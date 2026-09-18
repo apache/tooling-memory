@@ -2,7 +2,7 @@
 
 ### Cost-efficient, safe shared memory and coordination for agent fleets built to outlast every component
 
-Sander Striker · August 2026
+Sander Striker · August 2026 · revised September 2026
 
 *Fleets of AI agents doing sustained work at scale need shared memory, coordination, governance, and a way to survive the replacement of every component they are built from. This paper describes an architecture for that problem: a text-first system of record with tiered, provenance-tracked memory; retrieval built on progressive disclosure so agents read only what a cheaper signal could not rule out; coordination through leased shared state instead of messages; a layered policy stack behind a deterministic enforcement perimeter; eval-gated self-improvement that cannot widen its own permissions; and evaluation of change, whether self-initiated or vendor-inflicted, by replaying the system's own history. The components are ordinary on purpose (git, plain text, lexical search, policy-as-code) so that the whole remains legible, auditable, and rebuildable by humans over decades.*
 
@@ -51,13 +51,16 @@ flowchart TB
     HUM["Humans<br/>leadership and operators: amend policy,<br/>approve exceptions, own the registry"]
     AGT["Agents: stateless, disposable<br/>workers, orchestrators, librarians, auditors"]
     SRV["Serving layer: rebuildable<br/>retrieval, task board, OPA filters, telemetry"]
-    REC["System of record: git<br/>domain memory, policy stack, registry, exceptions"]
+    REC["System of record: git<br/>domain memory, policy stack, registry, exceptions, dom-platform"]
+    EXT["External systems: trackers, archives, tool servers<br/>canonical for their own items, each with a ceiling"]
 
     HUM ~~~ AGT
     AGT -->|"search, get, write, claim"| SRV
     SRV -->|"indexes and compiles from"| REC
     HUM -->|"policy commits and approvals"| REC
     SRV -.->|"telemetry drives curation"| AGT
+    EXT -->|"taps: items in"| SRV
+    SRV -->|"results out, label ≤ ceiling"| EXT
 ```
 
 Git repositories of Markdown hold everything durable: domain-partitioned memory, the policy stack, the registry, and exceptions. An indexer turns commits into a search index whose results are summaries first. Agents start empty, load a small cached index plus a policy digest, and reach everything else through a retrieval tool fronted by compiled permission filters. Work is coordinated through a task board with leased claims, never through agent-to-agent chat. Cheap librarian agents curate memory continuously, directed by the telemetry the retrieval service emits. Humans amend policy, approve exceptions, and remain the final continuity.
@@ -101,7 +104,7 @@ Every entry carries frontmatter:
 
 ```yaml
 id: mem-a-0847               # stable, permanent, meaningless
-type: decision | fact | convention | handoff
+type: decision | fact | convention | method | handoff
 domain: dom-a                 # capability ID, never a team name
 author: agent:worker-3 (model: <model-id>) | human:<user-id>
 created: <timestamp>
@@ -111,9 +114,10 @@ trust_tier: raw | curated | verified
 review_by: <date>             # decay clock, librarian-enforced
 supersedes: mem-a-0312
 policy_context: [pol-L1-007]  # policy version in force when written
+classification: internal      # data-handling label (§5); at least the label of what the author read
 ```
 
-The three content types age differently. **Decisions** (context, options, choice, rationale: the ADR pattern) age best, because the why stays true after the what changes; they are superseded, never expired. **Facts** decay fast and carry mandatory review dates. **Conventions** require a named owner; ownerless conventions are flagged within days.
+The three content types age differently. **Decisions** (context, options, choice, rationale: the ADR pattern) age best, because the why stays true after the what changes; they are superseded, never expired. **Facts** decay fast and carry mandatory review dates. **Conventions** require a named owner; ownerless conventions are flagged within days. **Methods**, the strategies and skills of §10, are conventions about how to work and follow the same rules, with the stricter scrutiny §10 gives them.
 
 A complete decision entry, showing the shape a librarian and a future agent both rely on:
 
@@ -174,23 +178,26 @@ Git is the system of record and the review substrate. It is not the concurrent w
 ```mermaid
 flowchart LR
     subgraph HOT["Hot path: high concurrency, no git"]
-        A1["Agents (many)"] -->|append, no lock| LOG["Append-only event log (T2)<br/>Kafka / log table / per-writer segments,<br/>partitioned by domain"]
+        A1["Agents and taps (many)"] -->|append, no lock| LOG["Append-only event log (T2)<br/>Kafka / log table / per-writer segments,<br/>partitioned by domain"]
     end
-    LOG -->|fast lane| IX["Search index<br/>(the read path)"]
+    LOG -->|"fast lane: handoffs, mid-task decisions<br/>slow lane: bulk curation"| IX["Search index<br/>(the read path)"]
+    LOG -->|projection| BRD["Task board<br/>(projection + lease cache)"]
     LOG -->|batched, async| MAT["Materializer<br/>(one committer per domain repo)"]
-    MAT -->|coarse commits| GIT["Git repos (per domain):<br/>curated T1 + decisions"]
+    MAT -->|coarse commits| GIT["Git repos (per domain):<br/>curated T1 + decisions + terminal tasks"]
     GIT -->|PR review, human-paced| VER["Verified tier + policy stack"]
 ```
 
-Four properties remove the contention. The hot write path is an append-only log, where concurrent appends don't contend. Partitioning by domain means cross-domain writes never touch the same repo. Ownership and leases mean two agents rarely write the same artifact at all. And a single materializer per domain is the only committer: many producers, one consumer, no ref contention, coarse healthy commits. The index is fed from the log directly, so the freshness SLO holds even when git materialization lags.
+Four properties remove the contention. The hot write path is an append-only log, where concurrent appends don't contend. Partitioning by domain means cross-domain writes never touch the same repo. Ownership and leases mean two agents rarely write the same artifact at all. And a single materializer per domain is the only committer: many producers, one consumer, no ref contention, coarse healthy commits. The index is fed from the log directly, so the freshness SLO holds even when git materialization lags. Writes another agent may be waiting on, handoffs and decisions written mid-task, take a fast lane with a published freshness bound (§9); bulk curation takes the slow lane.
 
-This maps onto the trust tiers: raw T2 in the log store at high frequency; curated T1 and decisions in git at moderate frequency via the materializer; verified promotions and policy changes through git PRs at low, human-paced frequency, the one place git's review semantics are needed and where its write rate is more than sufficient. If a deployment needs the same guarantees at higher commit rates, the tiering holds with a different engine (a git-semantics database, or a versioned object store plus manifest); principle 1 is about format and guarantees, not the binary.
+This maps onto the trust tiers: raw T2 in the log store at high frequency; curated T1 and decisions in git at moderate frequency via the materializer; verified promotions and policy changes through git PRs at low, human-paced frequency, the one place git's review semantics are needed and where its write rate is more than sufficient. If a deployment needs the same guarantees at higher commit rates, the tiering holds with a different engine (a git-semantics database, or a versioned object store plus a version index); principle 1 is about format and guarantees, not the binary.
 
 ## The librarian function
 
 A permanent fleet of cheap-model agents: verify stale facts, merge duplicates, write and maintain the one-to-two-sentence summaries the index serves, split oversized files, promote hot material, demote dead material, and act on telemetry signals (failed-query clusters become authoring tasks; high co-retrieval becomes merge candidates; high wasted-read becomes re-summarization). Curation is scheduled and budgeted like any other workload.
 
 Promotion into `trust_tier: verified` passes a review gate: a git PR approved by a human or senior agent, per domain policy. This is the main defense against memory poisoning: a wrong fact written once and trusted forever is the largest long-horizon risk this system carries.
+
+Raw entries are searchable, with their tier visible, because a handoff written a minute ago is raw and the next agent needs it. Two things narrow that default. A principal's policy may set a higher floor for a domain, as the example residual in §5 does. And dom-platform is the exception by design (§10): what a harness loads as its configuration must be verified, what an agent retrieves from dom-platform mid-task must be curated or better, and raw dom-platform is reachable by librarians and auditors only.
 
 ## Containing the librarian
 
@@ -211,7 +218,7 @@ The question of who audits the auditor has a deliberate stopping point: immutabl
 
 ## Retrieval as a service
 
-Agents never hold the corpus. Retrieval is a tool (`search`, `get`, `write`, `check_policy`) backed by a BM25 index (OpenSearch/Elasticsearch at large scale; Postgres FTS is the simpler alternative that can also host the task board and registry). Sandboxes start empty, so startup cost is constant regardless of corpus size.
+Agents never hold the corpus. Retrieval is a tool (`search`, `get`, `recall`, `write`; Appendix A) backed by a BM25 index (OpenSearch/Elasticsearch at large scale; Postgres FTS is the simpler alternative that can also host the task board and registry). Sandboxes start empty, so startup cost is constant regardless of corpus size.
 
 BM25 first, vectors later, because agent queries over curated memory are mostly known-item lookups (names, IDs, error strings) where lexical search performs well; because BM25 has no model dependency (no re-embedding the corpus when embedding models change); and because its matches are explainable, which auditing needs. Vectors are added as a derived, rebuildable layer only where the golden suites show hybrid scoring earns its cost.
 
@@ -235,7 +242,15 @@ OPA, the Open Policy Agent, is a general-purpose policy engine whose declarative
 
 Because the registry is OPA data, a reorg is a data update with no service changes. Exception objects are OPA data too, so expiry is a timestamp comparison. Decision logs (every allow/deny, with the policy version that produced it) flow to telemetry. Prefetch and any cross-corpus analytics pass through the same compiled filter as queries; a separate unfiltered path would be a leak waiting to happen.
 
-OPA's scope stays bounded to the checkable perimeter: access, spend limits, data boundaries, irreversibility gates. Judgment is never encoded in Rego.
+OPA's scope stays bounded to the checkable perimeter: access, spend limits per resource class (§12), data boundaries, irreversibility gates. Judgment is never encoded in Rego.
+
+## Information flow
+
+Access control says who may read an entry. It does not say where the content may go next, and an agent is a channel: what it reads shapes what it writes and what it sends out. So three things carry labels from one small ordered set the deployment defines (public, internal, restricted). Entries and tasks carry a `classification`. Every destination an agent can send to, a model class or a tool server, is registered with a **ceiling**, the highest classification it may receive. And a session carries two labels of its own. Its **handling** is the highest classification it may read, set by policy for its principal and attested by its capability manifest (§7); a harness attests handling above public only when every outbound path it has goes through the perimeter, so the check below cannot be bypassed. Its **current label** starts at the lowest level, rises to the highest classification it has read, and never falls within the session.
+
+Three rules follow, all enforced in the perimeter. Reads require `classification ≤ handling`, compiled into the index filter with the ordinary grant, so a session never sees hits, counts, or summaries above its handling. Writes inherit: an entry carries at least the session's current label, because the author cannot know which fragment of what it read shaped the text. Outbound calls require `current label ≤ ceiling` of the destination, checked per call. Handling is fixed for the session, so the read filter compiles once; only the outbound check follows the moving label. A recall (serving bindings, below) raises the caller's label to the highest classification the deputy read on its behalf.
+
+Crossing downward is declassification, and it is never a side effect of a write. `declassify` proposes a new entry at a lower label that cites the higher one; the proposal carries the higher label until a guard approves it. Policy names the guard for each crossing, and the widest crossings require a human. The result is an ordinary entry whose provenance names the guard, so every crossing can be enumerated. Labels only rise within a session, so the cost of this design is over-classification, and the remedies are a small label set, short sessions, and a declassification path cheap enough to be used.
 
 ```mermaid
 sequenceDiagram
@@ -249,7 +264,7 @@ sequenceDiagram
     Note over A: Session start (once)
     A->>R: authenticate(agent_id, task_id)
     R->>O: partial_eval(principal, read)
-    O-->>R: residual: domain ∈ {dom-a, dom-b}<br/>∧ trust_tier ≥ curated ∧ ¬hold_label
+    O-->>R: residual: domain ∈ {dom-a, dom-b}<br/>∧ trust_tier ≥ curated<br/>∧ classification ≤ handling
     R->>R: compile to index filter, cache for session
 
     Note over A: Each query
@@ -273,17 +288,19 @@ flowchart TB
     AG["Agent harnesses<br/>tool protocol, MCP or successors"]
     HT["Scripts and interfaces<br/>plain HTTP"]
     FV["Offline consumers<br/>read-only file projection"]
-    API["Durable surface<br/>seven operations, versioned"]
+    API["Durable surface<br/>Appendix A, versioned"]
     subgraph SVC["Service internals, binding-independent"]
-        FLT["Compiled permission filter<br/>per session"]
+        FLT["Compiled permission filter per session<br/>ceiling check per outbound call"]
         DEP["Recall deputy<br/>cheap model, caller-scoped"]
         IX["Index and store<br/>summaries first"]
         TEL["Telemetry"]
     end
+    TS["Tool servers<br/>each registered with a ceiling"]
     AG --> API
     HT --> API
     API -.->|renders| FV
     API --> FLT --> IX
+    FLT --> TS
     API -->|recall| DEP --> FLT
     API --> TEL
 ```
@@ -292,12 +309,14 @@ Every binding lands on the same surface; every read below it passes the same fil
 
 The operation surface (Appendix A), three small families covering retrieval, tasks, and policy, is the durable contract; protocols that carry it are adapters. Today that means a standard tool protocol (MCP or its successors) as the primary agent binding, since it gives any capable harness the operations without custom integration and supports remote, authenticated service deployment, with plain HTTP alongside for scripts and interfaces. Authorization and telemetry live in the service, not the binding, so every protocol hits the same compiled filters and emits the same funnel events. The choke point survives protocol churn.
 
-A hosted or public deployment is the same endpoint with an additional principal tier whose compiled filter scopes to public domains at curated trust or better. No new architecture: one policy row, with rate limits as the public face of the SLO tiers and the telemetry plane attributing usage per principal.
+A hosted or public deployment is the same endpoint with an additional principal tier whose compiled filter scopes to entries classified public, at curated trust or better. No new architecture: one policy row, with rate limits as the public face of the SLO tiers and the telemetry plane attributing usage per principal.
+
+Tool servers beyond this surface are governed the same way. Agents reach issue trackers, archives, repositories, and deployment targets through the same binding, and those servers sit inside the perimeter. Each is registered with a ceiling (information flow, above) and with the highest classification of its own sources. Grants are per principal and per server, and every call is checked against the session's current label, so a session that has read restricted material can no longer reach a public-ceiling server for the rest of the session. A server that reads restricted sources and a server whose ceiling is public are never the same grant; a deployment that needs the crossing builds it as a `declassify` through a guard. Tool calls emit the same telemetry as reads, and repeated ceiling denials from one principal are treated as probing, as in §10.
 
 
 Transport matters less than turn economics, because every pull costs the agent a model turn and context. Four rules govern the interaction pattern. Push the predictable: T0 and the policy digest arrive as a cached session prefix, never as tool calls; only the unpredictable tail is pulled. Make every pull dense: summaries-first responses, prefetch attachments, and batch search (one call, several queries) keep orientation to a single turn. Delegate multi-hop recall: a `recall(question, domain)` operation lets a cheap model inside the service run the search, fetch, synthesize loop and return a cited brief, so the expensive caller spends one turn while the cheap model spends the tokens; citations preserve provenance for drill-down. And project, never mount: where a harness works best with file tools, the service renders a scoped read-only file view (the derived-stub pattern of Appendix B, widened), so no path bypasses the permission filter or the telemetry.
 
-Two constraints apply to `recall` specifically. It runs under the caller's compiled filter, not the service identity: the synthesizing model is a deputy, and scoping it to the session's residual policy is what prevents a low-privilege caller from laundering reads through a higher-privilege synthesizer. And it is the only operation with real marginal cost, since the other six are index-served. Metering therefore reduces to one operation, attributed per principal by the telemetry plane and priced through the cost vector of §12. A deployment chooses per principal tier whether that cost is carried server-side or shifted to the caller by executing the synthesis loop through the caller's own model, accepting added latency and a recall SLO that applies only to server-executed recall.
+Two constraints apply to `recall` specifically. It runs under the caller's compiled filter, not the service identity: the synthesizing model is a deputy, and scoping it to the session's residual policy is what prevents a low-privilege caller from laundering reads through a higher-privilege synthesizer. And it is the only retrieval operation with real marginal cost, since `search` and `get` are index-served and `write` is an append. Metering therefore reduces to one operation, attributed per principal by the telemetry plane and priced through the price vector of §12. A deployment chooses per principal tier whether that cost is carried server-side or shifted to the caller by executing the synthesis loop through the caller's own model, accepting added latency and a recall SLO that applies only to server-executed recall.
 
 ```mermaid
 sequenceDiagram
@@ -317,6 +336,7 @@ sequenceDiagram
         end
         D-->>S: brief with entry citations
         S-->>C: cited brief, one caller turn spent
+        Note over C: caller's label rises to the highest<br/>classification the deputy read
     else caller-executed, cost shifts to the caller
         S->>C: sampling request with retrieved context
         C-->>S: synthesis step via the caller's own model
@@ -417,31 +437,39 @@ This is an alignment mechanism, and naming it clarifies the division of labor. A
 
 ## The task fabric
 
-Work flows through domain task boards plus a portfolio layer, never through agent-to-agent conversation.
+Work flows through one board, partitioned by domain and topped by a portfolio layer, never through agent-to-agent conversation. Agents see one operation surface; storage and ownership are per domain, as they are for the event log.
 
 Tasks enter the boards from five sources. Humans file goals and requests, and amendments to L1 recompile the rubric that reorders everything already queued. Orchestrators decompose: portfolio objectives into domain work, and follow-ups out of merge points. Working agents create tasks as a side effect of work: discovered subtasks, escalations, flagged consequences in other domains, and the cross-domain request tasks described below. The system creates its own maintenance work through telemetry: failed-query clusters become authoring tasks, expiring decay clocks become re-verification tasks, tension rollups become amendment evidence, tripped canaries and orphaned domains become alerts with tasks attached. And external taps (tickets, incidents, alerts flowing through the ordinary write path, per Appendix B) materialize as tasks on the owning domain's board.
 
-Creation is cheap and ungated; admission is not. Anything may file a task, and every task carries provenance citing its origin and evidence, but a task is born proposed and becomes claimable only when triage admits it: scored against the compiled rubric, checked for requirement coherence, deduplicated at the door, with irreversibility escalating regardless of score. The gate is universal while its depth scales, so ordinary work from trusted sources auto-triages in seconds and nothing waits on a human unless its class demands one. System-generated maintenance work competes under the same rubric with a protected budget floor per domain, so curation neither starves delivery nor is starved by it. Endings are governed like beginnings: a task closes as done or is invalidated as obsolete, invalid, or duplicate, always with a reason and provenance, never deleted. Creation, rescore, and invalidation are all telemetry: an invalid-heavy source is a noisy tap to filter, rescore churn is evidence of rubric instability, and obsolescence before claim marks a backlog going stale.
+Most of those sources already live in systems of their own: issue trackers per repository, ticket queues per team, incident tools. They stay where they are, and each is connected by a **tap**, a connector that runs in both directions. Inbound, an item becomes a task on the domain the registry says owns that repository or queue (§12), carrying an `origin` that cites the item; the tracker remains canonical for the item, the board for the task. The tap does not admit; triage does, with the tracker's state as evidence, since an acceptance recorded upstream is a human sign-off that has already happened. Outbound, when the task completes, the tap carries the handoff's result back as a comment, a proposed change, or a suggested transition, posted under the fleet's own identity, which is also how a tap recognises and ignores what the fleet wrote. The tap is a tool server with a ceiling (§5), the handoff carries the session's label, and the perimeter checks one against the other. The tracker's owner closes the item; the fleet only proposes. A task is **live** until it is terminal. Two events cross back inward: an upstream close invalidates a live task as obsolete and confirms a terminal one, and a reopen creates a new task that cites the old one as its predecessor. Taps are idempotent on origin and upstream event, so a replayed history creates nothing twice, and dedup at admission keys on origin among a domain's live tasks, so one item is one live task. An item and the items related to it, an issue and the change that fixes it, are related tasks, not one. If the registry moves a repository to another domain, a move event in both partitions carries its live tasks with it.
+
+The board is event-sourced on the same log as memory (§4). Every board operation, creation, admission, claim, heartbeat, release, rescore, completion, and invalidation, is an append to the domain's partition, and the board is a projection of that partition. There is no second store. The lease table agents dequeue from is a cache of the projection and is rebuilt from the log, so the record test of §12 holds for the board and replay (§11) sees every claim, not only every completion. A claim is an append that takes effect only if the projection shows the task claimable at that point in the log, which is what makes `claim_next` atomic within a domain; a claim that loses, or any event that arrives after a terminal one, is recorded and changes nothing, and `claim_next` moves on to the next task the caller can hold. Every board operation carries a caller-supplied attempt key, so a retry cannot double-claim or double-complete. Automatic re-ranks are the board's own appends; the `rescore` of Appendix A is an orchestrator's override and is gated. The materializer commits each terminal task with its event history to the record alongside decisions, so a replay checkout (§11) holds every claim; the projection keeps only live tasks; the origin index keeps every origin it has seen; and the log itself is in the snapshots the §12 drill restores from. Taps reconcile by pull on a schedule, with a webhook allowed to hasten a pull but never relied on to retry, because a tracker emits far more events than tasks.
+
+Rank is a property of open tasks; a claimed task keeps its lease whatever happens to the rubric. A single task re-ranks when its own state changes, on unblocking or narrowing. Rubric-wide rescoring, from an L1 amendment, a price-vector change, or a saturated pool, runs once per **cycle**, the triage cadence published with the SLOs (§9), so it touches every open task at most once per cycle. A parent's rank flows to its open children. Edges that cross domains, a request task or a dependency on another domain's work, travel as events between partitions; a request task carries its requester's rank as one input to the owning domain's rubric, propagation runs through the portfolio layer and may lag by a cycle, and each domain's rubric still orders its own queue. Invalidation cascades: an invalidated parent invalidates its live children as obsolete, an invalidated dependency re-triages its dependents, and a holder learns of either, or of an upstream close, from the status its next heartbeat returns, stops, and writes a handoff.
+
+Creation is cheap and ungated; admission is not. Anything may file a task, and every task carries provenance citing what created it and its evidence, but a task is born proposed and becomes claimable only when triage admits it: scored against the compiled rubric, checked for requirement coherence, deduplicated at the door, with irreversibility escalating regardless of score. The gate is universal while its depth scales, so ordinary work from trusted sources auto-triages in seconds and nothing waits on a human unless its class demands one. System-generated maintenance work competes under the same rubric with a protected budget floor per domain, so curation neither starves delivery nor is starved by it. Endings are governed like beginnings: a task closes as done or is invalidated as obsolete, invalid, or duplicate, always with a reason and provenance, never deleted. Creation, rescore, and invalidation are all telemetry: an invalid-heavy source is a noisy tap to filter, rescore churn is evidence of rubric instability, and obsolescence before claim marks a backlog going stale.
 
 A task:
 
 ```yaml
 id: task-a-1204
 parent: task-a-1200               # decomposition hierarchy
+origin: <system>:<permalink>      # the item this task came from, if any; that system stays canonical for it
 title: "Implement retry backoff for operation R"
 domain: dom-a
 scores: {value: 8, urgency: 5, effort: 3, unblocks: [task-a-1210, task-a-1215]}
   # rubric compiled from L1; unblocking is weighted up because
   # it is chronically underweighted and matters most
-requires: [<capability tags>]     # tools, model tier, data scope, human sign-off
+requires: [<capability tags>]     # tools, model tier (implies resource class), data scope, human sign-off
 reversibility: reversible | irreversible   # irreversible ⇒ escalate regardless of score
+classification: internal          # label of the data scope (§5); claimers must attest handling
 status: proposed | open | claimed | blocked | review | done | invalidated
   # proposed = awaiting triage; open = admitted and claimable; invalidated carries a reason
 claim: {agent: worker-7, lease_expires: 2026-08-12T15:30Z}
 depends_on: [...]
 artifacts_touched: [<owned path glob>]
 policy_context: [pol-L1-007, pol-L2-031]
-handoff: mem-a-0901          # written at completion
+handoff: mem-a-0901          # written at completion, release, or invalidation
 ```
 
 Leases make claims crash-safe: no heartbeat, lease expires, task returns to the pool, and the next agent recovers from the handoff note, not a transcript. Ownership partitioning prevents most conflicts structurally; touching foreign paths requires a claim through that domain's board. Conflicts that still occur surface as merge points for the orchestrator.
@@ -450,15 +478,17 @@ Tasks form a hierarchy through decomposition: each carries its parent, and a par
 
 When a dependency clears, the dependent does not become claimable with stale assumptions. Unblocking re-triages it, and the claiming agent's first act is verification: the dependency's handoff and decision entries are checked against what this task assumed, and a mismatch goes back to the orchestrator for re-decomposition instead of being silently absorbed. Blocked age is telemetry: tasks blocked past a bound alert, and tasks the world has moved past are invalidated as obsolete rather than left to rot.
 
-Closed tasks are memory. The board is an event source like commits and tickets: every terminal task, with its provenance, dependency edges, handoff, and outcome, is replayable history, already the label source for the evaluations of §11 and distillation input for the librarian, where recurring invalidation reasons or repeatedly re-decomposed parents become process entries in their own right.
+Closed tasks are memory. The board is an event source like commits and tickets: every terminal task, with its provenance, dependency edges, handoff, and outcome, is replayable history, already the ground truth for the evaluations of §11 and distillation input for the librarian, where recurring invalidation reasons or repeatedly re-decomposed parents become process entries in their own right.
 
-Triage is centralized so judgment isn't re-derived by every worker: an orchestrator (or a periodic cheap-model pass) ranks the queue against the compiled L1 rubric, workers pull the head of the queue through an atomic claim-next so two agents never race for the same task, and only ambiguous calls escalate. An empty claim-next is itself a signal: idle capacity against the current rubric, visible in the telemetry.
+Triage is centralized so judgment isn't re-derived by every worker: an orchestrator (or a periodic cheap-model pass) ranks the queue against the compiled L1 rubric, workers pull the head of the queue through an atomic claim-next so two agents can never both hold the same task, and only ambiguous calls escalate. An empty claim-next is itself a signal: idle capacity against the current rubric, visible in the telemetry.
 
-Matching is by requirement and capability, since the fleet is heterogeneous. Tasks declare requirements at creation or decomposition (tools, model tier, data scope, human sign-off), and each agent session advertises a capability manifest drawn from its harness configuration, which is a versioned dom-platform artifact, so capabilities are attested by gated config, not self-reported. Capability is not permission: requirements must be satisfied and the compiled filter must allow the hold, both inside the atomic dequeue. Unmatched tasks are skipped for that claimer, never blocked by it, and a high-ranked task that no active claimer can match surfaces as a capability gap in telemetry, a provisioning signal instead of silent starvation.
+Matching is by requirement and capability, since the fleet is heterogeneous. Tasks declare requirements at creation or decomposition (tools, model tier and the resource class it implies, data scope, human sign-off), and each agent session advertises a capability manifest drawn from its harness configuration, which is a versioned dom-platform artifact that includes the agent definition itself (§10), so capabilities are attested by gated config, not self-reported. Capability is not permission: requirements must be satisfied and the compiled filter must allow the hold, both inside the atomic dequeue. A task is skipped by any claimer whose manifest does not attest handling at the task's classification (§5). Unmatched tasks are skipped for that claimer, never blocked by it, and a high-ranked task that no active claimer can match surfaces as a capability gap in telemetry, a provisioning signal instead of silent starvation.
 
 A task whose requirements exceed every single manifest is not unclaimable work; it is a parent that has not been decomposed yet. Capability-driven decomposition is the standard response: the orchestrator splits it into dependency-ordered subtasks whose requirements each fit some claimant, and human principals count, since a step requiring sign-off is simply a task whose manifest match is a person. Solvability, the first criterion of decomposition, means exactly this: every leaf matches someone. Recurring splits of the same shape are telemetry twice over, a provisioning case for a harness carrying the union of capabilities, or a decomposition template worth distilling into dom-platform.
 
 Partial work follows the same discipline. An agent that discovers mid-task that a portion exceeds its capabilities neither completes the task partially, since done means the acceptance held, nor abandons it silently. It narrows through the board: it proposes re-decomposition, completes the portion it can as a subtask with a handoff, and files the residual as a dependent task carrying the missing requirements, with rank inherited through the edge. Partial progress is preserved in handoffs and completed subtasks; partial completion of an unchanged task does not exist. Narrowing acceptance is a board operation with provenance, never a private judgment.
+
+Delegation follows the same discipline. An agent that hands part of its work to helpers spawned inside its own session has decomposed a task, and the board records it as one. A helper runs a verified definition like any worker; the parent selects it from the verified set, supplies the task spec, and narrows the manifest; it does not compose a definition. Spawning is a `create_task` and a `claim` in one step: a child whose requirements fit inside the parent's manifest inherits the parent's admission, the zero-depth case of the scaled gate above, and one that needs more is a residual filed through the orchestrator, as for partial work. The child's lease expires no later than the parent's. The helper finishes with a `complete` and a handoff on the fast lane, and the handoff, not the transcript, returns to the parent. If the parent hands off or dies first, its children run out their own leases and then return to the pool like any task, and the next claimer of the parent task finds them through the parent link and their handoffs. Two invariants hold: the child's manifest is a subset of the parent's, so delegation never widens capability, and the child's current label (§5) starts at the parent's and flows back up, so delegation never launders a read. The parent decides how to decompose; the board records the result, because replay outcomes and cost per task depend on seeing every leaf. Helpers finer than a model turn are function calls, not agents, and need no task.
 
 The requirements field itself needs guarding, because creation is cheap and requirements are targeting: a task with inflated requirements is a message addressed to the most capable claimant, and a compromised or manipulated creator could route work, and payloads, toward agents holding tools and scopes the creator lacks. Four controls close this. Admission depth scales with the requirements class: every task passes triage before it is claimable, an automatic rubric pass for ordinary work, while tasks requiring privileged tools, elevated scopes, human time, or irreversible action draw orchestrator validation, with a coherence check that flags requirements the spec does not justify. Creators are bound by policy: by default a principal may not attach requirements it could not itself be granted, and the legitimate exception, a residual filed for capabilities the filer lacks, already arrives through orchestrator re-decomposition. A task spec is data, not authorization, the same rule §10 applies to retrieved memory: claiming a task grants nothing, and the claimer's own perimeter gates every action regardless of what the spec requests. And requirements inflation is telemetry: creators whose tasks systematically over-require are flagged, and completions of high-requirement tasks draw review sampling scaled to their class, the same way blast radius scales gates elsewhere.
 
@@ -467,7 +497,7 @@ One pass through the fabric, exercising admission, capability matching, narrowin
 ```mermaid
 sequenceDiagram
     autonumber
-    participant CR as Creator, any principal
+    participant CR as Creator, any principal or tap
     participant TB as Board
     participant TRI as Triage gate
     participant W1 as Worker A, limited manifest
@@ -477,7 +507,7 @@ sequenceDiagram
     participant M as Memory
 
     CR->>TB: create_task with spec and requires
-    Note over TB: status proposed, provenance attached
+    Note over TB: status proposed, provenance and origin attached
     TB->>TRI: triage
     TRI->>TRI: rubric score, coherence check, dedup
     Note over TRI: depth scales with requirements class
@@ -564,7 +594,7 @@ sequenceDiagram
     participant PF as Product orchestrator
 
     PO->>IS: read summary
-    PO->>LB: file cross-domain request task
+    PO->>LB: file cross-domain request task, carrying dom-a's rank
     LO->>LB: triage against dom-b rubric
     alt priorities conflict
         LO->>PF: escalate
@@ -575,7 +605,7 @@ sequenceDiagram
 
 **Department level.** Telemetry shows two domains cross-reading each other more than themselves; the librarian surfaces a boundary-redraw recommendation with the evidence attached; practice leads review; the redraw ships as a registry-plus-memory-move commit with tombstone redirects, logged as a decision. Boundary changes are schema migrations: rare, deliberate, evidenced.
 
-**Company level.** Leadership amends L1 as a reviewed commit; the scoring rubric recompiles; every board re-triages on the next cycle. The freshness SLO bounds when the fleet is fully operating under the new priorities, and every decision is stamped with the policy version in force when it was made.
+**Company level.** Leadership amends L1 as a reviewed commit; the scoring rubric recompiles; every board re-triages on the next cycle. The triage cycle bounds when the fleet is fully operating under the new priorities, and every decision is stamped with the policy version in force when it was made.
 
 ---
 
@@ -584,23 +614,23 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> Spawn
-    Spawn --> Oriented: load cached T0 and digest, compile filter, register capabilities
+    Spawn --> Oriented: load cached T0 and digest, compile filter, present attested manifest
     Oriented --> Claiming: pull top claimable task
     Claiming --> Working: claim granted with lease and heartbeat
-    Claiming --> Idle: nothing claimable
-    Working --> Working: search, fetch, act, write events, renew lease
+    Claiming --> Idle: nothing claimable, or board unreachable
+    Working --> Working: search, fetch, act, delegate, write events, renew lease
     Working --> Blocked: dependency unmet or gate denial
     Blocked --> Working: unblocked via board
     Blocked --> Escalated: files exception or escalation task
     Escalated --> Working: approved
     Escalated --> Handoff: denied, record and release
-    Working --> Handoff: complete, or budget or context limit reached
+    Working --> Handoff: complete, budget or context limit reached, or lease lost
     Handoff --> [*]: write handoff note, release task, die
     Working --> Died: crash or missed heartbeat
     Died --> [*]: lease expires, task returns to pool
 ```
 
-Spin-up is O(1) regardless of corpus size: no data in the sandbox, a cached T0 prefix, a session filter compiled once. Context recovery costs one index read plus one or two topic files; the previous agent's handoff note is the recovery mechanism, which is why handoff writes get the fast indexing lane. Death is safe by design: leases mean a crashed agent cannot deadlock work, and statelessness means nothing of value died with it. An agent nearing its context or spend limit hands off proactively; a fresh agent with a good handoff note beats a bloated context.
+Spin-up is O(1) regardless of corpus size: no data in the sandbox, a cached T0 prefix, a session filter compiled once. Context recovery costs one index read plus one or two topic files; the previous agent's handoff note is the recovery mechanism, which is why handoff writes get the fast indexing lane. An agent that delegates spawns its helpers through the board (§7) and receives their handoffs, so its context holds a summary of what they did, not a copy of what they saw. Death is safe by design: leases mean a crashed agent cannot deadlock work, and statelessness means nothing of value died with it. The same rule runs the other way: an agent that cannot renew its lease treats it as lost at the moment it would have expired, stops the task, writes its handoff, and claims nothing new (§9), so a partition between agent and board never leaves one task with two holders. An agent nearing its context or spend limit hands off proactively; a fresh agent with a good handoff note beats a bloated context.
 
 ---
 
@@ -615,7 +645,7 @@ Everything flows through the retrieval service and task board, so instrumentatio
 | Fetch-through rate | Low → summaries or ranking aren't informative |
 | Wasted-read ratio (fetched but never used; sampled cheap-model judge) | Direct measure of burned tokens; drives re-summarization |
 | Retrieval depth per task | Rising → corpus degrading or summaries stale; segment by domain |
-| Cost per task completed (today: tokens per task) | The primary efficiency number: raw spend rises with usage, spend per unit of work must not. Priced via the versioned cost vector (§12) |
+| Cost per task completed (today: mostly tokens per task) | The primary efficiency number: raw spend rises with usage, spend per unit of work must not. Reported per resource class, priced via the versioned price vector (§12) |
 | Zero-result / re-query rate | Index gaps; clustered weekly into librarian authoring tasks |
 | Prefetch precision | Below threshold → cut the association |
 | Policy citation and override rates | Uncited policies are dead letters; a weekly-overridden rule is a bad rule |
@@ -629,9 +659,10 @@ Cost attribution rolls up by domain and task type, which turns "spend rose 30%" 
 Agents hard-depend on retrieval behavior, so it is a published contract:
 
 - **Latency:** search p50 100 ms / p99 500 ms; fetch p99 bounded. Strict on purpose: slow reads push agents toward loading more up front, so latency and token-efficiency rise and fall together.
-- **Freshness:** 99% of writes searchable within 60 s on the handoff fast lane; bulk curation may lag further, and the bound is published so agents know when they can read their own writes.
+- **Freshness:** 99% of fast-lane writes (handoffs and mid-task decisions, §4) searchable within 60 s; bulk curation may lag further, and both bounds are published so agents know when they can read their own writes.
 - **Availability and degraded mode:** service down → agents run from T0, queue writes, take no irreversible actions. Degraded behavior is part of the contract.
 - **Quality floor:** no known-item misses: exact-match lookups by ID, title, or error string land in the top three, guaranteed by the golden suites.
+- **Board:** `claim_next` p99 1 s, since spin-up to first task is on every agent's path; projection lag p99 1 s, so the claimable set is at most that stale; ordinary admission within 10 s; tap-to-task and write-back within 5 min, excluding tracker unavailability; the triage cycle 5 min, and portfolio propagation within one cycle. Heartbeats run at a third of the lease. Degraded mode: a board outage is the projection; the log accepts appends throughout, so handoffs and heartbeats land but nothing is confirmed or dequeued. An agent that cannot confirm a renewal keeps working and retrying until its lease would have expired, then treats the lease as lost (§8): it stops the task, writes its handoff, and claims nothing until a claim succeeds again. The board expires leases by its own clock, so an outage shorter than a lease costs nothing, and a longer one returns held tasks to the pool with their handoffs, the ordinary crash path applied all at once. Spawning needs the board, so a parent that cannot spawn does the work itself within its lease or waits. Taps buffer inbound items in the log and outbound results at the tap, idempotent per task and event. A log outage is a retrieval outage as well, and that degraded mode applies. Trackers stay canonical for their items, so people keep working in them through any of this.
 
 ## Regressions
 
@@ -645,16 +676,22 @@ Telemetry is also the librarian's work queue: high wasted-read → re-summarize;
 
 ## The platform is a domain
 
-The harness (system prompts, tool definitions, retrieval configuration, the triage rubric, and the distilled strategies agents retrieve mid-task) is itself memory, in a domain called `dom-platform`. It also holds failure post-mortems, model-version quirks, and the eval suites themselves. Because librarians curate dom-platform like any other domain, the system improves itself without training anything: a better playbook for a recurring task type improves every future agent that draws it. Recent work on self-evolving agents reaches the same conclusion: improvement comes mostly from changing the harness, not the weights.
+The harness (system prompts, tool definitions, retrieval configuration, the triage rubric, and the distilled strategies agents retrieve mid-task) is itself memory, in a domain called `dom-platform`. It also holds agent definitions and the prompts that author them (below), decomposition templates (§7), failure post-mortems, model-version quirks, the eval suites and their scorecards (§11), and the seeding pipeline (Appendix B). Because librarians curate dom-platform like any other domain, the system improves itself without training anything: a better playbook for a recurring task type improves every future agent that draws it. Recent work on self-evolving agents reaches the same conclusion: improvement comes mostly from changing the harness, not the weights.
 
 The harness splits into two zones with a hard line between them:
 
 - **Mutable zone (inside the loop):** prompts, tools, retrieval config, rubric, strategies. Agents and librarians propose changes; the fleet loads verified versions.
 - **Perimeter (outside the loop, human-owned):** OPA policies, permission grants, spend limits, data boundaries, the L0 core. Not in dom-platform's writable scope; enforced at runtime against every action regardless of what the harness says.
 
+## Authoring agents
+
+An agent definition, the prompt, tool declarations, model choices, and control flow that turn a harness into a specific worker, is the harness artifact that fixes the capability manifest a session advertises (§7). Definitions are written by a person, or by a capable model from a person's stated intent, and run by cheaper models; the roles stay separate because the authoring model is spent once and the runtime models on every invocation. The artifact is ordinary code a person can read, run, and correct, which is principle 10 applied to the harness: an unreadable definition cannot be reviewed.
+
+A new or changed definition enters dom-platform at trust raw and passes the same gates as any other mutation before a live harness loads it. A new definition has no incumbent, so its performance gate is the domain suite for its task type, which it must pass. The review gate checks the manifest against the stated intent: a definition that declares more tools, scope, or handling than its description justifies is the requirements inflation of §7 arriving through authoring, and is rejected on the same grounds. The authoring model's own prompt and helper library are dom-platform artifacts too, so improving them improves every definition written afterwards. When the proposer is a librarian acting on a failed-query cluster rather than a person, this is the evolution loop below applied to definitions.
+
 ## The evolution loop
 
-No dom-platform artifact reaches `verified` without passing its gates, and nothing below verified is loaded into a live harness.
+No dom-platform artifact reaches `verified` without passing its gates. Two verbs carry two bars: nothing below verified is *loaded* into a live harness as its configuration, and nothing below curated is *retrieved* by an agent mid-task; raw dom-platform is for librarians and auditors only.
 
 ```mermaid
 flowchart TD
@@ -662,7 +699,7 @@ flowchart TD
     subgraph LOOP["Harness evolution loop"]
         H["Harness: prompts, tools,<br/>config, strategies"]
         RUN["Fleet runs tasks"]
-        DIST["Candidate mutation<br/>at trust raw"]
+        DIST["Candidate mutation or new definition<br/>at trust raw"]
         G1{"Performance<br/>gate"}
         G2{"Safety<br/>gate"}
         G3{"Review<br/>gate"}
@@ -670,7 +707,9 @@ flowchart TD
         ARCH["Archive<br/>with result"]
         QUAR["Quarantine<br/>and alert"]
     end
+    AUTH["Authoring: a person, or a model<br/>from a person's stated intent"]
     H --> RUN -->|trajectories| DIST --> G1
+    AUTH --> DIST
     G1 -- fail --> ARCH
     G1 -- pass --> G2
     G2 -- fail --> QUAR
@@ -726,7 +765,7 @@ The invariant: self-evolution is permission-monotonic. It makes agents better wi
 
 Two kinds of change need measuring: changes the operator makes (a new base model, a new sandbox bootstrap) and changes the vendor makes silently. Both use the same machinery, replay against memory, because memory holds three things benchmarks lack.
 
-First, **the knowledge state is reproducible**: "the corpus as the agent saw it" is a git checkout of the commit that was HEAD when the task ran, including the policy version and T0 contents. Second, **outcome labels are real**: the task graph records completion, handoff acceptance, whether dependent tasks later got reverted, human PR approval. The dependency edges add downstream-consequence labels, the strongest kind. Third, **scoring uses the system's own cost numbers**: tokens per task and retrieval depth, not pass/fail alone.
+First, **the knowledge state is reproducible**: "the corpus as the agent saw it" is a git checkout of the commit that was HEAD when the task ran, including the policy version and T0 contents. Second, **outcomes are real**: the task graph records completion, handoff acceptance, whether dependent tasks later got reverted, human PR approval. The dependency edges add downstream consequences, the strongest kind of ground truth. Third, **scoring uses the system's own cost numbers**: tokens per task and retrieval depth, not pass/fail alone.
 
 ## Replaying your own history
 
@@ -742,7 +781,7 @@ flowchart TD
     subgraph FIX["Held fixed"]
         SNAP["Corpus snapshot at<br/>task-time HEAD"]
         TASKS["Stratified task set"]
-        LAB["Real labels from<br/>the task graph"]
+        LAB["Real outcomes from<br/>the task graph"]
     end
     subgraph SUT["Vary exactly one"]
         MODEL["New model"]
@@ -766,7 +805,7 @@ For a **model swap**, freeze bootstrap and corpus to get a clean model delta, an
 
 Every evaluation writes a permanent scorecard to dom-platform: which model or bootstrap, against which snapshot, what moved, and the verdict. Over years this answers which model was running when, why each switch was made, and what it cost.
 
-Four traps make a naive version of this lie, so they are named: **survivorship bias**: mined tasks are what the old system could do, so a failure-recovery stratum replays archived failures and zero-result queries to test new capability. **Label leakage**: snapshot at the parent of the task's own writes and exclude its artifacts. **Noise**: single runs mislead, so use multi-seed confidence intervals and a paired noise-floor protocol, never a point estimate. **Judge drift**: for open-ended tasks, hold the judge model fixed across the comparison, anchor it to human-approved outcomes, and never let a model judge itself. Against distribution shift, run two suites: a rolling set resampled from recent memory, and a frozen anchor set comparable across years, whose changes pass human review.
+Four traps make a naive version of this lie, so they are named: **survivorship bias**: mined tasks are what the old system could do, so a failure-recovery stratum replays archived failures and zero-result queries to test new capability. **Leakage**: snapshot at the parent of the task's own writes and exclude its artifacts, so the candidate never sees the outcome it is being scored on. **Noise**: single runs mislead, so use multi-seed confidence intervals and a paired noise-floor protocol, never a point estimate. **Judge drift**: for open-ended tasks, hold the judge model fixed across the comparison, anchor it to human-approved outcomes, and never let a model judge itself. Against distribution shift, run two suites: a rolling set resampled from recent memory, and a frozen anchor set comparable across years, whose changes pass human review.
 
 ## Detecting unadvertised vendor change
 
@@ -802,13 +841,17 @@ One interlock matters more than the rest: a silent model change during self-evol
 
 # 12. Surviving Long Timescales
 
-**Org change.** Domains are keyed by permanent capability IDs; a registry maps current org units to the domains they own; a reorg is a one-file data change that OPA picks up automatically. Team split: co-ownership until the knowledge diverges in practice, then a librarian-assisted split with tombstone redirects. Merge: lazy, only on real convergence. Orphaning is the dangerous case: ownership is a checked invariant, and ownerless domains are flagged within days, because orphaned memory decays silently while agents keep trusting it. Acquisitions import into a quarantined low-trust tier and earn promotion through normal review.
+**Org change.** Domains are keyed by permanent capability IDs; a registry maps current org units to the domains they own, and each domain to the repositories and queues it owns; a reorg is a one-file data change that OPA picks up automatically. Team split: co-ownership until the knowledge diverges in practice, then a librarian-assisted split with tombstone redirects. Merge: lazy, only on real convergence. Orphaning is the dangerous case: ownership is a checked invariant, and ownerless domains are flagged within days, because orphaned memory decays silently while agents keep trusting it. Acquisitions import into a quarantined low-trust tier and earn promotion through normal review.
 
 **Model churn.** BM25 has no model dependency; embeddings, summaries, and rubric compilations are derived and rebuildable. Provenance records the model version behind every write, so a systematically wrong model generation's contributions can be found and re-verified later.
 
 **Tooling churn.** Everything authoritative is Markdown in git. If OPA dies, the policies are text. If the search engine dies, the indexer rebuilds elsewhere. If the platform dies entirely, a person with a laptop can read the whole estate with a text editor. This is checked annually as a drill: restore the serving layer from git and object-store snapshots alone.
 
-**Cost-model churn.** The architecture assumes reads dominate cost, but that assumption lives in parameters, not structure. Telemetry records raw quantities (tokens in and out, cache hits, requests, compute time, bytes stored), and a versioned price vector in the policy layer converts them to cost; the efficiency metric is cost-per-task-completed, with today's token prices as one instantiation. The knobs derived from cost (T0 size cap, disclosure depth, prefetch aggressiveness, librarian budget, triage weights) recompute when the vector changes, the same way the scoring rubric recompiles from L1. If pricing flips (cheap cached reads, expensive storage, per-request billing), the response is a price-vector commit, re-tuned serving parameters validated through the §11 replay harness, and in the storage case tighter per-tier retention with T3 as the cold tier. The structural layers (record, provenance, trust, domains, policy, perimeter) are justified by correctness and auditability, not by any price, and do not move. Progressive disclosure also keeps a non-monetary justification: overloaded contexts degrade output quality even when the tokens are free.
+Two tests apply to every component. The **record test** is the one above: if the serving layer goes dark, is anything lost beyond convenience? The **ownership test** is about people: if a contributed component's authors stop, does anything on the production path stop? A component fails it when the institution depends on it but does not operate it. Contributed components plug in at defined points; whatever sits on the production path is adopted at a version and operated by the institution, or it is not on the path.
+
+**Cost-model churn.** The architecture assumes reads dominate cost, but that assumption lives in parameters, not structure. Telemetry records raw quantities per resource class (tokens in and out, cache hits, requests, accelerator time, compute time, bytes stored), and a versioned price vector in the policy layer converts them to cost; the efficiency metric is cost-per-task-completed, with today's token prices as one instantiation. The knobs derived from cost (T0 size cap, disclosure depth, prefetch aggressiveness, librarian budget, triage weights) recompute when the vector changes, the same way the scoring rubric recompiles from L1, and the recomputed values pass the §11 replay harness before a harness loads them. If pricing flips (cheap cached reads, expensive storage, per-request billing), the response is a price-vector commit and, in the storage case, tighter per-tier retention with T3 as the cold tier. The structural layers (record, provenance, trust, domains, policy, perimeter) are justified by correctness and auditability, not by any price, and do not move. Progressive disclosure also keeps a non-monetary justification: overloaded contexts degrade output quality even when the tokens are free.
+
+Resource classes differ in scarcity as well as price. Metered tokens are limited only by money. A shared accelerator pool is limited by throughput: it has a fixed capacity per unit of time, and one principal's burst is another's queue. A single currency cannot express a fair share of a pool at peak, so the perimeter's limits are per resource class in native units, money for metered classes and throughput or time-share for pooled ones, set per domain and per principal, while the price vector converts all of them to cost for reporting. Triage sees the same split: a task's model tier implies a resource class, and a saturated pool is a rescore signal like a cleared dependency. The curation floor of §7 is set in the class librarians consume, which is the pooled one.
 
 **Boundary drift.** Domain boundaries drawn today will be wrong in five years for business reasons, not org reasons. Cross-domain read ratios detect it empirically; redraws are human-approved, tombstoned, and logged as decisions.
 
@@ -821,6 +864,7 @@ One interlock matters more than the rest: a silent model change during self-evol
 | Memory poisoning | Provenance; trust tiers; PR gates to verified; audit agents hunting contradictions |
 | Rogue or defective librarian | Reversible diffs and tombstones; independent cross-model faithfulness audits; telemetry outside librarian reach; approver never the proposer; lineage recall; canary entries (§4) |
 | Crashed agent deadlocks work | Leases + heartbeats; handoff-note recovery |
+| Board outage or partition | Holder and board both treat an unrenewable lease as lost at its expiry, so no task has two holders; held work ends in a handoff and returns to the pool; taps buffer in the log and reconcile by pull; trackers unaffected |
 | Retrieval outage | Defined degraded mode: T0-only, queued writes, no irreversible actions |
 | Corpus rot | Telemetry-driven librarian; decay clocks; per-domain golden suites |
 | Index or ranking regression | Canary/shadow serving; eval suite on every change, including summary rewrites |
@@ -828,11 +872,14 @@ One interlock matters more than the rest: a silent model change during self-evol
 | Policy drift (stated vs. enforced) | Bidirectional citations between L2 entries and Rego rules; librarian drift checks |
 | Exception calcification | Default expiry; audit of expired-but-relied-upon exceptions |
 | Reorg breaks access | Registry as OPA data; deny-rate alerts catch lag |
-| Runaway spend | Per-domain budgets; tokens-per-task trend alerts; gate-enforced limits |
+| Runaway spend | Per-domain budgets per resource class, in native units; cost-per-task trend alerts; gate-enforced limits |
 | Privilege steering via task requirements | Requirements-scaled admission with coherence checks; creators may not require what they may not do; task specs are data, not authorization; inflation telemetry and scaled review |
 | Privilege escalation via shared discovery | Perimeter outside the evolution loop; memory as data not commands; safety gate (privilege delta ≤ 0); raw-tier quarantine; separation of powers; probing alerts |
 | Silent vendor drift | Probe battery + change-point detection; provenance-based attribution; distillation freeze on drift |
+| Classified content leaves its boundary | Classification on entries and tasks; ceilings on destinations; session handling and current label; writes inherit; outbound calls require current label ≤ ceiling; downward only through `declassify` |
+| Exfiltration through a tool | Ceiling per server; grants per principal per server; current label checked per call; repeated denials alert as probing |
 | Write contention on the record | Append-only log as the hot path; one materializer per domain; git off both hot paths |
+| Contributor withdrawal | Ownership test (§12): on-path components are institution-operated; contributed pieces are adopted at a version and retired without outage |
 
 ---
 
@@ -845,8 +892,8 @@ Milestones, not dates: each delivers a capability, states the outcome that prove
 *Exit criteria:* a fresh agent recovers context from a handoff note and T0 alone, with no transcript replay; known-item lookups land top-3; cost-per-task on the pilot domain is measured and trending down against the pre-memory baseline.
 
 **M2: The system senses itself.**
-*Capability:* the telemetry funnel and first SLOs; librarian v1 (summaries, decay enforcement, faithfulness sampling); the handoff fast lane; golden suite v1; frozen-context replay (nearly free once decision contexts are logged).
-*Exit criteria:* published SLOs are being met and alerting on breach; a purposely degraded summary is caught by the suite before rollout; one model or prompt change has been evaluated by replay instead of judgment.
+*Capability:* the telemetry funnel and first SLOs; librarian v1 (summaries, decay enforcement, faithfulness sampling); the handoff fast lane; the first tap, inbound and outbound, with origin dedup; golden suite v1; frozen-context replay (nearly free once decision contexts are logged).
+*Exit criteria:* published SLOs are being met and alerting on breach; a purposely degraded summary is caught by the suite before rollout; a tracker item becomes a task and its result returns to the tracker, and a replayed day of tracker history creates no second task; one model or prompt change has been evaluated by replay instead of judgment.
 
 **M3: Governance holds.**
 *Capability:* OPA with compiled filters; the domain registry; policy stack L0–L2 authored with leadership; the policy gate; exception objects.
@@ -862,7 +909,7 @@ Milestones, not dates: each delivers a capability, states the outcome that prove
 
 Milestones are cumulative and each is independently useful; a deployment can stop at M2 or M3 and still hold a coherent, valuable system. Within a milestone, order is free; across milestones, the exit criteria are the dependency.
 
-What to revisit as the system grows: the search engine (Postgres to OpenSearch at scale), the log store (files to Kafka), the record engine if verified-tier commit rates ever strain git (a git-semantics database preserves the guarantees), and the domain boundaries themselves, on evidence, through the process in §12.
+What to revisit as the system grows: the search engine (Postgres to OpenSearch at scale), the log store (files to Kafka), the record engine if verified-tier commit rates ever strain git (a git-semantics database preserves the guarantees), the board's projection and origin index if claim latency or partition count outgrows one database, and the domain boundaries themselves, on evidence, through the process in §12.
 
 ---
 
@@ -870,7 +917,7 @@ What to revisit as the system grows: the search engine (Postgres to OpenSearch a
 
 This architecture assembles ideas with two distinct lineages: a recent body of agent-memory research, and several decades of systems and software-engineering practice. Both are mapped below, by section.
 
-**Memory substrate (§4).** Agent-memory architectures with tiered storage and explicit read/write management trace through MemGPT's OS-style memory hierarchy (arXiv:2310.08560), the reflection-and-importance scoring of Generative Agents (arXiv:2304.03442), an ancestor of the librarian, and experience-distillation lines such as ExpeL and A-MEM. Surveys formalize memory as a write–manage–read loop and catalogue substrates and control policies (arXiv:2603.07670; arXiv:2512.13564, which documents the field's shift from message passing to shared substrates; Wu & Shu, PAKDD 2026, which treats multi-agent memory as its own frontier). The write path is event sourcing: an append-only log as the source of truth with materialized views derived from it (Fowler; Kleppmann, *Designing Data-Intensive Applications*, 2017). Decisions-with-rationale as the durable unit is Nygard's architecture decision record (2011). Knowledge decay and curation have a pre-LLM literature in organizational memory (Walsh & Ungson, 1991).
+**Memory substrate (§4).** Agent-memory architectures with tiered storage and explicit read/write management trace through MemGPT's OS-style memory hierarchy (arXiv:2310.08560), the reflection-and-importance scoring of Generative Agents (arXiv:2304.03442), an ancestor of the librarian, experience-distillation lines such as ExpeL and A-MEM, and Voyager's library of executable skills written by the agent itself (arXiv:2305.16291), the ancestor of skills as stored method-type entries. Surveys formalize memory as a write–manage–read loop and catalogue substrates and control policies (arXiv:2603.07670; arXiv:2512.13564, which documents the field's shift from message passing to shared substrates; Wu & Shu, PAKDD 2026, which treats multi-agent memory as its own frontier). The write path is event sourcing: an append-only log as the source of truth with materialized views derived from it (Fowler; Kleppmann, *Designing Data-Intensive Applications*, 2017). Decisions-with-rationale as the durable unit is Nygard's architecture decision record (2011). Knowledge decay and curation have a pre-LLM literature in organizational memory (Walsh & Ungson, 1991).
 
 **Governed shared memory and trust (§4, §13).** arXiv:2606.24535 identifies four fleet-memory failure modes (unauthorized leakage, stale propagation, contradiction persistence, provenance collapse) matching the OPA filters, decay clocks, supersession lineage, and provenance here. On poisoning: MINJA demonstrates query-only injection without privileges; follow-ups show contagion through shared memory; arXiv:2606.04329 shows prompt-injection defenses structurally miss memory poisoning; trust-scored, decay-aware retrieval (arXiv:2510.02373) is a related mechanism. The librarian-containment controls are classical security engineering: least privilege and separation of privilege date to Saltzer & Schroeder (1975), and proposer-approver separation is standard insider-threat doctrine.
 
@@ -884,11 +931,11 @@ This architecture assembles ideas with two distinct lineages: a recent body of a
 
 **Measurement and SLOs (§9).** The observability plane is standard SRE practice (SLOs, error budgets, golden signals; Beyer et al., *Site Reliability Engineering*, 2016) applied to a retrieval funnel. Token cost as a first-class evaluation axis alongside accuracy follows the Mem0/LoCoMo line; LongMemEval (arXiv:2410.10813) benchmarks the long-horizon abilities (knowledge updates, temporal reasoning, abstention) that the librarian and decay mechanisms operationalize.
 
-**Self-improvement (§10).** SEAGym (arXiv:2606.17546) locates self-evolution in the harness, the same artifact set as dom-platform. EvolveR (arXiv:2510.16079) formalizes distill-offline/retrieve-online. The Darwin Gödel Machine (arXiv:2505.22954) supplies archive-plus-gated-admission; the Red Queen Gödel Machine (arXiv:2606.26294) shows evaluators must co-evolve with agents to resist gaming, which is why eval-suite curation stays human-reviewed. The failure the safety gate exists for is specification gaming (Amodei et al., arXiv:1606.06565; Krakovna et al., 2020), amplified here by a shared substrate that can propagate a gamed strategy fleet-wide.
+**Self-improvement (§10).** SEAGym (arXiv:2606.17546) locates self-evolution in the harness, the same artifact set as dom-platform. EvolveR (arXiv:2510.16079) formalizes distill-offline/retrieve-online. The Darwin Gödel Machine (arXiv:2505.22954) supplies archive-plus-gated-admission; the Red Queen Gödel Machine (arXiv:2606.26294) shows evaluators must co-evolve with agents to resist gaming, which is why eval-suite curation stays human-reviewed. The failure the safety gate exists for is specification gaming (Amodei et al., arXiv:1606.06565; Krakovna et al., 2020), amplified here by a shared substrate that can propagate a gamed strategy fleet-wide. Authoring agents as code that a meta-agent writes and an archive admits is Automated Design of Agentic Systems (Hu, Lu & Clune, arXiv:2408.08435); §10 differs in requiring human review and a manifest check before admission.
 
 **Evaluating change and vendor drift (§11).** Replay-based evaluation adapts record-and-replay testing and shadow deployment from service engineering to agent trajectories; the paired noise-floor protocol (arXiv:2606.20695) supplies the statistics. Silent vendor change is empirically documented: Chen, Zaharia & Zou (arXiv:2307.09009) measured large behavioral drift in GPT-3.5/4 behind stable model names. The detection battery draws on model-monitoring and change-point detection practice from ML operations.
 
-**Serving (§5).** Tool-protocol standardization for agent access is currently led by the Model Context Protocol (2024), which the serving bindings treat as the present binding around a durable operation surface. Delegated recall applies the retrieve-then-synthesize pattern of reader-model RAG inside the service boundary, traded for turn economy.
+**Serving (§5).** Tool-protocol standardization for agent access is currently led by the Model Context Protocol (2024), which the serving bindings treat as the present binding around a durable operation surface; its skills extension (2026) serves instruction bundles with per-file digest manifests, the delivery path Appendix B uses for method-type entries. Delegated recall applies the retrieve-then-synthesize pattern of reader-model RAG inside the service boundary, traded for turn economy.
 
 **Seeding (Appendix B).** The source mappings draw on two decades of mining-software-repositories research: co-change coupling recovered from version histories (Zimmermann et al., 2004), linking fixes to the changes that introduced defects (Śliwerski, Zimmermann & Zeller, 2005), and the study of review archives as records of enforced convention.
 
@@ -904,7 +951,7 @@ Trackers for ongoing coverage: github.com/Shichun-Liu/Agent-Memory-Paper-List ·
 
 Two constraints drive everything here: agents pay for what they read, and the system must outlive every component it is built from. The response to the first is a read path that discloses progressively (index, summary, section, document) with coordination flowing through shared state instead of conversation. The response to the second is a strict separation between what is durable and what is disposable: everything of value is text with provenance in a versioned record; indexes, services, models, and the agents themselves are rebuildable or replaceable without loss.
 
-The remaining sections are consequences. Governance is text agents read and a perimeter they cannot cross. Curation is a permanent, telemetry-directed function with its own containment. Self-improvement is real but permission-monotonic, gated by evals that co-evolve under human review. Change, whether self-initiated or vendor-inflicted, is measured by replaying the system's own history. And when any of it fails, the failure is a diff: inspectable, attributable, reversible.
+The remaining sections are consequences. Governance is text agents read and a perimeter they cannot cross, and classified content leaves its boundary only through a guard. Curation is a permanent, telemetry-directed function with its own containment. Self-improvement is real but permission-monotonic, gated by evals that co-evolve under human review. Change, whether self-initiated or vendor-inflicted, is measured by replaying the system's own history. And when any of it fails, the failure is a diff: inspectable, attributable, reversible.
 
 Everything durable is version-controlled text. Everything serving is rebuildable. Every agent is disposable. Every decision leaves a trail.
 
@@ -971,6 +1018,8 @@ Heylighen, F. (2016). Stigmergy as a Universal Coordination Mechanism. *Cognitiv
 
 *How Much Coordination Gain Is Real? A Paired Noise-Floor Protocol for Multi-Agent Benchmarks* (2026). arXiv:2606.20695. https://arxiv.org/abs/2606.20695
 
+Hu, S., Lu, C., & Clune, J. (2024). Automated Design of Agentic Systems. arXiv:2408.08435. https://arxiv.org/abs/2408.08435
+
 Hu, Y., Liu, S., Yue, Y., Zhang, G., et al. (2025). Memory in the Age of AI Agents. arXiv:2512.13564. https://arxiv.org/abs/2512.13564
 
 Kelley, J. E., & Walker, M. R. (1959). Critical-Path Planning and Scheduling. *Eastern Joint Computer Conference*.
@@ -986,6 +1035,8 @@ Maharana, A., et al. (2024). Evaluating Very Long-Term Conversational Memory of 
 *Memory Poisoning Evades Prompt-Injection Defenses: A Systematic Study* (2026). arXiv:2606.04329. https://arxiv.org/abs/2606.04329
 
 Model Context Protocol (2024). Specification and documentation. https://modelcontextprotocol.io
+
+Model Context Protocol (2026). Skills over MCP extension. https://modelcontextprotocol.io/extensions/skills/overview
 
 *Multi-Agent Memory as a Computer Architecture Problem* (2026). arXiv:2603.10062. https://arxiv.org/abs/2603.10062
 
@@ -1017,6 +1068,8 @@ van der Aalst, W. M. P., ter Hofstede, A. H. M., Kiepuszewski, B., & Barros, A. 
 
 Walsh, J. P., & Ungson, G. R. (1991). Organizational Memory. *Academy of Management Review*, 16(1).
 
+Wang, G., Xie, Y., Jiang, Y., Mandlekar, A., Xiao, C., Zhu, Y., Fan, L., & Anandkumar, A. (2023). Voyager: An Open-Ended Embodied Agent with Large Language Models. arXiv:2305.16291. https://arxiv.org/abs/2305.16291
+
 Wu, D., et al. (2024). LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory. arXiv:2410.10813. https://arxiv.org/abs/2410.10813
 
 Wu, & Shu (2026). Multi-Agent Memory. *PAKDD 2026*.
@@ -1043,19 +1096,25 @@ The tool surface agents see, consolidated from the sections that specify each ca
 search(query, domain?, filters?)   → [{id, title, summary, meta, snippet}]
 get(id | id#anchor)                → {body, related: [{id, summary, p}]}
 recall(question, domain?)          → {brief, citations: [id]}   # delegated multi-hop, cheap model
-write(entry)                       → {id}    # T2 append; fast lane if type=handoff
+write(entry)                       → {id}    # T2 append; fast lane for handoffs and mid-task decisions
 ```
 
 **Tasks (§7)**
 
 ```
+# every task operation is an append with a caller-supplied attempt key (§7)
 create_task(spec)                  → {id, status: proposed}   # provenance auto-attached;
+                                                              # origin cited when the spec came from a tap;
                                                               # claimable only after triage admits
+get_task(task_id)                  → {task, children, dependents}
 claim_next(domain?, lease_s)       → {task | none}  # atomically claims the highest-ranked task
                                                      # whose requirements the session's capability
-                                                     # manifest satisfies and the caller may hold
+                                                     # manifest satisfies and the caller may hold;
+                                                     # one partition per dequeue; domain defaults to
+                                                     # the session's home domain; a losing claim is
+                                                     # recorded and the dequeue moves on
 claim(task_id, lease_s)            → {claim | denied} # targeted claim, e.g. directed follow-ups
-heartbeat(task_id)                 → renews lease
+heartbeat(task_id)                 → {status}       # renews lease; status carries invalidation
 complete(task_id, handoff_id)      → closes task, links handoff note
 release(task_id)                   → returns task to pool
 rescore(task_id, scores, rationale)→ re-ranks; orchestrator-gated via OPA
@@ -1070,6 +1129,14 @@ check_policy(action_description, domain)
                                    → [{policy_id, layer, rule, intent, rank}]
 file_exception(scope, expiry, justification)
                                    → routed to approver by layer breached
+```
+
+**Flow (§5)**
+
+```
+declassify(id, target_label, justification)
+                                   → routed to the guard for that crossing;
+                                     on approval, a new entry at target_label citing id
 ```
 
 Everything else in the system (indexing, materialization, OPA evaluation, telemetry, librarian curation, gates) happens behind this surface. An agent that can call this small surface, read its T0, and honor a lease is a complete citizen of the system; that small surface keeps agents disposable and the system replaceable around them.
@@ -1116,10 +1183,22 @@ In-repo agent instruction files are memory with the machinery removed: no proven
 
 The boundary: if a commit changes its truth, it belongs in the repo (build configuration, generated API docs, tests as specification). If understanding changes its truth, it belongs in memory (decisions, rationale, hazards, conventions). Where an in-repo file is still needed, for external contributors or tools that cannot call the retrieval service, the librarian compiles one as a derived artifact: a small per-repo digest of the domain's T0 slice, clearly marked as generated, regenerated when the underlying entries change. Flow is one-way, memory to stub; direct edits are rejected or harvested back as raw entries.
 
+One-way flow needs a mechanism. The materializer records the digest of every stub it generates and publishes a digest manifest next to the entries, listing current digests and the superseded ones. Each stub carries a generated marker and its source entry IDs in frontmatter, and a consumer that can reach the service computes the digest of what it finds on disk and looks it up in the digest manifest:
+
+| Stub state | Condition | Online consumer | Offline consumer |
+|---|---|---|---|
+| Current | Digest is current in the manifest | Drops the file, reads from the service | Uses it |
+| Stale | Digest is superseded in the manifest | Drops it; regeneration queued | Uses it |
+| Hand-edited | Digest is not in the manifest | Never loads it; rejected in review or harvested as a raw entry with the editor as author | Uses it |
+
+The review check runs in the repository, where the edit happens; the drop runs in the harness. A fleet harness never mounts stubs; it projects the scoped file view of §5. A foreign harness that discovers instruction files on its own needs a load-time hook that applies the digest manifest, and where none exists the stub's shape limits the damage: it is a T0 slice under the cap that cites entry IDs and names where the full text is served, so a consumer that loads it alongside the service has loaded pointers, not a second copy of the facts.
+
+Method-type entries, the strategies and skills of dom-platform, have a delivery path of their own where the tool protocol can serve instruction bundles with a per-file digest manifest. A skill served this way is fetched when needed, checked byte for byte against its digest manifest, and tagged with its origin. Trust tier maps onto approval: only bundles at trust verified are approvable for a live harness, and a changed digest revokes approval until the entry passes its gates again. A repository copy of such a skill is a stub like any other.
+
 Two costs are accepted knowingly. Branch skew: external memory describes HEAD, so agents on long-lived branches resolve "as of this branch point" through the snapshot mechanism of §11 instead of getting co-versioned files for free. And offline consumers get the derived stub, not the full memory. Both are prices of keeping one curated source of truth.
 
 ## Two cautions
 
-Culture is extractable; people should be handled by policy. Norms distill legitimately from observable process: how decisions are phrased, what triggers discussion versus quiet consensus, how disagreement resolves. Roles and public records are facts. But behavioral profiles of individuals compiled from years of archives are a policy decision, not a distillation default; encode the boundary in L0/L2 before the first run and enforce it at the gate. Review and ticket archives carry the densest individual signal, so the rule matters most exactly where the code knowledge is richest.
+Culture is extractable; people should be handled by policy. Call the rule norms, not dispositions. Norms distill legitimately from observable process: how decisions are phrased, what triggers discussion versus quiet consensus, how disagreement resolves. Roles and public records are facts. But behavioral profiles of individuals compiled from years of archives are a policy decision, not a distillation default; encode the boundary in L0/L2 before the first run and enforce it at the gate. Review and ticket archives carry the densest individual signal, so the rule matters most exactly where the code knowledge is richest.
 
 And mine the golden suites from reality: the questions people historically asked, paired with the resolutions the archives record, produce evaluation coverage that matches actual demand instead of guessed demand.
