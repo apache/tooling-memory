@@ -96,7 +96,7 @@ Sizes, latencies, and thresholds in examples are illustrative starting points, n
 | **T2, event log** | Append-only agent writes: facts, decisions, handoffs, open questions | Unbounded, structured | Librarian input; rarely read raw |
 | **T3, archive** | Demoted material, tombstones, superseded versions | Unbounded | Audit only |
 
-Nothing is deleted, only demoted. The active read path stays small forever while total memory grows without bound.
+Nothing is deleted by curation, only demoted; erasure (below) is the one exception. The active read path stays small forever while total memory grows without bound.
 
 ## Entries
 
@@ -217,7 +217,7 @@ Raw entries are searchable, with their tier visible, because a handoff written a
 
 The librarian is the most privileged role in the system: it writes the summaries that form stage one of every retrieval, decides what is demoted and merged, and distills the strategies in `dom-platform`. A rogue or systematically wrong librarian can misdirect the fleet without ever editing a document body, and it operates at volumes per-action human review cannot cover. Containment therefore relies on structure rather than vigilance:
 
-- **Everything is a reversible diff.** Librarian actions are commits with provenance; demotion leaves tombstones; nothing is deleted. Any curation decision can be inspected and reverted, and censorship is detectable because the archive still holds what was buried.
+- **Everything is a reversible diff.** Librarian actions are commits with provenance; demotion leaves tombstones; curation deletes nothing. Any curation decision can be inspected and reverted, and censorship is detectable because the archive still holds what was buried.
 - **Curator and checker are independent.** Audit agents that verify summary faithfulness (does the summary entail the body, sampled continuously) and hunt contradictions run on a different base model and prompt lineage than the librarians, and share no writable state with them. A shared blind spot between curator and checker is the correlated failure to avoid. The golden suites already treat every re-summarization pass as a change requiring evaluation; faithfulness sampling extends that from ranking quality to content fidelity.
 - **The sensory plane is out of reach.** Telemetry is emitted by the retrieval service and task board, not by librarians, so a librarian cannot suppress the signals that would expose it. Curation behavior is itself monitored: demotion rates, summary-drift magnitude relative to body change, and retrieval-steering asymmetries are anomaly-alerted per librarian identity.
 - **Blast radius scales the gate.** Routine domain curation is sampled for human review; high-impact actions (dom-platform distillation, promotion proposals, boundary redraws, tombstone redirects) require an approver that is not the proposing librarian. A librarian can propose but never approve its own promotion, mirroring the separation of powers in §10.
@@ -225,6 +225,24 @@ The librarian is the most privileged role in the system: it writes the summaries
 - **Canary entries.** A small set of entries with known-correct content and summaries is planted per domain; any curation pass that alters them improperly trips an alarm before trust is spent anywhere else.
 
 The question of who audits the auditor has a deliberate stopping point: immutable history, deterministic checks, and sampled human review, not another agent layer.
+
+## Erasure
+
+Two operations, kept apart.
+
+**Demotion** is reversible. The content stays in the archive behind a tombstone.
+
+**Erasure** is not. It is an irreversible action, so it escalates like one. The body is removed everywhere. What remains is:
+
+- a stub: the frontmatter without the body;
+- an erasure record: who, why as a reason class, and when;
+- a receipt: what was covered, across the log, index, views, caches, replicas, and exports already issued, with *unresolved* for copies that could not be reached.
+
+How an engine removes a body from an append-only history is the engine's problem: rewrite the segment, or hold bodies under per-entry keys and destroy the key. Either way, the restore drill of §12 has to cover it.
+
+Erasure propagates. Entries that cite the erased one, and entries written by sessions that read it, which telemetry knows, are flagged, then re-derived from what remains or erased too. A replay that reaches the entry sees the stub, and the scorecard says so.
+
+The domain's owner may erase. A role policy names may erase on behalf of the person an entry concerns. The stub keeps `source` and the author only when the erasure was not about that person.
 
 ---
 
@@ -779,7 +797,7 @@ The invariant: self-evolution is permission-monotonic. It makes agents better wi
 
 Two kinds of change need measuring: changes the operator makes (a new base model, a new sandbox bootstrap) and changes the vendor makes silently. Both use the same machinery, replay against memory, because memory holds three things benchmarks lack.
 
-First, **the knowledge state is reproducible**: "the corpus as the agent saw it" is a git checkout of the commit that was HEAD when the task ran, including the policy version and T0 contents. Second, **outcomes are real**: the task graph records completion, handoff acceptance, whether dependent tasks later got reverted, human PR approval. The dependency edges add downstream consequences, the strongest kind of ground truth. Third, **scoring uses the system's own cost numbers**: tokens per task and retrieval depth, not pass/fail alone.
+First, **the knowledge state is reproducible**, up to erasure: "the corpus as the agent saw it" is a checkout of the record at the version current when the task ran, including the policy version and T0 contents, and a replay that reaches an erased entry sees its stub (§4). Second, **outcomes are real**: the task graph records completion, handoff acceptance, whether dependent tasks later got reverted, human PR approval. The dependency edges add downstream consequences, the strongest kind of ground truth. Third, **scoring uses the system's own cost numbers**: tokens per task and retrieval depth, not pass/fail alone.
 
 ## Replaying your own history
 
@@ -894,6 +912,7 @@ Resource classes differ in scarcity as well as price. Metered tokens are limited
 | Exfiltration through a tool | Ceiling per server; grants per principal per server; current label checked per call; repeated denials alert as probing |
 | Write contention on the record | Append-only log as the hot path; one materializer per domain; git off both hot paths |
 | Contributor withdrawal | Ownership test (§12): on-path components are institution-operated; contributed pieces are adopted at a version and retired without outage |
+| Erasure against an append-only record | Body removed by the engine; stub, erasure record, and receipt kept; derivations flagged and re-derived; replay sees the stub (§4) |
 
 ---
 
@@ -1151,6 +1170,8 @@ file_exception(scope, expiry, justification)
 declassify(id, target_label, justification)
                                    → routed to the guard for that crossing;
                                      on approval, a new entry at target_label citing id
+erase(id, reason_class)            → irreversible, escalates; leaves a stub, an erasure
+                                     record, and a receipt of coverage (§4)
 ```
 
 Everything else in the system (indexing, materialization, OPA evaluation, telemetry, librarian curation, gates) happens behind this surface. An agent that can call this small surface, read its T0, and honor a lease is a complete citizen of the system; that small surface keeps agents disposable and the system replaceable around them.
