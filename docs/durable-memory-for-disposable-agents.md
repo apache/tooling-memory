@@ -189,7 +189,21 @@ flowchart LR
 
 Four properties remove the contention. The hot write path is an append-only log, where concurrent appends don't contend. Partitioning by domain means cross-domain writes never touch the same repo. Ownership and leases mean two agents rarely write the same artifact at all. And a single materializer per domain is the only committer: many producers, one consumer, no ref contention, coarse healthy commits. The index is fed from the log directly, so the freshness SLO holds even when git materialization lags. Writes another agent may be waiting on, handoffs and decisions written mid-task, take a fast lane with a published freshness bound (§9); bulk curation takes the slow lane.
 
-This maps onto the trust tiers: raw T2 in the log store at high frequency; curated T1 and decisions in git at moderate frequency via the materializer; verified promotions and policy changes through git PRs at low, human-paced frequency, the one place git's review semantics are needed and where its write rate is more than sufficient. If a deployment needs the same guarantees at higher commit rates, the tiering holds with a different engine (a git-semantics database, or a versioned object store plus a version index); principle 1 is about format and guarantees, not the binary.
+This maps onto the trust tiers: raw T2 in the log store at high frequency; curated T1 and decisions in git at moderate frequency via the materializer; verified promotions and policy changes through git PRs at low, human-paced frequency, the one place git's review semantics are needed and where its write rate is more than sufficient.
+
+The engine behind the record is a choice. Principle 1 is about format and guarantees, not the binary. Git is the default. An object store with versions, or a database with git's semantics, can replace it when commit rates are high or when one repository per domain is more than an institution wants to run.
+
+Any engine must give seven things, because the rest of the paper depends on them:
+
+- entries readable as text with ordinary tools;
+- every write is a new version, so a curation action is a reversible diff;
+- demotion leaves a tombstone;
+- promotion passes a review gate in which the approver is never the proposer;
+- provenance and supersession can be audited without the engine's help;
+- an entry's body can be removed everywhere while its stub and the fact of erasure remain (see Erasure);
+- the whole estate can be restored from snapshots alone.
+
+The review gate is the one most easily lost when the engine changes.
 
 ## The librarian function
 
