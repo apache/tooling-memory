@@ -1172,6 +1172,9 @@ declassify(id, target_label, justification)
                                      on approval, a new entry at target_label citing id
 erase(id, reason_class)            → irreversible, escalates; leaves a stub, an erasure
                                      record, and a receipt of coverage (§4)
+export(domain, max_label)          → bundle of entries at or below max_label that the
+                                     caller's filter allows; the bundle carries the highest
+                                     label inside it (Appendix B)
 ```
 
 Everything else in the system (indexing, materialization, OPA evaluation, telemetry, librarian curation, gates) happens behind this surface. An agent that can call this small surface, read its T0, and honor a lease is a complete citizen of the system; that small surface keeps agents disposable and the system replaceable around them.
@@ -1233,6 +1236,12 @@ The review check runs in the repository, where the edit happens; the drop runs i
 Method-type entries, the strategies and skills of dom-platform, have a delivery path of their own where the tool protocol can serve instruction bundles with a per-file digest manifest. A skill served this way is fetched when needed, checked byte for byte against its digest manifest, and tagged with its origin. Trust tier maps onto approval: only bundles at trust verified are approvable for a live harness, and a changed digest revokes approval until the entry passes its gates again. A repository copy of such a skill is a stub like any other.
 
 Two costs are accepted knowingly. Branch skew: external memory describes HEAD, so agents on long-lived branches resolve "as of this branch point" through the snapshot mechanism of §11 instead of getting co-versioned files for free. And offline consumers get the derived stub, not the full memory. Both are prices of keeping one curated source of truth.
+
+## Leaving the system
+
+Export is a read. `export(domain, max_label)` returns, under the caller's compiled filter, the entries at or below the requested label, each with its provenance, classification, and supersession. The bundle carries the highest label inside it, and where it goes is a destination with a ceiling, checked like any outbound call. Nothing leaves below its label; content that must travel lower travels as the declassified entry that cites it.
+
+Import is the mirror. A bundle lands at trust raw, keeps each entry's classification or takes the receiving domain's default where that is higher, keeps provenance, and is keyed on origin so a second import creates nothing twice. A domain moving between its owner's homes keeps its tiers; everything else earns them again.
 
 ## Two cautions
 
