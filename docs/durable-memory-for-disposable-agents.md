@@ -1167,6 +1167,8 @@ A new deployment starts against a body of existing knowledge: repositories, tick
 
 **Two speeds.** Indexing is cheap; distillation costs model compute. So index everything immediately as a raw, searchable layer with stable citations back to the originals (which remain the canonical raw store), and distill selectively over time. Known-item retrieval works from day one; understanding accretes where it is needed.
 
+**Transcripts are sources, not memory.** A transcript is kept raw, addressed by turn, and cited by the entries distilled from it, like any archive. It is never re-ingested into a working context and never what an agent reads to recover; a handoff stands in for it. Replay (§11) re-presents recorded contexts to measure a model, which is evaluation, not recovery.
+
 **Backfill is replay.** Build the live taps first: commits, tickets, reviews, discussions flowing through the normal event-log write path. Then run history through the same pipeline, oldest first. Seeding stops being a special program and becomes the ordinary write path applied to the past. The pipeline itself becomes a dom-platform artifact, versioned and improved through the same gates as everything else.
 
 ## Source mapping
