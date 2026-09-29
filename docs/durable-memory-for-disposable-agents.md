@@ -106,7 +106,7 @@ Every entry carries frontmatter:
 id: mem-a-0847               # stable, permanent, meaningless
 type: decision | fact | convention | method | handoff
 domain: dom-a                 # capability ID, never a team name
-author: agent:worker-3 (model: <model-id>) | human:<user-id>
+author: agent:worker-3 (model: <model-id>) | human:<system>:<user-id>   # system-qualified, like origin
 created: <timestamp>
 source: [link or citation]
 confidence: high | medium | low
@@ -282,7 +282,7 @@ Access control says who may read an entry. It does not say where the content may
 
 Three rules follow, all enforced in the perimeter. Reads require `classification ≤ handling`, compiled into the index filter with the ordinary grant, so a session never sees hits, counts, or summaries above its handling. Writes inherit: an entry carries at least the session's current label, because the author cannot know which fragment of what it read shaped the text. Outbound calls require `current label ≤ ceiling` of the destination, checked per call. Handling is fixed for the session, so the read filter compiles once; only the outbound check follows the moving label. A recall (serving bindings, below) raises the caller's label to the highest classification the deputy read on its behalf.
 
-Crossing downward is declassification, and it is never a side effect of a write. `declassify` proposes a new entry at a lower label that cites the higher one; the proposal carries the higher label until a guard approves it. Policy names the guard for each crossing, and the widest crossings require a human. The result is an ordinary entry whose provenance names the guard, so every crossing can be enumerated. Labels only rise within a session, so the cost of this design is over-classification, and the remedies are a small label set, short sessions, and a declassification path cheap enough to be used.
+Crossing downward is declassification, and it is never a side effect of a write. `declassify` proposes a new entry at a lower label that cites the higher one; the proposal carries the higher label until a guard approves it. Policy names the guard for each crossing, the domain's owner by default, and the widest crossings require a human. The result is an ordinary entry whose provenance names the guard, so every crossing can be enumerated. Labels only rise within a session, so the cost of this design is over-classification, and the remedies are a small label set, short sessions, and a declassification path cheap enough to be used.
 
 ```mermaid
 sequenceDiagram
@@ -875,6 +875,14 @@ One interlock matters more than the rest: a silent model change during self-evol
 
 **Org change.** Domains are keyed by permanent capability IDs; a registry maps current org units to the domains they own, and each domain to the repositories and queues it owns; a reorg is a one-file data change that OPA picks up automatically. Team split: co-ownership until the knowledge diverges in practice, then a librarian-assisted split with tombstone redirects. Merge: lazy, only on real convergence. Orphaning is the dangerous case: ownership is a checked invariant, and ownerless domains are flagged within days, because orphaned memory decays silently while agents keep trusting it. Acquisitions import into a quarantined low-trust tier and earn promotion through normal review.
 
+**Personal domains.** A domain's owner may be a person. The domain is keyed by a permanent identifier for that person, as other domains are by capability, and the person chooses where its home is: their own store, a provider, or a store an institution runs for them. It is theirs because they hold the grants, they are its guard, and they can export it whole.
+
+Facts about a person live in the person's domain. Facts about the institution's work, and about the person's role in it, live in the institution's. An institution's serving layer holds the person's interface summary as a view under grant, never the domain. A working session reads the summary, so its label does not rise on the person's account.
+
+Several taps may write to a personal domain: a harness, an assistant, an employer's platform. They can only propose. The owner admits or refuses. A refused proposal is erased; its stub keeps the origin, so the same item is not proposed twice, and any broader refusal is the owner's policy, which taps read before proposing. A proposal nobody answers expires. The owner's own serving layer, or one they delegate under their keys, presents home and hosts as one view.
+
+When a grant ends, the institution's views drop and receipts say so. What the person wrote into institutional domains stays there under their identifier. What was learned about them stays theirs. An entry about the person written in a session that read restricted material carries that label and leaves only through the institution's guard; the remedy is to distill what concerns the person in a session that reads only at the person's level.
+
 **Model churn.** BM25 has no model dependency; embeddings, summaries, and rubric compilations are derived and rebuildable. Provenance records the model version behind every write, so a systematically wrong model generation's contributions can be found and re-verified later.
 
 **Tooling churn.** Everything authoritative is Markdown in git. If OPA dies, the policies are text. If the search engine dies, the indexer rebuilds elsewhere. If the platform dies entirely, a person with a laptop can read the whole estate with a text editor. This is checked annually as a drill: restore the serving layer from git and object-store snapshots alone.
@@ -913,6 +921,7 @@ Resource classes differ in scarcity as well as price. Metered tokens are limited
 | Write contention on the record | Append-only log as the hot path; one materializer per domain; git off both hot paths |
 | Contributor withdrawal | Ownership test (§12): on-path components are institution-operated; contributed pieces are adopted at a version and retired without outage |
 | Erasure against an append-only record | Body removed by the engine; stub, erasure record, and receipt kept; derivations flagged and re-derived; replay sees the stub (§4) |
+| Institution retains a person's memory | The personal domain is held under the owner's grants; institutional servers hold views under grant; revocation drops them with receipts (§12) |
 
 ---
 
