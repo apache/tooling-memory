@@ -963,6 +963,17 @@ Milestones, not dates: each delivers a capability, states the outcome that prove
 
 Milestones are cumulative and each is independently useful; a deployment can stop at M2 or M3 and still hold a coherent, valuable system. Within a milestone, order is free; across milestones, the exit criteria are the dependency.
 
+**A reference implementation for one person, runnable locally.** The smallest deployment of this design is a personal domain (§12), and one should exist as a reference. One process on the person's machine:
+
+- the record in files under version control, or in a local object store;
+- index and board in an embedded database;
+- grants in a policy file the person edits;
+- the surface of Appendix A as one memory server;
+- taps that import what the person's harnesses export;
+- `export` and `erase` working end to end.
+
+Its review gate is the owner: the librarian proposes, the person approves. It is the conformance check for the surface, since a harness that works against it works against any serving layer, and it lets people run the design before their institution has built anything.
+
 What to revisit as the system grows: the search engine (Postgres to OpenSearch at scale), the log store (files to Kafka), the record engine if verified-tier commit rates ever strain git (a git-semantics database preserves the guarantees), the board's projection and origin index if claim latency or partition count outgrows one database, and the domain boundaries themselves, on evidence, through the process in §12.
 
 ---
