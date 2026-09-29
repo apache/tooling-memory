@@ -151,7 +151,7 @@ flagged to dom-c as task-c-0332.
 
 The rationale is the durable part: months later the parameters may all have changed, but *why* fixed-interval was rejected still holds and stops an agent re-proposing it.
 
-A T0 always-loaded index, the entire file for one domain, under the 2k-token cap:
+A T0 always-loaded index, the slice for one domain, under the 2k-token cap:
 
 ```markdown
 # dom-a · T0 · generated <date> by librarian-2
@@ -170,6 +170,8 @@ A T0 always-loaded index, the entire file for one domain, under the 2k-token cap
 ```
 
 Everything an agent needs to start is here: what matters now, what is already settled, and where to look for the rest. Nothing else is loaded until a query asks for it.
+
+A session sees one T0. It is the slices of the domains the session may touch, each written by that domain's librarian and cached, joined under one cap. Loading T0 is a read, so slices hold pointers and summaries at the lowest label the task needs. Restricted material comes in on a query, not in the prefix.
 
 ## The write path
 
