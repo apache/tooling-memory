@@ -124,6 +124,12 @@ sequenceDiagram
     P->>T: allowed, public within ceiling public
 ```
 
+**A committer owns a domain.** The Foundation remembers a person's role: committer since, PMC member, release manager for. The public archive stays indexed as a source. Anything else the tooling learns about a person is the person's, kept in a domain they own.
+
+Into that domain, the Foundation's workbench and a committer's employer can only propose. The committer admits or refuses. A refused proposal is erased; its stub keeps where it came from, so the same item is not proposed twice. Anything a committer never wants proposed is a rule in their own domain. A proposal nobody answers expires.
+
+Work goes to the project under the committer's name, with the agent and model recorded. Everything else follows one test: whatever would still be true and still be theirs at another employer is theirs now. An entry about the committer written while reading a private list carries that label and leaves only through the PMC as guard. When a committer leaves, their domain goes with them and their contributions stay.
+
 **People deserve a policy before the pipeline runs.** The archives contain twenty-five years of individuals arguing, deciding, and occasionally behaving badly, all public. The norms-not-dispositions rule from Appendix B is adopted as written L0 policy before the first distillation pass: community entries describe roles, process, and norms; they do not compile behavioral profiles of named individuals, and the gate enforces it. Roles and public records (committer since, PMC member, release manager for) are facts. Patterns of persuasion attributed to a person are not entries, however public the mail.
 
 ---
