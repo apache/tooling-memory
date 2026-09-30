@@ -156,7 +156,7 @@ Per Appendix B, in ASF terms:
 
 **Taps first.** Live feeds from lists, commits, issues, and reviews flow through the ordinary write path into per-domain raw tiers. Backfill then replays history through the same pipeline, oldest first, so the seeding pipeline is exercised, versioned, and improved as a dom-platform artifact before the bulk of history arrives.
 
-**Trackers are the board's taps.** GitHub issues per repository and Jira per project are where work already arrives, and they stay where they are. The registry maps each repository and tracker project to the TLP domain that owns it, so an issue becomes a task on that domain's board with an `origin` citing the issue (paper §7). PMC triage on the tracker is admission evidence: a label the PMC applies is a human sign-off the gate can weight. Results return the way the security pipelines already return them, as ready-to-file issues and proposed changes written through a governed tool server, with the PMC deciding what closes.
+**Trackers are the ledger's taps.** GitHub issues per repository and Jira per project are where work already arrives, and they stay where they are. The registry maps each repository and tracker project to the TLP domain that owns it, so an issue becomes a task on that domain's ledger with an `origin` citing the issue (paper §7). PMC triage on the tracker is admission evidence: a label the PMC applies is a human sign-off the gate can weight. Results return the way the security pipelines already return them, as ready-to-file issues and proposed changes written through a governed tool server, with the PMC deciding what closes.
 
 ```mermaid
 sequenceDiagram
@@ -165,7 +165,7 @@ sequenceDiagram
     participant GH as GitHub issue
     participant TAP as Tap, ceiling public
     participant REG as Registry
-    participant B as Board, project domain
+    participant B as Ledger, project domain
     participant TRI as Triage
     participant W as Worker
     participant M as Memory

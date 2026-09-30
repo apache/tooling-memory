@@ -34,7 +34,7 @@ Ten rules govern every component. When a question isn't answered below, reason f
 1. **Data outlives tooling.** The record is versioned plain text; git is today's engine. Search indexes, embeddings, and dashboards are derived: rebuildable from source, never authoritative.
 2. **Agents are stateless and disposable.** A sandbox starts empty and dies without ceremony. Anything worth keeping is written to shared memory first.
 3. **Optimize the dominant cost, which today is the read path.** Progressive disclosure everywhere: index → summary → section → document. Load nothing a cheaper signal could have ruled out. The price model is configuration (§12); the discipline of loading less than everything is the principle.
-4. **Coordinate through state, not messages.** Agents read and write shared structures (task board, memory, handoff notes) the way a git repo coordinates a human team.
+4. **Coordinate through state, not messages.** Agents read and write shared structures (task ledger, memory, handoff notes) the way a git repo coordinates a human team.
 5. **Ownership prevents conflict.** Domains, files, and tasks have owners; claims are leases that expire on missed heartbeats. Negotiation is the exception path.
 6. **Judgment is written down.** Values, strategy, quality bars, and scoring rubrics are versioned files agents read. Higher layers take precedence; overrides are explicit, approved, and expire.
 7. **Every write carries provenance.** Author, model version, timestamp, source, confidence. Trust is tiered; promotion passes review. Memory poisoning is a first-class threat.
@@ -50,7 +50,7 @@ Ten rules govern every component. When a question isn't answered below, reason f
 flowchart TB
     HUM["Humans<br/>leadership and operators: amend policy,<br/>approve exceptions, own the registry"]
     AGT["Agents: stateless, disposable<br/>workers, orchestrators, librarians, auditors"]
-    SRV["Serving layer: rebuildable<br/>retrieval, task board, OPA filters, telemetry"]
+    SRV["Serving layer: rebuildable<br/>retrieval, task ledger, OPA filters, telemetry"]
     REC["System of record: git<br/>domain memory, policy stack, registry, exceptions, dom-platform"]
     EXT["External systems: trackers, archives, tool servers<br/>canonical for their own items, each with a ceiling"]
 
@@ -63,7 +63,7 @@ flowchart TB
     SRV -->|"results out, label ≤ ceiling"| EXT
 ```
 
-Git repositories of Markdown hold everything durable: domain-partitioned memory, the policy stack, the registry, and exceptions. An indexer turns commits into a search index whose results are summaries first. Agents start empty, load a small cached index plus a policy digest, and reach everything else through a retrieval tool fronted by compiled permission filters. Work is coordinated through a task board with leased claims, never through agent-to-agent chat. Cheap librarian agents curate memory continuously, directed by the telemetry the retrieval service emits. Humans amend policy, approve exceptions, and remain the final continuity.
+Git repositories of Markdown hold everything durable: domain-partitioned memory, the policy stack, the registry, and exceptions. An indexer turns commits into a search index whose results are summaries first. Agents start empty, load a small cached index plus a policy digest, and reach everything else through a retrieval tool fronted by compiled permission filters. Work is coordinated through a task ledger with leased claims, never through agent-to-agent chat. Cheap librarian agents curate memory continuously, directed by the telemetry the retrieval service emits. Humans amend policy, approve exceptions, and remain the final continuity.
 
 The components are common and old: git, Markdown, BM25 (Lucene-family or Postgres FTS), OPA (Open Policy Agent), OpenTelemetry. At decade scale, exotic dependencies are liabilities; each element here is text-first and independently replaceable. Vector search is allowed only as a derived, rebuildable layer.
 
@@ -76,7 +76,7 @@ Examples are abstract and use a fixed notation throughout:
 | `dom-a`, `dom-b`, `dom-c` | Capability domains. `dom-a` is the domain under discussion; `dom-b` is a neighbouring domain it depends on. |
 | `dom-platform` | The domain holding the system's own harness artifacts (§10). |
 | `mem-a-0847` | A memory entry in `dom-a`. IDs are stable and carry no meaning. |
-| `task-a-1204` | A task on `dom-a`'s board. |
+| `task-a-1204` | A task on `dom-a`'s ledger. |
 | `pol-L1-007` | A policy entry; the layer is encoded in the ID (§6). |
 | `worker-7`, `librarian-2` | Agent instances. |
 | Capability **C**, interface **I**, operation **R** | Placeholders for whatever the domain does. |
@@ -183,7 +183,7 @@ flowchart LR
         A1["Agents and taps (many)"] -->|append, no lock| LOG["Append-only event log (T2)<br/>Kafka / log table / per-writer segments,<br/>partitioned by domain"]
     end
     LOG -->|"fast lane: handoffs, mid-task decisions<br/>slow lane: bulk curation"| IX["Search index<br/>(the read path)"]
-    LOG -->|projection| BRD["Task board<br/>(projection + lease cache)"]
+    LOG -->|projection| BRD["Task ledger<br/>(projection + lease cache)"]
     LOG -->|batched, async| MAT["Materializer<br/>(one committer per domain repo)"]
     MAT -->|coarse commits| GIT["Git repos (per domain):<br/>curated T1 + decisions + terminal tasks"]
     GIT -->|PR review, human-paced| VER["Verified tier + policy stack"]
@@ -221,7 +221,7 @@ The librarian is the most privileged role in the system: it writes the summaries
 
 - **Everything is a reversible diff.** Librarian actions are commits with provenance; demotion leaves tombstones; curation deletes nothing. Any curation decision can be inspected and reverted, and censorship is detectable because the archive still holds what was buried.
 - **Curator and checker are independent.** Audit agents that verify summary faithfulness (does the summary entail the body, sampled continuously) and hunt contradictions run on a different base model and prompt lineage than the librarians, and share no writable state with them. A shared blind spot between curator and checker is the correlated failure to avoid. The golden suites already treat every re-summarization pass as a change requiring evaluation; faithfulness sampling extends that from ranking quality to content fidelity.
-- **The sensory plane is out of reach.** Telemetry is emitted by the retrieval service and task board, not by librarians, so a librarian cannot suppress the signals that would expose it. Curation behavior is itself monitored: demotion rates, summary-drift magnitude relative to body change, and retrieval-steering asymmetries are anomaly-alerted per librarian identity.
+- **The sensory plane is out of reach.** Telemetry is emitted by the retrieval service and task ledger, not by librarians, so a librarian cannot suppress the signals that would expose it. Curation behavior is itself monitored: demotion rates, summary-drift magnitude relative to body change, and retrieval-steering asymmetries are anomaly-alerted per librarian identity.
 - **Blast radius scales the gate.** Routine domain curation is sampled for human review; high-impact actions (dom-platform distillation, promotion proposals, boundary redraws, tombstone redirects) require an approver that is not the proposing librarian. A librarian can propose but never approve its own promotion, mirroring the separation of powers in §10.
 - **Lineage recall.** Provenance records which librarian instance and model version performed each action, so a compromised or defective lineage's entire output can be enumerated and re-verified after the fact, the same mechanism §12 uses for a bad model generation. Librarians are stateless and rotated like any other agent, bounding any single lineage's window.
 - **Canary entries.** A small set of entries with known-correct content and summaries is planted per domain; any curation pass that alters them improperly trips an alarm before trust is spent anywhere else.
@@ -252,7 +252,7 @@ The domain's owner may erase. A role policy names may erase on behalf of the per
 
 ## Retrieval as a service
 
-Agents never hold the corpus. Retrieval is a tool (`search`, `get`, `recall`, `write`; Appendix A) backed by a BM25 index (OpenSearch/Elasticsearch at large scale; Postgres FTS is the simpler alternative that can also host the task board and registry). Sandboxes start empty, so startup cost is constant regardless of corpus size.
+Agents never hold the corpus. Retrieval is a tool (`search`, `get`, `recall`, `write`; Appendix A) backed by a BM25 index (OpenSearch/Elasticsearch at large scale; Postgres FTS is the simpler alternative that can also host the task ledger and registry). Sandboxes start empty, so startup cost is constant regardless of corpus size.
 
 BM25 first, vectors later, because agent queries over curated memory are mostly known-item lookups (names, IDs, error strings) where lexical search performs well; because BM25 has no model dependency (no re-embedding the corpus when embedding models change); and because its matches are explainable, which auditing needs. Vectors are added as a derived, rebuildable layer only where the golden suites show hybrid scoring earns its cost.
 
@@ -481,13 +481,13 @@ This is an alignment mechanism, and naming it clarifies the division of labor. A
 
 ## The task fabric
 
-Work flows through one board, partitioned by domain and topped by a portfolio layer, never through agent-to-agent conversation. Agents see one operation surface; storage and ownership are per domain, as they are for the event log.
+Work flows through one ledger, partitioned by domain and topped by a portfolio layer, never through agent-to-agent conversation. Agents see one operation surface; storage and ownership are per domain, as they are for the event log.
 
-Tasks enter the boards from five sources. Humans file goals and requests, and amendments to L1 recompile the rubric that reorders everything already queued. Orchestrators decompose: portfolio objectives into domain work, and follow-ups out of merge points. Working agents create tasks as a side effect of work: discovered subtasks, escalations, flagged consequences in other domains, and the cross-domain request tasks described below. The system creates its own maintenance work through telemetry: failed-query clusters become authoring tasks, expiring decay clocks become re-verification tasks, tension rollups become amendment evidence, tripped canaries and orphaned domains become alerts with tasks attached. And external taps (tickets, incidents, alerts flowing through the ordinary write path, per Appendix B) materialize as tasks on the owning domain's board.
+Tasks enter the ledgers from five sources. Humans file goals and requests, and amendments to L1 recompile the rubric that reorders everything already queued. Orchestrators decompose: portfolio objectives into domain work, and follow-ups out of merge points. Working agents create tasks as a side effect of work: discovered subtasks, escalations, flagged consequences in other domains, and the cross-domain request tasks described below. The system creates its own maintenance work through telemetry: failed-query clusters become authoring tasks, expiring decay clocks become re-verification tasks, tension rollups become amendment evidence, tripped canaries and orphaned domains become alerts with tasks attached. And external taps (tickets, incidents, alerts flowing through the ordinary write path, per Appendix B) materialize as tasks on the owning domain's ledger.
 
-Most of those sources already live in systems of their own: issue trackers per repository, ticket queues per team, incident tools. They stay where they are, and each is connected by a **tap**, a connector that runs in both directions. Inbound, an item becomes a task on the domain the registry says owns that repository or queue (§12), carrying an `origin` that cites the item; the tracker remains canonical for the item, the board for the task. The tap does not admit; triage does, with the tracker's state as evidence, since an acceptance recorded upstream is a human sign-off that has already happened. Outbound, when the task completes, the tap carries the handoff's result back as a comment, a proposed change, or a suggested transition, posted under the fleet's own identity, which is also how a tap recognises and ignores what the fleet wrote. The tap is a tool server with a ceiling (§5), the handoff carries the session's label, and the perimeter checks one against the other. The tracker's owner closes the item; the fleet only proposes. A task is **live** until it is terminal. Two events cross back inward: an upstream close invalidates a live task as obsolete and confirms a terminal one, and a reopen creates a new task that cites the old one as its predecessor. Taps are idempotent on origin and upstream event, so a replayed history creates nothing twice, and dedup at admission keys on origin among a domain's live tasks, so one item is one live task. An item and the items related to it, an issue and the change that fixes it, are related tasks, not one. If the registry moves a repository to another domain, a move event in both partitions carries its live tasks with it.
+Most of those sources already live in systems of their own: issue trackers per repository, ticket queues per team, incident tools. They stay where they are, and each is connected by a **tap**, a connector that runs in both directions. Inbound, an item becomes a task on the domain the registry says owns that repository or queue (§12), carrying an `origin` that cites the item; the tracker remains canonical for the item, the ledger for the task. The tap does not admit; triage does, with the tracker's state as evidence, since an acceptance recorded upstream is a human sign-off that has already happened. Outbound, when the task completes, the tap carries the handoff's result back as a comment, a proposed change, or a suggested transition, posted under the fleet's own identity, which is also how a tap recognises and ignores what the fleet wrote. The tap is a tool server with a ceiling (§5), the handoff carries the session's label, and the perimeter checks one against the other. The tracker's owner closes the item; the fleet only proposes. A task is **live** until it is terminal. Two events cross back inward: an upstream close invalidates a live task as obsolete and confirms a terminal one, and a reopen creates a new task that cites the old one as its predecessor. Taps are idempotent on origin and upstream event, so a replayed history creates nothing twice, and dedup at admission keys on origin among a domain's live tasks, so one item is one live task. An item and the items related to it, an issue and the change that fixes it, are related tasks, not one. If the registry moves a repository to another domain, a move event in both partitions carries its live tasks with it.
 
-The board is event-sourced on the same log as memory (§4). Every board operation, creation, admission, claim, heartbeat, release, rescore, completion, and invalidation, is an append to the domain's partition, and the board is a projection of that partition. There is no second store. The lease table agents dequeue from is a cache of the projection and is rebuilt from the log, so the record test of §12 holds for the board and replay (§11) sees every claim, not only every completion. A claim is an append that takes effect only if the projection shows the task claimable at that point in the log, which is what makes `claim_next` atomic within a domain; a claim that loses, or any event that arrives after a terminal one, is recorded and changes nothing, and `claim_next` moves on to the next task the caller can hold. Every board operation carries a caller-supplied attempt key, so a retry cannot double-claim or double-complete. Automatic re-ranks are the board's own appends; the `rescore` of Appendix A is an orchestrator's override and is gated. The materializer commits each terminal task with its event history to the record alongside decisions, so a replay checkout (§11) holds every claim; the projection keeps only live tasks; the origin index keeps every origin it has seen; and the log itself is in the snapshots the §12 drill restores from. Taps reconcile by pull on a schedule, with a webhook allowed to hasten a pull but never relied on to retry, because a tracker emits far more events than tasks.
+The ledger is event-sourced on the same log as memory (§4). Every ledger operation, creation, admission, claim, heartbeat, release, rescore, completion, and invalidation, is an append to the domain's partition, and the ledger is a projection of that partition. There is no second store. The lease table agents dequeue from is a cache of the projection and is rebuilt from the log, so the record test of §12 holds for the ledger and replay (§11) sees every claim, not only every completion. A claim is an append that takes effect only if the projection shows the task claimable at that point in the log, which is what makes `claim_next` atomic within a domain; a claim that loses, or any event that arrives after a terminal one, is recorded and changes nothing, and `claim_next` moves on to the next task the caller can hold. Every ledger operation carries a caller-supplied attempt key, so a retry cannot double-claim or double-complete. Automatic re-ranks are the ledger's own appends; the `rescore` of Appendix A is an orchestrator's override and is gated. The materializer commits each terminal task with its event history to the record alongside decisions, so a replay checkout (§11) holds every claim; the projection keeps only live tasks; the origin index keeps every origin it has seen; and the log itself is in the snapshots the §12 drill restores from. Taps reconcile by pull on a schedule, with a webhook allowed to hasten a pull but never relied on to retry, because a tracker emits far more events than tasks.
 
 Rank is a property of open tasks; a claimed task keeps its lease whatever happens to the rubric. A single task re-ranks when its own state changes, on unblocking or narrowing. Rubric-wide rescoring, from an L1 amendment, a price-vector change, or a saturated pool, runs once per **cycle**, the triage cadence published with the SLOs (§9), so it touches every open task at most once per cycle. A parent's rank flows to its open children. Edges that cross domains, a request task or a dependency on another domain's work, travel as events between partitions; a request task carries its requester's rank as one input to the owning domain's rubric, propagation runs through the portfolio layer and may lag by a cycle, and each domain's rubric still orders its own queue. Invalidation cascades: an invalidated parent invalidates its live children as obsolete, an invalidated dependency re-triages its dependents, and a holder learns of either, or of an upstream close, from the status its next heartbeat returns, stops, and writes a handoff.
 
@@ -516,13 +516,13 @@ policy_context: [pol-L1-007, pol-L2-031]
 handoff: mem-a-0901          # written at completion, release, or invalidation
 ```
 
-Leases make claims crash-safe: no heartbeat, lease expires, task returns to the pool, and the next agent recovers from the handoff note, not a transcript. Ownership partitioning prevents most conflicts structurally; touching foreign paths requires a claim through that domain's board. Conflicts that still occur surface as merge points for the orchestrator.
+Leases make claims crash-safe: no heartbeat, lease expires, task returns to the pool, and the next agent recovers from the handoff note, not a transcript. Ownership partitioning prevents most conflicts structurally; touching foreign paths requires a claim through that domain's ledger. Conflicts that still occur surface as merge points for the orchestrator.
 
 Tasks form a hierarchy through decomposition: each carries its parent, and a parent completes only when its children are terminal and its own acceptance holds. Dependencies are completion dependencies: a task with open `depends_on` is blocked, visible and scored but not claimable. Blocked work is handled by the scheduler, not by agent ingenuity. Priority propagates along dependency edges, so a high-value blocked task raises the rank of whatever blocks it (the reason the rubric up-weights unblocking), and a blocker outside the fleet's control becomes an escalation, never a workaround. An agent that cannot proceed records why and releases; routing around a dependency is gate evasion, not initiative.
 
 When a dependency clears, the dependent does not become claimable with stale assumptions. Unblocking re-triages it, and the claiming agent's first act is verification: the dependency's handoff and decision entries are checked against what this task assumed, and a mismatch goes back to the orchestrator for re-decomposition instead of being silently absorbed. Blocked age is telemetry: tasks blocked past a bound alert, and tasks the world has moved past are invalidated as obsolete rather than left to rot.
 
-Closed tasks are memory. The board is an event source like commits and tickets: every terminal task, with its provenance, dependency edges, handoff, and outcome, is replayable history, already the ground truth for the evaluations of §11 and distillation input for the librarian, where recurring invalidation reasons or repeatedly re-decomposed parents become process entries in their own right.
+Closed tasks are memory. The ledger is an event source like commits and tickets: every terminal task, with its provenance, dependency edges, handoff, and outcome, is replayable history, already the ground truth for the evaluations of §11 and distillation input for the librarian, where recurring invalidation reasons or repeatedly re-decomposed parents become process entries in their own right.
 
 Triage is centralized so judgment isn't re-derived by every worker: an orchestrator (or a periodic cheap-model pass) ranks the queue against the compiled L1 rubric, workers pull the head of the queue through an atomic claim-next so two agents can never both hold the same task, and only ambiguous calls escalate. An empty claim-next is itself a signal: idle capacity against the current rubric, visible in the telemetry.
 
@@ -530,9 +530,9 @@ Matching is by requirement and capability, since the fleet is heterogeneous. Tas
 
 A task whose requirements exceed every single manifest is not unclaimable work; it is a parent that has not been decomposed yet. Capability-driven decomposition is the standard response: the orchestrator splits it into dependency-ordered subtasks whose requirements each fit some claimant, and human principals count, since a step requiring sign-off is simply a task whose manifest match is a person. Solvability, the first criterion of decomposition, means exactly this: every leaf matches someone. Recurring splits of the same shape are telemetry twice over, a provisioning case for a harness carrying the union of capabilities, or a decomposition template worth distilling into dom-platform.
 
-Partial work follows the same discipline. An agent that discovers mid-task that a portion exceeds its capabilities neither completes the task partially, since done means the acceptance held, nor abandons it silently. It narrows through the board: it proposes re-decomposition, completes the portion it can as a subtask with a handoff, and files the residual as a dependent task carrying the missing requirements, with rank inherited through the edge. Partial progress is preserved in handoffs and completed subtasks; partial completion of an unchanged task does not exist. Narrowing acceptance is a board operation with provenance, never a private judgment.
+Partial work follows the same discipline. An agent that discovers mid-task that a portion exceeds its capabilities neither completes the task partially, since done means the acceptance held, nor abandons it silently. It narrows through the ledger: it proposes re-decomposition, completes the portion it can as a subtask with a handoff, and files the residual as a dependent task carrying the missing requirements, with rank inherited through the edge. Partial progress is preserved in handoffs and completed subtasks; partial completion of an unchanged task does not exist. Narrowing acceptance is a ledger operation with provenance, never a private judgment.
 
-Delegation follows the same discipline. An agent that hands part of its work to helpers spawned inside its own session has decomposed a task, and the board records it as one. A helper runs a verified definition like any worker; the parent selects it from the verified set, supplies the task spec, and narrows the manifest; it does not compose a definition. Spawning is a `create_task` and a `claim` in one step: a child whose requirements fit inside the parent's manifest inherits the parent's admission, the zero-depth case of the scaled gate above, and one that needs more is a residual filed through the orchestrator, as for partial work. The child's lease expires no later than the parent's. The helper finishes with a `complete` and a handoff on the fast lane, and the handoff, not the transcript, returns to the parent. If the parent hands off or dies first, its children run out their own leases and then return to the pool like any task, and the next claimer of the parent task finds them through the parent link and their handoffs. Two invariants hold: the child's manifest is a subset of the parent's, so delegation never widens capability, and the child's current label (§5) starts at the parent's and flows back up, so delegation never launders a read. The parent decides how to decompose; the board records the result, because replay outcomes and cost per task depend on seeing every leaf. Helpers finer than a model turn are function calls, not agents, and need no task.
+Delegation follows the same discipline. An agent that hands part of its work to helpers spawned inside its own session has decomposed a task, and the ledger records it as one. A helper runs a verified definition like any worker; the parent selects it from the verified set, supplies the task spec, and narrows the manifest; it does not compose a definition. Spawning is a `create_task` and a `claim` in one step: a child whose requirements fit inside the parent's manifest inherits the parent's admission, the zero-depth case of the scaled gate above, and one that needs more is a residual filed through the orchestrator, as for partial work. The child's lease expires no later than the parent's. The helper finishes with a `complete` and a handoff on the fast lane, and the handoff, not the transcript, returns to the parent. If the parent hands off or dies first, its children run out their own leases and then return to the pool like any task, and the next claimer of the parent task finds them through the parent link and their handoffs. Two invariants hold: the child's manifest is a subset of the parent's, so delegation never widens capability, and the child's current label (§5) starts at the parent's and flows back up, so delegation never launders a read. The parent decides how to decompose; the ledger records the result, because replay outcomes and cost per task depend on seeing every leaf. Helpers finer than a model turn are function calls, not agents, and need no task.
 
 The requirements field itself needs guarding, because creation is cheap and requirements are targeting: a task with inflated requirements is a message addressed to the most capable claimant, and a compromised or manipulated creator could route work, and payloads, toward agents holding tools and scopes the creator lacks. Four controls close this. Admission depth scales with the requirements class: every task passes triage before it is claimable, an automatic rubric pass for ordinary work, while tasks requiring privileged tools, elevated scopes, human time, or irreversible action draw orchestrator validation, with a coherence check that flags requirements the spec does not justify. Creators are bound by policy: by default a principal may not attach requirements it could not itself be granted, and the legitimate exception, a residual filed for capabilities the filer lacks, already arrives through orchestrator re-decomposition. A task spec is data, not authorization, the same rule §10 applies to retrieved memory: claiming a task grants nothing, and the claimer's own perimeter gates every action regardless of what the spec requests. And requirements inflation is telemetry: creators whose tasks systematically over-require are flagged, and completions of high-requirement tasks draw review sampling scaled to their class, the same way blast radius scales gates elsewhere.
 
@@ -542,7 +542,7 @@ One pass through the fabric, exercising admission, capability matching, narrowin
 sequenceDiagram
     autonumber
     participant CR as Creator, any principal or tap
-    participant TB as Board
+    participant TB as Ledger
     participant TRI as Triage gate
     participant W1 as Worker A, limited manifest
     participant OR as Orchestrator
@@ -575,7 +575,7 @@ sequenceDiagram
     TB-->>H: task C, lease started
     H->>M: review the handoffs of A and B
     H->>TB: complete task C
-    Note over H: same board, same claim, same lease,<br/>a human is a claimant like any other
+    Note over H: same ledger, same claim, same lease,<br/>a human is a claimant like any other
 ```
 
 ## The same pattern at four levels
@@ -584,10 +584,10 @@ Coordination repeats fractally; what changes is the artifact it flows through an
 
 | Level | Coordination artifact | Contention resolver | Cadence |
 |---|---|---|---|
-| Feature | Task board + ownership + handoff notes | Domain orchestrator at merge points | Minutes–hours |
+| Feature | Task ledger + ownership + handoff notes | Domain orchestrator at merge points | Minutes–hours |
 | Product | Domain interface summaries + cross-domain request tasks | Product orchestrator; contract change = reviewed commit | Hours–days |
 | Department | Domain contracts, registry ownership, shared L2 policy | Practice leads; portfolio orchestrator | Days–weeks |
-| Company | L0/L1 stack, portfolio board, exception approvals | Leadership via policy amendment | Weeks–quarters |
+| Company | L0/L1 stack, portfolio ledger, exception approvals | Leadership via policy amendment | Weeks–quarters |
 
 **Feature level.** Two workers, one feature, no messages:
 
@@ -595,7 +595,7 @@ Coordination repeats fractally; what changes is the artifact it flows through an
 sequenceDiagram
     autonumber
     participant W1 as Worker A, interface side
-    participant TB as dom-a board
+    participant TB as dom-a ledger
     participant M as Shared memory
     participant W2 as Worker B, caller side
     participant OR as Orchestrator
@@ -614,7 +614,7 @@ sequenceDiagram
     OR->>OR: merge point - check artifact overlap,<br/>run policy gate, promote decision raw to curated
 ```
 
-**Product level.** Work in `dom-a` needs data owned by `dom-b`. The `dom-a` orchestrator reads `dom-b`'s interface summary, which answers most questions without touching foreign memory, then files a cross-domain request task on `dom-b`'s board. An interface summary is one curated page:
+**Product level.** Work in `dom-a` needs data owned by `dom-b`. The `dom-a` orchestrator reads `dom-b`'s interface summary, which answers most questions without touching foreign memory, then files a cross-domain request task on `dom-b`'s ledger. An interface summary is one curated page:
 
 ```markdown
 # dom-b · interface summary v3 · owner: <team, via registry>
@@ -623,7 +623,7 @@ Contracts: interface I v3 (mem-b-ctr-031): <inputs> to <outputs>;
   latency target; breaking changes via request task + deprecation window.
 Don't: query our stores directly; <class of assertion> comes from us.
 Current: <freeze, migration, or constraint in effect>; I v4 in design.
-Requests: file on board dom-b, template task-b-REQ.
+Requests: file on ledger dom-b, template task-b-REQ.
 ```
 
 `dom-b` triages the request against its own rubric; if priorities collide, the product orchestrator resolves using the compiled L1 weights and records the decision. Contract changes ship as reviewed commits to the summary. Domains coordinate like services: published interfaces and explicit requests instead of shared mutable state.
@@ -633,7 +633,7 @@ sequenceDiagram
     autonumber
     participant PO as dom-a orchestrator
     participant IS as dom-b interface summary
-    participant LB as dom-b board
+    participant LB as dom-b ledger
     participant LO as dom-b orchestrator
     participant PF as Product orchestrator
 
@@ -649,7 +649,7 @@ sequenceDiagram
 
 **Department level.** Telemetry shows two domains cross-reading each other more than themselves; the librarian surfaces a boundary-redraw recommendation with the evidence attached; practice leads review; the redraw ships as a registry-plus-memory-move commit with tombstone redirects, logged as a decision. Boundary changes are schema migrations: rare, deliberate, evidenced.
 
-**Company level.** Leadership amends L1 as a reviewed commit; the scoring rubric recompiles; every board re-triages on the next cycle. The triage cycle bounds when the fleet is fully operating under the new priorities, and every decision is stamped with the policy version in force when it was made.
+**Company level.** Leadership amends L1 as a reviewed commit; the scoring rubric recompiles; every ledger re-triages on the next cycle. The triage cycle bounds when the fleet is fully operating under the new priorities, and every decision is stamped with the policy version in force when it was made.
 
 ---
 
@@ -661,10 +661,10 @@ stateDiagram-v2
     Spawn --> Oriented: load cached T0 and digest, compile filter, present attested manifest
     Oriented --> Claiming: pull top claimable task
     Claiming --> Working: claim granted with lease and heartbeat
-    Claiming --> Idle: nothing claimable, or board unreachable
+    Claiming --> Idle: nothing claimable, or ledger unreachable
     Working --> Working: search, fetch, act, delegate, write events, renew lease
     Working --> Blocked: dependency unmet or gate denial
-    Blocked --> Working: unblocked via board
+    Blocked --> Working: unblocked via ledger
     Blocked --> Escalated: files exception or escalation task
     Escalated --> Working: approved
     Escalated --> Handoff: denied, record and release
@@ -674,13 +674,13 @@ stateDiagram-v2
     Died --> [*]: lease expires, task returns to pool
 ```
 
-Spin-up is O(1) regardless of corpus size: no data in the sandbox, a cached T0 prefix, a session filter compiled once. Context recovery costs one index read plus one or two topic files; the previous agent's handoff note is the recovery mechanism, which is why handoff writes get the fast indexing lane. An agent that delegates spawns its helpers through the board (§7) and receives their handoffs, so its context holds a summary of what they did, not a copy of what they saw. Death is safe by design: leases mean a crashed agent cannot deadlock work, and statelessness means nothing of value died with it. The same rule runs the other way: an agent that cannot renew its lease treats it as lost at the moment it would have expired, stops the task, writes its handoff, and claims nothing new (§9), so a partition between agent and board never leaves one task with two holders. An agent nearing its context or spend limit hands off proactively; a fresh agent with a good handoff note beats a bloated context.
+Spin-up is O(1) regardless of corpus size: no data in the sandbox, a cached T0 prefix, a session filter compiled once. Context recovery costs one index read plus one or two topic files; the previous agent's handoff note is the recovery mechanism, which is why handoff writes get the fast indexing lane. An agent that delegates spawns its helpers through the ledger (§7) and receives their handoffs, so its context holds a summary of what they did, not a copy of what they saw. Death is safe by design: leases mean a crashed agent cannot deadlock work, and statelessness means nothing of value died with it. The same rule runs the other way: an agent that cannot renew its lease treats it as lost at the moment it would have expired, stops the task, writes its handoff, and claims nothing new (§9), so a partition between agent and ledger never leaves one task with two holders. An agent nearing its context or spend limit hands off proactively; a fresh agent with a good handoff note beats a bloated context.
 
 ---
 
 # 9. Measurement
 
-Everything flows through the retrieval service and task board, so instrumentation is complete without agents self-reporting. Every retrieval event is tagged: agent, task, session, domain, query, hits, subsequent fetches, tokens served, latency per stage, cache hit.
+Everything flows through the retrieval service and task ledger, so instrumentation is complete without agents self-reporting. Every retrieval event is tagged: agent, task, session, domain, query, hits, subsequent fetches, tokens served, latency per stage, cache hit.
 
 ## Metrics
 
@@ -706,7 +706,7 @@ Agents hard-depend on retrieval behavior, so it is a published contract:
 - **Freshness:** 99% of fast-lane writes (handoffs and mid-task decisions, §4) searchable within 60 s; bulk curation may lag further, and both bounds are published so agents know when they can read their own writes.
 - **Availability and degraded mode:** service down → agents run from T0, queue writes, take no irreversible actions. Degraded behavior is part of the contract.
 - **Quality floor:** no known-item misses: exact-match lookups by ID, title, or error string land in the top three, guaranteed by the golden suites.
-- **Board:** `claim_next` p99 1 s, since spin-up to first task is on every agent's path; projection lag p99 1 s, so the claimable set is at most that stale; ordinary admission within 10 s; tap-to-task and write-back within 5 min, excluding tracker unavailability; the triage cycle 5 min, and portfolio propagation within one cycle. Heartbeats run at a third of the lease. Degraded mode: a board outage is the projection; the log accepts appends throughout, so handoffs and heartbeats land but nothing is confirmed or dequeued. An agent that cannot confirm a renewal keeps working and retrying until its lease would have expired, then treats the lease as lost (§8): it stops the task, writes its handoff, and claims nothing until a claim succeeds again. The board expires leases by its own clock, so an outage shorter than a lease costs nothing, and a longer one returns held tasks to the pool with their handoffs, the ordinary crash path applied all at once. Spawning needs the board, so a parent that cannot spawn does the work itself within its lease or waits. Taps buffer inbound items in the log and outbound results at the tap, idempotent per task and event. A log outage is a retrieval outage as well, and that degraded mode applies. Trackers stay canonical for their items, so people keep working in them through any of this.
+- **Ledger:** `claim_next` p99 1 s, since spin-up to first task is on every agent's path; projection lag p99 1 s, so the claimable set is at most that stale; ordinary admission within 10 s; tap-to-task and write-back within 5 min, excluding tracker unavailability; the triage cycle 5 min, and portfolio propagation within one cycle. Heartbeats run at a third of the lease. Degraded mode: a ledger outage is the projection; the log accepts appends throughout, so handoffs and heartbeats land but nothing is confirmed or dequeued. An agent that cannot confirm a renewal keeps working and retrying until its lease would have expired, then treats the lease as lost (§8): it stops the task, writes its handoff, and claims nothing until a claim succeeds again. The ledger expires leases by its own clock, so an outage shorter than a lease costs nothing, and a longer one returns held tasks to the pool with their handoffs, the ordinary crash path applied all at once. Spawning needs the ledger, so a parent that cannot spawn does the work itself within its lease or waits. Taps buffer inbound items in the log and outbound results at the tap, idempotent per task and event. A log outage is a retrieval outage as well, and that degraded mode applies. Trackers stay canonical for their items, so people keep working in them through any of this.
 
 ## Regressions
 
@@ -916,7 +916,7 @@ Resource classes differ in scarcity as well as price. Metered tokens are limited
 | Memory poisoning | Provenance; trust tiers; PR gates to verified; audit agents hunting contradictions |
 | Rogue or defective librarian | Reversible diffs and tombstones; independent cross-model faithfulness audits; telemetry outside librarian reach; approver never the proposer; lineage recall; canary entries (§4) |
 | Crashed agent deadlocks work | Leases + heartbeats; handoff-note recovery |
-| Board outage or partition | Holder and board both treat an unrenewable lease as lost at its expiry, so no task has two holders; held work ends in a handoff and returns to the pool; taps buffer in the log and reconcile by pull; trackers unaffected |
+| Ledger outage or partition | Holder and ledger both treat an unrenewable lease as lost at its expiry, so no task has two holders; held work ends in a handoff and returns to the pool; taps buffer in the log and reconcile by pull; trackers unaffected |
 | Retrieval outage | Defined degraded mode: T0-only, queued writes, no irreversible actions |
 | Corpus rot | Telemetry-driven librarian; decay clocks; per-domain golden suites |
 | Index or ranking regression | Canary/shadow serving; eval suite on every change, including summary rewrites |
@@ -942,7 +942,7 @@ Resource classes differ in scarcity as well as price. Metered tokens are limited
 Milestones, not dates: each delivers a capability, states the outcome that proves it, and gates the next. Duration depends on team and context; the sequence and the evidence do not.
 
 **M1: Memory works.**
-*Capability:* memory repos with the entry schema; retrieval on Postgres FTS with summaries-first responses; T0 discipline; one domain's task board with leases and handoff notes.
+*Capability:* memory repos with the entry schema; retrieval on Postgres FTS with summaries-first responses; T0 discipline; one domain's task ledger with leases and handoff notes.
 *Exit criteria:* a fresh agent recovers context from a handoff note and T0 alone, with no transcript replay; known-item lookups land top-3; cost-per-task on the pilot domain is measured and trending down against the pre-memory baseline.
 
 **M2: The system senses itself.**
@@ -955,7 +955,7 @@ Milestones, not dates: each delivers a capability, states the outcome that prove
 
 **M4: Scale across domains.**
 *Capability:* multi-domain federation with interface summaries; portfolio orchestration; co-retrieval mining and prefetch; canary infrastructure; the vendor-drift probe battery.
-*Exit criteria:* a cross-domain request completes through boards and summaries without foreign-memory writes; prefetch precision clears its threshold in production; an injected vendor-drift simulation (swapped model behind a fixed alias) is detected and attributed within the published bound.
+*Exit criteria:* a cross-domain request completes through ledgers and summaries without foreign-memory writes; prefetch precision clears its threshold in production; an injected vendor-drift simulation (swapped model behind a fixed alias) is detected and attributed within the published bound.
 
 **M5: Self-improvement, gated.**
 *Capability:* dom-platform with the full evolution loop of §10; live re-execution replay; the acquisition import pipeline; the restore-from-git drill as a standing exercise.
@@ -966,7 +966,7 @@ Milestones are cumulative and each is independently useful; a deployment can sto
 **A reference implementation for one person, runnable locally.** The smallest deployment of this design is a personal domain (§12), and one should exist as a reference. One process on the person's machine:
 
 - the record in files under version control, or in a local object store;
-- index and board in an embedded database;
+- index and ledger in an embedded database;
 - grants in a policy file the person edits;
 - the surface of Appendix A as one memory server;
 - taps that import what the person's harnesses export;
@@ -974,7 +974,7 @@ Milestones are cumulative and each is independently useful; a deployment can sto
 
 Its review gate is the owner: the librarian proposes, the person approves. It is the conformance check for the surface, since a harness that works against it works against any serving layer, and it lets people run the design before their institution has built anything.
 
-What to revisit as the system grows: the search engine (Postgres to OpenSearch at scale), the log store (files to Kafka), the record engine if verified-tier commit rates ever strain git (a git-semantics database preserves the guarantees), the board's projection and origin index if claim latency or partition count outgrows one database, and the domain boundaries themselves, on evidence, through the process in §12.
+What to revisit as the system grows: the search engine (Postgres to OpenSearch at scale), the log store (files to Kafka), the record engine if verified-tier commit rates ever strain git (a git-semantics database preserves the guarantees), the ledger's projection and origin index if claim latency or partition count outgrows one database, and the domain boundaries themselves, on evidence, through the process in §12.
 
 ---
 
@@ -992,7 +992,7 @@ This architecture assembles ideas with two distinct lineages: a recent body of a
 
 **Coordination (§7).** Coordination through a shared workspace is the blackboard architecture (Erman et al., Hearsay-II, 1980); coordination through decoupled tuple exchange is Linda (Gelernter, 1985); the biological framing is stigmergy (Grassé, 1959; Heylighen, 2016). Leases are Gray & Cheriton (1989). Domain partitioning with published interfaces restates bounded contexts (Evans, *Domain-Driven Design*, 2003) and data mesh's federated domain ownership (Dehghani, 2019); the registry indirection is Conway's law (1968) answered with a level of naming indirection, DNS-style. Among agent systems, CORAL (arXiv:2604.01658) demonstrates long-lived shared-memory coordination with heartbeat intervention empirically.
 
-**Task fabric (§7).** Hierarchy by decomposition is hierarchical task network planning (Erol, Hendler & Nau, 1994); priority propagating along dependency edges is critical-path scheduling (Kelley & Walker, 1959); the board's dependency and blocking semantics descend from the workflow-patterns tradition (van der Aalst et al., 2003). Among agent systems, scheduler-theoretic treatments of DAG execution formalize the ready set and the trade between plan immutability and runtime replanning (arXiv:2604.11378); decomposition with scoped per-task context shows large token reductions (Li et al., 2026), independent support for the fabric's turn economics; agent-oriented planning states decomposition criteria of solvability, completeness, and non-redundancy (arXiv:2410.02189); and plan-execute-verify-replan loops (arXiv:2603.11445) mirror the verification-on-unblock rule, where cleared dependencies are checked and gaps trigger re-decomposition. Capability-matched allocation echoes the contract net protocol (Smith, 1980), reduced from negotiated bidding to declarative matching against attested manifests.
+**Task fabric (§7).** Hierarchy by decomposition is hierarchical task network planning (Erol, Hendler & Nau, 1994); priority propagating along dependency edges is critical-path scheduling (Kelley & Walker, 1959); the ledger's dependency and blocking semantics descend from the workflow-patterns tradition (van der Aalst et al., 2003). Among agent systems, scheduler-theoretic treatments of DAG execution formalize the ready set and the trade between plan immutability and runtime replanning (arXiv:2604.11378); decomposition with scoped per-task context shows large token reductions (Li et al., 2026), independent support for the fabric's turn economics; agent-oriented planning states decomposition criteria of solvability, completeness, and non-redundancy (arXiv:2410.02189); and plan-execute-verify-replan loops (arXiv:2603.11445) mirror the verification-on-unblock rule, where cleared dependencies are checked and gaps trigger re-decomposition. Capability-matched allocation echoes the contract net protocol (Smith, 1980), reduced from negotiated bidding to declarative matching against attested manifests.
 
 **Measurement and SLOs (§9).** The observability plane is standard SRE practice (SLOs, error budgets, golden signals; Beyer et al., *Site Reliability Engineering*, 2016) applied to a retrieval funnel. Token cost as a first-class evaluation axis alongside accuracy follows the Mem0/LoCoMo line; LongMemEval (arXiv:2410.10813) benchmarks the long-horizon abilities (knowledge updates, temporal reasoning, abstention) that the librarian and decay mechanisms operationalize.
 
