@@ -4,7 +4,7 @@
 
 Sander Striker · August 2026 · revised September 2026
 
-*Fleets of AI agents doing sustained work at scale need shared memory, coordination, governance, and a way to survive the replacement of every component they are built from. This paper describes an architecture for that problem: a text-first system of record with tiered, provenance-tracked memory; retrieval built on progressive disclosure so agents read only what a cheaper signal could not rule out; coordination through leased shared state instead of messages; a layered policy stack behind a deterministic enforcement perimeter; eval-gated self-improvement that cannot widen its own permissions; and evaluation of change, whether self-initiated or vendor-inflicted, by replaying the system's own history. The components are ordinary on purpose (git, plain text, lexical search, policy-as-code) so that the whole remains legible, auditable, and rebuildable by humans over decades.*
+*Fleets of AI agents doing sustained work at scale need shared memory, coordination, governance, and a way to survive the replacement of every component they are built from. This paper describes an architecture for that problem: a text-first system of record with tiered, provenance-tracked memory; retrieval built on progressive disclosure so agents read only what a cheaper signal could not rule out; coordination through leased shared state instead of messages; a layered policy stack behind a deterministic enforcement perimeter; eval-gated self-improvement that cannot widen its own permissions; and evaluation of change, whether self-initiated or vendor-inflicted, by replaying the system's own history. The components are ordinary on purpose (versioned plain text, lexical search, policy-as-code) so that the whole remains legible, auditable, and rebuildable by humans over decades.*
 
 ---
 
@@ -31,10 +31,10 @@ Agents doing real, sustained work fail in four predictable ways:
 
 Ten rules govern every component. When a question isn't answered below, reason from these.
 
-1. **Data outlives tooling.** The record is versioned plain text; git is today's engine. Search indexes, embeddings, and dashboards are derived: rebuildable from source, never authoritative.
+1. **Data outlives tooling.** The record is versioned plain text, under whatever engine keeps the guarantees of §4. Search indexes, embeddings, and dashboards are derived: rebuildable from source, never authoritative.
 2. **Agents are stateless and disposable.** A sandbox starts empty and dies without ceremony. Anything worth keeping is written to shared memory first.
 3. **Optimize the dominant cost, which today is the read path.** Progressive disclosure everywhere: index → summary → section → document. Load nothing a cheaper signal could have ruled out. The price model is configuration (§12); the discipline of loading less than everything is the principle.
-4. **Coordinate through state, not messages.** Agents read and write shared structures (task ledger, memory, handoff notes) the way a git repo coordinates a human team.
+4. **Coordinate through state, not messages.** Agents read and write shared structures (task ledger, memory, handoff notes) the way a shared repository coordinates a human team.
 5. **Ownership prevents conflict.** Domains, files, and tasks have owners; claims are leases that expire on missed heartbeats. Negotiation is the exception path.
 6. **Judgment is written down.** Values, strategy, quality bars, and scoring rubrics are versioned files agents read. Higher layers take precedence; overrides are explicit, approved, and expire.
 7. **Every write carries provenance.** Author, model version, timestamp, source, confidence. Trust is tiered; promotion passes review. Memory poisoning is a first-class threat.
@@ -51,7 +51,7 @@ flowchart TB
     HUM["Humans<br/>leadership and operators: amend policy,<br/>approve exceptions, own the registry"]
     AGT["Agents: stateless, disposable<br/>workers, orchestrators, librarians, auditors"]
     SRV["Serving layer: rebuildable<br/>retrieval, task ledger, OPA filters, telemetry"]
-    REC["System of record: git<br/>domain memory, policy stack, registry, exceptions, dom-platform"]
+    REC["System of record: versioned text<br/>domain memory, policy stack, registry, exceptions, dom-platform"]
     EXT["External systems: trackers, archives, tool servers<br/>canonical for their own items, each with a ceiling"]
 
     HUM ~~~ AGT
@@ -63,9 +63,9 @@ flowchart TB
     SRV -->|"results out, label ≤ ceiling"| EXT
 ```
 
-Git repositories of Markdown hold everything durable: domain-partitioned memory, the policy stack, the registry, and exceptions. An indexer turns commits into a search index whose results are summaries first. Agents start empty, load a small cached index plus a policy digest, and reach everything else through a retrieval tool fronted by compiled permission filters. Work is coordinated through a task ledger with leased claims, never through agent-to-agent chat. Cheap librarian agents curate memory continuously, directed by the telemetry the retrieval service emits. Humans amend policy, approve exceptions, and remain the final continuity.
+A versioned store of Markdown holds everything durable: domain-partitioned memory, the policy stack, the registry, and exceptions. An indexer turns each new version into a search index whose results are summaries first. Agents start empty, load a small cached index plus a policy digest, and reach everything else through a retrieval tool fronted by compiled permission filters. Work is coordinated through a task ledger with leased claims, never through agent-to-agent chat. Cheap librarian agents curate memory continuously, directed by the telemetry the retrieval service emits. Humans amend policy, approve exceptions, and remain the final continuity.
 
-The components are common and old: git, Markdown, BM25 (Lucene-family or Postgres FTS), OPA (Open Policy Agent), OpenTelemetry. At decade scale, exotic dependencies are liabilities; each element here is text-first and independently replaceable. Vector search is allowed only as a derived, rebuildable layer.
+The components are common and old: Markdown in a versioned store, BM25 (Lucene-family or Postgres FTS), OPA (Open Policy Agent), OpenTelemetry. At decade scale, exotic dependencies are liabilities; each element here is text-first and independently replaceable. Vector search is allowed only as a derived, rebuildable layer.
 
 ## Notation
 
@@ -175,25 +175,25 @@ A session sees one T0. It is the slices of the domains the session may touch, ea
 
 ## The write path
 
-Git is the system of record and the review substrate. It is not the concurrent write buffer and it sits on no hot path. If thousands of agents committed to a shared branch, the ref update (a compare-and-swap) would serialize them, and millions of tiny commits would bloat the repo. Instead:
+The record is the review substrate. It is not the concurrent write buffer and it sits on no hot path. If thousands of agents wrote to it directly, every write would serialize on the version update, and millions of tiny versions would bloat the history. Instead:
 
 ```mermaid
 flowchart LR
-    subgraph HOT["Hot path: high concurrency, no git"]
+    subgraph HOT["Hot path: high concurrency, record untouched"]
         A1["Agents and taps (many)"] -->|append, no lock| LOG["Append-only event log (T2)<br/>Kafka / log table / per-writer segments,<br/>partitioned by domain"]
     end
     LOG -->|"fast lane: handoffs, mid-task decisions<br/>slow lane: bulk curation"| IX["Search index<br/>(the read path)"]
     LOG -->|projection| BRD["Task ledger<br/>(projection + lease cache)"]
-    LOG -->|batched, async| MAT["Materializer<br/>(one committer per domain repo)"]
-    MAT -->|coarse commits| GIT["Git repos (per domain):<br/>curated T1 + decisions + terminal tasks"]
-    GIT -->|PR review, human-paced| VER["Verified tier + policy stack"]
+    LOG -->|batched, async| MAT["Materializer<br/>(one writer per domain)"]
+    MAT -->|coarse versions| REC["Record (per domain):<br/>curated T1 + decisions + terminal tasks"]
+    REC -->|review gate, human-paced| VER["Verified tier + policy stack"]
 ```
 
-Four properties remove the contention. The hot write path is an append-only log, where concurrent appends don't contend. Partitioning by domain means cross-domain writes never touch the same repo. Ownership and leases mean two agents rarely write the same artifact at all. And a single materializer per domain is the only committer: many producers, one consumer, no ref contention, coarse healthy commits. The index is fed from the log directly, so the freshness SLO holds even when git materialization lags. Writes another agent may be waiting on, handoffs and decisions written mid-task, take a fast lane with a published freshness bound (§9); bulk curation takes the slow lane.
+Four properties remove the contention. The hot write path is an append-only log, where concurrent appends don't contend. Partitioning by domain means cross-domain writes never touch the same partition of the record. Ownership and leases mean two agents rarely write the same artifact at all. And a single materializer per domain is the only writer to the record: many producers, one consumer, no contention, coarse healthy versions. The index is fed from the log directly, so the freshness SLO holds even when materialization into the record lags. Writes another agent may be waiting on, handoffs and decisions written mid-task, take a fast lane with a published freshness bound (§9); bulk curation takes the slow lane.
 
-This maps onto the trust tiers: raw T2 in the log store at high frequency; curated T1 and decisions in git at moderate frequency via the materializer; verified promotions and policy changes through git PRs at low, human-paced frequency, the one place git's review semantics are needed and where its write rate is more than sufficient.
+This maps onto the trust tiers: raw T2 in the log store at high frequency; curated T1 and decisions in the record at moderate frequency via the materializer; verified promotions and policy changes through the review gate at low, human-paced frequency.
 
-The engine behind the record is a choice. Principle 1 is about format and guarantees, not the binary. Git is the default. An object store with versions, or a database with git's semantics, can replace it when commit rates are high or when one repository per domain is more than an institution wants to run.
+The engine behind the record is a choice this paper does not make. Principle 1 is about format and guarantees, not the engine. Version control, an object store with versioning, or a database can each hold the record; an institution picks by what it already runs and by its write rate.
 
 Any engine must give seven things, because the rest of the paper depends on them:
 
@@ -211,7 +211,7 @@ The review gate is the one most easily lost when the engine changes.
 
 A permanent fleet of cheap-model agents: verify stale facts, merge duplicates, write and maintain the one-to-two-sentence summaries the index serves, split oversized files, promote hot material, demote dead material, and act on telemetry signals (failed-query clusters become authoring tasks; high co-retrieval becomes merge candidates; high wasted-read becomes re-summarization). Curation is scheduled and budgeted like any other workload.
 
-Promotion into `trust_tier: verified` passes a review gate: a git PR approved by a human or senior agent, per domain policy. This is the main defense against memory poisoning: a wrong fact written once and trusted forever is the largest long-horizon risk this system carries.
+Promotion into `trust_tier: verified` passes a review gate: approval by a human or senior agent, per domain policy, where the approver is never the proposer. This is the main defense against memory poisoning: a wrong fact written once and trusted forever is the largest long-horizon risk this system carries.
 
 Raw entries are searchable, with their tier visible, because a handoff written a minute ago is raw and the next agent needs it. Two things narrow that default. A principal's policy may set a higher floor for a domain, as the example residual in §5 does. And dom-platform is the exception by design (§10): what a harness loads as its configuration must be verified, what an agent retrieves from dom-platform mid-task must be curated or better, and raw dom-platform is reachable by librarians and auditors only.
 
@@ -219,7 +219,7 @@ Raw entries are searchable, with their tier visible, because a handoff written a
 
 The librarian is the most privileged role in the system: it writes the summaries that form stage one of every retrieval, decides what is demoted and merged, and distills the strategies in `dom-platform`. A rogue or systematically wrong librarian can misdirect the fleet without ever editing a document body, and it operates at volumes per-action human review cannot cover. Containment therefore relies on structure rather than vigilance:
 
-- **Everything is a reversible diff.** Librarian actions are commits with provenance; demotion leaves tombstones; curation deletes nothing. Any curation decision can be inspected and reverted, and censorship is detectable because the archive still holds what was buried.
+- **Everything is a reversible diff.** Librarian actions are recorded writes with provenance; demotion leaves tombstones; curation deletes nothing. Any curation decision can be inspected and reverted, and censorship is detectable because the archive still holds what was buried.
 - **Curator and checker are independent.** Audit agents that verify summary faithfulness (does the summary entail the body, sampled continuously) and hunt contradictions run on a different base model and prompt lineage than the librarians, and share no writable state with them. A shared blind spot between curator and checker is the correlated failure to avoid. The golden suites already treat every re-summarization pass as a change requiring evaluation; faithfulness sampling extends that from ranking quality to content fidelity.
 - **The sensory plane is out of reach.** Telemetry is emitted by the retrieval service and task ledger, not by librarians, so a librarian cannot suppress the signals that would expose it. Curation behavior is itself monitored: demotion rates, summary-drift magnitude relative to body change, and retrieval-steering asymmetries are anomaly-alerted per librarian identity.
 - **Blast radius scales the gate.** Routine domain curation is sampled for human review; high-impact actions (dom-platform distillation, promotion proposals, boundary redraws, tombstone redirects) require an approver that is not the proposing librarian. A librarian can propose but never approve its own promotion, mirroring the separation of powers in §10.
@@ -272,7 +272,7 @@ BM25 first, vectors later, because agent queries over curated memory are mostly 
 
 ## Access control
 
-OPA, the Open Policy Agent, is a general-purpose policy engine whose declarative language, Rego, expresses rules evaluated against structured data; it runs here as a sidecar, with policies and the domain registry synced from git as that data. The key pattern is partial evaluation, not post-filtering: instead of asking "may this principal see this document?" per result, the service asks "under what conditions may this principal read?", gets back a residual policy, and compiles it into a native index filter attached to the query. Authorization then executes inside the search engine: counts and pagination are correct by construction, and unauthorized documents are never scored, ranked, or leaked through facet counts. Post-filtering would be slower and would still leak existence through result counts; that trade-off decides the pattern.
+OPA, the Open Policy Agent, is a general-purpose policy engine whose declarative language, Rego, expresses rules evaluated against structured data; it runs here as a sidecar, with policies and the domain registry synced from the record as that data. The key pattern is partial evaluation, not post-filtering: instead of asking "may this principal see this document?" per result, the service asks "under what conditions may this principal read?", gets back a residual policy, and compiles it into a native index filter attached to the query. Authorization then executes inside the search engine: counts and pagination are correct by construction, and unauthorized documents are never scored, ranked, or leaked through facet counts. Post-filtering would be slower and would still leak existence through result counts; that trade-off decides the pattern.
 
 Because the registry is OPA data, a reorg is a data update with no service changes. Exception objects are OPA data too, so expiry is a timestamp comparison. Decision logs (every allow/deny, with the policy version that produced it) flow to telemetry. Prefetch and any cross-corpus analytics pass through the same compiled filter as queries; a separate unfiltered path would be a leak waiting to happen.
 
@@ -809,7 +809,7 @@ The invariant: self-evolution is permission-monotonic. It makes agents better wi
 
 Two kinds of change need measuring: changes the operator makes (a new base model, a new sandbox bootstrap) and changes the vendor makes silently. Both use the same machinery, replay against memory, because memory holds three things benchmarks lack.
 
-First, **the knowledge state is reproducible**, up to erasure: "the corpus as the agent saw it" is a checkout of the record at the version current when the task ran, including the policy version and T0 contents, and a replay that reaches an erased entry sees its stub (§4). Second, **outcomes are real**: the task graph records completion, handoff acceptance, whether dependent tasks later got reverted, human PR approval. The dependency edges add downstream consequences, the strongest kind of ground truth. Third, **scoring uses the system's own cost numbers**: tokens per task and retrieval depth, not pass/fail alone.
+First, **the knowledge state is reproducible**, up to erasure: "the corpus as the agent saw it" is the record at the version current when the task ran, including the policy version and T0 contents, and a replay that reaches an erased entry sees its stub (§4). Second, **outcomes are real**: the task graph records completion, handoff acceptance, whether dependent tasks later got reverted, human PR approval. The dependency edges add downstream consequences, the strongest kind of ground truth. Third, **scoring uses the system's own cost numbers**: tokens per task and retrieval depth, not pass/fail alone.
 
 ## Replaying your own history
 
@@ -823,7 +823,7 @@ Frozen-context replay is available as soon as the funnel logs decision contexts;
 ```mermaid
 flowchart TD
     subgraph FIX["Held fixed"]
-        SNAP["Corpus snapshot at<br/>task-time HEAD"]
+        SNAP["Corpus snapshot at<br/>the task-time version"]
         TASKS["Stratified task set"]
         LAB["Real outcomes from<br/>the task graph"]
     end
@@ -897,7 +897,7 @@ When a grant ends, the institution's views drop and receipts say so. What the pe
 
 **Model churn.** BM25 has no model dependency; embeddings, summaries, and rubric compilations are derived and rebuildable. Provenance records the model version behind every write, so a systematically wrong model generation's contributions can be found and re-verified later.
 
-**Tooling churn.** Everything authoritative is Markdown in git. If OPA dies, the policies are text. If the search engine dies, the indexer rebuilds elsewhere. If the platform dies entirely, a person with a laptop can read the whole estate with a text editor. This is checked annually as a drill: restore the serving layer from git and object-store snapshots alone.
+**Tooling churn.** Everything authoritative is Markdown in a versioned store. If OPA dies, the policies are text. If the search engine dies, the indexer rebuilds elsewhere. If the platform dies entirely, a person with a laptop can read the whole estate with a text editor. This is checked annually as a drill: restore the serving layer from snapshots of the record alone.
 
 Two tests apply to every component. The **record test** is the one above: if the serving layer goes dark, is anything lost beyond convenience? The **ownership test** is about people: if a contributed component's authors stop, does anything on the production path stop? A component fails it when the institution depends on it but does not operate it. Contributed components plug in at defined points; whatever sits on the production path is adopted at a version and operated by the institution, or it is not on the path.
 
@@ -913,7 +913,7 @@ Resource classes differ in scarcity as well as price. Metered tokens are limited
 
 | Failure | Defense |
 |---|---|
-| Memory poisoning | Provenance; trust tiers; PR gates to verified; audit agents hunting contradictions |
+| Memory poisoning | Provenance; trust tiers; review gates to verified; audit agents hunting contradictions |
 | Rogue or defective librarian | Reversible diffs and tombstones; independent cross-model faithfulness audits; telemetry outside librarian reach; approver never the proposer; lineage recall; canary entries (§4) |
 | Crashed agent deadlocks work | Leases + heartbeats; handoff-note recovery |
 | Ledger outage or partition | Holder and ledger both treat an unrenewable lease as lost at its expiry, so no task has two holders; held work ends in a handoff and returns to the pool; taps buffer in the log and reconcile by pull; trackers unaffected |
@@ -930,7 +930,7 @@ Resource classes differ in scarcity as well as price. Metered tokens are limited
 | Silent vendor drift | Probe battery + change-point detection; provenance-based attribution; distillation freeze on drift |
 | Classified content leaves its boundary | Classification on entries and tasks; ceilings on destinations; session handling and current label; writes inherit; outbound calls require current label ≤ ceiling; downward only through `declassify` |
 | Exfiltration through a tool | Ceiling per server; grants per principal per server; current label checked per call; repeated denials alert as probing |
-| Write contention on the record | Append-only log as the hot path; one materializer per domain; git off both hot paths |
+| Write contention on the record | Append-only log as the hot path; one materializer per domain; the record off both hot paths |
 | Contributor withdrawal | Ownership test (§12): on-path components are institution-operated; contributed pieces are adopted at a version and retired without outage |
 | Erasure against an append-only record | Body removed by the engine; stub, erasure record, and receipt kept; derivations flagged and re-derived; replay sees the stub (§4) |
 | Institution retains a person's memory | The personal domain is held under the owner's grants; institutional servers hold views under grant; revocation drops them with receipts (§12) |
@@ -942,7 +942,7 @@ Resource classes differ in scarcity as well as price. Metered tokens are limited
 Milestones, not dates: each delivers a capability, states the outcome that proves it, and gates the next. Duration depends on team and context; the sequence and the evidence do not.
 
 **M1: Memory works.**
-*Capability:* memory repos with the entry schema; retrieval on Postgres FTS with summaries-first responses; T0 discipline; one domain's task ledger with leases and handoff notes.
+*Capability:* a memory record with the entry schema; retrieval on Postgres FTS with summaries-first responses; T0 discipline; one domain's task ledger with leases and handoff notes.
 *Exit criteria:* a fresh agent recovers context from a handoff note and T0 alone, with no transcript replay; known-item lookups land top-3; cost-per-task on the pilot domain is measured and trending down against the pre-memory baseline.
 
 **M2: The system senses itself.**
@@ -958,14 +958,14 @@ Milestones, not dates: each delivers a capability, states the outcome that prove
 *Exit criteria:* a cross-domain request completes through ledgers and summaries without foreign-memory writes; prefetch precision clears its threshold in production; an injected vendor-drift simulation (swapped model behind a fixed alias) is detected and attributed within the published bound.
 
 **M5: Self-improvement, gated.**
-*Capability:* dom-platform with the full evolution loop of §10; live re-execution replay; the acquisition import pipeline; the restore-from-git drill as a standing exercise.
-*Exit criteria:* a distilled harness improvement passes performance, safety, and review gates and measurably lowers cost-per-task on held-out work; a planted privilege-widening candidate is quarantined by the safety gate; the serving layer has been rebuilt from git and object-store snapshots alone.
+*Capability:* dom-platform with the full evolution loop of §10; live re-execution replay; the acquisition import pipeline; the restore-from-snapshot drill as a standing exercise.
+*Exit criteria:* a distilled harness improvement passes performance, safety, and review gates and measurably lowers cost-per-task on held-out work; a planted privilege-widening candidate is quarantined by the safety gate; the serving layer has been rebuilt from snapshots of the record alone.
 
 Milestones are cumulative and each is independently useful; a deployment can stop at M2 or M3 and still hold a coherent, valuable system. Within a milestone, order is free; across milestones, the exit criteria are the dependency.
 
 **A reference implementation for one person, runnable locally.** The smallest deployment of this design is a personal domain (§12), and one should exist as a reference. One process on the person's machine:
 
-- the record in files under version control, or in a local object store;
+- the record in a local versioned store;
 - index and ledger in an embedded database;
 - grants in a policy file the person edits;
 - the surface of Appendix A as one memory server;
@@ -974,7 +974,7 @@ Milestones are cumulative and each is independently useful; a deployment can sto
 
 Its review gate is the owner: the librarian proposes, the person approves. It is the conformance check for the surface, since a harness that works against it works against any serving layer, and it lets people run the design before their institution has built anything.
 
-What to revisit as the system grows: the search engine (Postgres to OpenSearch at scale), the log store (files to Kafka), the record engine if verified-tier commit rates ever strain git (a git-semantics database preserves the guarantees), the ledger's projection and origin index if claim latency or partition count outgrows one database, and the domain boundaries themselves, on evidence, through the process in §12.
+What to revisit as the system grows: the search engine (Postgres to OpenSearch at scale), the log store (files to Kafka), the record engine if write rates ever strain it (any engine that keeps the seven guarantees of §4 will do), the ledger's projection and origin index if claim latency or partition count outgrows one database, and the domain boundaries themselves, on evidence, through the process in §12.
 
 ---
 
