@@ -25,6 +25,18 @@ make check       # format, clippy, tests, guard tests
 | `make test` | `cargo test` alone |
 | `make fmt` | `cargo fmt`, rewriting in place |
 | `make run ARGS='...'` | the `memory` binary, for example `ARGS='init /tmp/m --domain dom-me'` |
+| `make verify` | `check` plus `cargo deny`, `cargo machete`, coverage against `COVERAGE_MIN`, and the wasm build of `dm-core`. What CI runs |
+| `make coverage` | `cargo llvm-cov` over the workspace; an lcov report lands in `target/lcov.info` |
+
+`verify` needs three cargo extensions. Install them once:
+
+```sh
+cargo install cargo-binstall
+cargo binstall cargo-llvm-cov cargo-deny cargo-machete
+```
+
+`rust-toolchain.toml` pins the channel and pulls in rustfmt, clippy, the llvm tools, and
+the wasm targets, so `rustup` sets the rest up on first use.
 
 One topic per worktree, so several people and sessions can work at once:
 

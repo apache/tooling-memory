@@ -1,14 +1,3 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+//! The task ledger: tasks, leases, handoffs, origin dedup. Backends behind one trait.
+//!
+//! Not yet implemented; see PLAN.md, M0.

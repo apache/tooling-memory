@@ -1,0 +1,5 @@
+edition = "2021"
+# One line ending everywhere, so a Windows checkout and a Linux checkout produce the same
+# diff and the same digest.
+newline_style = "Unix"
+use_field_init_shorthand = true

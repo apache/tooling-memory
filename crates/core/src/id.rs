@@ -19,18 +19,24 @@ fn suffix(len: usize) -> String {
         .collect()
 }
 
+/// A fresh entry id for `domain`.
 pub fn new_entry_id(domain: &str) -> String {
     format!("mem-{}-{}", tag(domain), suffix(8))
 }
 
+/// A fresh task id for `domain`.
 pub fn new_task_id(domain: &str) -> String {
     format!("task-{}-{}", tag(domain), suffix(8))
 }
 
+/// Whether `s` has the shape of an entry id.
+#[must_use]
 pub fn is_entry_id(s: &str) -> bool {
     s.starts_with("mem-") && s.len() > 6
 }
 
+/// Whether `s` has the shape of a task id.
+#[must_use]
 pub fn is_task_id(s: &str) -> bool {
     s.starts_with("task-") && s.len() > 7
 }

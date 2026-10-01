@@ -1,0 +1,8 @@
+# Thresholds for the complexity lints enabled in Cargo.toml. These may not be raised to
+# make a reading pass; split the function instead. Lowering them is always fine.
+cognitive-complexity-threshold = 15
+too-many-lines-threshold = 80
+
+# Tests may unwrap: a panic there is the failure being reported.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

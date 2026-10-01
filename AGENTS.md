@@ -76,6 +76,27 @@ Rust stable, one workspace, `cargo` on the host. A rule that applies everywhere 
 here; one that applies to a crate belongs in an `AGENTS.md` in that crate, where it is read
 by whoever is about to break it.
 
+## Quality gates, and where each lives
+
+Rust's conventions are followed as they stand; the thresholds are files, not memory.
+
+| Concern | Convention here | Where |
+| ------- | --------------- | ----- |
+| Tests | Unit tests in a `#[cfg(test)] mod tests` beside the code; integration tests in each crate's `tests/`; doc tests on public examples | `cargo test --workspace` |
+| Formatting | rustfmt, Unix line endings on every platform | `rustfmt.toml` |
+| Lints and complexity | clippy with warnings as errors; `cognitive_complexity` and `too_many_lines` enabled, thresholds in `clippy.toml`; `unwrap_used` outside tests; `missing_docs` on public items | `Cargo.toml` `[workspace.lints]`, `clippy.toml` |
+| Coverage | `cargo llvm-cov`, line coverage over the workspace, `COVERAGE_MIN` in the Makefile | `make coverage` |
+| Dependencies | `cargo deny` for advisories, licences, duplicates, sources; `cargo machete` for unused | `deny.toml`, `make deny`, `make machete` |
+| Portability | the workspace tests on Linux and Windows; `dm-core` builds for `wasm32-unknown-unknown` | CI, `make wasm-check` |
+
+Two of these are ratchets. **`COVERAGE_MIN` may be raised and may not be lowered**; raise
+it in the commit whose tests earn it. **The thresholds in `clippy.toml` may not be raised**
+to make a reading pass; split the function. An `#[allow]` on a lint is a decision and says
+why in a comment on the same line.
+
+`make check` is the pre-commit gate and is fast. `make verify` is what CI runs and adds
+coverage, dependencies, and the wasm build. Run `verify` before a push.
+
 ## Pull requests
 
 - Branch from `main`, open the PR against `main`, `make check` passing first.
