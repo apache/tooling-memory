@@ -25,7 +25,11 @@ export MEMORY_ROOT=~/memory
 ./target/release/memory t0
 ```
 
-Point a harness at it over stdio. For Claude Code:
+To run it the way the Foundation would, with every model call through a LiteLLM gateway
+that holds your provider key, see [local/README.md](local/README.md): `make local-up`,
+`make local-key`, then `scripts/claude-via-llmao.sh`.
+
+Or point a harness at the memory server alone over stdio. For Claude Code:
 
 ```sh
 claude mcp add memory -- /path/to/memory --root ~/memory serve --author "agent:claude-code"

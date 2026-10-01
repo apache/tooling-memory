@@ -1,0 +1,21 @@
+# LiteLLM configuration for the local gateway. Static routes, no secrets in the file.
+#
+# Any model id a client names is passed to the provider its name implies, with that
+# provider's key read from the environment. Claude Code names models like
+# `claude-sonnet-4-5`, which LiteLLM resolves to Anthropic. Add explicit entries here when
+# a model id should map somewhere else, which is how the Foundation's classes would be
+# expressed.
+
+model_list:
+  - model_name: "*"
+    litellm_params:
+      model: "*"
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: false
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600

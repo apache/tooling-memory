@@ -1,0 +1,51 @@
+# The local stack, the gateway half: LiteLLM as llmao's proxy, with Postgres for its keys
+# and spend. Run with `make local-up`, which reads local/.env. Nothing here holds a
+# credential in the file; keys come from the environment at start.
+#
+# This is the same shape the Foundation runs (LiteLLM over Postgres), without the asfquart
+# front desk that issues PATs against ASF identity. Locally the master key mints a virtual
+# key once, and that key is what Claude Code uses.
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-litellm}
+    volumes:
+      - litellm-pg:/var/lib/postgresql/data
+    # LiteLLM shares this network namespace (below), so the gateway's port is published
+    # here. Sharing the namespace rather than resolving a service name keeps the file
+    # working on Podman with the CNI backend, where compose DNS is not available.
+    ports:
+      - "127.0.0.1:4000:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    network_mode: "service:postgres"
+    command: ["--config", "/etc/litellm/litellm.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in local/.env}
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:-litellm}@127.0.0.1:5432/litellm
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      STORE_MODEL_IN_DB: "False"
+    volumes:
+      - ./litellm.yaml:/etc/litellm/litellm.yaml:ro,Z
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/health/liveliness || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  litellm-pg:

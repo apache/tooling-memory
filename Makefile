@@ -1,4 +1,31 @@
-.PHONY: init check verify fmt fmt-check clippy test guard-test deny machete coverage wasm-check run build
+.PHONY: init check verify fmt fmt-check clippy test guard-test deny machete coverage wasm-check run build \
+	local-up local-down local-logs local-key local-memory
+
+# ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
+# Reads local/.env. See local/README.md.
+COMPOSE ?= podman compose
+LOCAL_ENV = local/.env
+
+local-up:
+	@test -f $(LOCAL_ENV) || { echo "copy local/.env.example to local/.env and fill it in"; exit 1; }
+	$(COMPOSE) --env-file $(LOCAL_ENV) -f local/compose.yaml up -d
+	@echo "LiteLLM on http://127.0.0.1:4000; next: make local-key"
+
+# LiteLLM shares Postgres's network namespace, so it goes first or down trips over it.
+local-down:
+	$(COMPOSE) --env-file $(LOCAL_ENV) -f local/compose.yaml rm -sf litellm
+	$(COMPOSE) --env-file $(LOCAL_ENV) -f local/compose.yaml down
+
+local-logs:
+	$(COMPOSE) --env-file $(LOCAL_ENV) -f local/compose.yaml logs -f litellm
+
+local-key:
+	sh scripts/local-key.sh
+
+local-memory:
+	@set -a; . ./$(LOCAL_ENV); set +a; \
+	if [ -f "$$MEMORY_ROOT/grants.toml" ]; then echo "memory root at $$MEMORY_ROOT"; \
+	else target/release/memory --root "$$MEMORY_ROOT" init --domain dom-me; fi
 
 # `make check` is the pre-commit gate: fast, and what every commit must pass.
 check: fmt-check clippy test guard-test
