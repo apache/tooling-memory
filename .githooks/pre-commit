@@ -1,0 +1,6 @@
+#!/bin/sh
+# Installed by `make init` (git config core.hooksPath .githooks).
+# The gate is `make check`; a commit that skips it moves the failure to CI at best.
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+exec make check

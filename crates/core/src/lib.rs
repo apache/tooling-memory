@@ -12,7 +12,9 @@ pub mod id;
 pub mod manifest;
 
 /// How sensitive an entry is. Ordered: public < internal < restricted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Label {
     #[default]
@@ -45,7 +47,9 @@ impl std::str::FromStr for Label {
 }
 
 /// How far an entry has been checked. Ordered: raw < curated < verified.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustTier {
     #[default]
@@ -356,8 +360,14 @@ mod tests {
 
     #[test]
     fn rejects_without_frontmatter() {
-        assert!(matches!(Entry::parse("just text"), Err(Error::NoFrontmatter)));
-        assert!(matches!(Entry::parse("---\nid: x\n"), Err(Error::NoFrontmatter)));
+        assert!(matches!(
+            Entry::parse("just text"),
+            Err(Error::NoFrontmatter)
+        ));
+        assert!(matches!(
+            Entry::parse("---\nid: x\n"),
+            Err(Error::NoFrontmatter)
+        ));
     }
 
     #[test]

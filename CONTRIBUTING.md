@@ -1,0 +1,43 @@
+# Contributing
+
+## Prerequisites
+
+- Rust stable, via [rustup](https://rustup.rs). `rustup target add wasm32-unknown-unknown
+  wasm32-wasip2` for the browser and plugin targets; not needed for the native build.
+- A C toolchain for the bundled SQLite (`build-essential` on Debian and Ubuntu, the Visual
+  Studio Build Tools on Windows).
+- `make`. On Windows, run the targets from Git Bash or WSL.
+
+## Setup
+
+```sh
+git clone git@github.com:sstriker/durable-memory.git
+cd durable-memory
+make init        # installs the pre-commit hook
+make check       # format, clippy, tests, guard tests
+```
+
+## Day to day
+
+| Command | What it runs |
+| ------- | ------------ |
+| `make check` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the guard tests. The pre-commit gate |
+| `make test` | `cargo test` alone |
+| `make fmt` | `cargo fmt`, rewriting in place |
+| `make run ARGS='...'` | the `memory` binary, for example `ARGS='init /tmp/m --domain dom-me'` |
+
+One topic per worktree, so several people and sessions can work at once:
+
+```sh
+git worktree add ../durable-memory-<topic> -b feat/<topic> origin/main
+```
+
+## Pull requests
+
+Branch from `main`. `make check` passes before every commit, which the hook enforces. Write
+the commit subject with a conventional-commit prefix. Open the PR against `main` with a
+description that says what changed and why, and for a new test, what it reported against
+the code before the change.
+
+[AGENTS.md](AGENTS.md) is the contract for AI agents working here, and most of it is good
+advice for people too.
