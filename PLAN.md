@@ -36,6 +36,12 @@ The one piece of code that matters most is the **wrapper**: a per-session memory
 
 Items 1 through 4 are the demo. Items 5 through 7 are what makes it the paper's design rather than a notes folder.
 
+**Status, 1 October 2026.** All seven pass as `crates/memory/tests/cli.rs` against the
+built binary, and `memory serve` answers a raw JSON-RPC session: initialize, fifteen
+tools, a write under the session's author, the T0 resource. Left before the weekend: a
+run against Claude Code or Codex as the client, with what happened written down; a
+one-page demo script; and whatever that run turns up.
+
 **In scope for M0**
 
 - `core`: entry schema and frontmatter (id, type, domain, author, created, source, confidence, trust_tier, review_by, supersedes, classification), bundle manifest, digests, the label order.

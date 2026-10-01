@@ -14,17 +14,41 @@ A per-session memory server, `memory`, that an agent harness reaches over MCP. I
                                               └──▶ grants.toml
 ```
 
-## Build
+## Build and run
 
-Rust stable. Then:
+Rust stable, then:
 
-```
+```sh
 cargo build --release
-./target/release/memory init ~/memory --domain dom-me
-./target/release/memory serve ~/memory
+export MEMORY_ROOT=~/memory
+./target/release/memory init --domain dom-me
+./target/release/memory t0
 ```
 
-Point your harness's MCP configuration at `memory serve ~/memory` over stdio.
+Point a harness at it over stdio. For Claude Code:
+
+```sh
+claude mcp add memory -- /path/to/memory --root ~/memory serve --author "agent:claude-code"
+```
+
+The agent gets `t0`, `search`, `get`, `write`, `list`, the ledger tools, and a
+`memory://t0/dom-me` resource. Its writes land at raw trust under the author you gave.
+
+From the command line, the same operations:
+
+```sh
+echo "Stopped at step 3. Next: digests." | memory write --kind handoff --title "Import, step 3"
+memory search digests
+memory get mem-me-xxxxxxxx
+memory task create "Finish the import" --priority 5
+memory task admit task-me-xxxxxxxx
+memory task claim-next
+memory export ../bundle --max-label internal
+memory reindex
+```
+
+`crates/memory/tests/cli.rs` runs the seven steps PLAN.md calls M0, end to end, against the
+built binary.
 
 ## Layout
 
@@ -41,4 +65,6 @@ Point your harness's MCP configuration at `memory serve ~/memory` over stdio.
 
 ## Status
 
-Pre-M0. See [PLAN.md](PLAN.md) for what M0 is and when.
+M0 code complete as of 1 October 2026: the seven steps pass as an integration test, and
+the MCP server answers a raw JSON-RPC session. Not yet done: a recorded run against a real
+harness, and the developer weekend on 10 and 11 October. See [PLAN.md](PLAN.md).
