@@ -8,8 +8,11 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use time::OffsetDateTime;
 
+pub mod filter;
 pub mod id;
 pub mod manifest;
+
+pub use filter::ReadFilter;
 
 /// How sensitive an entry is. Ordered: public < internal < restricted.
 #[derive(
