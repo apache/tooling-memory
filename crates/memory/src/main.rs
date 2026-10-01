@@ -756,6 +756,7 @@ fn relay(
     Ok(code)
 }
 
+#[cfg(unix)]
 fn spawn_harness(argv: &[OsString]) -> Result<i32, String> {
     #[cfg(target_os = "linux")]
     {
