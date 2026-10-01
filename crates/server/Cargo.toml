@@ -6,6 +6,20 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+dm-core = { version = "0.1.0", path = "../core" }
+dm-index = { version = "0.1.0", path = "../index" }
+dm-ledger = { version = "0.1.0", path = "../ledger" }
+dm-policy = { version = "0.1.0", path = "../policy" }
+dm-store = { version = "0.1.0", path = "../store" }
+rmcp = { version = "3.5.0", features = ["server", "transport-io", "macros"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0.151"
+thiserror.workspace = true
+time = { version = "0.3.55", features = ["formatting", "serde-well-known", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-std"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

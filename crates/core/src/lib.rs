@@ -78,12 +78,13 @@ impl fmt::Display for TrustTier {
 }
 
 /// What kind of knowledge an entry holds. The kinds age differently.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryType {
     /// Context, options, choice, rationale. Superseded, never expired.
     Decision,
-    /// Decays fast; carries a review date.
+    /// Decays fast; carries a review date. The default kind.
+    #[default]
     Fact,
     /// How things are done here; needs an owner.
     Convention,
