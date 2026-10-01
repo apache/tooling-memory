@@ -598,16 +598,22 @@ async fn launch(
     let workdir = std::fs::canonicalize(&workdir)?;
     let p = prepare_launch(root, harness, auth).await?;
 
+    #[cfg(unix)]
     let serve = {
         let egress = p.egress.clone();
         let socket = p.socket.clone();
         tokio::spawn(async move { egress.serve_unix(&socket).await })
     };
+    #[cfg(unix)]
     for _ in 0..100 {
         if p.socket.exists() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    #[cfg(not(unix))]
+    if !unconfined {
+        return Err("confinement needs Linux; run under WSL2, or pass --unconfined".into());
     }
     eprintln!(
         "memory: {} confined to {} · model calls via {} at ceiling {} · session {}",
@@ -640,8 +646,11 @@ async fn launch(
         run_confined(&p, harness, auth, &workdir, &args).await?
     };
 
-    serve.abort();
-    std::fs::remove_file(&p.socket).ok();
+    #[cfg(unix)]
+    {
+        serve.abort();
+        std::fs::remove_file(&p.socket).ok();
+    }
     report_usage(&p.egress);
     std::process::exit(code);
 }
@@ -698,6 +707,16 @@ fn run_unconfined(
 
 /// Inside the sandbox, as pid 1 of the harness's namespace: forward the loopback port to
 /// the socket and run the harness.
+#[cfg(not(unix))]
+fn relay(
+    _socket: &Path,
+    _listen: &str,
+    _argv: &[OsString],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    Err("the relay runs inside a Linux sandbox only".into())
+}
+
+#[cfg(unix)]
 fn relay(
     socket: &Path,
     listen: &str,

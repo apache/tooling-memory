@@ -156,10 +156,12 @@ impl Egress {
     }
 
     /// Serve on a unix socket until the task is cancelled. Removes a stale socket first.
+    /// Unix only; Windows runs the harness unconfined over TCP.
     ///
     /// # Errors
     ///
     /// When the socket cannot be bound or serving fails.
+    #[cfg(unix)]
     pub async fn serve_unix(&self, path: &FsPath) -> Result<(), Error> {
         if path.exists() {
             std::fs::remove_file(path)?;
