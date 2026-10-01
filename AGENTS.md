@@ -41,6 +41,11 @@ with an explicit request from the user, ask before overriding it.
   says "SQLite" or "S3" is a bug.
 - **The CLI and the MCP server call the same library functions.** Nothing lives only in
   the binary.
+- **Nothing reaches outside its root.** The wrapper is a confined process: it touches the
+  record, its own state, and its grants file, each behind a rooted operator, and nothing
+  else on the host. A name is validated before it becomes a path. Code that opens a file
+  by an absolute path, reads an environment variable for a location, or follows a path
+  it was handed is a bug unless it is the binary resolving its own mounts at startup.
 
 ## Some of these are held for you
 

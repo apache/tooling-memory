@@ -1,3 +1,537 @@
-//! The record: entries as versioned objects behind Apache OpenDAL. Versions, tombstones, nothing edited in place.
+//! The record: entries as versioned objects behind Apache OpenDAL.
 //!
-//! Not yet implemented; see PLAN.md, M0.
+//! Four things hold here, because the rest of the system depends on them:
+//!
+//! - every write is a new version; the previous text is kept, byte for byte;
+//! - nothing is edited in place: the current version is replaced, never patched;
+//! - demotion leaves a tombstone, which is the same entry with a status;
+//! - the whole record can be read back, so an index can be rebuilt from it alone.
+//!
+//! The store is rooted. Every path it touches is relative to the operator's root, names
+//! are validated before they become paths, and nothing can name a file outside the root.
+//! On a laptop the root is a directory; in an institution it is a bucket. The code does
+//! not know which.
+//!
+//! Layout, per domain:
+//!
+//! ```text
+//! record/<domain>/<id>.md                         the current version
+//! record/<domain>/.history/<id>/<stamp>-<digest>.md   every previous version
+//! ```
+
+use dm_core::{digest, Entry, Status};
+use opendal::Operator;
+use std::path::Path;
+use time::{format_description::FormatItem, macros::format_description, OffsetDateTime};
+
+const RECORD: &str = "record";
+const HISTORY: &str = ".history";
+const STAMP: &[FormatItem<'_>] =
+    format_description!("[year][month][day]T[hour][minute][second].[subsecond digits:6]Z");
+
+/// What can go wrong at the record.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The backend refused or failed.
+    #[error("record backend: {0}")]
+    Backend(#[from] opendal::Error),
+    /// Text in the record is not a valid entry.
+    #[error("entry {path}: {source}")]
+    Entry {
+        /// The path that failed to parse.
+        path: String,
+        /// Why.
+        source: dm_core::Error,
+    },
+    /// A domain or id that cannot be a path segment.
+    #[error("bad name {0:?}: letters, digits, '.', '_' and '-' only, not starting with '.'")]
+    BadName(String),
+    /// Bytes in the record that are not UTF-8.
+    #[error("entry {0} is not UTF-8")]
+    NotText(String),
+    /// Asked for an entry that is not there.
+    #[error("no entry {id} in {domain}")]
+    NotFound {
+        /// The domain asked for.
+        domain: String,
+        /// The id asked for.
+        id: String,
+    },
+}
+
+/// The outcome of a write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Written {
+    /// The entry's id.
+    pub id: String,
+    /// Digest of the text now current.
+    pub digest: String,
+    /// Where the previous version went, if there was one and it differed.
+    pub archived: Option<String>,
+    /// False when the text was already current and nothing was written.
+    pub changed: bool,
+}
+
+/// One previous version of an entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Version {
+    /// `<stamp>-<digest>`, which sorts by time.
+    pub name: String,
+    /// The text as it was.
+    pub text: String,
+}
+
+/// The record, behind one operator.
+#[derive(Clone)]
+pub struct Store {
+    op: Operator,
+}
+
+fn valid_name(s: &str) -> Result<&str, Error> {
+    let ok = !s.is_empty()
+        && !s.starts_with('.')
+        && s.len() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(s)
+    } else {
+        Err(Error::BadName(s.to_string()))
+    }
+}
+
+fn current_path(domain: &str, id: &str) -> Result<String, Error> {
+    Ok(format!(
+        "{RECORD}/{}/{}.md",
+        valid_name(domain)?,
+        valid_name(id)?
+    ))
+}
+
+fn history_dir(domain: &str, id: &str) -> Result<String, Error> {
+    Ok(format!(
+        "{RECORD}/{}/{HISTORY}/{}/",
+        valid_name(domain)?,
+        valid_name(id)?
+    ))
+}
+
+fn stamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(STAMP)
+        .unwrap_or_else(|_| "00000000T000000.000000Z".to_string())
+}
+
+impl Store {
+    /// A store over any operator. The operator's root is the record's boundary.
+    #[must_use]
+    pub fn from_operator(op: Operator) -> Store {
+        Store { op }
+    }
+
+    /// A store in a directory on disk, created if missing.
+    ///
+    /// # Errors
+    ///
+    /// When the backend cannot be built, for instance when the path is not a directory.
+    pub fn open_dir(root: &Path) -> Result<Store, Error> {
+        let root = root.to_string_lossy();
+        let op = Operator::new(opendal::services::Fs::default().root(&root))?;
+        Ok(Store::from_operator(op))
+    }
+
+    /// A store that lives only in memory, for tests and dry runs.
+    ///
+    /// # Errors
+    ///
+    /// Never in practice; the memory backend has nothing to fail on.
+    pub fn in_memory() -> Result<Store, Error> {
+        let op = Operator::new(opendal::services::Memory::default())?;
+        Ok(Store::from_operator(op))
+    }
+
+    /// Write an entry as the current version of its id in its domain.
+    ///
+    /// If a different version is current, it is archived first. If the same text is
+    /// already current, nothing is written. If the entry supersedes another that is still
+    /// active, that one is marked superseded, which is a write of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadName`] for a domain or id that cannot be a path, or a backend error.
+    pub async fn put(&self, entry: &Entry) -> Result<Written, Error> {
+        let domain = entry.front.domain.as_str();
+        let id = entry.front.id.as_str();
+        let path = current_path(domain, id)?;
+        let text = entry.render();
+        let new_digest = digest(&text);
+
+        let previous = self.read_text(&path).await?;
+        if previous.as_deref() == Some(text.as_str()) {
+            return Ok(Written {
+                id: id.to_string(),
+                digest: new_digest,
+                archived: None,
+                changed: false,
+            });
+        }
+
+        let mut archived = None;
+        if let Some(old) = previous {
+            let name = format!("{}-{}", stamp(), &digest(&old)[..8]);
+            let hist = format!("{}{name}.md", history_dir(domain, id)?);
+            self.op.write(&hist, old.into_bytes()).await?;
+            archived = Some(name);
+        }
+        self.op.write(&path, text.into_bytes()).await?;
+
+        if let Some(older) = &entry.front.supersedes {
+            if let Some(mut old) = self.get(domain, older).await? {
+                if old.is_active() {
+                    old.front.status = Some(Status::Superseded);
+                    Box::pin(self.put(&old)).await?;
+                }
+            }
+        }
+
+        Ok(Written {
+            id: id.to_string(),
+            digest: new_digest,
+            archived,
+            changed: true,
+        })
+    }
+
+    /// The current version of an entry, parsed. `None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// A bad name, a backend error, or text in the record that is not an entry.
+    pub async fn get(&self, domain: &str, id: &str) -> Result<Option<Entry>, Error> {
+        let path = current_path(domain, id)?;
+        match self.read_text(&path).await? {
+            None => Ok(None),
+            Some(text) => Entry::parse(&text)
+                .map(Some)
+                .map_err(|source| Error::Entry { path, source }),
+        }
+    }
+
+    /// The current version of an entry as text. `None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// A bad name or a backend error.
+    pub async fn get_text(&self, domain: &str, id: &str) -> Result<Option<String>, Error> {
+        self.read_text(&current_path(domain, id)?).await
+    }
+
+    /// Demote an entry: a new version with `status: demoted`, the body kept.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when there is no such entry, or what [`Store::put`] returns.
+    pub async fn demote(&self, domain: &str, id: &str) -> Result<Written, Error> {
+        let mut entry = self.get(domain, id).await?.ok_or_else(|| Error::NotFound {
+            domain: domain.to_string(),
+            id: id.to_string(),
+        })?;
+        entry.front.status = Some(Status::Demoted);
+        self.put(&entry).await
+    }
+
+    /// Ids with a current version in a domain, tombstones included, sorted.
+    ///
+    /// # Errors
+    ///
+    /// A bad name or a backend error.
+    pub async fn list(&self, domain: &str) -> Result<Vec<String>, Error> {
+        let dir = format!("{RECORD}/{}/", valid_name(domain)?);
+        let mut ids: Vec<String> = self
+            .op
+            .list(&dir)
+            .await?
+            .into_iter()
+            .filter(|e| e.metadata().is_file())
+            .filter_map(|e| e.name().strip_suffix(".md").map(str::to_string))
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Every domain with a directory in the record, sorted.
+    ///
+    /// # Errors
+    ///
+    /// A backend error.
+    pub async fn domains(&self) -> Result<Vec<String>, Error> {
+        let mut names: Vec<String> = self
+            .op
+            .list(&format!("{RECORD}/"))
+            .await?
+            .into_iter()
+            .filter(|e| e.metadata().is_dir())
+            .map(|e| e.name().trim_end_matches('/').to_string())
+            .filter(|n| !n.is_empty() && !n.starts_with('.'))
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// Every previous version of an entry, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A bad name, a backend error, or bytes that are not text.
+    pub async fn history(&self, domain: &str, id: &str) -> Result<Vec<Version>, Error> {
+        let dir = history_dir(domain, id)?;
+        if !self.op.exists(&dir).await? {
+            return Ok(Vec::new());
+        }
+        let mut names: Vec<String> = self
+            .op
+            .list(&dir)
+            .await?
+            .into_iter()
+            .filter(|e| e.metadata().is_file())
+            .filter_map(|e| e.name().strip_suffix(".md").map(str::to_string))
+            .collect();
+        names.sort();
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let path = format!("{dir}{name}.md");
+            let text = self
+                .read_text(&path)
+                .await?
+                .ok_or_else(|| Error::NotText(path.clone()))?;
+            out.push(Version { name, text });
+        }
+        Ok(out)
+    }
+
+    /// Every current entry in every domain. What a rebuild reads.
+    ///
+    /// # Errors
+    ///
+    /// A backend error, or text in the record that is not an entry.
+    pub async fn all(&self) -> Result<Vec<Entry>, Error> {
+        let mut out = Vec::new();
+        for domain in self.domains().await? {
+            for id in self.list(&domain).await? {
+                if let Some(e) = self.get(&domain, &id).await? {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn read_text(&self, path: &str) -> Result<Option<String>, Error> {
+        match self.op.read(path).await {
+            Ok(buf) => String::from_utf8(buf.to_vec())
+                .map(Some)
+                .map_err(|_| Error::NotText(path.to_string())),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dm_core::{EntryType, Frontmatter, Label, TrustTier};
+    use time::macros::datetime;
+
+    fn entry(domain: &str, id: &str, body: &str) -> Entry {
+        Entry {
+            front: Frontmatter {
+                id: id.into(),
+                entry_type: EntryType::Fact,
+                domain: domain.into(),
+                author: "human:test:me".into(),
+                created: datetime!(2026-10-01 10:00 UTC),
+                source: vec![],
+                confidence: None,
+                trust_tier: TrustTier::Raw,
+                review_by: None,
+                supersedes: None,
+                policy_context: vec![],
+                classification: Label::Public,
+                status: None,
+                origin: None,
+                summary: None,
+                title: None,
+            },
+            body: body.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_then_get_round_trips() {
+        let s = Store::in_memory().unwrap();
+        let e = entry("dom-a", "mem-a-1", "First.\n");
+        let w = s.put(&e).await.unwrap();
+        assert!(w.changed);
+        assert!(w.archived.is_none());
+        assert_eq!(w.digest, digest(&e.render()));
+        assert_eq!(s.get("dom-a", "mem-a-1").await.unwrap(), Some(e));
+        assert_eq!(s.get("dom-a", "mem-a-9").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn every_write_is_a_new_version_and_the_old_text_survives() {
+        let s = Store::in_memory().unwrap();
+        let v1 = entry("dom-a", "mem-a-1", "First.\n");
+        let v2 = entry("dom-a", "mem-a-1", "Second.\n");
+        s.put(&v1).await.unwrap();
+        let w = s.put(&v2).await.unwrap();
+        assert!(w.changed);
+        let archived = w.archived.expect("previous version archived");
+        let hist = s.history("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].name, archived);
+        assert_eq!(hist[0].text, v1.render(), "archived byte for byte");
+        assert_eq!(s.get("dom-a", "mem-a-1").await.unwrap(), Some(v2));
+    }
+
+    #[tokio::test]
+    async fn identical_write_changes_nothing() {
+        let s = Store::in_memory().unwrap();
+        let e = entry("dom-a", "mem-a-1", "Same.\n");
+        s.put(&e).await.unwrap();
+        let w = s.put(&e).await.unwrap();
+        assert!(!w.changed);
+        assert!(w.archived.is_none());
+        assert!(s.history("dom-a", "mem-a-1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_is_oldest_first() {
+        let s = Store::in_memory().unwrap();
+        for i in 1..=3 {
+            s.put(&entry("dom-a", "mem-a-1", &format!("v{i}\n")))
+                .await
+                .unwrap();
+        }
+        let hist = s.history("dom-a", "mem-a-1").await.unwrap();
+        let bodies: Vec<_> = hist
+            .iter()
+            .map(|v| Entry::parse(&v.text).unwrap().body)
+            .collect();
+        assert_eq!(bodies, vec!["v1\n", "v2\n"]);
+        assert!(hist[0].name < hist[1].name);
+    }
+
+    #[tokio::test]
+    async fn demotion_leaves_a_tombstone_with_the_body() {
+        let s = Store::in_memory().unwrap();
+        s.put(&entry("dom-a", "mem-a-1", "Kept.\n")).await.unwrap();
+        s.demote("dom-a", "mem-a-1").await.unwrap();
+        let t = s.get("dom-a", "mem-a-1").await.unwrap().unwrap();
+        assert_eq!(t.front.status, Some(Status::Demoted));
+        assert!(!t.is_active());
+        assert_eq!(t.body, "Kept.\n");
+        assert_eq!(s.list("dom-a").await.unwrap(), vec!["mem-a-1"]);
+        assert!(matches!(
+            s.demote("dom-a", "mem-a-nope").await,
+            Err(Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn superseding_marks_the_old_entry() {
+        let s = Store::in_memory().unwrap();
+        s.put(&entry("dom-a", "mem-a-1", "Old.\n")).await.unwrap();
+        let mut newer = entry("dom-a", "mem-a-2", "New.\n");
+        newer.front.supersedes = Some("mem-a-1".into());
+        s.put(&newer).await.unwrap();
+        let old = s.get("dom-a", "mem-a-1").await.unwrap().unwrap();
+        assert_eq!(old.front.status, Some(Status::Superseded));
+        assert_eq!(s.history("dom-a", "mem-a-1").await.unwrap().len(), 1);
+        // superseding again is idempotent: the old one is no longer active
+        s.put(&newer).await.unwrap();
+        assert_eq!(s.history("dom-a", "mem-a-1").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_domains_and_all_for_rebuild() {
+        let s = Store::in_memory().unwrap();
+        s.put(&entry("dom-b", "mem-b-1", "b1\n")).await.unwrap();
+        s.put(&entry("dom-a", "mem-a-2", "a2\n")).await.unwrap();
+        s.put(&entry("dom-a", "mem-a-1", "a1\n")).await.unwrap();
+        s.put(&entry("dom-a", "mem-a-1", "a1 again\n"))
+            .await
+            .unwrap();
+        assert_eq!(s.domains().await.unwrap(), vec!["dom-a", "dom-b"]);
+        assert_eq!(s.list("dom-a").await.unwrap(), vec!["mem-a-1", "mem-a-2"]);
+        let all = s.all().await.unwrap();
+        let ids: Vec<_> = all.iter().map(|e| e.front.id.as_str()).collect();
+        assert_eq!(ids, vec!["mem-a-1", "mem-a-2", "mem-b-1"]);
+        assert_eq!(
+            all[0].body, "a1 again\n",
+            "all() reads current versions only"
+        );
+        assert!(s.list("dom-none").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn names_that_could_leave_the_root_are_refused() {
+        let s = Store::in_memory().unwrap();
+        for bad in ["../x", "a/b", ".hidden", "", "a b", "x\\y", "..", "."] {
+            assert!(
+                matches!(s.get(bad, "mem-a-1").await, Err(Error::BadName(_))),
+                "domain {bad:?}"
+            );
+            assert!(
+                matches!(s.get("dom-a", bad).await, Err(Error::BadName(_))),
+                "id {bad:?}"
+            );
+        }
+        let mut e = entry("dom-a", "../escape", "x\n");
+        assert!(matches!(s.put(&e).await, Err(Error::BadName(_))));
+        e.front.id = "ok".into();
+        e.front.domain = "../escape".into();
+        assert!(matches!(s.put(&e).await, Err(Error::BadName(_))));
+    }
+
+    #[tokio::test]
+    async fn on_disk_layout_is_what_the_docs_say() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_dir(dir.path()).unwrap();
+        s.put(&entry("dom-a", "mem-a-1", "v1\n")).await.unwrap();
+        let w = s.put(&entry("dom-a", "mem-a-1", "v2\n")).await.unwrap();
+        let current = dir.path().join("record/dom-a/mem-a-1.md");
+        assert!(current.is_file());
+        assert!(std::fs::read_to_string(&current).unwrap().ends_with("v2\n"));
+        let hist = dir
+            .path()
+            .join("record/dom-a/.history/mem-a-1")
+            .join(format!("{}.md", w.archived.unwrap()));
+        assert!(hist.is_file(), "{}", hist.display());
+        assert!(std::fs::read_to_string(&hist).unwrap().ends_with("v1\n"));
+        // a second store over the same directory sees the same record
+        let again = Store::open_dir(dir.path()).unwrap();
+        assert_eq!(again.list("dom-a").await.unwrap(), vec!["mem-a-1"]);
+        assert_eq!(again.history("dom-a", "mem-a-1").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn text_that_is_not_an_entry_is_an_error_not_a_panic() {
+        let s = Store::in_memory().unwrap();
+        s.op.write("record/dom-a/mem-a-1.md", b"not an entry".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.get("dom-a", "mem-a-1").await,
+            Err(Error::Entry { .. })
+        ));
+        s.op.write("record/dom-a/mem-a-2.md", vec![0xff, 0xfe])
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.get("dom-a", "mem-a-2").await,
+            Err(Error::NotText(_))
+        ));
+    }
+}

@@ -20,6 +20,7 @@ The one piece of code that matters most is the **wrapper**: a per-session memory
 | Agent binding | MCP over stdio first, HTTP second | Every harness speaks it; the surface in the paper's Appendix A is the contract |
 | Policy | A grants file the owner edits; one principal | Identity is the serving layer's concern and a local server authenticates nobody (§5) |
 | Interchange | A directory of entries plus a manifest with digests | Aligns with where the Open Memory Protocol work converges |
+| The wrapper's reach | A confined process. It reads and writes only what is mounted into it: the record, its own state, its grants file. Nothing else on the host. Store and index roots are the mount points, and no name may become a path outside them | The agent beside it holds no credentials and the wrapper holds no ambient access. What is mounted is deliberate, as a container's mounts are, whether or not a container runtime is doing the confining |
 
 ## M0: the developer weekend, 10 and 11 October 2026
 
