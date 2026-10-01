@@ -194,6 +194,15 @@ dependencies = [
 [[package]]
 name = "dm-ledger"
 version = "0.1.0"
+dependencies = [
+ "dm-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+]
 
 [[package]]
 name = "dm-policy"
