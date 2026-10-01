@@ -88,7 +88,9 @@ fn restricted() -> Label {
 
 impl Grants {
     /// A starting file for one owner and one domain: the owner reads everything, the
-    /// domain's writes default to internal, and nothing may be sent anywhere yet.
+    /// domain's writes default to internal, and the three model destinations a laptop
+    /// uses accept up to internal. Restricted material stays home until the owner raises
+    /// a ceiling by hand.
     #[must_use]
     pub fn starter(owner: &str, domain: &str) -> Grants {
         let mut domains = BTreeMap::new();
@@ -98,11 +100,20 @@ impl Grants {
                 default_classification: Label::Internal,
             },
         );
+        let mut destinations = BTreeMap::new();
+        for d in ["anthropic", "openai", "llmao"] {
+            destinations.insert(
+                d.to_string(),
+                Destination {
+                    ceiling: Label::Internal,
+                },
+            );
+        }
         Grants {
             owner: owner.to_string(),
             handling: Label::Restricted,
             domains,
-            destinations: BTreeMap::new(),
+            destinations,
         }
     }
 
@@ -320,15 +331,23 @@ ceiling = "restricted"
     }
 
     #[test]
-    fn starter_round_trips_and_sends_nowhere() {
+    fn starter_round_trips_and_keeps_restricted_home() {
         let g = Grants::starter("human:local:me", "dom-me");
         let text = g.render().unwrap();
         let back = Grants::parse(&text).unwrap();
         assert_eq!(back, g);
         assert_eq!(back.handling, Label::Restricted);
-        assert!(back.destinations.is_empty());
+        assert_eq!(back.ceiling("anthropic"), Some(Label::Internal));
+        assert_eq!(back.ceiling("llmao"), Some(Label::Internal));
         assert!(!back.session().may_send(back.ceiling("anything")));
+        let mut s = back.session();
+        s.observe(Label::Restricted);
+        assert!(
+            !s.may_send(back.ceiling("anthropic")),
+            "restricted stays home"
+        );
         assert!(text.contains("[domains.dom-me]"), "{text}");
+        assert!(text.contains("[destinations.anthropic]"), "{text}");
     }
 
     #[test]

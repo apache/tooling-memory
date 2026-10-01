@@ -41,6 +41,9 @@ with an explicit request from the user, ask before overriding it.
   says "SQLite" or "S3" is a bug.
 - **The CLI and the MCP server call the same library functions.** Nothing lives only in
   the binary.
+- **`unsafe` lives in one crate.** `crates/sandbox` is the only crate that may use it,
+  because namespaces and mounts have to happen between fork and exec. Every block has a
+  SAFETY comment. Anywhere else the workspace forbids it; do not relax that.
 - **Nothing reaches outside its root.** The wrapper is a confined process: it touches the
   record, its own state, and its grants file, each behind a rooted operator, and nothing
   else on the host. A name is validated before it becomes a path. Code that opens a file
@@ -74,8 +77,10 @@ is held to the same rules by reading them.
 | `crates/index` | search index, summaries first; backends behind one trait | native |
 | `crates/ledger` | tasks, leases, origin dedup; backends behind one trait | native |
 | `crates/policy` | the grants file, labels, ceilings | native, wasm |
-| `crates/server` | the MCP and HTTP surface | native |
-| `crates/memory` | the binary | native |
+| `crates/server` | the memory surface: the service, T0, bundles, MCP | native |
+| `crates/egress` | the one way out: forwarding proxy with ceilings and usage, MCP over HTTP | native |
+| `crates/sandbox` | confinement: the plan, and a namespaces backend for Linux | native |
+| `crates/memory` | the binary: serve, launch, relay, and the command line | native |
 
 Rust stable, one workspace, `cargo` on the host. A rule that applies everywhere belongs
 here; one that applies to a crate belongs in an `AGENTS.md` in that crate, where it is read

@@ -25,6 +25,10 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "MPL-2.0",
+    # Mozilla's root certificate bundle, as webpki-root-certs ships it. Data, not code, under
+    # a permissive data licence. Allowed deliberately: the egress makes TLS connections to
+    # model providers and needs a root store.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 # The list above is what may be used, not what is used; an allowance nothing needs yet

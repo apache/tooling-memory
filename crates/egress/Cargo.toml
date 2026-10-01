@@ -1,0 +1,29 @@
+[package]
+name = "dm-egress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = "0.8"
+bytes = "1.12.1"
+dm-core = { version = "0.1.0", path = "../core" }
+dm-server = { version = "0.1.0", path = "../server" }
+futures-util = "0.3.34"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "rustls-native-certs", "stream", "http2"] }
+rmcp = { version = "3.5", features = ["server", "transport-streamable-http-server"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde_json = "1.0.151"
+thiserror.workspace = true
+time = { version = "0.3.45", features = ["formatting", "parsing"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

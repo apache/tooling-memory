@@ -25,9 +25,10 @@ export MEMORY_ROOT=~/memory
 ./target/release/memory t0
 ```
 
-To run it the way the Foundation would, with every model call through a LiteLLM gateway
-that holds your provider key, see [local/README.md](local/README.md): `make local-up`,
-`make local-key`, then `scripts/claude-via-llmao.sh`.
+To run a harness confined, with the memory server attached and every model call metered,
+see [local/README.md](local/README.md): `make launch` runs Claude Code or Codex in native
+namespaces with no network except the egress. The gateway half of that page runs LiteLLM
+locally so the Foundation's shape can be tried end to end.
 
 Or point a harness at the memory server alone over stdio. For Claude Code:
 
@@ -69,6 +70,6 @@ built binary.
 
 ## Status
 
-M0 code complete as of 1 October 2026: the seven steps pass as an integration test, and
-the MCP server answers a raw JSON-RPC session. Not yet done: a recorded run against a real
-harness, and the developer weekend on 10 and 11 October. See [PLAN.md](PLAN.md).
+M0 code complete as of 2 October 2026, plus the confined launcher: Claude Code and Codex
+run in native Linux namespaces with the memory server attached over MCP and model calls
+forwarded and metered through the egress. See [PLAN.md](PLAN.md).

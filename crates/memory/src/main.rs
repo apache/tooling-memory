@@ -1,15 +1,21 @@
-//! The `memory` binary: the per-session memory server and its command line.
+//! The `memory` binary: the per-session memory server, the egress, the launcher, and the
+//! command line.
 //!
-//! Every subcommand is a thin call into `dm_server::Memory`; the MCP server and the
-//! command line see the same operations. The one thing the binary does that the library
-//! does not is resolve its mounts at startup: `--root`, or `MEMORY_ROOT`.
+//! Every subcommand is a thin call into the library crates; the MCP server and the command
+//! line see the same operations. The binary resolves its mounts at startup (`--root`, or
+//! `MEMORY_ROOT`) and, for `launch`, reads the one or two credentials it needs from its own
+//! environment and never passes them inside.
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dm_core::{EntryType, Label};
+use dm_egress::{Auth, Destination, Egress, Telemetry};
 use dm_ledger::{Status, TaskSpec};
+use dm_sandbox::{AuthMode, Harness};
 use dm_server::{mcp, Memory, WriteRequest};
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use time::Duration;
 
@@ -17,7 +23,7 @@ use time::Duration;
 #[command(
     name = "memory",
     version,
-    about = "Durable memory for disposable agents: one root, served over MCP or driven from the command line."
+    about = "Durable memory for disposable agents: one root, served over MCP, with a confined launcher for the harness."
 )]
 struct Cli {
     /// The memory root: grants.toml, record/, state/. The only path this process touches.
@@ -86,6 +92,38 @@ impl From<StatusArg> for Status {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum HarnessArg {
+    Claude,
+    Codex,
+}
+
+impl From<HarnessArg> for Harness {
+    fn from(h: HarnessArg) -> Harness {
+        match h {
+            HarnessArg::Claude => Harness::Claude,
+            HarnessArg::Codex => Harness::Codex,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AuthArg {
+    Gateway,
+    Key,
+    Subscription,
+}
+
+impl From<AuthArg> for AuthMode {
+    fn from(a: AuthArg) -> AuthMode {
+        match a {
+            AuthArg::Gateway => AuthMode::Gateway,
+            AuthArg::Key => AuthMode::Key,
+            AuthArg::Subscription => AuthMode::Subscription,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Create a root for one owner and one domain.
@@ -106,6 +144,39 @@ enum Command {
         #[arg(long = "cap")]
         manifest: Vec<String>,
     },
+    /// Run a harness confined: no network except the egress, the memory server attached,
+    /// model calls forwarded and metered. Credentials come from this process's
+    /// environment: ANTHROPIC_API_KEY or OPENAI_API_KEY for --auth key, LLMAO_KEY (and
+    /// LLMAO_URL) for --auth gateway, the harness's own login for --auth subscription.
+    Launch {
+        #[arg(long, value_enum, default_value = "claude")]
+        harness: HarnessArg,
+        #[arg(long, value_enum, default_value = "subscription")]
+        auth: AuthArg,
+        /// The working tree the harness may read and write. Defaults to the current directory.
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Run without namespaces: the egress still proxies and meters, but nothing is
+        /// confined. For platforms without a backend, and for debugging.
+        #[arg(long)]
+        unconfined: bool,
+        /// Arguments passed to the harness.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Inside the sandbox: forward a loopback port to the egress socket, then run the
+    /// harness in its own pid namespace.
+    #[command(hide = true)]
+    Relay {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        listen: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<OsString>,
+    },
+    /// Token usage recorded by the egress, by destination and model.
+    Usage,
     /// Write an entry. The body comes from --body or standard input.
     Write {
         #[arg(long, value_enum, default_value = "fact")]
@@ -261,6 +332,26 @@ fn body_or_stdin(body: Option<String>) -> std::io::Result<String> {
 }
 
 fn main() {
+    // The relay unshares a pid namespace, which only a single-threaded process may do,
+    // so it runs before any runtime starts.
+    let args: Vec<OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "relay") || args.get(3).is_some_and(|a| a == "relay") {
+        let cli = Cli::parse();
+        if let Command::Relay {
+            socket,
+            listen,
+            argv,
+        } = cli.command
+        {
+            match relay(&socket, &listen, &argv) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("relay: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     if let Err(e) = run_cli() {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -289,8 +380,375 @@ async fn run_cli() -> Fallible {
             mcp::serve_stdio(Arc::new(m)).await?;
             Ok(())
         }
+        Command::Launch {
+            harness,
+            auth,
+            workdir,
+            unconfined,
+            args,
+        } => {
+            launch(
+                &root,
+                harness.into(),
+                auth.into(),
+                workdir,
+                unconfined,
+                args,
+            )
+            .await
+        }
+        Command::Relay { .. } => unreachable!("handled in main"),
+        Command::Usage => {
+            let t = Telemetry::open(&root.join("state/telemetry.db"))?;
+            let rows = t.summary()?;
+            if rows.is_empty() {
+                println!("no model calls recorded");
+                return Ok(());
+            }
+            println!(
+                "{:<12} {:<28} {:>6} {:>10} {:>10} {:>10} {:>10}",
+                "destination", "model", "calls", "input", "output", "cache_rd", "cache_wr"
+            );
+            for r in rows {
+                println!(
+                    "{:<12} {:<28} {:>6} {:>10} {:>10} {:>10} {:>10}",
+                    r.destination,
+                    r.model,
+                    r.calls,
+                    r.input_tokens,
+                    r.output_tokens,
+                    r.cache_read_tokens,
+                    r.cache_write_tokens
+                );
+            }
+            Ok(())
+        }
         Command::Task { op } => task(&Memory::open(&root)?, op).await,
         other => entries(&Memory::open(&root)?, other).await,
+    }
+}
+
+/// What the launcher reads from its own environment for a destination.
+fn destination_for(
+    harness: Harness,
+    auth: AuthMode,
+) -> Result<(String, Destination, String), Box<dyn std::error::Error>> {
+    let provider = harness.provider().to_string();
+    let bearer = |v: String| Auth::Inject {
+        header: axum_header("authorization"),
+        value: format!("Bearer {v}"),
+    };
+    match auth {
+        AuthMode::Subscription => {
+            let upstream = match harness {
+                Harness::Claude => "https://api.anthropic.com",
+                Harness::Codex => "https://api.openai.com",
+            };
+            Ok((
+                provider.clone(),
+                Destination {
+                    upstream: upstream.into(),
+                    auth: Auth::PassThrough,
+                },
+                provider,
+            ))
+        }
+        AuthMode::Key => match harness {
+            Harness::Claude => {
+                let key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+                    "--auth key needs ANTHROPIC_API_KEY in the launcher's environment"
+                })?;
+                Ok((
+                    provider.clone(),
+                    Destination {
+                        upstream: "https://api.anthropic.com".into(),
+                        auth: Auth::Inject {
+                            header: axum_header("x-api-key"),
+                            value: key,
+                        },
+                    },
+                    provider,
+                ))
+            }
+            Harness::Codex => {
+                let key = std::env::var("OPENAI_API_KEY")
+                    .map_err(|_| "--auth key needs OPENAI_API_KEY in the launcher's environment")?;
+                Ok((
+                    provider.clone(),
+                    Destination {
+                        upstream: "https://api.openai.com".into(),
+                        auth: bearer(key),
+                    },
+                    provider,
+                ))
+            }
+        },
+        AuthMode::Gateway => {
+            let key = std::env::var("LLMAO_KEY").map_err(|_| {
+                "--auth gateway needs LLMAO_KEY (a virtual key) in the launcher's environment"
+            })?;
+            let url = std::env::var("LLMAO_URL").unwrap_or_else(|_| "http://127.0.0.1:4000".into());
+            Ok((
+                provider,
+                Destination {
+                    upstream: url,
+                    auth: bearer(key),
+                },
+                "llmao".to_string(),
+            ))
+        }
+    }
+}
+
+fn axum_header(name: &'static str) -> axum::http::HeaderName {
+    axum::http::HeaderName::from_static(name)
+}
+
+/// Everything a launch needs before the harness starts: the memory with its handling
+/// capped, the egress with its one destination, and the socket it serves on.
+struct Prepared {
+    memory: Arc<Memory>,
+    egress: Egress,
+    socket: PathBuf,
+    home: PathBuf,
+    ceiling: Label,
+    ceiling_of: String,
+}
+
+async fn prepare_launch(
+    root: &Path,
+    harness: Harness,
+    auth: AuthMode,
+) -> Result<Prepared, Box<dyn std::error::Error>> {
+    let (name, destination, ceiling_of) = destination_for(harness, auth)?;
+    let memory = Memory::open(root)?.with_author(format!("agent:{}", harness.binary()));
+    let ceiling = memory.grants().ceiling(&ceiling_of).ok_or_else(|| {
+        format!("grants.toml has no [destinations.{ceiling_of}]; add one with a ceiling")
+    })?;
+    let memory = Arc::new(memory.with_handling_cap(ceiling));
+    let mut destinations = HashMap::new();
+    destinations.insert(name, destination);
+    let egress = Egress::new(
+        memory.clone(),
+        destinations,
+        &root.join("state/telemetry.db"),
+    )?;
+    let run_dir = root.join("state/run");
+    std::fs::create_dir_all(&run_dir)?;
+    Ok(Prepared {
+        memory,
+        egress,
+        socket: run_dir.join(format!("egress-{}.sock", std::process::id())),
+        home: root.join("state/sandbox").join(harness.binary()),
+        ceiling,
+        ceiling_of,
+    })
+}
+
+fn report_usage(egress: &Egress) {
+    let Ok(rows) = egress.telemetry().summary() else {
+        return;
+    };
+    if rows.is_empty() {
+        return;
+    }
+    eprintln!("memory: usage this root, by destination and model:");
+    for r in rows {
+        eprintln!(
+            "  {:<10} {:<26} calls {:>4}  in {:>8}  out {:>8}  cache {:>8}",
+            r.destination, r.model, r.calls, r.input_tokens, r.output_tokens, r.cache_read_tokens
+        );
+    }
+}
+
+async fn run_confined(
+    p: &Prepared,
+    harness: Harness,
+    auth: AuthMode,
+    workdir: &Path,
+    args: &[String],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let creds = home_dir().map(|h| h.join(".claude/.credentials.json"));
+    let plan = dm_sandbox::prepare(&dm_sandbox::Request {
+        harness,
+        auth,
+        workdir,
+        home: &p.home,
+        egress_socket: &p.socket,
+        memory_binary: &std::env::current_exe()?,
+        destination_ceiling: p.ceiling,
+        harness_args: args,
+        claude_credentials: creds.as_deref().filter(|c| c.is_file()),
+    })?;
+    Ok(tokio::task::spawn_blocking(move || dm_sandbox::run(&plan)).await??)
+}
+
+async fn launch(
+    root: &Path,
+    harness: Harness,
+    auth: AuthMode,
+    workdir: Option<PathBuf>,
+    unconfined: bool,
+    args: Vec<String>,
+) -> Fallible {
+    let workdir = match workdir {
+        Some(w) => w,
+        None => std::env::current_dir()?,
+    };
+    let workdir = std::fs::canonicalize(&workdir)?;
+    let p = prepare_launch(root, harness, auth).await?;
+
+    let serve = {
+        let egress = p.egress.clone();
+        let socket = p.socket.clone();
+        tokio::spawn(async move { egress.serve_unix(&socket).await })
+    };
+    for _ in 0..100 {
+        if p.socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    eprintln!(
+        "memory: {} confined to {} · model calls via {} at ceiling {} · session {}",
+        harness.binary(),
+        workdir.display(),
+        p.ceiling_of,
+        p.ceiling,
+        p.memory.session_id()
+    );
+
+    let code = if unconfined {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = tcp.local_addr()?;
+        drop(tcp);
+        let serve_tcp = {
+            let egress = p.egress.clone();
+            tokio::spawn(async move { egress.serve_tcp(addr).await })
+        };
+        let code = run_unconfined(
+            harness,
+            auth,
+            &workdir,
+            &p.home,
+            &format!("http://{addr}"),
+            &args,
+        )?;
+        serve_tcp.abort();
+        code
+    } else {
+        run_confined(&p, harness, auth, &workdir, &args).await?
+    };
+
+    serve.abort();
+    std::fs::remove_file(&p.socket).ok();
+    report_usage(&p.egress);
+    std::process::exit(code);
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Run the harness on the host with the egress on a TCP port. The same configuration as
+/// the confined path, minus the namespaces.
+fn run_unconfined(
+    harness: Harness,
+    auth: AuthMode,
+    workdir: &Path,
+    home: &Path,
+    egress_url: &str,
+    args: &[String],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(home)?;
+    let mut cmd = std::process::Command::new(harness.binary());
+    cmd.current_dir(workdir);
+    match harness {
+        Harness::Claude => {
+            let mcp = serde_json::json!({
+                "mcpServers": { "memory": { "type": "http", "url": format!("{egress_url}/mcp") } }
+            });
+            let mcp_path = home.join("mcp.json");
+            std::fs::write(&mcp_path, mcp.to_string())?;
+            cmd.env("ANTHROPIC_BASE_URL", format!("{egress_url}/anthropic"));
+            if auth != AuthMode::Subscription {
+                cmd.env("ANTHROPIC_AUTH_TOKEN", "egress");
+            }
+            cmd.arg("--mcp-config")
+                .arg(&mcp_path)
+                .arg("--strict-mcp-config");
+        }
+        Harness::Codex => {
+            let codex_home = home.join("codex-home");
+            std::fs::create_dir_all(&codex_home)?;
+            std::fs::write(
+                codex_home.join("config.toml"),
+                format!(
+                    "model_provider = \"egress\"\n\n[model_providers.egress]\nname = \"egress\"\nbase_url = \"{egress_url}/openai/v1\"\nenv_key = \"DM_EGRESS_TOKEN\"\nwire_api = \"responses\"\n\n[mcp_servers.memory]\nurl = \"{egress_url}/mcp\"\n"
+                ),
+            )?;
+            cmd.env("CODEX_HOME", &codex_home);
+            cmd.env("DM_EGRESS_TOKEN", "egress");
+        }
+    }
+    cmd.args(args);
+    let status = cmd.status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Inside the sandbox, as pid 1 of the harness's namespace: forward the loopback port to
+/// the socket and run the harness.
+fn relay(
+    socket: &Path,
+    listen: &str,
+    argv: &[OsString],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let socket = socket.to_path_buf();
+    let listen = listen.to_string();
+    rt.spawn(async move {
+        let Ok(listener) = tokio::net::TcpListener::bind(&listen).await else {
+            eprintln!("relay: cannot listen on {listen}");
+            return;
+        };
+        loop {
+            let Ok((mut inbound, _)) = listener.accept().await else {
+                continue;
+            };
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                match tokio::net::UnixStream::connect(&socket).await {
+                    Ok(mut outbound) => {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                    Err(e) => eprintln!("relay: egress socket: {e}"),
+                }
+            });
+        }
+    });
+    let argv = argv.to_vec();
+    let code =
+        rt.block_on(
+            async move { tokio::task::spawn_blocking(move || spawn_harness(&argv)).await },
+        )??;
+    Ok(code)
+}
+
+fn spawn_harness(argv: &[OsString]) -> Result<i32, String> {
+    #[cfg(target_os = "linux")]
+    {
+        dm_sandbox::linux::spawn_in_pid_namespace(argv).map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status()
+            .map_err(|e| e.to_string())?;
+        Ok(status.code().unwrap_or(1))
     }
 }
 
@@ -381,6 +839,9 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         }
         Command::Init { .. }
         | Command::Serve { .. }
+        | Command::Launch { .. }
+        | Command::Relay { .. }
+        | Command::Usage
         | Command::Task { .. }
         | Command::Write { .. }
         | Command::Search { .. }

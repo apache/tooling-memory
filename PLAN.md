@@ -20,6 +20,9 @@ The one piece of code that matters most is the **wrapper**: a per-session memory
 | Agent binding | MCP over stdio first, HTTP second | Every harness speaks it; the surface in the paper's Appendix A is the contract |
 | Policy | A grants file the owner edits; one principal | Identity is the serving layer's concern and a local server authenticates nobody (§5) |
 | Interchange | A directory of entries plus a manifest with digests | Aligns with where the Open Memory Protocol work converges |
+| Containment | The harness runs with no network. Its only egress is the wrapper, over a unix socket relayed to loopback inside. The wrapper forwards model calls (to a gateway or a provider), checks the session label against the destination's ceiling first, reads token usage out of every response, and serves memory over MCP on the same socket. Linux: native namespaces, unprivileged. macOS: Seatbelt, not yet. Windows: WSL2 | Containment is the launcher's job and does not depend on how the harness authenticates. Metering and the model-class check come for free from being in the path, which is what a subscription login would otherwise lose |
+| Handling by egress | A session's handling is capped at the ceiling of the destination its model calls go to, set at launch | A session whose calls go to a public-ceiling destination reads only public entries, so nothing it reads can leave above that ceiling |
+| Credentials | The wrapper holds and injects them; the harness gets a placeholder. The one exception is a subscription login, which the harness must hold itself and the wrapper passes through | Anthropic requires the subscription be used by Claude Code itself. Codex with a ChatGPT login is not supported yet, since Codex routes that to chatgpt.com |
 | The wrapper's reach | A confined process. It reads and writes only what is mounted into it: the record, its own state, its grants file. Nothing else on the host. Store and index roots are the mount points, and no name may become a path outside them | The agent beside it holds no credentials and the wrapper holds no ambient access. What is mounted is deliberate, as a container's mounts are, whether or not a container runtime is doing the confining |
 
 ## M0: the developer weekend, 10 and 11 October 2026
@@ -68,8 +71,10 @@ that run turns up.
 |---|---|---|
 | M1 | `recall` through llmao or any OpenAI-compatible endpoint; erasure with stub and receipt; ceilings checked on every outbound call; HTTP binding | The paper's §5 flow rules hold in one process |
 | M2 | Postgres ledger, Solr index, Kafka log as alternative backends behind the same crates; a compose file | The same binary runs as the sidecar in a container stack |
-| M3 | WASI host for taps; a GitHub issues tap with a ceiling | Contributed connectors run sandboxed with the access the grant allows |
+| M3 | WASI host for taps; a GitHub issues tap with a ceiling. Federated tools reached through the gateway's MCP endpoint, exposed under the wrapper's own surface so the one-server rule holds | Contributed connectors run sandboxed with the access the grant allows |
+| M3b | Upstream transport: the wrapper talks to hosts (the institution's memory, the gateway's federation) over gRPC where that pays, while the agent-facing surface stays MCP over stdio or HTTP | MCP has no gRPC transport and the harness side should stay standard; server-to-server is where the paper says a shared protocol belongs, and where efficiency matters |
 | M4 | Browser reader over an exported bundle, SQLite FTS5 compiled to wasm | Distribution by URL for the person's own memory |
+| M5 | More harnesses behind `memory launch`: Gemini CLI, GitHub Copilot CLI, Cursor's agent CLI, then OpenCode, Aider, Goose. Each needs three things from the harness: a base-URL override for its model calls, MCP over HTTP, and a config directory the launcher can own | The launcher's shape is one adapter per harness; the sandbox, egress, and memory do not change |
 
 ## What a developer can pick up on the weekend
 

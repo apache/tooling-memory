@@ -1,5 +1,39 @@
 # Running it locally
 
+## Confined: `memory launch`
+
+The way to run a harness. It needs no containers. The harness gets its own user, mount,
+network, pid, uts and ipc namespaces, built natively by the `memory` binary with no
+privilege: the system's binaries read-only, a private home, the working tree read-write,
+the memory binary, and the egress socket. No network interface except loopback. Inside,
+a relay forwards one loopback port to the egress, which serves memory over MCP and
+forwards model calls to the provider or the gateway, checks the session label against the
+destination's ceiling first, and reads token usage out of every response.
+
+```sh
+make launch                                   # claude, your own login, confined
+make launch HARNESS=codex AUTH=key            # codex, OPENAI_API_KEY from local/.env
+make launch AUTH=gateway                      # claude through the local LiteLLM
+make launch ARGS='-p "load T0 and summarise"' # arguments go to the harness
+make usage                                    # tokens by destination and model
+```
+
+| `AUTH` | Model calls go to | Credential | Who holds it |
+|---|---|---|---|
+| `subscription` | api.anthropic.com | your Claude Code login | the harness, copied into its private home |
+| `key` | the provider | `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` from `local/.env` | the egress; the harness gets a placeholder |
+| `gateway` | LiteLLM on 127.0.0.1:4000 | `local/.virtual-key` | the egress; the harness gets a placeholder |
+
+In every mode the session's handling is capped at the destination's ceiling from
+`grants.toml`, so a session whose calls go to a destination with a public ceiling reads only
+public entries. Codex with a ChatGPT login is not supported yet: Codex routes that to
+chatgpt.com, which the egress does not proxy.
+
+`--unconfined` runs the same configuration without namespaces, with the egress on a TCP
+port, for platforms without a backend. macOS gets Seatbelt later; on Windows run under WSL2.
+
+The rest of this page is the gateway half of the stack.
+
 The local stack is the Foundation's shape at laptop size: LiteLLM as the gateway with
 Postgres behind it, the memory server as a sidecar beside the harness, and Claude Code as
 the harness. Your provider key sits in LiteLLM and nowhere else. The harness gets a

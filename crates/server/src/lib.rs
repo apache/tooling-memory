@@ -135,6 +135,7 @@ pub struct Memory {
     grants: Grants,
     author: String,
     manifest: Vec<String>,
+    session_id: String,
     store: Store,
     index: AsyncMutex<Index>,
     ledger: AsyncMutex<Ledger>,
@@ -185,6 +186,7 @@ impl Memory {
             author: grants.owner.clone(),
             grants,
             manifest: Vec::new(),
+            session_id: dm_core::id::new_task_id("session").replace("task-session-", "sess-"),
             store,
             index: AsyncMutex::new(index),
             ledger: AsyncMutex::new(ledger),
@@ -205,6 +207,25 @@ impl Memory {
     pub fn with_manifest(mut self, manifest: Vec<String>) -> Memory {
         self.manifest = manifest;
         self
+    }
+
+    /// Cap what this session may read at `cap`, whatever the grants say. The launcher
+    /// sets this from the model destination it allowed: a session whose model calls go
+    /// to a destination with a public ceiling reads only public entries, so nothing it
+    /// reads can leave above that ceiling.
+    #[must_use]
+    pub fn with_handling_cap(mut self, cap: Label) -> Memory {
+        if cap < self.grants.handling {
+            self.grants.handling = cap;
+            self.session = Mutex::new(self.grants.session());
+        }
+        self
+    }
+
+    /// A short identifier for this session, for telemetry.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// The root directory.
@@ -960,6 +981,41 @@ mod tests {
             m.import(bad.path(), None).await,
             Err(Error::Bundle(bundle::Error::Invalid(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_handling_cap_lowers_what_the_session_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let m = mem(dir.path());
+            m.write(WriteRequest {
+                classification: Some(Label::Internal),
+                ..req("internal note\n")
+            })
+            .await
+            .unwrap();
+            m.write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("public note\n")
+            })
+            .await
+            .unwrap();
+        }
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        assert_eq!(capped.grants().handling, Label::Public);
+        assert_eq!(capped.search("note", None, 10).await.unwrap().len(), 1);
+        let full = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Restricted);
+        assert_eq!(
+            full.grants().handling,
+            Label::Restricted,
+            "a cap never raises"
+        );
+        assert_eq!(full.search("note", None, 10).await.unwrap().len(), 2);
+        assert!(full.session_id().starts_with("sess-"));
     }
 
     #[tokio::test]
