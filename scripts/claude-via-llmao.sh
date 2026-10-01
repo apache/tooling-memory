@@ -8,6 +8,9 @@
 #
 #   scripts/claude-via-llmao.sh                 interactive
 #   scripts/claude-via-llmao.sh -p "load T0"    one prompt
+#   GATEWAY=0 scripts/claude-via-llmao.sh       skip the gateway: Claude Code uses its own
+#                                               login (a Max or Pro subscription works), the
+#                                               memory server is still attached
 
 set -eu
 
@@ -22,8 +25,9 @@ fi
 # shellcheck disable=SC1090
 set -a; . "$env_file"; set +a
 
-if [ ! -f "$key_file" ]; then
-    echo "no virtual key yet; run: make local-key" >&2
+gateway=${GATEWAY:-1}
+if [ "$gateway" = 1 ] && [ ! -f "$key_file" ]; then
+    echo "no virtual key yet; run: make local-key (or GATEWAY=0 to use your own login)" >&2
     exit 1
 fi
 : "${MEMORY_ROOT:?set MEMORY_ROOT in local/.env}"
@@ -51,6 +55,10 @@ cat > "$mcp_config" <<JSON
 }
 JSON
 
-ANTHROPIC_BASE_URL="http://127.0.0.1:4000" \
-ANTHROPIC_AUTH_TOKEN="$(cat "$key_file")" \
-exec claude --mcp-config "$mcp_config" "$@"
+if [ "$gateway" = 1 ]; then
+    ANTHROPIC_BASE_URL="http://127.0.0.1:4000" \
+    ANTHROPIC_AUTH_TOKEN="$(cat "$key_file")" \
+    exec claude --mcp-config "$mcp_config" "$@"
+else
+    exec claude --mcp-config "$mcp_config" "$@"
+fi
