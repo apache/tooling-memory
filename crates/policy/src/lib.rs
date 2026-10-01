@@ -1,3 +1,354 @@
-//! The grants file: who may read which domain at which label, and the ceiling of every destination.
+//! The grants file: what one owner may read, at what label, and where it may go.
 //!
-//! Not yet implemented; see PLAN.md, M0.
+//! On a laptop there is one principal, the owner, and a file they edit. The file is
+//! compiled into a [`ReadFilter`] that the index applies inside every query, and into the
+//! ceilings that every outbound call is checked against. An institution replaces this
+//! crate's input with its identity provider and policy engine; the filter and the
+//! ceilings it produces are the same types.
+//!
+//! The file:
+//!
+//! ```toml
+//! owner = "human:local:striker"
+//! handling = "restricted"            # the highest classification the owner reads
+//!
+//! [domains.dom-striker]              # one table per domain the owner holds
+//! default_classification = "internal"
+//!
+//! [destinations.github]             # one table per place the agent may send to
+//! ceiling = "public"
+//! [destinations.notes]
+//! ceiling = "restricted"
+//! ```
+//!
+//! A destination that is not in the file has no ceiling and is refused. That is the
+//! deny-by-default the paper asks for.
+
+use dm_core::{Label, ReadFilter};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// What can go wrong with a grants file.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The file could not be read.
+    #[error("grants file {path}: {source}")]
+    Io {
+        /// The path.
+        path: String,
+        /// Why.
+        source: std::io::Error,
+    },
+    /// The file is not valid TOML, or does not fit the schema.
+    #[error("grants file: {0}")]
+    Parse(#[from] toml::de::Error),
+    /// The file could not be rendered, which the schema should make impossible.
+    #[error("grants file: {0}")]
+    Render(#[from] toml::ser::Error),
+    /// A value is well-formed but not allowed.
+    #[error("grants file: {0}")]
+    Invalid(String),
+}
+
+/// One domain's settings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DomainGrant {
+    /// What a write gets when the entry states no classification.
+    #[serde(default)]
+    pub default_classification: Label,
+}
+
+/// One destination's settings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Destination {
+    /// The highest classification this destination may receive.
+    pub ceiling: Label,
+}
+
+/// The grants file, as parsed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grants {
+    /// The owner, system-qualified. The author of everything written here by a person.
+    pub owner: String,
+    /// The highest classification the owner reads.
+    #[serde(default = "restricted")]
+    pub handling: Label,
+    /// Domains the owner holds, by id.
+    #[serde(default)]
+    pub domains: BTreeMap<String, DomainGrant>,
+    /// Places the agent may send to, by name.
+    #[serde(default)]
+    pub destinations: BTreeMap<String, Destination>,
+}
+
+fn restricted() -> Label {
+    Label::Restricted
+}
+
+impl Grants {
+    /// A starting file for one owner and one domain: the owner reads everything, the
+    /// domain's writes default to internal, and nothing may be sent anywhere yet.
+    #[must_use]
+    pub fn starter(owner: &str, domain: &str) -> Grants {
+        let mut domains = BTreeMap::new();
+        domains.insert(
+            domain.to_string(),
+            DomainGrant {
+                default_classification: Label::Internal,
+            },
+        );
+        Grants {
+            owner: owner.to_string(),
+            handling: Label::Restricted,
+            domains,
+            destinations: BTreeMap::new(),
+        }
+    }
+
+    /// Parse the file's text.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Parse`] for bad TOML or a value outside the schema, [`Error::Invalid`] for
+    /// an empty owner or no domains.
+    pub fn parse(text: &str) -> Result<Grants, Error> {
+        let g: Grants = toml::from_str(text)?;
+        if g.owner.trim().is_empty() {
+            return Err(Error::Invalid("owner is required".into()));
+        }
+        if g.domains.is_empty() {
+            return Err(Error::Invalid("at least one domain is required".into()));
+        }
+        Ok(g)
+    }
+
+    /// Read and parse the file.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when it cannot be read, or what [`Grants::parse`] returns.
+    pub fn load(path: &Path) -> Result<Grants, Error> {
+        let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Grants::parse(&text)
+    }
+
+    /// Render as TOML, for `memory init` to write.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Render`], which the schema should make impossible.
+    pub fn render(&self) -> Result<String, Error> {
+        Ok(toml::to_string_pretty(self)?)
+    }
+
+    /// The filter a session under these grants reads with.
+    #[must_use]
+    pub fn read_filter(&self) -> ReadFilter {
+        ReadFilter::for_domains(self.domains.keys().cloned(), self.handling)
+    }
+
+    /// Whether the owner may write into a domain.
+    #[must_use]
+    pub fn may_write(&self, domain: &str) -> bool {
+        self.domains.contains_key(domain)
+    }
+
+    /// The classification a write gets: what the entry asked for, or the domain's
+    /// default, raised to the session's label so that nothing written is lower than what
+    /// its author read. `None` when the domain is not granted.
+    #[must_use]
+    pub fn classification_for_write(
+        &self,
+        domain: &str,
+        requested: Option<Label>,
+        session: &Session,
+    ) -> Option<Label> {
+        let d = self.domains.get(domain)?;
+        Some(
+            requested
+                .unwrap_or(d.default_classification)
+                .max(session.label),
+        )
+    }
+
+    /// The ceiling of a destination, if it is granted at all.
+    #[must_use]
+    pub fn ceiling(&self, destination: &str) -> Option<Label> {
+        self.destinations.get(destination).map(|d| d.ceiling)
+    }
+
+    /// A fresh session under these grants, with its label at public.
+    #[must_use]
+    pub fn session(&self) -> Session {
+        Session {
+            handling: self.handling,
+            label: Label::Public,
+        }
+    }
+}
+
+/// What one session has read so far, and what it may therefore do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+    /// The highest classification this session may read. Fixed at the start.
+    pub handling: Label,
+    /// The highest classification it has read. Rises, never falls.
+    pub label: Label,
+}
+
+impl Session {
+    /// Record that the session read something at this classification. The label rises to
+    /// it and never falls. Reading above handling cannot happen, because the filter
+    /// never returned it; if a caller reports one anyway, the label is capped and the
+    /// report is returned as `false` so the caller can treat it as the bug it is.
+    pub fn observe(&mut self, classification: Label) -> bool {
+        if classification > self.handling {
+            self.label = self.handling;
+            return false;
+        }
+        self.label = self.label.max(classification);
+        true
+    }
+
+    /// Whether this session may send to a destination with the given ceiling. `None`
+    /// means the destination is not granted, and the answer is no.
+    #[must_use]
+    pub fn may_send(&self, ceiling: Option<Label>) -> bool {
+        ceiling.is_some_and(|c| self.label <= c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE: &str = r#"
+owner = "human:local:striker"
+handling = "internal"
+
+[domains.dom-striker]
+default_classification = "internal"
+
+[domains.dom-notes]
+
+[destinations.github]
+ceiling = "public"
+[destinations.notes]
+ceiling = "restricted"
+"#;
+
+    #[test]
+    fn parses_and_compiles_to_a_filter() {
+        let g = Grants::parse(FILE).unwrap();
+        assert_eq!(g.owner, "human:local:striker");
+        assert_eq!(g.handling, Label::Internal);
+        let f = g.read_filter();
+        assert_eq!(f.domains, vec!["dom-notes", "dom-striker"]);
+        assert_eq!(f.handling, Label::Internal);
+        assert!(!f.include_inactive);
+        assert!(g.may_write("dom-striker"));
+        assert!(!g.may_write("dom-else"));
+        assert_eq!(
+            g.domains["dom-notes"].default_classification,
+            Label::Public,
+            "a domain table with nothing in it defaults to public"
+        );
+    }
+
+    #[test]
+    fn the_label_rises_and_never_falls_and_gates_sending() {
+        let g = Grants::parse(FILE).unwrap();
+        let mut s = g.session();
+        assert_eq!(s.label, Label::Public);
+        assert!(s.may_send(g.ceiling("github")));
+        assert!(s.observe(Label::Internal));
+        assert_eq!(s.label, Label::Internal);
+        assert!(
+            s.observe(Label::Public),
+            "reading something public changes nothing"
+        );
+        assert_eq!(s.label, Label::Internal);
+        assert!(
+            !s.may_send(g.ceiling("github")),
+            "internal exceeds a public ceiling"
+        );
+        assert!(s.may_send(g.ceiling("notes")));
+        assert!(
+            !s.may_send(g.ceiling("nowhere")),
+            "an ungranted destination is refused"
+        );
+        assert!(!s.may_send(None));
+    }
+
+    #[test]
+    fn a_read_above_handling_is_reported_and_capped() {
+        let g = Grants::parse(FILE).unwrap();
+        let mut s = g.session();
+        assert!(!s.observe(Label::Restricted));
+        assert_eq!(s.label, Label::Internal);
+    }
+
+    #[test]
+    fn writes_inherit_the_session_label() {
+        let g = Grants::parse(FILE).unwrap();
+        let mut s = g.session();
+        assert_eq!(
+            g.classification_for_write("dom-notes", None, &s),
+            Some(Label::Public),
+            "domain default"
+        );
+        assert_eq!(
+            g.classification_for_write("dom-striker", None, &s),
+            Some(Label::Internal)
+        );
+        assert_eq!(
+            g.classification_for_write("dom-notes", Some(Label::Internal), &s),
+            Some(Label::Internal),
+            "the entry may ask for more"
+        );
+        s.observe(Label::Internal);
+        assert_eq!(
+            g.classification_for_write("dom-notes", Some(Label::Public), &s),
+            Some(Label::Internal),
+            "never lower than what the author read"
+        );
+        assert_eq!(g.classification_for_write("dom-else", None, &s), None);
+    }
+
+    #[test]
+    fn starter_round_trips_and_sends_nowhere() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        let back = Grants::parse(&text).unwrap();
+        assert_eq!(back, g);
+        assert_eq!(back.handling, Label::Restricted);
+        assert!(back.destinations.is_empty());
+        assert!(!back.session().may_send(back.ceiling("anything")));
+        assert!(text.contains("[domains.dom-me]"), "{text}");
+    }
+
+    #[test]
+    fn bad_files_are_errors() {
+        assert!(matches!(Grants::parse("owner = 1"), Err(Error::Parse(_))));
+        assert!(matches!(
+            Grants::parse("owner = \"x\"\nhandling = \"secret\"\n[domains.a]\n"),
+            Err(Error::Parse(_))
+        ));
+        assert!(matches!(
+            Grants::parse("owner = \"\"\n[domains.a]\n"),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            Grants::parse("owner = \"x\"\n"),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            Grants::load(Path::new("/nonexistent/grants.toml")),
+            Err(Error::Io { .. })
+        ));
+    }
+}

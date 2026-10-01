@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+dm-core = { version = "0.1.0", path = "../core" }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+toml = "1.1.6"
 
 [lints]
 workspace = true
