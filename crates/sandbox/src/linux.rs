@@ -193,15 +193,13 @@ fn build_root(plan: &Plan, root: &Path) -> Result<(), Error> {
     for m in &plan.mounts {
         bind(m, root)?;
     }
-    // merged-usr: /bin -> usr/bin and so on, recreated so `#!/bin/sh` resolves inside
-    for name in ["bin", "sbin", "lib", "lib64", "lib32"] {
-        let host = Path::new("/").join(name);
-        if let Ok(target) = std::fs::read_link(&host) {
-            let inside = root.join(name);
-            if !inside.exists() {
-                std::os::unix::fs::symlink(&target, &inside)
-                    .map_err(|e| confine(format!("symlink {}: {e}", inside.display())))?;
-            }
+    // merged-usr: /bin -> usr/bin and so on, recreated so `#!/bin/sh` resolves inside;
+    // the plan took them from the rootfs it runs in
+    for (name, target) in &plan.links {
+        let inside = root.join(name);
+        if !inside.exists() {
+            std::os::unix::fs::symlink(target, &inside)
+                .map_err(|e| confine(format!("symlink {}: {e}", inside.display())))?;
         }
     }
     std::fs::create_dir_all(root.join("proc")).map_err(confine)?;

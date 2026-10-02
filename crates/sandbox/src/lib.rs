@@ -181,6 +181,9 @@ pub struct Plan {
     pub hostname: String,
     /// The label this session's reads are capped at, from the destination's ceiling.
     pub handling_cap: Label,
+    /// Symlinks to recreate at the root, as `(name, target)`: merged-usr's `/bin ->
+    /// usr/bin` and friends, taken from the rootfs the plan runs in.
+    pub links: Vec<(PathBuf, PathBuf)>,
 }
 
 /// The inputs to a plan.
@@ -218,6 +221,11 @@ pub struct Request<'a> {
     /// Where the working tree appears inside, when not at its host path. The `wslc`
     /// backend mounts it at `/work`; the namespace backend keeps the host path.
     pub workdir_inside: Option<&'a Path>,
+    /// An unpacked harness image to pivot into instead of this host's system: its
+    /// `/usr`, `/etc`, `/opt` and the rest are mounted read-only in place of the host's,
+    /// so a Linux run is the same environment as a run in the image elsewhere. Implies
+    /// `image`.
+    pub rootfs: Option<&'a Path>,
 }
 
 impl Request<'_> {
@@ -308,6 +316,44 @@ fn system_mounts() -> Vec<Mount> {
             });
         }
     }
+    system_files(&mut m, Path::new("/"));
+    m
+}
+
+/// The system from an unpacked image: whole directories, read-only, including `/etc`
+/// and `/opt` since the image's `passwd`, certificates and `memory` binary are the ones
+/// a run in the image elsewhere would see. Merged-usr symlinks are skipped here and
+/// recreated by the backend from [`Plan::links`].
+fn rootfs_mounts(rootfs: &Path) -> Vec<Mount> {
+    let mut m = Vec::new();
+    for d in [
+        "usr", "bin", "sbin", "lib", "lib64", "lib32", "etc", "opt", "var",
+    ] {
+        let p = rootfs.join(d);
+        if p.is_dir() && !p.is_symlink() {
+            m.push(Mount {
+                source: p,
+                target: Path::new("/").join(d),
+                read_only: true,
+            });
+        }
+    }
+    m
+}
+
+/// Merged-usr's symlinks at the root of `rootfs`, to recreate inside.
+fn root_links(rootfs: &Path) -> Vec<(PathBuf, PathBuf)> {
+    ["bin", "sbin", "lib", "lib64", "lib32"]
+        .iter()
+        .filter_map(|name| {
+            std::fs::read_link(rootfs.join(name))
+                .ok()
+                .map(|t| (PathBuf::from(name), t))
+        })
+        .collect()
+}
+
+fn system_files(m: &mut Vec<Mount>, _root: &Path) {
     for f in [
         "/etc/ld.so.cache",
         "/etc/localtime",
@@ -325,7 +371,6 @@ fn system_mounts() -> Vec<Mount> {
             });
         }
     }
-    m
 }
 
 /// What to mount so the harness binary runs, and what to add to PATH for it.
@@ -440,7 +485,8 @@ fn image_mounts(req: &Request<'_>) -> Vec<Mount> {
 /// A harness not on PATH, an unsupported harness, auth and provider combination, or a
 /// file under the home that cannot be written.
 pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
-    let harness_bin = if req.image {
+    let image = req.image || req.rootfs.is_some();
+    let harness_bin = if image {
         PathBuf::from("/usr/local/bin").join(req.harness.binary())
     } else {
         find_on_path(req.harness.binary())?
@@ -461,11 +507,21 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
     };
 
     let mut env = base_env(req.harness_env);
-    let (mounts, extra_path) = if req.image {
-        (image_mounts(req), None)
-    } else {
-        plan_mounts(req, &harness_bin)
+    let (mounts, extra_path) = match req.rootfs {
+        Some(rootfs) => {
+            let mut m = rootfs_mounts(rootfs);
+            m.extend(image_mounts(req));
+            m.push(Mount {
+                source: req.egress_socket.to_path_buf(),
+                target: PathBuf::from(INSIDE_SOCKET),
+                read_only: false,
+            });
+            (m, None)
+        }
+        None if image => (image_mounts(req), None),
+        None => plan_mounts(req, &harness_bin),
     };
+    let links = root_links(req.rootfs.unwrap_or(Path::new("/")));
     let mut path = String::from("/opt/memory:/usr/local/bin:/usr/bin:/bin");
     if let Some(p) = extra_path {
         path = format!("{}:{path}", p.display());
@@ -497,6 +553,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         cwd: req.workdir_inside().to_path_buf(),
         hostname: "memory-sandbox".into(),
         handling_cap: req.destination_ceiling,
+        links,
     })
 }
 
@@ -842,6 +899,7 @@ mod tests {
                 harness_env,
                 image: false,
                 workdir_inside: None,
+                rootfs: None,
             });
             std::env::set_var("PATH", old);
             r.map(|p| (home, p))
@@ -898,6 +956,65 @@ mod tests {
         assert!(plan.argv.contains(&"--strict-mcp-config".to_string()));
         assert_eq!(&plan.argv[plan.argv.len() - 2..], &args[..]);
         assert_eq!(plan.handling_cap, Label::Internal);
+    }
+
+    #[test]
+    fn an_unpacked_image_replaces_the_host_system() {
+        let f = fixture();
+        let rootfs = f.root.join("rootfs");
+        for d in ["usr/local/bin", "etc", "opt/memory", "var"] {
+            std::fs::create_dir_all(rootfs.join(d)).unwrap();
+        }
+        std::os::unix::fs::symlink("usr/bin", rootfs.join("bin")).unwrap();
+        let home = f.root.join("img-home");
+        let plan = prepare(&Request {
+            harness: Harness::Claude,
+            auth: AuthMode::Key,
+            provider: None,
+            workdir: &f.work,
+            home: &home,
+            egress_socket: &f.sock,
+            memory_binary: &f.memory_bin,
+            destination_ceiling: Label::Public,
+            harness_args: &[],
+            host_home: None,
+            harness_env: &[],
+            image: false,
+            workdir_inside: None,
+            rootfs: Some(&rootfs),
+        })
+        .unwrap();
+        let from_rootfs = |t: &str| {
+            plan.mounts
+                .iter()
+                .find(|m| m.target == Path::new(t))
+                .map(|m| m.source.starts_with(&rootfs) && m.read_only)
+        };
+        assert_eq!(from_rootfs("/usr"), Some(true));
+        assert_eq!(from_rootfs("/etc"), Some(true));
+        assert_eq!(from_rootfs("/opt"), Some(true), "the image's memory binary");
+        assert_eq!(from_rootfs("/var"), Some(true));
+        assert!(
+            !plan.mounts.iter().any(|m| m.source == Path::new("/usr")),
+            "nothing of the host's system"
+        );
+        assert!(
+            !plan
+                .mounts
+                .iter()
+                .any(|m| m.target == Path::new(INSIDE_MEMORY)),
+            "the binary comes with the image"
+        );
+        assert!(plan
+            .mounts
+            .iter()
+            .any(|m| m.target == Path::new(INSIDE_SOCKET)));
+        assert!(plan.argv.contains(&"/usr/local/bin/claude".to_string()));
+        assert_eq!(
+            plan.links,
+            vec![(PathBuf::from("bin"), PathBuf::from("usr/bin"))],
+            "merged-usr links come from the rootfs, not the host"
+        );
     }
 
     #[test]
@@ -1206,6 +1323,7 @@ mod tests {
             host_home: None,
             image: false,
             workdir_inside: None,
+            rootfs: None,
             harness_env: &[],
         });
         std::env::set_var("PATH", old);

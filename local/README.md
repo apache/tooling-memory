@@ -86,7 +86,18 @@ Max login (Anthropic prohibits third-party clients), Copilot with a key (it has 
 mode). A call the upstream refuses is recorded in `make usage` under its HTTP status, so
 an expired login or a wrong key shows up there rather than vanishing.
 
-## In the harness image: `--backend wslc`
+## In the harness image, on Linux: `make unpack`
+
+The same image serves the Linux backend. `make unpack` exports it from whichever runtime
+holds it (`wslc` from a WSL distribution, otherwise podman or docker) into the record's
+state as a plain directory, and from then on `make launch` on Linux pivots into that
+directory instead of mounting this machine's `/usr`: the image's harnesses, Node, `/etc`
+and `memory` binary, read-only, with only the private home, the working tree and the
+egress socket added. A Linux run and a run under WSL containers are then the same
+environment. `--backend namespaces` goes back to the host's binaries; `--backend image`
+insists on the image.
+
+## In the harness image, under WSL containers: `--backend wslc`
 
 On Windows with WSL 2.9.3 or later, or from inside a WSL distribution, the harness can run
 in the harness image under WSL containers instead of from this machine's binaries: the same

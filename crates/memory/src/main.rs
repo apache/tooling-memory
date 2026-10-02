@@ -6,6 +6,7 @@
 //! `MEMORY_ROOT`) and, for `launch`, reads the one or two credentials it needs from its own
 //! environment and never passes them inside.
 
+mod image;
 mod requests;
 mod work;
 mod wslc;
@@ -117,6 +118,18 @@ impl From<HarnessArg> for Harness {
     }
 }
 
+#[derive(Subcommand)]
+enum ImageOp {
+    /// Export the image from the runtime that holds it (wslc, podman or docker) and
+    /// unpack it under the record, for the namespace backend to pivot into.
+    Unpack {
+        #[arg(long, env = "MEMORY_IMAGE", default_value = wslc::DEFAULT_IMAGE)]
+        image: String,
+    },
+    /// Where the unpacked image is, if it is there.
+    Path,
+}
+
 /// Where the harness runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum BackendArg {
@@ -124,6 +137,9 @@ enum BackendArg {
     Auto,
     /// Native Linux namespaces, from this host's binaries.
     Namespaces,
+    /// Native Linux namespaces, pivoted into the unpacked harness image (`memory image
+    /// unpack` first). What `auto` picks on Linux once the image is unpacked.
+    Image,
     /// WSL containers: the harness image in a session VM, through `wslc`.
     Wslc,
     /// No confinement: the egress still proxies and meters, nothing else.
@@ -297,6 +313,11 @@ enum Command {
     },
     /// Token usage recorded by the egress, by destination and model.
     Usage,
+    /// The harness image on this host.
+    Image {
+        #[command(subcommand)]
+        op: ImageOp,
+    },
     /// Write an entry. The body comes from --body or standard input.
     Write {
         #[arg(long, value_enum, default_value = "fact")]
@@ -507,6 +528,19 @@ async fn run_cli() -> Fallible {
         cmd @ (Command::Launch { .. } | Command::Work { .. } | Command::Inside { .. }) => {
             launch_cmd(&root, cmd).await
         }
+        Command::Image { op } => match op {
+            ImageOp::Unpack { image } => {
+                image::unpack(&root, &image)?;
+                Ok(())
+            }
+            ImageOp::Path => match image::present(&root) {
+                Some(p) => {
+                    println!("{}", p.display());
+                    Ok(())
+                }
+                None => Err("no unpacked image; run `memory image unpack`".into()),
+            },
+        },
         Command::Relay { .. } => unreachable!("handled in main"),
         Command::Usage => {
             let t = Telemetry::open(&root.join("state/telemetry.db"))?;
@@ -720,6 +754,7 @@ async fn run_confined(
     workdir: &Path,
     args: &[String],
     capture: bool,
+    rootfs: Option<&Path>,
 ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
     let host_home = home_dir();
     let plan = dm_sandbox::prepare(&dm_sandbox::Request {
@@ -736,6 +771,7 @@ async fn run_confined(
         harness_env: &p.harness_env,
         image: false,
         workdir_inside: None,
+        rootfs,
     })?;
     Ok(tokio::task::spawn_blocking(move || {
         if capture {
@@ -778,7 +814,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         unreachable!("routed by launch_cmd")
     };
     let workdir = resolve_workdir(workdir)?;
-    if backend_of(backend, unconfined) == Backend::Wslc {
+    if backend_of(backend, unconfined, root) == Backend::Wslc {
         let mut inside_args = Vec::new();
         if let Some(p) = &prompt {
             inside_args.extend(["--prompt".to_string(), p.clone()]);
@@ -813,7 +849,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         auth.into(),
         provider.as_deref(),
         workdir,
-        runner_for(backend_of(backend, unconfined), None),
+        runner_for(backend_of(backend, unconfined, root), root)?,
     )
     .await?;
     let code = match prompt {
@@ -842,7 +878,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         unreachable!("routed by launch_cmd")
     };
     let workdir = resolve_workdir(workdir)?;
-    if backend_of(backend, unconfined) == Backend::Wslc {
+    if backend_of(backend, unconfined, root) == Backend::Wslc {
         let mut inside_args = vec!["--work".to_string()];
         if let Some(d) = &domain {
             inside_args.extend(["--domain".to_string(), d.clone()]);
@@ -869,7 +905,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         auth.into(),
         provider.as_deref(),
         workdir,
-        runner_for(backend_of(backend, unconfined), None),
+        runner_for(backend_of(backend, unconfined, root), root)?,
     )
     .await?;
     let options = work::Options {
@@ -956,21 +992,30 @@ fn resolve_workdir(workdir: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::err
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
     Namespaces,
+    Image,
     Wslc,
     None,
 }
 
-fn backend_of(arg: BackendArg, unconfined: bool) -> Backend {
+/// Which backend a launch resolves to. `auto` on Linux is the unpacked image when there
+/// is one, so homogeneity is the default once you have it, and the host's binaries
+/// otherwise.
+fn backend_of(arg: BackendArg, unconfined: bool, root: &Path) -> Backend {
     if unconfined {
         return Backend::None;
     }
     match arg {
         BackendArg::Namespaces => Backend::Namespaces,
+        BackendArg::Image => Backend::Image,
         BackendArg::Wslc => Backend::Wslc,
         BackendArg::None => Backend::None,
         BackendArg::Auto => {
             if cfg!(target_os = "linux") {
-                Backend::Namespaces
+                if image::present(root).is_some() {
+                    Backend::Image
+                } else {
+                    Backend::Namespaces
+                }
             } else if cfg!(windows) {
                 Backend::Wslc
             } else {
@@ -980,11 +1025,14 @@ fn backend_of(arg: BackendArg, unconfined: bool) -> Backend {
     }
 }
 
-fn runner_for(backend: Backend, _requests: Option<PathBuf>) -> Runner {
-    match backend {
+fn runner_for(backend: Backend, root: &Path) -> Result<Runner, Box<dyn std::error::Error>> {
+    Ok(match backend {
         Backend::Namespaces => Runner::Namespaces,
+        Backend::Image => Runner::Image(
+            image::present(root).ok_or("no unpacked image; run `memory image unpack` first")?,
+        ),
         Backend::None | Backend::Wslc => Runner::Unconfined(None),
-    }
+    })
 }
 
 /// A started session: the memory opened, the egress serving, the harness not yet run.
@@ -1003,6 +1051,8 @@ pub struct Session {
 pub enum Runner {
     /// Native Linux namespaces, from this host's binaries.
     Namespaces,
+    /// Native Linux namespaces, pivoted into this unpacked image.
+    Image(PathBuf),
     /// On the host, with the egress on a loopback TCP port.
     Unconfined(
         Option<(
@@ -1062,7 +1112,10 @@ impl Session {
             open_to_all(&p.socket, 0o666)?;
         }
         #[cfg(not(unix))]
-        if matches!(runner, Runner::Namespaces | Runner::Requests(_)) {
+        if matches!(
+            runner,
+            Runner::Namespaces | Runner::Image(_) | Runner::Requests(_)
+        ) {
             return Err(
                 "confinement needs Linux; run under WSL2, or pass --backend wslc or --unconfined"
                     .into(),
@@ -1080,6 +1133,7 @@ impl Session {
         }
         let how = match &runner {
             Runner::Namespaces => "confined to",
+            Runner::Image(_) => "confined, in the harness image, to",
             Runner::Unconfined(_) => "unconfined in",
             Runner::Requests(_) => "in the harness image, working tree at",
         };
@@ -1146,6 +1200,19 @@ impl Session {
                     &self.workdir,
                     args,
                     capture,
+                    None,
+                )
+                .await
+            }
+            Runner::Image(rootfs) => {
+                run_confined(
+                    &self.p,
+                    self.harness,
+                    self.auth,
+                    &self.workdir,
+                    args,
+                    capture,
+                    Some(rootfs),
                 )
                 .await
             }
@@ -1174,6 +1241,7 @@ impl Session {
             harness_env: &self.p.harness_env,
             image: true,
             workdir_inside: Some(&r.workdir_inside),
+            rootfs: None,
         })?;
         let n = r.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let home_rel = self
@@ -1465,6 +1533,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Launch { .. }
         | Command::Work { .. }
         | Command::Inside { .. }
+        | Command::Image { .. }
         | Command::Relay { .. }
         | Command::Usage
         | Command::Task { .. }

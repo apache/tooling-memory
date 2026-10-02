@@ -50,6 +50,12 @@ image: build
 	elif command -v wslc >/dev/null 2>&1; then wslc build -t $(IMAGE) images/harness; \
 	else podman build -t $(IMAGE) images/harness; fi
 
+# Unpack the harness image under the record, for the Linux backend to pivot into. After
+# this, `make launch` on Linux runs in the image by default.
+unpack: build
+	@set -a; . ./$(LOCAL_ENV); set +a; \
+	target/release/memory --root "$$MEMORY_ROOT" image unpack --image $(IMAGE)
+
 # Claim the next task from the ledger and run the harness on it. LOOP=1 keeps claiming.
 work: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \
