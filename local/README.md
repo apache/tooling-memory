@@ -86,6 +86,21 @@ Max login (Anthropic prohibits third-party clients), Copilot with a key (it has 
 mode). A call the upstream refuses is recorded in `make usage` under its HTTP status, so
 an expired login or a wrong key shows up there rather than vanishing.
 
+## In the browser: `make web`
+
+`make web` serves a web terminal on 127.0.0.1:4200. The front page lists sessions and
+starts one: harness, auth, an optional prompt, or the next task from the ledger. Each
+session is `memory launch` (or `memory work`) in a pseudo-terminal the server keeps
+alive whether or not a browser is attached, with the same confinement as from a shell.
+Its output goes into a two-megabyte ring on the server and to every attached browser, so
+a refresh, a dropped connection or a second browser replays the scrollback and lands in
+the same place; resizes reach the harness. Beside the terminal a reading pane renders
+Markdown, Mermaid included, for entries from the record: whatever the session writes
+opens as it lands, a `mem-…` id in the terminal is a link, and the recent entries are
+listed under it. Loopback only; reach it over SSH when remote. The page loads xterm.js,
+marked and mermaid from a CDN in this first cut, so the browser needs the internet even
+though the harness does not.
+
 ## Handoffs the harness did not write
 
 The launcher installs two hooks in Claude Code's settings in the private home: before

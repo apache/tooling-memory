@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; --muted: #6b6b6b; --line: #ddd; --accent: #0a62c9; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #16181d; --muted: #9a9a9a; --line: #333; --accent: #6fb2ff; } }
+  body { margin: 0; padding: 24px 16px; font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 860px; margin-inline: auto; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  h2 { font-size: 15px; margin: 24px 0 8px; color: var(--muted); font-weight: 600; }
+  form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; align-items: end; }
+  label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+  input, select, button { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--fg); }
+  .wide { grid-column: 1 / -1; }
+  button { background: var(--accent); color: white; border: 0; cursor: pointer; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+  li a { color: var(--accent); text-decoration: none; }
+  .status { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>memory</h1>
+<form id="new">
+  <label>Harness
+    <select name="harness"><option>claude</option><option>codex</option><option>gemini</option><option>copilot</option><option>opencode</option></select>
+  </label>
+  <label>Auth
+    <select name="auth"><option>subscription</option><option>key</option><option>gateway</option></select>
+  </label>
+  <label class="wide">Prompt, or leave empty for an interactive session
+    <input name="prompt" placeholder="load T0 and summarise it">
+  </label>
+  <label><input type="checkbox" name="work" style="width:auto"> Work the next task from the ledger</label>
+  <button type="submit">Start</button>
+</form>
+<h2>Sessions</h2>
+<ul id="sessions"><li class="status">none yet</li></ul>
+<script>
+const form = document.getElementById('new');
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = new FormData(form);
+  const body = { harness: f.get('harness'), auth: f.get('auth'), work: !!f.get('work') };
+  if (f.get('prompt')) body.prompt = f.get('prompt');
+  const r = await fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) { alert(await r.text()); return; }
+  const s = await r.json();
+  location.href = `/s/${s.id}`;
+});
+async function refresh() {
+  const r = await fetch('/api/sessions');
+  const list = await r.json();
+  const ul = document.getElementById('sessions');
+  if (!list.length) { ul.innerHTML = '<li class="status">none yet</li>'; return; }
+  ul.innerHTML = list.reverse().map(s =>
+    `<li><a href="/s/${s.id}">${esc(s.title)}</a><span class="status">${s.alive ? 'running' : 'exited ' + (s.exit ?? '?')} · ${s.started.slice(11,19)}Z</span></li>`).join('');
+}
+const esc = (t) => t.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>

@@ -56,6 +56,13 @@ unpack: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	target/release/memory --root "$$MEMORY_ROOT" image unpack --image $(IMAGE)
 
+# The web terminal on 127.0.0.1:4200: sessions start from the browser.
+web: build
+	@set -a; . ./$(LOCAL_ENV); set +a; \
+	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
+	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
+	target/release/memory --root "$$MEMORY_ROOT" web --harness $(HARNESS) --auth $(AUTH) --backend $(BACKEND)
+
 # Claim the next task from the ledger and run the harness on it. LOOP=1 keeps claiming.
 work: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \

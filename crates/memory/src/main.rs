@@ -321,6 +321,22 @@ enum Command {
         /// Which harness's hook format; claude for now.
         harness: String,
     },
+    /// A web terminal on the launcher: sessions in pseudo-terminals streamed to the
+    /// browser, with a reading pane over the record. Loopback only.
+    Web {
+        /// Where to listen.
+        #[arg(long, default_value = "127.0.0.1:4200")]
+        listen: String,
+        #[arg(long, value_enum, default_value = "claude")]
+        harness: HarnessArg,
+        #[arg(long, value_enum, default_value = "subscription")]
+        auth: AuthArg,
+        #[arg(long, value_enum, default_value = "auto")]
+        backend: BackendArg,
+        /// The working tree sessions start in. Defaults to the current directory.
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
     /// The harness image on this host.
     Image {
         #[command(subcommand)]
@@ -552,6 +568,7 @@ async fn run_cli() -> Fallible {
             launch_cmd(&root, cmd).await
         }
         Command::Hook { .. } => unreachable!("handled in main before the root is needed"),
+        cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
         Command::Image { op } => match op {
             ImageOp::Unpack { image } => {
                 image::unpack(&root, &image)?;
@@ -806,6 +823,43 @@ async fn run_confined(
         }
     })
     .await??)
+}
+
+/// `web`: the web terminal.
+async fn web_cmd(root: &Path, command: Command) -> Fallible {
+    let Command::Web {
+        listen,
+        harness,
+        auth,
+        backend,
+        workdir,
+    } = command
+    else {
+        unreachable!("routed by run_cli")
+    };
+    let backend_name = match backend {
+        BackendArg::Auto => "auto",
+        BackendArg::Namespaces => "namespaces",
+        BackendArg::Image => "image",
+        BackendArg::Wslc => "wslc",
+        BackendArg::None => "none",
+    };
+    let config = dm_web::Config {
+        root: root.to_path_buf(),
+        memory_binary: std::env::current_exe()?,
+        workdir: resolve_workdir(workdir)?,
+        harness: Harness::from(harness).binary().to_string(),
+        auth: match AuthMode::from(auth) {
+            AuthMode::Subscription => "subscription",
+            AuthMode::Key => "key",
+            AuthMode::Gateway => "gateway",
+        }
+        .to_string(),
+        backend: backend_name.to_string(),
+        command_override: None,
+    };
+    dm_web::serve(config, &listen).await?;
+    Ok(())
 }
 
 /// `launch`, `work` and `inside`: start a session, run it once or per task, exit with
@@ -1564,6 +1618,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Work { .. }
         | Command::Inside { .. }
         | Command::Image { .. }
+        | Command::Web { .. }
         | Command::Hook { .. }
         | Command::Relay { .. }
         | Command::Usage
