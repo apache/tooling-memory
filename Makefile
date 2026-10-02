@@ -30,12 +30,22 @@ local-key:
 HARNESS ?= claude
 AUTH ?= subscription
 PROVIDER ?=
+PROMPT ?=
+LOOP ?=
 launch: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
 	target/release/memory --root "$$MEMORY_ROOT" launch --harness $(HARNESS) --auth $(AUTH) \
-		$(if $(PROVIDER),--provider $(PROVIDER),) -- $(ARGS)
+		$(if $(PROVIDER),--provider $(PROVIDER),) $(if $(PROMPT),--prompt '$(PROMPT)',) -- $(ARGS)
+
+# Claim the next task from the ledger and run the harness on it. LOOP=1 keeps claiming.
+work: build
+	@set -a; . ./$(LOCAL_ENV); set +a; \
+	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
+	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
+	target/release/memory --root "$$MEMORY_ROOT" work --harness $(HARNESS) --auth $(AUTH) \
+		$(if $(PROVIDER),--provider $(PROVIDER),) $(if $(LOOP),--loop,)
 
 usage:
 	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" usage

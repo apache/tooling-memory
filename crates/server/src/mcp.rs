@@ -208,6 +208,17 @@ pub struct LeaseParams {
     pub lease_seconds: Option<i64>,
 }
 
+/// Parameters of `release`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct ReleaseParams {
+    /// The task id.
+    pub id: String,
+    /// A handoff entry you wrote about what you did before stopping; the next claimant
+    /// starts from it. Optional.
+    #[serde(default)]
+    pub handoff: Option<String>,
+}
+
 /// Parameters of `complete`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct CompleteParams {
@@ -469,9 +480,16 @@ impl McpServer {
         ok(json!({ "task": t }))
     }
 
-    #[tool(description = "Give a task back to the pool without completing it.")]
-    async fn release(&self, p: Parameters<TaskIdParams>) -> Result<CallToolResult, McpError> {
-        let t = self.memory.release(&p.0.id).await.map_err(mcp_err)?;
+    #[tool(
+        description = "Give a task back to the pool without completing it. Pass the id of a handoff you wrote so the next claimant starts where you stopped."
+    )]
+    async fn release(&self, p: Parameters<ReleaseParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .release(&p.id, p.handoff.as_deref())
+            .await
+            .map_err(mcp_err)?;
         ok(json!({ "task": t }))
     }
 
@@ -573,9 +591,23 @@ impl ServerHandler for McpServer {
 ///
 /// When the MCP handshake fails or the service task panics.
 pub async fn serve_stdio(memory: Arc<Memory>) -> Result<(), String> {
+    serve_pipe(memory, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Serve over any byte pair until the peer closes: standard input and output, or one end
+/// of an in-process pipe for a client in the same process.
+///
+/// # Errors
+///
+/// When the MCP handshake fails or the service task panics.
+pub async fn serve_pipe<R, W>(memory: Arc<Memory>, reader: R, writer: W) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
     use rmcp::ServiceExt;
     let service = McpServer::new(memory)
-        .serve(rmcp::transport::stdio())
+        .serve((reader, writer))
         .await
         .map_err(|e| format!("mcp: {e}"))?;
     service.waiting().await.map_err(|e| format!("mcp: {e}"))?;
@@ -872,9 +904,12 @@ mod tests {
         );
         assert_eq!(c["task"]["holder"], "human:test:me");
         let r = payload(
-            &s.release(Parameters(TaskIdParams { id: id.clone() }))
-                .await
-                .unwrap(),
+            &s.release(Parameters(ReleaseParams {
+                id: id.clone(),
+                handoff: None,
+            }))
+            .await
+            .unwrap(),
         );
         assert_eq!(r["task"]["status"], "admitted");
         let inv = payload(

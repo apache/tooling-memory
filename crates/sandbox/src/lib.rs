@@ -115,6 +115,26 @@ impl Harness {
         }
     }
 
+    /// The harness's non-interactive form: run this prompt, print the answer, exit.
+    /// Tool use by the memory server is allowed up front, since nobody is there to
+    /// approve it; the sandbox is what bounds the harness, not its prompts.
+    #[must_use]
+    pub fn headless(self, prompt: &str) -> Vec<String> {
+        let p = prompt.to_string();
+        match self {
+            Harness::Claude => vec![
+                "-p".into(),
+                p,
+                "--allowedTools".into(),
+                "mcp__memory".into(),
+            ],
+            Harness::Codex => vec!["exec".into(), "--skip-git-repo-check".into(), p],
+            Harness::Gemini => vec!["-p".into(), p, "--approval-mode".into(), "yolo".into()],
+            Harness::Copilot => vec!["-p".into(), p, "--allow-all-tools".into()],
+            Harness::OpenCode => vec!["run".into(), p],
+        }
+    }
+
     /// Whether `--provider` may point this harness at another destination.
     #[must_use]
     pub fn accepts_provider(self) -> bool {
@@ -653,6 +673,24 @@ pub fn run(plan: &Plan) -> Result<i32, Error> {
     #[cfg(target_os = "linux")]
     {
         linux::run(plan)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = plan;
+        Err(Error::NoBackend)
+    }
+}
+
+/// Run a plan with the harness's standard output captured, for a non-interactive run
+/// whose answer the launcher files. Standard error still reaches the terminal.
+///
+/// # Errors
+///
+/// [`Error::NoBackend`] off Linux, or a confinement failure.
+pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>), Error> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::run_captured(plan)
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -1,0 +1,22 @@
+[package]
+name = "dm-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A typed MCP client for the memory server: the ledger and the record as the launcher and an orchestrator use them"
+
+[dependencies]
+rmcp = { version = "3.5.0", features = ["client", "transport-async-rw"] }
+serde_json = "1.0.151"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "io-util", "macros"] }
+
+[dev-dependencies]
+dm-ledger = { version = "0.1.0", path = "../ledger" }
+dm-server = { version = "0.1.0", path = "../server" }
+tempfile = "3.27.0"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util"] }
+
+[lints]
+workspace = true

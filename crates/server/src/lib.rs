@@ -558,10 +558,13 @@ impl Memory {
     /// # Errors
     ///
     /// A ledger error, or a task outside the grants.
-    pub async fn release(&self, id: &str) -> Result<Task, Error> {
+    pub async fn release(&self, id: &str, handoff: Option<&str>) -> Result<Task, Error> {
+        if let Some(h) = handoff {
+            self.get(h).await?; // the handoff must exist and be readable here
+        }
         let mut l = self.ledger.lock().await;
         self.task_in_grants(&l.get(id)?)?;
-        Ok(l.release(id, &self.author)?)
+        Ok(l.release(id, &self.author, handoff)?)
     }
 
     /// Close a task without doing it.

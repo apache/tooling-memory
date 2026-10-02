@@ -224,6 +224,34 @@ fn build_root(plan: &Plan, root: &Path) -> Result<(), Error> {
 ///
 /// When the sandbox cannot be built or the relay cannot be started.
 pub fn run(plan: &Plan) -> Result<i32, Error> {
+    let (mut cmd, root) = command(plan)?;
+    let status = cmd
+        .status()
+        .map_err(|e| confine(format!("spawn {}: {e}", plan.argv[0])))?;
+    std::fs::remove_dir_all(&root).ok();
+    Ok(status.code().unwrap_or(1))
+}
+
+/// As [`run`], with the harness's standard output captured; standard error is inherited.
+///
+/// # Errors
+///
+/// When the sandbox cannot be built or the relay cannot be started.
+pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>), Error> {
+    let (mut cmd, root) = command(plan)?;
+    let out = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| confine(format!("spawn {}: {e}", plan.argv[0])))?;
+    std::fs::remove_dir_all(&root).ok();
+    Ok((out.status.code().unwrap_or(1), out.stdout))
+}
+
+/// The command that builds the sandbox in `pre_exec` and execs the relay, and the
+/// scratch directory it pivots into, for the caller to remove.
+fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
     let root = std::env::temp_dir().join(format!("memory-sandbox-{}", std::process::id()));
@@ -258,11 +286,7 @@ pub fn run(plan: &Plan) -> Result<i32, Error> {
             })
         });
     }
-    let status = cmd
-        .status()
-        .map_err(|e| confine(format!("spawn {}: {e}", plan.argv[0])))?;
-    std::fs::remove_dir_all(&root).ok();
-    Ok(status.code().unwrap_or(1))
+    Ok((cmd, root))
 }
 
 /// Enter a pid namespace and become its pid 1. Runs between fork and exec, while the

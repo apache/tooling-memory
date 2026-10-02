@@ -251,6 +251,11 @@ enum Event {
         until: OffsetDateTime,
     },
     Released,
+    /// A handoff left on a task that is going back to the pool, so the next claimant
+    /// starts where this one stopped. Appended before `Released`.
+    HandoffLeft {
+        handoff: String,
+    },
     Completed {
         handoff: String,
     },
@@ -579,7 +584,12 @@ impl Ledger {
     /// # Errors
     ///
     /// [`Error::NotFound`], [`Error::NotHolder`], or [`Error::WrongState`].
-    pub fn release(&mut self, id: &str, holder: &str) -> Result<Task, Error> {
+    pub fn release(
+        &mut self,
+        id: &str,
+        holder: &str,
+        handoff: Option<&str>,
+    ) -> Result<Task, Error> {
         let now = self.now();
         let task = self.get(id)?;
         if task.status != Status::Claimed {
@@ -590,6 +600,15 @@ impl Ledger {
             });
         }
         Ledger::check_holder(&task, holder, now)?;
+        if let Some(handoff) = handoff {
+            self.append_at(
+                id,
+                now,
+                &Event::HandoffLeft {
+                    handoff: handoff.to_string(),
+                },
+            )?;
+        }
         self.append_at(id, now, &Event::Released)?;
         self.get(id)
     }
@@ -762,6 +781,7 @@ impl Ledger {
             Event::Claimed { .. } => "claimed",
             Event::Heartbeat { .. } => "heartbeat",
             Event::Released => "released",
+            Event::HandoffLeft { .. } => "handoff_left",
             Event::Completed { .. } => "completed",
             Event::Invalidated { .. } => "invalidated",
         };
@@ -827,6 +847,12 @@ impl Ledger {
                     "UPDATE tasks SET status = 'admitted', holder = NULL, lease_until = NULL
                      WHERE id = ?1",
                     params![id],
+                )?;
+            }
+            Event::HandoffLeft { handoff } => {
+                conn.execute(
+                    "UPDATE tasks SET handoff = ?2 WHERE id = ?1",
+                    params![id, handoff],
                 )?;
             }
             Event::Completed { handoff } => {
@@ -980,7 +1006,7 @@ mod tests {
             Err(Error::NotHolder { .. })
         ));
         assert!(matches!(
-            l.release(&t.id, "s1"),
+            l.release(&t.id, "s1", None),
             Err(Error::NotHolder { .. })
         ));
         // s2's own lease also expires if never renewed
@@ -1045,7 +1071,12 @@ mod tests {
         let (mut l, _) = ledger();
         let t = admitted(&mut l, spec("Give back"));
         l.claim(&t.id, "s1", mins(5), &[]).unwrap();
-        let t = l.release(&t.id, "s1").unwrap();
+        let t = l.release(&t.id, "s1", Some("mem-x-left")).unwrap();
+        assert_eq!(
+            t.handoff.as_deref(),
+            Some("mem-x-left"),
+            "the handoff rides with the released task"
+        );
         assert_eq!(t.status, Status::Admitted);
         assert!(t.holder.is_none());
         let c = l.claim_next("dom-a", "s2", mins(5), &[]).unwrap().unwrap();
@@ -1100,7 +1131,7 @@ mod tests {
         l.claim(&a.id, "s1", mins(5), &[]).unwrap();
         *now.lock().unwrap() = T0 + mins(2);
         l.heartbeat(&a.id, "s1", mins(5)).unwrap();
-        l.release(&a.id, "s1").unwrap();
+        l.release(&a.id, "s1", None).unwrap();
         l.claim(&a.id, "s2", mins(5), &[]).unwrap();
         l.complete(&a.id, "s2", "mem-a-h").unwrap();
         let b = l.create(spec("B")).unwrap().task;

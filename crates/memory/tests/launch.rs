@@ -228,3 +228,223 @@ fn confined_launch_has_no_network_and_no_host_home() {
     assert!(text.contains(&format!("cwd={}", work.display())), "{text}");
     assert!(stderr.contains("confined to"), "{stderr}");
 }
+
+// ---- non-interactive: a prompt, and a task from the ledger ----
+
+/// A fake harness from a shell body. It receives the launcher's arguments; `$*` holds
+/// the prompt among them.
+fn fake_harness(dir: &Path, body: &str) -> PathBuf {
+    let bins = dir.join("bins");
+    std::fs::create_dir_all(&bins).unwrap();
+    let p = bins.join("claude");
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bins
+}
+
+/// Shell that speaks MCP to the egress with curl: initialize, write a handoff, complete
+/// the task named in the prompt.
+const COMPLETES_ITS_TASK: &str = r#"
+task=$(printf '%s' "$*" | grep -o 'task-[a-z0-9]*-[a-z0-9]*' | head -1)
+base="${ANTHROPIC_BASE_URL%/anthropic}"
+H1='content-type: application/json'; H2='accept: application/json, text/event-stream'
+sid=$(curl -s -D - -o /dev/null -X POST "$base/mcp" -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake","version":"0"}}}' | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:"{print $2}')
+curl -s -o /dev/null -X POST "$base/mcp" -H "$H1" -H "$H2" -H "mcp-session-id: $sid" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+hid=$(curl -s -X POST "$base/mcp" -H "$H1" -H "$H2" -H "mcp-session-id: $sid" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write","arguments":{"body":"Import finished, all five steps.","entry_type":"handoff","title":"Import done"}}}' | grep -o 'mem-[a-z0-9]*-[a-z0-9]*' | head -1)
+curl -s -o /dev/null -X POST "$base/mcp" -H "$H1" -H "$H2" -H "mcp-session-id: $sid" -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"complete\",\"arguments\":{\"id\":\"$task\",\"handoff\":\"$hid\"}}}"
+echo "finished $task with $hid"
+"#;
+
+fn cli_text(root: &Path, args: &[&str]) -> String {
+    let out = memory()
+        .args(["--root", root.to_str().unwrap()])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn cli(root: &Path, args: &[&str]) -> serde_json::Value {
+    let text = cli_text(root, args);
+    serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+}
+
+fn file_task(root: &Path, title: &str) -> String {
+    let t = cli(
+        root,
+        &[
+            "task",
+            "create",
+            title,
+            "--priority",
+            "5",
+            "--body",
+            "Steps 3 to 5.",
+        ],
+    );
+    let id = t["id"].as_str().unwrap().to_string();
+    cli(root, &["task", "admit", &id]);
+    id
+}
+
+fn work(root: &Path, bins: &Path, workdir: &Path) -> Output {
+    let mut cmd = memory();
+    cmd.args([
+        "--root",
+        root.to_str().unwrap(),
+        "work",
+        "--harness",
+        "claude",
+        "--auth",
+        "key",
+        "--unconfined",
+    ]);
+    cmd.args([
+        "--workdir",
+        workdir.to_str().unwrap(),
+        "--lease-seconds",
+        "60",
+    ]);
+    cmd.env("PATH", path_with(bins));
+    cmd.env("ANTHROPIC_API_KEY", "sk-ant-placeholder");
+    cmd.stdin(Stdio::null());
+    cmd.output().unwrap()
+}
+
+#[test]
+fn work_leaves_a_completed_task_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), COMPLETES_ITS_TASK);
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let id = file_task(&root, "Finish the import");
+
+    let out = work(&root, &bins, &work_dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stderr}\n{stdout}");
+    assert!(
+        stderr.contains(&format!("claimed {id}: Finish the import")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("completed, handoff mem-"), "{stderr}");
+    let t = cli(&root, &["task", "get", &id]);
+    assert_eq!(t["status"], "completed");
+    let h = t["handoff"].as_str().unwrap();
+    let e = cli_text(&root, &["get", h]);
+    assert!(e.contains("all five steps"), "{e}");
+}
+
+#[test]
+fn work_files_the_output_and_releases_when_the_harness_stops_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(
+        dir.path(),
+        "echo \"args=$*\" > ./fake.out; echo 'I looked at step 3 and stopped.'; exit 0",
+    );
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let id = file_task(&root, "Finish the import");
+
+    let out = work(&root, &bins, &work_dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(
+        stderr.contains("released; its output is filed as handoff"),
+        "{stderr}"
+    );
+    let t = cli(&root, &["task", "get", &id]);
+    assert_eq!(t["status"], "admitted", "back in the pool: {t}");
+    let h = t["handoff"]
+        .as_str()
+        .expect("the handoff rides with the task");
+    let e = cli_text(&root, &["get", h]);
+    assert!(e.contains("I looked at step 3"), "{e}");
+    // the harness saw its headless form, the task, and T0
+    let args = std::fs::read_to_string(work_dir.join("fake.out")).unwrap();
+    assert!(args.contains("-p "), "{args}");
+    assert!(args.contains(&id), "{args}");
+    assert!(args.contains("--allowedTools mcp__memory"), "{args}");
+    assert!(args.contains("# T0 for dom-me"), "{args}");
+    assert!(args.contains("do not call `heartbeat`"), "{args}");
+
+    // the next claimant is told where the last attempt stopped
+    let out = work(&root, &bins, &work_dir);
+    assert_eq!(out.status.code(), Some(4));
+    let args = std::fs::read_to_string(work_dir.join("fake.out")).unwrap();
+    assert!(args.contains("Where the last attempt stopped"), "{args}");
+    assert!(args.contains("I looked at step 3"), "{args}");
+}
+
+#[test]
+fn work_with_nothing_claimable_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), "exit 0");
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let out = work(&root, &bins, &work_dir);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing claimable"));
+}
+
+#[test]
+fn a_prompted_launch_runs_headless_and_insists_on_a_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), "echo \"args=$*\"; echo 'the answer'; exit 0");
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let run = |extra: &[&str]| {
+        let mut cmd = memory();
+        cmd.args([
+            "--root",
+            root.to_str().unwrap(),
+            "launch",
+            "--harness",
+            "claude",
+            "--auth",
+            "key",
+            "--unconfined",
+        ]);
+        cmd.args([
+            "--workdir",
+            work_dir.to_str().unwrap(),
+            "--prompt",
+            "say the answer",
+        ]);
+        cmd.args(extra);
+        cmd.env("PATH", path_with(&bins));
+        cmd.env("ANTHROPIC_API_KEY", "sk-ant-placeholder");
+        cmd.stdin(Stdio::null());
+        cmd.output().unwrap()
+    };
+    let out = run(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(
+        stdout.contains("args=") && stdout.contains("-p say the answer"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("the answer"),
+        "the harness's output is printed: {stdout}"
+    );
+    assert!(stderr.contains("left no handoff"), "{stderr}");
+    let out = run(&["--no-handoff"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

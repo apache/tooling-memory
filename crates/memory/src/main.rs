@@ -6,6 +6,8 @@
 //! `MEMORY_ROOT`) and, for `launch`, reads the one or two credentials it needs from its own
 //! environment and never passes them inside.
 
+mod work;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use dm_core::{EntryType, Label};
 use dm_egress::{Auth, Destination, Egress, Telemetry};
@@ -170,9 +172,50 @@ enum Command {
         /// confined. For platforms without a backend, and for debugging.
         #[arg(long)]
         unconfined: bool,
+        /// Non-interactive: run this prompt in the harness's headless form, print its
+        /// answer, and exit when it does. The run is expected to leave a handoff.
+        #[arg(long, conflicts_with = "prompt_file")]
+        prompt: Option<String>,
+        /// As --prompt, read from a file.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// With --prompt: a run that leaves no handoff is fine.
+        #[arg(long)]
+        no_handoff: bool,
         /// Arguments passed to the harness.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Claim the next task from the ledger and run the harness on it, non-interactively.
+    /// The launcher holds the lease and heartbeats while the harness works. A task the
+    /// harness completed stays complete; anything else goes back to the pool with the
+    /// harness's output filed as a handoff. One invocation, one task; --loop keeps going.
+    Work {
+        #[arg(long, value_enum, default_value = "claude")]
+        harness: HarnessArg,
+        #[arg(long, value_enum, default_value = "subscription")]
+        auth: AuthArg,
+        /// Send model calls to another destination. Codex and OpenCode only.
+        #[arg(long)]
+        provider: Option<String>,
+        /// The working tree the harness may read and write. Defaults to the current directory.
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Run without namespaces.
+        #[arg(long)]
+        unconfined: bool,
+        /// Claim from this domain; the only granted domain when omitted.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Lease length in seconds; the launcher heartbeats at a third of it.
+        #[arg(long, default_value_t = 900)]
+        lease_seconds: i64,
+        /// Keep claiming until interrupted; wait --idle-seconds when nothing is claimable.
+        #[arg(long = "loop")]
+        keep_going: bool,
+        /// With --loop: how long to wait when the queue is empty.
+        #[arg(long, default_value_t = 30)]
+        idle_seconds: u64,
     },
     /// Inside the sandbox: forward a loopback port to the egress socket, then run the
     /// harness in its own pid namespace.
@@ -291,8 +334,12 @@ enum TaskOp {
     },
     /// Complete a task with a handoff entry id.
     Complete { id: String, handoff: String },
-    /// Give a task back.
-    Release { id: String },
+    /// Give a task back, optionally with a handoff for the next claimant.
+    Release {
+        id: String,
+        #[arg(long)]
+        handoff: Option<String>,
+    },
     /// Close a task without doing it.
     Invalidate {
         id: String,
@@ -390,25 +437,7 @@ async fn run_cli() -> Fallible {
             mcp::serve_stdio(Arc::new(m)).await?;
             Ok(())
         }
-        Command::Launch {
-            harness,
-            auth,
-            provider,
-            workdir,
-            unconfined,
-            args,
-        } => {
-            launch(
-                &root,
-                harness.into(),
-                auth.into(),
-                provider.as_deref(),
-                workdir,
-                unconfined,
-                args,
-            )
-            .await
-        }
+        cmd @ (Command::Launch { .. } | Command::Work { .. }) => launch_cmd(&root, cmd).await,
         Command::Relay { .. } => unreachable!("handled in main"),
         Command::Usage => {
             let t = Telemetry::open(&root.join("state/telemetry.db"))?;
@@ -617,7 +646,8 @@ async fn run_confined(
     auth: AuthMode,
     workdir: &Path,
     args: &[String],
-) -> Result<i32, Box<dyn std::error::Error>> {
+    capture: bool,
+) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
     let host_home = home_dir();
     let plan = dm_sandbox::prepare(&dm_sandbox::Request {
         harness,
@@ -632,80 +662,230 @@ async fn run_confined(
         host_home: host_home.as_deref(),
         harness_env: &p.harness_env,
     })?;
-    Ok(tokio::task::spawn_blocking(move || dm_sandbox::run(&plan)).await??)
+    Ok(tokio::task::spawn_blocking(move || {
+        if capture {
+            dm_sandbox::run_captured(&plan)
+                .map(|(code, out)| (code, Some(String::from_utf8_lossy(&out).into_owned())))
+        } else {
+            dm_sandbox::run(&plan).map(|code| (code, None))
+        }
+    })
+    .await??)
 }
 
-async fn launch(
-    root: &Path,
-    harness: Harness,
-    auth: AuthMode,
-    provider: Option<&str>,
-    workdir: Option<PathBuf>,
-    unconfined: bool,
-    args: Vec<String>,
-) -> Fallible {
-    let workdir = match workdir {
-        Some(w) => w,
-        None => std::env::current_dir()?,
-    };
-    let workdir = std::fs::canonicalize(&workdir)?;
-    let p = prepare_launch(root, harness, auth, provider).await?;
-
-    #[cfg(unix)]
-    let serve = {
-        let egress = p.egress.clone();
-        let socket = p.socket.clone();
-        tokio::spawn(async move { egress.serve_unix(&socket).await })
-    };
-    #[cfg(unix)]
-    for _ in 0..100 {
-        if p.socket.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    #[cfg(not(unix))]
-    if !unconfined {
-        return Err("confinement needs Linux; run under WSL2, or pass --unconfined".into());
-    }
-    eprintln!(
-        "memory: {} confined to {} · model calls via {} at ceiling {} · session {}",
-        harness.binary(),
-        workdir.display(),
-        p.ceiling_of,
-        p.ceiling,
-        p.memory.session_id()
-    );
-
-    let code = if unconfined {
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let addr = tcp.local_addr()?;
-        drop(tcp);
-        let serve_tcp = {
-            let egress = p.egress.clone();
-            tokio::spawn(async move { egress.serve_tcp(addr).await })
-        };
-        let code = run_unconfined(
+/// `launch` and `work`: start a session, run it once or per task, exit with the code.
+async fn launch_cmd(root: &Path, command: Command) -> Fallible {
+    match command {
+        Command::Launch {
             harness,
             auth,
-            &workdir,
-            &p.home,
-            &format!("http://{addr}"),
-            &args,
-        )?;
-        serve_tcp.abort();
-        code
-    } else {
-        run_confined(&p, harness, auth, &workdir, &args).await?
-    };
-
-    #[cfg(unix)]
-    {
-        serve.abort();
-        std::fs::remove_file(&p.socket).ok();
+            provider,
+            workdir,
+            unconfined,
+            prompt,
+            prompt_file,
+            no_handoff,
+            args,
+        } => {
+            let prompt = match (prompt, prompt_file) {
+                (Some(p), _) => Some(p),
+                (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
+                (None, None) => None,
+            };
+            let session = Session::start(
+                root,
+                harness.into(),
+                auth.into(),
+                provider.as_deref(),
+                workdir,
+                unconfined,
+            )
+            .await?;
+            let code = match prompt {
+                Some(prompt) => work::prompted(&session, &prompt, no_handoff).await?,
+                None => session.run(&args, false).await?.0,
+            };
+            session.finish();
+            std::process::exit(code);
+        }
+        Command::Work {
+            harness,
+            auth,
+            provider,
+            workdir,
+            unconfined,
+            domain,
+            lease_seconds,
+            keep_going,
+            idle_seconds,
+        } => {
+            let session = Session::start(
+                root,
+                harness.into(),
+                auth.into(),
+                provider.as_deref(),
+                workdir,
+                unconfined,
+            )
+            .await?;
+            let options = work::Options {
+                domain,
+                lease_seconds,
+                keep_going,
+                idle: std::time::Duration::from_secs(idle_seconds),
+            };
+            let code = work::run(&session, &options).await?;
+            session.finish();
+            std::process::exit(code);
+        }
+        _ => unreachable!("only launch and work are routed here"),
     }
-    report_usage(&p.egress);
-    std::process::exit(code);
+}
+
+/// A started session: the memory opened, the egress serving, the harness not yet run.
+/// `launch` runs it once; `work` runs it once per task.
+pub struct Session {
+    p: Prepared,
+    harness: Harness,
+    auth: AuthMode,
+    workdir: PathBuf,
+    unconfined: bool,
+    #[cfg(unix)]
+    serve_unix: tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
+    tcp: Option<(
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
+    )>,
+}
+
+impl Session {
+    async fn start(
+        root: &Path,
+        harness: Harness,
+        auth: AuthMode,
+        provider: Option<&str>,
+        workdir: Option<PathBuf>,
+        unconfined: bool,
+    ) -> Result<Session, Box<dyn std::error::Error>> {
+        let workdir = match workdir {
+            Some(w) => w,
+            None => std::env::current_dir()?,
+        };
+        let workdir = std::fs::canonicalize(&workdir)?;
+        let p = prepare_launch(root, harness, auth, provider).await?;
+
+        #[cfg(unix)]
+        let serve_unix = {
+            let egress = p.egress.clone();
+            let socket = p.socket.clone();
+            tokio::spawn(async move { egress.serve_unix(&socket).await })
+        };
+        #[cfg(unix)]
+        for _ in 0..100 {
+            if p.socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        #[cfg(not(unix))]
+        if !unconfined {
+            return Err("confinement needs Linux; run under WSL2, or pass --unconfined".into());
+        }
+        let tcp = if unconfined {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            drop(listener);
+            let egress = p.egress.clone();
+            Some((
+                addr,
+                tokio::spawn(async move { egress.serve_tcp(addr).await }),
+            ))
+        } else {
+            None
+        };
+        eprintln!(
+            "memory: {} {} {} · model calls via {} at ceiling {} · session {}",
+            harness.binary(),
+            if unconfined {
+                "unconfined in"
+            } else {
+                "confined to"
+            },
+            workdir.display(),
+            p.ceiling_of,
+            p.ceiling,
+            p.memory.session_id()
+        );
+        Ok(Session {
+            p,
+            harness,
+            auth,
+            workdir,
+            unconfined,
+            #[cfg(unix)]
+            serve_unix,
+            tcp,
+        })
+    }
+
+    /// The opened memory, for a client in the same process.
+    pub fn memory(&self) -> Arc<Memory> {
+        self.p.memory.clone()
+    }
+
+    /// Which harness.
+    pub fn harness(&self) -> Harness {
+        self.harness
+    }
+
+    /// Run the harness once with these arguments. With `capture`, its standard output
+    /// comes back instead of reaching the terminal.
+    ///
+    /// # Errors
+    ///
+    /// When the sandbox cannot be built or the harness cannot be spawned.
+    pub async fn run(
+        &self,
+        args: &[String],
+        capture: bool,
+    ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
+        match &self.tcp {
+            Some((addr, _)) => run_unconfined(
+                self.harness,
+                self.auth,
+                &self.workdir,
+                &self.p.home,
+                &format!("http://{addr}"),
+                args,
+                capture,
+            ),
+            None => {
+                run_confined(
+                    &self.p,
+                    self.harness,
+                    self.auth,
+                    &self.workdir,
+                    args,
+                    capture,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Stop serving and report usage.
+    pub fn finish(self) {
+        if let Some((_, serve)) = self.tcp {
+            serve.abort();
+        }
+        #[cfg(unix)]
+        {
+            self.serve_unix.abort();
+            std::fs::remove_file(&self.p.socket).ok();
+        }
+        let _ = self.unconfined;
+        report_usage(&self.p.egress);
+    }
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -714,6 +894,7 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Run the harness on the host with the egress on a TCP port. The same configuration as
 /// the confined path, minus the namespaces.
+#[allow(clippy::too_many_arguments)] // the host-side twin of dm_sandbox::Request
 fn run_unconfined(
     harness: Harness,
     auth: AuthMode,
@@ -721,7 +902,8 @@ fn run_unconfined(
     home: &Path,
     egress_url: &str,
     args: &[String],
-) -> Result<i32, Box<dyn std::error::Error>> {
+    capture: bool,
+) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(home)?;
     let mut cmd = std::process::Command::new(harness.binary());
     cmd.current_dir(workdir);
@@ -761,8 +943,18 @@ fn run_unconfined(
         }
     }
     cmd.args(args);
+    if capture {
+        let out = cmd
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .output()?;
+        return Ok((
+            out.status.code().unwrap_or(1),
+            Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        ));
+    }
     let status = cmd.status()?;
-    Ok(status.code().unwrap_or(1))
+    Ok((status.code().unwrap_or(1), None))
 }
 
 /// Inside the sandbox, as pid 1 of the harness's namespace: forward the loopback port to
@@ -920,6 +1112,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         Command::Init { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
+        | Command::Work { .. }
         | Command::Relay { .. }
         | Command::Usage
         | Command::Task { .. }
@@ -976,7 +1169,7 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
             json(&m.heartbeat(&id, Duration::seconds(lease_seconds)).await?)
         }
         TaskOp::Complete { id, handoff } => json(&m.complete(&id, &handoff).await?),
-        TaskOp::Release { id } => json(&m.release(&id).await?),
+        TaskOp::Release { id, handoff } => json(&m.release(&id, handoff.as_deref()).await?),
         TaskOp::Invalidate { id, reason } => json(&m.invalidate(&id, &reason, None).await?),
         TaskOp::Get { id } => json(&m.get_task(&id).await?),
     }

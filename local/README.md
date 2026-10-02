@@ -21,7 +21,30 @@ make launch HARNESS=opencode AUTH=key         # opencode, ANTHROPIC_API_KEY
 make launch HARNESS=opencode AUTH=key PROVIDER=xai   # the same harness, Grok behind it
 make launch AUTH=gateway                      # claude through the local LiteLLM
 make launch ARGS='-p "load T0 and summarise"' # arguments go to the harness
+make launch PROMPT='load T0 and summarise'    # non-interactive, in the harness's headless form
+make work                                     # claim the next task from the ledger and run it
+make work LOOP=1                              # keep claiming until interrupted
 make usage                                    # tokens by destination and model
+```
+
+Three ways to run, one launcher. Interactive is the harness as you know it. `PROMPT` runs the
+harness's headless form, prints its answer, and exits with its code; a run that leaves no
+handoff exits 4, since a non-interactive run whose outcome is only in its transcript has
+left nothing for the next session (`--no-handoff` if that is intended). `make work` claims
+the next admitted task the session may take, builds the prompt from T0, the task, where the
+last attempt stopped, and the handoffs of the tasks it depends on, and runs the harness on
+it. The launcher holds the lease and heartbeats while the harness works, so a crashed or
+wedged harness cannot leave a task stuck. On exit, a task the harness completed stays
+complete (exit 0); anything else goes back to the pool with the harness's output filed as a
+handoff and attached to the task (exit 4), so the next claimant starts where this one
+stopped. Nothing claimable is exit 3. The launcher reaches the ledger through the memory
+server's own tool surface, as a client like the harness, so the ledger's rules live in one
+place and a launcher that is behind still works.
+
+```sh
+memory task create "Finish the import" --body "Steps 3 to 5." --priority 5
+memory task admit task-me-xxxxxxxx
+make work HARNESS=codex AUTH=key
 ```
 
 Five harnesses, one launcher. Each needed the same three things, and the table is the whole

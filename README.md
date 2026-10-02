@@ -26,6 +26,7 @@ export MEMORY_ROOT=~/memory
 ```
 
 To run a harness confined, with the memory server attached and every model call metered,
+interactively, on a prompt, or on the next task from the ledger,
 see [local/README.md](local/README.md): `make launch` runs Claude Code, Codex, Gemini CLI,
 Copilot CLI or OpenCode in native namespaces with no network except the egress. The gateway half of that page runs LiteLLM
 locally so the Foundation's shape can be tried end to end.
@@ -65,6 +66,7 @@ built binary.
 | `crates/ledger` | Tasks, leases, origin dedup |
 | `crates/policy` | The grants file |
 | `crates/server` | The MCP surface |
+| `crates/client` | A typed MCP client for the ledger and the record; what the launcher's task mode and an orchestrator use |
 | `crates/memory` | The binary |
 | `docs/` | The paper, its case study, the stack |
 

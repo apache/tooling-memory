@@ -437,6 +437,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-client"
+version = "0.1.0"
+dependencies = [
+ "dm-ledger",
+ "dm-server",
+ "rmcp",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "dm-core"
 version = "0.1.0"
 dependencies = [
@@ -1250,6 +1263,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "dm-client",
  "dm-core",
  "dm-egress",
  "dm-index",
