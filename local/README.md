@@ -86,12 +86,28 @@ Max login (Anthropic prohibits third-party clients), Copilot with a key (it has 
 mode). A call the upstream refuses is recorded in `make usage` under its HTTP status, so
 an expired login or a wrong key shows up there rather than vanishing.
 
+## Handoffs the harness did not write
+
+The launcher installs two hooks in Claude Code's settings in the private home: before
+context is compacted, and at session end. Each runs the `memory` binary inside the
+sandbox, which reads the event and the transcript's tail and leaves a note in an outbox in
+the private home. When the run ends, the launcher files the notes as handoffs, marked as
+left by the hook rather than the agent and pointing at the full transcript. A note from
+before compaction is always filed, since what it holds has left the harness's context. A
+note from session end is filed only when the run left no handoff of its own: the handoff
+of last resort, which is also why a prompted run that forgot to write one no longer exits
+4. Transcripts stay where the harness keeps them, under the private home in the record's
+state, so nothing is lost even when no note is filed. Codex and Gemini CLI expose the same
+moments; their adapters are next.
+
 ## In the harness image, on Linux: `make unpack`
 
-The same image serves the Linux backend. `make unpack` exports it from whichever runtime
-holds it (`wslc` from a WSL distribution, otherwise podman or docker) into the record's
-state as a plain directory, and from then on `make launch` on Linux pivots into that
-directory instead of mounting this machine's `/usr`: the image's harnesses, Node, `/etc`
+The same image serves the Linux backend. `make unpack` exports it once from whichever
+runtime holds it (`wslc` from a WSL distribution, otherwise podman or docker) into the
+record's state as a plain directory, about twenty seconds for the two gigabytes, and from
+then on `make launch` on Linux pivots into that directory instead of mounting this
+machine's `/usr`, at no extra cost per run since it is only bind mounts. Unpack again when
+the image changes: the image's harnesses, Node, `/etc`
 and `memory` binary, read-only, with only the private home, the working tree and the
 egress socket added. A Linux run and a run under WSL containers are then the same
 environment. `--backend namespaces` goes back to the host's binaries; `--backend image`

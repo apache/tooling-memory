@@ -6,6 +6,7 @@
 //! `MEMORY_ROOT`) and, for `launch`, reads the one or two credentials it needs from its own
 //! environment and never passes them inside.
 
+mod hooks;
 mod image;
 mod requests;
 mod work;
@@ -313,6 +314,13 @@ enum Command {
     },
     /// Token usage recorded by the egress, by destination and model.
     Usage,
+    /// Inside the sandbox, run by the harness's hooks: read the event from standard
+    /// input and leave a note in the outbox for the launcher to file as a handoff.
+    #[command(hide = true)]
+    Hook {
+        /// Which harness's hook format; claude for now.
+        harness: String,
+    },
     /// The harness image on this host.
     Image {
         #[command(subcommand)]
@@ -497,6 +505,21 @@ fn main() {
             }
         }
     }
+    // A hook needs no record and no runtime: it reads one event and writes one file.
+    if args.get(1).is_some_and(|a| a == "hook") {
+        let outbox = std::env::var_os("MEMORY_OUTBOX")
+            .map(PathBuf::from)
+            .or_else(|| home_dir().map(|h| h.join(hooks::OUTBOX)));
+        match outbox {
+            Some(outbox) => {
+                if let Err(e) = hooks::run(&outbox) {
+                    eprintln!("memory hook: {e}");
+                }
+            }
+            None => eprintln!("memory hook: no MEMORY_OUTBOX and no HOME"),
+        }
+        std::process::exit(0);
+    }
     if let Err(e) = run_cli() {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -528,6 +551,7 @@ async fn run_cli() -> Fallible {
         cmd @ (Command::Launch { .. } | Command::Work { .. } | Command::Inside { .. }) => {
             launch_cmd(&root, cmd).await
         }
+        Command::Hook { .. } => unreachable!("handled in main before the root is needed"),
         Command::Image { op } => match op {
             ImageOp::Unpack { image } => {
                 image::unpack(&root, &image)?;
@@ -854,7 +878,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     .await?;
     let code = match prompt {
         Some(prompt) => work::prompted(&session, &prompt, no_handoff).await?,
-        None => session.run(&args, false).await?.0,
+        None => work::interactive(&session, &args).await?,
     };
     session.finish(code);
     std::process::exit(code);
@@ -973,7 +997,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
         };
         match prompt {
             Some(prompt) => work::prompted(&session, &prompt, no_handoff).await?,
-            None => session.run(&args, false).await?.0,
+            None => work::interactive(&session, &args).await?,
         }
     };
     session.finish(code);
@@ -1170,6 +1194,11 @@ impl Session {
         self.harness
     }
 
+    /// Where the harness's hooks leave notes.
+    pub fn outbox(&self) -> PathBuf {
+        self.p.home.join(hooks::OUTBOX)
+    }
+
     /// Run the harness once with these arguments. With `capture`, its standard output
     /// comes back instead of reaching the terminal.
     ///
@@ -1340,6 +1369,7 @@ fn run_unconfined(
             cmd.arg("--mcp-config")
                 .arg(&mcp_path)
                 .arg("--strict-mcp-config");
+            cmd.env("MEMORY_OUTBOX", home.join(hooks::OUTBOX));
         }
         Harness::Gemini | Harness::Copilot | Harness::OpenCode => {
             return Err(format!(
@@ -1534,6 +1564,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Work { .. }
         | Command::Inside { .. }
         | Command::Image { .. }
+        | Command::Hook { .. }
         | Command::Relay { .. }
         | Command::Usage
         | Command::Task { .. }

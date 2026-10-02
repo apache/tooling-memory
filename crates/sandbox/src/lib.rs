@@ -244,6 +244,8 @@ pub const INSIDE_SOCKET: &str = "/run/memory/egress.sock";
 pub const INSIDE_MEMORY: &str = "/opt/memory/memory";
 /// The loopback address the relay listens on inside.
 pub const INSIDE_RELAY: &str = "127.0.0.1:4100";
+/// Where hooks leave notes for the launcher, under the private home.
+pub const OUTBOX: &str = ".memory-outbox";
 
 fn write(path: &Path, text: &str) -> Result<(), Error> {
     if let Some(p) = path.parent() {
@@ -568,6 +570,8 @@ fn setup_claude(
     });
     write(&req.home.join(".claude-mcp.json"), &mcp.to_string())?;
     claude_global_config(&req.home.join(".claude.json"), req.workdir_inside())?;
+    claude_hooks(&req.home.join(".claude/settings.json"))?;
+    env.insert("MEMORY_OUTBOX".into(), format!("{INSIDE_HOME}/{OUTBOX}"));
     env.insert("ANTHROPIC_BASE_URL".into(), format!("{relay}/anthropic"));
     env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
     match req.auth {
@@ -583,6 +587,27 @@ fn setup_claude(
     argv.push(format!("{INSIDE_HOME}/.claude-mcp.json"));
     argv.push("--strict-mcp-config".into());
     Ok(())
+}
+
+/// The hooks that leave a handoff the agent did not write: before compaction and at
+/// session end, the `memory` binary inside reads the event and the transcript and
+/// drops a note in the outbox for the launcher to file. Merged into the user settings
+/// in the private home, which the launcher owns.
+fn claude_hooks(path: &Path) -> Result<(), Error> {
+    let mut settings: serde_json::Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let hook = serde_json::json!([{
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": format!("{INSIDE_MEMORY} hook claude"), "timeout": 30 }]
+    }]);
+    settings["hooks"]["PreCompact"] = hook.clone();
+    settings["hooks"]["SessionEnd"] = hook;
+    write(
+        path,
+        &serde_json::to_string_pretty(&settings).unwrap_or_default(),
+    )
 }
 
 fn setup_codex(

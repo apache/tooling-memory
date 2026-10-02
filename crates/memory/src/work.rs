@@ -4,6 +4,7 @@
 //! memory server's tool surface, over an in-process pipe. The ledger's rules stay on the
 //! server; this module knows how to turn a task into a prompt and an exit into a handoff.
 
+use crate::hooks::{self, Event};
 use crate::Session;
 use dm_client::{MemoryClient, Task};
 use dm_sandbox::Harness;
@@ -58,6 +59,52 @@ async fn handoff_ids(client: &MemoryClient, domain: Option<&str>) -> Fallible<BT
         .collect())
 }
 
+/// File what the harness's hooks left in the outbox. A note from before compaction is
+/// always filed: what it holds is gone from the harness's context. A note from session
+/// end is filed only when the run left no handoff of its own, as the handoff of last
+/// resort; otherwise it is dropped. Returns the ids filed.
+///
+/// # Errors
+///
+/// When the outbox cannot be read or the memory server refuses a write.
+pub async fn file_outbox(
+    session: &Session,
+    client: &MemoryClient,
+    wrote_handoff: bool,
+) -> Fallible<Vec<String>> {
+    let mut filed = Vec::new();
+    for note in hooks::notes(&session.outbox())? {
+        if note.event == Event::SessionEnd && wrote_handoff {
+            std::fs::remove_file(&note.path).ok();
+            continue;
+        }
+        let id = client.write_handoff(&note.title, &note.body, None).await?;
+        eprintln!(
+            "memory: handoff {id} from the harness's hook ({})",
+            note.event.suffix()
+        );
+        std::fs::remove_file(&note.path).ok();
+        filed.push(id);
+    }
+    Ok(filed)
+}
+
+/// An interactive run: the harness as the person knows it, with the outbox filed when
+/// it exits.
+///
+/// # Errors
+///
+/// When the harness cannot be run or the memory server cannot be reached.
+pub async fn interactive(session: &Session, args: &[String]) -> Fallible<i32> {
+    let client = client(session.memory()).await?;
+    let before = handoff_ids(&client, None).await?;
+    let (code, _) = session.run(args, false).await?;
+    let after = handoff_ids(&client, None).await?;
+    file_outbox(session, &client, after.difference(&before).next().is_some()).await?;
+    client.close().await.ok();
+    Ok(code)
+}
+
 /// Run one prompt in the harness's headless form. Unless `no_handoff`, a run that left
 /// no handoff exits [`STOPPED`]: a non-interactive run whose outcome is only in its
 /// transcript has left nothing for the next session.
@@ -77,7 +124,9 @@ pub async fn prompted(session: &Session, prompt: &str, no_handoff: bool) -> Fall
             println!();
         }
     }
-    let after = handoff_ids(&client, None).await?;
+    let mut after = handoff_ids(&client, None).await?;
+    let wrote = after.difference(&before).next().is_some();
+    after.extend(file_outbox(session, &client, wrote).await?);
     let new: Vec<&String> = after.difference(&before).collect();
     if new.is_empty() && !no_handoff {
         eprintln!(
@@ -153,6 +202,8 @@ async fn one(
         .await;
     heartbeat.abort();
     let (code, output) = run?;
+    let now = client.get_task(&task.id).await?;
+    file_outbox(session, client, now.status == "completed").await?;
     let output = output.unwrap_or_default();
     if !output.trim().is_empty() {
         print!("{output}");

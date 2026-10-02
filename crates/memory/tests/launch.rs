@@ -547,3 +547,93 @@ fn inside_writes_image_requests_and_reports_done() {
         "0"
     );
 }
+
+// ---- hooks: a handoff the harness did not write ----
+
+/// A fake harness that behaves like Claude Code's hooks: before "compaction" and at
+/// session end it runs `memory hook claude` with the event on standard input and a
+/// transcript on disk, and writes no handoff of its own.
+const FIRES_HOOKS: &str = r#"
+t=./transcript.jsonl
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"Finish the import."}}' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Step 3 done, starting step 4."}]}}' > "$t"
+printf '{"hook_event_name":"PreCompact","session_id":"fake-session-1","transcript_path":"%s","trigger":"auto"}' "$t" | "$MEMORY_BIN" hook claude
+printf '{"hook_event_name":"SessionEnd","session_id":"fake-session-1","transcript_path":"%s","reason":"other"}' "$t" | "$MEMORY_BIN" hook claude
+echo "the answer"
+"#;
+
+#[test]
+fn hook_notes_become_handoffs_when_the_run_left_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), FIRES_HOOKS);
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let mut cmd = memory();
+    cmd.args([
+        "--root",
+        root.to_str().unwrap(),
+        "launch",
+        "--harness",
+        "claude",
+        "--auth",
+        "key",
+        "--unconfined",
+    ]);
+    cmd.args([
+        "--workdir",
+        work_dir.to_str().unwrap(),
+        "--prompt",
+        "finish the import",
+    ]);
+    cmd.env("PATH", path_with(&bins));
+    cmd.env("ANTHROPIC_API_KEY", "sk-ant-placeholder");
+    cmd.env("MEMORY_BIN", env!("CARGO_BIN_EXE_memory"));
+    cmd.stdin(Stdio::null());
+    let out = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the session-end note is the handoff of last resort: {stderr}"
+    );
+    assert!(
+        stderr.contains("from the harness's hook (precompact)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("from the harness's hook (sessionend)"),
+        "{stderr}"
+    );
+    let list = cli(&root, &["list", "--kind", "handoff"]);
+    let titles: Vec<String> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["title"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        titles
+            .iter()
+            .any(|t| t.starts_with("Session fake-ses before compaction (auto)")),
+        "{titles:?}"
+    );
+    assert!(
+        titles
+            .iter()
+            .any(|t| t.starts_with("Session fake-ses at session end (other)")),
+        "{titles:?}"
+    );
+    let id = list[0]["id"].as_str().unwrap();
+    let body = cli_text(&root, &["get", id]);
+    assert!(
+        body.contains("Step 3 done, starting step 4."),
+        "the transcript's tail is in the handoff: {body}"
+    );
+    assert!(body.contains("Left by the launcher's hook"), "{body}");
+    // nothing left waiting
+    assert!(
+        std::fs::read_dir(root.join("state/sandbox/claude/.memory-outbox"))
+            .map(|d| d.count() == 0)
+            .unwrap_or(true)
+    );
+}
