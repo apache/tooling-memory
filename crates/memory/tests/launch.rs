@@ -448,3 +448,102 @@ fn a_prompted_launch_runs_headless_and_insists_on_a_handoff() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---- the wslc backend's inside half, driven by a fake host ----
+
+/// `memory inside` writes run requests for the host and waits for exit codes. This fake
+/// host answers them from the test, which proves the protocol and the plan the inside
+/// builds for the harness image without a container runtime.
+/// The host's side of the protocol: wait for the request file.
+fn await_request(req_path: &Path) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !req_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    serde_json::from_str(&std::fs::read_to_string(req_path).unwrap()).unwrap()
+}
+
+/// What a request for the harness image must say.
+fn check_image_request(req: &serde_json::Value) {
+    let argv: Vec<&str> = req["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(argv[0], "/opt/memory/memory", "{argv:?}");
+    assert!(
+        argv.contains(&"/usr/local/bin/claude"),
+        "the harness at the image's path: {argv:?}"
+    );
+    assert!(
+        argv.contains(&"-p") && argv.contains(&"say the answer"),
+        "{argv:?}"
+    );
+    assert_eq!(req["cwd"], "/work");
+    assert_eq!(req["home"], "state/sandbox/claude");
+    assert_eq!(req["interactive"], false);
+    assert_eq!(
+        req["env"]["ANTHROPIC_BASE_URL"],
+        "http://127.0.0.1:4100/anthropic"
+    );
+    assert_eq!(req["env"]["HOME"], "/home/user");
+}
+
+#[test]
+fn inside_writes_image_requests_and_reports_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let requests = dir.path().join("volume");
+    std::fs::create_dir_all(&requests).unwrap();
+    let host_home = dir.path().join("host-home");
+    std::fs::create_dir_all(host_home.join(".claude")).unwrap();
+    std::fs::write(host_home.join(".claude/.credentials.json"), "{}").unwrap();
+
+    let child = memory()
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "inside",
+            "--harness",
+            "claude",
+            "--auth",
+            "subscription",
+        ])
+        .args([
+            "--requests",
+            requests.to_str().unwrap(),
+            "--host-home",
+            host_home.to_str().unwrap(),
+        ])
+        .args(["--prompt", "say the answer", "--no-handoff"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let req = await_request(&requests.join("req-0.json"));
+    check_image_request(&req);
+    std::fs::write(requests.join("req-0.out"), "the answer\n").unwrap();
+    std::fs::write(requests.join("req-0.exit"), "0\n").unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stdout.contains("the answer"),
+        "the captured output is printed: {stdout}"
+    );
+    assert!(
+        stderr.contains("in the harness image, working tree at /work"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(requests.join("done"))
+            .unwrap()
+            .trim(),
+        "0"
+    );
+}
