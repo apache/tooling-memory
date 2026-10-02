@@ -101,7 +101,16 @@ impl Grants {
             },
         );
         let mut destinations = BTreeMap::new();
-        for d in ["anthropic", "openai", "gemini", "github", "xai", "llmao"] {
+        for d in [
+            "anthropic",
+            "openai",
+            "chatgpt",
+            "gemini",
+            "google",
+            "github",
+            "xai",
+            "llmao",
+        ] {
             destinations.insert(
                 d.to_string(),
                 Destination {

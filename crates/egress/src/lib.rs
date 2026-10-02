@@ -88,6 +88,17 @@ impl Destination {
             tunnel_hosts: hosts.into_iter().map(Into::into).collect(),
         }
     }
+
+    /// Also allow tunnels to these hosts. For a forwarding destination whose login
+    /// refreshes its token at a host the forward does not cover.
+    #[must_use]
+    pub fn with_tunnels(
+        mut self,
+        hosts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Destination {
+        self.tunnel_hosts.extend(hosts.into_iter().map(Into::into));
+        self
+    }
 }
 
 /// What can go wrong building or running the egress.
@@ -481,14 +492,23 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<Usage>>();
     let stream = usage_tail(body_stream, content_type.as_deref(), tx);
     tokio::spawn(async move {
-        if let Ok(Some(u)) = rx.await {
-            if let Err(e) = egress2
-                .inner
-                .telemetry
-                .record(&session, &destination, status_code, &u)
-            {
-                eprintln!("egress: telemetry: {e}");
-            }
+        // a call that reported usage is recorded as such; a call the upstream refused is
+        // recorded by its status, so a refused key or an expired login shows up in
+        // `memory usage` rather than vanishing
+        let usage = match rx.await {
+            Ok(Some(u)) => u,
+            Ok(None) if !status.is_success() => Usage {
+                model: Some(format!("http {status_code}")),
+                ..Usage::default()
+            },
+            _ => return,
+        };
+        if let Err(e) = egress2
+            .inner
+            .telemetry
+            .record(&session, &destination, status_code, &usage)
+        {
+            eprintln!("egress: telemetry: {e}");
         }
     });
 

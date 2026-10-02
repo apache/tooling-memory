@@ -72,4 +72,5 @@ built binary.
 
 M0 code complete as of 2 October 2026, plus the confined launcher: Claude Code, Codex,
 Gemini CLI, Copilot CLI and OpenCode run in native Linux namespaces with the memory
-server attached over MCP and model calls forwarded and metered through the egress. See [PLAN.md](PLAN.md).
+server attached over MCP and model calls forwarded and metered through the egress, on
+your own logins or on keys the egress holds. See [PLAN.md](PLAN.md).

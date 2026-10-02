@@ -103,6 +103,18 @@ impl Harness {
         }
     }
 
+    /// The destination a login, rather than a key, talks to. Differs where the
+    /// subscription backend is not the public API: Codex's ChatGPT login talks to
+    /// the ChatGPT backend, Gemini's Google login to Code Assist.
+    #[must_use]
+    pub fn subscription_provider(self) -> &'static str {
+        match self {
+            Harness::Codex => "chatgpt",
+            Harness::Gemini => "google",
+            other => other.provider(),
+        }
+    }
+
     /// Whether `--provider` may point this harness at another destination.
     #[must_use]
     pub fn accepts_provider(self) -> bool {
@@ -171,8 +183,10 @@ pub struct Request<'a> {
     pub destination_ceiling: Label,
     /// Arguments after the harness binary.
     pub harness_args: &'a [String],
-    /// The host's `~/.claude/.credentials.json`, copied in for Claude's subscription mode.
-    pub claude_credentials: Option<&'a Path>,
+    /// The host's home, read only for the login file a subscription mode copies in:
+    /// Claude Code's `.claude/.credentials.json`, Codex's `.codex/auth.json`, Gemini's
+    /// `.gemini/oauth_creds.json`. Nothing else is read from it and it is never mounted.
+    pub host_home: Option<&'a Path>,
     /// Credentials the harness itself must hold, passed into its environment. For
     /// subscription modes that are a token rather than a file, such as Copilot's
     /// `GH_TOKEN`.
@@ -193,6 +207,37 @@ fn write(path: &Path, text: &str) -> Result<(), Error> {
         std::fs::create_dir_all(p).map_err(io(p))?;
     }
     std::fs::write(path, text).map_err(io(path))
+}
+
+/// Copy one login file from the host's home into the sandbox's private home, at the same
+/// relative path. The harness then finds its own login where it expects it.
+fn copy_login(req: &Request<'_>, rel: &str, login: &str) -> Result<(), Error> {
+    let src = req.host_home.map(|h| h.join(rel)).filter(|p| p.is_file());
+    let Some(src) = src else {
+        return Err(Error::Unsupported(format!(
+            "subscription mode needs ~/{rel} from {login}; run that login on the host first"
+        )));
+    };
+    let dst = req.home.join(rel);
+    if let Some(p) = dst.parent() {
+        std::fs::create_dir_all(p).map_err(io(p))?;
+    }
+    std::fs::copy(src, &dst).map_err(io(&dst))?;
+    Ok(())
+}
+
+/// Point the harness's HTTPS at the egress for what its base-URL override does not
+/// cover, such as a token refresh; the egress tunnels only to the hosts the
+/// destination allows.
+fn proxy_via(relay: &str, env: &mut BTreeMap<String, String>) {
+    env.insert("HTTPS_PROXY".into(), relay.to_string());
+    env.insert("HTTP_PROXY".into(), relay.to_string());
+    env.insert("NO_PROXY".into(), "127.0.0.1,localhost".into());
+}
+
+/// A variable from the launcher's environment the harness may see, when it is set.
+fn env_passthrough(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 fn find_on_path(name: &str) -> Result<PathBuf, Error> {
@@ -345,8 +390,9 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
     let harness_bin = find_on_path(req.harness.binary())?;
     std::fs::create_dir_all(req.home).map_err(io(req.home))?;
     let relay = format!("http://{INSIDE_RELAY}");
+    let own = [req.harness.provider(), req.harness.subscription_provider()];
     let provider = match req.provider {
-        Some(p) if req.harness.accepts_provider() || p == req.harness.provider() => p.to_string(),
+        Some(p) if req.harness.accepts_provider() || own.contains(&p) => p.to_string(),
         Some(p) => {
             return Err(Error::Unsupported(format!(
                 "{} does not take --provider ({p}); its model calls go to {}",
@@ -408,17 +454,7 @@ fn setup_claude(
     env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
     match req.auth {
         AuthMode::Subscription => {
-            let Some(src) = req.claude_credentials else {
-                return Err(Error::Unsupported(
-                    "subscription mode needs ~/.claude/.credentials.json from a Claude Code login"
-                        .into(),
-                ));
-            };
-            let dst = req.home.join(".claude/.credentials.json");
-            if let Some(p) = dst.parent() {
-                std::fs::create_dir_all(p).map_err(io(p))?;
-            }
-            std::fs::copy(src, &dst).map_err(io(&dst))?;
+            copy_login(req, ".claude/.credentials.json", "a Claude Code login")?;
         }
         AuthMode::Gateway | AuthMode::Key => {
             // the egress injects the real credential; this one only has to exist
@@ -437,13 +473,28 @@ fn setup_codex(
     provider: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
-    if req.auth == AuthMode::Subscription {
-        return Err(Error::Unsupported(
-            "codex with a ChatGPT login routes to chatgpt.com, which the egress does not proxy yet; use --auth key or --auth gateway".into(),
-        ));
-    }
-    let config = format!(
-        r#"# written by memory launch; edits are overwritten
+    let config = if req.auth == AuthMode::Subscription {
+        // a ChatGPT login talks to the ChatGPT backend, not the OpenAI API: the built-in
+        // provider stays, its backend base moves to the egress, and the token refresh
+        // at auth.openai.com goes through the egress as a tunnel
+        copy_login(
+            req,
+            ".codex/auth.json",
+            "`codex login` (or `codex login --device-auth`)",
+        )?;
+        proxy_via(relay, env);
+        format!(
+            r#"# written by memory launch; edits are overwritten
+chatgpt_base_url = "{relay}/chatgpt/"
+
+[mcp_servers.memory]
+url = "{relay}/mcp"
+"#
+        )
+    } else {
+        env.insert("DM_EGRESS_TOKEN".into(), "egress".into());
+        format!(
+            r#"# written by memory launch; edits are overwritten
 model_provider = "egress"
 
 [model_providers.egress]
@@ -455,10 +506,10 @@ wire_api = "responses"
 [mcp_servers.memory]
 url = "{relay}/mcp"
 "#
-    );
+        )
+    };
     write(&req.home.join(".codex/config.toml"), &config)?;
     env.insert("CODEX_HOME".into(), format!("{INSIDE_HOME}/.codex"));
-    env.insert("DM_EGRESS_TOKEN".into(), "egress".into());
     Ok(())
 }
 
@@ -467,13 +518,31 @@ fn setup_gemini(
     relay: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
-    if req.auth == AuthMode::Subscription {
-        return Err(Error::Unsupported(
-            "gemini's Google login talks to cloudcode-pa.googleapis.com, which the egress does not proxy yet; use --auth key with GEMINI_API_KEY".into(),
-        ));
+    let subscription = req.auth == AuthMode::Subscription;
+    if subscription {
+        // a Google login talks to Code Assist, not the Gemini API: its endpoint moves to
+        // the egress, and the token refresh at oauth2.googleapis.com goes through the
+        // egress as a tunnel
+        copy_login(req, ".gemini/oauth_creds.json", "a Gemini CLI Google login")?;
+        // which account and tier; optional, Gemini asks Google again without it
+        let _ = copy_login(req, ".gemini/google_accounts.json", "");
+        proxy_via(relay, env);
+        env.insert("CODE_ASSIST_ENDPOINT".into(), format!("{relay}/google"));
+        if let Some(project) = env_passthrough("GOOGLE_CLOUD_PROJECT") {
+            env.insert("GOOGLE_CLOUD_PROJECT".into(), project);
+        }
+    } else {
+        env.insert("GOOGLE_GEMINI_BASE_URL".into(), format!("{relay}/gemini"));
+        // the egress injects the real key as x-goog-api-key and drops any ?key= it sees
+        env.insert("GEMINI_API_KEY".into(), "egress".into());
     }
+    let auth_type = if subscription {
+        "oauth-personal"
+    } else {
+        "gemini-api-key"
+    };
     let settings = serde_json::json!({
-        "security": { "auth": { "selectedType": "gemini-api-key" } },
+        "security": { "auth": { "selectedType": auth_type } },
         "general": { "enableAutoUpdate": false },
         "privacy": { "usageStatisticsEnabled": false },
         "mcpServers": { "memory": { "httpUrl": format!("{relay}/mcp") } }
@@ -482,11 +551,8 @@ fn setup_gemini(
         &req.home.join(".gemini/settings.json"),
         &serde_json::to_string_pretty(&settings).unwrap_or_default(),
     )?;
-    env.insert("GOOGLE_GEMINI_BASE_URL".into(), format!("{relay}/gemini"));
     // the working tree is the one thing mounted read-write; it is trusted by construction
     env.insert("GEMINI_CLI_TRUST_WORKSPACE".into(), "true".into());
-    // the egress injects the real key as x-goog-api-key and drops any ?key= it sees
-    env.insert("GEMINI_API_KEY".into(), "egress".into());
     Ok(())
 }
 
@@ -514,9 +580,7 @@ fn setup_copilot(
     env.insert("COPILOT_AUTO_UPDATE".into(), "false".into());
     // no base-url override exists, so its HTTPS goes through the egress as a CONNECT
     // tunnel to the hosts the github destination allows
-    env.insert("HTTPS_PROXY".into(), relay.to_string());
-    env.insert("HTTP_PROXY".into(), relay.to_string());
-    env.insert("NO_PROXY".into(), "127.0.0.1,localhost".into());
+    proxy_via(relay, env);
     Ok(())
 }
 
@@ -607,7 +671,7 @@ mod tests {
         work: PathBuf,
         sock: PathBuf,
         memory_bin: PathBuf,
-        creds: PathBuf,
+        host_home: PathBuf,
         root: PathBuf,
     }
 
@@ -634,8 +698,24 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         let sock = dir.path().join("egress.sock");
         std::fs::write(&sock, "").unwrap();
-        let creds = dir.path().join("creds.json");
-        std::fs::write(&creds, r#"{"claudeAiOauth":{"accessToken":"x"}}"#).unwrap();
+        // a host home holding one login per harness, and a file that must not leak
+        let host_home = dir.path().join("host-home");
+        for (rel, text) in [
+            (
+                ".claude/.credentials.json",
+                r#"{"claudeAiOauth":{"accessToken":"x"}}"#,
+            ),
+            (".codex/auth.json", r#"{"tokens":{"access_token":"x"}}"#),
+            (
+                ".gemini/oauth_creds.json",
+                r#"{"access_token":"x","refresh_token":"y"}"#,
+            ),
+            (".ssh/id_ed25519", "private"),
+        ] {
+            let p = host_home.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+        }
         let root = dir.path().to_path_buf();
         Fixture {
             _dir: dir,
@@ -643,7 +723,7 @@ mod tests {
             work,
             sock,
             memory_bin,
-            creds,
+            host_home,
             root,
         }
     }
@@ -679,7 +759,7 @@ mod tests {
                     Label::Public
                 },
                 harness_args: args,
-                claude_credentials: creds.then_some(self.creds.as_path()),
+                host_home: creds.then_some(self.host_home.as_path()),
                 harness_env,
             });
             std::env::set_var("PATH", old);
@@ -822,10 +902,6 @@ mod tests {
             cfg.contains("base_url = \"http://127.0.0.1:4100/xai/v1\""),
             "grok through the xai destination: {cfg}"
         );
-        assert!(matches!(
-            f.plan(Harness::Codex, AuthMode::Subscription, "c3", &[], false),
-            Err(Error::Unsupported(_))
-        ));
         assert!(
             matches!(
                 f.plan_with(
@@ -857,6 +933,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_subscription_moves_the_chatgpt_backend_to_the_egress() {
+        let f = fixture();
+        // without a host login the subscription mode is refused; with one, the ChatGPT
+        // backend moves to the egress and the login file is copied in
+        assert!(matches!(
+            f.plan(Harness::Codex, AuthMode::Subscription, "c3", &[], false),
+            Err(Error::Unsupported(_))
+        ));
+        let (home, plan) = f
+            .plan(Harness::Codex, AuthMode::Subscription, "c5", &[], true)
+            .unwrap();
+        let cfg = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(
+            cfg.contains("chatgpt_base_url = \"http://127.0.0.1:4100/chatgpt/\""),
+            "{cfg}"
+        );
+        assert!(
+            !cfg.contains("model_provider"),
+            "the built-in provider stays: {cfg}"
+        );
+        assert!(home.join(".codex/auth.json").is_file(), "login copied in");
+        assert!(
+            !home.join(".ssh").exists(),
+            "nothing else from the host home"
+        );
+        assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
+        assert!(!plan.env.contains_key("DM_EGRESS_TOKEN"));
+    }
+
+    #[test]
     fn gemini_settings_and_env() {
         let f = fixture();
         let (home, plan) = f
@@ -879,6 +985,23 @@ mod tests {
             f.plan(Harness::Gemini, AuthMode::Subscription, "g2", &[], false),
             Err(Error::Unsupported(_))
         ));
+        // a Google login: Code Assist moves to the egress, refresh goes through the tunnel
+        let (home, plan) = f
+            .plan(Harness::Gemini, AuthMode::Subscription, "g3", &[], true)
+            .unwrap();
+        let s = json_file(&home.join(".gemini/settings.json"));
+        assert_eq!(s["security"]["auth"]["selectedType"], "oauth-personal");
+        assert!(
+            home.join(".gemini/oauth_creds.json").is_file(),
+            "login copied in"
+        );
+        assert_eq!(
+            plan.env["CODE_ASSIST_ENDPOINT"],
+            "http://127.0.0.1:4100/google"
+        );
+        assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
+        assert!(!plan.env.contains_key("GEMINI_API_KEY"));
+        assert!(!plan.env.contains_key("GOOGLE_GEMINI_BASE_URL"));
     }
 
     #[test]
@@ -999,7 +1122,7 @@ mod tests {
             memory_binary: dir.path(),
             destination_ceiling: Label::Public,
             harness_args: &[],
-            claude_credentials: None,
+            host_home: None,
             harness_env: &[],
         });
         std::env::set_var("PATH", old);

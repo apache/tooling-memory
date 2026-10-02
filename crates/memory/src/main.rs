@@ -496,6 +496,12 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
         "anthropic" => Destination::forward("https://api.anthropic.com", Auth::PassThrough),
         "openai" => Destination::forward("https://api.openai.com", Auth::PassThrough),
         "github" => Destination::tunnel(["api.github.com", "github.com", ".githubcopilot.com"]),
+        // the two logins whose backend is not the public API: forwarded in the clear and
+        // metered like any other, with a tunnel only for the token refresh
+        "chatgpt" => Destination::forward("https://chatgpt.com/backend-api", Auth::PassThrough)
+            .with_tunnels(["auth.openai.com"]),
+        "google" => Destination::forward("https://cloudcode-pa.googleapis.com", Auth::PassThrough)
+            .with_tunnels(["oauth2.googleapis.com", "accounts.google.com"]),
         other => return Err(format!("no subscription-mode destination named {other}").into()),
     })
 }
@@ -505,7 +511,12 @@ fn route_for(
     auth: AuthMode,
     provider: Option<&str>,
 ) -> Result<Route, Box<dyn std::error::Error>> {
-    let name = provider.unwrap_or(harness.provider()).to_string();
+    let default = if auth == AuthMode::Subscription {
+        harness.subscription_provider()
+    } else {
+        harness.provider()
+    };
+    let name = provider.unwrap_or(default).to_string();
     let mut harness_env = Vec::new();
     let (destination, ceiling_of) = match auth {
         AuthMode::Subscription => {
@@ -607,7 +618,7 @@ async fn run_confined(
     workdir: &Path,
     args: &[String],
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    let creds = home_dir().map(|h| h.join(".claude/.credentials.json"));
+    let host_home = home_dir();
     let plan = dm_sandbox::prepare(&dm_sandbox::Request {
         harness,
         auth,
@@ -618,7 +629,7 @@ async fn run_confined(
         memory_binary: &std::env::current_exe()?,
         destination_ceiling: p.ceiling,
         harness_args: args,
-        claude_credentials: creds.as_deref().filter(|c| c.is_file()),
+        host_home: host_home.as_deref(),
         harness_env: &p.harness_env,
     })?;
     Ok(tokio::task::spawn_blocking(move || dm_sandbox::run(&plan)).await??)

@@ -12,7 +12,9 @@ destination's ceiling first, and reads token usage out of every response.
 
 ```sh
 make launch                                   # claude, your own login, confined
+make launch HARNESS=codex                     # codex, your ChatGPT login
 make launch HARNESS=codex AUTH=key            # codex, OPENAI_API_KEY from local/.env
+make launch HARNESS=gemini                    # gemini, your Google login
 make launch HARNESS=gemini AUTH=key           # gemini, GEMINI_API_KEY
 make launch HARNESS=copilot                   # copilot, your GitHub login (GH_TOKEN)
 make launch HARNESS=opencode AUTH=key         # opencode, ANTHROPIC_API_KEY
@@ -28,8 +30,8 @@ of what differs:
 | Harness | Model calls reach the egress by | Memory over MCP by | `AUTH` modes |
 |---|---|---|---|
 | Claude Code | `ANTHROPIC_BASE_URL` | `--mcp-config` | subscription, key, gateway |
-| Codex | `model_providers.<id>.base_url` in `config.toml` | `mcp_servers.<id>.url` | key, gateway; `--provider xai` for Grok |
-| Gemini CLI | `GOOGLE_GEMINI_BASE_URL` | `mcpServers.<id>.httpUrl` | key |
+| Codex | `model_providers.<id>.base_url` in `config.toml`; with a ChatGPT login, `chatgpt_base_url` | `mcp_servers.<id>.url` | subscription, key, gateway; `--provider xai` for Grok |
+| Gemini CLI | `GOOGLE_GEMINI_BASE_URL`; with a Google login, `CODE_ASSIST_ENDPOINT` | `mcpServers.<id>.httpUrl` | subscription, key |
 | Copilot CLI | no override exists; `HTTPS_PROXY` to the egress, which tunnels only to GitHub's Copilot hosts | `mcp-config.json` | subscription (`GH_TOKEN`) |
 | OpenCode | `provider.<id>.options.baseURL` | `mcp.<id>.url` | key; `--provider openai` or `xai` |
 
@@ -41,16 +43,25 @@ Grok is not a harness but a destination: any OpenAI-shaped harness reaches it wi
 
 | `AUTH` | Model calls go to | Credential | Who holds it |
 |---|---|---|---|
-| `subscription` | the provider | the harness's own login (Claude Code's credentials file, Copilot's `GH_TOKEN`) | the harness, inside its private home or environment |
+| `subscription` | the provider | the harness's own login: Claude Code's credentials file, Codex's `auth.json`, Gemini's `oauth_creds.json`, Copilot's `GH_TOKEN` | the harness, inside its private home or environment |
 | `key` | the provider | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` or `XAI_API_KEY` from `local/.env` | the egress; the harness gets a placeholder |
 | `gateway` | LiteLLM on 127.0.0.1:4000 | `local/.virtual-key` | the egress; the harness gets a placeholder |
 
+A login is made once on the host, in the harness's own way, and the launcher copies that
+one file into the private home. For Claude Code, `claude` and its login prompt; for Codex,
+`codex login` or, with no browser to hand, `codex login --device-auth`; for Gemini,
+`gemini` and `/auth`, Login with Google. Nothing else under your home is read or mounted.
+The ChatGPT and Google logins talk to backends that are not the public API, the ChatGPT
+backend and Code Assist, so those two get their own destinations, `chatgpt` and `google`,
+forwarded and metered like the rest; only the token refresh goes through the egress as a
+tunnel to the login host.
+
 In every mode the session's handling is capped at the destination's ceiling from
 `grants.toml`, so a session whose calls go to a destination with a public ceiling reads only
-public entries. Not supported, each refused with the reason: Codex with a ChatGPT login
-(routes to chatgpt.com), Gemini with a Google login (routes to cloudcode-pa), OpenCode with
-a Claude Pro or Max login (Anthropic prohibits third-party clients), Copilot with a key
-(it has no key mode).
+public entries. Not supported, each refused with the reason: OpenCode with a Claude Pro or
+Max login (Anthropic prohibits third-party clients), Copilot with a key (it has no key
+mode). A call the upstream refuses is recorded in `make usage` under its HTTP status, so
+an expired login or a wrong key shows up there rather than vanishing.
 
 `--unconfined` runs the same configuration without namespaces, with the egress on a TCP
 port, for platforms without a backend. macOS gets Seatbelt later; on Windows run under WSL2.
