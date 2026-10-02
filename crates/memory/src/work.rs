@@ -153,14 +153,14 @@ async fn one(
         .await;
     heartbeat.abort();
     let (code, output) = run?;
-    settle(
-        session.harness(),
-        client,
-        task,
-        code,
-        output.unwrap_or_default(),
-    )
-    .await
+    let output = output.unwrap_or_default();
+    if !output.trim().is_empty() {
+        print!("{output}");
+        if !output.ends_with('\n') {
+            println!();
+        }
+    }
+    settle(session.harness(), client, task, code, output).await
 }
 
 /// After the harness exits: a completed task stays complete; a task still held goes
