@@ -211,6 +211,21 @@ pub struct Request<'a> {
     /// subscription modes that are a token rather than a file, such as Copilot's
     /// `GH_TOKEN`.
     pub harness_env: &'a [(String, String)],
+    /// The harness runs in the harness image rather than from this host's binaries: the
+    /// harness is at `/usr/local/bin/<name>`, the memory binary is already inside, and
+    /// nothing of the host's system is mounted. Set by the `wslc` backend.
+    pub image: bool,
+    /// Where the working tree appears inside, when not at its host path. The `wslc`
+    /// backend mounts it at `/work`; the namespace backend keeps the host path.
+    pub workdir_inside: Option<&'a Path>,
+}
+
+impl Request<'_> {
+    /// The working tree's path as the harness sees it.
+    #[must_use]
+    pub fn workdir_inside(&self) -> &Path {
+        self.workdir_inside.unwrap_or(self.workdir)
+    }
 }
 
 /// Where things sit inside the sandbox.
@@ -388,7 +403,7 @@ fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<Pat
     });
     mounts.push(Mount {
         source: req.workdir.to_path_buf(),
-        target: req.workdir.to_path_buf(),
+        target: req.workdir_inside().to_path_buf(),
         read_only: false,
     });
     mounts.push(Mount {
@@ -399,6 +414,24 @@ fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<Pat
     (mounts, extra_path)
 }
 
+/// In the harness image only the two things that are the session's: its private home
+/// and the working tree. The runner turns these into the container's bind mounts; the
+/// egress socket arrives through a shared volume instead.
+fn image_mounts(req: &Request<'_>) -> Vec<Mount> {
+    vec![
+        Mount {
+            source: req.home.to_path_buf(),
+            target: PathBuf::from(INSIDE_HOME),
+            read_only: false,
+        },
+        Mount {
+            source: req.workdir.to_path_buf(),
+            target: req.workdir_inside().to_path_buf(),
+            read_only: false,
+        },
+    ]
+}
+
 /// Build the plan: write the harness's configuration into the private home and decide
 /// mounts, environment, and command.
 ///
@@ -407,7 +440,11 @@ fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<Pat
 /// A harness not on PATH, an unsupported harness, auth and provider combination, or a
 /// file under the home that cannot be written.
 pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
-    let harness_bin = find_on_path(req.harness.binary())?;
+    let harness_bin = if req.image {
+        PathBuf::from("/usr/local/bin").join(req.harness.binary())
+    } else {
+        find_on_path(req.harness.binary())?
+    };
     std::fs::create_dir_all(req.home).map_err(io(req.home))?;
     let relay = format!("http://{INSIDE_RELAY}");
     let own = [req.harness.provider(), req.harness.subscription_provider()];
@@ -424,7 +461,11 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
     };
 
     let mut env = base_env(req.harness_env);
-    let (mounts, extra_path) = plan_mounts(req, &harness_bin);
+    let (mounts, extra_path) = if req.image {
+        (image_mounts(req), None)
+    } else {
+        plan_mounts(req, &harness_bin)
+    };
     let mut path = String::from("/opt/memory:/usr/local/bin:/usr/bin:/bin");
     if let Some(p) = extra_path {
         path = format!("{}:{path}", p.display());
@@ -453,7 +494,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         mounts,
         env,
         argv,
-        cwd: req.workdir.to_path_buf(),
+        cwd: req.workdir_inside().to_path_buf(),
         hostname: "memory-sandbox".into(),
         handling_cap: req.destination_ceiling,
     })
@@ -469,7 +510,7 @@ fn setup_claude(
         "mcpServers": { "memory": { "type": "http", "url": format!("{relay}/mcp") } }
     });
     write(&req.home.join(".claude-mcp.json"), &mcp.to_string())?;
-    claude_global_config(&req.home.join(".claude.json"), req.workdir)?;
+    claude_global_config(&req.home.join(".claude.json"), req.workdir_inside())?;
     env.insert("ANTHROPIC_BASE_URL".into(), format!("{relay}/anthropic"));
     env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
     match req.auth {
@@ -799,6 +840,8 @@ mod tests {
                 harness_args: args,
                 host_home: creds.then_some(self.host_home.as_path()),
                 harness_env,
+                image: false,
+                workdir_inside: None,
             });
             std::env::set_var("PATH", old);
             r.map(|p| (home, p))
@@ -1161,6 +1204,8 @@ mod tests {
             destination_ceiling: Label::Public,
             harness_args: &[],
             host_home: None,
+            image: false,
+            workdir_inside: None,
             harness_env: &[],
         });
         std::env::set_var("PATH", old);

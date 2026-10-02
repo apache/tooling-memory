@@ -6,7 +6,9 @@
 //! `MEMORY_ROOT`) and, for `launch`, reads the one or two credentials it needs from its own
 //! environment and never passes them inside.
 
+mod requests;
 mod work;
+mod wslc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dm_core::{EntryType, Label};
@@ -115,6 +117,19 @@ impl From<HarnessArg> for Harness {
     }
 }
 
+/// Where the harness runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum BackendArg {
+    /// Namespaces on Linux; WSL containers on Windows.
+    Auto,
+    /// Native Linux namespaces, from this host's binaries.
+    Namespaces,
+    /// WSL containers: the harness image in a session VM, through `wslc`.
+    Wslc,
+    /// No confinement: the egress still proxies and meters, nothing else.
+    None,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum AuthArg {
     Gateway,
@@ -172,6 +187,12 @@ enum Command {
         /// confined. For platforms without a backend, and for debugging.
         #[arg(long)]
         unconfined: bool,
+        /// Where the harness runs. `wslc` uses the harness image under WSL containers.
+        #[arg(long, value_enum, default_value = "auto")]
+        backend: BackendArg,
+        /// The harness image for the `wslc` backend.
+        #[arg(long, env = "MEMORY_IMAGE", default_value = wslc::DEFAULT_IMAGE)]
+        image: String,
         /// Non-interactive: run this prompt in the harness's headless form, print its
         /// answer, and exit when it does. The run is expected to leave a handoff.
         #[arg(long, conflicts_with = "prompt_file")]
@@ -204,6 +225,12 @@ enum Command {
         /// Run without namespaces.
         #[arg(long)]
         unconfined: bool,
+        /// Where the harness runs. `wslc` uses the harness image under WSL containers.
+        #[arg(long, value_enum, default_value = "auto")]
+        backend: BackendArg,
+        /// The harness image for the `wslc` backend.
+        #[arg(long, env = "MEMORY_IMAGE", default_value = wslc::DEFAULT_IMAGE)]
+        image: String,
         /// Claim from this domain; the only granted domain when omitted.
         #[arg(long)]
         domain: Option<String>,
@@ -216,6 +243,46 @@ enum Command {
         /// With --loop: how long to wait when the queue is empty.
         #[arg(long, default_value_t = 30)]
         idle_seconds: u64,
+    },
+    /// Inside the egress container of the `wslc` backend: open the memory, serve the
+    /// egress on the shared volume, and run `launch` or `work` by writing run requests
+    /// the host turns into harness containers.
+    #[command(hide = true)]
+    Inside {
+        #[arg(long, value_enum)]
+        harness: HarnessArg,
+        #[arg(long, value_enum)]
+        auth: AuthArg,
+        #[arg(long)]
+        provider: Option<String>,
+        /// The shared volume.
+        #[arg(long)]
+        requests: PathBuf,
+        /// The host's login directories, read-only.
+        #[arg(long)]
+        host_home: Option<PathBuf>,
+        /// Where the working tree appears in the harness container.
+        #[arg(long, default_value = "/work")]
+        workdir_inside: PathBuf,
+        #[arg(long, conflicts_with = "prompt_file")]
+        prompt: Option<String>,
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        #[arg(long)]
+        no_handoff: bool,
+        /// Task mode.
+        #[arg(long)]
+        work: bool,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long, default_value_t = 900)]
+        lease_seconds: i64,
+        #[arg(long = "loop")]
+        keep_going: bool,
+        #[arg(long, default_value_t = 30)]
+        idle_seconds: u64,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Inside the sandbox: forward a loopback port to the egress socket, then run the
     /// harness in its own pid namespace.
@@ -437,7 +504,9 @@ async fn run_cli() -> Fallible {
             mcp::serve_stdio(Arc::new(m)).await?;
             Ok(())
         }
-        cmd @ (Command::Launch { .. } | Command::Work { .. }) => launch_cmd(&root, cmd).await,
+        cmd @ (Command::Launch { .. } | Command::Work { .. } | Command::Inside { .. }) => {
+            launch_cmd(&root, cmd).await
+        }
         Command::Relay { .. } => unreachable!("handled in main"),
         Command::Usage => {
             let t = Telemetry::open(&root.join("state/telemetry.db"))?;
@@ -576,6 +645,7 @@ fn axum_header(name: &'static str) -> axum::http::HeaderName {
 /// Everything a launch needs before the harness starts: the memory with its handling
 /// capped, the egress with its one destination, and the socket it serves on.
 struct Prepared {
+    root: PathBuf,
     memory: Arc<Memory>,
     egress: Egress,
     socket: PathBuf,
@@ -591,6 +661,7 @@ async fn prepare_launch(
     harness: Harness,
     auth: AuthMode,
     provider: Option<&str>,
+    socket: Option<PathBuf>,
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
     let Route {
         name,
@@ -615,7 +686,9 @@ async fn prepare_launch(
     Ok(Prepared {
         memory,
         egress,
-        socket: run_dir.join(format!("egress-{}.sock", std::process::id())),
+        socket: socket
+            .unwrap_or_else(|| run_dir.join(format!("egress-{}.sock", std::process::id()))),
+        root: root.to_path_buf(),
         home: root.join("state/sandbox").join(harness.binary()),
         ceiling,
         ceiling_of,
@@ -661,6 +734,8 @@ async fn run_confined(
         harness_args: args,
         host_home: host_home.as_deref(),
         harness_env: &p.harness_env,
+        image: false,
+        workdir_inside: None,
     })?;
     Ok(tokio::task::spawn_blocking(move || {
         if capture {
@@ -673,72 +748,242 @@ async fn run_confined(
     .await??)
 }
 
-/// `launch` and `work`: start a session, run it once or per task, exit with the code.
+/// `launch`, `work` and `inside`: start a session, run it once or per task, exit with
+/// the code. On the `wslc` backend the host hands the whole thing to the egress
+/// container, which runs this same code as `inside`.
 async fn launch_cmd(root: &Path, command: Command) -> Fallible {
     match command {
-        Command::Launch {
-            harness,
-            auth,
-            provider,
-            workdir,
-            unconfined,
-            prompt,
-            prompt_file,
-            no_handoff,
-            args,
-        } => {
-            let prompt = match (prompt, prompt_file) {
-                (Some(p), _) => Some(p),
-                (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
-                (None, None) => None,
-            };
-            let session = Session::start(
-                root,
-                harness.into(),
-                auth.into(),
-                provider.as_deref(),
-                workdir,
-                unconfined,
-            )
-            .await?;
-            let code = match prompt {
-                Some(prompt) => work::prompted(&session, &prompt, no_handoff).await?,
-                None => session.run(&args, false).await?.0,
-            };
-            session.finish();
-            std::process::exit(code);
+        Command::Launch { .. } => cmd_launch(root, command).await,
+        Command::Work { .. } => cmd_work(root, command).await,
+        Command::Inside { .. } => cmd_inside(root, command).await,
+        _ => unreachable!("only launch, work and inside are routed here"),
+    }
+}
+
+async fn cmd_launch(root: &Path, command: Command) -> Fallible {
+    let Command::Launch {
+        harness,
+        auth,
+        provider,
+        workdir,
+        unconfined,
+        backend,
+        image,
+        prompt,
+        prompt_file,
+        no_handoff,
+        args,
+    } = command
+    else {
+        unreachable!("routed by launch_cmd")
+    };
+    let workdir = resolve_workdir(workdir)?;
+    if backend_of(backend, unconfined) == Backend::Wslc {
+        let mut inside_args = Vec::new();
+        if let Some(p) = &prompt {
+            inside_args.extend(["--prompt".to_string(), p.clone()]);
         }
-        Command::Work {
-            harness,
-            auth,
+        if let Some(f) = &prompt_file {
+            inside_args.extend(["--prompt".to_string(), std::fs::read_to_string(f)?]);
+        }
+        if no_handoff {
+            inside_args.push("--no-handoff".into());
+        }
+        inside_args.push("--".into());
+        inside_args.extend(args);
+        let code = wslc::run(&wslc::Launch {
+            root: root.to_path_buf(),
+            harness: harness.into(),
+            auth: auth.into(),
             provider,
             workdir,
-            unconfined,
+            image,
+            inside_args,
+        })?;
+        std::process::exit(code);
+    }
+    let prompt = match (prompt, prompt_file) {
+        (Some(p), _) => Some(p),
+        (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
+        (None, None) => None,
+    };
+    let session = Session::start(
+        root,
+        harness.into(),
+        auth.into(),
+        provider.as_deref(),
+        workdir,
+        runner_for(backend_of(backend, unconfined), None),
+    )
+    .await?;
+    let code = match prompt {
+        Some(prompt) => work::prompted(&session, &prompt, no_handoff).await?,
+        None => session.run(&args, false).await?.0,
+    };
+    session.finish(code);
+    std::process::exit(code);
+}
+
+async fn cmd_work(root: &Path, command: Command) -> Fallible {
+    let Command::Work {
+        harness,
+        auth,
+        provider,
+        workdir,
+        unconfined,
+        backend,
+        image,
+        domain,
+        lease_seconds,
+        keep_going,
+        idle_seconds,
+    } = command
+    else {
+        unreachable!("routed by launch_cmd")
+    };
+    let workdir = resolve_workdir(workdir)?;
+    if backend_of(backend, unconfined) == Backend::Wslc {
+        let mut inside_args = vec!["--work".to_string()];
+        if let Some(d) = &domain {
+            inside_args.extend(["--domain".to_string(), d.clone()]);
+        }
+        inside_args.extend(["--lease-seconds".to_string(), lease_seconds.to_string()]);
+        if keep_going {
+            inside_args.push("--loop".into());
+        }
+        inside_args.extend(["--idle-seconds".to_string(), idle_seconds.to_string()]);
+        let code = wslc::run(&wslc::Launch {
+            root: root.to_path_buf(),
+            harness: harness.into(),
+            auth: auth.into(),
+            provider,
+            workdir,
+            image,
+            inside_args,
+        })?;
+        std::process::exit(code);
+    }
+    let session = Session::start(
+        root,
+        harness.into(),
+        auth.into(),
+        provider.as_deref(),
+        workdir,
+        runner_for(backend_of(backend, unconfined), None),
+    )
+    .await?;
+    let options = work::Options {
+        domain,
+        lease_seconds,
+        keep_going,
+        idle: std::time::Duration::from_secs(idle_seconds),
+    };
+    let code = work::run(&session, &options).await?;
+    session.finish(code);
+    std::process::exit(code);
+}
+
+async fn cmd_inside(root: &Path, command: Command) -> Fallible {
+    let Command::Inside {
+        harness,
+        auth,
+        provider,
+        requests,
+        host_home,
+        workdir_inside,
+        prompt,
+        prompt_file,
+        no_handoff,
+        work,
+        domain,
+        lease_seconds,
+        keep_going,
+        idle_seconds,
+        args,
+    } = command
+    else {
+        unreachable!("routed by launch_cmd")
+    };
+    let runner = Runner::Requests(RequestsRunner {
+        dir: requests,
+        host_home,
+        workdir_inside,
+        next: std::sync::atomic::AtomicUsize::new(0),
+    });
+    // the harness container's working tree is at the inside path; this process
+    // never touches it, so any existing directory serves as the host-side value
+    let session = Session::start(
+        root,
+        harness.into(),
+        auth.into(),
+        provider.as_deref(),
+        PathBuf::from("/"),
+        runner,
+    )
+    .await?;
+    let code = if work {
+        let options = work::Options {
             domain,
             lease_seconds,
             keep_going,
-            idle_seconds,
-        } => {
-            let session = Session::start(
-                root,
-                harness.into(),
-                auth.into(),
-                provider.as_deref(),
-                workdir,
-                unconfined,
-            )
-            .await?;
-            let options = work::Options {
-                domain,
-                lease_seconds,
-                keep_going,
-                idle: std::time::Duration::from_secs(idle_seconds),
-            };
-            let code = work::run(&session, &options).await?;
-            session.finish();
-            std::process::exit(code);
+            idle: std::time::Duration::from_secs(idle_seconds),
+        };
+        work::run(&session, &options).await?
+    } else {
+        let prompt = match (prompt, prompt_file) {
+            (Some(p), _) => Some(p),
+            (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
+            (None, None) => None,
+        };
+        match prompt {
+            Some(prompt) => work::prompted(&session, &prompt, no_handoff).await?,
+            None => session.run(&args, false).await?.0,
         }
-        _ => unreachable!("only launch and work are routed here"),
+    };
+    session.finish(code);
+    std::process::exit(code);
+}
+
+fn resolve_workdir(workdir: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let w = match workdir {
+        Some(w) => w,
+        None => std::env::current_dir()?,
+    };
+    Ok(std::fs::canonicalize(&w)?)
+}
+
+/// Which backend a launch resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Namespaces,
+    Wslc,
+    None,
+}
+
+fn backend_of(arg: BackendArg, unconfined: bool) -> Backend {
+    if unconfined {
+        return Backend::None;
+    }
+    match arg {
+        BackendArg::Namespaces => Backend::Namespaces,
+        BackendArg::Wslc => Backend::Wslc,
+        BackendArg::None => Backend::None,
+        BackendArg::Auto => {
+            if cfg!(target_os = "linux") {
+                Backend::Namespaces
+            } else if cfg!(windows) {
+                Backend::Wslc
+            } else {
+                Backend::None
+            }
+        }
+    }
+}
+
+fn runner_for(backend: Backend, _requests: Option<PathBuf>) -> Runner {
+    match backend {
+        Backend::Namespaces => Runner::Namespaces,
+        Backend::None | Backend::Wslc => Runner::Unconfined(None),
     }
 }
 
@@ -749,13 +994,37 @@ pub struct Session {
     harness: Harness,
     auth: AuthMode,
     workdir: PathBuf,
-    unconfined: bool,
+    runner: Runner,
     #[cfg(unix)]
     serve_unix: tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
-    tcp: Option<(
-        std::net::SocketAddr,
-        tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
-    )>,
+}
+
+/// How a session runs the harness.
+pub enum Runner {
+    /// Native Linux namespaces, from this host's binaries.
+    Namespaces,
+    /// On the host, with the egress on a loopback TCP port.
+    Unconfined(
+        Option<(
+            std::net::SocketAddr,
+            tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
+        )>,
+    ),
+    /// Inside the egress container: each run is a request the host turns into a harness
+    /// container.
+    Requests(RequestsRunner),
+}
+
+/// The `Requests` runner's state.
+pub struct RequestsRunner {
+    /// The shared volume.
+    dir: PathBuf,
+    /// The host's login directories, read-only, for the subscription modes.
+    host_home: Option<PathBuf>,
+    /// Where the working tree appears in the harness container.
+    workdir_inside: PathBuf,
+    /// The next request number.
+    next: std::sync::atomic::AtomicUsize,
 }
 
 impl Session {
@@ -764,15 +1033,14 @@ impl Session {
         harness: Harness,
         auth: AuthMode,
         provider: Option<&str>,
-        workdir: Option<PathBuf>,
-        unconfined: bool,
+        workdir: PathBuf,
+        mut runner: Runner,
     ) -> Result<Session, Box<dyn std::error::Error>> {
-        let workdir = match workdir {
-            Some(w) => w,
-            None => std::env::current_dir()?,
+        let socket = match &runner {
+            Runner::Requests(r) => Some(r.dir.join("egress.sock")),
+            _ => None,
         };
-        let workdir = std::fs::canonicalize(&workdir)?;
-        let p = prepare_launch(root, harness, auth, provider).await?;
+        let p = prepare_launch(root, harness, auth, provider, socket).await?;
 
         #[cfg(unix)]
         let serve_unix = {
@@ -787,31 +1055,42 @@ impl Session {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        #[cfg(not(unix))]
-        if !unconfined {
-            return Err("confinement needs Linux; run under WSL2, or pass --unconfined".into());
+        if let Runner::Requests(r) = &runner {
+            // the harness container runs as uid 1000 and must reach the socket and leave
+            // its exit code beside it; this process is root in the egress container
+            open_to_all(&r.dir, 0o1777)?;
+            open_to_all(&p.socket, 0o666)?;
         }
-        let tcp = if unconfined {
+        #[cfg(not(unix))]
+        if matches!(runner, Runner::Namespaces | Runner::Requests(_)) {
+            return Err(
+                "confinement needs Linux; run under WSL2, or pass --backend wslc or --unconfined"
+                    .into(),
+            );
+        }
+        if let Runner::Unconfined(slot) = &mut runner {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
             drop(listener);
             let egress = p.egress.clone();
-            Some((
+            *slot = Some((
                 addr,
                 tokio::spawn(async move { egress.serve_tcp(addr).await }),
-            ))
-        } else {
-            None
+            ));
+        }
+        let how = match &runner {
+            Runner::Namespaces => "confined to",
+            Runner::Unconfined(_) => "unconfined in",
+            Runner::Requests(_) => "in the harness image, working tree at",
+        };
+        let shown = match &runner {
+            Runner::Requests(r) => r.workdir_inside.clone(),
+            _ => workdir.clone(),
         };
         eprintln!(
-            "memory: {} {} {} · model calls via {} at ceiling {} · session {}",
+            "memory: {} {how} {} · model calls via {} at ceiling {} · session {}",
             harness.binary(),
-            if unconfined {
-                "unconfined in"
-            } else {
-                "confined to"
-            },
-            workdir.display(),
+            shown.display(),
             p.ceiling_of,
             p.ceiling,
             p.memory.session_id()
@@ -821,10 +1100,9 @@ impl Session {
             harness,
             auth,
             workdir,
-            unconfined,
+            runner,
             #[cfg(unix)]
             serve_unix,
-            tcp,
         })
     }
 
@@ -849,8 +1127,8 @@ impl Session {
         args: &[String],
         capture: bool,
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
-        match &self.tcp {
-            Some((addr, _)) => run_unconfined(
+        match &self.runner {
+            Runner::Unconfined(Some((addr, _))) => run_unconfined(
                 self.harness,
                 self.auth,
                 &self.workdir,
@@ -859,7 +1137,8 @@ impl Session {
                 args,
                 capture,
             ),
-            None => {
+            Runner::Unconfined(None) => Err("the unconfined runner was not started".into()),
+            Runner::Namespaces => {
                 run_confined(
                     &self.p,
                     self.harness,
@@ -870,12 +1149,71 @@ impl Session {
                 )
                 .await
             }
+            Runner::Requests(r) => self.run_requested(r, args, capture).await,
         }
     }
 
-    /// Stop serving and report usage.
-    pub fn finish(self) {
-        if let Some((_, serve)) = self.tcp {
+    /// Write a run request for the host and wait for the harness container's exit code.
+    async fn run_requested(
+        &self,
+        r: &RequestsRunner,
+        args: &[String],
+        capture: bool,
+    ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
+        let plan = dm_sandbox::prepare(&dm_sandbox::Request {
+            harness: self.harness,
+            auth: self.auth,
+            provider: Some(self.p.provider.as_str()),
+            workdir: &self.workdir,
+            home: &self.p.home,
+            egress_socket: &self.p.socket,
+            memory_binary: Path::new(dm_sandbox::INSIDE_MEMORY),
+            destination_ceiling: self.p.ceiling,
+            harness_args: args,
+            host_home: r.host_home.as_deref(),
+            harness_env: &self.p.harness_env,
+            image: true,
+            workdir_inside: Some(&r.workdir_inside),
+        })?;
+        let n = r.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let home_rel = self
+            .p
+            .home
+            .strip_prefix(&self.p.root)
+            .map(|h| h.display().to_string())
+            .unwrap_or_default();
+        let req = requests::RunRequest {
+            argv: plan.argv,
+            env: plan.env,
+            cwd: plan.cwd.display().to_string(),
+            home: home_rel,
+            interactive: !capture,
+        };
+        let tmp = r.dir.join(format!("{}.tmp", requests::RunRequest::file(n)));
+        std::fs::write(&tmp, serde_json::to_vec(&req)?)?;
+        std::fs::rename(&tmp, r.dir.join(requests::RunRequest::file(n)))?;
+        let exit = PathBuf::from(requests::RunRequest::exit_file(n));
+        let exit = r.dir.join(exit.file_name().unwrap_or_default());
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&exit) {
+                if let Ok(code) = text.trim().parse::<i32>() {
+                    let out = if capture {
+                        let out = PathBuf::from(requests::RunRequest::out_file(n));
+                        std::fs::read_to_string(r.dir.join(out.file_name().unwrap_or_default()))
+                            .ok()
+                    } else {
+                        None
+                    };
+                    return Ok((code, out.or_else(|| capture.then(String::new))));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Stop serving, report usage, and tell the host the final code where there is one.
+    pub fn finish(self, code: i32) {
+        if let Runner::Unconfined(Some((_, serve))) = &self.runner {
             serve.abort();
         }
         #[cfg(unix)]
@@ -883,9 +1221,22 @@ impl Session {
             self.serve_unix.abort();
             std::fs::remove_file(&self.p.socket).ok();
         }
-        let _ = self.unconfined;
         report_usage(&self.p.egress);
+        if let Runner::Requests(r) = &self.runner {
+            std::fs::write(r.dir.join(requests::DONE), code.to_string()).ok();
+        }
     }
+}
+
+#[cfg(unix)]
+fn open_to_all(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn open_to_all(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1113,6 +1464,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Serve { .. }
         | Command::Launch { .. }
         | Command::Work { .. }
+        | Command::Inside { .. }
         | Command::Relay { .. }
         | Command::Usage
         | Command::Task { .. }

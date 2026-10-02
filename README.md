@@ -68,6 +68,7 @@ built binary.
 | `crates/server` | The MCP surface |
 | `crates/client` | A typed MCP client for the ledger and the record; what the launcher's task mode and an orchestrator use |
 | `crates/memory` | The binary |
+| `images/harness` | The harness image: five harnesses, Node, and `memory`, pinned |
 | `docs/` | The paper, its case study, the stack |
 
 ## Status

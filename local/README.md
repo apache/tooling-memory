@@ -86,8 +86,32 @@ Max login (Anthropic prohibits third-party clients), Copilot with a key (it has 
 mode). A call the upstream refuses is recorded in `make usage` under its HTTP status, so
 an expired login or a wrong key shows up there rather than vanishing.
 
+## In the harness image: `--backend wslc`
+
+On Windows with WSL 2.9.3 or later, or from inside a WSL distribution, the harness can run
+in the harness image under WSL containers instead of from this machine's binaries: the same
+harness versions and tools on every machine, in an image we build. `make image` builds it
+from `images/harness/Dockerfile`; then
+
+```sh
+make launch BACKEND=wslc                      # claude in the image, your login
+make launch BACKEND=wslc PROMPT='say pong'    # prompted
+make work BACKEND=wslc                        # a task from the ledger
+```
+
+Two containers in the session VM. The egress container runs the Linux `memory` with your
+record mounted in and the only route outside; it opens the memory, serves the egress on a
+socket in a shared volume, and runs the launcher logic, task mode included. The harness
+container has no network at all, its private home and the working tree mounted in, and
+reaches the egress through the shared volume with the same relay as on Linux. The host side
+only turns run requests into `wslc run` and reports the exit code. Your login directories
+(`~/.claude`, `~/.codex`, `~/.gemini`) are mounted read-only into the egress container, which
+copies the one file the harness needs into the private home; keys and `GH_TOKEN` are passed
+as environment. The gateway mode is not wired through yet, since LiteLLM on this machine's
+loopback is not reachable from the session VM.
+
 `--unconfined` runs the same configuration without namespaces, with the egress on a TCP
-port, for platforms without a backend. macOS gets Seatbelt later; on Windows run under WSL2.
+port, for platforms without a backend. macOS gets Seatbelt later.
 
 The rest of this page is the gateway half of the stack.
 

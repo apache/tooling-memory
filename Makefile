@@ -32,12 +32,23 @@ AUTH ?= subscription
 PROVIDER ?=
 PROMPT ?=
 LOOP ?=
+BACKEND ?= auto
 launch: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
 	target/release/memory --root "$$MEMORY_ROOT" launch --harness $(HARNESS) --auth $(AUTH) \
-		$(if $(PROVIDER),--provider $(PROVIDER),) $(if $(PROMPT),--prompt '$(PROMPT)',) -- $(ARGS)
+		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(if $(PROMPT),--prompt '$(PROMPT)',) -- $(ARGS)
+
+# The harness image, for the wslc backend (and any OCI runtime): the release binary is
+# copied in beside the Dockerfile, then built with wslc on Windows/WSL or podman elsewhere.
+IMAGE ?= durable-memory/harness:dev
+image: build
+	@cp target/release/memory images/harness/memory
+	@if command -v wslc.exe >/dev/null 2>&1; then \
+		wslc.exe build -t $(IMAGE) "$$(wslpath -w images/harness)"; \
+	elif command -v wslc >/dev/null 2>&1; then wslc build -t $(IMAGE) images/harness; \
+	else podman build -t $(IMAGE) images/harness; fi
 
 # Claim the next task from the ledger and run the harness on it. LOOP=1 keeps claiming.
 work: build
@@ -45,7 +56,7 @@ work: build
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
 	target/release/memory --root "$$MEMORY_ROOT" work --harness $(HARNESS) --auth $(AUTH) \
-		$(if $(PROVIDER),--provider $(PROVIDER),) $(if $(LOOP),--loop,)
+		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(if $(LOOP),--loop,)
 
 usage:
 	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" usage
@@ -94,7 +105,9 @@ machete:
 COVERAGE_MIN ?= 90
 # crates/sandbox/src/linux.rs runs between fork and exec, where a profile is never written,
 # so it is measured by the confined launch test rather than by line coverage.
-COVERAGE_IGNORE = 'sandbox/src/linux\.rs'
+# crates/memory/src/wslc.rs drives wslc.exe, which CI does not have; its argument builders
+# are unit-tested and the rest is proven by hand on a WSL machine.
+COVERAGE_IGNORE = 'sandbox/src/linux\.rs|memory/src/wslc\.rs'
 coverage:
 	cargo llvm-cov --workspace --ignore-filename-regex $(COVERAGE_IGNORE) --fail-under-lines $(COVERAGE_MIN) --lcov --output-path target/lcov.info
 	cargo llvm-cov report --ignore-filename-regex $(COVERAGE_IGNORE) --summary-only
