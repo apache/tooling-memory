@@ -3,6 +3,8 @@
 
 // An integration test is test code; a panic here is the failure being reported.
 #![allow(clippy::unwrap_used)]
+// The fake harness is a shell script and the egress socket is a unix socket.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

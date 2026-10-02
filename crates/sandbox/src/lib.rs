@@ -541,6 +541,7 @@ mod tests {
         assert!(targets.contains(&f.work.as_path()));
         assert!(targets.contains(&Path::new(INSIDE_SOCKET)));
         assert!(targets.contains(&Path::new(INSIDE_MEMORY)));
+        #[cfg(unix)]
         assert!(plan
             .mounts
             .iter()
