@@ -459,6 +459,8 @@ dependencies = [
  "dm-core",
  "dm-server",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "reqwest",
  "rmcp",
  "rusqlite",

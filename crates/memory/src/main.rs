@@ -96,6 +96,9 @@ impl From<StatusArg> for Status {
 enum HarnessArg {
     Claude,
     Codex,
+    Gemini,
+    Copilot,
+    Opencode,
 }
 
 impl From<HarnessArg> for Harness {
@@ -103,6 +106,9 @@ impl From<HarnessArg> for Harness {
         match h {
             HarnessArg::Claude => Harness::Claude,
             HarnessArg::Codex => Harness::Codex,
+            HarnessArg::Gemini => Harness::Gemini,
+            HarnessArg::Copilot => Harness::Copilot,
+            HarnessArg::Opencode => Harness::OpenCode,
         }
     }
 }
@@ -153,6 +159,10 @@ enum Command {
         harness: HarnessArg,
         #[arg(long, value_enum, default_value = "subscription")]
         auth: AuthArg,
+        /// Send model calls to another destination: openai, xai (Grok), or a name from
+        /// grants.toml. Codex and OpenCode only.
+        #[arg(long)]
+        provider: Option<String>,
         /// The working tree the harness may read and write. Defaults to the current directory.
         #[arg(long)]
         workdir: Option<PathBuf>,
@@ -383,6 +393,7 @@ async fn run_cli() -> Fallible {
         Command::Launch {
             harness,
             auth,
+            provider,
             workdir,
             unconfined,
             args,
@@ -391,6 +402,7 @@ async fn run_cli() -> Fallible {
                 &root,
                 harness.into(),
                 auth.into(),
+                provider.as_deref(),
                 workdir,
                 unconfined,
                 args,
@@ -428,76 +440,93 @@ async fn run_cli() -> Fallible {
     }
 }
 
-/// What the launcher reads from its own environment for a destination.
-fn destination_for(
+/// What one launch needs for its model calls: the destination name as the harness will
+/// address it, the destination itself, the grants entry whose ceiling caps the session,
+/// and any credential the harness must hold itself.
+struct Route {
+    name: String,
+    destination: Destination,
+    ceiling_of: String,
+    harness_env: Vec<(String, String)>,
+}
+
+fn need(var: &str, why: &str) -> Result<String, Box<dyn std::error::Error>> {
+    std::env::var(var)
+        .map_err(|_| format!("{why} needs {var} in the launcher's environment").into())
+}
+
+fn bearer(value: String) -> Auth {
+    Auth::Inject {
+        header: axum_header("authorization"),
+        value: format!("Bearer {value}"),
+    }
+}
+
+/// The provider-shaped destination for a key: where it goes and how the key travels.
+fn keyed_provider(name: &str) -> Result<Destination, Box<dyn std::error::Error>> {
+    Ok(match name {
+        "anthropic" => Destination::forward(
+            "https://api.anthropic.com",
+            Auth::Inject {
+                header: axum_header("x-api-key"),
+                value: need("ANTHROPIC_API_KEY", "--auth key to anthropic")?,
+            },
+        ),
+        "openai" => Destination::forward(
+            "https://api.openai.com",
+            bearer(need("OPENAI_API_KEY", "--auth key to openai")?),
+        ),
+        "xai" => Destination::forward(
+            "https://api.x.ai",
+            bearer(need("XAI_API_KEY", "--auth key to xai")?),
+        ),
+        "gemini" => Destination::forward(
+            "https://generativelanguage.googleapis.com",
+            Auth::Inject {
+                header: axum_header("x-goog-api-key"),
+                value: need("GEMINI_API_KEY", "--auth key to gemini")?,
+            },
+        ),
+        other => return Err(format!("no key-mode destination named {other}").into()),
+    })
+}
+
+fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::Error>> {
+    Ok(match name {
+        "anthropic" => Destination::forward("https://api.anthropic.com", Auth::PassThrough),
+        "openai" => Destination::forward("https://api.openai.com", Auth::PassThrough),
+        "github" => Destination::tunnel(["api.github.com", "github.com", ".githubcopilot.com"]),
+        other => return Err(format!("no subscription-mode destination named {other}").into()),
+    })
+}
+
+fn route_for(
     harness: Harness,
     auth: AuthMode,
-) -> Result<(String, Destination, String), Box<dyn std::error::Error>> {
-    let provider = harness.provider().to_string();
-    let bearer = |v: String| Auth::Inject {
-        header: axum_header("authorization"),
-        value: format!("Bearer {v}"),
-    };
-    match auth {
+    provider: Option<&str>,
+) -> Result<Route, Box<dyn std::error::Error>> {
+    let name = provider.unwrap_or(harness.provider()).to_string();
+    let mut harness_env = Vec::new();
+    let (destination, ceiling_of) = match auth {
         AuthMode::Subscription => {
-            let upstream = match harness {
-                Harness::Claude => "https://api.anthropic.com",
-                Harness::Codex => "https://api.openai.com",
-            };
-            Ok((
-                provider.clone(),
-                Destination {
-                    upstream: upstream.into(),
-                    auth: Auth::PassThrough,
-                },
-                provider,
-            ))
+            if harness == Harness::Copilot {
+                harness_env.push(("GH_TOKEN".to_string(), need("GH_TOKEN", "copilot")?));
+            }
+            (pass_through_provider(&name)?, name.clone())
         }
-        AuthMode::Key => match harness {
-            Harness::Claude => {
-                let key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-                    "--auth key needs ANTHROPIC_API_KEY in the launcher's environment"
-                })?;
-                Ok((
-                    provider.clone(),
-                    Destination {
-                        upstream: "https://api.anthropic.com".into(),
-                        auth: Auth::Inject {
-                            header: axum_header("x-api-key"),
-                            value: key,
-                        },
-                    },
-                    provider,
-                ))
-            }
-            Harness::Codex => {
-                let key = std::env::var("OPENAI_API_KEY")
-                    .map_err(|_| "--auth key needs OPENAI_API_KEY in the launcher's environment")?;
-                Ok((
-                    provider.clone(),
-                    Destination {
-                        upstream: "https://api.openai.com".into(),
-                        auth: bearer(key),
-                    },
-                    provider,
-                ))
-            }
-        },
+        AuthMode::Key => (keyed_provider(&name)?, name.clone()),
         AuthMode::Gateway => {
-            let key = std::env::var("LLMAO_KEY").map_err(|_| {
-                "--auth gateway needs LLMAO_KEY (a virtual key) in the launcher's environment"
-            })?;
+            let key = need("LLMAO_KEY", "--auth gateway")?;
             let url = std::env::var("LLMAO_URL").unwrap_or_else(|_| "http://127.0.0.1:4000".into());
-            Ok((
-                provider,
-                Destination {
-                    upstream: url,
-                    auth: bearer(key),
-                },
-                "llmao".to_string(),
-            ))
+            (Destination::forward(url, bearer(key)), "llmao".to_string())
         }
-    }
+    };
+    Ok(Route {
+        name,
+        destination,
+        ceiling_of,
+        harness_env,
+    })
 }
 
 fn axum_header(name: &'static str) -> axum::http::HeaderName {
@@ -513,21 +542,29 @@ struct Prepared {
     home: PathBuf,
     ceiling: Label,
     ceiling_of: String,
+    provider: String,
+    harness_env: Vec<(String, String)>,
 }
 
 async fn prepare_launch(
     root: &Path,
     harness: Harness,
     auth: AuthMode,
+    provider: Option<&str>,
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
-    let (name, destination, ceiling_of) = destination_for(harness, auth)?;
+    let Route {
+        name,
+        destination,
+        ceiling_of,
+        harness_env,
+    } = route_for(harness, auth, provider)?;
     let memory = Memory::open(root)?.with_author(format!("agent:{}", harness.binary()));
     let ceiling = memory.grants().ceiling(&ceiling_of).ok_or_else(|| {
         format!("grants.toml has no [destinations.{ceiling_of}]; add one with a ceiling")
     })?;
     let memory = Arc::new(memory.with_handling_cap(ceiling));
     let mut destinations = HashMap::new();
-    destinations.insert(name, destination);
+    destinations.insert(name.clone(), destination);
     let egress = Egress::new(
         memory.clone(),
         destinations,
@@ -542,6 +579,8 @@ async fn prepare_launch(
         home: root.join("state/sandbox").join(harness.binary()),
         ceiling,
         ceiling_of,
+        provider: name,
+        harness_env,
     })
 }
 
@@ -572,6 +611,7 @@ async fn run_confined(
     let plan = dm_sandbox::prepare(&dm_sandbox::Request {
         harness,
         auth,
+        provider: Some(p.provider.as_str()),
         workdir,
         home: &p.home,
         egress_socket: &p.socket,
@@ -579,6 +619,7 @@ async fn run_confined(
         destination_ceiling: p.ceiling,
         harness_args: args,
         claude_credentials: creds.as_deref().filter(|c| c.is_file()),
+        harness_env: &p.harness_env,
     })?;
     Ok(tokio::task::spawn_blocking(move || dm_sandbox::run(&plan)).await??)
 }
@@ -587,6 +628,7 @@ async fn launch(
     root: &Path,
     harness: Harness,
     auth: AuthMode,
+    provider: Option<&str>,
     workdir: Option<PathBuf>,
     unconfined: bool,
     args: Vec<String>,
@@ -596,7 +638,7 @@ async fn launch(
         None => std::env::current_dir()?,
     };
     let workdir = std::fs::canonicalize(&workdir)?;
-    let p = prepare_launch(root, harness, auth).await?;
+    let p = prepare_launch(root, harness, auth, provider).await?;
 
     #[cfg(unix)]
     let serve = {
@@ -686,6 +728,13 @@ fn run_unconfined(
             cmd.arg("--mcp-config")
                 .arg(&mcp_path)
                 .arg("--strict-mcp-config");
+        }
+        Harness::Gemini | Harness::Copilot | Harness::OpenCode => {
+            return Err(format!(
+                "--unconfined is wired for claude and codex only so far; {} runs confined",
+                harness.binary()
+            )
+            .into());
         }
         Harness::Codex => {
             let codex_home = home.join("codex-home");

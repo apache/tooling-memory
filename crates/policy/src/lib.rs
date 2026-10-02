@@ -88,8 +88,8 @@ fn restricted() -> Label {
 
 impl Grants {
     /// A starting file for one owner and one domain: the owner reads everything, the
-    /// domain's writes default to internal, and the three model destinations a laptop
-    /// uses accept up to internal. Restricted material stays home until the owner raises
+    /// domain's writes default to internal, and the model destinations a laptop uses
+    /// accept up to internal. Restricted material stays home until the owner raises
     /// a ceiling by hand.
     #[must_use]
     pub fn starter(owner: &str, domain: &str) -> Grants {
@@ -101,7 +101,7 @@ impl Grants {
             },
         );
         let mut destinations = BTreeMap::new();
-        for d in ["anthropic", "openai", "llmao"] {
+        for d in ["anthropic", "openai", "gemini", "github", "xai", "llmao"] {
             destinations.insert(
                 d.to_string(),
                 Destination {

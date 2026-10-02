@@ -59,6 +59,16 @@ impl Usage {
         {
             self.cache_read_tokens = x;
         }
+        // Gemini's usageMetadata
+        if let Some(x) = n("promptTokenCount") {
+            self.input_tokens = x;
+        }
+        if let Some(x) = n("candidatesTokenCount") {
+            self.output_tokens = x;
+        }
+        if let Some(x) = n("cachedContentTokenCount") {
+            self.cache_read_tokens = x;
+        }
     }
 }
 
@@ -146,13 +156,19 @@ impl Sniffer {
     fn take_json(&mut self, v: &Value) {
         // Anthropic message_start wraps the message; Responses wraps in `response`.
         let inner = v.get("message").or_else(|| v.get("response")).unwrap_or(v);
-        if let Some(m) = inner.get("model").and_then(Value::as_str) {
+        if let Some(m) = inner
+            .get("model")
+            .or_else(|| inner.get("modelVersion"))
+            .and_then(Value::as_str)
+        {
             self.usage.model = Some(m.to_string());
         }
-        if let Some(u) = inner.get("usage").filter(|u| u.is_object()) {
-            self.usage.absorb(u);
-            self.found = true;
-        } else if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+        let usage = inner
+            .get("usage")
+            .or_else(|| v.get("usage"))
+            .or_else(|| inner.get("usageMetadata"))
+            .filter(|u| u.is_object());
+        if let Some(u) = usage {
             self.usage.absorb(u);
             self.found = true;
         }
@@ -236,6 +252,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!((chat.input_tokens, chat.output_tokens), (7, 3));
+    }
+
+    #[test]
+    fn gemini_json_and_sse() {
+        let u = run(
+            "application/json",
+            &[r#"{"candidates":[],"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":6,"cachedContentTokenCount":3,"totalTokenCount":21},"modelVersion":"gemini-2.5-pro"}"#],
+        )
+        .unwrap();
+        assert_eq!(u.model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(
+            (u.input_tokens, u.output_tokens, u.cache_read_tokens),
+            (15, 6, 3)
+        );
+        let sse = "data: {\"candidates\":[],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":2},\"modelVersion\":\"gemini-2.5-flash\"}\r\n\r\ndata: {\"candidates\":[],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":9},\"modelVersion\":\"gemini-2.5-flash\"}\r\n\r\n";
+        let u = run("text/event-stream", &[sse]).unwrap();
+        assert_eq!(
+            (u.input_tokens, u.output_tokens),
+            (15, 9),
+            "the last event's cumulative count"
+        );
     }
 
     #[test]

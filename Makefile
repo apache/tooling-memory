@@ -29,10 +29,13 @@ local-key:
 #   make launch AUTH=gateway                     claude through the local LiteLLM
 HARNESS ?= claude
 AUTH ?= subscription
+PROVIDER ?=
 launch: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
-	target/release/memory --root "$$MEMORY_ROOT" launch --harness $(HARNESS) --auth $(AUTH) -- $(ARGS)
+	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
+	target/release/memory --root "$$MEMORY_ROOT" launch --harness $(HARNESS) --auth $(AUTH) \
+		$(if $(PROVIDER),--provider $(PROVIDER),) -- $(ARGS)
 
 usage:
 	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" usage

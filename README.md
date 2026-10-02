@@ -26,8 +26,8 @@ export MEMORY_ROOT=~/memory
 ```
 
 To run a harness confined, with the memory server attached and every model call metered,
-see [local/README.md](local/README.md): `make launch` runs Claude Code or Codex in native
-namespaces with no network except the egress. The gateway half of that page runs LiteLLM
+see [local/README.md](local/README.md): `make launch` runs Claude Code, Codex, Gemini CLI,
+Copilot CLI or OpenCode in native namespaces with no network except the egress. The gateway half of that page runs LiteLLM
 locally so the Foundation's shape can be tried end to end.
 
 Or point a harness at the memory server alone over stdio. For Claude Code:
@@ -70,6 +70,6 @@ built binary.
 
 ## Status
 
-M0 code complete as of 2 October 2026, plus the confined launcher: Claude Code and Codex
-run in native Linux namespaces with the memory server attached over MCP and model calls
-forwarded and metered through the egress. See [PLAN.md](PLAN.md).
+M0 code complete as of 2 October 2026, plus the confined launcher: Claude Code, Codex,
+Gemini CLI, Copilot CLI and OpenCode run in native Linux namespaces with the memory
+server attached over MCP and model calls forwarded and metered through the egress. See [PLAN.md](PLAN.md).

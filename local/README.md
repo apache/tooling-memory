@@ -13,21 +13,44 @@ destination's ceiling first, and reads token usage out of every response.
 ```sh
 make launch                                   # claude, your own login, confined
 make launch HARNESS=codex AUTH=key            # codex, OPENAI_API_KEY from local/.env
+make launch HARNESS=gemini AUTH=key           # gemini, GEMINI_API_KEY
+make launch HARNESS=copilot                   # copilot, your GitHub login (GH_TOKEN)
+make launch HARNESS=opencode AUTH=key         # opencode, ANTHROPIC_API_KEY
+make launch HARNESS=opencode AUTH=key PROVIDER=xai   # the same harness, Grok behind it
 make launch AUTH=gateway                      # claude through the local LiteLLM
 make launch ARGS='-p "load T0 and summarise"' # arguments go to the harness
 make usage                                    # tokens by destination and model
 ```
 
+Five harnesses, one launcher. Each needed the same three things, and the table is the whole
+of what differs:
+
+| Harness | Model calls reach the egress by | Memory over MCP by | `AUTH` modes |
+|---|---|---|---|
+| Claude Code | `ANTHROPIC_BASE_URL` | `--mcp-config` | subscription, key, gateway |
+| Codex | `model_providers.<id>.base_url` in `config.toml` | `mcp_servers.<id>.url` | key, gateway; `--provider xai` for Grok |
+| Gemini CLI | `GOOGLE_GEMINI_BASE_URL` | `mcpServers.<id>.httpUrl` | key |
+| Copilot CLI | no override exists; `HTTPS_PROXY` to the egress, which tunnels only to GitHub's Copilot hosts | `mcp-config.json` | subscription (`GH_TOKEN`) |
+| OpenCode | `provider.<id>.options.baseURL` | `mcp.<id>.url` | key; `--provider openai` or `xai` |
+
+Copilot is the odd one: with no base-URL override, its HTTPS goes through the egress as a
+CONNECT tunnel to an allowlist of hosts. That is pinned egress without metering: TLS runs
+end to end, so the egress sees no tokens and checks the ceiling when the tunnel opens.
+Grok is not a harness but a destination: any OpenAI-shaped harness reaches it with
+`--provider xai` and `XAI_API_KEY`.
+
 | `AUTH` | Model calls go to | Credential | Who holds it |
 |---|---|---|---|
-| `subscription` | api.anthropic.com | your Claude Code login | the harness, copied into its private home |
-| `key` | the provider | `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` from `local/.env` | the egress; the harness gets a placeholder |
+| `subscription` | the provider | the harness's own login (Claude Code's credentials file, Copilot's `GH_TOKEN`) | the harness, inside its private home or environment |
+| `key` | the provider | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` or `XAI_API_KEY` from `local/.env` | the egress; the harness gets a placeholder |
 | `gateway` | LiteLLM on 127.0.0.1:4000 | `local/.virtual-key` | the egress; the harness gets a placeholder |
 
 In every mode the session's handling is capped at the destination's ceiling from
 `grants.toml`, so a session whose calls go to a destination with a public ceiling reads only
-public entries. Codex with a ChatGPT login is not supported yet: Codex routes that to
-chatgpt.com, which the egress does not proxy.
+public entries. Not supported, each refused with the reason: Codex with a ChatGPT login
+(routes to chatgpt.com), Gemini with a Google login (routes to cloudcode-pa), OpenCode with
+a Claude Pro or Max login (Anthropic prohibits third-party clients), Copilot with a key
+(it has no key mode).
 
 `--unconfined` runs the same configuration without namespaces, with the egress on a TCP
 port, for platforms without a backend. macOS gets Seatbelt later; on Windows run under WSL2.

@@ -60,6 +60,34 @@ pub struct Destination {
     pub upstream: String,
     /// How to authenticate there.
     pub auth: Auth,
+    /// Hosts a `CONNECT` tunnel may be opened to, for a harness with no base-URL
+    /// override that is pointed here with `HTTPS_PROXY`. An entry starting with a dot
+    /// matches that domain and its subdomains. Empty for an ordinary forward.
+    /// A tunnel is pinned egress without metering: TLS runs end to end, so the egress
+    /// sees no usage and checks the ceiling only when the tunnel opens.
+    pub tunnel_hosts: Vec<String>,
+}
+
+impl Destination {
+    /// A forwarding destination.
+    #[must_use]
+    pub fn forward(upstream: impl Into<String>, auth: Auth) -> Destination {
+        Destination {
+            upstream: upstream.into(),
+            auth,
+            tunnel_hosts: Vec::new(),
+        }
+    }
+
+    /// A tunnel-only destination to the given hosts.
+    #[must_use]
+    pub fn tunnel(hosts: impl IntoIterator<Item = impl Into<String>>) -> Destination {
+        Destination {
+            upstream: String::new(),
+            auth: Auth::PassThrough,
+            tunnel_hosts: hosts.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// What can go wrong building or running the egress.
@@ -152,6 +180,7 @@ impl Egress {
             .nest_service("/mcp", mcp)
             .route("/{destination}", any(forward_root))
             .route("/{destination}/{*rest}", any(forward))
+            .fallback(connect_or_not_found)
             .with_state(self.clone())
     }
 
@@ -220,7 +249,12 @@ const HOP_BY_HOP: &[&str] = &[
 
 /// What the harness may have sent as its own credential, stripped when the egress
 /// injects one of its own.
-const CREDENTIAL_HEADERS: &[&str] = &["authorization", "x-api-key", "openai-organization"];
+const CREDENTIAL_HEADERS: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "x-goog-api-key",
+    "openai-organization",
+];
 
 fn error_json(status: StatusCode, kind: &str, message: &str) -> Response {
     let body = serde_json::json!({
@@ -250,11 +284,19 @@ fn copy_headers(from: &HeaderMap, strip_credentials: bool) -> HeaderMap {
     out
 }
 
-fn upstream_url(base: &str, rest: &str, uri: &Uri) -> String {
+/// The upstream URL. When the egress injects the credential, a `key=` query parameter
+/// (how Google's SDKs may send an API key) is dropped along with the credential headers.
+fn upstream_url(base: &str, rest: &str, uri: &Uri, strip_credentials: bool) -> String {
     let mut url = format!("{}/{}", base.trim_end_matches('/'), rest);
     if let Some(q) = uri.query() {
-        url.push('?');
-        url.push_str(q);
+        let kept: Vec<&str> = q
+            .split('&')
+            .filter(|kv| !(strip_credentials && (kv.starts_with("key=") || *kv == "key")))
+            .collect();
+        if !kept.is_empty() {
+            url.push('?');
+            url.push_str(&kept.join("&"));
+        }
     }
     url
 }
@@ -284,7 +326,94 @@ fn admit(inner: &Inner, destination: &str) -> Result<Destination, Box<Response>>
             ),
         )));
     }
+    if dest.upstream.is_empty() {
+        return Err(Box::new(error_json(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("{destination} is a tunnel destination; use CONNECT"),
+        )));
+    }
     Ok(dest.clone())
+}
+
+/// Whether an allowlist entry admits a host: exact, or, for an entry starting with a
+/// dot, the domain itself and any subdomain.
+fn host_allowed(entry: &str, host: &str) -> bool {
+    match entry.strip_prefix('.') {
+        Some(domain) => host == domain || host.ends_with(&format!(".{domain}")),
+        None => entry == host,
+    }
+}
+
+/// `CONNECT host:port`: open a TCP tunnel when some destination allows the host and the
+/// session's label is within that destination's ceiling. Anything else here is a 404.
+async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) -> Response {
+    if req.method() != Method::CONNECT {
+        return error_json(StatusCode::NOT_FOUND, "not_found_error", "no such path");
+    }
+    let inner = egress.inner.clone();
+    let authority = req
+        .uri()
+        .authority()
+        .map(|a| a.to_string())
+        .or_else(|| {
+            req.headers()
+                .get(header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority.as_str(), |(h, _)| h);
+    let Some((name, _)) = inner
+        .destinations
+        .iter()
+        .find(|(_, d)| d.tunnel_hosts.iter().any(|h| host_allowed(h, host)))
+    else {
+        return error_json(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &format!("no destination allows a tunnel to {host}"),
+        );
+    };
+    let ceiling = inner.memory.grants().ceiling(name).unwrap_or(Label::Public);
+    let label = inner.memory.label();
+    if label > ceiling {
+        return error_json(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &format!("this session has read {label} material and {name} accepts at most {ceiling}"),
+        );
+    }
+    let target = if authority.contains(':') {
+        authority.clone()
+    } else {
+        format!("{authority}:443")
+    };
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    let name = name.clone();
+    let session = inner.memory.session_id().to_string();
+    tokio::spawn(async move {
+        let Ok(upgraded) = on_upgrade.await else {
+            return;
+        };
+        let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+            return;
+        };
+        let mut inbound = hyper_util::rt::TokioIo::new(upgraded);
+        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        let _ = inner.telemetry.record(
+            &session,
+            &name,
+            200,
+            &Usage {
+                model: Some("tunnel".into()),
+                ..Usage::default()
+            },
+        );
+    });
+    Response::new(Body::empty())
 }
 
 /// The upstream request: the harness's request with hop-by-hop headers dropped, the
@@ -296,10 +425,11 @@ fn upstream_request(
     req: Request,
 ) -> reqwest::RequestBuilder {
     let (parts, body) = req.into_parts();
-    let url = upstream_url(&dest.upstream, rest, &parts.uri);
+    let inject = matches!(dest.auth, Auth::Inject { .. });
+    let url = upstream_url(&dest.upstream, rest, &parts.uri, inject);
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
-    let mut headers = copy_headers(&parts.headers, matches!(dest.auth, Auth::Inject { .. }));
+    let mut headers = copy_headers(&parts.headers, inject);
     if let Auth::Inject { header, value } = &dest.auth {
         if let Ok(v) = HeaderValue::from_str(value) {
             headers.insert(header.clone(), v);
@@ -496,10 +626,7 @@ mod tests {
         let mut d = HashMap::new();
         d.insert(
             "nowhere".to_string(),
-            Destination {
-                upstream: "http://127.0.0.1:1".into(),
-                auth: Auth::PassThrough,
-            },
+            Destination::forward("http://127.0.0.1:1", Auth::PassThrough),
         );
         assert!(matches!(
             Egress::new(m, d, &dir.path().join("t.db")),
@@ -537,13 +664,13 @@ mod tests {
 
         let (_d, e) = fixture(Some((
             "anthropic",
-            Destination {
-                upstream: format!("http://{addr}"),
-                auth: Auth::Inject {
+            Destination::forward(
+                format!("http://{addr}"),
+                Auth::Inject {
                     header: HeaderName::from_static("x-api-key"),
                     value: "real-key".into(),
                 },
-            },
+            ),
         )))
         .await;
         let r = e
@@ -615,10 +742,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
         let (_d, e) = fixture(Some((
             "anthropic",
-            Destination {
-                upstream: format!("http://{addr}"),
-                auth: Auth::PassThrough,
-            },
+            Destination::forward(format!("http://{addr}"), Auth::PassThrough),
         )))
         .await;
         let r = e
@@ -652,6 +776,103 @@ mod tests {
         assert_eq!((s[0].input_tokens, s[0].output_tokens), (30, 12));
     }
 
+    #[test]
+    fn allowlist_entries_match_exactly_or_by_suffix() {
+        assert!(host_allowed("api.github.com", "api.github.com"));
+        assert!(!host_allowed("api.github.com", "evil.api.github.com"));
+        assert!(host_allowed(
+            ".githubcopilot.com",
+            "api.individual.githubcopilot.com"
+        ));
+        assert!(host_allowed(".githubcopilot.com", "githubcopilot.com"));
+        assert!(!host_allowed(".githubcopilot.com", "notgithubcopilot.com"));
+    }
+
+    #[tokio::test]
+    async fn a_key_in_the_query_is_dropped_when_the_egress_injects() {
+        assert_eq!(
+            upstream_url(
+                "https://g",
+                "v1beta/models",
+                &"/x?alt=sse&key=inside".parse().unwrap(),
+                true
+            ),
+            "https://g/v1beta/models?alt=sse"
+        );
+        assert_eq!(
+            upstream_url(
+                "https://g",
+                "v1beta/models",
+                &"/x?key=inside".parse().unwrap(),
+                true
+            ),
+            "https://g/v1beta/models"
+        );
+        assert_eq!(
+            upstream_url(
+                "https://g",
+                "v1beta/models",
+                &"/x?key=own".parse().unwrap(),
+                false
+            ),
+            "https://g/v1beta/models?key=own",
+            "pass-through keeps what the harness sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_tunnel_opens_only_to_allowed_hosts_within_the_ceiling() {
+        // a plain TCP echo "upstream" standing in for a TLS host
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await {
+                        let _ = tokio::io::AsyncWriteExt::write_all(&mut s, &buf[..n]).await;
+                    }
+                });
+            }
+        });
+        let (_d, e) = fixture(Some(("github", Destination::tunnel(["127.0.0.1"])))).await;
+        let egress_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let egress_addr = egress_listener.local_addr().unwrap();
+        let app = e.router();
+        tokio::spawn(async move { axum::serve(egress_listener, app).await.unwrap() });
+
+        // the proxy handshake by hand, as a client behind HTTPS_PROXY would do it
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut c = tokio::net::TcpStream::connect(egress_addr).await.unwrap();
+        c.write_all(format!("CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            c.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        c.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        c.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping", "bytes flow through the tunnel untouched");
+
+        // a host no destination allows
+        let mut c = tokio::net::TcpStream::connect(egress_addr).await.unwrap();
+        c.write_all(b"CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = c.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 403"));
+    }
+
     #[tokio::test]
     async fn a_label_above_the_ceiling_is_refused_before_anything_leaves() {
         let dir = tempfile::tempdir().unwrap();
@@ -670,10 +891,7 @@ mod tests {
         let mut d = HashMap::new();
         d.insert(
             "anthropic".to_string(),
-            Destination {
-                upstream: "http://127.0.0.1:1".into(),
-                auth: Auth::PassThrough,
-            },
+            Destination::forward("http://127.0.0.1:1", Auth::PassThrough),
         );
         let e = Egress::new(Arc::new(m), d, &dir.path().join("t.db")).unwrap();
         let r = e
