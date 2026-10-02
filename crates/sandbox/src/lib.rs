@@ -766,8 +766,10 @@ mod tests {
             "the host's ~/.claude is never mounted"
         );
         assert!(!Path::new(INSIDE_MEMORY).starts_with("/usr"));
+        // the plan canonicalizes the harness's directory; on Windows that adds a prefix
+        let bins = std::fs::canonicalize(&f.bins).unwrap();
         assert!(
-            plan.env["PATH"].starts_with(&format!("{}:", f.bins.display())),
+            plan.env["PATH"].starts_with(&format!("{}:", bins.display())),
             "{}",
             plan.env["PATH"]
         );
