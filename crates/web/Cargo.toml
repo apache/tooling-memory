@@ -9,7 +9,6 @@ description = "A web terminal on the launcher: sessions in pseudo-terminals, str
 [dependencies]
 axum = { version = "0.8", features = ["ws", "json", "http1", "tokio", "query"] }
 bytes = "1"
-dm-core = { version = "0.1.0", path = "../core" }
 dm-server = { version = "0.1.0", path = "../server" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 portable-pty = "0.9"

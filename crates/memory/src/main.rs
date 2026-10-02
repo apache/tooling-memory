@@ -1681,3 +1681,54 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         TaskOp::Get { id } => json(&m.get_task(&id).await?),
     }
 }
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn unconfined_wins_and_auto_prefers_the_image_when_unpacked() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            backend_of(BackendArg::Wslc, true, dir.path()),
+            Backend::None
+        );
+        assert_eq!(
+            backend_of(BackendArg::Wslc, false, dir.path()),
+            Backend::Wslc
+        );
+        assert_eq!(
+            backend_of(BackendArg::Image, false, dir.path()),
+            Backend::Image
+        );
+        assert_eq!(
+            backend_of(BackendArg::None, false, dir.path()),
+            Backend::None
+        );
+        assert_eq!(
+            backend_of(BackendArg::Namespaces, false, dir.path()),
+            Backend::Namespaces
+        );
+        let auto = backend_of(BackendArg::Auto, false, dir.path());
+        if cfg!(target_os = "linux") {
+            assert_eq!(auto, Backend::Namespaces, "no image unpacked yet");
+            let r = image::rootfs_dir(dir.path());
+            std::fs::create_dir_all(r.join("usr/local/bin")).unwrap();
+            std::fs::create_dir_all(r.join("opt/memory")).unwrap();
+            std::fs::write(r.join("opt/memory/memory"), "").unwrap();
+            assert_eq!(
+                backend_of(BackendArg::Auto, false, dir.path()),
+                Backend::Image
+            );
+            assert!(matches!(
+                runner_for(Backend::Image, dir.path()).unwrap(),
+                Runner::Image(_)
+            ));
+        }
+        assert!(runner_for(Backend::Image, &dir.path().join("empty")).is_err());
+        assert!(matches!(
+            runner_for(Backend::None, dir.path()).unwrap(),
+            Runner::Unconfined(None)
+        ));
+    }
+}

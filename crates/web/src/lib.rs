@@ -594,6 +594,7 @@ mod tests {
         (status, serde_json::from_str(&body).unwrap_or(Value::Null))
     }
 
+    #[cfg(unix)]
     async fn ws_connect(
         addr: std::net::SocketAddr,
         id: &str,
@@ -605,6 +606,7 @@ mod tests {
         ws
     }
 
+    #[cfg(unix)]
     async fn read_until(
         ws: &mut (impl StreamExt<
             Item = Result<
@@ -683,6 +685,7 @@ mod tests {
         a_late_browser_sees_everything(addr, &created.id).await;
     }
 
+    #[cfg(unix)]
     async fn a_late_browser_sees_everything(addr: std::net::SocketAddr, id: &str) {
         let created_id = id;
         // a second browser, after the fact, gets the whole scrollback and the exit
@@ -703,6 +706,52 @@ mod tests {
         assert_eq!(page, 200);
         let (missing, _) = http(addr, "GET", "/s/nope", None).await;
         assert_eq!(missing, 404);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_session_can_be_killed_and_unknown_ids_are_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["sh", "-c", "sleep 30"]).await;
+        let (status, body) = http(addr, "POST", "/api/sessions", Some("{}")).await;
+        assert_eq!(status, 200, "{body}");
+        let created: SessionInfo = serde_json::from_str(&body).unwrap();
+        assert_eq!(created.title, "claude");
+        let (status, _) = http(
+            addr,
+            "DELETE",
+            &format!("/api/sessions/{}", created.id),
+            None,
+        )
+        .await;
+        assert_eq!(status, 204);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (_, info) = get_json(addr, &format!("/api/sessions/{}", created.id)).await;
+            if info["alive"] == false || tokio::time::Instant::now() > deadline {
+                assert_eq!(info["alive"], false, "{info}");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, _) = http(addr, "GET", "/api/sessions/nope", None).await;
+        assert_eq!(status, 404);
+        let (status, _) = http(addr, "DELETE", "/api/sessions/nope", None).await;
+        assert_eq!(status, 404);
+        // without the upgrade headers the websocket route is a bad request, not a page
+        let (status, _) = http(addr, "GET", "/ws/nope", None).await;
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn a_launcher_that_cannot_start_is_a_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["/definitely/not/a/program"]).await;
+        let (status, body) = http(addr, "POST", "/api/sessions", Some("{}")).await;
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("session:"), "{body}");
+        let (status, _) = http(addr, "GET", "/", None).await;
+        assert_eq!(status, 200);
     }
 
     #[tokio::test]
