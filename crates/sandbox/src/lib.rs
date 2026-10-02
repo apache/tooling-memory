@@ -801,6 +801,16 @@ pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>), Error> {
 mod tests {
     use super::*;
 
+    /// Tests that change the process's PATH take this, since cargo runs tests in
+    /// parallel and PATH is one variable for the whole process.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn path_lock() -> std::sync::MutexGuard<'static, ()> {
+        PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     struct Fixture {
         _dir: tempfile::TempDir,
         bins: PathBuf,
@@ -877,6 +887,7 @@ mod tests {
             harness_env: &[(String, String)],
         ) -> Result<(PathBuf, Plan), Error> {
             let home = self.root.join(home);
+            let _path = path_lock();
             let old = std::env::var_os("PATH").unwrap_or_default();
             let mut paths = vec![self.bins.clone()];
             paths.extend(std::env::split_paths(&old));
@@ -959,6 +970,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // rootfs mode is the Linux backend's; the symlink here is unix-only
     fn an_unpacked_image_replaces_the_host_system() {
         let f = fixture();
         let rootfs = f.root.join("rootfs");
@@ -1308,6 +1320,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let empty = dir.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
+        let _path = path_lock();
         let old = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", &empty);
         let r = prepare(&Request {
