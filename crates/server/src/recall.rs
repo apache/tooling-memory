@@ -89,12 +89,12 @@ impl Default for Budget {
 }
 
 impl Budget {
-    /// What is left after a pack: the hits and the body tokens it already holds come
-    /// off, so a second hop spends the remainder and not a fresh budget.
+    /// What is left after a pack: the body tokens it already holds come off, so a second
+    /// hop spends the remainder and not a fresh budget. Hits are a page size per round,
+    /// not a total: a first page that came back full is the case a second hop is for.
     #[must_use]
     pub fn remaining(&self, pack: &Pack) -> Budget {
         Budget {
-            hits: self.hits.saturating_sub(pack.pieces.len()),
             tokens: self.tokens.saturating_sub(pack.body_tokens()),
             ..*self
         }
@@ -284,16 +284,20 @@ pub(crate) struct FanOut {
     observed: bool,
 }
 
-/// The bodies a pack fetched for one session, newest kept, [`CACHE_MAX`] at most.
+/// What packs pushed to one session: each entry's id and the digest of the version
+/// pushed, newest [`CACHE_MAX`] kept. A note for the funnel, not a serving path: the
+/// record serves every `get`, and a get whose body is the version a pack pushed is
+/// counted as pushed and then opened.
 #[derive(Debug, Default)]
 pub(crate) struct Cache {
-    map: std::collections::HashMap<String, Entry>,
+    map: std::collections::HashMap<String, String>,
     order: VecDeque<String>,
 }
 
 impl Cache {
-    pub(crate) fn get(&self, id: &str) -> Option<&Entry> {
-        self.map.get(id)
+    /// The digest pushed for `id`, if any.
+    pub(crate) fn get(&self, id: &str) -> Option<&str> {
+        self.map.get(id).map(String::as_str)
     }
 
     #[cfg(test)]
@@ -301,11 +305,12 @@ impl Cache {
         self.map.len()
     }
 
-    fn insert(&mut self, entry: Entry) {
-        let id = entry.front.id.clone();
-        if self.map.insert(id.clone(), entry).is_none() {
-            self.order.push_back(id);
+    /// Note a push; an id pushed again moves to the newest end.
+    pub(crate) fn insert(&mut self, id: &str, digest: String) {
+        if self.map.insert(id.to_string(), digest).is_some() {
+            self.order.retain(|o| o != id);
         }
+        self.order.push_back(id.to_string());
         while self.map.len() > CACHE_MAX {
             if let Some(old) = self.order.pop_front() {
                 self.map.remove(&old);
@@ -317,6 +322,11 @@ impl Cache {
         if self.map.remove(id).is_some() {
             self.order.retain(|o| o != id);
         }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
     }
 }
 
@@ -467,33 +477,38 @@ impl Memory {
         lock(&self.fan_out).note(Instant::now());
     }
 
-    /// Forget what the fan-out rule has seen: the launcher calls this when the harness
-    /// starts, so the launcher's own reads while building a prompt do not count.
-    pub fn reset_fan_out(&self) {
+    /// The harness is about to start: forget what the fan-out rule has seen and what
+    /// packs have pushed, so the launcher's own reads while building a prompt count for
+    /// neither. Task mode calls this per task.
+    pub fn harness_starts(&self) {
         *lock(&self.fan_out) = FanOut::default();
+        lock(&self.cache).clear();
     }
 
-    /// The body a pack fetched for this session, if `id` is one, whatever the record
-    /// holds now; `get` goes through [`Memory::cached_current`] instead.
+    /// The digest a pack pushed for `id` to this session, if any.
     #[cfg(test)]
-    pub(crate) fn cached(&self, id: &str) -> Option<Entry> {
-        lock(&self.cache).get(id).cloned()
+    pub(crate) fn cached(&self, id: &str) -> Option<String> {
+        lock(&self.cache).get(id).map(str::to_string)
     }
 
-    /// The cached body for `id` if it is still the record's version, which the index
-    /// row's digest says; a stale or refused copy leaves the cache.
-    pub(crate) fn cached_current(&self, id: &str, digest: Option<&str>) -> Option<Entry> {
+    /// Whether `served` is the version a pack pushed for its id; a push the record has
+    /// moved past is forgotten.
+    pub(crate) fn was_pushed(&self, served: &Entry) -> bool {
         let mut cache = lock(&self.cache);
-        let current = match (cache.get(id), digest) {
-            (Some(e), Some(d)) => dm_core::digest(&e.render()) == d,
-            _ => false,
-        };
-        if current {
-            cache.get(id).cloned()
-        } else {
-            cache.remove(id);
-            None
+        let id = served.front.id.as_str();
+        match cache.get(id) {
+            Some(d) if d == dm_core::digest(&served.render()) => true,
+            Some(_) => {
+                cache.remove(id);
+                false
+            }
+            None => false,
         }
+    }
+
+    /// An id the index refused: whatever was pushed for it no longer counts.
+    pub(crate) fn forget_pushed(&self, id: &str) {
+        lock(&self.cache).remove(id);
     }
 
     /// The pack for a batch of queries: hits interleaved across queries, each id once,
@@ -536,9 +551,11 @@ impl Memory {
     }
 
     /// Bodies, best hit first, each only if it fits in what is left of the budget; a
-    /// body that does not fit is skipped, not clipped, and the pack says so. A hit the
-    /// record has no current version for leaves the pack: the index is ahead of the
-    /// record, and `get` would refuse it too.
+    /// body that does not fit is skipped, not clipped, and the pack says so. The body is
+    /// the record's current version, so its classification is what the session has now
+    /// read, whatever the index row said; a version above the session's handling is
+    /// refused. A hit the record has no current version for leaves the pack: the index
+    /// is ahead of the record, and `get` would refuse it too.
     async fn fill_sections(&self, pack: &mut Pack, tokens: usize) -> Result<(), Error> {
         let mut spent = 0;
         let mut gone = Vec::new();
@@ -547,6 +564,10 @@ impl Memory {
                 gone.push(p.id.clone());
                 continue;
             };
+            if !lock(&self.session).observe(entry.front.classification) {
+                gone.push(p.id.clone());
+                continue;
+            }
             let cost = approx_tokens(&entry.body);
             if spent + cost > tokens {
                 pack.truncated = true;
@@ -555,7 +576,7 @@ impl Memory {
             spent += cost;
             p.links = mem_ids(&entry.front.source);
             p.body = Some(entry.body.clone());
-            lock(&self.cache).insert(entry);
+            lock(&self.cache).insert(&p.id, dm_core::digest(&entry.render()));
         }
         pack.pieces.retain(|p| !gone.contains(&p.id));
         Ok(())
@@ -613,10 +634,11 @@ impl Memory {
     }
 
     /// Delegated recall. With a deputy: the pack at section depth, one synthesis call,
-    /// a second search round only when the deputy names what is missing and the budget
-    /// has hits left, spending what the first round left, and the brief back with the
-    /// pack at summary depth beside it; the caller's label has risen to everything the
-    /// deputy read. The budget's wall clock bounds the whole of it. Without a deputy:
+    /// a second search round only when the deputy names what is missing, spending the
+    /// body tokens the first round left, and the brief back with the pack at summary
+    /// depth beside it; a second round that fails leaves the first brief standing. The
+    /// caller's label has risen to everything the deputy read. The budget's wall clock
+    /// bounds the whole of it. Without a deputy:
     /// the pack at the depth asked for, or the session's default, with synthesis owed
     /// to the caller.
     ///
@@ -632,26 +654,7 @@ impl Memory {
         budget: Budget,
     ) -> Result<Recall, Error> {
         let Some(deputy) = self.deputy() else {
-            let depth = depth.unwrap_or_else(|| self.default_depth());
-            let pack = self
-                .pack(&[question.to_string()], domain, depth, budget)
-                .await?;
-            self.reads.served_via(
-                "recall",
-                Some(question),
-                pack.pieces.len(),
-                pack.tokens,
-                false,
-                Some(&format!("pack:{depth}")),
-            );
-            return Ok(Recall {
-                question: question.to_string(),
-                synthesis: Synthesis::Owed,
-                brief: None,
-                citations: pack.ids(),
-                pack,
-                hops: 1,
-            });
+            return self.recall_owed(question, domain, depth, budget).await;
         };
         let deadline = Instant::now() + budget.wall;
         let mut pack = self
@@ -660,19 +663,25 @@ impl Memory {
         let mut hops = 1;
         let mut answer = self.ask(deputy.as_ref(), question, &pack, deadline).await?;
         while !answer.missing.is_empty() && hops < MAX_HOPS {
-            let left = budget.remaining(&pack);
-            if left.hits == 0 {
-                break;
-            }
             let more = self
-                .pack(&answer.missing, domain, Depth::Sections, left)
+                .pack(
+                    &answer.missing,
+                    domain,
+                    Depth::Sections,
+                    budget.remaining(&pack),
+                )
                 .await?;
             hops += 1;
             if more.pieces.iter().all(|p| pack.ids().contains(&p.id)) {
                 break;
             }
             pack.extend(more);
-            answer = self.ask(deputy.as_ref(), question, &pack, deadline).await?;
+            // a second hop that fails, out of clock or refused by the egress, costs
+            // the caller nothing it already had: the first brief stands
+            match self.ask(deputy.as_ref(), question, &pack, deadline).await {
+                Ok(a) => answer = a,
+                Err(_) => break,
+            }
         }
         let in_pack: HashSet<String> = pack.ids().into_iter().collect();
         let mut citations: Vec<String> = answer
@@ -705,6 +714,37 @@ impl Memory {
             citations,
             pack,
             hops,
+        })
+    }
+
+    /// The caller-executed tier: the pack at the depth asked for, or the session's
+    /// default, with synthesis owed.
+    async fn recall_owed(
+        &self,
+        question: &str,
+        domain: Option<&str>,
+        depth: Option<Depth>,
+        budget: Budget,
+    ) -> Result<Recall, Error> {
+        let depth = depth.unwrap_or_else(|| self.default_depth());
+        let pack = self
+            .pack(&[question.to_string()], domain, depth, budget)
+            .await?;
+        self.reads.served_via(
+            "recall",
+            Some(question),
+            pack.pieces.len(),
+            pack.tokens,
+            false,
+            Some(&format!("pack:{depth}")),
+        );
+        Ok(Recall {
+            question: question.to_string(),
+            synthesis: Synthesis::Owed,
+            brief: None,
+            citations: pack.ids(),
+            pack,
+            hops: 1,
         })
     }
 
@@ -964,13 +1004,20 @@ mod tests {
     struct Scripted {
         answers: Mutex<Vec<String>>,
         prompts: Mutex<Vec<String>>,
+        /// Sleep this long before every answer.
+        delay: Duration,
     }
 
     impl Scripted {
         fn new(answers: &[&str]) -> Arc<Scripted> {
+            Scripted::slow(answers, Duration::ZERO)
+        }
+
+        fn slow(answers: &[&str], delay: Duration) -> Arc<Scripted> {
             Arc::new(Scripted {
                 answers: Mutex::new(answers.iter().rev().map(|s| (*s).to_string()).collect()),
                 prompts: Mutex::new(Vec::new()),
+                delay,
             })
         }
     }
@@ -986,6 +1033,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async move {
                 self.prompts.lock().unwrap().push(prompt.to_string());
+                tokio::time::sleep(self.delay).await;
                 self.answers
                     .lock()
                     .unwrap()
@@ -1280,7 +1328,7 @@ mod tests {
         m.get(&id).await.unwrap();
         m.get(&id).await.unwrap();
         assert!(m.fans_out());
-        m.reset_fan_out();
+        m.harness_starts();
         assert!(!m.fans_out(), "the launcher's prompt reads do not count");
         m.get(&id).await.unwrap();
         assert!(!m.fans_out(), "one get after the reset is not a fan-out");
@@ -1406,6 +1454,216 @@ mod tests {
             "{err}"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_section_read_raises_the_label_to_what_the_record_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let x = write(
+            &m,
+            "Retry policy",
+            "Operation R retries with backoff.\n",
+            vec![],
+        )
+        .await;
+        // the record moves ahead of the index: a restricted version, no upsert yet
+        let mut again = m.store.get("dom-me", &x).await.unwrap().unwrap();
+        again.front.classification = Label::Restricted;
+        m.store.put(&again).await.unwrap();
+        let pack = m
+            .pack(&["retry".into()], None, Depth::Sections, Budget::default())
+            .await
+            .unwrap();
+        assert!(pack.pieces[0].body.is_some());
+        assert_eq!(
+            m.label(),
+            Label::Restricted,
+            "the body read is the record's version"
+        );
+        // under a cap below the record's version, the body is refused, not served
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Internal);
+        let pack = capped
+            .pack(&["retry".into()], None, Depth::Sections, Budget::default())
+            .await
+            .unwrap();
+        assert!(pack.pieces.is_empty(), "{pack:?}");
+        assert_eq!(
+            capped.label(),
+            Label::Internal,
+            "the summary the index admitted was read; the restricted body was not"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hit_the_record_lost_leaves_the_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let x = write(
+            &m,
+            "Retry policy",
+            "Operation R retries with backoff.\n",
+            vec![],
+        )
+        .await;
+        let y = write(&m, "Retry log", "Retry log for R.\n", vec![]).await;
+        std::fs::remove_file(dir.path().join(format!("record/dom-me/{y}.md"))).unwrap();
+        let pack = m
+            .pack(&["retry".into()], None, Depth::Sections, Budget::default())
+            .await
+            .unwrap();
+        assert_eq!(pack.ids(), [x]);
+        assert!(!pack.truncated);
+    }
+
+    #[tokio::test]
+    async fn get_serves_the_record_even_when_the_index_is_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let x = write(
+            &m,
+            "Retry policy",
+            "Operation R retries with backoff.\n",
+            vec![],
+        )
+        .await;
+        m.pack(&["retry".into()], None, Depth::Sections, Budget::default())
+            .await
+            .unwrap();
+        let mut again = m.store.get("dom-me", &x).await.unwrap().unwrap();
+        again.body = "Operation R retries with jitter now.\n".into();
+        m.store.put(&again).await.unwrap(); // no index upsert: the index is behind
+        let got = m.get(&x).await.unwrap();
+        assert!(
+            got.body.contains("jitter"),
+            "the record serves, whatever the index says"
+        );
+        let reads = crate::reads::all(dir.path()).unwrap();
+        assert!(!reads.last().unwrap().cached);
+    }
+
+    #[tokio::test]
+    async fn the_second_hop_runs_when_the_first_page_was_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        for i in 0..9 {
+            write(
+                &m,
+                &format!("Retry note {i}"),
+                "Operation R retries.\n",
+                vec![],
+            )
+            .await;
+        }
+        let limit = write(
+            &m,
+            "Attempt ceiling",
+            "The operation gives up after five attempts.\n",
+            vec![],
+        )
+        .await;
+        let deputy = Scripted::new(&[
+            "{\"brief\": \"R retries.\", \"missing\": [\"attempts\"]}",
+            &format!("{{\"brief\": \"R retries and stops after five [{limit}].\"}}"),
+        ]);
+        let strong: Arc<dyn Deputy> = deputy.clone();
+        m.set_deputy(&strong);
+        let r = m
+            .recall("retry", None, None, Budget::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            r.hops, 2,
+            "a full first page does not end the recall: {r:?}"
+        );
+        assert!(r.pack.ids().contains(&limit));
+        assert_eq!(r.citations, [limit]);
+    }
+
+    #[tokio::test]
+    async fn a_two_hop_recall_shares_one_wall_clock_and_keeps_the_first_brief() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let retry = write(
+            &m,
+            "Retry policy",
+            "Operation R retries with backoff.\n",
+            vec![],
+        )
+        .await;
+        write(
+            &m,
+            "Attempt ceiling",
+            "The operation gives up after five attempts.\n",
+            vec![],
+        )
+        .await;
+        // each call is under the wall; the two together are not
+        let deputy = Scripted::slow(
+            &[
+                &format!("{{\"brief\": \"first [{retry}]\", \"missing\": [\"attempts\"]}}"),
+                "{\"brief\": \"second\"}",
+            ],
+            Duration::from_millis(200),
+        );
+        let strong: Arc<dyn Deputy> = deputy.clone();
+        m.set_deputy(&strong);
+        let r = m
+            .recall(
+                "retry",
+                None,
+                None,
+                Budget {
+                    wall: Duration::from_millis(300),
+                    ..Budget::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deputy.prompts.lock().unwrap().len(),
+            2,
+            "the second hop was tried"
+        );
+        assert_eq!(
+            r.brief.as_deref(),
+            Some(format!("first [{retry}]").as_str()),
+            "the first brief survives the second hop running out of clock"
+        );
+        assert_eq!(r.citations, [retry]);
+        assert_eq!(r.hops, 2);
+    }
+
+    #[tokio::test]
+    async fn harness_starts_forgets_what_was_pushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let x = write(
+            &m,
+            "Retry policy",
+            "Operation R retries with backoff.\n",
+            vec![],
+        )
+        .await;
+        m.pack(&["retry".into()], None, Depth::Sections, Budget::default())
+            .await
+            .unwrap();
+        assert!(m.cached(&x).is_some());
+        m.harness_starts();
+        assert!(
+            m.cached(&x).is_none(),
+            "a push to the launcher is not a push to the harness"
+        );
+        m.get(&x).await.unwrap();
+        assert!(
+            !crate::reads::all(dir.path())
+                .unwrap()
+                .last()
+                .unwrap()
+                .cached
+        );
     }
 
     #[tokio::test]

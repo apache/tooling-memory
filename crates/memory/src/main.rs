@@ -1046,6 +1046,17 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     Ok(())
 }
 
+/// The auth mode a deputy may run under. A subscription login is the harness's alone,
+/// so naming a provider with it would quietly give no deputy; refuse it instead.
+fn deputy_auth(auth: AuthArg) -> Result<AuthMode, Box<dyn std::error::Error>> {
+    match AuthMode::from(auth) {
+        AuthMode::Subscription => Err("a subscription login is the harness's alone and cannot \
+             stand in for the deputy; use --auth key or --auth gateway with --provider"
+            .into()),
+        mode => Ok(mode),
+    }
+}
+
 /// `golden`: the suite against this root, with the deputy's brief when a provider is
 /// named.
 async fn golden_cmd(
@@ -1063,7 +1074,7 @@ async fn golden_cmd(
             let p = prepare_launch(
                 root,
                 Harness::Command,
-                auth.into(),
+                deputy_auth(auth)?,
                 Some(&provider),
                 None,
                 model,
@@ -1116,7 +1127,7 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
             let p = prepare_launch(
                 root,
                 Harness::Command,
-                auth.into(),
+                deputy_auth(auth)?,
                 Some(&provider),
                 None,
                 model.as_deref(),

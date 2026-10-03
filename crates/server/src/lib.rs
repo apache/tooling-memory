@@ -150,7 +150,8 @@ pub struct Memory {
     deputy: OnceLock<Weak<dyn recall::Deputy>>,
     /// Whether this session has issued two gets inside one turn.
     fan_out: Mutex<recall::FanOut>,
-    /// Bodies a pack fetched for this session, served to a later `get` of the same id.
+    /// What packs pushed to this session, so a later `get` of the same version is
+    /// counted as pushed and then opened.
     cache: Mutex<recall::Cache>,
 }
 
@@ -355,10 +356,9 @@ impl Memory {
     }
 
     /// One entry, body included, if the filter admits it. Raises the session label.
-    /// The index decides admission; the body comes from the session cache when a pack
-    /// already fetched it and the index's digest says it is still the record's version,
-    /// else from the record. Two admitted gets inside one turn mark the session as one
-    /// that fans out.
+    /// The index decides admission and the record serves the body, always; when that
+    /// body is the version a pack pushed to this session, the read log says so. Two
+    /// admitted gets inside one turn mark the session as one that fans out.
     ///
     /// # Errors
     ///
@@ -367,28 +367,19 @@ impl Memory {
         let f = self.grants.read_filter();
         let meta = self.index.lock().await.meta(id, &f)?;
         let Some(meta) = meta else {
-            self.cached_current(id, None);
+            self.forget_pushed(id);
             return Err(Error::NotFound(id.to_string()));
         };
         self.note_get();
-        let cached = self.cached_current(id, Some(&meta.digest));
-        let from_cache = cached.is_some();
-        let entry = match cached {
-            Some(e) => e,
-            None => self
-                .store
-                .get(&meta.hit.domain, id)
-                .await?
-                .ok_or_else(|| Error::NotFound(id.to_string()))?,
-        };
+        let entry = self
+            .store
+            .get(&meta.hit.domain, id)
+            .await?
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
         lock(&self.session).observe(entry.front.classification);
-        self.reads.served(
-            "get",
-            None,
-            1,
-            dm_core::approx_tokens(&entry.body),
-            from_cache,
-        );
+        let pushed = self.was_pushed(&entry);
+        self.reads
+            .served("get", None, 1, dm_core::approx_tokens(&entry.body), pushed);
         Ok(entry)
     }
 

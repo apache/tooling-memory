@@ -39,7 +39,7 @@ echo "== before: the record, T0 and retrieval, with no session yet"
 "$memory" --root "$root" savings --query "$question" | sed -n '1,12p'
 echo
 echo "== recall with no model behind it: the pack comes back, synthesis owed to the caller"
-"$memory" --root "$root" recall "$question" | show_recall
+"$memory" --root "$root" recall "$question" | show_recall || true
 echo
 title=${TASK_TITLE:-"Answer: what did DR-19 decide about MoinMoin, and why?"}
 body=${TASK_BODY:-"Use the memory tools: search the record, open only the entries you need, and answer in a handoff entry: what was decided, the reasons given, and the entry ids you cite. Then complete this task with that handoff. Do not read files from the working tree; the record is the source."}

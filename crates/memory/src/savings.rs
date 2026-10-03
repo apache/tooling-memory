@@ -189,11 +189,11 @@ fn count_recall(row: &mut RecallRow, r: &reads::Read) {
     match (r.tool.as_str(), r.via.as_deref()) {
         ("recall", Some("brief")) => {
             row.briefs += 1;
-            row.brief_tokens += r.tokens;
+            row.brief_tokens = row.brief_tokens.saturating_add(r.tokens);
         }
         ("recall", Some(via)) => {
             row.packs += 1;
-            row.pack_tokens += r.tokens;
+            row.pack_tokens = row.pack_tokens.saturating_add(r.tokens);
             if via == "pack:sections" {
                 row.packs_with_sections += 1;
             }
@@ -216,7 +216,8 @@ fn funnel(root: &Path, report: &mut Report) -> Fallible<()> {
             ..SessionRow::default()
         });
         row.reads += 1;
-        row.served_tokens += r.tokens;
+        // a log line is a file anyone can append to: a number that cannot be is clamped
+        row.served_tokens = row.served_tokens.saturating_add(r.tokens);
         count_recall(&mut report.recall, &r);
     }
     if let Ok(t) = Telemetry::open(&root.join("state/telemetry.db")) {
@@ -449,6 +450,41 @@ mod tests {
             text.contains("Recall") && text.contains("pushed then opened"),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hostile_read_log_line_cannot_overflow_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        m.write(dm_server::WriteRequest {
+            body: "# Import steps\n\nSteps one to five.".into(),
+            ..dm_server::WriteRequest::default()
+        })
+        .await
+        .unwrap();
+        drop(m);
+        let log = dir.path().join("state/reads.jsonl");
+        let huge = usize::MAX;
+        std::fs::write(
+            &log,
+            format!(
+                "{{\"at\":\"2026-10-03T00:00:00Z\",\"session\":\"sess-x\",\"tool\":\"recall\",\"hits\":1,\"tokens\":{huge},\"via\":\"brief\"}}\n\
+                 {{\"at\":\"2026-10-03T00:00:01Z\",\"session\":\"sess-x\",\"tool\":\"recall\",\"hits\":1,\"tokens\":{huge},\"via\":\"pack:sections\"}}\n\
+                 {{\"at\":\"2026-10-03T00:00:02Z\",\"session\":\"sess-x\",\"tool\":\"get\",\"hits\":1,\"tokens\":5}}\n\
+                 {{\"at\":\"2026-10-03T00:00:03Z\",\"session\":\"sess-x\",\"tool\":\"recall\",\"hits\":1,\"tokens\":5,\"via\":\"brief\"}}\n\
+                 {{\"at\":\"2026-10-03T00:00:04Z\",\"session\":\"sess-x\",\"tool\":\"recall\",\"hits\":1,\"tokens\":5,\"via\":\"pack:summaries\"}}\n"
+            ),
+        )
+        .unwrap();
+        let r = measure(dir.path(), Some("import")).await.unwrap();
+        assert_eq!(
+            r.sessions[0].served_tokens,
+            usize::MAX,
+            "saturated, not wrapped"
+        );
+        assert_eq!(r.recall.brief_tokens, usize::MAX);
+        assert_eq!(r.recall.pack_tokens, usize::MAX);
+        assert_eq!(r.recall.briefs, 2);
     }
 
     #[tokio::test]

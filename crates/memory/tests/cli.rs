@@ -153,6 +153,18 @@ fn step_recall_and_golden(d: &Demo) {
         .iter()
         .any(|c| c == &d.handoff));
     assert!(fails(&d.root, &["recall", "q", "--model", "m"]).contains("provider"));
+    assert!(fails(
+        &d.root,
+        &[
+            "recall",
+            "q",
+            "--provider",
+            "anthropic",
+            "--auth",
+            "subscription"
+        ]
+    )
+    .contains("subscription"));
     // the savings report runs from the CLI and counts that recall
     let savings = ok(&d.root, &["savings", "--query", "digests"], None);
     assert!(savings.contains("owed packs             1"), "{savings}");
