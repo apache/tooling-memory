@@ -409,6 +409,8 @@ fn harness_mounts(real: &Path) -> (Vec<Mount>, Option<PathBuf>) {
 fn base_env(harness_env: &[(String, String)]) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     env.insert("HOME".into(), INSIDE_HOME.into());
+    // where every harness's hooks leave notes for the launcher
+    env.insert("MEMORY_OUTBOX".into(), format!("{INSIDE_HOME}/{OUTBOX}"));
     env.insert("USER".into(), "user".into());
     env.insert("LOGNAME".into(), "user".into());
     env.insert("TMPDIR".into(), "/tmp".into());
@@ -571,7 +573,6 @@ fn setup_claude(
     write(&req.home.join(".claude-mcp.json"), &mcp.to_string())?;
     claude_global_config(&req.home.join(".claude.json"), req.workdir_inside())?;
     claude_hooks(&req.home.join(".claude/settings.json"))?;
-    env.insert("MEMORY_OUTBOX".into(), format!("{INSIDE_HOME}/{OUTBOX}"));
     env.insert("ANTHROPIC_BASE_URL".into(), format!("{relay}/anthropic"));
     env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
     match req.auth {
@@ -594,16 +595,28 @@ fn setup_claude(
 /// drops a note in the outbox for the launcher to file. Merged into the user settings
 /// in the private home, which the launcher owns.
 fn claude_hooks(path: &Path) -> Result<(), Error> {
+    merge_hooks(path, "claude", &["PreCompact", "SessionEnd"], 30)
+}
+
+/// Merge the two hooks into a JSON settings file that may hold other things: Claude
+/// Code's `settings.json`, Codex's `hooks.json`, Gemini CLI's `settings.json`. All three
+/// share the shape, `hooks → event → matcher groups → command handlers`; they differ in
+/// the name of the compaction event and in how long a session-end hook may run.
+fn merge_hooks(path: &Path, harness: &str, events: &[&str], timeout: u32) -> Result<(), Error> {
     let mut settings: serde_json::Value = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| serde_json::json!({}));
+    if !settings.is_object() {
+        settings = serde_json::json!({});
+    }
     let hook = serde_json::json!([{
         "matcher": "*",
-        "hooks": [{ "type": "command", "command": format!("{INSIDE_MEMORY} hook claude"), "timeout": 30 }]
+        "hooks": [{ "type": "command", "command": format!("{INSIDE_MEMORY} hook {harness}"), "timeout": timeout }]
     }]);
-    settings["hooks"]["PreCompact"] = hook.clone();
-    settings["hooks"]["SessionEnd"] = hook;
+    for e in events {
+        settings["hooks"][*e] = hook.clone();
+    }
     write(
         path,
         &serde_json::to_string_pretty(&settings).unwrap_or_default(),
@@ -652,6 +665,13 @@ url = "{relay}/mcp"
         )
     };
     write(&req.home.join(".codex/config.toml"), &config)?;
+    // Codex gives a session-end hook three seconds at most
+    merge_hooks(
+        &req.home.join(".codex/hooks.json"),
+        "codex",
+        &["PreCompact", "SessionEnd"],
+        3,
+    )?;
     env.insert("CODEX_HOME".into(), format!("{INSIDE_HOME}/.codex"));
     Ok(())
 }
@@ -684,7 +704,13 @@ fn setup_gemini(
     } else {
         "gemini-api-key"
     };
+    // Gemini's hook timeout is in milliseconds, unlike Claude Code's and Codex's seconds
+    let hook = serde_json::json!([{
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": format!("{INSIDE_MEMORY} hook gemini"), "timeout": 10_000 }]
+    }]);
     let settings = serde_json::json!({
+        "hooks": { "PreCompress": hook, "SessionEnd": hook },
         "security": { "auth": { "selectedType": auth_type } },
         "general": { "enableAutoUpdate": false },
         "privacy": { "usageStatisticsEnabled": false },
@@ -1120,6 +1146,14 @@ mod tests {
         );
         assert!(cfg.contains("[mcp_servers.memory]"));
         assert_eq!(plan.env["CODEX_HOME"], "/home/user/.codex");
+        let hooks = json_file(&home.join(".codex/hooks.json"));
+        assert_eq!(
+            hooks["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+            "/opt/memory/memory hook codex"
+        );
+        assert_eq!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        assert!(hooks["hooks"]["PreCompact"].is_array());
+        assert_eq!(plan.env["MEMORY_OUTBOX"], "/home/user/.memory-outbox");
         assert_eq!(plan.env["DM_EGRESS_TOKEN"], "egress");
         let (home, _) = f
             .plan_with(
@@ -1211,6 +1245,15 @@ mod tests {
         );
         assert_eq!(s["general"]["enableAutoUpdate"], false);
         assert_eq!(
+            s["hooks"]["PreCompress"][0]["hooks"][0]["command"],
+            "/opt/memory/memory hook gemini"
+        );
+        assert!(s["hooks"]["SessionEnd"].is_array());
+        assert_eq!(
+            s["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 10_000,
+            "milliseconds, for Gemini"
+        );
+        assert_eq!(
             plan.env["GOOGLE_GEMINI_BASE_URL"],
             "http://127.0.0.1:4100/gemini"
         );
@@ -1220,6 +1263,11 @@ mod tests {
             f.plan(Harness::Gemini, AuthMode::Subscription, "g2", &[], false),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn gemini_subscription_moves_code_assist_to_the_egress() {
+        let f = fixture();
         // a Google login: Code Assist moves to the egress, refresh goes through the tunnel
         let (home, plan) = f
             .plan(Harness::Gemini, AuthMode::Subscription, "g3", &[], true)

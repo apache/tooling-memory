@@ -44,7 +44,8 @@ pub enum Event {
 impl Event {
     fn from_name(name: &str) -> Option<Event> {
         match name {
-            "PreCompact" => Some(Event::PreCompact),
+            // Claude Code and Codex say PreCompact; Gemini CLI says PreCompress
+            "PreCompact" | "PreCompress" => Some(Event::PreCompact),
             "SessionEnd" => Some(Event::SessionEnd),
             _ => None,
         }
@@ -72,7 +73,9 @@ fn text_of(content: &Value) -> String {
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(|b| match b.get("type").and_then(Value::as_str) {
-                Some("text") => b.get("text").and_then(Value::as_str).map(str::to_string),
+                Some("text" | "input_text" | "output_text") | None => {
+                    b.get("text").and_then(Value::as_str).map(str::to_string)
+                }
                 Some("tool_use") => b
                     .get("name")
                     .and_then(Value::as_str)
@@ -86,25 +89,64 @@ fn text_of(content: &Value) -> String {
     }
 }
 
-/// The last `turns` user and assistant turns of a Claude Code transcript, as Markdown,
-/// capped at `max_chars`. Tool calls are named, their results elided.
+/// The turns one transcript line holds, in whichever harness's shape it is.
+///
+/// Claude Code: `{"type":"user"|"assistant","message":{"content":…}}`, one turn a line.
+/// Codex: `{"type":"response_item","payload":{"type":"message","role":…,"content":[{"text":…}]}}`.
+/// Gemini CLI: a patch log, `{"$set":{"messages":[{"type":"user"|"gemini","content":[{"text":…}]}]}}`.
+fn turns_in(v: &Value) -> Vec<Turn> {
+    let keep = |role: &str, text: String| {
+        let text = text.trim().to_string();
+        (!text.is_empty() && text != "[tool result]").then(|| Turn {
+            role: role.to_string(),
+            text,
+        })
+    };
+    if let Some(role) = v.get("type").and_then(Value::as_str) {
+        if role == "user" || role == "assistant" {
+            if let Some(c) = v.get("message").and_then(|m| m.get("content")) {
+                return keep(role, text_of(c)).into_iter().collect();
+            }
+        }
+        if role == "response_item" {
+            if let Some(p) = v.get("payload") {
+                let is_message = p.get("type").and_then(Value::as_str) == Some("message");
+                let who = p.get("role").and_then(Value::as_str).unwrap_or_default();
+                if is_message && (who == "user" || who == "assistant") {
+                    return keep(who, text_of(p.get("content").unwrap_or(&Value::Null)))
+                        .into_iter()
+                        .collect();
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(messages) = v
+        .pointer("/$set/messages")
+        .or_else(|| v.get("messages"))
+        .and_then(Value::as_array)
+    {
+        for m in messages {
+            let who = match m.get("type").and_then(Value::as_str) {
+                Some("user") => "user",
+                Some("gemini" | "model" | "assistant") => "assistant",
+                _ => continue,
+            };
+            out.extend(keep(who, text_of(m.get("content").unwrap_or(&Value::Null))));
+        }
+    }
+    out
+}
+
+/// The last `turns` user and assistant turns of a transcript, as Markdown, capped at
+/// `max_chars`. Tool calls are named, their results elided. Claude Code, Codex and Gemini
+/// CLI shapes are all read.
 #[must_use]
 pub fn transcript_tail(jsonl: &str, turns: usize, max_chars: usize) -> String {
     let mut all: Vec<Turn> = jsonl
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| {
-            let role = v.get("type").and_then(Value::as_str)?;
-            if role != "user" && role != "assistant" {
-                return None;
-            }
-            let text = text_of(v.get("message")?.get("content")?);
-            let text = text.trim().to_string();
-            (!text.is_empty() && text != "[tool result]").then(|| Turn {
-                role: role.to_string(),
-                text,
-            })
-        })
+        .flat_map(|v| turns_in(&v))
         .collect();
     let keep = all.len().saturating_sub(turns);
     all.drain(..keep);
@@ -265,6 +307,42 @@ not json
             "{capped}"
         );
         assert_eq!(transcript_tail("", 10, 100), "");
+    }
+
+    #[test]
+    fn codex_and_gemini_transcripts_are_read_too() {
+        let codex = concat!(
+            r#"{"type":"session_meta","payload":{"id":"s"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"system stuff"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Finish the import."}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Step 3 done."}]}}"#,
+            "\n",
+        );
+        let t = transcript_tail(codex, 10, 10_000);
+        assert!(
+            !t.contains("system stuff"),
+            "developer messages are not turns: {t}"
+        );
+        assert!(
+            t.contains("**user**\n\nFinish the import.") && t.ends_with("Step 3 done."),
+            "{t}"
+        );
+        let gemini = concat!(
+            r#"{"sessionId":"g","kind":"main"}"#,
+            "\n",
+            r#"{"$set":{"messages":[{"type":"user","content":[{"text":"Hello there."}]},{"type":"gemini","content":[{"text":"General Kenobi."}]}]}}"#,
+            "\n",
+        );
+        let t = transcript_tail(gemini, 10, 10_000);
+        assert!(
+            t.starts_with("**user**\n\nHello there.") && t.ends_with("General Kenobi."),
+            "{t}"
+        );
+        assert_eq!(Event::from_name("PreCompress"), Some(Event::PreCompact));
+        assert_eq!(Event::from_name("Stop"), None);
     }
 
     #[test]

@@ -136,8 +136,10 @@ though the harness does not.
 
 ## Handoffs the harness did not write
 
-The launcher installs two hooks in Claude Code's settings in the private home: before
-context is compacted, and at session end. Each runs the `memory` binary inside the
+The launcher installs two hooks in each harness's settings in the private home: before
+context is compacted, and at session end. Claude Code and Codex call the first PreCompact
+and Gemini CLI calls it PreCompress; Codex allows a session-end hook three seconds, which
+is plenty for one file read and one file write. Each runs the `memory` binary inside the
 sandbox, which reads the event and the transcript's tail and leaves a note in an outbox in
 the private home. When the run ends, the launcher files the notes as handoffs, marked as
 left by the hook rather than the agent and pointing at the full transcript. A note from
@@ -145,8 +147,8 @@ before compaction is always filed, since what it holds has left the harness's co
 note from session end is filed only when the run left no handoff of its own: the handoff
 of last resort, which is also why a prompted run that forgot to write one no longer exits
 4. Transcripts stay where the harness keeps them, under the private home in the record's
-state, so nothing is lost even when no note is filed. Codex and Gemini CLI expose the same
-moments; their adapters are next.
+state, so nothing is lost even when no note is filed. The hook reads all three transcript
+shapes: Claude Code's one turn a line, Codex's rollout items, Gemini's patch log.
 
 ## In the harness image, on Linux: `make unpack`
 
