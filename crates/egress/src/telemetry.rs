@@ -9,6 +9,25 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+/// One session's model calls, summed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionTotals {
+    /// The memory session id.
+    pub session: String,
+    /// How many calls.
+    pub calls: u64,
+    /// Summed input tokens, cache reads excluded.
+    pub input_tokens: u64,
+    /// Summed output tokens.
+    pub output_tokens: u64,
+    /// Summed cache reads.
+    pub cache_read_tokens: u64,
+    /// Summed cache writes.
+    pub cache_write_tokens: u64,
+    /// The first call, RFC 3339.
+    pub started: String,
+}
+
 /// What can go wrong recording usage.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -119,6 +138,36 @@ impl Telemetry {
             ],
         )?;
         Ok(())
+    }
+
+    /// Totals by session: what each session's model calls cost, all destinations.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn by_session(&self) -> Result<Vec<SessionTotals>, Error> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT session, COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read),
+                    SUM(cache_write), MIN(at)
+             FROM usage WHERE model NOT LIKE 'http %' AND model != 'tunnel'
+             GROUP BY session ORDER BY MIN(at)",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let u = |i: usize| -> rusqlite::Result<u64> {
+                Ok(u64::try_from(r.get::<_, i64>(i)?).unwrap_or(0))
+            };
+            Ok(SessionTotals {
+                session: r.get(0)?,
+                calls: u(1)?,
+                input_tokens: u(2)?,
+                output_tokens: u(3)?,
+                cache_read_tokens: u(4)?,
+                cache_write_tokens: u(5)?,
+                started: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Totals by destination and model, most tokens first.

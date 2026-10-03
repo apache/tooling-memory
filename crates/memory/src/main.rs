@@ -9,6 +9,7 @@
 mod hooks;
 mod image;
 mod requests;
+mod savings;
 mod work;
 mod wslc;
 
@@ -314,6 +315,18 @@ enum Command {
     },
     /// Token usage recorded by the egress, by destination and model.
     Usage,
+    /// The paper's read-path claims measured on this record: recovery from T0 and a
+    /// handoff against transcript replay, a page of hits against bodies and corpus,
+    /// known-item lookups in the top three, and tokens served per session beside what
+    /// its model calls ingested.
+    Savings {
+        /// The query for the retrieval section; the newest entry's title when omitted.
+        #[arg(long)]
+        query: Option<String>,
+        /// Numbers as JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inside the sandbox, run by the harness's hooks: read the event from standard
     /// input and leave a note in the outbox for the launcher to file as a handoff.
     #[command(hide = true)]
@@ -569,6 +582,18 @@ async fn run_cli() -> Fallible {
         }
         Command::Hook { .. } => unreachable!("handled in main before the root is needed"),
         cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
+        Command::Savings {
+            query,
+            json: as_json,
+        } => {
+            let r = savings::measure(&root, query.as_deref()).await?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print!("{}", savings::render(&r));
+            }
+            Ok(())
+        }
         Command::Image { op } => match op {
             ImageOp::Unpack { image } => {
                 image::unpack(&root, &image)?;
@@ -1619,6 +1644,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Inside { .. }
         | Command::Image { .. }
         | Command::Web { .. }
+        | Command::Savings { .. }
         | Command::Hook { .. }
         | Command::Relay { .. }
         | Command::Usage

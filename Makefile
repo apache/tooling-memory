@@ -71,6 +71,10 @@ work: build
 	target/release/memory --root "$$MEMORY_ROOT" work --harness $(HARNESS) --auth $(AUTH) \
 		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(if $(LOOP),--loop,)
 
+# The paper's read-path claims measured on this record.
+savings: build
+	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" savings $(if $(QUERY),--query '$(QUERY)',)
+
 usage:
 	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" usage
 

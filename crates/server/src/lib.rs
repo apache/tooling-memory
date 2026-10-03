@@ -26,6 +26,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 pub mod bundle;
 pub mod mcp;
+pub mod reads;
 pub mod t0;
 
 /// The grants file, relative to the root.
@@ -140,6 +141,7 @@ pub struct Memory {
     index: AsyncMutex<Index>,
     ledger: AsyncMutex<Ledger>,
     session: Mutex<Session>,
+    reads: reads::ReadLog,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -181,12 +183,14 @@ impl Memory {
         let index = Index::open(&root.join(INDEX_FILE))?;
         let ledger = Ledger::open(&root.join(LEDGER_FILE))?;
         let session = grants.session();
+        let session_id = dm_core::id::new_task_id("session").replace("task-session-", "sess-");
         Ok(Memory {
             root: root.to_path_buf(),
             author: grants.owner.clone(),
             grants,
             manifest: Vec::new(),
-            session_id: dm_core::id::new_task_id("session").replace("task-session-", "sess-"),
+            reads: reads::ReadLog::new(root, &session_id),
+            session_id,
             store,
             index: AsyncMutex::new(index),
             ledger: AsyncMutex::new(ledger),
@@ -308,6 +312,7 @@ impl Memory {
         let f = self.filter_for(domain)?;
         let hits = self.index.lock().await.search(query, &f, limit)?;
         self.observe(&hits);
+        self.reads.hits("search", Some(query), &hits);
         Ok(hits)
     }
 
@@ -325,6 +330,7 @@ impl Memory {
         let f = self.filter_for(domain)?;
         let hits = self.index.lock().await.list(&f, kind, limit)?;
         self.observe(&hits);
+        self.reads.hits("list", None, &hits);
         Ok(hits)
     }
 
@@ -347,6 +353,7 @@ impl Memory {
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         lock(&self.session).observe(entry.front.classification);
+        self.reads.text("get", &entry.body);
         Ok(entry)
     }
 
@@ -437,7 +444,7 @@ impl Memory {
         self.observe(&decisions);
         self.observe(&conventions);
         let generated_by = format!("memory {}", env!("CARGO_PKG_VERSION"));
-        Ok(t0::render(&t0::Inputs {
+        let text = t0::render(&t0::Inputs {
             domain: &domain,
             generated_by: &generated_by,
             handoffs: &handoffs,
@@ -446,7 +453,9 @@ impl Memory {
             total_active: total,
             due_for_review: due,
             tasks_waiting: waiting,
-        }))
+        });
+        self.reads.text("t0", &text);
+        Ok(text)
     }
 
     // ---- tasks ----

@@ -86,6 +86,20 @@ Max login (Anthropic prohibits third-party clients), Copilot with a key (it has 
 mode). A call the upstream refuses is recorded in `make usage` under its HTTP status, so
 an expired login or a wrong key shows up there rather than vanishing.
 
+## The savings, measured: `make savings`
+
+The paper's case is that reads dominate cost and that summaries-first retrieval, a T0
+under two thousand tokens and recovery from a handoff rather than a transcript cut what an
+agent ingests. `make savings` measures that on your own record rather than asserting it.
+Recovery: tokens of T0 and the latest handoff against the transcripts the sessions here
+left in their private homes, so the comparison is with what a replay of this machine's own
+sessions would cost. Retrieval: a page of ten BM25 hits in tokens against the bodies those
+hits stand for and against the whole corpus, and every entry searched by its own title to
+see whether known items land in the top three. The funnel:
+every read the memory server answered is logged with the tokens it served
+(`state/reads.jsonl`), shown per session beside what that session's model calls ingested
+according to the egress. `QUERY='...'` picks the retrieval query; `--json` gives the numbers.
+
 ## In the browser: `make web`
 
 `make web` serves a web terminal on 127.0.0.1:4200. The front page lists sessions and

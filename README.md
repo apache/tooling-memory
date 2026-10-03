@@ -52,6 +52,7 @@ memory task admit task-me-xxxxxxxx
 memory task claim-next
 memory export ../bundle --max-label internal
 memory reindex
+memory savings        # the paper's read-path claims, measured on this record
 ```
 
 `crates/memory/tests/cli.rs` runs the seven steps PLAN.md calls M0, end to end, against the
