@@ -61,3 +61,88 @@ impl Deputy for EgressDeputy {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use dm_egress::{Auth, Destination};
+    use dm_server::Memory;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// A fake chat-completions upstream through the egress, under the starter grants'
+    /// `openai` ceiling.
+    async fn egress_to(answer: serde_json::Value) -> (tempfile::TempDir, Egress) {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let answer = answer.clone();
+                async move { Json(answer) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(Memory::init(dir.path(), "human:test:me", "dom-me").unwrap());
+        let mut destinations = HashMap::new();
+        destinations.insert(
+            "openai".to_string(),
+            Destination::forward(
+                format!("http://{addr}"),
+                Auth::Inject {
+                    header: axum::http::header::AUTHORIZATION,
+                    value: "Bearer sk-test".into(),
+                },
+            ),
+        );
+        let egress = Egress::new(memory, destinations, &dir.path().join("t.db")).unwrap();
+        (dir, egress)
+    }
+
+    #[tokio::test]
+    async fn the_deputy_asks_through_the_egress_and_reads_the_answer() {
+        let (_dir, egress) = egress_to(serde_json::json!({
+            "model": "gpt-5-mini",
+            "choices": [{ "message": { "content": "{\"brief\": \"R retries.\"}" } }],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 4 }
+        }))
+        .await;
+        let deputy = EgressDeputy::new(egress.clone(), "openai", None);
+        assert_eq!(
+            deputy.model(),
+            "gpt-5-mini",
+            "the destination's small default"
+        );
+        let text = deputy.complete("how does R retry").await.unwrap();
+        assert!(text.contains("R retries"));
+        let rows = egress.telemetry().summary().unwrap();
+        assert_eq!(rows[0].destination, "openai", "the call was metered");
+        assert_eq!(rows[0].input_tokens, 12);
+        assert_eq!(
+            EgressDeputy::new(egress, "openai", Some("m-x")).model(),
+            "m-x"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_text_is_an_error_with_the_body_in_it() {
+        let (_dir, egress) = egress_to(serde_json::json!({ "error": "overloaded" })).await;
+        let deputy = EgressDeputy::new(egress, "openai", None);
+        let err = deputy.complete("anything").await.unwrap_err();
+        assert!(
+            err.contains("without text") && err.contains("overloaded"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_destination_the_egress_lacks_is_refused() {
+        let (_dir, egress) = egress_to(serde_json::json!({})).await;
+        let deputy = EgressDeputy::new(egress, "xai", None);
+        let err = deputy.complete("anything").await.unwrap_err();
+        assert!(err.contains("xai"), "{err}");
+    }
+}

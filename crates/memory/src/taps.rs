@@ -81,9 +81,21 @@ pub async fn run(
     let memory = Arc::new(memory);
     let config = config.unwrap_or("{}");
     loop {
-        let outcome =
-            dm_taps::run(memory.clone(), &path, &grant, credential.as_deref(), config).await?;
-        println!("{}", serde_json::to_string_pretty(&outcome)?);
+        let run = dm_taps::run(
+            memory.clone(),
+            &path,
+            &grant,
+            credential.as_deref(),
+            config,
+            dm_taps::Limits::default(),
+        )
+        .await;
+        match (run, every) {
+            (Ok(outcome), _) => println!("{}", serde_json::to_string_pretty(&outcome)?),
+            (Err(e), None) => return Err(e.into()),
+            // on a schedule, one failed pull is reported and the next one still comes
+            (Err(e), Some(_)) => eprintln!("memory: tap {name}: {e}"),
+        }
         let Some(secs) = every else {
             return Ok(());
         };

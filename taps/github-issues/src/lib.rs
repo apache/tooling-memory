@@ -1,6 +1,7 @@
 //! The GitHub issues tap: the open issues of one repository become proposed tasks on the
 //! owning domain's ledger, each citing its issue as origin, deduplicated on origin and
-//! the issue's last update. Pull requests are not issues and are skipped. The tap holds
+//! the issue's last update. Pull requests are not issues and are skipped; an item the
+//! tap cannot read costs only itself. Every page the API links to is read. The tap holds
 //! no credential: the host puts the bearer token on the request to the host the grant
 //! names, and the tap sees only the response.
 //!
@@ -17,6 +18,9 @@ use serde::Deserialize;
 use wasi::http::outgoing_handler;
 use wasi::http::types::{Fields, Method, OutgoingRequest, Scheme};
 use wasi::io::streams::StreamError;
+
+/// Pages read at most; GitHub serves a hundred issues a page.
+const MAX_PAGES: usize = 50;
 
 #[derive(Deserialize)]
 struct Config {
@@ -42,11 +46,11 @@ struct Issue {
     pull_request: Option<serde_json::Value>,
 }
 
-/// `scheme`, `authority` and `path` of a URL, enough for an API base.
+/// `scheme`, `authority` and `path?query` of a URL.
 fn split(url: &str) -> Result<(Scheme, String, String), String> {
     let (scheme, rest) = url
         .split_once("://")
-        .ok_or_else(|| format!("api {url:?} has no scheme"))?;
+        .ok_or_else(|| format!("{url:?} has no scheme"))?;
     let scheme = match scheme {
         "https" => Scheme::Https,
         "http" => Scheme::Http,
@@ -54,17 +58,24 @@ fn split(url: &str) -> Result<(Scheme, String, String), String> {
     };
     let (authority, path) = match rest.split_once('/') {
         Some((a, p)) => (a.to_string(), format!("/{p}")),
-        None => (rest.to_string(), String::new()),
+        None => (rest.to_string(), "/".to_string()),
     };
     if authority.is_empty() {
-        return Err(format!("api {url:?} has no host"));
+        return Err(format!("{url:?} has no host"));
     }
-    Ok((scheme, authority, path.trim_end_matches('/').to_string()))
+    Ok((scheme, authority, path))
 }
 
-/// GET a path under the API, the whole body back as text.
-fn get(api: &str, path: &str) -> Result<(u16, String), String> {
-    let (scheme, authority, base) = split(api)?;
+/// A response: status, headers and the whole body as text.
+struct Answer {
+    status: u16,
+    headers: Vec<(String, String)>,
+    text: String,
+}
+
+/// GET one URL.
+fn get(url: &str) -> Result<Answer, String> {
+    let (scheme, authority, path) = split(url)?;
     let headers = Fields::from_list(&[
         (
             "accept".to_string(),
@@ -78,8 +89,7 @@ fn get(api: &str, path: &str) -> Result<(u16, String), String> {
     req.set_scheme(Some(&scheme)).map_err(|()| "scheme")?;
     req.set_authority(Some(&authority))
         .map_err(|()| "authority")?;
-    req.set_path_with_query(Some(&format!("{base}{path}")))
-        .map_err(|()| "path")?;
+    req.set_path_with_query(Some(&path)).map_err(|()| "path")?;
     let pending = outgoing_handler::handle(req, None).map_err(|e| format!("request: {e}"))?;
     pending.subscribe().block();
     let response = pending
@@ -88,6 +98,17 @@ fn get(api: &str, path: &str) -> Result<(u16, String), String> {
         .map_err(|()| "response taken twice")?
         .map_err(|e| format!("response: {e}"))?;
     let status = response.status();
+    let headers = response
+        .headers()
+        .entries()
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k.to_ascii_lowercase(),
+                String::from_utf8_lossy(&v).into_owned(),
+            )
+        })
+        .collect();
     let body = response.consume().map_err(|()| "body")?;
     let stream = body.stream().map_err(|()| "stream")?;
     let mut bytes = Vec::new();
@@ -101,7 +122,28 @@ fn get(api: &str, path: &str) -> Result<(u16, String), String> {
         }
     }
     drop(stream);
-    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+    Ok(Answer {
+        status,
+        headers,
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+    })
+}
+
+/// The `rel="next"` URL of a `Link` header, if there is one.
+fn next_page(headers: &[(String, String)]) -> Option<String> {
+    let link = headers
+        .iter()
+        .find(|(k, _)| k == "link")
+        .map(|(_, v)| v.as_str())?;
+    link.split(',').find_map(|part| {
+        let (url, params) = part.trim().split_once(';')?;
+        params.contains("rel=\"next\"").then(|| {
+            url.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string()
+        })
+    })
 }
 
 struct Component;
@@ -109,57 +151,72 @@ struct Component;
 impl Guest for Component {
     fn run(config: String) -> Result<Report, String> {
         let config: Config = serde_json::from_str(&config).map_err(|e| format!("config: {e}"))?;
-        if config.repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
+        if config.repo.split('/').filter(|s| !s.is_empty()).count() != 2
+            || config.repo.contains("..")
+        {
             return Err(format!("repo {:?} is not owner/name", config.repo));
         }
-        let (status, text) = get(
-            &config.api,
-            &format!("/repos/{}/issues?state=open&per_page=100", config.repo),
-        )?;
-        if status != 200 {
-            return Err(format!(
-                "{} answered {status}: {}",
-                config.api,
-                text.chars().take(200).collect::<String>()
-            ));
-        }
-        let issues: Vec<Issue> = serde_json::from_str(&text).map_err(|e| format!("issues: {e}"))?;
+        let mut url = Some(format!(
+            "{}/repos/{}/issues?state=open&per_page=100",
+            config.api.trim_end_matches('/'),
+            config.repo
+        ));
         let mut report = Report {
             filed: 0,
             deduplicated: 0,
             proposed: 0,
             note: String::new(),
         };
-        let mut skipped = 0u32;
-        for issue in issues {
-            if issue.pull_request.is_some() {
-                skipped += 1;
-                continue;
+        let (mut pages, mut skipped, mut unreadable) = (0usize, 0u32, 0u32);
+        while let Some(page) = url.take() {
+            if pages == MAX_PAGES {
+                break;
             }
-            let body = format!(
-                "{}\n\n{}\n",
-                issue.html_url,
-                issue.body.as_deref().unwrap_or("").trim()
-            );
-            let filed = file_task(&Task {
-                title: format!("#{}: {}", issue.number, issue.title),
-                body,
-                origin: format!("github:{}#{}", config.repo, issue.number),
-                upstream_event: format!("{}:{}", issue.state, issue.updated_at),
-                requirements: vec![],
-                priority: 0,
-            })?;
-            if filed.deduplicated {
-                report.deduplicated += 1;
-            } else {
-                report.filed += 1;
+            let answer = get(&page)?;
+            pages += 1;
+            if answer.status != 200 {
+                return Err(format!(
+                    "{page} answered {}: {}",
+                    answer.status,
+                    answer.text.chars().take(200).collect::<String>()
+                ));
             }
+            let items: Vec<serde_json::Value> =
+                serde_json::from_str(&answer.text).map_err(|e| format!("issues: {e}"))?;
+            for item in items {
+                let Ok(issue) = serde_json::from_value::<Issue>(item) else {
+                    unreadable += 1;
+                    continue;
+                };
+                if issue.pull_request.is_some() {
+                    skipped += 1;
+                    continue;
+                }
+                let body = format!(
+                    "{}\n\n{}\n",
+                    issue.html_url,
+                    issue.body.as_deref().unwrap_or("").trim()
+                );
+                let filed = file_task(&Task {
+                    title: format!("#{}: {}", issue.number, issue.title),
+                    body,
+                    origin: format!("github:{}#{}", config.repo, issue.number),
+                    upstream_event: format!("{}:{}", issue.state, issue.updated_at),
+                    requirements: vec![],
+                    priority: 0,
+                })?;
+                if filed.deduplicated {
+                    report.deduplicated += 1;
+                } else {
+                    report.filed += 1;
+                }
+            }
+            url = next_page(&answer.headers);
         }
         report.note = format!(
-            "{}: {} open issues read, {} pull requests skipped",
+            "{}: {} open issues read over {pages} pages, {skipped} pull requests skipped, {unreadable} items unreadable",
             config.repo,
-            report.filed + report.deduplicated,
-            skipped
+            report.filed + report.deduplicated
         );
         Ok(report)
     }

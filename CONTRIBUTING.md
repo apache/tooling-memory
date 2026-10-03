@@ -2,8 +2,10 @@
 
 ## Prerequisites
 
-- Rust stable, via [rustup](https://rustup.rs). `rustup target add wasm32-unknown-unknown
-  wasm32-wasip2` for the browser and plugin targets; not needed for the native build.
+- Rust stable, via [rustup](https://rustup.rs), with two more targets:
+  `rustup target add wasm32-unknown-unknown wasm32-wasip2`. The first is the browser
+  reader's; the second builds the taps, which `make check` lints and the tap host's tests
+  build, so the gate needs it.
 - A C toolchain for the bundled SQLite (`build-essential` on Debian and Ubuntu, the Visual
   Studio Build Tools on Windows).
 - `make`. On Windows, run the targets from Git Bash or WSL.

@@ -24,14 +24,7 @@ use wasmtime_wasi_http::{
 };
 
 #[allow(missing_docs)] // generated from wit/tap.wit, which carries the documentation
-mod bindings {
-    wasmtime::component::bindgen!({
-        path: "wit",
-        world: "tap",
-        imports: { default: async | trappable },
-        exports: { default: async },
-    });
-}
+mod bindings;
 
 use bindings::durable_memory::tap::memory::{Filed, Host, Proposal, Task};
 use bindings::Tap;
@@ -69,7 +62,8 @@ struct Hooks {
     refused: Vec<String>,
 }
 
-/// Whether an authority (`host` or `host:port`) is one the grant names.
+/// Whether an authority (`host` or `host:port`) is one the grant names. A grant entry
+/// with a port is that port only; one without is any port on that host.
 #[must_use]
 pub fn host_allowed(hosts: &[String], authority: &str) -> bool {
     let a = authority.to_ascii_lowercase();
@@ -77,6 +71,42 @@ pub fn host_allowed(hosts: &[String], authority: &str) -> bool {
         let h = h.trim().to_ascii_lowercase();
         !h.is_empty() && (a == h || a.rsplit_once(':').is_some_and(|(host, _)| host == h))
     })
+}
+
+/// The host part of an authority, without a port; a bracketed IPv6 literal keeps its
+/// brackets.
+fn host_of(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        return authority
+            .split(']')
+            .next()
+            .map_or(authority, |h| &authority[..=h.len()]);
+    }
+    authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+}
+
+/// Whether a host is this machine, where plaintext never leaves the kernel.
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]") || host.starts_with("127.")
+}
+
+/// The one rule for an outbound call: a host the grant names, and TLS unless the host
+/// is loopback, since the credential rides on the request. Why not, in words, when not.
+///
+/// # Errors
+///
+/// The reason the call is refused.
+pub fn allowed(hosts: &[String], scheme: Option<&str>, authority: &str) -> Result<(), String> {
+    if !host_allowed(hosts, authority) {
+        return Err(format!("the grant does not allow {authority}"));
+    }
+    let scheme = scheme.unwrap_or("https");
+    if scheme != "https" && !is_loopback(host_of(authority)) {
+        return Err(format!(
+            "{scheme} to {authority} would send the credential in the clear; https only"
+        ));
+    }
+    Ok(())
 }
 
 type HttpError = wasmtime_wasi_http::Error;
@@ -100,9 +130,9 @@ impl WasiHttpHooks for Hooks {
             .authority()
             .map(|a| a.as_str().to_string())
             .unwrap_or_default();
-        if !host_allowed(&self.hosts, &authority) {
-            self.refused
-                .push(format!("the grant does not allow {authority}"));
+        let scheme = request.uri().scheme_str();
+        if let Err(why) = allowed(&self.hosts, scheme, &authority) {
+            self.refused.push(why);
             return Box::new(async { Err(HttpError::HttpRequestDenied) });
         }
         let label = self.memory.label();
@@ -137,6 +167,7 @@ struct State {
     hooks: Hooks,
     memory: Arc<Memory>,
     domain: String,
+    limits: wasmtime::StoreLimits,
 }
 
 impl WasiView for State {
@@ -169,7 +200,13 @@ impl Host for State {
             origin: Some(t.origin),
             upstream_event: Some(t.upstream_event),
             created_by: String::new(),
-            classification: dm_core::Label::Public,
+            // upstream content is as sensitive as the domain says, never less
+            classification: self
+                .memory
+                .grants()
+                .domains
+                .get(&self.domain)
+                .map_or(dm_core::Label::Public, |d| d.default_classification),
             priority: t.priority,
         };
         Ok(match self.memory.create_task(spec).await {
@@ -202,7 +239,7 @@ impl Host for State {
     }
 }
 
-/// What one run did, as the tap reported it.
+/// What one run did, as the tap reported it, and what the host refused on the way.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Outcome {
     /// Tasks filed anew.
@@ -213,13 +250,40 @@ pub struct Outcome {
     pub proposed: u32,
     /// The tap's one-line note to the owner.
     pub note: String,
+    /// Outbound calls the host refused, in words, whether or not the tap went on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<String>,
+}
+
+/// What a run may spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Wall clock for the whole run, waits on the network included.
+    pub wall: std::time::Duration,
+    /// Linear memory the component may grow to, in bytes.
+    pub memory: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            wall: std::time::Duration::from_secs(120),
+            memory: 256 << 20,
+        }
+    }
 }
 
 fn engine() -> wasmtime::Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
+    // the epoch is what lets a busy guest be interrupted: a timer ticks it, the store
+    // yields to the executor on every tick, and the wall clock can then end the run
+    config.epoch_interruption(true);
     Engine::new(&config)
 }
+
+/// How often the epoch ticks while a tap runs.
+const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Run a tap once. `memory` is opened by the caller under the tap's author;
 /// `credential` is the value of the variable the grant names, if it was set.
@@ -234,6 +298,7 @@ pub async fn run(
     grant: &TapGrant,
     credential: Option<&str>,
     config: &str,
+    limits: Limits,
 ) -> Result<Outcome, Error> {
     let engine = engine()?;
     let component = Component::from_file(&engine, component)
@@ -260,20 +325,49 @@ pub async fn run(
         },
         domain: grant.domain.clone(),
         memory,
+        limits: wasmtime::StoreLimitsBuilder::new()
+            .memory_size(limits.memory)
+            .build(),
     };
     let mut store = Store::new(&engine, state);
-    let tap = Tap::instantiate_async(&mut store, &component, &linker).await?;
-    let result = tap.call_run(&mut store, config).await?;
-    let refused = store.data().hooks.refused.join("; ");
+    store.limiter(|s| &mut s.limits);
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_async_yield_and_update(1);
+    let ticker = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(EPOCH_TICK).await;
+                engine.increment_epoch();
+            }
+        })
+    };
+    let outcome = tokio::time::timeout(limits.wall, async {
+        let tap = Tap::instantiate_async(&mut store, &component, &linker).await?;
+        tap.call_run(&mut store, config).await
+    })
+    .await;
+    ticker.abort();
+    let result = match outcome {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(Error::Runtime(format!(
+                "the run exceeded its wall clock of {:?}",
+                limits.wall
+            )))
+        }
+    };
+    let refused = std::mem::take(&mut store.data_mut().hooks.refused);
     match result {
         Ok(r) => Ok(Outcome {
             filed: r.filed,
             deduplicated: r.deduplicated,
             proposed: r.proposed,
             note: r.note,
+            refused,
         }),
         Err(e) if refused.is_empty() => Err(Error::Tap(e)),
-        Err(e) => Err(Error::Refused(refused, e)),
+        Err(e) => Err(Error::Refused(refused.join("; "), e)),
     }
 }
 
@@ -292,5 +386,34 @@ mod tests {
         assert!(!host_allowed(&hosts, "github.com"));
         assert!(!host_allowed(&[], "api.github.com"));
         assert!(!host_allowed(&[String::new()], ""));
+    }
+
+    #[test]
+    fn plaintext_is_for_loopback_only_and_a_granted_port_is_that_port() {
+        let gh = vec!["api.github.com".to_string()];
+        assert!(allowed(&gh, Some("https"), "api.github.com").is_ok());
+        assert!(
+            allowed(&gh, None, "api.github.com").is_ok(),
+            "no scheme defaults to https"
+        );
+        let err = allowed(&gh, Some("http"), "api.github.com").unwrap_err();
+        assert!(err.contains("https only"), "{err}");
+        assert!(allowed(&gh, Some("http"), "api.github.com:8080").is_err());
+        let local = vec![
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "[::1]".to_string(),
+        ];
+        assert!(allowed(&local, Some("http"), "127.0.0.1:4321").is_ok());
+        assert!(allowed(&local, Some("http"), "localhost:80").is_ok());
+        assert!(allowed(&local, Some("http"), "[::1]:8080").is_ok());
+        let pinned = vec!["127.0.0.1:4321".to_string()];
+        assert!(allowed(&pinned, Some("http"), "127.0.0.1:4321").is_ok());
+        assert!(allowed(&pinned, Some("http"), "127.0.0.1:4322")
+            .unwrap_err()
+            .contains("does not allow"));
+        assert_eq!(host_of("[::1]:8080"), "[::1]");
+        assert_eq!(host_of("a.b:1"), "a.b");
+        assert_eq!(host_of("a.b"), "a.b");
     }
 }
