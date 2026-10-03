@@ -674,12 +674,12 @@ impl Memory {
                 self.grants.handling
             )));
         }
-        let f = self.grants.read_filter();
-        let ix = self.index.lock().await;
+        let scope = bundle::export_scope(&self.grants.read_filter(), &domain, max_label)?;
+        // the index is read and released before the record is, so the future is Send
+        let hits = self.index.lock().await.list(&scope, None, usize::MAX / 2)?;
         Ok(bundle::export(
             &self.store,
-            &ix,
-            &f,
+            hits,
             &domain,
             max_label,
             &self.grants.owner,

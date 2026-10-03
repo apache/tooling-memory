@@ -826,6 +826,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-reader"
+version = "0.1.0"
+dependencies = [
+ "dm-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "time",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "dm-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -895,6 +907,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "dm-core",
  "dm-server",
  "futures-util",
  "portable-pty",

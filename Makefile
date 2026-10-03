@@ -8,7 +8,7 @@ NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
 .PHONY: init check verify fmt fmt-check clippy test guard-test deny machete coverage wasm-check run build \
-	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build wasip2-target
+	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
 # Reads local/.env. See local/README.md.
@@ -158,10 +158,21 @@ coverage:
 	cargo llvm-cov --workspace --ignore-filename-regex $(COVERAGE_IGNORE) --fail-under-lines $(COVERAGE_MIN) --lcov --output-path target/lcov.info
 	cargo llvm-cov report --ignore-filename-regex $(COVERAGE_IGNORE) --summary-only
 
+# The browser reader's core: dm-reader built for the browser and bound to JavaScript with
+# wasm-bindgen, into crates/web/static/reader/, which is committed so the web crate embeds
+# it without the tool. Rerun after a change to crates/reader or crates/core.
+reader:
+	@command -v wasm-bindgen >/dev/null 2>&1 || \
+		{ echo "needs wasm-bindgen-cli: cargo install wasm-bindgen-cli --version 0.2.129" >&2; exit 1; }
+	cargo build -p dm-reader --target wasm32-unknown-unknown --release
+	wasm-bindgen --target web --no-typescript --out-dir crates/web/static/reader \
+		target/wasm32-unknown-unknown/release/dm_reader.wasm
+
 # The core crate must build for the browser target, or the reader and the plugins cannot.
 wasm-check:
 	cargo check -p dm-core --target wasm32-unknown-unknown
 	cargo check -p dm-policy --target wasm32-unknown-unknown
+	cargo check -p dm-reader --target wasm32-unknown-unknown
 
 # The taps are a workspace of their own, built as wasm32-wasip2 components. The host's
 # tests build them; the gate also formats and lints them.

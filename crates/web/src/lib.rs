@@ -462,6 +462,84 @@ async fn entry(State(app): State<App>, Path(id): Path<String>) -> Response {
     }
 }
 
+/// The browser reader.
+async fn reader() -> Html<&'static str> {
+    Html(pages::READER)
+}
+
+/// The reader's wasm and glue, immutable like the vendored libraries.
+async fn reader_asset(Path(name): Path<String>) -> Response {
+    match pages::reader_asset(&name) {
+        Some((content_type, bytes)) => (
+            [
+                (axum::http::header::CONTENT_TYPE, content_type),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable",
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no such asset").into_response(),
+    }
+}
+
+/// The domains the record grants, for the reader's picker.
+async fn domains(State(app): State<App>) -> Json<Vec<String>> {
+    Json(app.memory.domains())
+}
+
+/// Where a domain's bundle at a label is exported for the reader.
+fn bundle_dir(root: &std::path::Path, domain: &str, label: dm_core::Label) -> PathBuf {
+    root.join("state/bundles").join(format!("{domain}-{label}"))
+}
+
+/// A file of a domain's bundle. Asking for the manifest exports the domain afresh at
+/// that label, under the owner's filter and the label bound export always applies; the
+/// entries are then served from that export. A file name is a plain name or nothing.
+async fn bundle_file(
+    State(app): State<App>,
+    Path((domain, label, file)): Path<(String, String, String)>,
+) -> Response {
+    let Ok(label) = label.parse::<dm_core::Label>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "label is public, internal or restricted",
+        )
+            .into_response();
+    };
+    if file.is_empty() || file.contains(['/', '\\']) || file.starts_with('.') {
+        return (StatusCode::NOT_FOUND, "no such file").into_response();
+    }
+    let dir = bundle_dir(&app.config.root, &domain, label);
+    if file == "manifest.yaml" {
+        if let Err(e) = app.memory.export(Some(&domain), label, &dir).await {
+            return (StatusCode::FORBIDDEN, e.to_string()).into_response();
+        }
+    }
+    let content_type = if file.ends_with(".yaml") {
+        "application/yaml"
+    } else {
+        "text/markdown; charset=utf-8"
+    };
+    match tokio::fs::read(dir.join(&file)).await {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, content_type),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            "no such file; load manifest.yaml first",
+        )
+            .into_response(),
+    }
+}
+
 /// The router, for serving or for tests.
 ///
 /// # Errors
@@ -483,6 +561,10 @@ pub fn router(config: Config) -> Result<Router, Error> {
         .route("/api/sessions/{id}", get(session_info).delete(kill_session))
         .route("/api/entries", get(entries))
         .route("/api/entry/{id}", get(entry))
+        .route("/api/domains", get(domains))
+        .route("/reader", get(reader))
+        .route("/reader/{name}", get(reader_asset))
+        .route("/bundle/{domain}/{label}/{file}", get(bundle_file))
         .with_state(app))
 }
 
@@ -822,5 +904,73 @@ mod tests {
         assert!(e["body"].as_str().unwrap().contains("mermaid"));
         let (missing, _) = http(addr, "GET", "/api/entry/mem-me-nothere", None).await;
         assert_eq!(missing, 404);
+    }
+
+    #[tokio::test]
+    async fn the_reader_its_assets_and_a_bundle_are_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let m = Memory::open(&dir.path().join("memory")).unwrap();
+        let w = m
+            .write(dm_server::WriteRequest {
+                title: Some("Retry policy".into()),
+                body: "Operation R retries with backoff.\n".into(),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let (status, page) = http(addr, "GET", "/reader", None).await;
+        assert_eq!(status, 200);
+        assert!(page.contains("memory reader") && page.contains("reader/dm_reader.js"));
+        let (status, glue) = http(addr, "GET", "/reader/dm_reader.js", None).await;
+        assert_eq!(status, 200);
+        assert!(glue.contains("parse_entry"));
+        let (status, _) = http(addr, "GET", "/reader/dm_reader_bg.wasm", None).await;
+        assert_eq!(status, 200);
+        let (status, _) = http(addr, "GET", "/reader/other.js", None).await;
+        assert_eq!(status, 404);
+        for v in ["sqlite3.mjs", "sqlite3.wasm"] {
+            let (status, _) = http(addr, "GET", &format!("/vendor/{v}"), None).await;
+            assert_eq!(status, 200, "{v}");
+        }
+        let (status, domains) = get_json(addr, "/api/domains").await;
+        assert_eq!((status, domains), (200, serde_json::json!(["dom-me"])));
+
+        let (status, manifest) =
+            http(addr, "GET", "/bundle/dom-me/internal/manifest.yaml", None).await;
+        assert_eq!(status, 200, "{manifest}");
+        assert!(manifest.contains("durable-memory/bundle/0") && manifest.contains(&w.id));
+        let (status, text) = http(
+            addr,
+            "GET",
+            &format!("/bundle/dom-me/internal/{}.md", w.id),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            text.starts_with("---\n") && text.contains("backoff"),
+            "{text}"
+        );
+        let (status, public) = http(addr, "GET", "/bundle/dom-me/public/manifest.yaml", None).await;
+        assert_eq!(status, 200);
+        assert!(
+            !public.contains(&w.id),
+            "an internal entry stays out of a public bundle"
+        );
+        let (status, _) = http(addr, "GET", "/bundle/dom-me/secret/manifest.yaml", None).await;
+        assert_eq!(status, 400);
+        let (status, _) = http(
+            addr,
+            "GET",
+            "/bundle/dom-me/internal/..%2Fgrants.toml",
+            None,
+        )
+        .await;
+        assert_eq!(status, 404, "a path is not a file name");
+        let (status, _) = http(addr, "GET", "/bundle/dom-me/internal/.hidden", None).await;
+        assert_eq!(status, 404);
+        let (status, _) = http(addr, "GET", "/bundle/dom-else/internal/manifest.yaml", None).await;
+        assert_eq!(status, 403, "a domain the owner does not hold");
     }
 }

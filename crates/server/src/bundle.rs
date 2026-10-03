@@ -12,7 +12,7 @@
 
 use dm_core::manifest::{Manifest, ManifestEntry};
 use dm_core::{digest, Entry, Label, ReadFilter, TrustTier};
-use dm_index::Index;
+use dm_index::{Hit, Index};
 use dm_store::Store;
 use std::path::Path;
 
@@ -64,21 +64,18 @@ pub struct Imported {
     pub skipped: Vec<String>,
 }
 
-/// Export every entry in `domain` that `filter` admits at or below `max_label`, including
-/// tombstones, into `dest`. Fails before writing if the filter does not cover the domain.
+/// What an export reads: `filter` narrowed to `domain`, bounded at `max_label`, with
+/// tombstones and every tier, since a bundle carries the domain whole. Fails if the
+/// filter does not cover the domain.
 ///
 /// # Errors
 ///
-/// A store, index, or I/O error, or a domain the filter does not admit.
-pub async fn export(
-    store: &Store,
-    index: &Index,
+/// [`Error::Invalid`] for a domain the filter does not admit.
+pub fn export_scope(
     filter: &ReadFilter,
     domain: &str,
     max_label: Label,
-    exported_by: &str,
-    dest: &Path,
-) -> Result<Exported, Error> {
+) -> Result<ReadFilter, Error> {
     if !filter.domains.is_empty() && !filter.domains.iter().any(|d| d == domain) {
         return Err(Error::Invalid(format!(
             "domain {domain} is not readable here"
@@ -89,10 +86,27 @@ pub async fn export(
     scoped.handling = scoped.handling.min(max_label);
     scoped.include_inactive = true;
     scoped.min_tier = TrustTier::Raw;
+    Ok(scoped)
+}
 
+/// Export `hits`, the entries [`export_scope`] listed for `domain`, into `dest`. The
+/// index is consulted before this is called and never held across the record reads,
+/// so the export can run on any executor thread.
+///
+/// # Errors
+///
+/// A store or I/O error.
+pub async fn export(
+    store: &Store,
+    hits: Vec<Hit>,
+    domain: &str,
+    max_label: Label,
+    exported_by: &str,
+    dest: &Path,
+) -> Result<Exported, Error> {
     std::fs::create_dir_all(dest).map_err(io(dest))?;
     let mut manifest = Manifest::new(domain, exported_by, max_label);
-    for hit in index.list(&scoped, None, usize::MAX / 2)? {
+    for hit in hits {
         let Some(text) = store.get_text(domain, &hit.id).await? else {
             continue;
         };

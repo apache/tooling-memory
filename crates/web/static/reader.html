@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory reader</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; --muted: #6b6b6b; --line: #ddd; --accent: #0a62c9; --pane: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #16181d; --muted: #9a9a9a; --line: #333; --accent: #6fb2ff; --pane: #1d2027; } }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  header { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0 12px 0 0; }
+  input, select, button { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--fg); }
+  input[type=search] { flex: 1 1 240px; min-width: 160px; }
+  button { background: var(--accent); color: white; border: 0; cursor: pointer; }
+  main { display: grid; grid-template-columns: minmax(280px, 2fr) 3fr; height: calc(100vh - 57px); }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; height: auto; } #entry { border-left: 0; border-top: 1px solid var(--line); } }
+  #hits { overflow: auto; margin: 0; padding: 0; list-style: none; }
+  #hits li { padding: 10px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  #hits li:hover, #hits li.open { background: var(--pane); }
+  #hits .t { font-weight: 600; }
+  #hits .s { color: var(--muted); font-size: 13px; }
+  .chip { display: inline-block; font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; margin-right: 4px; vertical-align: middle; }
+  #entry { overflow: auto; padding: 16px 24px; border-left: 1px solid var(--line); background: var(--pane); }
+  #entry pre { overflow: auto; padding: 8px; background: var(--bg); border-radius: 6px; }
+  #entry .meta { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+  .status { color: var(--muted); font-size: 13px; padding: 10px 16px; }
+  .status.bad { color: #c0392b; }
+</style>
+</head>
+<body>
+<header>
+  <h1>memory reader</h1>
+  <input id="bundle" type="url" placeholder="bundle URL, the directory with manifest.yaml" size="36">
+  <button id="load" type="button">Load</button>
+  <label style="font-size:13px;color:var(--muted)">or pick a folder <input id="folder" type="file" webkitdirectory multiple style="font-size:12px"></label>
+  <select id="handling" title="the highest classification to show">
+    <option value="2">restricted</option><option value="1">internal</option><option value="0">public</option>
+  </select>
+  <input id="q" type="search" placeholder="search, summaries first" autocomplete="off">
+  <span id="domains"></span>
+</header>
+<main>
+  <div>
+    <div id="status" class="status">no bundle loaded</div>
+    <ul id="hits"></ul>
+  </div>
+  <article id="entry"><p class="status">open a hit to read it</p></article>
+</main>
+<script src="vendor/marked.min.js"></script>
+<script type="module">
+import initReader, { parse_entry, parse_manifest, digest } from './reader/dm_reader.js';
+import sqlite3InitModule from './vendor/sqlite3.mjs';
+
+const $ = (id) => document.getElementById(id);
+const status = (text, bad = false) => { const s = $('status'); s.textContent = text; s.className = 'status' + (bad ? ' bad' : ''); };
+
+// The same index the server keeps: FTS5 over title, summary and body, porter unicode61,
+// bm25 weighted 10, 5, 1, phrases ANDed and any-word as the fallback for a question.
+let db = null;
+let entries = new Map();
+let manifest = null;
+
+async function boot() {
+  await initReader();
+  const sqlite3 = await sqlite3InitModule();
+  db = new sqlite3.oo1.DB(':memory:');
+  db.exec(`CREATE TABLE entries (id TEXT PRIMARY KEY, domain TEXT, type TEXT, tier TEXT, label_rank INTEGER, status TEXT, title TEXT, summary TEXT, created TEXT);
+           CREATE VIRTUAL TABLE entries_fts USING fts5(id UNINDEXED, title, summary, body, tokenize = 'porter unicode61');`);
+  const params = new URLSearchParams(location.search);
+  if (params.get('bundle')) { $('bundle').value = params.get('bundle'); await loadUrl(params.get('bundle')); }
+  if (params.get('q')) { $('q').value = params.get('q'); search(); }
+  // served by `memory web`, the record's own domains are one click away; a static copy
+  // has no such endpoint and shows nothing here
+  try {
+    const r = await fetch('api/domains');
+    if (r.ok) {
+      const labels = ['public', 'internal', 'restricted'];
+      for (const d of await r.json()) {
+        const b = document.createElement('button'); b.type = 'button'; b.textContent = d;
+        b.title = `export ${d} at the chosen label and read it here`;
+        b.addEventListener('click', () => { const url = `bundle/${d}/${labels[Number($('handling').value)]}`; $('bundle').value = url; loadUrl(url); });
+        $('domains').append(b, ' ');
+      }
+    }
+  } catch (_) { /* a static copy */ }
+}
+
+function reset() {
+  db.exec('DELETE FROM entries; DELETE FROM entries_fts;');
+  entries = new Map();
+  $('hits').replaceChildren();
+}
+
+function admit(text, name, expected) {
+  // the manifest's digest is the bundle's word for what the entry is; a mismatch is
+  // refused before it is indexed, as import refuses it before it is written
+  if (expected && digest(text) !== expected) return { error: `${name}: digest does not match the manifest` };
+  const parsed = JSON.parse(parse_entry(text));
+  if (parsed.error) return { error: `${name}: ${parsed.error}` };
+  entries.set(parsed.id, parsed);
+  db.exec({ sql: 'INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?)',
+    bind: [parsed.id, parsed.domain, parsed.type, parsed.trust_tier, parsed.label_rank, parsed.status, parsed.title, parsed.summary, parsed.created] });
+  db.exec({ sql: 'INSERT INTO entries_fts (id, title, summary, body) VALUES (?,?,?,?)', bind: [parsed.id, parsed.title, parsed.summary, parsed.body] });
+  return parsed;
+}
+
+async function loadUrl(base) {
+  reset();
+  base = base.replace(/\/+$/, '');
+  status(`loading ${base}…`);
+  try {
+    const m = JSON.parse(parse_manifest(await (await fetch(`${base}/manifest.yaml`)).text()));
+    if (m.error) throw new Error(m.error);
+    manifest = m;
+    let refused = 0;
+    for (const e of m.entries) {
+      if (/^[^/\\]+$/.test(e.path) === false) { refused++; continue; } // a manifest path is a plain file name
+      const text = await (await fetch(`${base}/${encodeURIComponent(e.path)}`)).text();
+      const r = admit(text, e.path, e.digest);
+      if (r.error) { refused++; console.warn(r.error); }
+    }
+    done(m, refused);
+  } catch (err) { status(`could not load: ${err.message}`, true); }
+}
+
+async function loadFolder(files) {
+  reset();
+  const byName = new Map([...files].map((f) => [f.name, f]));
+  const mf = byName.get('manifest.yaml');
+  if (!mf) { status('that folder has no manifest.yaml', true); return; }
+  const m = JSON.parse(parse_manifest(await mf.text()));
+  if (m.error) { status(m.error, true); return; }
+  manifest = m;
+  let refused = 0;
+  for (const e of m.entries) {
+    const f = byName.get(e.path);
+    if (!f) { refused++; continue; }
+    const r = admit(await f.text(), e.path, e.digest);
+    if (r.error) { refused++; console.warn(r.error); }
+  }
+  done(m, refused);
+}
+
+function done(m, refused) {
+  const note = refused ? `, ${refused} refused (digest or path)` : '';
+  status(`${m.domain}: ${entries.size} entries, highest label ${m.highest_label}, exported ${m.exported_at.slice(0, 10)} by ${m.exported_by}${note}`);
+  search();
+}
+
+const quote = (w) => `"${w.replace(/"/g, '""')}"`;
+function ftsQuery(text, anyWord) {
+  const words = text.split(/\s+/).filter(Boolean).map(quote);
+  return words.length ? words.join(anyWord ? ' OR ' : ' ') : null;
+}
+
+function run(match, handling, limit) {
+  const rows = [];
+  db.exec({
+    sql: `SELECT e.id, e.type, e.tier, e.label_rank, e.title, e.summary, bm25(entries_fts, 0.0, 10.0, 5.0, 1.0) AS score
+          FROM entries_fts f JOIN entries e ON e.id = f.id
+          WHERE entries_fts MATCH ? AND e.label_rank <= ? AND e.status IS NULL
+          ORDER BY score, e.created DESC LIMIT ?`,
+    bind: [match, handling, limit], rowMode: 'object', callback: (r) => rows.push(r) });
+  return rows;
+}
+
+function list(handling, limit) {
+  const rows = [];
+  db.exec({ sql: `SELECT id, type, tier, label_rank, title, summary FROM entries WHERE label_rank <= ? AND status IS NULL ORDER BY created DESC LIMIT ?`,
+    bind: [handling, limit], rowMode: 'object', callback: (r) => rows.push(r) });
+  return rows;
+}
+
+function search() {
+  if (!db) return;
+  const handling = Number($('handling').value);
+  const text = $('q').value.trim();
+  let rows;
+  if (!text) rows = list(handling, 50);
+  else {
+    const all = ftsQuery(text, false);
+    rows = all ? run(all, handling, 25) : [];
+    if (rows.length === 0 && text.split(/\s+/).length > 1) rows = run(ftsQuery(text, true), handling, 25);
+  }
+  const labels = ['public', 'internal', 'restricted'];
+  $('hits').replaceChildren(...rows.map((r) => {
+    const li = document.createElement('li');
+    li.dataset.id = r.id;
+    li.innerHTML = `<div class="t"></div><div class="s"></div><div><span class="chip"></span><span class="chip"></span><span class="chip"></span></div>`;
+    li.querySelector('.t').textContent = r.title;
+    li.querySelector('.s').textContent = r.summary;
+    const chips = li.querySelectorAll('.chip');
+    chips[0].textContent = r.type; chips[1].textContent = r.tier; chips[2].textContent = labels[r.label_rank];
+    li.addEventListener('click', () => open(r.id));
+    return li;
+  }));
+  if (rows.length === 0 && entries.size) {
+    const li = document.createElement('li'); li.className = 'status'; li.textContent = 'nothing matches'; $('hits').append(li);
+  }
+}
+
+function open(id) {
+  const e = entries.get(id);
+  if (!e) return;
+  for (const li of $('hits').children) li.classList.toggle('open', li.dataset.id === id);
+  const art = $('entry');
+  art.replaceChildren();
+  const meta = document.createElement('div'); meta.className = 'meta';
+  meta.textContent = `${e.id} · ${e.type} · ${e.trust_tier} · ${e.classification} · ${e.author} · ${e.created.slice(0, 10)}` + (e.supersedes ? ` · supersedes ${e.supersedes}` : '');
+  const h = document.createElement('h2'); h.textContent = e.title;
+  const body = document.createElement('div');
+  body.innerHTML = marked.parse(e.body);
+  // a link to another entry opens it here
+  for (const a of body.querySelectorAll('a')) {
+    const m = /^(mem-[a-z0-9-]+)$/.exec(a.getAttribute('href') || '');
+    if (m) a.addEventListener('click', (ev) => { ev.preventDefault(); open(m[1]); });
+  }
+  art.append(h, meta, body);
+  if (e.source && e.source.length) {
+    const src = document.createElement('p'); src.className = 'meta'; src.textContent = `source: ${e.source.join(', ')}`; art.append(src);
+  }
+}
+
+$('load').addEventListener('click', () => loadUrl($('bundle').value.trim()));
+$('bundle').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') loadUrl($('bundle').value.trim()); });
+$('folder').addEventListener('change', (ev) => loadFolder(ev.target.files));
+$('q').addEventListener('input', search);
+$('handling').addEventListener('change', search);
+boot().catch((err) => status(`the reader could not start: ${err.message}`, true));
+</script>
+</body>
+</html>
