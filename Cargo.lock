@@ -1410,6 +1410,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "toml",
 ]
 
 [[package]]

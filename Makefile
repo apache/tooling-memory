@@ -8,7 +8,7 @@ NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
 .PHONY: init check verify fmt fmt-check clippy test guard-test deny machete coverage wasm-check run build \
-	local-up local-down local-logs local-key local-memory launch usage
+	local-up local-down local-logs local-key local-memory launch usage golden
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
 # Reads local/.env. See local/README.md.
@@ -92,6 +92,15 @@ demo: build
 # The paper's read-path claims measured on this record.
 savings: build
 	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" savings $(if $(QUERY),--query '$(QUERY)',)
+
+# A golden suite scored against a record: SUITE (default golden/docs.toml, which fits the
+# demo corpus) on ROOT (default DEMO_ROOT). PROVIDER adds the deputy's brief to the score.
+SUITE ?= golden/docs.toml
+GOLDEN_AUTH ?= key
+golden: build
+	@set -a; [ -f $(LOCAL_ENV) ] && . ./$(LOCAL_ENV); set +a; \
+	LLMAO_KEY="$${LLMAO_KEY:-$$(cat local/.virtual-key 2>/dev/null)}" \
+	target/release/memory --root "$${ROOT:-$(DEMO_ROOT)}" golden $(SUITE) $(if $(PROVIDER),--provider $(PROVIDER) --auth $(GOLDEN_AUTH),)
 
 usage:
 	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" usage

@@ -130,6 +130,10 @@ fn step_search_and_get(d: &Demo) {
     assert!(body.starts_with("---\nid: "), "{body}");
     assert!(body.contains("Next: digests."));
     assert!(fails(&d.root, &["get", "mem-me-nope"]).contains("not found"));
+}
+
+/// 4b. recall with no model behind it, and a golden suite scored against the record.
+fn step_recall_and_golden(d: &Demo) {
     // recall with no model behind it: the pack comes back with synthesis owed
     let r = json(&ok(
         &d.root,
@@ -152,6 +156,26 @@ fn step_search_and_get(d: &Demo) {
     // the savings report runs from the CLI and counts that recall
     let savings = ok(&d.root, &["savings", "--query", "digests"], None);
     assert!(savings.contains("owed packs             1"), "{savings}");
+    // a golden suite scores the question against the record with no model behind it
+    let suite = d.dir.path().join("golden.toml");
+    std::fs::write(
+        &suite,
+        "[[question]]\nask = \"what comes after the manifest\"\nanswers = [\"step 3 of the import\"]\nkeywords = \"digests\"\n",
+    )
+    .unwrap();
+    let g = json(&ok(
+        &d.root,
+        &["golden", suite.to_str().unwrap(), "--json"],
+        None,
+    ));
+    assert_eq!(g["questions"], 1, "{g}");
+    let kw = g["scores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["strategy"] == "keywords")
+        .unwrap();
+    assert_eq!(kw["hits"], 1, "{g}");
 }
 
 /// 5. a task is created, claimed with a lease, heartbeated, completed; a second claim
@@ -241,6 +265,7 @@ fn the_seven_m0_steps() {
     step_write(&mut d);
     step_t0(&d);
     step_search_and_get(&d);
+    step_recall_and_golden(&d);
     step_tasks(&d);
     step_export_import(&d);
     step_reindex(&d);

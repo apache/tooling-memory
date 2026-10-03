@@ -1,0 +1,78 @@
+# Golden questions over the three documents in docs/, seeded as the demo corpus by
+# scripts/seed-corpus.py, one entry per section. Answers name section titles, or parts
+# of them; any one is a hit. `keywords` is the query a person would write, standing in
+# for the one a model writes. Run: memory golden golden/docs.toml
+#
+# Add your own domain's suite beside this one; the format is the same.
+
+domain = "dom-demo"
+
+[[question]]
+ask = "How does recall decide between pushing sections and letting the caller pull, and what does the paper say about caller-executed recall?"
+answers = ["Serving bindings"]
+keywords = "recall caller-executed sampling deputy"
+
+[[question]]
+ask = "Who pays for recall at a foundation, and which principals get it server-side?"
+answers = ["Serving, identity, and who pays"]
+keywords = "recall committer public tier caller-executed"
+
+[[question]]
+ask = "Why is the domain the partition key everywhere?"
+answers = ["the domain is the partition key"]
+keywords = "domain partition key"
+
+[[question]]
+ask = "What label does an entry get when a session writes after reading restricted material?"
+answers = ["Information flow"]
+keywords = "write inherit label classification"
+
+[[question]]
+ask = "What happens when an entry must be erased, and what remains in its place?"
+answers = ["Erasure"]
+keywords = "erasure stub receipt"
+
+[[question]]
+ask = "How is a rogue or defective librarian contained?"
+answers = ["Containing the librarian"]
+keywords = "librarian contain audit tombstone"
+
+[[question]]
+ask = "Which three uses does WebAssembly have in the stack?"
+answers = ["WebAssembly, split into three uses"]
+keywords = "WebAssembly three uses"
+
+[[question]]
+ask = "Where does latency on the hot path come from?"
+answers = ["Latency on the hot path"]
+keywords = "latency hot path"
+
+[[question]]
+ask = "What does the policy stack look like for a federation of projects?"
+answers = ["A policy stack for a federation"]
+keywords = "policy stack federation"
+
+[[question]]
+ask = "What do trust tiers mean, and how does an entry move between them?"
+answers = ["Tiers"]
+keywords = "trust tier raw curated promotion"
+
+[[question]]
+ask = "What is progressive disclosure in retrieval?"
+answers = ["Progressive disclosure"]
+keywords = "progressive disclosure summaries"
+
+[[question]]
+ask = "How does the system detect a vendor changing a model without announcing it?"
+answers = ["Detecting unadvertised vendor change"]
+keywords = "vendor change pin drift"
+
+[[question]]
+ask = "What can a task's requirements field be abused for, and what guards it?"
+answers = ["The task fabric"]
+keywords = "task requirements inflation admission"
+
+[[question]]
+ask = "Which sources become entries at the foundation, and how do they get there?"
+answers = ["Sources to entries"]
+keywords = "sources entries lists commits issues taps"

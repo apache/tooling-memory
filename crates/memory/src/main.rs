@@ -7,6 +7,7 @@
 //! environment and never passes them inside.
 
 mod deputy;
+mod golden;
 mod hooks;
 mod image;
 mod mine;
@@ -397,6 +398,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Score a golden suite: questions and the entries that answer them, each question
+    /// asked as written, stripped of stopwords, and by its keywords, through the pack
+    /// with no model; with `--provider`, the deputy's brief too.
+    Golden {
+        /// The suite, TOML; see golden/docs.toml.
+        suite: PathBuf,
+        /// Hits count within the top k.
+        #[arg(long, default_value_t = 8)]
+        k: usize,
+        /// Numbers as JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
+        /// A destination to run the deputy through, so the brief is scored too.
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long, value_enum, default_value = "key", requires = "provider")]
+        auth: AuthArg,
+        /// The deputy's model; a small default per destination otherwise.
+        #[arg(long, requires = "provider")]
+        model: Option<String>,
+    },
     /// Inside the sandbox, run by the harness's hooks: read the event from standard
     /// input and leave a note in the outbox for the launcher to file as a handoff.
     #[command(hide = true)]
@@ -695,6 +717,7 @@ async fn run_cli() -> Fallible {
         cmd @ (Command::Mine { .. }
         | Command::WslcApiCheck
         | Command::Savings { .. }
+        | Command::Golden { .. }
         | Command::Recall {
             provider: Some(_), ..
         }) => tools_cmd(&root, cmd).await,
@@ -1023,6 +1046,41 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     Ok(())
 }
 
+/// `golden`: the suite against this root, with the deputy's brief when a provider is
+/// named.
+async fn golden_cmd(
+    root: &Path,
+    suite: &Path,
+    k: usize,
+    as_json: bool,
+    provider: Option<String>,
+    auth: AuthArg,
+    model: Option<&str>,
+) -> Fallible {
+    let suite = golden::Suite::load(suite)?;
+    let r = match provider {
+        Some(provider) => {
+            let p = prepare_launch(
+                root,
+                Harness::Command,
+                auth.into(),
+                Some(&provider),
+                None,
+                model,
+            )
+            .await?;
+            golden::score(&p.memory, &suite, k).await?
+        }
+        None => golden::score(&Memory::open(root)?.without_read_log(), &suite, k).await?,
+    };
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+    } else {
+        print!("{}", golden::render(&r));
+    }
+    Ok(())
+}
+
 /// `mine` and the C API check.
 async fn tools_cmd(root: &Path, command: Command) -> Fallible {
     match command {
@@ -1081,6 +1139,14 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
             println!("{}", dm_wslc_api::check("memory-check", &storage)?);
             Ok(())
         }
+        Command::Golden {
+            suite,
+            k,
+            json: as_json,
+            provider,
+            auth,
+            model,
+        } => golden_cmd(root, &suite, k, as_json, provider, auth, model.as_deref()).await,
         Command::Savings {
             query,
             json: as_json,
@@ -2021,6 +2087,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Mine { .. }
         | Command::WslcApiCheck
         | Command::Savings { .. }
+        | Command::Golden { .. }
         | Command::Hook { .. }
         | Command::Relay { .. }
         | Command::Usage
