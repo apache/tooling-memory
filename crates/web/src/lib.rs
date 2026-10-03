@@ -519,7 +519,10 @@ mod tests {
         );
         assert_eq!(
             a.join(" "),
-            "memory --root /tmp/x/memory launch --harness codex --auth subscription --backend auto --provider xai --prompt hi -- -v"
+            format!(
+                "memory --root {} launch --harness codex --auth subscription --backend auto --provider xai --prompt hi -- -v",
+                c.root.display()
+            )
         );
         let a = launch_argv(
             &c,
