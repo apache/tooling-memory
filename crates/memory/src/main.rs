@@ -754,8 +754,14 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
         }
         // the two logins whose backend is not the public API: forwarded in the clear and
         // metered like any other, with a tunnel only for the token refresh
-        "chatgpt" => Destination::forward("https://chatgpt.com/backend-api", Auth::PassThrough)
-            .with_tunnels(["auth.openai.com"]),
+        // the ChatGPT backend refuses relayed requests (Cloudflare, and Codex speaks
+        // websockets first), so a Codex login is a tunnel, like Copilot's: pinned egress,
+        // no metering
+        "chatgpt" if std::env::var_os("MEMORY_CHATGPT_FORWARD").is_some() => {
+            Destination::forward("https://chatgpt.com/backend-api", Auth::PassThrough)
+                .with_tunnels(["auth.openai.com"])
+        }
+        "chatgpt" => Destination::tunnel(["chatgpt.com", ".chatgpt.com", "auth.openai.com"]),
         "google" => Destination::forward("https://cloudcode-pa.googleapis.com", Auth::PassThrough)
             .with_tunnels(["oauth2.googleapis.com", "accounts.google.com"]),
         other => return Err(format!("no subscription-mode destination named {other}").into()),

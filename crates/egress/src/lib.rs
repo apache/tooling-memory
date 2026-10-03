@@ -533,6 +533,28 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() && std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
+        // a diagnostic: who refused, and how. The body is read here and not relayed, so
+        // this is for finding out, not for running.
+        let url = upstream.url().to_string();
+        let server = upstream
+            .headers()
+            .get("server")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let cf = upstream.headers().contains_key("cf-ray");
+        let body = upstream.text().await.unwrap_or_default();
+        eprintln!(
+            "egress debug: {status} from {url} server={server} cloudflare={cf} body={:?}",
+            body.chars().take(300).collect::<String>()
+        );
+        return error_json(
+            status,
+            "upstream_error",
+            &body.chars().take(300).collect::<String>(),
+        );
+    }
     let resp_headers = copy_headers(upstream.headers(), false);
     let content_type = upstream
         .headers()

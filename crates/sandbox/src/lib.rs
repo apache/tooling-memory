@@ -130,10 +130,14 @@ impl Harness {
         let p = prompt.to_string();
         match self {
             Harness::Claude => vec!["-p".into(), p, "--dangerously-skip-permissions".into()],
+            // codex exec cannot ask, and refuses an MCP tool call that would need
+            // approval; its own gate and sandbox are bypassed, since ours is the boundary
             Harness::Codex => vec![
                 "exec".into(),
                 "--skip-git-repo-check".into(),
-                "--full-auto".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                // hooks the launcher wrote are ours to trust; nobody is there to say so
+                "--dangerously-bypass-hook-trust".into(),
                 p,
             ],
             Harness::Gemini => vec!["-p".into(), p, "--approval-mode".into(), "yolo".into()],
@@ -659,18 +663,25 @@ fn setup_codex(
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
     let config = if req.auth == AuthMode::Subscription {
-        // a ChatGPT login talks to the ChatGPT backend, not the OpenAI API: the built-in
-        // provider stays, its backend base moves to the egress, and the token refresh
-        // at auth.openai.com goes through the egress as a tunnel
+        // a ChatGPT login talks to the ChatGPT backend, which refuses relayed requests, so
+        // Codex's HTTPS goes through the egress as a tunnel to the ChatGPT hosts, as
+        // Copilot CLI's does; the built-in provider and its backend stay as they are
         copy_login(
             req,
             ".codex/auth.json",
             "`codex login` (or `codex login --device-auth`)",
         )?;
         proxy_via(relay, env);
+        // the forward variant, kept for diagnosis: the backend behind the egress
+        let base = if std::env::var_os("MEMORY_CHATGPT_FORWARD").is_some() {
+            format!("chatgpt_base_url = \"{relay}/chatgpt/\"\n\n")
+        } else {
+            String::new()
+        };
         format!(
             r#"# written by memory launch; edits are overwritten
-chatgpt_base_url = "{relay}/chatgpt/"
+{base}[features]
+hooks = true
 
 [mcp_servers.memory]
 url = "{relay}/mcp"
@@ -688,12 +699,27 @@ base_url = "{relay}/{provider}/v1"
 env_key = "DM_EGRESS_TOKEN"
 wire_api = "responses"
 
+[features]
+hooks = true
+
 [mcp_servers.memory]
 url = "{relay}/mcp"
 "#
         )
     };
     write(&req.home.join(".codex/config.toml"), &config)?;
+    // Codex routes its tools, MCP included, through a helper it expects beside itself;
+    // the npm install ships it, a bare release tarball does not
+    if !req.image && req.rootfs.is_none() {
+        if let Ok(bin) = find_on_path("codex") {
+            if !bin.with_file_name("codex-code-mode-host").is_file() {
+                eprintln!(
+                    "memory: warning: {} has no codex-code-mode-host beside it; Codex's tools, memory among them, will fail. Install it from the same Codex release",
+                    bin.display()
+                );
+            }
+        }
+    }
     // Codex gives a session-end hook three seconds at most
     merge_hooks(
         &req.home.join(".codex/hooks.json"),
@@ -1319,8 +1345,8 @@ mod tests {
             .unwrap();
         let cfg = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
         assert!(
-            cfg.contains("chatgpt_base_url = \"http://127.0.0.1:4100/chatgpt/\""),
-            "{cfg}"
+            !cfg.contains("chatgpt_base_url"),
+            "the backend is reached through the tunnel: {cfg}"
         );
         assert!(
             !cfg.contains("model_provider"),

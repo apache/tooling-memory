@@ -55,7 +55,7 @@ of what differs:
 | Harness | Model calls reach the egress by | Memory over MCP by | `AUTH` modes |
 |---|---|---|---|
 | Claude Code | `ANTHROPIC_BASE_URL` | `--mcp-config` | subscription, key, gateway |
-| Codex | `model_providers.<id>.base_url` in `config.toml`; with a ChatGPT login, `chatgpt_base_url` | `mcp_servers.<id>.url` | subscription, key, gateway; `--provider xai` for Grok |
+| Codex | `model_providers.<id>.base_url` in `config.toml`; with a ChatGPT login, a CONNECT tunnel to the ChatGPT hosts | `mcp_servers.<id>.url` | subscription, key, gateway; `--provider xai` for Grok |
 | Gemini CLI | `GOOGLE_GEMINI_BASE_URL`; with a Google login, `CODE_ASSIST_ENDPOINT` | `mcpServers.<id>.httpUrl` | subscription, key |
 | Copilot CLI | no override exists; `HTTPS_PROXY` to the egress, which tunnels only to GitHub's Copilot hosts | `mcp-config.json` | subscription (`GH_TOKEN`) |
 | OpenCode | `provider.<id>.options.baseURL`; on a GitHub Copilot login, `HTTPS_PROXY` and the GitHub tunnel | `mcp.<id>.url` | key; `--provider openai` or `xai`; subscription with `--provider github-copilot`, which GitHub supports |
@@ -91,10 +91,16 @@ A login is made once on the host, in the harness's own way, and the launcher cop
 one file into the private home. For Claude Code, `claude` and its login prompt; for Codex,
 `codex login` or, with no browser to hand, `codex login --device-auth`; for Gemini,
 `gemini` and `/auth`, Login with Google. Nothing else under your home is read or mounted.
-The ChatGPT and Google logins talk to backends that are not the public API, the ChatGPT
-backend and Code Assist, so those two get their own destinations, `chatgpt` and `google`,
-forwarded and metered like the rest; only the token refresh goes through the egress as a
-tunnel to the login host.
+The ChatGPT and Google logins talk to backends that are not the public API. Gemini's Code
+Assist is forwarded and metered like the rest, with only the token refresh tunnelled. The
+ChatGPT backend refuses relayed requests: its bot protection answers a forwarded call with
+a challenge page, and Codex speaks websockets first, which a forwarding proxy cannot carry.
+So a Codex login is a tunnel, like Copilot's: pinned egress without metering. Proven here on
+a ChatGPT login: Codex loaded T0 over MCP, its hooks fired, and it completed a ledger task.
+Two things Codex needs that a bare release tarball lacks: the `codex-code-mode-host` helper
+beside the binary, which its tools go through (the npm install and the harness image have
+it; the launcher warns when it is missing), and, headless, its own approval and hook-trust
+gates bypassed, since nobody is there to answer and the sandbox is the boundary.
 
 In every mode the session's handling is capped at the destination's ceiling from
 `grants.toml`, so a session whose calls go to a destination with a public ceiling reads only
