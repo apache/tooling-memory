@@ -302,7 +302,7 @@ impl Entry {
     #[must_use]
     pub fn summary(&self) -> String {
         if let Some(s) = &self.front.summary {
-            return s.clone();
+            return clip(s, 200);
         }
         let para: String = self
             .body
@@ -420,6 +420,12 @@ mod tests {
         let s = e.summary();
         assert_eq!(s.chars().count(), 200);
         assert!(s.ends_with('…'));
+        e.front.summary = Some("y ".repeat(300));
+        assert_eq!(
+            e.summary().chars().count(),
+            200,
+            "an explicit summary is served clipped too; the frontmatter keeps it whole"
+        );
     }
 
     #[test]

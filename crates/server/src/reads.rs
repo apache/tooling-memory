@@ -8,6 +8,7 @@ use dm_index::Hit;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// One retrieval event.
@@ -45,7 +46,7 @@ pub struct ReadLog {
     path: PathBuf,
     session: String,
     lock: Mutex<()>,
-    enabled: bool,
+    enabled: AtomicBool,
 }
 
 impl ReadLog {
@@ -56,13 +57,13 @@ impl ReadLog {
             path: path(root),
             session: session.to_string(),
             lock: Mutex::new(()),
-            enabled: true,
+            enabled: AtomicBool::new(true),
         }
     }
 
     /// Stop recording: for a reader whose reads are not a session's, such as a report.
-    pub fn disable(&mut self) {
-        self.enabled = false;
+    pub fn disable(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
     }
 
     fn append(&self, tool: &str, query: Option<&str>, hits: usize, tokens: usize) {
@@ -92,7 +93,7 @@ impl ReadLog {
         cached: bool,
         via: Option<&str>,
     ) {
-        if !self.enabled {
+        if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         let read = Read {

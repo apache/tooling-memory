@@ -775,9 +775,14 @@ struct Route {
     harness_env: Vec<(String, String)>,
 }
 
+/// A variable's value, if it carries one: a variable set to nothing is not set.
+fn present(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
 fn need(var: &str, why: &str) -> Result<String, Box<dyn std::error::Error>> {
-    std::env::var(var)
-        .map_err(|_| format!("{why} needs {var} in the launcher's environment").into())
+    present(std::env::var(var).ok())
+        .ok_or_else(|| format!("{why} needs {var} in the launcher's environment").into())
 }
 
 fn bearer(value: String) -> Auth {
@@ -1080,6 +1085,8 @@ async fn golden_cmd(
                 model,
             )
             .await?;
+            // the suite's reads are a measurement, not a session's
+            p.memory.disable_read_log();
             golden::score(&p.memory, &suite, k).await?
         }
         None => golden::score(&Memory::open(root)?.without_read_log(), &suite, k).await?,
@@ -2166,6 +2173,14 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[test]
+    fn an_empty_variable_is_a_missing_one() {
+        assert_eq!(present(Some("k".into())).as_deref(), Some("k"));
+        assert_eq!(present(Some(String::new())), None);
+        assert_eq!(present(Some("  ".into())), None);
+        assert_eq!(present(None), None);
+    }
 
     #[test]
     fn unconfined_wins_and_auto_prefers_the_image_when_unpacked() {

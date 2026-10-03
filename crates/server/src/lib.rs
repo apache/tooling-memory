@@ -214,9 +214,15 @@ impl Memory {
 
     /// Read without recording: for a report or a tool whose reads are not a session's.
     #[must_use]
-    pub fn without_read_log(mut self) -> Memory {
-        self.reads.disable();
+    pub fn without_read_log(self) -> Memory {
+        self.disable_read_log();
         self
+    }
+
+    /// Stop recording reads from now on, behind a shared handle: for a measurement that
+    /// runs over a memory a launcher already built.
+    pub fn disable_read_log(&self) {
+        self.reads.disable();
     }
 
     /// Record writes under this author instead of the owner: `agent:<name> (model: <id>)`.
@@ -356,9 +362,11 @@ impl Memory {
     }
 
     /// One entry, body included, if the filter admits it. Raises the session label.
-    /// The index decides admission and the record serves the body, always; when that
-    /// body is the version a pack pushed to this session, the read log says so. Two
-    /// admitted gets inside one turn mark the session as one that fans out.
+    /// The index decides admission and the record serves the body, always; a current
+    /// version the record has moved above the session's handling is refused, whatever
+    /// the index row said. When the body is the version a pack pushed to this session,
+    /// the read log says so. Two admitted gets inside one turn mark the session as one
+    /// that fans out.
     ///
     /// # Errors
     ///
@@ -376,7 +384,10 @@ impl Memory {
             .get(&meta.hit.domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        lock(&self.session).observe(entry.front.classification);
+        if !lock(&self.session).observe(entry.front.classification) {
+            self.forget_pushed(id);
+            return Err(Error::NotFound(id.to_string()));
+        }
         let pushed = self.was_pushed(&entry);
         self.reads
             .served("get", None, 1, dm_core::approx_tokens(&entry.body), pushed);
@@ -773,6 +784,16 @@ mod tests {
             again.resolve_domain(Some("dom-x")),
             Err(Error::Denied(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn the_read_log_can_be_switched_off_behind_an_arc() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = std::sync::Arc::new(mem(dir.path()));
+        m.write(req("Operation R retries.\n")).await.unwrap();
+        m.disable_read_log();
+        m.search("retries", None, 10).await.unwrap();
+        assert!(reads::all(dir.path()).unwrap().is_empty());
     }
 
     #[tokio::test]

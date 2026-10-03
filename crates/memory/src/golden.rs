@@ -20,6 +20,9 @@ use std::path::Path;
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// Hits are counted within at most this many.
+pub const MAX_K: usize = 1000;
+
 /// A suite file.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct Suite {
@@ -54,12 +57,16 @@ impl Suite {
         if s.questions.is_empty() {
             return Err("a suite needs at least one [[question]]".into());
         }
-        if let Some(q) = s
-            .questions
-            .iter()
-            .find(|q| q.answers.is_empty() || q.ask.trim().is_empty())
-        {
-            return Err(format!("question {:?} needs an ask and answers", q.ask).into());
+        if let Some(q) = s.questions.iter().find(|q| {
+            q.answers.is_empty()
+                || q.ask.trim().is_empty()
+                || q.answers.iter().any(|a| a.trim().is_empty())
+        }) {
+            return Err(format!(
+                "question {:?} needs an ask and answers, none of them blank",
+                q.ask
+            )
+            .into());
         }
         Ok(s)
     }
@@ -138,7 +145,7 @@ pub fn stripped(ask: &str) -> String {
         .join(" ")
 }
 
-fn answers_of(q: &Question, titles: &BTreeMap<String, String>) -> Vec<String> {
+fn answers_of(q: &Question, titles: &BTreeMap<String, Vec<String>>) -> Vec<String> {
     titles
         .iter()
         .filter(|(title, _)| {
@@ -148,7 +155,7 @@ fn answers_of(q: &Question, titles: &BTreeMap<String, String>) -> Vec<String> {
                     .contains(a.trim().to_lowercase().as_str())
             })
         })
-        .map(|(_, id)| id.clone())
+        .flat_map(|(_, ids)| ids.iter().cloned())
         .collect()
 }
 
@@ -158,11 +165,12 @@ fn rank_of(ids: &[String], answers: &[String]) -> Option<usize> {
         .map(|i| i + 1)
 }
 
-/// Every active entry's title and id, within the suite's domain.
-async fn titles(memory: &Memory, domain: Option<&str>) -> Fallible<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
+/// Every active entry's ids by title, within the suite's domain; a title held by
+/// several entries names them all.
+async fn titles(memory: &Memory, domain: Option<&str>) -> Fallible<BTreeMap<String, Vec<String>>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for h in memory.list(domain, None, 100_000).await? {
-        out.insert(h.title, h.id);
+        out.entry(h.title).or_default().push(h.id);
     }
     Ok(out)
 }
@@ -178,7 +186,7 @@ pub async fn score(memory: &Memory, suite: &Suite, k: usize) -> Fallible<Report>
     let domain = suite.domain.as_deref();
     let titles = titles(memory, domain).await?;
     let budget = Budget {
-        hits: k.max(1),
+        hits: k.clamp(1, MAX_K),
         links: 0,
         ..Budget::default()
     };
@@ -311,6 +319,10 @@ answers = ["Deployment runbook"]
         assert_eq!(s.questions[0].keywords.as_deref(), Some("retry backoff"));
         assert!(Suite::parse("domain = \"x\"\n").is_err());
         assert!(Suite::parse("[[question]]\nask = \"q\"\nanswers = []\n").is_err());
+        assert!(
+            Suite::parse("[[question]]\nask = \"q\"\nanswers = [\"  \"]\n").is_err(),
+            "a blank answer would match every title"
+        );
         assert_eq!(
             stripped("How does the import retry when a step fails?"),
             "import retry step fails"
@@ -325,6 +337,88 @@ answers = ["Deployment runbook"]
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rank_k_and_the_stripped_query_are_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me")
+            .unwrap()
+            .without_read_log();
+        write(
+            &m,
+            "Retry policy",
+            "Operation R retries with exponential backoff.\n",
+        )
+        .await;
+        write(
+            &m,
+            "Retry chant",
+            "retry retry retry retry retry retry retry retry.\n",
+        )
+        .await;
+        write(&m, "Commit convention", "Short subject, body says why.\n").await;
+        write(
+            &m,
+            "Import steps",
+            "The import has five steps; the fourth is slow.\n",
+        )
+        .await;
+        let suite = Suite::parse(
+            r#"
+[[question]]
+ask = "retry"
+answers = ["Retry policy"]
+
+[[question]]
+ask = "What is the commit convention?"
+answers = ["Commit convention"]
+"#,
+        )
+        .unwrap();
+        let r = score(&m, &suite, 5).await.unwrap();
+        let row = |r: &Report, strategy: &str, ask: &str| {
+            r.rows
+                .iter()
+                .find(|row| row.strategy == strategy && row.ask == ask)
+                .map(|row| (row.rank, row.tokens))
+                .unwrap()
+        };
+        assert_eq!(row(&r, "question", "retry").0, Some(2), "{r:?}");
+        let q = r.scores.iter().find(|s| s.strategy == "question").unwrap();
+        assert!((q.mrr - 0.75).abs() < 1e-9, "(1/2 + 1/1) / 2: {q:?}");
+        let asked = "What is the commit convention?";
+        assert!(
+            row(&r, "question", asked).1 > row(&r, "stripped", asked).1,
+            "the question falls back to any word and pulls more; stripped matches one"
+        );
+        let r1 = score(&m, &suite, 1).await.unwrap();
+        assert_eq!(r1.k, 1);
+        assert!(
+            row(&r1, "question", "retry").0.is_none(),
+            "second place is a miss at k = 1"
+        );
+        assert_eq!(score(&m, &suite, 10_000_000).await.unwrap().k, 1000);
+    }
+
+    #[tokio::test]
+    async fn two_entries_with_one_title_both_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me")
+            .unwrap()
+            .without_read_log();
+        write(&m, "Summary", "Unrelated: the weather was fine.\n").await;
+        write(
+            &m,
+            "Summary",
+            "Operation R retries with exponential backoff.\n",
+        )
+        .await;
+        let suite =
+            Suite::parse("[[question]]\nask = \"backoff\"\nanswers = [\"Summary\"]\n").unwrap();
+        let r = score(&m, &suite, 5).await.unwrap();
+        assert!(r.unresolved.is_empty());
+        assert_eq!(r.rows[0].rank, Some(1), "{r:?}");
     }
 
     #[tokio::test]

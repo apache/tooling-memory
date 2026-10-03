@@ -139,6 +139,9 @@ pub struct Piece {
     pub via: Via,
 }
 
+/// A title longer than this is cut: it rides into every pack and every deputy prompt.
+const TITLE_MAX: usize = 200;
+
 impl Piece {
     fn from_hit(h: &Hit, via: Via) -> Piece {
         Piece {
@@ -147,7 +150,7 @@ impl Piece {
             entry_type: h.entry_type,
             trust_tier: h.trust_tier,
             classification: h.classification,
-            title: h.title.clone(),
+            title: h.title.chars().take(TITLE_MAX).collect(),
             summary: h.summary.clone(),
             body: None,
             links: Vec::new(),
@@ -1498,6 +1501,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_refuses_a_body_the_record_moved_above_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let x = write(&m, "Retry policy", "Operation R retries. SECRET\n", vec![]).await;
+        let mut again = m.store.get("dom-me", &x).await.unwrap().unwrap();
+        again.front.classification = Label::Restricted;
+        m.store.put(&again).await.unwrap(); // the index still says internal
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Internal);
+        assert!(
+            matches!(capped.get(&x).await, Err(Error::NotFound(_))),
+            "a body above the cap is refused, whatever the index row said"
+        );
+        assert!(capped.label() <= Label::Internal);
+        assert!(
+            crate::reads::all(dir.path()).unwrap().is_empty(),
+            "nothing was served, so nothing is logged"
+        );
+    }
+
+    #[test]
+    fn a_piece_s_title_is_bounded() {
+        let mut h = hit("x");
+        h.title = "t".repeat(1000);
+        assert!(Piece::from_hit(&h, Via::Query).title.chars().count() <= 200);
+    }
+
+    #[tokio::test]
     async fn a_hit_the_record_lost_leaves_the_pack() {
         let dir = tempfile::tempdir().unwrap();
         let m = mem(dir.path());
@@ -1560,10 +1592,19 @@ mod tests {
         let limit = write(
             &m,
             "Attempt ceiling",
-            "The operation gives up after five attempts.\n",
+            "Attempts: the operation gives up after five attempts.\n",
             vec![],
         )
         .await;
+        for i in 0..8 {
+            write(
+                &m,
+                &format!("Attempt note {i}"),
+                "A longer note that mentions attempts once among other words here.\n",
+                vec![],
+            )
+            .await;
+        }
         let deputy = Scripted::new(&[
             "{\"brief\": \"R retries.\", \"missing\": [\"attempts\"]}",
             &format!("{{\"brief\": \"R retries and stops after five [{limit}].\"}}"),
@@ -1580,6 +1621,12 @@ mod tests {
         );
         assert!(r.pack.ids().contains(&limit));
         assert_eq!(r.citations, [limit]);
+        assert_eq!(
+            r.pack.pieces.len(),
+            Budget::default().hits * 2,
+            "hits are a page per round, not a total: {:?}",
+            r.pack.ids()
+        );
     }
 
     #[tokio::test]
