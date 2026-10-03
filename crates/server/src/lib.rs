@@ -19,14 +19,16 @@ use dm_ledger::{Claim, Created, Ledger, Task, TaskSpec};
 use dm_policy::{Grants, Session};
 use dm_store::Store;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
 pub mod bundle;
 pub mod mcp;
 pub mod reads;
+pub mod recall;
 pub mod t0;
 
 /// The grants file, relative to the root.
@@ -71,6 +73,9 @@ pub enum Error {
     /// Not there, or not for this session to see. The two are deliberately the same.
     #[error("not found: {0}")]
     NotFound(String),
+    /// The recall deputy failed or timed out.
+    #[error("deputy: {0}")]
+    Deputy(String),
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
@@ -142,6 +147,12 @@ pub struct Memory {
     ledger: AsyncMutex<Ledger>,
     session: Mutex<Session>,
     reads: reads::ReadLog,
+    /// The recall deputy, held weakly: it lives as long as the launcher that built it.
+    deputy: OnceLock<Weak<dyn recall::Deputy>>,
+    /// Whether this session has issued two gets inside one turn.
+    fan_out: Mutex<recall::FanOut>,
+    /// Bodies a pack fetched for this session, served to a later `get` of the same id.
+    cache: Mutex<HashMap<String, Entry>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -195,6 +206,9 @@ impl Memory {
             index: AsyncMutex::new(index),
             ledger: AsyncMutex::new(ledger),
             session: Mutex::new(session),
+            deputy: OnceLock::new(),
+            fan_out: Mutex::new(recall::FanOut::default()),
+            cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -342,11 +356,15 @@ impl Memory {
     }
 
     /// One entry, body included, if the filter admits it. Raises the session label.
+    /// The index decides admission; the body comes from the session cache when a pack
+    /// already fetched it, else from the record. Two gets inside one turn mark the
+    /// session as one that fans out.
     ///
     /// # Errors
     ///
     /// [`Error::NotFound`] when absent or not for this session, or a store error.
     pub async fn get(&self, id: &str) -> Result<Entry, Error> {
+        self.note_get();
         let f = self.grants.read_filter();
         let meta = self
             .index
@@ -354,13 +372,24 @@ impl Memory {
             .await
             .meta(id, &f)?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        let entry = self
-            .store
-            .get(&meta.hit.domain, id)
-            .await?
-            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        let cached = self.cached(id);
+        let from_cache = cached.is_some();
+        let entry = match cached {
+            Some(e) => e,
+            None => self
+                .store
+                .get(&meta.hit.domain, id)
+                .await?
+                .ok_or_else(|| Error::NotFound(id.to_string()))?,
+        };
         lock(&self.session).observe(entry.front.classification);
-        self.reads.text("get", &entry.body);
+        self.reads.served(
+            "get",
+            None,
+            1,
+            dm_core::approx_tokens(&entry.body),
+            from_cache,
+        );
         Ok(entry)
     }
 

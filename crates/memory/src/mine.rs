@@ -5,10 +5,11 @@
 //! model call, made through the same egress and destination as the session's own calls.
 
 use crate::hooks::transcript_tail;
+pub use crate::model::{answer_text, default_model};
 use dm_client::{MemoryClient, NewEntry};
 use dm_egress::Egress;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::Path;
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
@@ -22,17 +23,6 @@ pub struct Proposal {
     pub title: String,
     /// Markdown.
     pub body: String,
-}
-
-/// The default model per destination, small and cheap: mining is a librarian's job.
-#[must_use]
-pub fn default_model(destination: &str) -> &'static str {
-    match destination {
-        "anthropic" | "llmao" => "claude-haiku-4-5-20251001",
-        "gemini" | "google" => "gemini-2.5-flash",
-        "xai" => "grok-4-fast",
-        _ => "gpt-5-mini",
-    }
 }
 
 const INSTRUCTIONS: &str = "You are a librarian for a shared memory record used by agents and people. \
@@ -93,35 +83,10 @@ pub async fn write_proposals(
     Ok(ids)
 }
 
-/// The request body for a destination's API shape.
+/// The mining request for a destination's API shape.
 #[must_use]
 pub fn request(destination: &str, model: &str, excerpt: &str) -> (String, Value) {
-    let user = prompt_for(excerpt);
-    match destination {
-        "anthropic" => (
-            "v1/messages".into(),
-            json!({ "model": model, "max_tokens": 4000, "messages": [{ "role": "user", "content": user }] }),
-        ),
-        "gemini" | "google" => (
-            format!("v1beta/models/{model}:generateContent"),
-            json!({ "contents": [{ "role": "user", "parts": [{ "text": user }] }] }),
-        ),
-        _ => (
-            "v1/chat/completions".into(),
-            json!({ "model": model, "messages": [{ "role": "user", "content": user }] }),
-        ),
-    }
-}
-
-/// The model's text out of a response in any of the three shapes.
-#[must_use]
-pub fn answer_text(destination: &str, v: &Value) -> String {
-    let path = match destination {
-        "anthropic" => v.pointer("/content/0/text"),
-        "gemini" | "google" => v.pointer("/candidates/0/content/parts/0/text"),
-        _ => v.pointer("/choices/0/message/content"),
-    };
-    path.and_then(Value::as_str).unwrap_or_default().to_string()
+    crate::model::request(destination, model, &prompt_for(excerpt))
 }
 
 /// Proposals out of the model's text, tolerant of a code fence around the JSON.
@@ -216,21 +181,10 @@ mod tests {
             .contains("librarian"));
         let (p, _) = request("gemini", "gemini-2.5-flash", "x");
         assert_eq!(p, "v1beta/models/gemini-2.5-flash:generateContent");
-        let (p, b) = request("llmao", "m", "x");
-        assert_eq!(p, "v1/chat/completions");
-        assert_eq!(b["model"], "m");
-        assert_eq!(default_model("anthropic"), "claude-haiku-4-5-20251001");
-        assert_eq!(default_model("openai"), "gpt-5-mini");
     }
 
     #[test]
-    fn answers_are_read_from_each_shape_and_proposals_filtered() {
-        let a = json!({ "content": [{ "type": "text", "text": "hi" }] });
-        assert_eq!(answer_text("anthropic", &a), "hi");
-        let g = json!({ "candidates": [{ "content": { "parts": [{ "text": "g" }] } }] });
-        assert_eq!(answer_text("google", &g), "g");
-        let o = json!({ "choices": [{ "message": { "content": "o" } }] });
-        assert_eq!(answer_text("openai", &o), "o");
+    fn proposals_are_filtered() {
         let text = "```json\n[{\"kind\":\"fact\",\"title\":\"The import has five steps\",\"body\":\"Steps one to five, the fourth is slow.\"},\
             {\"kind\":\"gossip\",\"title\":\"x\",\"body\":\"a b c d e f\"},{\"kind\":\"decision\",\"title\":\"short\",\"body\":\"too short\"}]\n```";
         let p = proposals(text);

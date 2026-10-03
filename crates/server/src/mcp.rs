@@ -5,6 +5,7 @@
 //! ledger operations, and a `memory://t0/<domain>` resource per granted domain. What it
 //! never gets is a path on disk, a credential, or an entry its grants do not admit.
 
+use crate::recall::{self, Budget, Depth};
 use crate::{Error, Memory, WriteRequest};
 use dm_index::Hit;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -92,6 +93,31 @@ pub struct SearchParams {
     #[serde(default)]
     pub domain: Option<String>,
     /// How many hits, 1 to 100. Default 10.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// summaries (default) or sections: with sections, the bodies of the best hits come
+    /// back too, within a token budget, so one call replaces a search and several gets.
+    #[serde(default)]
+    pub depth: Option<String>,
+}
+
+/// Parameters of `recall`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct RecallParams {
+    /// The question, in natural language.
+    pub question: String,
+    /// A granted domain. Omit for every granted domain.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// summaries or sections: how much of each entry comes back when the synthesis is
+    /// owed to you. Default: sections, or summaries once this session has fetched
+    /// entries in parallel.
+    #[serde(default)]
+    pub depth: Option<String>,
+    /// Tokens of entry bodies the pack may carry, 500 to 50000. Default 6000.
+    #[serde(default)]
+    pub budget_tokens: Option<usize>,
+    /// Entries in the pack, 1 to 100. Default 8.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -303,10 +329,22 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Ranked search over memory, summaries only. Open a hit with `get` if its summary warrants it. Search before writing a fact that may already exist."
+        description = "Ranked search over memory, summaries by default; open a hit with `get` if its summary warrants it. With depth `sections` the best hits come with their bodies, within a budget, so one call does the work of a search and several gets. Search before writing a fact that may already exist."
     )]
     async fn search(&self, p: Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
+        if parse::<Depth>("depth", p.depth)? == Some(Depth::Sections) {
+            let pack = self
+                .memory
+                .search_sections(&p.query, p.domain.as_deref(), limit(p.limit))
+                .await
+                .map_err(mcp_err)?;
+            return ok(json!({
+                "hits": pack.pieces,
+                "truncated": pack.truncated,
+                "tokens": pack.tokens,
+            }));
+        }
         let hits = self
             .memory
             .search(&p.query, p.domain.as_deref(), limit(p.limit))
@@ -381,6 +419,27 @@ impl McpServer {
             .await
             .map_err(mcp_err)?;
         ok(json!({ "entries": hits.iter().map(hit_json).collect::<Vec<_>>() }))
+    }
+
+    #[tool(
+        description = "Delegated recall, one turn either way: a question in; a cited brief out when this server has a model behind it, else the pack the brief would be written from, with the synthesis owed to you in this turn. `synthesis.by` says which. Cheaper than a search and several gets when the question spans entries."
+    )]
+    async fn recall(&self, p: Parameters<RecallParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let depth = parse::<Depth>("depth", p.depth)?;
+        let default = Budget::default();
+        let budget = Budget {
+            hits: p.limit.map_or(default.hits, |n| n.clamp(1, MAX_LIMIT)),
+            tokens: p
+                .budget_tokens
+                .map_or(default.tokens, |t| t.clamp(500, 50_000)),
+        };
+        let r = self
+            .memory
+            .recall(&p.question, p.domain.as_deref(), depth, budget)
+            .await
+            .map_err(mcp_err)?;
+        ok(recall::to_json(&r))
     }
 
     #[tool(
@@ -629,6 +688,7 @@ mod tests {
             "write",
             "list",
             "t0",
+            "recall",
             "create_task",
             "admit_task",
             "claim_next",

@@ -130,6 +130,24 @@ fn step_search_and_get(d: &Demo) {
     assert!(body.starts_with("---\nid: "), "{body}");
     assert!(body.contains("Next: digests."));
     assert!(fails(&d.root, &["get", "mem-me-nope"]).contains("not found"));
+    // recall with no model behind it: the pack comes back with synthesis owed
+    let r = json(&ok(
+        &d.root,
+        &["recall", "what is next after the manifest"],
+        None,
+    ));
+    assert_eq!(r["synthesis"]["by"], "owed", "{r}");
+    assert_eq!(r["pack"]["depth"], "sections");
+    let pieces = r["pack"]["pieces"].as_array().unwrap();
+    assert!(pieces.iter().any(|p| p["id"] == d.handoff), "{r}");
+    assert!(pieces
+        .iter()
+        .any(|p| p["body"].as_str().is_some_and(|b| b.contains("digests"))));
+    assert!(r["citations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == &d.handoff));
 }
 
 /// 5. a task is created, claimed with a lease, heartbeated, completed; a second claim

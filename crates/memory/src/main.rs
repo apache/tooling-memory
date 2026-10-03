@@ -6,9 +6,11 @@
 //! `MEMORY_ROOT`) and, for `launch`, reads the one or two credentials it needs from its own
 //! environment and never passes them inside.
 
+mod deputy;
 mod hooks;
 mod image;
 mod mine;
+mod model;
 mod requests;
 mod savings;
 mod work;
@@ -19,6 +21,7 @@ use dm_core::{EntryType, Label};
 use dm_egress::{Auth, Destination, Egress, Telemetry};
 use dm_ledger::{Status, TaskSpec};
 use dm_sandbox::{AuthMode, Harness};
+use dm_server::recall::{self, Budget, Depth, Deputy};
 use dm_server::{mcp, Memory, WriteRequest};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -39,6 +42,24 @@ struct Cli {
     root: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+
+/// How much of each hit a search or a recall carries.
+#[derive(Clone, Copy, ValueEnum)]
+enum DepthArg {
+    /// Title and summary.
+    Summaries,
+    /// Bodies too, best first, within a budget.
+    Sections,
+}
+
+impl From<DepthArg> for Depth {
+    fn from(d: DepthArg) -> Depth {
+        match d {
+            DepthArg::Summaries => Depth::Summaries,
+            DepthArg::Sections => Depth::Sections,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -428,6 +449,29 @@ enum Command {
         domain: Option<String>,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Summaries, or the best hits with their bodies within a budget.
+        #[arg(long, value_enum, default_value = "summaries")]
+        depth: DepthArg,
+    },
+    /// Delegated recall: a cited brief when a model is behind it, else the pack the
+    /// brief would be written from, with the synthesis owed to the caller.
+    Recall {
+        question: String,
+        #[arg(long)]
+        domain: Option<String>,
+        /// How much of each entry comes back when synthesis is owed; the session's
+        /// default otherwise: sections, or summaries once it has fetched in parallel.
+        #[arg(long, value_enum)]
+        depth: Option<DepthArg>,
+        /// A destination to run the deputy through, with `--auth` and `--model`. With
+        /// none, the pack comes back with synthesis owed.
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long, value_enum, default_value = "key")]
+        auth: AuthArg,
+        /// The deputy's model; a small default per destination otherwise.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// One entry, in full.
     Get { id: String },
@@ -648,7 +692,11 @@ async fn run_cli() -> Fallible {
         }
         Command::Hook { .. } => unreachable!("handled in main before the root is needed"),
         cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
-        cmd @ (Command::Mine { .. } | Command::WslcApiCheck) => tools_cmd(&root, cmd).await,
+        cmd @ (Command::Mine { .. }
+        | Command::WslcApiCheck
+        | Command::Recall {
+            provider: Some(_), ..
+        }) => tools_cmd(&root, cmd).await,
         Command::Image { op } => match op {
             ImageOp::Unpack { image } => {
                 image::unpack(&root, &image)?;
@@ -817,6 +865,10 @@ struct Prepared {
     root: PathBuf,
     memory: Arc<Memory>,
     egress: Egress,
+    /// The recall deputy, when the route gives the server a model of its own. Held
+    /// here because the memory holds it weakly: it lives as long as the session.
+    #[allow(dead_code)] // kept alive, not read
+    deputy: Option<Arc<dyn Deputy>>,
     socket: PathBuf,
     home: PathBuf,
     ceiling: Label,
@@ -831,6 +883,7 @@ async fn prepare_launch(
     auth: AuthMode,
     provider: Option<&str>,
     socket: Option<PathBuf>,
+    recall_model: Option<&str>,
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
     let Route {
         name,
@@ -850,11 +903,24 @@ async fn prepare_launch(
         destinations,
         &root.join("state/telemetry.db"),
     )?;
+    // a key or the gateway is the launcher's credential, so the server may spend a
+    // small model on recall; a subscription login is the harness's alone
+    let deputy: Option<Arc<dyn Deputy>> = (auth != AuthMode::Subscription).then(|| {
+        Arc::new(deputy::EgressDeputy::new(
+            egress.clone(),
+            &name,
+            recall_model,
+        )) as Arc<dyn Deputy>
+    });
+    if let Some(d) = &deputy {
+        memory.set_deputy(d);
+    }
     let run_dir = root.join("state/run");
     std::fs::create_dir_all(&run_dir)?;
     Ok(Prepared {
         memory,
         egress,
+        deputy,
         socket: socket
             .unwrap_or_else(|| run_dir.join(format!("egress-{}.sock", std::process::id()))),
         root: root.to_path_buf(),
@@ -965,13 +1031,48 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
             provider,
             model,
         } => {
-            let p =
-                prepare_launch(root, Harness::Command, auth.into(), Some(&provider), None).await?;
+            let p = prepare_launch(
+                root,
+                Harness::Command,
+                auth.into(),
+                Some(&provider),
+                None,
+                None,
+            )
+            .await?;
             let client = work::client(p.memory.clone()).await?;
             let model = model.unwrap_or_else(|| mine::default_model(&p.provider).to_string());
             let ids = mine::mine(&p.egress, &client, &p.provider, &model, &transcript).await?;
             println!("{}", serde_json::to_string_pretty(&ids)?);
             Ok(())
+        }
+        Command::Recall {
+            question,
+            domain,
+            depth,
+            provider: Some(provider),
+            auth,
+            model,
+        } => {
+            let p = prepare_launch(
+                root,
+                Harness::Command,
+                auth.into(),
+                Some(&provider),
+                None,
+                model.as_deref(),
+            )
+            .await?;
+            let r = p
+                .memory
+                .recall(
+                    &question,
+                    domain.as_deref(),
+                    depth.map(Into::into),
+                    Budget::default(),
+                )
+                .await?;
+            json(&recall::to_json(&r))
         }
         Command::WslcApiCheck => {
             let storage = root.join("state/wslc-api");
@@ -1346,7 +1447,7 @@ impl Session {
             Runner::Requests(r) => Some(r.dir.join("egress.sock")),
             _ => None,
         };
-        let p = prepare_launch(root, harness, auth, provider, socket).await?;
+        let p = prepare_launch(root, harness, auth, provider, socket, None).await?;
 
         #[cfg(unix)]
         let serve_unix = {
@@ -1813,13 +1914,7 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
                 .await?;
             json(&w)
         }
-        Command::Search {
-            query,
-            domain,
-            limit,
-        } => json(&hits_json(
-            &m.search(&query, domain.as_deref(), limit).await?,
-        )),
+        cmd @ (Command::Search { .. } | Command::Recall { .. }) => retrieve(m, cmd).await,
         Command::Get { id } => {
             print!("{}", m.get(&id).await?.render());
             Ok(())
@@ -1837,6 +1932,50 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
             Ok(())
         }
         other => maintain(m, other).await,
+    }
+}
+
+/// `search` and `recall`: the retrieval operations, one shape of JSON each.
+async fn retrieve(m: &Memory, command: Command) -> Fallible {
+    match command {
+        Command::Search {
+            query,
+            domain,
+            limit,
+            depth: DepthArg::Sections,
+        } => {
+            let pack = m.search_sections(&query, domain.as_deref(), limit).await?;
+            json(&serde_json::json!({
+                "hits": pack.pieces,
+                "truncated": pack.truncated,
+                "tokens": pack.tokens,
+            }))
+        }
+        Command::Search {
+            query,
+            domain,
+            limit,
+            depth: DepthArg::Summaries,
+        } => json(&hits_json(
+            &m.search(&query, domain.as_deref(), limit).await?,
+        )),
+        Command::Recall {
+            question,
+            domain,
+            depth,
+            ..
+        } => {
+            let r = m
+                .recall(
+                    &question,
+                    domain.as_deref(),
+                    depth.map(Into::into),
+                    Budget::default(),
+                )
+                .await?;
+            json(&recall::to_json(&r))
+        }
+        _ => unreachable!("only search and recall are routed here"),
     }
 }
 
@@ -1887,6 +2026,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Task { .. }
         | Command::Write { .. }
         | Command::Search { .. }
+        | Command::Recall { .. }
         | Command::Get { .. }
         | Command::List { .. }
         | Command::T0 { .. } => unreachable!("dispatched before reaching maintain"),

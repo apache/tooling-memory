@@ -26,6 +26,9 @@ pub struct Read {
     pub hits: usize,
     /// Tokens served, approximately.
     pub tokens: usize,
+    /// Whether the body came from the session cache: pushed by a pack, then asked for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cached: bool,
 }
 
 /// The log file under a root.
@@ -60,6 +63,19 @@ impl ReadLog {
     }
 
     fn append(&self, tool: &str, query: Option<&str>, hits: usize, tokens: usize) {
+        self.served(tool, query, hits, tokens, false);
+    }
+
+    /// Anything served: a page of hits, a text, a pack, a brief. `cached` says the
+    /// body was one a pack had already pushed to this session.
+    pub fn served(
+        &self,
+        tool: &str,
+        query: Option<&str>,
+        hits: usize,
+        tokens: usize,
+        cached: bool,
+    ) {
         if !self.enabled {
             return;
         }
@@ -72,6 +88,7 @@ impl ReadLog {
             query: query.map(str::to_string),
             hits,
             tokens,
+            cached,
         };
         let _g = self
             .lock
