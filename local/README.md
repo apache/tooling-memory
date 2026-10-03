@@ -101,7 +101,9 @@ every read the memory server answered is logged with the tokens it served
 according to the egress. `QUERY='...'` picks the retrieval query; `--json` gives the numbers.
 
 A record of six entries proves nothing, so seed one of a few hundred from Markdown you
-have, one entry per section, and run a task over it:
+have, one entry per section, and run a task over it. `make demo` does all of it in a
+record of its own (`DEMO_ROOT`, seeded from `DEMO_FROM`), measuring before and after; by
+hand it is:
 
 ```sh
 memory --root ~/memory-demo init --owner human:asf:you --domain dom-demo

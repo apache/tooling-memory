@@ -71,6 +71,13 @@ work: build
 	target/release/memory --root "$$MEMORY_ROOT" work --harness $(HARNESS) --auth $(AUTH) \
 		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(if $(LOOP),--loop,)
 
+# The weekend demo in a record of its own: DEMO_ROOT (default ~/memory-demo) seeded from
+# DEMO_FROM (Markdown directories), one task worked by the harness, the savings measured.
+DEMO_ROOT ?= $(HOME)/memory-demo
+DEMO_FROM ?= docs
+demo: build
+	@scripts/demo.sh "$(DEMO_ROOT)" $(DEMO_FROM)
+
 # The paper's read-path claims measured on this record.
 savings: build
 	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" savings $(if $(QUERY),--query '$(QUERY)',)

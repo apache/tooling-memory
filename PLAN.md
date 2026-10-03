@@ -83,6 +83,16 @@ that run turns up.
 | M5, done 2 October | Five harnesses behind `memory launch`: Claude Code, Codex, Gemini CLI, Copilot CLI, OpenCode, plus Grok as a destination through `--provider xai`. Copilot has no base-URL override and goes through a CONNECT tunnel to an allowlist, which is pinned egress without metering. Codex's ChatGPT login and Gemini's Google login have their own destinations, `chatgpt` and `google`, because each talks to a backend that is not the public API; both are forwarded and metered, with a tunnel only for token refresh. Next: Cursor's agent CLI, Aider, Goose | The launcher's shape held: one adapter per harness; the sandbox, egress, and memory did not change |
 | M3c | Taps as WASI components talk to the wrapper through the component model's typed interfaces, in process; no gRPC at that boundary. Where a tap reaches out (GitHub, a tracker) it uses WASI HTTP under the grant's ceiling. gRPC stays for the wrapper's upstream hosts (M3b) | A component boundary is a function call with capabilities, not a network hop; adding a wire protocol there would add a process and a socket for nothing |
 
+## The demo
+
+`make demo`: a fresh record seeded with a few hundred entries from the decisions, the docs
+and the paper; the savings report before any session; a task filed and admitted; a harness
+claiming it, searching the record, answering with cited entries and completing it, confined
+and metered; the savings report after, with that session in the funnel; the handoff it
+wrote. Then `make web` to show the same from a browser, and `make launch` for the
+interactive session. Everything the paper claims about the read path appears as a measured
+number next to the alternative it replaced.
+
 ## What a developer can pick up on the weekend
 
 Each is a crate or a backend with a clear seam, and each can be done without touching the others.
