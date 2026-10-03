@@ -14,7 +14,7 @@ use dm_core::manifest::{Manifest, ManifestEntry};
 use dm_core::{digest, Entry, Label, ReadFilter, TrustTier};
 use dm_index::{Hit, Index};
 use dm_store::Store;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What can go wrong at the bundle boundary.
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +62,16 @@ pub struct Imported {
     pub written: Vec<String>,
     /// Ids skipped because their origin was already in the index.
     pub skipped: Vec<String>,
+}
+
+/// Where the binary keeps the bundles it serves, under the root's state.
+pub const BUNDLES_DIR: &str = "state/bundles";
+
+/// Where a domain's bundle at a label is exported for serving: one directory per
+/// domain and label, replaced whole on each export.
+#[must_use]
+pub fn bundle_dir(root: &Path, domain: &str, label: Label) -> PathBuf {
+    root.join(BUNDLES_DIR).join(format!("{domain}-{label}"))
 }
 
 /// What an export reads: `filter` narrowed to `domain`, bounded at `max_label`, with

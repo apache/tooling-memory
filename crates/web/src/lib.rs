@@ -490,11 +490,6 @@ async fn domains(State(app): State<App>) -> Json<Vec<String>> {
     Json(app.memory.domains())
 }
 
-/// Where a domain's bundle at a label is exported for the reader.
-fn bundle_dir(root: &std::path::Path, domain: &str, label: dm_core::Label) -> PathBuf {
-    root.join("state/bundles").join(format!("{domain}-{label}"))
-}
-
 /// A bundle file name: letters, digits, dot, underscore and hyphen, not starting with a
 /// dot. Anything else is not a name and is never joined to a path.
 fn plain_file_name(file: &str) -> bool {
@@ -611,7 +606,7 @@ async fn bundle_file(
         Ok(label) => label,
         Err(refused) => return refused.into_response(),
     };
-    let dir = bundle_dir(&app.config.root, &domain, label);
+    let dir = dm_server::bundle::bundle_dir(&app.config.root, &domain, label);
     if file == "manifest.yaml" {
         if let Err(failed) = refresh_bundle(&app, &domain, label, &dir).await {
             return failed.into_response();

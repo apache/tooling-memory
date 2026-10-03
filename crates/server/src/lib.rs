@@ -13,7 +13,8 @@
 //! Every read goes through the grants' filter. Every write is classified at least as high
 //! as what the session has read. The session's label rises and never falls.
 
-use dm_core::{Confidence, Entry, EntryType, Frontmatter, Label, ReadFilter, TrustTier};
+use dm_core::erasure::{self, Reason, Receipt};
+use dm_core::{Confidence, Entry, EntryType, Frontmatter, Label, ReadFilter, Status, TrustTier};
 use dm_index::{Hit, Index};
 use dm_ledger::{Claim, Created, Ledger, Task, TaskSpec};
 use dm_policy::{Grants, Session};
@@ -688,6 +689,127 @@ impl Memory {
         .await?)
     }
 
+    /// Erase an entry: the body leaves every version in the record and the index, the
+    /// stub, the erasure record and the receipt remain. Only the owner may, and only
+    /// once. Entries that cite the erased one are flagged for review today rather than
+    /// re-derived here. The bundles served from this root for the domain are removed,
+    /// since each held a copy; exports already handed out, and the transcripts of
+    /// sessions that read the entry, are beyond reach and the receipt says so.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a session that is not the owner or an entry already
+    /// erased, [`Error::NotFound`] for an entry in no granted domain, or a store, index
+    /// or I/O error.
+    pub async fn erase(&self, id: &str, reason: Reason) -> Result<Receipt, Error> {
+        if self.author != self.grants.owner {
+            return Err(Error::Denied(format!(
+                "only the owner {} may erase",
+                self.grants.owner
+            )));
+        }
+        let (domain, entry) = self.find(id).await?;
+        if entry.front.status == Some(Status::Erased) {
+            return Err(Error::Denied(format!("{id} is already erased")));
+        }
+        let stub = erasure::stub(&entry, reason);
+        let removed = self.store.erase(&stub).await?;
+        let flagged = self.flag_citers(id).await?;
+        {
+            let mut ix = self.index.lock().await;
+            ix.remove(id)?;
+            ix.upsert(&stub)?;
+            ix.vacuum()?;
+        }
+        self.forget_pushed(id);
+        self.drop_bundles(&domain)?;
+        let receipt = Receipt {
+            id: id.to_string(),
+            domain,
+            erased_at: OffsetDateTime::now_utc(),
+            erased_by: self.author.clone(),
+            reason,
+            removed,
+            flagged,
+            unresolved: vec![
+                "exports issued before the erasure".into(),
+                "transcripts of sessions that read it".into(),
+            ],
+        };
+        self.store.put_receipt(&receipt).await?;
+        Ok(receipt)
+    }
+
+    /// The receipt of an erasure, if the entry was erased in a granted domain.
+    ///
+    /// # Errors
+    ///
+    /// A store error.
+    pub async fn receipt(&self, id: &str) -> Result<Option<Receipt>, Error> {
+        for domain in self.domains() {
+            if let Some(r) = self.store.receipt(&domain, id).await? {
+                return Ok(Some(r));
+            }
+        }
+        Ok(None)
+    }
+
+    /// An entry by id across the granted domains, from the record, whatever its status.
+    async fn find(&self, id: &str) -> Result<(String, Entry), Error> {
+        for domain in self.domains() {
+            if let Some(e) = self.store.get(&domain, id).await? {
+                return Ok((domain, e));
+            }
+        }
+        Err(Error::NotFound(id.to_string()))
+    }
+
+    /// Flag every granted entry that names `id`, in its body, its sources or as the
+    /// entry it supersedes: its review date becomes today, so curation re-derives it from
+    /// what remains or erases it too. Returns the ids flagged.
+    async fn flag_citers(&self, id: &str) -> Result<Vec<String>, Error> {
+        let today = OffsetDateTime::now_utc().date();
+        let mut flagged = Vec::new();
+        for domain in self.domains() {
+            for other in self.store.list(&domain).await? {
+                if other == id {
+                    continue;
+                }
+                let Some(mut e) = self.store.get(&domain, &other).await? else {
+                    continue;
+                };
+                let cites = e.body.contains(id)
+                    || e.front.source.iter().any(|s| s.contains(id))
+                    || e.front.supersedes.as_deref() == Some(id);
+                if !cites || e.front.status == Some(Status::Erased) {
+                    continue;
+                }
+                e.front.review_by = Some(today);
+                self.store.put(&e).await?;
+                self.index.lock().await.upsert(&e)?;
+                flagged.push(other);
+            }
+        }
+        Ok(flagged)
+    }
+
+    /// Remove the bundles served from this root for a domain, at every label, and the
+    /// working copies an export in progress leaves beside them.
+    fn drop_bundles(&self, domain: &str) -> Result<(), Error> {
+        let dir = self.root.join(bundle::BUNDLES_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(());
+        };
+        let prefix = format!("{domain}-");
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && entry.path().is_dir() {
+                std::fs::remove_dir_all(entry.path()).map_err(io(&entry.path()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Import a bundle into a granted domain. Entries land raw unless this owner
     /// exported them.
     ///
@@ -1116,5 +1238,130 @@ mod tests {
         want.sort();
         assert_eq!(found, want);
         assert_eq!(m.tasks(None, Status::Admitted).await.unwrap().len(), 1);
+    }
+
+    /// Every file under a directory, read as bytes.
+    fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for f in std::fs::read_dir(&d).unwrap().flatten() {
+                if f.path().is_dir() {
+                    stack.push(f.path());
+                } else {
+                    out.push((f.path(), std::fs::read(f.path()).unwrap()));
+                }
+            }
+        }
+        out
+    }
+
+    const MARKER: &str = "passphrase-Qz7xx";
+
+    /// A root with a secret entry, an entry citing it, an unrelated one and a served
+    /// bundle holding a copy; the ids in that order, and the bundle's directory.
+    async fn vault(dir: &Path) -> (Memory, [String; 3], PathBuf) {
+        let m = mem(dir);
+        m.disable_read_log();
+        let a = m
+            .write(req(&format!("The vault opens with {MARKER}.\n")))
+            .await
+            .unwrap();
+        let b = m
+            .write(req(&format!("See {} for how the vault opens.\n", a.id)))
+            .await
+            .unwrap();
+        let c = m.write(req("Unrelated, and stays so.\n")).await.unwrap();
+        let bundle = bundle::bundle_dir(dir, "dom-me", Label::Internal);
+        m.export(Some("dom-me"), Label::Internal, &bundle)
+            .await
+            .unwrap();
+        assert!(bundle.join(format!("{}.md", a.id)).is_file());
+        (m, [a.id, b.id, c.id], bundle)
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_erases_and_only_an_entry_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, [a, _, _], _) = vault(dir.path()).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:x");
+        agent.disable_read_log();
+        assert!(
+            matches!(
+                agent.erase(&a, Reason::Requested).await,
+                Err(Error::Denied(_))
+            ),
+            "only the owner erases"
+        );
+        assert!(matches!(
+            m.erase("mem-me-nothere", Reason::Requested).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(m.get(&a).await.is_ok(), "a refused erasure changes nothing");
+    }
+
+    #[tokio::test]
+    async fn erasure_leaves_a_stub_a_receipt_and_the_body_nowhere_under_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, ids, bundle) = vault(dir.path()).await;
+        let marker = MARKER;
+        let (a, b, c) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        let r = m.erase(&a, Reason::Requested).await.unwrap();
+        assert_eq!((r.id.as_str(), r.domain.as_str()), (a.as_str(), "dom-me"));
+        assert_eq!(r.reason, Reason::Requested);
+        assert_eq!(r.erased_by, "human:test:me");
+        assert_eq!(r.removed.len(), 1);
+        assert_eq!(r.removed[0].version, "current");
+        assert_eq!(r.flagged, vec![b.clone()], "the citing entry is flagged");
+        assert!(r.unresolved.iter().any(|u| u.contains("exports")));
+
+        assert!(
+            matches!(m.get(&a).await, Err(Error::NotFound(_))),
+            "the stub is not an active entry"
+        );
+        assert!(m.search(marker, None, 10).await.unwrap().is_empty());
+        assert!(m
+            .search("vault", None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|h| h.id != a));
+        let flagged = m.get(&b).await.unwrap();
+        assert_eq!(
+            flagged.front.review_by,
+            Some(OffsetDateTime::now_utc().date()),
+            "review today"
+        );
+        assert!(m.get(&c).await.unwrap().front.review_by.is_none());
+        assert!(!bundle.exists(), "the served bundle held a copy");
+        let kept = m.receipt(&a).await.unwrap().unwrap();
+        assert_eq!(
+            (kept.id, kept.reason, kept.removed),
+            (r.id, r.reason, r.removed)
+        );
+        assert!(m.receipt(&b).await.unwrap().is_none());
+        assert!(
+            matches!(m.erase(&a, Reason::Legal).await, Err(Error::Denied(_))),
+            "an entry is erased once"
+        );
+        assert_eq!(
+            m.receipt(&a).await.unwrap().unwrap().reason,
+            Reason::Requested,
+            "the first receipt stands"
+        );
+        let stub =
+            std::fs::read_to_string(dir.path().join(format!("record/dom-me/{}.md", a))).unwrap();
+        assert!(
+            stub.contains("status: erased") && stub.contains("author: erased"),
+            "{stub}"
+        );
+        drop(m);
+        for (path, bytes) in files_under(dir.path()) {
+            assert!(
+                !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                "{} still holds the erased body",
+                path.display()
+            );
+        }
     }
 }

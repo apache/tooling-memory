@@ -305,6 +305,23 @@ impl Index {
         Ok(n > 0)
     }
 
+    /// Leave no trace of what was removed: the full-text index merges its segments so
+    /// deleted documents drop out of them, and the file gives its free pages back, so the
+    /// bytes of a removed body are gone from disk rather than waiting to be overwritten.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn vacuum(&mut self) -> Result<(), Error> {
+        self.conn.execute_batch(
+            "INSERT INTO entries_fts(entries_fts) VALUES('optimize');
+             PRAGMA wal_checkpoint(TRUNCATE);
+             VACUUM;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        Ok(())
+    }
+
     /// Replace the whole index with what the record holds. One transaction: a reader
     /// sees the old index or the new one, never half.
     ///
@@ -841,6 +858,38 @@ mod tests {
         assert_eq!(
             ids(&ix.search("still", &any(), 10).unwrap()),
             vec!["mem-a-1"]
+        );
+    }
+
+    /// Bytes anywhere in the index's files: the database and whatever journal it keeps.
+    fn index_bytes(dir: &std::path::Path) -> Vec<u8> {
+        let mut all = Vec::new();
+        for f in std::fs::read_dir(dir).unwrap().flatten() {
+            all.extend(std::fs::read(f.path()).unwrap());
+        }
+        all
+    }
+
+    #[test]
+    fn a_removed_body_leaves_no_bytes_behind_once_vacuumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let marker = b"passphrase-Qz7xx";
+        {
+            let mut ix = Index::open(&path).unwrap();
+            let body = format!(
+                "The body says {m} twice: {m}.\n",
+                m = String::from_utf8_lossy(marker)
+            );
+            ix.upsert(&entry("dom-a", "mem-a-1", "A title", &body))
+                .unwrap();
+            assert!(ix.remove("mem-a-1").unwrap());
+            ix.vacuum().unwrap();
+        }
+        let bytes = index_bytes(dir.path());
+        assert!(
+            !bytes.windows(marker.len()).any(|w| w == marker),
+            "the removed body is still in the index's files"
         );
     }
 }

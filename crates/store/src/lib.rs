@@ -15,10 +15,16 @@
 //! Layout, per domain:
 //!
 //! ```text
-//! record/<domain>/<id>.md                         the current version
+//! record/<domain>/<id>.md                             the current version
 //! record/<domain>/.history/<id>/<stamp>-<digest>.md   every previous version
+//! record/<domain>/.erasures/<id>.yaml                 the receipt of an erasure
 //! ```
+//!
+//! Erasure is the one exception to the first two rules: the body leaves every version,
+//! current and archived, and the stub is written over each of them in place, with the
+//! receipt beside the record saying what was removed.
 
+use dm_core::erasure::{Receipt, Removed};
 use dm_core::{digest, Entry, Status};
 use opendal::Operator;
 use std::path::Path;
@@ -26,6 +32,7 @@ use time::{format_description::FormatItem, macros::format_description, OffsetDat
 
 const RECORD: &str = "record";
 const HISTORY: &str = ".history";
+const ERASURES: &str = ".erasures";
 const STAMP: &[FormatItem<'_>] =
     format_description!("[year][month][day]T[hour][minute][second].[subsecond digits:6]Z");
 
@@ -111,6 +118,14 @@ fn current_path(domain: &str, id: &str) -> Result<String, Error> {
 fn history_dir(domain: &str, id: &str) -> Result<String, Error> {
     Ok(format!(
         "{RECORD}/{}/{HISTORY}/{}/",
+        valid_name(domain)?,
+        valid_name(id)?
+    ))
+}
+
+fn receipt_path(domain: &str, id: &str) -> Result<String, Error> {
+    Ok(format!(
+        "{RECORD}/{}/{ERASURES}/{}.yaml",
         valid_name(domain)?,
         valid_name(id)?
     ))
@@ -238,6 +253,73 @@ impl Store {
         })?;
         entry.front.status = Some(Status::Demoted);
         self.put(&entry).await
+    }
+
+    /// Erase an entry: `stub` is written over its current version and over every
+    /// archived one, so no version keeps the body, and nothing is archived on the way.
+    /// Returns what was removed, the current version first, each with the digest of the
+    /// text it had, so a copy met later can be recognised.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when there is no such entry, a bad name, or a backend error.
+    pub async fn erase(&self, stub: &Entry) -> Result<Vec<Removed>, Error> {
+        let domain = stub.front.domain.as_str();
+        let id = stub.front.id.as_str();
+        let path = current_path(domain, id)?;
+        let current = self
+            .read_text(&path)
+            .await?
+            .ok_or_else(|| Error::NotFound {
+                domain: domain.to_string(),
+                id: id.to_string(),
+            })?;
+        let text = stub.render();
+        let mut removed = vec![Removed {
+            version: "current".into(),
+            digest: digest(&current),
+        }];
+        let dir = history_dir(domain, id)?;
+        for version in self.history(domain, id).await? {
+            self.op
+                .write(
+                    &format!("{dir}{}.md", version.name),
+                    text.clone().into_bytes(),
+                )
+                .await?;
+            removed.push(Removed {
+                version: version.name,
+                digest: digest(&version.text),
+            });
+        }
+        self.op.write(&path, text.into_bytes()).await?;
+        Ok(removed)
+    }
+
+    /// Keep the receipt of an erasure beside the record.
+    ///
+    /// # Errors
+    ///
+    /// A bad name or a backend error.
+    pub async fn put_receipt(&self, receipt: &Receipt) -> Result<(), Error> {
+        let path = receipt_path(&receipt.domain, &receipt.id)?;
+        self.op.write(&path, receipt.to_yaml().into_bytes()).await?;
+        Ok(())
+    }
+
+    /// The receipt of an erasure, if the entry was erased.
+    ///
+    /// # Errors
+    ///
+    /// A bad name, a backend error, or a receipt that does not parse.
+    pub async fn receipt(&self, domain: &str, id: &str) -> Result<Option<Receipt>, Error> {
+        let path = receipt_path(domain, id)?;
+        match self.read_text(&path).await? {
+            None => Ok(None),
+            Some(text) => Receipt::from_yaml(&text)
+                .map(Some)
+                .map_err(|source| Error::Entry { path, source }),
+        }
     }
 
     /// Ids with a current version in a domain, tombstones included, sorted.
@@ -532,6 +614,77 @@ mod tests {
         assert!(matches!(
             s.get("dom-a", "mem-a-2").await,
             Err(Error::NotText(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn erasure_writes_the_stub_over_every_version_and_keeps_a_receipt() {
+        use dm_core::erasure::{stub, Reason, Receipt};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_dir(dir.path()).unwrap();
+        for i in 1..=3 {
+            s.put(&entry(
+                "dom-a",
+                "mem-a-1",
+                &format!("version {i} of the secret\n"),
+            ))
+            .await
+            .unwrap();
+        }
+        s.put(&entry("dom-a", "mem-a-2", "another entry, kept\n"))
+            .await
+            .unwrap();
+        let current = s.get("dom-a", "mem-a-1").await.unwrap().unwrap();
+        let removed = s.erase(&stub(&current, Reason::Mistaken)).await.unwrap();
+        assert_eq!(
+            removed.len(),
+            3,
+            "the current version and two archived ones"
+        );
+        assert_eq!(removed[0].version, "current");
+        assert_eq!(removed[0].digest, digest(&current.render()));
+        let after = s.get("dom-a", "mem-a-1").await.unwrap().unwrap();
+        assert_eq!(after.front.status, Some(Status::Erased));
+        assert_eq!(after.body, "");
+        for v in s.history("dom-a", "mem-a-1").await.unwrap() {
+            assert_eq!(Entry::parse(&v.text).unwrap().body, "", "{}", v.name);
+        }
+        let receipt = Receipt {
+            id: "mem-a-1".into(),
+            domain: "dom-a".into(),
+            erased_at: OffsetDateTime::UNIX_EPOCH,
+            erased_by: "human:test:me".into(),
+            reason: Reason::Mistaken,
+            removed,
+            flagged: vec![],
+            unresolved: vec![],
+        };
+        s.put_receipt(&receipt).await.unwrap();
+        assert_eq!(s.receipt("dom-a", "mem-a-1").await.unwrap(), Some(receipt));
+        assert_eq!(s.receipt("dom-a", "mem-a-2").await.unwrap(), None);
+        // the word is in no file under the root, and the other entry is untouched
+        let mut stack = vec![dir.path().to_path_buf()];
+        let mut files = 0;
+        while let Some(d) = stack.pop() {
+            for f in std::fs::read_dir(&d).unwrap().flatten() {
+                if f.path().is_dir() {
+                    stack.push(f.path());
+                } else {
+                    files += 1;
+                    let text = std::fs::read_to_string(f.path()).unwrap();
+                    assert!(!text.contains("secret"), "{}:\n{text}", f.path().display());
+                }
+            }
+        }
+        assert_eq!(
+            files, 5,
+            "current, two archived, the receipt, the other entry"
+        );
+        assert_eq!(s.list("dom-a").await.unwrap(), vec!["mem-a-1", "mem-a-2"]);
+        assert!(matches!(
+            s.erase(&stub(&entry("dom-a", "mem-a-9", "x\n"), Reason::Legal))
+                .await,
+            Err(Error::NotFound { .. })
         ));
     }
 }

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use time::OffsetDateTime;
 
+pub mod erasure;
 pub mod filter;
 pub mod id;
 pub mod manifest;

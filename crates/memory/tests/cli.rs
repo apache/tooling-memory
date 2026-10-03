@@ -287,6 +287,80 @@ fn the_seven_m0_steps() {
 }
 
 #[test]
+fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
+    let mut d = step_init();
+    step_write(&mut d);
+    let marker = "passphrase-Qz7xx";
+    let secret = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Vault"],
+        Some(&format!("The vault opens with {marker}.\n")),
+    ));
+    let citing = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Where the vault is explained"],
+        Some(&format!("See {secret}.\n")),
+    ));
+    // the query is a word, not the secret: the read log keeps queries
+    let ids = |text: &str| -> Vec<String> {
+        json(text)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
+    let err = fails(&d.root, &["erase", &secret, "--reason", "because"]);
+    assert!(err.contains("invalid value"), "{err}");
+    let receipt = json(&ok(
+        &d.root,
+        &["erase", &secret, "--reason", "sensitive"],
+        None,
+    ));
+    assert_eq!(receipt["id"], secret);
+    assert_eq!(receipt["reason"], "sensitive");
+    assert_eq!(receipt["removed"][0]["version"], "current");
+    assert_eq!(receipt["flagged"], serde_json::json!([citing]));
+    assert!(!ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
+    let err = fails(&d.root, &["get", &secret]);
+    assert!(err.contains("not found"), "{err}");
+    let err = fails(&d.root, &["erase", &secret, "--reason", "legal"]);
+    assert!(err.contains("already erased"), "{err}");
+    let stub = std::fs::read_to_string(d.root.join(format!("record/dom-me/{secret}.md"))).unwrap();
+    assert!(
+        stub.contains("status: erased") && !stub.contains(marker),
+        "{stub}"
+    );
+    let receipt_file = d
+        .root
+        .join(format!("record/dom-me/.erasures/{secret}.yaml"));
+    assert!(receipt_file.is_file());
+    if let Some(file) = holds(&d.root, marker.as_bytes()) {
+        panic!("{} still holds the erased body", file.display());
+    }
+}
+
+/// The first file under `root` whose bytes contain `needle`.
+fn holds(root: &Path, needle: &[u8]) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for f in std::fs::read_dir(&dir).unwrap().flatten() {
+            if f.path().is_dir() {
+                stack.push(f.path());
+            } else if std::fs::read(f.path())
+                .unwrap()
+                .windows(needle.len())
+                .any(|w| w == needle)
+            {
+                return Some(f.path());
+            }
+        }
+    }
+    None
+}
+
+#[test]
 fn no_root_is_a_clear_error() {
     let out = Command::new(env!("CARGO_BIN_EXE_memory"))
         .env_remove("MEMORY_ROOT")

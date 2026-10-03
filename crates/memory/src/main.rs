@@ -539,6 +539,39 @@ enum Command {
     },
     /// Rebuild the index from the record and the ledger from its events.
     Reindex,
+    /// Erase an entry: the body leaves every version and the index, a stub and a receipt
+    /// remain, and entries that cite it are flagged for review. Irreversible; the owner
+    /// only.
+    Erase {
+        id: String,
+        /// Why, as a class: the receipt keeps it.
+        #[arg(long, value_enum)]
+        reason: ReasonArg,
+    },
+}
+
+/// Why an entry is erased, on the command line.
+#[derive(Clone, Copy, ValueEnum)]
+enum ReasonArg {
+    /// The person it concerns, or its author, asked.
+    Requested,
+    /// It should never have been written.
+    Mistaken,
+    /// It carries material above what the record may hold.
+    Sensitive,
+    /// A legal obligation.
+    Legal,
+}
+
+impl From<ReasonArg> for dm_core::erasure::Reason {
+    fn from(r: ReasonArg) -> Self {
+        match r {
+            ReasonArg::Requested => Self::Requested,
+            ReasonArg::Mistaken => Self::Mistaken,
+            ReasonArg::Sensitive => Self::Sensitive,
+            ReasonArg::Legal => Self::Legal,
+        }
+    }
 }
 
 /// Tap operations.
@@ -2137,6 +2170,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
             println!("indexed {n} entries, replayed {events} ledger events");
             Ok(())
         }
+        Command::Erase { id, reason } => json(&m.erase(&id, reason.into()).await?),
         Command::Init { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
