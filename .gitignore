@@ -9,3 +9,6 @@
 .claude/worktrees/
 local/.env
 local/.virtual-key
+
+# the taps workspace builds into its own target directory
+/taps/target/
