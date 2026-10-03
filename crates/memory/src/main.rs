@@ -106,6 +106,9 @@ enum HarnessArg {
     Gemini,
     Copilot,
     Opencode,
+    /// A program: the first argument after `--` is run as given, with the egress and
+    /// the memory server in its environment.
+    Command,
 }
 
 impl From<HarnessArg> for Harness {
@@ -116,6 +119,7 @@ impl From<HarnessArg> for Harness {
             HarnessArg::Gemini => Harness::Gemini,
             HarnessArg::Copilot => Harness::Copilot,
             HarnessArg::Opencode => Harness::OpenCode,
+            HarnessArg::Command => Harness::Command,
         }
     }
 }
@@ -693,7 +697,10 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
     Ok(match name {
         "anthropic" => Destination::forward("https://api.anthropic.com", Auth::PassThrough),
         "openai" => Destination::forward("https://api.openai.com", Auth::PassThrough),
-        "github" => Destination::tunnel(["api.github.com", "github.com", ".githubcopilot.com"]),
+        // GitHub Copilot, from Copilot CLI or from OpenCode's supported Copilot login
+        "github" | "github-copilot" => {
+            Destination::tunnel(["api.github.com", "github.com", ".githubcopilot.com"])
+        }
         // the two logins whose backend is not the public API: forwarded in the clear and
         // metered like any other, with a tunnel only for the token refresh
         "chatgpt" => Destination::forward("https://chatgpt.com/backend-api", Auth::PassThrough)
@@ -721,7 +728,12 @@ fn route_for(
             if harness == Harness::Copilot {
                 harness_env.push(("GH_TOKEN".to_string(), need("GH_TOKEN", "copilot")?));
             }
-            (pass_through_provider(&name)?, name.clone())
+            let ceiling_of = if name == "github-copilot" {
+                "github".to_string()
+            } else {
+                name.clone()
+            };
+            (pass_through_provider(&name)?, ceiling_of)
         }
         AuthMode::Key => (keyed_provider(&name)?, name.clone()),
         AuthMode::Gateway => {
@@ -946,6 +958,13 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
         (None, None) => None,
     };
+    // a command harness's program is fixed for the session; a harness's own arguments
+    // are passed once, with the run
+    let (program, args) = if Harness::from(harness) == Harness::Command {
+        (args, Vec::new())
+    } else {
+        (Vec::new(), args)
+    };
     let session = Session::start(
         root,
         harness.into(),
@@ -953,6 +972,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         provider.as_deref(),
         workdir,
         runner_for(backend_of(backend, unconfined, root), root)?,
+        program,
     )
     .await?;
     let code = match prompt {
@@ -1009,6 +1029,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         provider.as_deref(),
         workdir,
         runner_for(backend_of(backend, unconfined, root), root)?,
+        Vec::new(),
     )
     .await?;
     let options = work::Options {
@@ -1051,6 +1072,11 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
     });
     // the harness container's working tree is at the inside path; this process
     // never touches it, so any existing directory serves as the host-side value
+    let (program, args) = if Harness::from(harness) == Harness::Command {
+        (args, Vec::new())
+    } else {
+        (Vec::new(), args)
+    };
     let session = Session::start(
         root,
         harness.into(),
@@ -1058,6 +1084,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
         provider.as_deref(),
         PathBuf::from("/"),
         runner,
+        program,
     )
     .await?;
     let code = if work {
@@ -1146,6 +1173,9 @@ pub struct Session {
     auth: AuthMode,
     workdir: PathBuf,
     runner: Runner,
+    /// For a `command` harness: the program and its fixed arguments, which every run
+    /// starts with; a prompt or task comes after them.
+    program: Vec<String>,
     #[cfg(unix)]
     serve_unix: tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
 }
@@ -1188,6 +1218,7 @@ impl Session {
         provider: Option<&str>,
         workdir: PathBuf,
         mut runner: Runner,
+        program: Vec<String>,
     ) -> Result<Session, Box<dyn std::error::Error>> {
         let socket = match &runner {
             Runner::Requests(r) => Some(r.dir.join("egress.sock")),
@@ -1258,6 +1289,7 @@ impl Session {
             auth,
             workdir,
             runner,
+            program,
             #[cfg(unix)]
             serve_unix,
         })
@@ -1289,6 +1321,8 @@ impl Session {
         args: &[String],
         capture: bool,
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
+        let full: Vec<String> = [self.program.as_slice(), args].concat();
+        let args = full.as_slice();
         match &self.runner {
             Runner::Unconfined(Some((addr, _))) => run_unconfined(
                 self.harness,
@@ -1450,7 +1484,7 @@ fn run_unconfined(
                 .arg("--strict-mcp-config");
             cmd.env("MEMORY_OUTBOX", home.join(hooks::OUTBOX));
         }
-        Harness::Gemini | Harness::Copilot | Harness::OpenCode => {
+        Harness::Gemini | Harness::Copilot | Harness::OpenCode | Harness::Command => {
             return Err(format!(
                 "--unconfined is wired for claude and codex only so far; {} runs confined",
                 harness.binary()

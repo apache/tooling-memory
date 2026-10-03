@@ -107,6 +107,12 @@ why in a comment on the same line.
 `make check` is the pre-commit gate and is fast. `make verify` is what CI runs and adds
 coverage, dependencies, and the wasm build. Run `verify` before a push.
 
+Builds are faster with `sccache` and `cargo-nextest` installed (`cargo binstall sccache
+cargo-nextest`); the Makefile uses them when present and needs nothing from you. The dev
+profile keeps line tables only, so backtraces still read while the target directory stays
+small; `cargo sweep --time 7` clears stale artifacts if it grows. Remote execution for CI
+is the direction (PLAN.md, Build speed); until then the cache is local.
+
 ## Pull requests
 
 - Branch from `main`, open the PR against `main`, `make check` passing first.

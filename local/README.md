@@ -28,7 +28,9 @@ make usage                                    # tokens by destination and model
 ```
 
 Three ways to run, one launcher. Interactive is the harness as you know it. `PROMPT` runs the
-harness's headless form, prints its answer, and exits with its code; a run that leaves no
+harness's headless form with the harness's own permission prompts off, since nobody is
+there to answer them and a task needs edits and commands; the sandbox is the boundary, and
+the working tree is what it can change. It prints the answer and exits with its code; a run that leaves no
 handoff exits 4, since a non-interactive run whose outcome is only in its transcript has
 left nothing for the next session (`--no-handoff` if that is intended). `make work` claims
 the next admitted task the session may take, builds the prompt from T0, the task, where the
@@ -56,13 +58,28 @@ of what differs:
 | Codex | `model_providers.<id>.base_url` in `config.toml`; with a ChatGPT login, `chatgpt_base_url` | `mcp_servers.<id>.url` | subscription, key, gateway; `--provider xai` for Grok |
 | Gemini CLI | `GOOGLE_GEMINI_BASE_URL`; with a Google login, `CODE_ASSIST_ENDPOINT` | `mcpServers.<id>.httpUrl` | subscription, key |
 | Copilot CLI | no override exists; `HTTPS_PROXY` to the egress, which tunnels only to GitHub's Copilot hosts | `mcp-config.json` | subscription (`GH_TOKEN`) |
-| OpenCode | `provider.<id>.options.baseURL` | `mcp.<id>.url` | key; `--provider openai` or `xai` |
+| OpenCode | `provider.<id>.options.baseURL`; on a GitHub Copilot login, `HTTPS_PROXY` and the GitHub tunnel | `mcp.<id>.url` | key; `--provider openai` or `xai`; subscription with `--provider github-copilot`, which GitHub supports |
+| `command` | the program itself: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_GEMINI_BASE_URL` in its environment | `MEMORY_MCP_URL` in its environment | key, gateway; `--provider` picks the destination |
 
 Copilot is the odd one: with no base-URL override, its HTTPS goes through the egress as a
 CONNECT tunnel to an allowlist of hosts. That is pinned egress without metering: TLS runs
 end to end, so the egress sees no tokens and checks the ceiling when the tunnel opens.
 Grok is not a harness but a destination: any OpenAI-shaped harness reaches it with
-`--provider xai` and `XAI_API_KEY`.
+`--provider xai` and `XAI_API_KEY`. `command` is not a harness either but a program: the
+first argument after `--` runs as given, confined, with the egress and the memory server in
+its environment and nothing else configured. That is how a Gofannon agent, ordinary Python
+calling a gateway, runs under the same confinement and metering as a harness:
+
+```sh
+make launch HARNESS=command AUTH=gateway ARGS='python3 agent.py'
+```
+
+GitHub Copilot and the other harnesses: GitHub supports a Copilot subscription in Copilot
+CLI and, since January 2026, in OpenCode. Codex is not among the clients GitHub accepts;
+its API refuses requests from clients it does not recognise, and the community proxies
+that work around that are not something to build on. OpenCode on a Copilot login is
+`make launch HARNESS=opencode PROVIDER=github-copilot` after `opencode auth login` on the
+host, through the same tunnel Copilot CLI uses.
 
 | `AUTH` | Model calls go to | Credential | Who holds it |
 |---|---|---|---|

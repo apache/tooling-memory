@@ -371,6 +371,23 @@ async fn index() -> Html<&'static str> {
     Html(pages::INDEX)
 }
 
+async fn vendor(Path(name): Path<String>) -> Response {
+    match pages::vendor(&name) {
+        Some((content_type, bytes)) => (
+            [
+                (axum::http::header::CONTENT_TYPE, content_type),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable",
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no such file").into_response(),
+    }
+}
+
 async fn session_page(State(app): State<App>, Path(id): Path<String>) -> Response {
     match app.get(&id) {
         Some(_) => Html(pages::SESSION).into_response(),
@@ -459,6 +476,7 @@ pub fn router(config: Config) -> Result<Router, Error> {
     };
     Ok(Router::new()
         .route("/", get(index))
+        .route("/vendor/{name}", get(vendor))
         .route("/s/{id}", get(session_page))
         .route("/ws/{id}", get(ws))
         .route("/api/sessions", get(list_sessions).post(create_session))
@@ -755,6 +773,31 @@ mod tests {
         assert!(body.contains("session:"), "{body}");
         let (status, _) = http(addr, "GET", "/", None).await;
         assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn the_libraries_are_served_from_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        for (name, needle) in [
+            ("xterm.min.js", "Terminal"),
+            ("xterm.min.css", ".xterm"),
+            ("addon-fit.min.js", "FitAddon"),
+            ("marked.min.js", "marked"),
+            ("mermaid.min.js", "mermaid"),
+        ] {
+            let (status, body) = http(addr, "GET", &format!("/vendor/{name}"), None).await;
+            assert_eq!(status, 200, "{name}");
+            assert!(body.contains(needle), "{name} lacks {needle}");
+        }
+        let (status, _) = http(addr, "GET", "/vendor/evil.js", None).await;
+        assert_eq!(status, 404);
+        let (_, page) = http(addr, "GET", "/", None).await;
+        assert!(!page.contains("cdn."), "no CDN on the index page");
+        assert!(
+            !pages::SESSION.contains("cdn."),
+            "no CDN on the session page"
+        );
     }
 
     #[tokio::test]

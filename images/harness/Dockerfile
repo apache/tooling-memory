@@ -1,5 +1,6 @@
 # The harness image: every harness `memory launch` knows, at pinned versions, on one base,
-# with the memory binary where the sandbox expects it. The same image on every machine is
+# with the memory binary where the sandbox expects it, and Python for workloads that are
+# programs rather than harnesses, such as a Gofannon agent. The same image on every machine is
 # the point; nothing here depends on what a developer's WSL or laptop contains.
 #
 # Build with `make image`, which copies the release binary in beside this file.
@@ -15,7 +16,7 @@ ARG OPENCODE=1.18.34
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git xz-utils ripgrep procps less \
+      ca-certificates curl git xz-utils ripgrep procps less python3 python3-venv python3-pip \
  && rm -rf /var/lib/apt/lists/*
 
 # Node from the official tarball into /usr/local, so npm's global bin is /usr/local/bin.

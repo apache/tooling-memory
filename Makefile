@@ -1,3 +1,12 @@
+# Faster builds when the tools are there: sccache caches compiled crates across clean
+# builds and worktrees, nextest runs tests in parallel processes. Neither is required.
+SCCACHE := $(shell command -v sccache 2>/dev/null)
+ifneq ($(SCCACHE),)
+export RUSTC_WRAPPER := $(SCCACHE)
+endif
+NEXTEST := $(shell cargo nextest --version 2>/dev/null)
+TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
+
 .PHONY: init check verify fmt fmt-check clippy test guard-test deny machete coverage wasm-check run build \
 	local-up local-down local-logs local-key local-memory launch usage
 
@@ -110,8 +119,7 @@ clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
 test:
-	cargo test --workspace
-
+	$(TEST_CMD)
 guard-test:
 	sh .claude/hooks/guard-bash.test.sh
 

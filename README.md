@@ -71,7 +71,7 @@ built binary.
 | `crates/client` | A typed MCP client for the ledger and the record; what the launcher's task mode and an orchestrator use |
 | `crates/web` | The web terminal: sessions in pseudo-terminals, a reading pane over the record |
 | `crates/memory` | The binary |
-| `images/harness` | The harness image: five harnesses, Node, and `memory`, pinned |
+| `images/harness` | The harness image: five harnesses, Node, Python, and `memory`, pinned |
 | `docs/` | The paper, its case study, the stack |
 
 ## Status

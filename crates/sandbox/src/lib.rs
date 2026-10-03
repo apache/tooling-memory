@@ -77,6 +77,10 @@ pub enum Harness {
     Copilot,
     /// OpenCode.
     OpenCode,
+    /// A program rather than a harness: the first harness argument is run as given, with
+    /// the egress and the memory server in its environment and nothing else configured.
+    /// For workloads such as a Gofannon agent, which is ordinary Python calling a gateway.
+    Command,
 }
 
 impl Harness {
@@ -89,6 +93,7 @@ impl Harness {
             Harness::Gemini => "gemini",
             Harness::Copilot => "copilot",
             Harness::OpenCode => "opencode",
+            Harness::Command => "command",
         }
     }
 
@@ -97,7 +102,7 @@ impl Harness {
     pub fn provider(self) -> &'static str {
         match self {
             Harness::Claude | Harness::OpenCode => "anthropic",
-            Harness::Codex => "openai",
+            Harness::Codex | Harness::Command => "openai",
             Harness::Gemini => "gemini",
             Harness::Copilot => "github",
         }
@@ -116,29 +121,33 @@ impl Harness {
     }
 
     /// The harness's non-interactive form: run this prompt, print the answer, exit.
-    /// Tool use by the memory server is allowed up front, since nobody is there to
-    /// approve it; the sandbox is what bounds the harness, not its prompts.
+    /// Each harness's own permission prompts are turned off, since nobody is there to
+    /// answer them and a task needs edits and commands, not only memory calls. The
+    /// sandbox is what bounds the harness: the working tree, the private home, and the
+    /// egress are all it can reach, whatever it is allowed to try.
     #[must_use]
     pub fn headless(self, prompt: &str) -> Vec<String> {
         let p = prompt.to_string();
         match self {
-            Harness::Claude => vec![
-                "-p".into(),
+            Harness::Claude => vec!["-p".into(), p, "--dangerously-skip-permissions".into()],
+            Harness::Codex => vec![
+                "exec".into(),
+                "--skip-git-repo-check".into(),
+                "--full-auto".into(),
                 p,
-                "--allowedTools".into(),
-                "mcp__memory".into(),
             ],
-            Harness::Codex => vec!["exec".into(), "--skip-git-repo-check".into(), p],
             Harness::Gemini => vec!["-p".into(), p, "--approval-mode".into(), "yolo".into()],
             Harness::Copilot => vec!["-p".into(), p, "--allow-all-tools".into()],
             Harness::OpenCode => vec!["run".into(), p],
+            // a program has no headless form of its own; the prompt is its first argument
+            Harness::Command => vec![p],
         }
     }
 
     /// Whether `--provider` may point this harness at another destination.
     #[must_use]
     pub fn accepts_provider(self) -> bool {
-        matches!(self, Harness::Codex | Harness::OpenCode)
+        matches!(self, Harness::Codex | Harness::OpenCode | Harness::Command)
     }
 }
 
@@ -490,10 +499,17 @@ fn image_mounts(req: &Request<'_>) -> Vec<Mount> {
 /// file under the home that cannot be written.
 pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
     let image = req.image || req.rootfs.is_some();
-    let harness_bin = if image {
+    let harness_bin = if req.harness == Harness::Command {
+        program_of(req.harness_args, image)?
+    } else if image {
         PathBuf::from("/usr/local/bin").join(req.harness.binary())
     } else {
         find_on_path(req.harness.binary())?
+    };
+    let harness_args: &[String] = if req.harness == Harness::Command {
+        req.harness_args.get(1..).unwrap_or(&[])
+    } else {
+        req.harness_args
     };
     std::fs::create_dir_all(req.home).map_err(io(req.home))?;
     let relay = format!("http://{INSIDE_RELAY}");
@@ -547,8 +563,9 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         Harness::Gemini => setup_gemini(req, &relay, &mut env)?,
         Harness::Copilot => setup_copilot(req, &relay, &mut env)?,
         Harness::OpenCode => setup_opencode(req, &relay, &provider, &mut env)?,
+        Harness::Command => setup_command(req, &relay, &provider, &mut env),
     }
-    argv.extend(req.harness_args.iter().cloned());
+    argv.extend(harness_args.iter().cloned());
 
     Ok(Plan {
         mounts,
@@ -753,15 +770,90 @@ fn setup_copilot(
     Ok(())
 }
 
+/// The program a `command` harness runs: the first harness argument, as given when it is
+/// a path, found on PATH otherwise. In the image it is taken as given.
+fn program_of(args: &[String], image: bool) -> Result<PathBuf, Error> {
+    let Some(first) = args.first() else {
+        return Err(Error::Unsupported(
+            "--harness command needs the program to run after `--`".into(),
+        ));
+    };
+    let p = Path::new(first);
+    if p.is_absolute() || image {
+        return Ok(p.to_path_buf());
+    }
+    find_on_path(first)
+}
+
+/// A program gets the egress and the memory server as environment and nothing else:
+/// base URLs for the three API shapes at the destination it was given, a placeholder
+/// credential the egress replaces, and the memory server's address.
+fn setup_command(
+    req: &Request<'_>,
+    relay: &str,
+    provider: &str,
+    env: &mut BTreeMap<String, String>,
+) {
+    env.insert("MEMORY_MCP_URL".into(), format!("{relay}/mcp"));
+    env.insert("MEMORY_PROVIDER".into(), provider.to_string());
+    env.insert("OPENAI_BASE_URL".into(), format!("{relay}/{provider}/v1"));
+    env.insert("ANTHROPIC_BASE_URL".into(), format!("{relay}/{provider}"));
+    env.insert(
+        "GOOGLE_GEMINI_BASE_URL".into(),
+        format!("{relay}/{provider}"),
+    );
+    if req.auth != AuthMode::Subscription {
+        for k in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"] {
+            env.insert(k.into(), "egress".into());
+        }
+    }
+}
+
+/// OpenCode on a GitHub Copilot subscription, which GitHub supports: the login OpenCode
+/// made on the host is copied in, and its HTTPS goes through the egress as a tunnel to
+/// GitHub's hosts, as Copilot CLI's does. Pinned egress without metering.
+fn setup_opencode_copilot(
+    req: &Request<'_>,
+    relay: &str,
+    env: &mut BTreeMap<String, String>,
+) -> Result<(), Error> {
+    copy_login(
+        req,
+        ".local/share/opencode/auth.json",
+        "an OpenCode GitHub Copilot login (`opencode auth login`, GitHub Copilot)",
+    )?;
+    proxy_via(relay, env);
+    let config = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "autoupdate": false,
+        "mcp": {
+            "memory": { "type": "remote", "url": format!("{relay}/mcp"), "enabled": true }
+        }
+    });
+    write(
+        &req.home.join(".config/opencode/opencode.json"),
+        &serde_json::to_string_pretty(&config).unwrap_or_default(),
+    )?;
+    env.insert("XDG_CONFIG_HOME".into(), format!("{INSIDE_HOME}/.config"));
+    env.insert(
+        "XDG_DATA_HOME".into(),
+        format!("{INSIDE_HOME}/.local/share"),
+    );
+    Ok(())
+}
+
 fn setup_opencode(
     req: &Request<'_>,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
+    if req.auth == AuthMode::Subscription && provider == "github-copilot" {
+        return setup_opencode_copilot(req, relay, env);
+    }
     if req.auth == AuthMode::Subscription {
         return Err(Error::Unsupported(
-            "opencode's Claude Pro/Max login is something Anthropic prohibits for third-party clients; use --auth key".into(),
+            "opencode's Claude Pro/Max login is something Anthropic prohibits for third-party clients; use --auth key, or --provider github-copilot with your GitHub Copilot login".into(),
         ));
     }
     let (npm, key_env) = match provider {
@@ -1285,6 +1377,85 @@ mod tests {
         assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
         assert!(!plan.env.contains_key("GEMINI_API_KEY"));
         assert!(!plan.env.contains_key("GOOGLE_GEMINI_BASE_URL"));
+    }
+
+    #[test]
+    fn a_command_harness_runs_a_program_with_the_egress_in_its_environment() {
+        let f = fixture();
+        let args = vec!["sh".to_string(), "-c".to_string(), "echo hi".to_string()];
+        let (_home, plan) = f
+            .plan_with(
+                Harness::Command,
+                AuthMode::Key,
+                Some("openai"),
+                "cmd1",
+                &args,
+                false,
+                &[],
+            )
+            .unwrap();
+        // `sh` resolves to whatever the host's shell is, dash on Debian and Ubuntu
+        let sh_path = find_on_path("sh").unwrap().display().to_string();
+        let sh = plan.argv.iter().position(|a| *a == sh_path).unwrap();
+        assert_eq!(&plan.argv[sh + 1..], &["-c", "echo hi"]);
+        assert_eq!(plan.env["MEMORY_MCP_URL"], "http://127.0.0.1:4100/mcp");
+        assert_eq!(
+            plan.env["OPENAI_BASE_URL"],
+            "http://127.0.0.1:4100/openai/v1"
+        );
+        assert_eq!(plan.env["OPENAI_API_KEY"], "egress");
+        assert!(matches!(
+            f.plan(Harness::Command, AuthMode::Key, "cmd2", &[], false),
+            Err(Error::Unsupported(_))
+        ));
+        let gw = f
+            .plan_with(
+                Harness::Command,
+                AuthMode::Gateway,
+                None,
+                "cmd3",
+                &["/usr/bin/python3".to_string(), "agent.py".to_string()],
+                false,
+                &[],
+            )
+            .unwrap()
+            .1;
+        assert!(gw.argv.contains(&"/usr/bin/python3".to_string()));
+        assert_eq!(gw.env["MEMORY_PROVIDER"], "openai");
+    }
+
+    #[test]
+    fn opencode_on_a_copilot_login_tunnels_like_copilot_cli() {
+        let f = fixture();
+        std::fs::create_dir_all(f.host_home.join(".local/share/opencode")).unwrap();
+        std::fs::write(
+            f.host_home.join(".local/share/opencode/auth.json"),
+            r#"{"github-copilot":{"type":"oauth"}}"#,
+        )
+        .unwrap();
+        let (home, plan) = f
+            .plan_with(
+                Harness::OpenCode,
+                AuthMode::Subscription,
+                Some("github-copilot"),
+                "oc1",
+                &[],
+                true,
+                &[],
+            )
+            .unwrap();
+        assert!(home.join(".local/share/opencode/auth.json").is_file());
+        assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
+        let c = json_file(&home.join(".config/opencode/opencode.json"));
+        assert!(
+            c.get("provider").is_none(),
+            "no base-URL override: the tunnel carries it"
+        );
+        assert_eq!(c["mcp"]["memory"]["type"], "remote");
+        assert!(matches!(
+            f.plan(Harness::OpenCode, AuthMode::Subscription, "oc2", &[], true),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[test]

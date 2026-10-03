@@ -372,7 +372,10 @@ fn work_files_the_output_and_releases_when_the_harness_stops_short() {
     let args = std::fs::read_to_string(work_dir.join("fake.out")).unwrap();
     assert!(args.contains("-p "), "{args}");
     assert!(args.contains(&id), "{args}");
-    assert!(args.contains("--allowedTools mcp__memory"), "{args}");
+    assert!(
+        args.contains("--dangerously-skip-permissions"),
+        "the sandbox is the boundary: {args}"
+    );
     assert!(args.contains("# T0 for dom-me"), "{args}");
     assert!(args.contains("do not call `heartbeat`"), "{args}");
 
