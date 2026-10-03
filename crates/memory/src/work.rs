@@ -30,8 +30,16 @@ pub struct Options {
     pub keep_going: bool,
     /// How long to wait when the queue is empty, with `keep_going`.
     pub idle: Duration,
-    /// Mine the transcript after each task with this model, when set.
-    pub mine: Option<String>,
+    /// Mine the transcript after each task, when set.
+    pub mine: Option<MinePlan>,
+}
+
+/// How to mine after a task.
+pub struct MinePlan {
+    /// The model, or the destination's small default.
+    pub model: Option<String>,
+    /// Through a prompted run of the harness rather than a direct call.
+    pub via_harness: bool,
 }
 
 /// A client joined to this process's memory server by a byte pipe: the same JSON-RPC
@@ -169,8 +177,13 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
             continue;
         };
         last = one(session, &client, &task, options.lease_seconds).await?;
-        if let Some(model) = &options.mine {
-            if let Err(e) = session.mine(Some(model)).await {
+        if let Some(plan) = &options.mine {
+            let via = if plan.via_harness {
+                crate::MineVia::Harness
+            } else {
+                crate::MineVia::Api
+            };
+            if let Err(e) = session.mine(plan.model.as_deref(), via).await {
                 eprintln!("memory: mining failed: {e}");
             }
         }

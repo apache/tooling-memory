@@ -640,3 +640,75 @@ fn hook_notes_become_handoffs_when_the_run_left_none() {
             .unwrap_or(true)
     );
 }
+
+// ---- mining through the harness itself, as a subscription login requires ----
+
+/// A fake harness: a normal prompt gets a normal answer; a mining run, recognisable by the
+/// model flag, gets a JSON array of proposals, as a model would print it.
+const MINES_WHEN_ASKED: &str = r#"
+case "$*" in
+  *--model*) printf '%s\n' '[{"kind":"fact","title":"The import has five steps","body":"Steps one to five; the fourth, digests, is the slow one and failed before."}]' ;;
+  *) echo "the answer" ;;
+esac
+"#;
+
+#[test]
+fn mining_can_go_through_the_harness_on_a_small_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), MINES_WHEN_ASKED);
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    // a transcript for the mining run to read, where Claude Code would leave one
+    let projects = root.join("state/sandbox/claude/.claude/projects/p");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join("s.jsonl"),
+        r#"{"type":"user","message":{"role":"user","content":"Finish the import; step four is digests."}}"#,
+    )
+    .unwrap();
+    let mut cmd = memory();
+    cmd.args([
+        "--root",
+        root.to_str().unwrap(),
+        "launch",
+        "--harness",
+        "claude",
+        "--auth",
+        "key",
+        "--unconfined",
+    ]);
+    cmd.args([
+        "--workdir",
+        work_dir.to_str().unwrap(),
+        "--prompt",
+        "finish the import",
+        "--no-handoff",
+    ]);
+    cmd.args([
+        "--mine",
+        "--mine-via",
+        "harness",
+        "--mine-model",
+        "claude-haiku-4-5-20251001",
+    ]);
+    cmd.env("PATH", path_with(&bins));
+    cmd.env("ANTHROPIC_API_KEY", "sk-ant-placeholder");
+    cmd.stdin(Stdio::null());
+    let out = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("mined fact"), "{stderr}");
+    assert!(stderr.contains("mined 1 entries"), "{stderr}");
+    let list = cli(&root, &["list", "--kind", "fact"]);
+    let titles: Vec<String> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["title"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        titles.iter().any(|t| t == "The import has five steps"),
+        "{titles:?}"
+    );
+}

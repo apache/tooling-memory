@@ -137,6 +137,17 @@ enum ImageOp {
     Path,
 }
 
+/// How mining reaches a model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum MineVia {
+    /// Through the harness on a subscription login, directly through the egress otherwise.
+    Auto,
+    /// A prompted run of the harness itself, which is the client the login belongs to.
+    Harness,
+    /// A direct call through the egress, with a key or the gateway.
+    Api,
+}
+
 /// Where the harness runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum BackendArg {
@@ -234,6 +245,9 @@ enum Command {
         /// The model mining uses; a small default per destination otherwise.
         #[arg(long)]
         mine_model: Option<String>,
+        /// How mining reaches the model.
+        #[arg(long, value_enum, default_value = "auto")]
+        mine_via: MineVia,
         /// Arguments passed to the harness.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -279,6 +293,8 @@ enum Command {
         mine: bool,
         #[arg(long)]
         mine_model: Option<String>,
+        #[arg(long, value_enum, default_value = "auto")]
+        mine_via: MineVia,
     },
     /// Mine one transcript for entries with a small model through a destination.
     Mine {
@@ -999,6 +1015,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         no_handoff,
         mine: mine_after,
         mine_model,
+        mine_via,
         args,
     } = command
     else {
@@ -1040,7 +1057,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         None => work::interactive(&session, &args).await?,
     };
     if mine_after {
-        session.mine(mine_model.as_deref()).await?;
+        session.mine(mine_model.as_deref(), mine_via).await?;
     }
     session.finish(code);
     std::process::exit(code);
@@ -1061,6 +1078,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         idle_seconds,
         mine: mine_after,
         mine_model,
+        mine_via,
     } = command
     else {
         unreachable!("routed by launch_cmd")
@@ -1102,8 +1120,9 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         lease_seconds,
         keep_going,
         idle: std::time::Duration::from_secs(idle_seconds),
-        mine: mine_after.then(|| {
-            mine_model.unwrap_or_else(|| mine::default_model(&session.provider()).to_string())
+        mine: mine_after.then(|| work::MinePlan {
+            model: mine_model,
+            via_harness: session.mines_via_harness(mine_via),
         }),
     };
     let code = work::run(&session, &options).await?;
@@ -1422,14 +1441,28 @@ impl Session {
         &self.p.home
     }
 
-    /// Mine the newest transcript in the private home, if there is one.
+    /// Whether mining goes through the harness: always on a subscription login, since
+    /// that credential belongs to the harness and may be used by nothing else; by choice
+    /// otherwise.
+    pub fn mines_via_harness(&self, via: MineVia) -> bool {
+        match via {
+            MineVia::Harness => true,
+            MineVia::Api => false,
+            MineVia::Auto => self.auth == AuthMode::Subscription,
+        }
+    }
+
+    /// Mine the newest transcript in the private home, if there is one. Through the
+    /// harness on a subscription login: a prompted, confined run of the harness itself on
+    /// a small model, whose printed answer is the proposals. Through the egress otherwise.
     ///
     /// # Errors
     ///
-    /// When the model call or a write fails.
+    /// When the model call, the harness run, or a write fails.
     pub async fn mine(
         &self,
         model: Option<&str>,
+        via: MineVia,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let Some(t) = mine::newest_transcript(&self.p.home) else {
             eprintln!("memory: nothing to mine; no transcript under the private home");
@@ -1440,10 +1473,35 @@ impl Session {
             str::to_string,
         );
         let client = work::client(self.p.memory.clone()).await?;
-        let ids = mine::mine(&self.p.egress, &client, &self.p.provider, &model, &t).await?;
+        let ids = if self.mines_via_harness(via) {
+            self.mine_via_harness(&client, &model, &t).await?
+        } else {
+            mine::mine(&self.p.egress, &client, &self.p.provider, &model, &t).await?
+        };
         eprintln!("memory: mined {} entries from {}", ids.len(), t.display());
         client.close().await.ok();
         Ok(ids)
+    }
+
+    async fn mine_via_harness(
+        &self,
+        client: &dm_client::MemoryClient,
+        model: &str,
+        transcript: &Path,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let Some(excerpt) = mine::excerpt_of(transcript)? else {
+            return Ok(Vec::new());
+        };
+        let mut args = self.harness.headless(&mine::prompt_for(&excerpt));
+        args.extend(self.harness.model_flag(model));
+        let (code, output) = self.run(&args, true).await?;
+        // the mining run is not a session anyone continues: its own hook notes go
+        let _ = std::fs::remove_dir_all(self.outbox());
+        if code != 0 {
+            return Err(format!("the mining run exited {code}").into());
+        }
+        let found = mine::proposals(&output.unwrap_or_default());
+        mine::write_proposals(client, &found, transcript, model).await
     }
 
     /// Run the harness once with these arguments. With `capture`, its standard output

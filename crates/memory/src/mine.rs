@@ -42,10 +42,61 @@ that worked. Leave out chit-chat, tool noise, and anything already obvious from 
 Answer with a JSON array only, no prose, each element {\"kind\": \"fact\"|\"decision\"|\"convention\"|\"method\", \
 \"title\": one line, \"body\": Markdown, a paragraph or two}. An empty array is a fine answer.";
 
+/// The prompt, for a model reached directly or through a harness.
+#[must_use]
+pub fn prompt_for(excerpt: &str) -> String {
+    format!("{INSTRUCTIONS}\n\n## Transcript excerpt\n\n{excerpt}")
+}
+
+/// The excerpt a transcript yields, or none when there is nothing to read.
+///
+/// # Errors
+///
+/// When the transcript cannot be read.
+pub fn excerpt_of(transcript: &Path) -> std::io::Result<Option<String>> {
+    let text = std::fs::read_to_string(transcript)?;
+    let excerpt = transcript_tail(&text, 60, 40_000);
+    Ok((!excerpt.trim().is_empty()).then_some(excerpt))
+}
+
+/// Write proposals as entries: raw tier, low confidence, the transcript as source.
+///
+/// # Errors
+///
+/// When a write fails.
+pub async fn write_proposals(
+    client: &MemoryClient,
+    found: &[Proposal],
+    transcript: &Path,
+    model: &str,
+) -> Fallible<Vec<String>> {
+    let source = format!("transcript:{}", transcript.display());
+    let mut ids = Vec::new();
+    for p in found {
+        let id = client
+            .write_entry(&NewEntry {
+                kind: &p.kind,
+                title: &p.title,
+                body: &format!(
+                    "{}\n\n*Mined from a session transcript by {model}; raw, low confidence, \
+                     for a person to confirm or drop.*\n",
+                    p.body.trim()
+                ),
+                confidence: Some("low"),
+                source: vec![source.clone()],
+                domain: None,
+            })
+            .await?;
+        eprintln!("memory: mined {} {id}: {}", p.kind, p.title);
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
 /// The request body for a destination's API shape.
 #[must_use]
 pub fn request(destination: &str, model: &str, excerpt: &str) -> (String, Value) {
-    let user = format!("{INSTRUCTIONS}\n\n## Transcript excerpt\n\n{excerpt}");
+    let user = prompt_for(excerpt);
     match destination {
         "anthropic" => (
             "v1/messages".into(),
@@ -111,35 +162,13 @@ pub async fn mine(
     model: &str,
     transcript: &Path,
 ) -> Fallible<Vec<String>> {
-    let text = std::fs::read_to_string(transcript)?;
-    let excerpt = transcript_tail(&text, 60, 40_000);
-    if excerpt.trim().is_empty() {
+    let Some(excerpt) = excerpt_of(transcript)? else {
         return Ok(Vec::new());
-    }
+    };
     let (path, body) = request(destination, model, &excerpt);
     let answer = egress.call(destination, &path, &body).await?;
     let found = proposals(&answer_text(destination, &answer));
-    let source = format!("transcript:{}", transcript.display());
-    let mut ids = Vec::new();
-    for p in &found {
-        let id = client
-            .write_entry(&NewEntry {
-                kind: &p.kind,
-                title: &p.title,
-                body: &format!(
-                    "{}\n\n*Mined from a session transcript by {model}; raw, low confidence, \
-                     for a person to confirm or drop.*\n",
-                    p.body.trim()
-                ),
-                confidence: Some("low"),
-                source: vec![source.clone()],
-                domain: None,
-            })
-            .await?;
-        eprintln!("memory: mined {} {id}: {}", p.kind, p.title);
-        ids.push(id);
-    }
-    Ok(ids)
+    write_proposals(client, &found, transcript, model).await
 }
 
 /// The newest transcript a harness left under its private home: Claude Code's project

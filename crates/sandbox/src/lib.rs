@@ -144,6 +144,18 @@ impl Harness {
         }
     }
 
+    /// The flag that picks a model for one run, where the harness has one.
+    #[must_use]
+    pub fn model_flag(self, model: &str) -> Vec<String> {
+        match self {
+            Harness::Claude | Harness::Copilot => vec!["--model".into(), model.into()],
+            Harness::Codex | Harness::Gemini | Harness::OpenCode => {
+                vec!["-m".into(), model.into()]
+            }
+            Harness::Command => Vec::new(),
+        }
+    }
+
     /// Whether `--provider` may point this harness at another destination.
     #[must_use]
     pub fn accepts_provider(self) -> bool {

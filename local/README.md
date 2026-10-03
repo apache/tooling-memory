@@ -178,8 +178,12 @@ read the transcript's tail and propose entries: facts, decisions, conventions, m
 They land at raw tier with low confidence and the transcript as their source, for a person
 to confirm or drop; nothing mined is trusted on arrival. The default model is a small one
 per destination (`--mine-model` overrides): mining is a librarian's job, and the paper puts
-librarians on the cheap class. In subscription mode the session's login is the harness's,
-not ours, so mining needs `--auth key` or `gateway`.
+librarians on the cheap class. Two routes, picked by `--mine-via auto`: on a subscription
+login the call is a prompted, confined run of the harness itself on the small model, since
+that credential belongs to the harness and may be used by nothing else, and the harness's
+printed answer is the proposals; with a key or the gateway it is a direct call through the
+egress, metered like any other. Proven here on a Max login: Claude Code on Haiku read a
+session's transcript and filed two facts.
 
 ## The gateway inside the VM
 
