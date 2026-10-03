@@ -582,9 +582,26 @@ fn main() {
         }
         std::process::exit(0);
     }
-    if let Err(e) = run_cli() {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    // The command futures are large and Windows gives the main thread one megabyte, so
+    // the CLI runs on a thread with room; the runtime starts there.
+    let outcome = std::thread::Builder::new()
+        .name("memory".into())
+        .stack_size(64 << 20)
+        .spawn(|| run_cli().map_err(|e| e.to_string()))
+        .and_then(|h| {
+            h.join()
+                .map_err(|_| std::io::Error::other("the CLI thread panicked"))
+        });
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
