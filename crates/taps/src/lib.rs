@@ -8,7 +8,9 @@
 //! through one hook: a host outside the grant is refused, a label above the ceiling is
 //! refused, and the credential goes on as a bearer token so the tap never holds it.
 //! Everything the tap writes is a proposal in the owner's domain, under the tap's own
-//! author: a task born proposed, or an entry at raw tier.
+//! author: a task born proposed, or an entry at raw tier. The one thing it reads is the
+//! handoffs of its domain's completed tasks from upstream, under its ceiling, to post
+//! them back.
 
 use dm_core::{Confidence, EntryType};
 use dm_policy::TapGrant;
@@ -26,7 +28,7 @@ use wasmtime_wasi_http::{
 #[allow(missing_docs)] // generated from wit/tap.wit, which carries the documentation
 mod bindings;
 
-use bindings::durable_memory::tap::memory::{Filed, Host, Proposal, Task};
+use bindings::durable_memory::tap::memory::{Done, Filed, Host, Proposal, Task};
 use bindings::Tap;
 
 /// What can go wrong running a tap.
@@ -218,6 +220,35 @@ impl Host for State {
         })
     }
 
+    async fn completed(&mut self) -> wasmtime::Result<Result<Vec<Done>, String>> {
+        // the ceiling bounds what the tap may read as it bounds what it may send: a
+        // handoff above it is not handed out, and the tap's label stays under it
+        let ceiling = self.hooks.ceiling;
+        Ok(match self.memory.unposted(&self.domain, ceiling).await {
+            Ok(done) => Ok(done
+                .into_iter()
+                .map(|(task, handoff)| Done {
+                    id: task.id,
+                    title: task.spec.title,
+                    origin: task.spec.origin.unwrap_or_default(),
+                    upstream_event: task.spec.upstream_event.unwrap_or_default(),
+                    handoff: handoff.front.id.clone(),
+                    text: handoff.body,
+                })
+                .collect()),
+            Err(e) => Err(e.to_string()),
+        })
+    }
+
+    async fn posted(&mut self, id: String, to: String) -> wasmtime::Result<Result<(), String>> {
+        Ok(self
+            .memory
+            .post(&id, &to)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string()))
+    }
+
     async fn propose(&mut self, p: Proposal) -> wasmtime::Result<Result<String, String>> {
         let entry_type = match p.kind.parse::<EntryType>() {
             Ok(k) => k,
@@ -248,6 +279,8 @@ pub struct Outcome {
     pub deduplicated: u32,
     /// Entries proposed.
     pub proposed: u32,
+    /// Handoffs posted back upstream.
+    pub posted: u32,
     /// The tap's one-line note to the owner.
     pub note: String,
     /// Outbound calls the host refused, in words, whether or not the tap went on.
@@ -363,6 +396,7 @@ pub async fn run(
             filed: r.filed,
             deduplicated: r.deduplicated,
             proposed: r.proposed,
+            posted: r.posted,
             note: r.note,
             refused,
         }),

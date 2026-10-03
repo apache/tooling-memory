@@ -165,6 +165,7 @@ impl Guest for Component {
             filed: 0,
             deduplicated: 0,
             proposed: 0,
+            posted: 0,
             note: String::new(),
         };
         let (mut pages, mut skipped, mut unreadable) = (0usize, 0u32, 0u32);

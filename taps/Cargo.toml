@@ -1,7 +1,7 @@
 # The taps: WASI components, built for wasm32-wasip2, outside the native workspace.
 [workspace]
 resolver = "2"
-members = ["github-issues"]
+members = ["github-issues", "github-comments"]
 
 [workspace.package]
 version = "0.1.0"

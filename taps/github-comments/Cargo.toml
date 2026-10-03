@@ -1,0 +1,15 @@
+[package]
+name = "tap-github-comments"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A tap: the handoff of a completed task that came from a GitHub issue is posted back on the issue"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasi = "0.14"
+wit-bindgen = "0.62"

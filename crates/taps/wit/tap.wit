@@ -4,7 +4,9 @@
 /// clocks and random the standard library needs, and outbound HTTP to the hosts its
 /// grant names, with the tracker's credential injected by the host so the tap never
 /// holds it. It gets no filesystem, no sockets, no environment. What it writes lands
-/// in the owner's domain as proposals: tasks born proposed, entries at raw tier.
+/// in the owner's domain as proposals: tasks born proposed, entries at raw tier. What
+/// it reads is one thing: the handoffs of its domain's completed tasks that came from
+/// upstream, so it can post them back.
 package durable-memory:tap@0.1.0;
 
 interface memory {
@@ -50,6 +52,30 @@ interface memory {
 
     /// Write a proposal. Returns the new entry's id.
     propose: func(p: proposal) -> result<string, string>;
+
+    /// A task that came from upstream and is done, whose handoff has not been posted
+    /// back where the task came from.
+    record done {
+        /// The task's id.
+        id: string,
+        /// One line.
+        title: string,
+        /// What the task cited upstream, such as `github:apache/x#12`.
+        origin: string,
+        /// The upstream event that produced it.
+        upstream-event: string,
+        /// The handoff entry's id.
+        handoff: string,
+        /// The handoff's body, as the record holds it.
+        text: string,
+    }
+
+    /// The tap's domain's completed tasks from upstream whose handoff was not yet posted
+    /// back, oldest first. A handoff above the tap's ceiling is not handed out.
+    completed: func() -> result<list<done>, string>;
+
+    /// Record where a done task's handoff was posted, so it is posted once.
+    posted: func(id: string, to: string) -> result<_, string>;
 }
 
 world tap {
@@ -63,6 +89,8 @@ world tap {
         deduplicated: u32,
         /// Entries proposed.
         proposed: u32,
+        /// Handoffs posted back upstream.
+        posted: u32,
         /// Anything the tap wants the owner to read, one line.
         note: string,
     }

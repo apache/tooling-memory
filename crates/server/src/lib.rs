@@ -30,6 +30,7 @@ pub mod mcp;
 pub mod reads;
 pub mod recall;
 pub mod t0;
+mod taps;
 
 /// The grants file, relative to the root.
 pub const GRANTS_FILE: &str = "grants.toml";

@@ -168,6 +168,9 @@ pub struct Task {
     pub reason: Option<String>,
     /// The task that replaced it, when invalidated as a duplicate.
     pub superseded_by: Option<String>,
+    /// Where its handoff was posted back upstream, once a tap has done so.
+    #[serde(default)]
+    pub posted_to: Option<String>,
 }
 
 /// The result of filing a task.
@@ -225,7 +228,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts       INTEGER NOT NULL DEFAULT 0,
     handoff        TEXT,
     reason         TEXT,
-    superseded_by  TEXT
+    superseded_by  TEXT,
+    posted_to      TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON tasks (domain, status, priority DESC, created);
 DROP INDEX IF EXISTS tasks_origin;
@@ -264,6 +268,10 @@ enum Event {
         reason: String,
         superseded_by: Option<String>,
     },
+    /// The handoff of a completed task was posted back where the task came from.
+    Posted {
+        to: String,
+    },
 }
 
 fn fmt_time(t: OffsetDateTime) -> String {
@@ -293,7 +301,7 @@ fn label_from_rank(id: &str, rank: i64) -> Result<Label, Error> {
 const TASK_COLUMNS: &str =
     "id, domain, title, body, requirements, depends_on, origin, upstream_event,
     created_by, label_rank, priority, created, status, holder, lease_until, attempts, handoff,
-    reason, superseded_by";
+    reason, superseded_by, posted_to";
 
 fn task_from_row(row: &Row<'_>) -> Result<Task, Error> {
     let id: String = row.get(0)?;
@@ -331,6 +339,7 @@ fn task_from_row(row: &Row<'_>) -> Result<Task, Error> {
         handoff: row.get(16)?,
         reason: row.get(17)?,
         superseded_by: row.get(18)?,
+        posted_to: row.get(19)?,
         id,
     })
 }
@@ -357,6 +366,15 @@ impl Ledger {
     fn init(conn: Connection) -> Result<Ledger, Error> {
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         conn.execute_batch(SCHEMA)?;
+        // a ledger from before handoffs were posted back has no column for it
+        let has_posted: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'posted_to'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_posted == 0 {
+            conn.execute_batch("ALTER TABLE tasks ADD COLUMN posted_to TEXT;")?;
+        }
         Ok(Ledger {
             conn,
             clock: Box::new(OffsetDateTime::now_utc),
@@ -667,6 +685,44 @@ impl Ledger {
         rows.map(|r| r?).collect()
     }
 
+    /// Record that a completed task's handoff was posted back where the task came from,
+    /// at `to`, so it is not posted twice.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`], or [`Error::WrongState`] when the task is not completed or
+    /// was posted already.
+    pub fn post(&mut self, id: &str, to: &str) -> Result<Task, Error> {
+        let task = self.get(id)?;
+        if task.status != Status::Completed || task.posted_to.is_some() {
+            return Err(Error::WrongState {
+                id: id.to_string(),
+                status: task.status,
+                op: "post",
+            });
+        }
+        let now = self.now();
+        self.append_at(id, now, &Event::Posted { to: to.to_string() })?;
+        self.get(id)
+    }
+
+    /// Completed tasks in a domain that came from upstream and whose handoff has not
+    /// been posted back, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the ledger did not write.
+    pub fn unposted(&self, domain: &str) -> Result<Vec<Task>, Error> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks
+             WHERE domain = ?1 AND status = 'completed' AND origin IS NOT NULL
+               AND posted_to IS NULL
+             ORDER BY created"
+        ))?;
+        let rows = stmt.query_map(params![domain], |r| Ok(task_from_row(r)))?;
+        rows.map(|r| r?).collect()
+    }
+
     /// Tasks that depend on this one.
     ///
     /// # Errors
@@ -786,6 +842,7 @@ impl Ledger {
             Event::HandoffLeft { .. } => "handoff_left",
             Event::Completed { .. } => "completed",
             Event::Invalidated { .. } => "invalidated",
+            Event::Posted { .. } => "posted",
         };
         conn.execute(
             "INSERT INTO events (task_id, kind, at, payload) VALUES (?1, ?2, ?3, ?4)",
@@ -795,6 +852,37 @@ impl Ledger {
     }
 
     /// Update the projection for one event. Replay calls this and nothing else.
+    /// The row a `Created` event projects to: a task born proposed.
+    fn insert_task(
+        conn: &Connection,
+        id: &str,
+        at: OffsetDateTime,
+        spec: &TaskSpec,
+    ) -> Result<(), Error> {
+        let requirements = serde_json::to_string(&spec.requirements).unwrap_or_default();
+        let depends_on = serde_json::to_string(&spec.depends_on).unwrap_or_default();
+        conn.execute(
+            "INSERT INTO tasks (id, domain, title, body, requirements, depends_on, origin,
+                upstream_event, created_by, label_rank, priority, created, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'proposed')",
+            params![
+                id,
+                spec.domain,
+                spec.title,
+                spec.body,
+                requirements,
+                depends_on,
+                spec.origin,
+                spec.upstream_event,
+                spec.created_by,
+                spec.classification as i64,
+                spec.priority,
+                fmt_time(at),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn project(
         conn: &Connection,
         id: &str,
@@ -802,29 +890,7 @@ impl Ledger {
         event: &Event,
     ) -> Result<(), Error> {
         match event {
-            Event::Created { id: new_id, spec } => {
-                let requirements = serde_json::to_string(&spec.requirements).unwrap_or_default();
-                let depends_on = serde_json::to_string(&spec.depends_on).unwrap_or_default();
-                conn.execute(
-                    "INSERT INTO tasks (id, domain, title, body, requirements, depends_on, origin,
-                        upstream_event, created_by, label_rank, priority, created, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'proposed')",
-                    params![
-                        new_id,
-                        spec.domain,
-                        spec.title,
-                        spec.body,
-                        requirements,
-                        depends_on,
-                        spec.origin,
-                        spec.upstream_event,
-                        spec.created_by,
-                        spec.classification as i64,
-                        spec.priority,
-                        fmt_time(at),
-                    ],
-                )?;
-            }
+            Event::Created { id: new_id, spec } => Ledger::insert_task(conn, new_id, at, spec)?,
             Event::Admitted => {
                 conn.execute(
                     "UPDATE tasks SET status = 'admitted' WHERE id = ?1",
@@ -872,6 +938,12 @@ impl Ledger {
                     "UPDATE tasks SET status = 'invalidated', reason = ?2, superseded_by = ?3,
                         lease_until = NULL WHERE id = ?1",
                     params![id, reason, superseded_by],
+                )?;
+            }
+            Event::Posted { to } => {
+                conn.execute(
+                    "UPDATE tasks SET posted_to = ?2 WHERE id = ?1",
+                    params![id, to],
                 )?;
             }
         }
@@ -1180,5 +1252,60 @@ mod tests {
         let l = Ledger::open(&path).unwrap();
         assert_eq!(l.get(&id).unwrap().status, Status::Admitted);
         assert_eq!(l.list("dom-a", Status::Admitted).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_completed_task_from_upstream_is_posted_back_once() {
+        let (mut l, _) = ledger();
+        let mut s = spec("From an issue");
+        s.origin = Some("github:acme/widgets#12".into());
+        s.upstream_event = Some("open:2026-10-01T09:00:00Z".into());
+        let from_upstream = l.create(s).unwrap().task;
+        let local = l.create(spec("Filed by hand")).unwrap().task;
+        for t in [&from_upstream, &local] {
+            l.admit(&t.id).unwrap();
+            l.claim(&t.id, "s1", mins(5), &[]).unwrap();
+        }
+        assert!(
+            l.unposted("dom-a").unwrap().is_empty(),
+            "nothing is done yet"
+        );
+        assert!(matches!(
+            l.post(&from_upstream.id, "https://x/1"),
+            Err(Error::WrongState { op: "post", .. })
+        ));
+        l.complete(&from_upstream.id, "s1", "mem-a-h1").unwrap();
+        l.complete(&local.id, "s1", "mem-a-h2").unwrap();
+        let due: Vec<String> = l
+            .unposted("dom-a")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            due,
+            vec![from_upstream.id.clone()],
+            "only what came from upstream"
+        );
+        assert!(l.unposted("dom-b").unwrap().is_empty());
+        let posted = l
+            .post(
+                &from_upstream.id,
+                "https://github.com/acme/widgets/issues/12#c1",
+            )
+            .unwrap();
+        assert_eq!(
+            posted.posted_to.as_deref(),
+            Some("https://github.com/acme/widgets/issues/12#c1")
+        );
+        assert!(l.unposted("dom-a").unwrap().is_empty());
+        assert!(matches!(
+            l.post(&from_upstream.id, "https://x/2"),
+            Err(Error::WrongState { op: "post", .. })
+        ));
+        let events = l.event_count().unwrap();
+        l.rebuild().unwrap();
+        assert_eq!(l.event_count().unwrap(), events);
+        assert_eq!(l.get(&from_upstream.id).unwrap(), posted, "replay keeps it");
     }
 }

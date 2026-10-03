@@ -23,36 +23,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The component, built once per test binary from the taps workspace.
+mod common;
+
+/// The GitHub issues component, built once per test binary.
 fn component() -> &'static Path {
     static BUILT: OnceLock<PathBuf> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
-        let manifest = repo.join("taps/Cargo.toml");
-        let out = std::process::Command::new(env!("CARGO"))
-            .args([
-                "build",
-                "--manifest-path",
-                manifest.to_str().unwrap(),
-                "-p",
-                "tap-github-issues",
-                "--target",
-                "wasm32-wasip2",
-                "--release",
-            ])
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .expect("cargo runs");
-        assert!(
-            out.status.success(),
-            "the tap did not build (is the wasm32-wasip2 target installed? rustup target add wasm32-wasip2):\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        repo.join("taps/target/wasm32-wasip2/release/tap_github_issues.wasm")
-    })
+    BUILT.get_or_init(|| common::build("tap-github-issues"))
 }
 
 #[derive(Clone, Default)]
