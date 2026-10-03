@@ -196,7 +196,7 @@ fn funnel(root: &Path, report: &mut Report) -> Fallible<()> {
 ///
 /// When the record cannot be read.
 pub async fn measure(root: &Path, query: Option<&str>) -> Fallible<Report> {
-    let memory = Memory::open(root)?;
+    let memory = Memory::open(root)?.without_read_log();
     let mut report = Report::default();
     let titles = corpus(&memory, &mut report).await?;
     let t0 = memory.t0(None).await?;
@@ -353,8 +353,8 @@ mod tests {
         assert_eq!(r.known_items, 3);
         assert!(r.known_items_top3 >= 2, "{r:?}");
         assert!(
-            !r.sessions.is_empty(),
-            "the report's own reads are in the log: {r:?}"
+            r.sessions.is_empty(),
+            "the report's own reads are not logged: {r:?}"
         );
         let text = render(&r);
         assert!(
