@@ -9,6 +9,7 @@ get https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css xterm.min.
 get https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js addon-fit.min.js
 get https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js marked.min.js
 get https://cdn.jsdelivr.net/npm/mermaid@11.6.0/dist/mermaid.min.js mermaid.min.js
+get https://cdn.jsdelivr.net/npm/dompurify@3.4.16/dist/purify.min.js purify.min.js
 # SQLite with FTS5 for the browser reader, from the npm registry's tarball: the two files
 # the reader needs, nothing else from the package.
 sqlite=3.53.4-build2

@@ -24,8 +24,9 @@ pub fn reader_asset(name: &str) -> Option<(&'static str, &'static [u8])> {
     })
 }
 
-/// A vendored library: xterm.js, its fit addon, marked and mermaid, MIT, and SQLite with
-/// FTS5 for the browser, Apache-2.0 over public-domain SQLite; all pinned.
+/// A vendored library: xterm.js, its fit addon, marked and mermaid, MIT, DOMPurify,
+/// Apache-2.0 or MPL-2.0, and SQLite with FTS5 for the browser, Apache-2.0 over
+/// public-domain SQLite; all pinned.
 pub fn vendor(name: &str) -> Option<(&'static str, &'static [u8])> {
     Some(match name {
         "xterm.min.js" => (
@@ -44,6 +45,10 @@ pub fn vendor(name: &str) -> Option<(&'static str, &'static [u8])> {
         "mermaid.min.js" => (
             "text/javascript",
             include_bytes!("../static/vendor/mermaid.min.js"),
+        ),
+        "purify.min.js" => (
+            "text/javascript",
+            include_bytes!("../static/vendor/purify.min.js"),
         ),
         "sqlite3.mjs" => (
             "text/javascript",

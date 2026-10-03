@@ -39,6 +39,7 @@
 <script src="/vendor/addon-fit.min.js"></script>
 <script src="/vendor/marked.min.js"></script>
 <script src="/vendor/mermaid.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
 <script>
 mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
 
@@ -96,7 +97,7 @@ async function open(entryId) {
   document.getElementById('kind').textContent = `${e.type} · ${e.classification} · ${e.trust_tier}`;
   document.getElementById('ptitle').textContent = e.title;
   const body = document.getElementById('body');
-  body.innerHTML = marked.parse(e.body);
+  body.innerHTML = DOMPurify.sanitize(marked.parse(e.body));
   const blocks = body.querySelectorAll('pre code.language-mermaid');
   for (const b of blocks) { const d = document.createElement('div'); d.className = 'mermaid'; d.textContent = b.textContent; b.parentElement.replaceWith(d); }
   if (blocks.length) { try { await mermaid.run({ nodes: body.querySelectorAll('.mermaid') }); } catch (err) { console.warn(err); } }

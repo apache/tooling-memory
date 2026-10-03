@@ -104,7 +104,7 @@ pub async fn export(
     exported_by: &str,
     dest: &Path,
 ) -> Result<Exported, Error> {
-    std::fs::create_dir_all(dest).map_err(io(dest))?;
+    tokio::fs::create_dir_all(dest).await.map_err(io(dest))?;
     let mut manifest = Manifest::new(domain, exported_by, max_label);
     for hit in hits {
         let Some(text) = store.get_text(domain, &hit.id).await? else {
@@ -112,7 +112,7 @@ pub async fn export(
         };
         let file = format!("{}.md", hit.id);
         let path = dest.join(&file);
-        std::fs::write(&path, &text).map_err(io(&path))?;
+        tokio::fs::write(&path, &text).await.map_err(io(&path))?;
         manifest.push(ManifestEntry {
             id: hit.id.clone(),
             path: file,
@@ -121,7 +121,9 @@ pub async fn export(
         })?;
     }
     let mpath = dest.join("manifest.yaml");
-    std::fs::write(&mpath, manifest.to_yaml()).map_err(io(&mpath))?;
+    tokio::fs::write(&mpath, manifest.to_yaml())
+        .await
+        .map_err(io(&mpath))?;
     Ok(Exported { manifest })
 }
 

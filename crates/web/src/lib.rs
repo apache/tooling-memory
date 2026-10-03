@@ -129,6 +129,8 @@ struct App {
     config: Config,
     memory: Arc<Memory>,
     sessions: Arc<Mutex<BTreeMap<String, Arc<Session>>>>,
+    /// Bundle exports run one at a time: each replaces a directory by renaming.
+    exports: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -467,16 +469,14 @@ async fn reader() -> Html<&'static str> {
     Html(pages::READER)
 }
 
-/// The reader's wasm and glue, immutable like the vendored libraries.
+/// The reader's wasm and glue. They change with the binary, under the same names, so
+/// the browser revalidates them rather than keeping a copy.
 async fn reader_asset(Path(name): Path<String>) -> Response {
     match pages::reader_asset(&name) {
         Some((content_type, bytes)) => (
             [
                 (axum::http::header::CONTENT_TYPE, content_type),
-                (
-                    axum::http::header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable",
-                ),
+                (axum::http::header::CACHE_CONTROL, "no-cache"),
             ],
             bytes,
         )
@@ -495,28 +495,133 @@ fn bundle_dir(root: &std::path::Path, domain: &str, label: dm_core::Label) -> Pa
     root.join("state/bundles").join(format!("{domain}-{label}"))
 }
 
-/// A file of a domain's bundle. Asking for the manifest exports the domain afresh at
-/// that label, under the owner's filter and the label bound export always applies; the
-/// entries are then served from that export. A file name is a plain name or nothing.
+/// A bundle file name: letters, digits, dot, underscore and hyphen, not starting with a
+/// dot. Anything else is not a name and is never joined to a path.
+fn plain_file_name(file: &str) -> bool {
+    !file.is_empty()
+        && !file.starts_with('.')
+        && file
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// A status and the line that explains it.
+type Refusal = (StatusCode, String);
+
+/// What every bundle request passes before a path is built: the label parses, the file
+/// is a plain name, the domain is granted and the label is within the handling. The
+/// error is the refusal.
+fn admit_bundle_request(
+    app: &App,
+    domain: &str,
+    label: &str,
+    file: &str,
+) -> Result<dm_core::Label, Refusal> {
+    let Ok(label) = label.parse::<dm_core::Label>() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "label is public, internal or restricted".into(),
+        ));
+    };
+    if !plain_file_name(file) {
+        return Err((StatusCode::NOT_FOUND, "no such file".into()));
+    }
+    if !app.memory.domains().iter().any(|d| d == domain) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("domain {domain} is not granted"),
+        ));
+    }
+    if label > app.memory.grants().handling {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "{label} is above the handling {}",
+                app.memory.grants().handling
+            ),
+        ));
+    }
+    Ok(label)
+}
+
+/// The refusal for an export that did not happen: a denial is the client's, anything
+/// else is the server's.
+fn export_refusal(e: dm_server::Error) -> Refusal {
+    let status = match e {
+        dm_server::Error::Denied(_)
+        | dm_server::Error::NotFound(_)
+        | dm_server::Error::Bundle(dm_server::bundle::Error::Invalid(_)) => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string())
+}
+
+/// Export the domain afresh into a sibling directory and swap it in, so `dir` holds
+/// its last export and nothing that was there before. One export runs at a time.
+async fn refresh_bundle(
+    app: &App,
+    domain: &str,
+    label: dm_core::Label,
+    dir: &std::path::Path,
+) -> Result<(), Refusal> {
+    let _one_at_a_time = app.exports.lock().await;
+    let sibling = |suffix: &str| {
+        let mut name = dir.file_name().unwrap_or_default().to_os_string();
+        name.push(suffix);
+        dir.with_file_name(name)
+    };
+    let (fresh, old) = (sibling(".new"), sibling(".old"));
+    let _ = tokio::fs::remove_dir_all(&fresh).await;
+    let _ = tokio::fs::remove_dir_all(&old).await;
+    app.memory
+        .export(Some(domain), label, &fresh)
+        .await
+        .map_err(export_refusal)?;
+    let failed = |e: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    if tokio::fs::metadata(dir).await.is_ok() {
+        tokio::fs::rename(dir, &old).await.map_err(failed)?;
+    }
+    tokio::fs::rename(&fresh, dir).await.map_err(failed)?;
+    let _ = tokio::fs::remove_dir_all(&old).await;
+    Ok(())
+}
+
+/// Whether the directory's current manifest lists `file`; the manifest lists itself.
+async fn listed(dir: &std::path::Path, file: &str) -> bool {
+    if file == "manifest.yaml" {
+        return true;
+    }
+    let Ok(text) = tokio::fs::read_to_string(dir.join("manifest.yaml")).await else {
+        return false;
+    };
+    dm_core::manifest::Manifest::from_yaml(&text)
+        .map(|m| m.entries.iter().any(|e| e.path == file))
+        .unwrap_or(false)
+}
+
+/// A file of a domain's bundle. Every request is checked against the grants before a
+/// path is built. Asking for the manifest exports the domain afresh at that label,
+/// under the owner's filter and the label bound export always applies; the entries
+/// are then served from that export, and only the ones its manifest lists.
 async fn bundle_file(
     State(app): State<App>,
     Path((domain, label, file)): Path<(String, String, String)>,
 ) -> Response {
-    let Ok(label) = label.parse::<dm_core::Label>() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "label is public, internal or restricted",
-        )
-            .into_response();
+    let label = match admit_bundle_request(&app, &domain, &label, &file) {
+        Ok(label) => label,
+        Err(refused) => return refused.into_response(),
     };
-    if file.is_empty() || file.contains(['/', '\\']) || file.starts_with('.') {
-        return (StatusCode::NOT_FOUND, "no such file").into_response();
-    }
     let dir = bundle_dir(&app.config.root, &domain, label);
     if file == "manifest.yaml" {
-        if let Err(e) = app.memory.export(Some(&domain), label, &dir).await {
-            return (StatusCode::FORBIDDEN, e.to_string()).into_response();
+        if let Err(failed) = refresh_bundle(&app, &domain, label, &dir).await {
+            return failed.into_response();
         }
+    } else if !listed(&dir, &file).await {
+        return (
+            StatusCode::NOT_FOUND,
+            "no such file; load manifest.yaml first",
+        )
+            .into_response();
     }
     let content_type = if file.ends_with(".yaml") {
         "application/yaml"
@@ -532,11 +637,7 @@ async fn bundle_file(
             bytes,
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            "no such file; load manifest.yaml first",
-        )
-            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "no such file").into_response(),
     }
 }
 
@@ -551,6 +652,7 @@ pub fn router(config: Config) -> Result<Router, Error> {
         config,
         memory,
         sessions: Arc::new(Mutex::new(BTreeMap::new())),
+        exports: Arc::new(tokio::sync::Mutex::new(())),
     };
     Ok(Router::new()
         .route("/", get(index))
@@ -972,5 +1074,91 @@ mod tests {
         assert_eq!(status, 404);
         let (status, _) = http(addr, "GET", "/bundle/dom-else/internal/manifest.yaml", None).await;
         assert_eq!(status, 403, "a domain the owner does not hold");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_serves_only_what_its_manifest_lists_under_the_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let root = dir.path().join("memory");
+        let m = Memory::open(&root).unwrap();
+        let w = m
+            .write(dm_server::WriteRequest {
+                title: Some("Key rotation".into()),
+                body: "Rotate the signing key quarterly.\n".into(),
+                classification: Some(dm_core::Label::Restricted),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        // the grants file sits three directories above a bundle
+        let (status, body) = http(
+            addr,
+            "GET",
+            "/bundle/dom-me/restricted/..%2F..%2F..%2Fgrants.toml",
+            None,
+        )
+        .await;
+        assert_eq!(status, 404);
+        assert!(!body.contains("owner ="), "a traversal reached the grants");
+        let (status, _) = http(addr, "GET", "/bundle/dom-me/restricted/manifest.yaml", None).await;
+        assert_eq!(status, 200);
+        let bundle = root.join("state/bundles/dom-me-restricted");
+        std::fs::write(
+            bundle.join("stray.md"),
+            "---\nid: mem-me-stray\n---\nnot exported\n",
+        )
+        .unwrap();
+        let (status, _) = http(addr, "GET", "/bundle/dom-me/restricted/stray.md", None).await;
+        assert_eq!(
+            status, 404,
+            "a file the manifest does not list is not served"
+        );
+        let (status, _) = http(addr, "GET", "/bundle/dom-me/restricted/C:x.md", None).await;
+        assert_eq!(status, 404, "a drive letter is not a file name");
+        let (status, _) = http(addr, "GET", "/bundle/dom-else/restricted/x.md", None).await;
+        assert_eq!(status, 403, "the domain is checked on every file");
+        let file = format!("/bundle/dom-me/restricted/{}.md", w.id);
+        let (status, text) = http(addr, "GET", &file, None).await;
+        assert_eq!(status, 200);
+        assert!(text.contains("quarterly"));
+
+        // the handling drops to internal: a second server over the same root must not
+        // serve the restricted export that is still on disk
+        let grants = root.join("grants.toml");
+        let lowered = std::fs::read_to_string(&grants)
+            .unwrap()
+            .replace("handling = \"restricted\"", "handling = \"internal\"");
+        assert!(lowered.contains("handling = \"internal\""));
+        std::fs::write(&grants, lowered).unwrap();
+        let app = router(config(dir.path(), &["true"])).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener.local_addr().unwrap();
+        let _h2 = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (status, _) = http(addr2, "GET", &file, None).await;
+        assert_eq!(
+            status, 403,
+            "a stale export above the handling is not served"
+        );
+        let (status, _) = http(
+            addr2,
+            "GET",
+            "/bundle/dom-me/restricted/manifest.yaml",
+            None,
+        )
+        .await;
+        assert_eq!(status, 403);
+
+        // an export replaces its directory rather than adding to it
+        let (status, _) = http(addr2, "GET", "/bundle/dom-me/internal/manifest.yaml", None).await;
+        assert_eq!(status, 200);
+        let stray = root.join("state/bundles/dom-me-internal/stray.md");
+        std::fs::write(&stray, "x").unwrap();
+        let (status, _) = http(addr2, "GET", "/bundle/dom-me/internal/manifest.yaml", None).await;
+        assert_eq!(status, 200);
+        assert!(
+            !stray.exists(),
+            "a bundle directory holds only its last export"
+        );
     }
 }
