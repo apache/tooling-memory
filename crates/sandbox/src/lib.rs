@@ -1380,6 +1380,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // the program under test is the shell, which Windows runners lack
     fn a_command_harness_runs_a_program_with_the_egress_in_its_environment() {
         let f = fixture();
         let args = vec!["sh".to_string(), "-c".to_string(), "echo hi".to_string()];
