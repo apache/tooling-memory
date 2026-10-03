@@ -100,6 +100,25 @@ every read the memory server answered is logged with the tokens it served
 (`state/reads.jsonl`), shown per session beside what that session's model calls ingested
 according to the egress. `QUERY='...'` picks the retrieval query; `--json` gives the numbers.
 
+A record of six entries proves nothing, so seed one of a few hundred from Markdown you
+have, one entry per section, and run a task over it:
+
+```sh
+memory --root ~/memory-demo init --owner human:asf:you --domain dom-demo
+scripts/seed-corpus.py --root ~/memory-demo --memory target/release/memory docs
+memory --root ~/memory-demo task create "Answer: what did DR-19 decide, and why?" \
+  --body "Search the record, open only what you need, answer in a handoff with the entry ids you cite, then complete." --priority 5
+memory --root ~/memory-demo task admit task-demo-xxxxxxxx
+memory --root ~/memory-demo work --harness claude
+memory --root ~/memory-demo savings --query "what did DR-19 decide about MoinMoin"
+```
+
+On 243 entries and 76k tokens here: T0 was 2.6% of the corpus, 194 of 200 known items
+ranked in the top three, the answer took seven reads and 3k tokens served against a
+corpus of 76k, and T0 plus the handoff was 58% of replaying that session's transcript.
+Search ANDs every word as a phrase, the known-item case; when that finds nothing it
+retries with any word, still ranked by BM25, so a question in natural language lands too.
+
 ## In the browser: `make web`
 
 `make web` serves a web terminal on 127.0.0.1:4200. The front page lists sessions and

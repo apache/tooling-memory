@@ -178,13 +178,17 @@ fn hit_from_row(row: &Row<'_>, score: f64) -> Result<Hit, Error> {
 /// Turn free text into an FTS5 query that cannot fail to parse: every whitespace-separated
 /// token becomes a quoted phrase, and the phrases are ANDed. `None` when there is nothing
 /// to search for.
-fn fts_query(text: &str) -> Option<String> {
+/// The FTS5 query for a text: every word a quoted phrase, so user input can never be
+/// query syntax; joined with AND (implicit) or, for the fallback, OR.
+fn fts_query(text: &str, any_word: bool) -> Option<String> {
     let parts: Vec<String> = text
         .split_whitespace()
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect();
     if parts.is_empty() {
         None
+    } else if any_word {
+        Some(parts.join(" OR "))
     } else {
         Some(parts.join(" "))
     }
@@ -334,9 +338,23 @@ impl Index {
         filter: &ReadFilter,
         limit: usize,
     ) -> Result<Vec<Hit>, Error> {
-        let Some(q) = fts_query(query) else {
+        let Some(q) = fts_query(query, false) else {
             return Ok(Vec::new());
         };
+        let hits = self.search_fts(&q, filter, limit)?;
+        if !hits.is_empty() || query.split_whitespace().count() < 2 {
+            return Ok(hits);
+        }
+        // every word as a phrase found nothing: a question in natural language rather
+        // than a known item. Any word, still ranked by BM25, so the best partial match
+        // leads. Explainable either way.
+        match fts_query(query, true) {
+            Some(q) => self.search_fts(&q, filter, limit),
+            None => Ok(hits),
+        }
+    }
+
+    fn search_fts(&self, q: &str, filter: &ReadFilter, limit: usize) -> Result<Vec<Hit>, Error> {
         let (where_sql, mut values) = compile_filter(filter, 2);
         let sql = format!(
             "SELECT {HIT_COLUMNS}, bm25(entries_fts, 0.0, 10.0, 5.0, 1.0) AS score
@@ -346,7 +364,7 @@ impl Index {
              LIMIT {}",
             limit.max(1)
         );
-        values.insert(0, q.into());
+        values.insert(0, q.to_string().into());
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
             let score: f64 = row.get(7)?;
@@ -633,6 +651,37 @@ mod tests {
     }
 
     #[test]
+    fn a_question_falls_back_to_any_word_when_no_entry_has_them_all() {
+        let mut ix = Index::in_memory().unwrap();
+        ix.upsert(&entry(
+            "dom-a",
+            "mem-a-dr19",
+            "DR-19: does the wiki stay on MoinMoin",
+            "MoinMoin cannot rank full text without Xapian beside it.\n",
+        ))
+        .unwrap();
+        ix.upsert(&entry(
+            "dom-a",
+            "mem-a-commits",
+            "Commit messages",
+            "Short subject, body says why.\n",
+        ))
+        .unwrap();
+        let hits = ix
+            .search("what did DR-19 decide about MoinMoin", &any(), 10)
+            .unwrap();
+        assert_eq!(ids(&hits), vec!["mem-a-dr19"], "any-word fallback finds it");
+        assert!(ix
+            .search("nothing matches this at all", &any(), 10)
+            .unwrap()
+            .is_empty());
+        assert!(
+            ix.search("zzzz", &any(), 10).unwrap().is_empty(),
+            "a single unknown word has no fallback"
+        );
+    }
+
+    #[test]
     fn query_syntax_from_a_user_cannot_break_the_search() {
         let mut ix = Index::in_memory().unwrap();
         ix.upsert(&entry(
@@ -659,7 +708,7 @@ mod tests {
         );
         assert!(ix.search("   ", &any(), 10).unwrap().is_empty());
         assert_eq!(
-            fts_query("a \"b\" c"),
+            fts_query("a \"b\" c", false),
             Some("\"a\" \"\"\"b\"\"\" \"c\"".into())
         );
     }

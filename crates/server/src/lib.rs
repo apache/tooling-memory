@@ -198,6 +198,13 @@ impl Memory {
         })
     }
 
+    /// Read without recording: for a report or a tool whose reads are not a session's.
+    #[must_use]
+    pub fn without_read_log(mut self) -> Memory {
+        self.reads.disable();
+        self
+    }
+
     /// Record writes under this author instead of the owner: `agent:<name> (model: <id>)`.
     #[must_use]
     pub fn with_author(mut self, author: impl Into<String>) -> Memory {

@@ -54,8 +54,8 @@ def main():
         for head, body in merged:
             if len(body.split()) < 8: continue
             t = f"{title}: {head}" if head else title
-            r = subprocess.run([a.memory, "--root", a.root, "write", "--kind", kind, "--title", t[:140],
-                                "--body", body[:12000]], capture_output=True, text=True)
+            r = subprocess.run([a.memory, "--root", a.root, "write", f"--kind={kind}", f"--title={t[:140]}",
+                                f"--body={body[:12000]}"], capture_output=True, text=True)
             if r.returncode != 0:
                 print(f"skip {f} [{head}]: {r.stderr.strip()[:120]}", file=sys.stderr); continue
             written += 1

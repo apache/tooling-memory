@@ -39,6 +39,7 @@ pub struct ReadLog {
     path: PathBuf,
     session: String,
     lock: Mutex<()>,
+    enabled: bool,
 }
 
 impl ReadLog {
@@ -49,10 +50,19 @@ impl ReadLog {
             path: path(root),
             session: session.to_string(),
             lock: Mutex::new(()),
+            enabled: true,
         }
     }
 
+    /// Stop recording: for a reader whose reads are not a session's, such as a report.
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
     fn append(&self, tool: &str, query: Option<&str>, hits: usize, tokens: usize) {
+        if !self.enabled {
+            return;
+        }
         let read = Read {
             at: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
