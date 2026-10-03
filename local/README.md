@@ -169,6 +169,35 @@ of last resort, which is also why a prompted run that forgot to write one no lon
 state, so nothing is lost even when no note is filed. The hook reads all three transcript
 shapes: Claude Code's one turn a line, Codex's rollout items, Gemini's patch log.
 
+## Mining a transcript: `--mine`
+
+The third source of memory the harness did not write, after the hooks and the kept
+transcript, and the only one that costs a model call. `--mine` on `launch` or `work`, or
+`memory mine <transcript>`, asks a small model through the session's own destination to
+read the transcript's tail and propose entries: facts, decisions, conventions, methods.
+They land at raw tier with low confidence and the transcript as their source, for a person
+to confirm or drop; nothing mined is trusted on arrival. The default model is a small one
+per destination (`--mine-model` overrides): mining is a librarian's job, and the paper puts
+librarians on the cheap class. In subscription mode the session's login is the harness's,
+not ours, so mining needs `--auth key` or `gateway`.
+
+## The gateway inside the VM
+
+`--backend wslc --auth gateway` runs LiteLLM over Postgres as two containers on their own
+network inside the session VM, since the host's gateway on loopback is not reachable from
+there, and the egress container joins that network. They are left running between launches
+like the host stack; `wslc remove -f memory-litellm memory-postgres` takes them down. The
+key the egress uses is `LITELLM_MASTER_KEY` from `local/.env`, which is right for a laptop
+and wrong for the Foundation, where the front desk mints a virtual key per principal.
+
+## The WSL containers C API
+
+`wslcsdk.dll` is what Microsoft supports for production, and it does not ship with WSL: it
+comes in the `Microsoft.WSL.Containers` NuGet package. The binding is in
+`crates/memory/src/wslc_api.rs`, Windows only, loaded at run time, and `memory
+wslc-api-check` proves it as far as creating and terminating a session. Running containers
+through it is next, and needs the image provisioned into the API's own session store.
+
 ## In the harness image, on Linux: `make unpack`
 
 The same image serves the Linux backend. `make unpack` exports it once from whichever

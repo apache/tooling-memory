@@ -109,6 +109,23 @@ pub struct Entry {
     pub body: String,
 }
 
+/// An entry to write.
+#[derive(Clone, Debug, Default)]
+pub struct NewEntry<'a> {
+    /// decision, fact, convention, method, or handoff.
+    pub kind: &'a str,
+    /// One line.
+    pub title: &'a str,
+    /// Markdown.
+    pub body: &'a str,
+    /// high, medium, or low.
+    pub confidence: Option<&'a str>,
+    /// Where it was distilled from.
+    pub source: Vec<String>,
+    /// A granted domain; the only one when omitted.
+    pub domain: Option<&'a str>,
+}
+
 /// The client. Drop it, or call [`MemoryClient::close`], to end the session.
 pub struct MemoryClient {
     service: RunningService<RoleClient, ()>,
@@ -237,6 +254,31 @@ impl MemoryClient {
             .call(
                 "write",
                 json!({ "body": body, "title": title, "entry_type": "handoff", "domain": domain }),
+            )
+            .await?;
+        v.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| Error::Shape {
+                tool: "write".into(),
+                what: "no id in the answer".into(),
+            })
+    }
+
+    /// Write an entry of any kind, with a confidence and sources; returns its id. Mined
+    /// knowledge lands this way: raw tier, low confidence, the transcript as its source.
+    ///
+    /// # Errors
+    ///
+    /// A transport or tool error.
+    pub async fn write_entry(&self, entry: &NewEntry<'_>) -> Result<String> {
+        let v = self
+            .call(
+                "write",
+                json!({
+                    "body": entry.body, "title": entry.title, "entry_type": entry.kind,
+                    "confidence": entry.confidence, "source": entry.source, "domain": entry.domain,
+                }),
             )
             .await?;
         v.get("id")
@@ -425,6 +467,19 @@ mod tests {
         let left = client.get(t.handoff.as_deref().unwrap()).await.unwrap();
         assert_eq!(left.entry_type, "handoff");
         assert!(left.body.contains("half done"));
+        let mined = client
+            .write_entry(&NewEntry {
+                kind: "fact",
+                title: "Mined: the import has five steps",
+                body: "Five steps, the fourth is the slow one.",
+                confidence: Some("low"),
+                source: vec!["transcript:/home/user/.claude/projects/p/s.jsonl".into()],
+                domain: None,
+            })
+            .await
+            .unwrap();
+        let e = client.get(&mined).await.unwrap();
+        assert_eq!(e.entry_type, "fact");
         let h2 = client
             .write_handoff("Import done", "All five steps.", None)
             .await

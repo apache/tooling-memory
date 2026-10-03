@@ -45,6 +45,18 @@ const PASS_ENV: &[&str] = &[
 /// Login directories copied from, never written.
 const LOGIN_DIRS: &[&str] = &[".claude", ".codex", ".gemini"];
 
+/// The gateway inside the session VM, for `--auth gateway`: the same LiteLLM over
+/// Postgres as `make local-up` runs on the host, which the VM cannot reach. Both live on a
+/// network of their own; the egress container joins it. They are left running between
+/// launches, like the host's.
+const GATEWAY_NETWORK: &str = "memory-gateway";
+const GATEWAY_LITELLM: &str = "memory-litellm";
+const GATEWAY_POSTGRES: &str = "memory-postgres";
+const LITELLM_IMAGE: &str = "ghcr.io/berriai/litellm:main-stable";
+const POSTGRES_IMAGE: &str = "docker.io/library/postgres:16-alpine";
+/// The gateway's configuration, the same file the host stack uses.
+const LITELLM_CONFIG: &str = include_str!("../../../local/litellm.yaml");
+
 /// What to run.
 pub struct Launch {
     /// The record on this host.
@@ -118,15 +130,23 @@ fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| (*x).to_string()).collect()
 }
 
-/// The arguments of the egress container's `wslc run`.
+/// The arguments of the egress container's `wslc run`. `extra` is environment the
+/// launch adds, such as the gateway's address inside the VM; `network` joins a network.
 fn egress_run_args(
     l: &Launch,
     name: &str,
     volume: &str,
     root_m: &str,
     host_home: Option<(&str, &[String])>,
+    extra: &[(String, String)],
+    network: Option<&str>,
 ) -> Vec<String> {
-    let mut a = s(&["run", "-d", "--name", name, "-v"]);
+    let mut a = s(&["run", "-d", "--name", name]);
+    if let Some(n) = network {
+        a.push("--network".into());
+        a.push(n.to_string());
+    }
+    a.push("-v".into());
     a.push(format!("{root_m}:{INSIDE_ROOT}"));
     a.push("-v".into());
     a.push(format!("{volume}:{REQUEST_DIR_INSIDE}"));
@@ -140,12 +160,19 @@ fn egress_run_args(
         }
     }
     for k in PASS_ENV {
+        if extra.iter().any(|(ek, _)| ek == k) {
+            continue;
+        }
         if let Ok(v) = std::env::var(k) {
             if !v.is_empty() {
                 a.push("-e".into());
                 a.push(format!("{k}={v}"));
             }
         }
+    }
+    for (k, v) in extra {
+        a.push("-e".into());
+        a.push(format!("{k}={v}"));
     }
     a.push(l.image.clone());
     a.extend(s(&[
@@ -258,6 +285,21 @@ pub fn run(l: &Launch) -> Fallible<i32> {
         _ => None,
     };
 
+    let (extra, network) = if l.auth == AuthMode::Gateway {
+        let key = gateway_up(&l.root)?;
+        (
+            vec![
+                (
+                    "LLMAO_URL".to_string(),
+                    format!("http://{GATEWAY_LITELLM}:4000"),
+                ),
+                ("LLMAO_KEY".to_string(), key),
+            ],
+            Some(GATEWAY_NETWORK),
+        )
+    } else {
+        (Vec::new(), None)
+    };
     run_ok(&s(&["volume", "create", &volume]))?;
     let result = (|| -> Fallible<i32> {
         let args = egress_run_args(
@@ -266,6 +308,8 @@ pub fn run(l: &Launch) -> Fallible<i32> {
             &volume,
             &root_m,
             host_home_m.as_deref().map(|m| (m, login_dirs.as_slice())),
+            &extra,
+            network,
         );
         run_ok(&args)?;
         let mut logs = Command::new(wslc())
@@ -290,6 +334,109 @@ pub fn run(l: &Launch) -> Fallible<i32> {
         .status()
         .ok();
     result
+}
+
+fn container_state(name: &str) -> Option<String> {
+    run_ok(&s(&["inspect", "--format", "{{.State.Status}}", name]))
+        .ok()
+        .map(|t| t.trim().to_string())
+}
+
+/// Bring the gateway up inside the VM if it is not already, and return the key the egress
+/// uses against it. Locally that is the master key, as `make local-key` would mint a
+/// virtual key from; a per-session virtual key is for the Foundation's front desk.
+fn gateway_up(root: &Path) -> Fallible<String> {
+    let master = std::env::var("LITELLM_MASTER_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .ok_or("--auth gateway inside the VM needs LITELLM_MASTER_KEY (from local/.env)")?;
+    let pg_password = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "litellm".into());
+    if run_ok(&s(&["network", "inspect", GATEWAY_NETWORK])).is_err() {
+        run_ok(&s(&["network", "create", GATEWAY_NETWORK]))?;
+    }
+    ensure_running(GATEWAY_POSTGRES, || {
+        let mut a = s(&[
+            "run",
+            "-d",
+            "--name",
+            GATEWAY_POSTGRES,
+            "--network",
+            GATEWAY_NETWORK,
+        ]);
+        a.extend(s(&[
+            "-e",
+            "POSTGRES_DB=litellm",
+            "-e",
+            "POSTGRES_USER=litellm",
+        ]));
+        a.push("-e".into());
+        a.push(format!("POSTGRES_PASSWORD={pg_password}"));
+        a.push(POSTGRES_IMAGE.into());
+        a
+    })?;
+    let config_dir = root.join("state/gateway");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::write(config_dir.join("litellm.yaml"), LITELLM_CONFIG)?;
+    let config_m = mount_path(&config_dir)?;
+    ensure_running(GATEWAY_LITELLM, || {
+        let mut a = s(&[
+            "run",
+            "-d",
+            "--name",
+            GATEWAY_LITELLM,
+            "--network",
+            GATEWAY_NETWORK,
+        ]);
+        a.push("-v".into());
+        a.push(format!("{config_m}:/etc/litellm"));
+        a.push("-e".into());
+        a.push(format!("LITELLM_MASTER_KEY={master}"));
+        a.push("-e".into());
+        a.push(format!(
+            "DATABASE_URL=postgresql://litellm:{pg_password}@{GATEWAY_POSTGRES}:5432/litellm"
+        ));
+        for k in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "XAI_API_KEY",
+        ] {
+            if let Ok(v) = std::env::var(k) {
+                if !v.is_empty() {
+                    a.push("-e".into());
+                    a.push(format!("{k}={v}"));
+                }
+            }
+        }
+        a.push(LITELLM_IMAGE.into());
+        a.extend(s(&[
+            "--config",
+            "/etc/litellm/litellm.yaml",
+            "--port",
+            "4000",
+        ]));
+        a
+    })?;
+    // LiteLLM takes a while to come up; wait for its liveliness probe from inside
+    let probe = "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)";
+    for _ in 0..60 {
+        if run_ok(&s(&["exec", GATEWAY_LITELLM, "python3", "-c", probe])).is_ok() {
+            eprintln!("memory: gateway up inside the VM at http://{GATEWAY_LITELLM}:4000");
+            return Ok(master);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Err("the gateway inside the VM did not come up in two minutes; `wslc logs memory-litellm` says why".into())
+}
+
+/// Start a named container if it is not running: create it if absent, start it if it
+/// exited.
+fn ensure_running(name: &str, create: impl FnOnce() -> Vec<String>) -> Fallible<()> {
+    match container_state(name).as_deref() {
+        Some("running") => Ok(()),
+        Some(_) => run_ok(&s(&["start", name])).map(|_| ()),
+        None => run_ok(&create()).map(|_| ()),
+    }
 }
 
 /// Serve the inside's requests until it writes `done`.
@@ -416,10 +563,21 @@ mod tests {
             "vol",
             "/home/me/memory",
             Some(("/home/me", &dirs)),
+            &[(
+                "LLMAO_URL".to_string(),
+                "http://memory-litellm:4000".to_string(),
+            )],
+            Some("memory-gateway"),
         );
         let joined = a.join(" ");
         assert!(
-            joined.starts_with("run -d --name eg -v /home/me/memory:/memory -v vol:/run/memory"),
+            joined.starts_with(
+                "run -d --name eg --network memory-gateway -v /home/me/memory:/memory -v vol:/run/memory"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-e LLMAO_URL=http://memory-litellm:4000"),
             "{joined}"
         );
         assert!(

@@ -15,6 +15,15 @@
 
 use serde_json::Value;
 
+/// The usage a complete JSON response carries, in any of the three providers' shapes, or
+/// `None` when it carries none.
+#[must_use]
+pub fn from_value(v: &serde_json::Value) -> Option<Usage> {
+    let mut s = Sniffer::new(None);
+    s.take_json(v);
+    s.found.then_some(s.usage)
+}
+
 /// Token counts for one model call.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Usage {

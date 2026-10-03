@@ -8,10 +8,12 @@
 
 mod hooks;
 mod image;
+mod mine;
 mod requests;
 mod savings;
 mod work;
 mod wslc;
+mod wslc_api;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dm_core::{EntryType, Label};
@@ -225,6 +227,14 @@ enum Command {
         /// With --prompt: a run that leaves no handoff is fine.
         #[arg(long)]
         no_handoff: bool,
+        /// After the run, mine the session's transcript for entries with a small model
+        /// through the same destination; they land raw, low confidence, with the
+        /// transcript as source.
+        #[arg(long)]
+        mine: bool,
+        /// The model mining uses; a small default per destination otherwise.
+        #[arg(long)]
+        mine_model: Option<String>,
         /// Arguments passed to the harness.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -265,7 +275,27 @@ enum Command {
         /// With --loop: how long to wait when the queue is empty.
         #[arg(long, default_value_t = 30)]
         idle_seconds: u64,
+        /// After each task, mine the session's transcript for entries.
+        #[arg(long)]
+        mine: bool,
+        #[arg(long)]
+        mine_model: Option<String>,
     },
+    /// Mine one transcript for entries with a small model through a destination.
+    Mine {
+        /// The transcript, JSON Lines, from any of the harnesses.
+        transcript: PathBuf,
+        #[arg(long, value_enum, default_value = "key")]
+        auth: AuthArg,
+        /// The destination; openai by default.
+        #[arg(long, default_value = "openai")]
+        provider: String,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Prove the WSL containers C API binding: create and terminate a session. Windows.
+    #[command(hide = true)]
+    WslcApiCheck,
     /// Inside the egress container of the `wslc` backend: open the memory, serve the
     /// egress on the shared volume, and run `launch` or `work` by writing run requests
     /// the host turns into harness containers.
@@ -586,18 +616,7 @@ async fn run_cli() -> Fallible {
         }
         Command::Hook { .. } => unreachable!("handled in main before the root is needed"),
         cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
-        Command::Savings {
-            query,
-            json: as_json,
-        } => {
-            let r = savings::measure(&root, query.as_deref()).await?;
-            if as_json {
-                println!("{}", serde_json::to_string_pretty(&r)?);
-            } else {
-                print!("{}", savings::render(&r));
-            }
-            Ok(())
-        }
+        cmd @ (Command::Mine { .. } | Command::WslcApiCheck) => tools_cmd(&root, cmd).await,
         Command::Image { op } => match op {
             ImageOp::Unpack { image } => {
                 image::unpack(&root, &image)?;
@@ -899,6 +918,45 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     Ok(())
 }
 
+/// `mine` and the C API check.
+async fn tools_cmd(root: &Path, command: Command) -> Fallible {
+    match command {
+        Command::Mine {
+            transcript,
+            auth,
+            provider,
+            model,
+        } => {
+            let p =
+                prepare_launch(root, Harness::Command, auth.into(), Some(&provider), None).await?;
+            let client = work::client(p.memory.clone()).await?;
+            let model = model.unwrap_or_else(|| mine::default_model(&p.provider).to_string());
+            let ids = mine::mine(&p.egress, &client, &p.provider, &model, &transcript).await?;
+            println!("{}", serde_json::to_string_pretty(&ids)?);
+            Ok(())
+        }
+        Command::WslcApiCheck => {
+            let storage = root.join("state/wslc-api");
+            std::fs::create_dir_all(&storage)?;
+            println!("{}", wslc_api::check("memory-check", &storage)?);
+            Ok(())
+        }
+        Command::Savings {
+            query,
+            json: as_json,
+        } => {
+            let r = savings::measure(root, query.as_deref()).await?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print!("{}", savings::render(&r));
+            }
+            Ok(())
+        }
+        _ => unreachable!("routed by run_cli"),
+    }
+}
+
 /// `launch`, `work` and `inside`: start a session, run it once or per task, exit with
 /// the code. On the `wslc` backend the host hands the whole thing to the egress
 /// container, which runs this same code as `inside`.
@@ -923,6 +981,8 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         prompt,
         prompt_file,
         no_handoff,
+        mine: mine_after,
+        mine_model,
         args,
     } = command
     else {
@@ -930,18 +990,8 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     };
     let workdir = resolve_workdir(workdir)?;
     if backend_of(backend, unconfined, root) == Backend::Wslc {
-        let mut inside_args = Vec::new();
-        if let Some(p) = &prompt {
-            inside_args.extend(["--prompt".to_string(), p.clone()]);
-        }
-        if let Some(f) = &prompt_file {
-            inside_args.extend(["--prompt".to_string(), std::fs::read_to_string(f)?]);
-        }
-        if no_handoff {
-            inside_args.push("--no-handoff".into());
-        }
-        inside_args.push("--".into());
-        inside_args.extend(args);
+        let inside_args =
+            inside_args_for_launch(prompt.as_deref(), prompt_file.as_deref(), no_handoff, &args)?;
         let code = wslc::run(&wslc::Launch {
             root: root.to_path_buf(),
             harness: harness.into(),
@@ -958,13 +1008,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
         (None, None) => None,
     };
-    // a command harness's program is fixed for the session; a harness's own arguments
-    // are passed once, with the run
-    let (program, args) = if Harness::from(harness) == Harness::Command {
-        (args, Vec::new())
-    } else {
-        (Vec::new(), args)
-    };
+    let (program, args) = split_program(harness.into(), args);
     let session = Session::start(
         root,
         harness.into(),
@@ -979,6 +1023,9 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         Some(prompt) => work::prompted(&session, &prompt, no_handoff).await?,
         None => work::interactive(&session, &args).await?,
     };
+    if mine_after {
+        session.mine(mine_model.as_deref()).await?;
+    }
     session.finish(code);
     std::process::exit(code);
 }
@@ -996,6 +1043,8 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         lease_seconds,
         keep_going,
         idle_seconds,
+        mine: mine_after,
+        mine_model,
     } = command
     else {
         unreachable!("routed by launch_cmd")
@@ -1037,6 +1086,9 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         lease_seconds,
         keep_going,
         idle: std::time::Duration::from_secs(idle_seconds),
+        mine: mine_after.then(|| {
+            mine_model.unwrap_or_else(|| mine::default_model(&session.provider()).to_string())
+        }),
     };
     let code = work::run(&session, &options).await?;
     session.finish(code);
@@ -1072,11 +1124,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
     });
     // the harness container's working tree is at the inside path; this process
     // never touches it, so any existing directory serves as the host-side value
-    let (program, args) = if Harness::from(harness) == Harness::Command {
-        (args, Vec::new())
-    } else {
-        (Vec::new(), args)
-    };
+    let (program, args) = split_program(harness.into(), args);
     let session = Session::start(
         root,
         harness.into(),
@@ -1093,6 +1141,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
             lease_seconds,
             keep_going,
             idle: std::time::Duration::from_secs(idle_seconds),
+            mine: None,
         };
         work::run(&session, &options).await?
     } else {
@@ -1108,6 +1157,38 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
     };
     session.finish(code);
     std::process::exit(code);
+}
+
+/// A command harness's program is fixed for the session and everything else is a run's
+/// arguments; for the other harnesses all of it is the run's.
+fn split_program(harness: Harness, args: Vec<String>) -> (Vec<String>, Vec<String>) {
+    if harness == Harness::Command {
+        (args, Vec::new())
+    } else {
+        (Vec::new(), args)
+    }
+}
+
+/// The flags `memory inside` gets for a launch handed to the wslc backend.
+fn inside_args_for_launch(
+    prompt: Option<&str>,
+    prompt_file: Option<&Path>,
+    no_handoff: bool,
+    args: &[String],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut inside_args = Vec::new();
+    if let Some(p) = prompt {
+        inside_args.extend(["--prompt".to_string(), p.to_string()]);
+    }
+    if let Some(f) = prompt_file {
+        inside_args.extend(["--prompt".to_string(), std::fs::read_to_string(f)?]);
+    }
+    if no_handoff {
+        inside_args.push("--no-handoff".into());
+    }
+    inside_args.push("--".into());
+    inside_args.extend(args.iter().cloned());
+    Ok(inside_args)
 }
 
 fn resolve_workdir(workdir: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -1308,6 +1389,45 @@ impl Session {
     /// Where the harness's hooks leave notes.
     pub fn outbox(&self) -> PathBuf {
         self.p.home.join(hooks::OUTBOX)
+    }
+
+    /// The destination the session's model calls go to.
+    pub fn provider(&self) -> String {
+        self.p.provider.clone()
+    }
+
+    /// The egress, for the launcher's own calls.
+    pub fn egress(&self) -> &Egress {
+        &self.p.egress
+    }
+
+    /// The private home, where the harness leaves its transcript.
+    pub fn home(&self) -> &Path {
+        &self.p.home
+    }
+
+    /// Mine the newest transcript in the private home, if there is one.
+    ///
+    /// # Errors
+    ///
+    /// When the model call or a write fails.
+    pub async fn mine(
+        &self,
+        model: Option<&str>,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let Some(t) = mine::newest_transcript(&self.p.home) else {
+            eprintln!("memory: nothing to mine; no transcript under the private home");
+            return Ok(Vec::new());
+        };
+        let model = model.map_or_else(
+            || mine::default_model(&self.p.provider).to_string(),
+            str::to_string,
+        );
+        let client = work::client(self.p.memory.clone()).await?;
+        let ids = mine::mine(&self.p.egress, &client, &self.p.provider, &model, &t).await?;
+        eprintln!("memory: mined {} entries from {}", ids.len(), t.display());
+        client.close().await.ok();
+        Ok(ids)
     }
 
     /// Run the harness once with these arguments. With `capture`, its standard output
@@ -1678,6 +1798,8 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Inside { .. }
         | Command::Image { .. }
         | Command::Web { .. }
+        | Command::Mine { .. }
+        | Command::WslcApiCheck
         | Command::Savings { .. }
         | Command::Hook { .. }
         | Command::Relay { .. }

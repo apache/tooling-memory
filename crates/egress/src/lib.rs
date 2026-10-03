@@ -118,6 +118,13 @@ pub enum Error {
     /// Listening or serving.
     #[error("egress: {0}")]
     Io(#[from] std::io::Error),
+    /// A direct call to a destination this egress does not have, or may not send to at
+    /// the session's label.
+    #[error("destination {0} is not available to this session")]
+    Refused(String),
+    /// A direct call the upstream did not answer with success.
+    #[error("{0}")]
+    Upstream(String),
 }
 
 struct Inner {
@@ -177,6 +184,56 @@ impl Egress {
     #[must_use]
     pub fn telemetry(&self) -> &Telemetry {
         &self.inner.telemetry
+    }
+
+    /// Call a destination directly with a JSON body, as the launcher does for its own
+    /// model calls, such as mining a transcript. The same ceiling check, credential
+    /// injection and usage recording as a harness's call through the proxy.
+    ///
+    /// # Errors
+    ///
+    /// A destination this egress does not have or may not send to, an upstream that
+    /// cannot be reached, or a non-success status, with the upstream's body in the message.
+    pub async fn call(
+        &self,
+        destination: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        let inner = &self.inner;
+        let dest =
+            admit(inner, destination).map_err(|_| Error::Refused(destination.to_string()))?;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{destination}/{}", path.trim_start_matches('/')))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .map_err(|e| Error::Upstream(e.to_string()))?;
+        let rest = path.trim_start_matches('/').to_string();
+        let resp = upstream_request(inner, &dest, &rest, req)
+            .send()
+            .await
+            .map_err(|e| Error::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::Upstream(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let usage = usage::from_value(&value).unwrap_or_else(|| Usage {
+            model: Some(format!("http {status}")),
+            ..Usage::default()
+        });
+        let _ = inner
+            .telemetry
+            .record(inner.memory.session_id(), destination, status, &usage);
+        if !(200..300).contains(&status) {
+            return Err(Error::Upstream(format!(
+                "{destination} answered {status}: {text}"
+            )));
+        }
+        Ok(value)
     }
 
     /// The router: `/mcp` plus one forwarding prefix per destination.
@@ -651,6 +708,53 @@ mod tests {
         assert!(matches!(
             Egress::new(m, d, &dir.path().join("t.db")),
             Err(Error::NoCeiling(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_goes_through_the_same_destination_and_is_recorded() {
+        let fake = Router::new().route(
+            "/v1/chat/completions",
+            any(|req: Request| async move {
+                let (_, body) = req.into_parts();
+                let b = to_bytes(body, 1 << 20).await.unwrap();
+                assert!(String::from_utf8_lossy(&b).contains("extract"));
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"model":"gpt-x","choices":[{"message":{"content":"[]"}}],"usage":{"prompt_tokens":40,"completion_tokens":2}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let (_d, e) = fixture(Some((
+            "openai",
+            Destination::forward(
+                format!("http://{addr}"),
+                Auth::Inject {
+                    header: header::AUTHORIZATION,
+                    value: "Bearer sk-real".into(),
+                },
+            ),
+        )))
+        .await;
+        let v = e
+            .call(
+                "openai",
+                "v1/chat/completions",
+                &serde_json::json!({ "messages": [{ "role": "user", "content": "extract" }] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "[]");
+        let rows = e.telemetry().summary().unwrap();
+        let row = rows.iter().find(|r| r.destination == "openai").unwrap();
+        assert_eq!(row.model, "gpt-x");
+        assert_eq!(row.input_tokens, 40);
+        assert!(matches!(
+            e.call("nowhere", "v1/x", &serde_json::json!({})).await,
+            Err(Error::Refused(_))
         ));
     }
 
