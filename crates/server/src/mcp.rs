@@ -310,6 +310,16 @@ fn confidence(s: Option<&str>) -> Result<Option<dm_core::Confidence>, McpError> 
     })
 }
 
+/// A recall's budget from its parameters: the defaults, clamped where given.
+fn recall_budget(limit: Option<usize>, tokens: Option<usize>) -> Budget {
+    let default = Budget::default();
+    Budget {
+        hits: limit.map_or(default.hits, |n| n.clamp(1, MAX_LIMIT)),
+        tokens: tokens.map_or(default.tokens, |t| t.clamp(500, 50_000)),
+        ..default
+    }
+}
+
 /// The MCP server over one [`Memory`].
 #[derive(Clone)]
 pub struct McpServer {
@@ -427,13 +437,7 @@ impl McpServer {
     async fn recall(&self, p: Parameters<RecallParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
         let depth = parse::<Depth>("depth", p.depth)?;
-        let default = Budget::default();
-        let budget = Budget {
-            hits: p.limit.map_or(default.hits, |n| n.clamp(1, MAX_LIMIT)),
-            tokens: p
-                .budget_tokens
-                .map_or(default.tokens, |t| t.clamp(500, 50_000)),
-        };
+        let budget = recall_budget(p.limit, p.budget_tokens);
         let r = self
             .memory
             .recall(&p.question, p.domain.as_deref(), depth, budget)
@@ -759,6 +763,52 @@ mod tests {
             Some(dm_core::Confidence::High)
         );
         assert!(parse::<dm_core::Label>("classification", Some("secret".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn search_at_section_depth_carries_bodies_and_depth_is_checked() {
+        let (_dir, s) = server().await;
+        s.write(handoff(
+            "# Digest handoff\n\nThe manifest parses. Next: digests.\n",
+        ))
+        .await
+        .unwrap();
+        let deep = payload(
+            &s.search(Parameters(SearchParams {
+                query: "digests".into(),
+                depth: Some("sections".into()),
+                ..SearchParams::default()
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(deep["hits"][0]["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("Next: digests")));
+        assert_eq!(deep["truncated"], false);
+        let flat = payload(
+            &s.search(Parameters(SearchParams {
+                query: "digests".into(),
+                depth: Some("summaries".into()),
+                ..SearchParams::default()
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(flat["hits"][0].get("body").is_none());
+        assert!(s
+            .search(Parameters(SearchParams {
+                query: "digests".into(),
+                depth: Some("deep".into()),
+                ..SearchParams::default()
+            }))
+            .await
+            .is_err());
+        let b = recall_budget(Some(10_000), Some(10_000_000));
+        assert_eq!(b.hits, MAX_LIMIT);
+        assert_eq!(b.tokens, 50_000);
+        assert_eq!(recall_budget(None, Some(1)).tokens, 500);
+        assert_eq!(recall_budget(None, None), Budget::default());
     }
 
     fn payload(r: &CallToolResult) -> Value {

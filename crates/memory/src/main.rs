@@ -467,10 +467,10 @@ enum Command {
         /// none, the pack comes back with synthesis owed.
         #[arg(long)]
         provider: Option<String>,
-        #[arg(long, value_enum, default_value = "key")]
+        #[arg(long, value_enum, default_value = "key", requires = "provider")]
         auth: AuthArg,
         /// The deputy's model; a small default per destination otherwise.
-        #[arg(long)]
+        #[arg(long, requires = "provider")]
         model: Option<String>,
     },
     /// One entry, in full.

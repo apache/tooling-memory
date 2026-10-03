@@ -201,6 +201,8 @@ async fn one(
 ) -> Fallible<i32> {
     eprintln!("memory: claimed {}: {}", task.id, task.title);
     let prompt = prompt_for(client, task).await?;
+    // the reads above were the launcher's; the fan-out rule watches the harness
+    session.memory().reset_fan_out();
     let heartbeat = {
         let client = client.clone();
         let id = task.id.clone();

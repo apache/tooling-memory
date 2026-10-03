@@ -19,7 +19,6 @@ use dm_ledger::{Claim, Created, Ledger, Task, TaskSpec};
 use dm_policy::{Grants, Session};
 use dm_store::Store;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
@@ -152,7 +151,7 @@ pub struct Memory {
     /// Whether this session has issued two gets inside one turn.
     fan_out: Mutex<recall::FanOut>,
     /// Bodies a pack fetched for this session, served to a later `get` of the same id.
-    cache: Mutex<HashMap<String, Entry>>,
+    cache: Mutex<recall::Cache>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -208,7 +207,7 @@ impl Memory {
             session: Mutex::new(session),
             deputy: OnceLock::new(),
             fan_out: Mutex::new(recall::FanOut::default()),
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(recall::Cache::default()),
         })
     }
 
@@ -357,22 +356,22 @@ impl Memory {
 
     /// One entry, body included, if the filter admits it. Raises the session label.
     /// The index decides admission; the body comes from the session cache when a pack
-    /// already fetched it, else from the record. Two gets inside one turn mark the
-    /// session as one that fans out.
+    /// already fetched it and the index's digest says it is still the record's version,
+    /// else from the record. Two admitted gets inside one turn mark the session as one
+    /// that fans out.
     ///
     /// # Errors
     ///
     /// [`Error::NotFound`] when absent or not for this session, or a store error.
     pub async fn get(&self, id: &str) -> Result<Entry, Error> {
-        self.note_get();
         let f = self.grants.read_filter();
-        let meta = self
-            .index
-            .lock()
-            .await
-            .meta(id, &f)?
-            .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        let cached = self.cached(id);
+        let meta = self.index.lock().await.meta(id, &f)?;
+        let Some(meta) = meta else {
+            self.cached_current(id, None);
+            return Err(Error::NotFound(id.to_string()));
+        };
+        self.note_get();
+        let cached = self.cached_current(id, Some(&meta.digest));
         let from_cache = cached.is_some();
         let entry = match cached {
             Some(e) => e,

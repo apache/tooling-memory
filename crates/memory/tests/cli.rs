@@ -148,6 +148,7 @@ fn step_search_and_get(d: &Demo) {
         .unwrap()
         .iter()
         .any(|c| c == &d.handoff));
+    assert!(fails(&d.root, &["recall", "q", "--model", "m"]).contains("provider"));
 }
 
 /// 5. a task is created, claimed with a lease, heartbeated, completed; a second claim
