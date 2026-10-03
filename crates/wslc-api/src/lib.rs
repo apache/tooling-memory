@@ -9,8 +9,6 @@
 //! session store (pull from a registry or load from a tar), since the `wslc` command
 //! line's images are not visible to it.
 
-#![allow(clippy::missing_safety_doc)]
-
 use std::path::Path;
 
 /// `WslcSessionSettings`: 72 bytes, 8-aligned, opaque.
@@ -66,24 +64,28 @@ mod dll {
     /// Create a session with `name` and `storage`, then terminate and release it.
     /// Returns the DLL path used and how long the round trip took.
     pub fn session_round_trip(name: &str, storage: &Path) -> Result<String, String> {
+        // SAFETY: loading the vendor's DLL runs its initialisers; that is the point.
         let lib = unsafe { Library::new("wslcsdk.dll") }
             .map_err(|e| format!("wslcsdk.dll: {e} (it ships in the Microsoft.WSL.Containers NuGet package, not with WSL)"))?;
+        // SAFETY: every symbol is resolved by the name and signature the header gives, the
+        // settings block is the size and alignment the header gives, and the strings
+        // outlive the calls that read them.
         unsafe {
-            let init: Symbol<InitSessionSettings> = lib
+            let init: Symbol<'_, InitSessionSettings> = lib
                 .get(b"WslcInitSessionSettings\0")
                 .map_err(|e| e.to_string())?;
-            let cpus: Symbol<SetSessionSettingsCpuCount> = lib
+            let cpus: Symbol<'_, SetSessionSettingsCpuCount> = lib
                 .get(b"WslcSetSessionSettingsCpuCount\0")
                 .map_err(|e| e.to_string())?;
-            let mem: Symbol<SetSessionSettingsMemory> = lib
+            let mem: Symbol<'_, SetSessionSettingsMemory> = lib
                 .get(b"WslcSetSessionSettingsMemory\0")
                 .map_err(|e| e.to_string())?;
-            let create: Symbol<CreateSession> =
+            let create: Symbol<'_, CreateSession> =
                 lib.get(b"WslcCreateSession\0").map_err(|e| e.to_string())?;
-            let terminate: Symbol<TerminateSession> = lib
+            let terminate: Symbol<'_, TerminateSession> = lib
                 .get(b"WslcTerminateSession\0")
                 .map_err(|e| e.to_string())?;
-            let release: Symbol<ReleaseSession> = lib
+            let release: Symbol<'_, ReleaseSession> = lib
                 .get(b"WslcReleaseSession\0")
                 .map_err(|e| e.to_string())?;
             let mut settings = WslcSessionSettings { _opaque: [0; 72] };

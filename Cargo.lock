@@ -635,6 +635,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-wslc-api"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1397,7 +1404,7 @@ dependencies = [
  "dm-sandbox",
  "dm-server",
  "dm-web",
- "libloading",
+ "dm-wslc-api",
  "serde",
  "serde_json",
  "tempfile",

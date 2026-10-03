@@ -69,6 +69,7 @@ built binary.
 | `crates/policy` | The grants file |
 | `crates/server` | The MCP surface |
 | `crates/client` | A typed MCP client for the ledger and the record; what the launcher's task mode and an orchestrator use |
+| `crates/wslc-api` | The WSL containers C API, bound by hand, Windows only |
 | `crates/web` | The web terminal: sessions in pseudo-terminals, a reading pane over the record |
 | `crates/memory` | The binary |
 | `images/harness` | The harness image: five harnesses, Node, Python, and `memory`, pinned |

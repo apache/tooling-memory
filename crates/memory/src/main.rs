@@ -13,7 +13,6 @@ mod requests;
 mod savings;
 mod work;
 mod wslc;
-mod wslc_api;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dm_core::{EntryType, Label};
@@ -938,7 +937,7 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
         Command::WslcApiCheck => {
             let storage = root.join("state/wslc-api");
             std::fs::create_dir_all(&storage)?;
-            println!("{}", wslc_api::check("memory-check", &storage)?);
+            println!("{}", dm_wslc_api::check("memory-check", &storage)?);
             Ok(())
         }
         Command::Savings {

@@ -139,7 +139,9 @@ COVERAGE_MIN ?= 90
 # so it is measured by the confined launch test rather than by line coverage.
 # crates/memory/src/wslc.rs drives wslc.exe, which CI does not have; its argument builders
 # are unit-tested and the rest is proven by hand on a WSL machine.
-COVERAGE_IGNORE = 'sandbox/src/linux\.rs|memory/src/wslc\.rs'
+# crates/wslc-api binds a Windows-only DLL; its layout test runs everywhere
+# and the rest only where the DLL is.
+COVERAGE_IGNORE = 'sandbox/src/linux\.rs|memory/src/wslc\.rs|wslc-api/src/lib\.rs'
 coverage:
 	cargo llvm-cov --workspace --ignore-filename-regex $(COVERAGE_IGNORE) --fail-under-lines $(COVERAGE_MIN) --lcov --output-path target/lcov.info
 	cargo llvm-cov report --ignore-filename-regex $(COVERAGE_IGNORE) --summary-only
