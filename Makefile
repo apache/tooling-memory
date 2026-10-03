@@ -85,7 +85,9 @@ work: build
 DEMO_ROOT ?= $(HOME)/memory-demo
 DEMO_FROM ?= docs
 demo: build
-	@scripts/demo.sh "$(DEMO_ROOT)" $(DEMO_FROM)
+	@set -a; [ -f $(LOCAL_ENV) ] && . ./$(LOCAL_ENV); set +a; \
+	LLMAO_KEY="$${LLMAO_KEY:-$$(cat local/.virtual-key 2>/dev/null)}" \
+	scripts/demo.sh "$(DEMO_ROOT)" $(DEMO_FROM)
 
 # The paper's read-path claims measured on this record.
 savings: build

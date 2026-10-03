@@ -694,6 +694,7 @@ async fn run_cli() -> Fallible {
         cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
         cmd @ (Command::Mine { .. }
         | Command::WslcApiCheck
+        | Command::Savings { .. }
         | Command::Recall {
             provider: Some(_), ..
         }) => tools_cmd(&root, cmd).await,

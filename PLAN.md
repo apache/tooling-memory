@@ -42,8 +42,8 @@ The one piece of code that matters most is the **wrapper**: a per-session memory
 Items 1 through 4 are the demo. Items 5 through 7 are what makes it the paper's design rather than a notes folder.
 
 **Status, 1 October 2026.** All seven pass as `crates/memory/tests/cli.rs` against the
-built binary, and `memory serve` answers a raw JSON-RPC session: initialize, fifteen
-tools, a write under the session's author, the T0 resource. `local/` brings up LiteLLM
+built binary, and `memory serve` answers a raw JSON-RPC session: initialize, sixteen
+tools (`recall` among them since 3 October), a write under the session's author, the T0 resource. `local/` brings up LiteLLM
 and Postgres in containers as the gateway, and `scripts/claude-via-llmao.sh` starts Claude
 Code through it with the memory server attached. Left before the weekend: a run with a
 real provider key and what happened written down; a one-page demo script; and whatever
@@ -62,7 +62,7 @@ that run turns up.
 
 **Out of scope for M0, named so nobody builds it by accident**
 
-- `recall`: needs a model behind it. M1, through an OpenAI-compatible endpoint (llmao locally is LiteLLM).
+- `recall`: landed early, 3 October, as M1's first cut: the pack with synthesis owed on a subscription login, a deputy through a key or the gateway otherwise. See the M1 row; what is left there is the real run.
 - Erasure with receipts. M1. Demotion and tombstones are enough for M0.
 - Classification enforcement on destinations beyond export. M1.
 - HTTP binding, Postgres and Solr backends, Kafka log, WASI tap host, browser reader. M2 and later; see the stack document.
@@ -93,8 +93,10 @@ that run turns up.
 `make demo`: a fresh record seeded with a few hundred entries from the decisions, the docs
 and the paper; the savings report before any session; a task filed and admitted; a harness
 claiming it, searching the record, answering with cited entries and completing it, confined
-and metered; the savings report after, with that session in the funnel; the handoff it
-wrote. Then `make web` to show the same from a browser, and `make launch` for the
+and metered; a recall of the same question twice, owed with no model behind it and
+server-executed through the gateway when a key is there, so the tier switch is on screen;
+the savings report after, with that session in the funnel and both recalls in the recall
+section; the handoff it wrote. Then `make web` to show the same from a browser, and `make launch` for the
 interactive session. Everything the paper claims about the read path appears as a measured
 number next to the alternative it replaced.
 

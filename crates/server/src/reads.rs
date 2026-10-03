@@ -29,6 +29,9 @@ pub struct Read {
     /// Whether the body came from the session cache: pushed by a pack, then asked for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cached: bool,
+    /// How a recall was served: `brief`, or `pack:sections` and `pack:summaries`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// The log file under a root.
@@ -76,6 +79,19 @@ impl ReadLog {
         tokens: usize,
         cached: bool,
     ) {
+        self.served_via(tool, query, hits, tokens, cached, None);
+    }
+
+    /// As [`ReadLog::served`], with how it was served: a recall's regime.
+    pub fn served_via(
+        &self,
+        tool: &str,
+        query: Option<&str>,
+        hits: usize,
+        tokens: usize,
+        cached: bool,
+        via: Option<&str>,
+    ) {
         if !self.enabled {
             return;
         }
@@ -89,6 +105,7 @@ impl ReadLog {
             hits,
             tokens,
             cached,
+            via: via.map(str::to_string),
         };
         let _g = self
             .lock

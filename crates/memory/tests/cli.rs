@@ -149,6 +149,9 @@ fn step_search_and_get(d: &Demo) {
         .iter()
         .any(|c| c == &d.handoff));
     assert!(fails(&d.root, &["recall", "q", "--model", "m"]).contains("provider"));
+    // the savings report runs from the CLI and counts that recall
+    let savings = ok(&d.root, &["savings", "--query", "digests"], None);
+    assert!(savings.contains("owed packs             1"), "{savings}");
 }
 
 /// 5. a task is created, claimed with a lease, heartbeated, completed; a second claim

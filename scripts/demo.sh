@@ -16,9 +16,30 @@ if [ ! -f "$root/grants.toml" ]; then
   "$memory" --root "$root" init --owner "human:demo:$(id -un)" --domain dom-demo
   python3 "$here/scripts/seed-corpus.py" --root "$root" --memory "$memory" "$@"
 fi
+question=${QUERY:-what did DR-19 decide about MoinMoin}
+show=$(cat <<'PY'
+import json, sys
+r = json.load(sys.stdin)
+by = r["synthesis"]["by"]
+head = f"synthesis {by}"
+if by == "server":
+    head += " by " + r["synthesis"]["model"]
+pack = r["pack"]
+print(f'{head}; {len(pack["pieces"])} pieces at {pack["depth"]} depth, {pack["tokens"]} tokens, {r["hops"]} hop(s)')
+if r.get("brief"):
+    print()
+    print(r["brief"].strip())
+    print()
+print("cites: " + ", ".join(r["citations"]))
+PY
+)
+show_recall() { python3 -c "$show"; }
 echo
 echo "== before: the record, T0 and retrieval, with no session yet"
-"$memory" --root "$root" savings --query "${QUERY:-what did DR-19 decide about MoinMoin}" | sed -n '1,12p'
+"$memory" --root "$root" savings --query "$question" | sed -n '1,12p'
+echo
+echo "== recall with no model behind it: the pack comes back, synthesis owed to the caller"
+"$memory" --root "$root" recall "$question" | show_recall
 echo
 title=${TASK_TITLE:-"Answer: what did DR-19 decide about MoinMoin, and why?"}
 body=${TASK_BODY:-"Use the memory tools: search the record, open only the entries you need, and answer in a handoff entry: what was decided, the reasons given, and the entry ids you cite. Then complete this task with that handoff. Do not read files from the working tree; the record is the source."}
@@ -28,8 +49,18 @@ echo "== task $id filed and admitted; a ${HARNESS:-claude} session claims and wo
 work=$(mktemp -d)
 ( cd "$work" && "$memory" --root "$root" work --harness "${HARNESS:-claude}" --auth "${AUTH:-subscription}" --lease-seconds 300 ) || true
 echo
-echo "== after: recovery, retrieval and the funnel, with that session in the numbers"
-"$memory" --root "$root" savings --query "${QUERY:-what did DR-19 decide about MoinMoin}"
+if [ -n "${LLMAO_KEY:-}" ]; then
+  echo "== recall through the gateway: the deputy reads, a cited brief comes back"
+  "$memory" --root "$root" recall "$question" --provider llmao --auth gateway | show_recall || true
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "== recall with a key: the deputy reads, a cited brief comes back"
+  "$memory" --root "$root" recall "$question" --provider anthropic --auth key | show_recall || true
+else
+  echo "== no LLMAO_KEY or ANTHROPIC_API_KEY in the environment: server-executed recall skipped"
+fi
+echo
+echo "== after: recovery, retrieval, the funnel and recall, with that session in the numbers"
+"$memory" --root "$root" savings --query "$question"
 echo
 echo "The handoff the session wrote:"
 h=$("$memory" --root "$root" task get "$id" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("handoff") or "")')

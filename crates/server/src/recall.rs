@@ -636,12 +636,13 @@ impl Memory {
             let pack = self
                 .pack(&[question.to_string()], domain, depth, budget)
                 .await?;
-            self.reads.served(
+            self.reads.served_via(
                 "recall",
                 Some(question),
                 pack.pieces.len(),
                 pack.tokens,
                 false,
+                Some(&format!("pack:{depth}")),
             );
             return Ok(Recall {
                 question: question.to_string(),
@@ -687,12 +688,13 @@ impl Memory {
                 .collect();
         }
         let pack = pack.summaries();
-        self.reads.served(
+        self.reads.served_via(
             "recall",
             Some(question),
             pack.pieces.len(),
             approx_tokens(&answer.brief) + pack.tokens,
             false,
+            Some("brief"),
         );
         Ok(Recall {
             question: question.to_string(),

@@ -45,6 +45,28 @@ pub struct Report {
     pub known_items_top3: usize,
     /// Per session: tokens memory served, tokens the model ingested.
     pub sessions: Vec<SessionRow>,
+    /// Recall, by regime: the brief against the pack it would be written from.
+    pub recall: RecallRow,
+}
+
+/// Recall in the funnel. One turn for the caller either way; what differs is the
+/// tokens the turn carries and whether the caller then opens what was pushed.
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+pub struct RecallRow {
+    /// Server-executed recalls: a brief came back.
+    pub briefs: usize,
+    /// Tokens those briefs cost the caller, summaries beside them included.
+    pub brief_tokens: usize,
+    /// Caller-executed recalls: a pack came back with synthesis owed.
+    pub packs: usize,
+    /// Of those, packs that carried sections.
+    pub packs_with_sections: usize,
+    /// Tokens those packs cost the caller.
+    pub pack_tokens: usize,
+    /// Gets served from the session cache: pushed by a pack, then opened.
+    pub pushed_then_opened: usize,
+    /// Gets in total, for the share.
+    pub gets: usize,
 }
 
 /// One session in the funnel.
@@ -162,6 +184,30 @@ async fn retrieval(
     Ok(())
 }
 
+/// One read's share of the recall row.
+fn count_recall(row: &mut RecallRow, r: &reads::Read) {
+    match (r.tool.as_str(), r.via.as_deref()) {
+        ("recall", Some("brief")) => {
+            row.briefs += 1;
+            row.brief_tokens += r.tokens;
+        }
+        ("recall", Some(via)) => {
+            row.packs += 1;
+            row.pack_tokens += r.tokens;
+            if via == "pack:sections" {
+                row.packs_with_sections += 1;
+            }
+        }
+        ("get", _) => {
+            row.gets += 1;
+            if r.cached {
+                row.pushed_then_opened += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
 fn funnel(root: &Path, report: &mut Report) -> Fallible<()> {
     let mut rows: BTreeMap<String, SessionRow> = BTreeMap::new();
     for r in reads::all(root)? {
@@ -171,6 +217,7 @@ fn funnel(root: &Path, report: &mut Report) -> Fallible<()> {
         });
         row.reads += 1;
         row.served_tokens += r.tokens;
+        count_recall(&mut report.recall, &r);
     }
     if let Ok(t) = Telemetry::open(&root.join("state/telemetry.db")) {
         for s in t.by_session()? {
@@ -287,6 +334,38 @@ pub fn render(r: &Report) -> String {
     if r.sessions.is_empty() {
         s.push_str("  nothing recorded yet\n");
     }
+    s.push_str(&render_recall(&r.recall));
+    s
+}
+
+/// The recall section: one caller turn either way, so the comparison is tokens per
+/// turn and what the caller opened afterwards.
+fn render_recall(r: &RecallRow) -> String {
+    let mut s = String::new();
+    s.push_str("\nRecall: one turn either way; the brief against the pack it is written from\n");
+    if r.briefs + r.packs == 0 {
+        s.push_str("  none yet; `memory recall <question>` on this record\n");
+        return s;
+    }
+    let each = |tokens: usize, n: usize| tokens.checked_div(n).unwrap_or(0);
+    s.push_str(&format!(
+        "  server briefs      {:>5}   {:>7} tokens each\n",
+        r.briefs,
+        each(r.brief_tokens, r.briefs)
+    ));
+    s.push_str(&format!(
+        "  owed packs         {:>5}   {:>7} tokens each  ({} with sections, {} summaries only)\n",
+        r.packs,
+        each(r.pack_tokens, r.packs),
+        r.packs_with_sections,
+        r.packs - r.packs_with_sections
+    ));
+    s.push_str(&format!(
+        "  pushed then opened {:>5}   of {} gets served from a pack's push ({})\n",
+        r.pushed_then_opened,
+        r.gets,
+        pct(r.pushed_then_opened, r.gets)
+    ));
     s
 }
 
@@ -307,6 +386,69 @@ mod tests {
         let n = transcript_tokens(t);
         assert!(n >= 4 + 2, "{n}");
         assert!(n < 40, "{n}");
+    }
+
+    struct Scripted;
+
+    impl dm_server::recall::Deputy for Scripted {
+        fn model(&self) -> String {
+            "scripted".into()
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _prompt: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
+        {
+            Box::pin(async { Ok("{\"brief\": \"The import has five steps.\"}".into()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_is_counted_by_regime_with_what_was_pushed_and_then_opened() {
+        use dm_server::recall::{Budget, Depth};
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let w = m
+            .write(dm_server::WriteRequest {
+                body: "# Import steps\n\nSteps one to five of the import.".into(),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        m.recall("import", None, Some(Depth::Sections), Budget::default())
+            .await
+            .unwrap();
+        m.recall("import", None, Some(Depth::Summaries), Budget::default())
+            .await
+            .unwrap();
+        m.get(&w.id).await.unwrap();
+        let deputy: std::sync::Arc<dyn dm_server::recall::Deputy> = std::sync::Arc::new(Scripted);
+        m.set_deputy(&deputy);
+        m.recall("import", None, None, Budget::default())
+            .await
+            .unwrap();
+        drop(m);
+        let r = measure(dir.path(), Some("import")).await.unwrap();
+        assert_eq!(
+            r.recall,
+            RecallRow {
+                briefs: 1,
+                brief_tokens: r.recall.brief_tokens,
+                packs: 2,
+                packs_with_sections: 1,
+                pack_tokens: r.recall.pack_tokens,
+                pushed_then_opened: 1,
+                gets: 1,
+            },
+            "{r:?}"
+        );
+        assert!(r.recall.brief_tokens > 0 && r.recall.pack_tokens > r.recall.brief_tokens);
+        let text = render(&r);
+        assert!(
+            text.contains("Recall") && text.contains("pushed then opened"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
