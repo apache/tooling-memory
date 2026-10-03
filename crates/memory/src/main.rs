@@ -14,6 +14,7 @@ mod mine;
 mod model;
 mod requests;
 mod savings;
+mod taps;
 mod work;
 mod wslc;
 
@@ -524,6 +525,12 @@ enum Command {
         #[arg(long, value_enum, default_value = "public")]
         max_label: LabelArg,
     },
+    /// A tap: a connector run as a WASI component with exactly the access its grant
+    /// allows.
+    Tap {
+        #[command(subcommand)]
+        op: TapOp,
+    },
     /// Import a bundle directory into a domain.
     Import {
         src: PathBuf,
@@ -532,6 +539,24 @@ enum Command {
     },
     /// Rebuild the index from the record and the ledger from its events.
     Reindex,
+}
+
+/// Tap operations.
+#[derive(Subcommand)]
+enum TapOp {
+    /// Copy a component under the root as `name`; `[taps.<name>]` in grants.toml says
+    /// what it may do.
+    Install { name: String, file: PathBuf },
+    /// Run a tap once, or on a schedule. Its outcome is printed as JSON.
+    Run {
+        name: String,
+        /// The tap's own configuration, JSON.
+        #[arg(long)]
+        config: Option<String>,
+        /// Run again every this many seconds until stopped.
+        #[arg(long)]
+        every: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -761,6 +786,7 @@ async fn run_cli() -> Fallible {
             Ok(())
         }
         Command::Task { op } => task(&Memory::open(&root)?, op).await,
+        Command::Tap { op } => tap_cmd(&root, op).await,
         other => entries(&Memory::open(&root)?, other).await,
     }
 }
@@ -1097,6 +1123,22 @@ async fn golden_cmd(
         print!("{}", golden::render(&r));
     }
     Ok(())
+}
+
+/// `tap install` and `tap run`.
+async fn tap_cmd(root: &Path, op: TapOp) -> Fallible {
+    match op {
+        TapOp::Install { name, file } => {
+            let dest = taps::install(root, &name, &file)?;
+            println!("{}", dest.display());
+            Ok(())
+        }
+        TapOp::Run {
+            name,
+            config,
+            every,
+        } => taps::run(root, &name, config.as_deref(), every).await,
+    }
 }
 
 /// `mine` and the C API check.
@@ -2110,6 +2152,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Relay { .. }
         | Command::Usage
         | Command::Task { .. }
+        | Command::Tap { .. }
         | Command::Write { .. }
         | Command::Search { .. }
         | Command::Recall { .. }

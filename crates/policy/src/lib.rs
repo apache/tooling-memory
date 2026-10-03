@@ -66,6 +66,23 @@ pub struct Destination {
     pub ceiling: Label,
 }
 
+/// What one tap may do: a connector the wrapper hosts as a WASI component.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TapGrant {
+    /// The domain its proposals land in.
+    pub domain: String,
+    /// Hosts it may reach, as `host` or `host:port`; nothing else answers.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// The highest classification it may send out.
+    pub ceiling: Label,
+    /// The environment variable holding the tracker's credential, which the host
+    /// injects as a bearer token; the tap never sees it. The file names the variable,
+    /// never the secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
 /// The grants file, as parsed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grants {
@@ -80,6 +97,9 @@ pub struct Grants {
     /// Places the agent may send to, by name.
     #[serde(default)]
     pub destinations: BTreeMap<String, Destination>,
+    /// Taps the wrapper may run, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub taps: BTreeMap<String, TapGrant>,
 }
 
 fn restricted() -> Label {
@@ -123,6 +143,7 @@ impl Grants {
             handling: Label::Restricted,
             domains,
             destinations,
+            taps: BTreeMap::new(),
         }
     }
 
@@ -169,6 +190,12 @@ impl Grants {
     #[must_use]
     pub fn read_filter(&self) -> ReadFilter {
         ReadFilter::for_domains(self.domains.keys().cloned(), self.handling)
+    }
+
+    /// A tap's grant, if the file names it and its domain is one the owner holds.
+    #[must_use]
+    pub fn tap(&self, name: &str) -> Option<&TapGrant> {
+        self.taps.get(name).filter(|t| self.may_write(&t.domain))
     }
 
     /// Whether the owner may write into a domain.
@@ -259,7 +286,40 @@ default_classification = "internal"
 ceiling = "public"
 [destinations.notes]
 ceiling = "restricted"
+
+[taps.github-issues]
+domain = "dom-striker"
+hosts = ["api.github.com"]
+ceiling = "public"
+credential = "GH_TOKEN"
+
+[taps.stray]
+domain = "dom-else"
+ceiling = "public"
 "#;
+
+    #[test]
+    fn a_tap_grant_names_a_held_domain_and_round_trips() {
+        let g = Grants::parse(FILE).unwrap();
+        let t = g.tap("github-issues").unwrap();
+        assert_eq!(t.domain, "dom-striker");
+        assert_eq!(t.hosts, ["api.github.com"]);
+        assert_eq!(t.ceiling, Label::Public);
+        assert_eq!(t.credential.as_deref(), Some("GH_TOKEN"));
+        assert!(
+            g.tap("stray").is_none(),
+            "a tap on a domain the owner does not hold"
+        );
+        assert!(g.tap("nope").is_none());
+        let again = Grants::parse(&g.render().unwrap()).unwrap();
+        assert_eq!(again, g);
+        let starter = Grants::starter("human:x:y", "dom-y");
+        assert!(starter.taps.is_empty());
+        assert!(
+            !starter.render().unwrap().contains("[taps"),
+            "no section until one is granted"
+        );
+    }
 
     #[test]
     fn parses_and_compiles_to_a_filter() {

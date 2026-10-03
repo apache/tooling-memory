@@ -1,0 +1,30 @@
+[package]
+name = "dm-taps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Taps as WASI components: a host that runs a connector with exactly the access its grant allows"
+
+[dependencies]
+dm-core = { version = "0.1.0", path = "../core" }
+dm-ledger = { version = "0.1.0", path = "../ledger" }
+dm-policy = { version = "0.1.0", path = "../policy" }
+dm-server = { version = "0.1.0", path = "../server" }
+http = "1"
+http-body-util = "0.1"
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+wasmtime = { version = "49", default-features = false, features = ["async", "component-model", "cranelift", "runtime", "std", "parallel-compilation"] }
+wasmtime-wasi = { version = "49", default-features = false }
+wasmtime-wasi-http = { version = "49" }
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+serde_json = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

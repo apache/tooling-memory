@@ -1,0 +1,73 @@
+/// The tap world: what a connector may do, and nothing else.
+///
+/// A tap is a WASI component the wrapper hosts. It gets this interface, the WASI
+/// clocks and random the standard library needs, and outbound HTTP to the hosts its
+/// grant names, with the tracker's credential injected by the host so the tap never
+/// holds it. It gets no filesystem, no sockets, no environment. What it writes lands
+/// in the owner's domain as proposals: tasks born proposed, entries at raw tier.
+package durable-memory:tap@0.1.0;
+
+interface memory {
+    /// A task to file on the tap's domain. Born proposed; the owner admits it.
+    record task {
+        /// One line.
+        title: string,
+        /// What is to be done, in Markdown.
+        body: string,
+        /// What the task cites upstream, such as `github:apache/x#12`.
+        origin: string,
+        /// The upstream event that produced it, such as `open:2026-10-01T09:00:00Z`;
+        /// with the origin, what makes a replay file nothing twice.
+        upstream-event: string,
+        /// Capabilities a session must carry to claim it, such as `tool:github`.
+        requirements: list<string>,
+        /// Higher is claimed first.
+        priority: s64,
+    }
+
+    /// What filing produced.
+    record filed {
+        /// The task's id: a new one, or the one already filed for this origin and event.
+        id: string,
+        /// Whether the same origin and event had already been filed.
+        deduplicated: bool,
+    }
+
+    /// File a task. An error is the ledger's refusal, in words.
+    file-task: func(t: task) -> result<filed, string>;
+
+    /// An entry proposed at raw tier under the tap's own author.
+    record proposal {
+        /// fact, decision, convention, method or handoff.
+        kind: string,
+        /// One line.
+        title: string,
+        /// Markdown.
+        body: string,
+        /// Links or citations this was distilled from.
+        source: list<string>,
+    }
+
+    /// Write a proposal. Returns the new entry's id.
+    propose: func(p: proposal) -> result<string, string>;
+}
+
+world tap {
+    import memory;
+
+    /// What one run of a tap did.
+    record report {
+        /// Tasks filed anew.
+        filed: u32,
+        /// Tasks already filed for their origin and event.
+        deduplicated: u32,
+        /// Entries proposed.
+        proposed: u32,
+        /// Anything the tap wants the owner to read, one line.
+        note: string,
+    }
+
+    /// One reconciliation: pull from upstream, file what is new. `config` is the tap's
+    /// own, as JSON; the owner wrote it.
+    export run: func(config: string) -> result<report, string>;
+}

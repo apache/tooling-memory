@@ -1,0 +1,14 @@
+# The taps: WASI components, built for wasm32-wasip2, outside the native workspace.
+[workspace]
+resolver = "2"
+members = ["github-issues"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# Small components: size over speed, and no symbols in what ships.
+[profile.release]
+opt-level = "s"
+strip = true

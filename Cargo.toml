@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# the taps are wasm32-wasip2 components with a workspace of their own
+exclude = ["taps"]
 
 [workspace.package]
 version = "0.1.0"

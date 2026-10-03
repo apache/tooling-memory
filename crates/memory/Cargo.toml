@@ -15,6 +15,7 @@ dm-index = { version = "0.1.0", path = "../index" }
 dm-ledger = { version = "0.1.0", path = "../ledger" }
 dm-sandbox = { version = "0.1.0", path = "../sandbox" }
 dm-server = { version = "0.1.0", path = "../server" }
+dm-taps = { version = "0.1.0", path = "../taps" }
 dm-web = { version = "0.1.0", path = "../web" }
 dm-wslc-api = { version = "0.1.0", path = "../wslc-api" }
 serde.workspace = true

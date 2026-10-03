@@ -165,6 +165,9 @@ fn step_recall_and_golden(d: &Demo) {
         ]
     )
     .contains("subscription"));
+    // taps: a name is checked before it becomes a path, and a run needs a grant
+    assert!(fails(&d.root, &["tap", "install", "Bad Name", "x.wasm"]).contains("name"));
+    assert!(fails(&d.root, &["tap", "run", "github-issues"]).contains("grants.toml has no"));
     // the savings report runs from the CLI and counts that recall
     let savings = ok(&d.root, &["savings", "--query", "digests"], None);
     assert!(savings.contains("owed packs             1"), "{savings}");

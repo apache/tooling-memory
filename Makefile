@@ -8,7 +8,7 @@ NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
 .PHONY: init check verify fmt fmt-check clippy test guard-test deny machete coverage wasm-check run build \
-	local-up local-down local-logs local-key local-memory launch usage golden
+	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
 # Reads local/.env. See local/README.md.
@@ -111,7 +111,7 @@ local-memory:
 	else target/release/memory --root "$$MEMORY_ROOT" init --domain dom-me; fi
 
 # `make check` is the pre-commit gate: fast, and what every commit must pass.
-check: fmt-check clippy test guard-test
+check: fmt-check clippy test guard-test taps-check
 
 # `make verify` is what CI runs: the gate plus dependencies, coverage, and the wasm build.
 verify: check deny machete coverage wasm-check
@@ -160,6 +160,16 @@ coverage:
 # The core crate must build for the browser target, or the reader and the plugins cannot.
 wasm-check:
 	cargo check -p dm-core --target wasm32-unknown-unknown
+	cargo check -p dm-policy --target wasm32-unknown-unknown
+
+# The taps are a workspace of their own, built as wasm32-wasip2 components. The host's
+# tests build them; the gate also formats and lints them.
+taps-check:
+	cargo fmt --manifest-path taps/Cargo.toml --all -- --check
+	cargo clippy --manifest-path taps/Cargo.toml --target wasm32-wasip2 --all-targets -- -D warnings
+
+taps-build:
+	cargo build --manifest-path taps/Cargo.toml --target wasm32-wasip2 --release
 
 build:
 	cargo build --release
