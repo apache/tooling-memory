@@ -228,7 +228,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     superseded_by  TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON tasks (domain, status, priority DESC, created);
-CREATE UNIQUE INDEX IF NOT EXISTS tasks_origin ON tasks (origin, upstream_event)
+DROP INDEX IF EXISTS tasks_origin;
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_domain_origin ON tasks (domain, origin, upstream_event)
     WHERE origin IS NOT NULL AND upstream_event IS NOT NULL;
 ";
 
@@ -372,7 +373,8 @@ impl Ledger {
     }
 
     /// File a task. It is born proposed. If `origin` and `upstream_event` are both set and
-    /// a task with that pair exists, that task is returned and nothing is filed.
+    /// the domain already has a task with that pair, that task is returned and nothing is
+    /// filed; another domain's task with the same pair is not this domain's.
     ///
     /// # Errors
     ///
@@ -382,8 +384,8 @@ impl Ledger {
             let existing: Option<String> = self
                 .conn
                 .query_row(
-                    "SELECT id FROM tasks WHERE origin = ?1 AND upstream_event = ?2",
-                    params![o, u],
+                    "SELECT id FROM tasks WHERE domain = ?1 AND origin = ?2 AND upstream_event = ?3",
+                    params![spec.domain, o, u],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -1121,6 +1123,21 @@ mod tests {
             2,
             "the duplicate appended nothing"
         );
+        // the same issue filed into another domain is that domain's task: dedup is
+        // scoped to the domain, since one domain's ledger says nothing about another's
+        let mut elsewhere = spec("From the same issue, elsewhere");
+        elsewhere.domain = "dom-b".into();
+        elsewhere.origin = Some("github:apache/x#12".into());
+        elsewhere.upstream_event = Some("labeled:2026-10-01T09:00:00Z".into());
+        let theirs = l.create(elsewhere.clone()).unwrap();
+        assert!(
+            !theirs.deduplicated,
+            "another domain's filing is not a duplicate"
+        );
+        assert_ne!(theirs.task.id, first.task.id);
+        assert_eq!(theirs.task.spec.domain, "dom-b");
+        assert!(l.create(elsewhere).unwrap().deduplicated);
+        assert_eq!(l.event_count().unwrap(), 3);
     }
 
     #[test]
