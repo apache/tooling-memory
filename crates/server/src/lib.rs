@@ -28,6 +28,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 pub mod bundle;
 pub mod mcp;
+pub mod projection;
 pub mod reads;
 pub mod recall;
 pub mod t0;
@@ -156,6 +157,9 @@ pub struct Memory {
     /// What packs pushed to this session, so a later `get` of the same version is
     /// counted as pushed and then opened.
     cache: Mutex<recall::Cache>,
+    /// Where the record is projected as files for this session, when it is; refreshed
+    /// after every write, import and erasure made through this service.
+    projection: Option<PathBuf>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -212,7 +216,28 @@ impl Memory {
             deputy: OnceLock::new(),
             fan_out: Mutex::new(recall::FanOut::default()),
             cache: Mutex::new(recall::Cache::default()),
+            projection: None,
         })
+    }
+
+    /// Keep the record projected as files under `dir` for this session: rendered on
+    /// demand with [`Memory::project_into`] and again after every write, import and
+    /// erasure made through this service.
+    #[must_use]
+    pub fn with_projection(mut self, dir: PathBuf) -> Memory {
+        self.projection = Some(dir);
+        self
+    }
+
+    /// Render the projection again, when there is one. A render that fails is said on
+    /// standard error and does not fail the write that caused it: the record is the
+    /// truth and the projection follows it on the next event.
+    async fn refresh_projection(&self) {
+        if let Some(dir) = &self.projection {
+            if let Err(e) = self.project_into(dir).await {
+                eprintln!("memory: projection at {}: {e}", dir.display());
+            }
+        }
     }
 
     /// Read without recording: for a report or a tool whose reads are not a session's.
@@ -447,6 +472,7 @@ impl Memory {
                 }
             }
         }
+        self.refresh_projection().await;
         Ok(Written {
             id: entry.front.id,
             classification,
@@ -772,6 +798,7 @@ impl Memory {
                 .push("the versions removed were not recorded: the stub was there first".into());
         }
         self.store.put_receipt(&receipt).await?;
+        self.refresh_projection().await;
         Ok(receipt)
     }
 
@@ -901,7 +928,7 @@ impl Memory {
                     .flat_map(|v| std::iter::once(v.digest).chain(v.body_digest))
             })
             .collect();
-        Ok(bundle::import(
+        let imported = bundle::import(
             &self.store,
             &mut ix,
             &self.grants.owner,
@@ -910,7 +937,10 @@ impl Memory {
             default,
             &erased,
         )
-        .await?)
+        .await?;
+        drop(ix);
+        self.refresh_projection().await;
+        Ok(imported)
     }
 
     /// Rebuild the index from the record and the ledger's projection from its events.

@@ -10,6 +10,7 @@ mod deputy;
 mod golden;
 mod hooks;
 mod image;
+mod mcp_http;
 mod mine;
 mod model;
 mod requests;
@@ -983,7 +984,12 @@ async fn prepare_launch(
     let ceiling = memory.grants().ceiling(&ceiling_of).ok_or_else(|| {
         format!("grants.toml has no [destinations.{ceiling_of}]; add one with a ceiling")
     })?;
-    let memory = Arc::new(memory.with_handling_cap(ceiling));
+    let home = root.join("state/sandbox").join(harness.binary());
+    let memory = Arc::new(
+        memory
+            .with_handling_cap(ceiling)
+            .with_projection(home.join(dm_sandbox::PROJECTION)),
+    );
     let mut destinations = HashMap::new();
     destinations.insert(name.clone(), destination);
     let egress = Egress::new(
@@ -1012,7 +1018,7 @@ async fn prepare_launch(
         socket: socket
             .unwrap_or_else(|| run_dir.join(format!("egress-{}.sock", std::process::id()))),
         root: root.to_path_buf(),
-        home: root.join("state/sandbox").join(harness.binary()),
+        home,
         ceiling,
         ceiling_of,
         provider: name,
@@ -1046,6 +1052,9 @@ async fn run_confined(
     rootfs: Option<&Path>,
 ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
     let host_home = home_dir();
+    p.memory
+        .project_into(&p.home.join(dm_sandbox::PROJECTION))
+        .await?;
     let plan = dm_sandbox::prepare(&dm_sandbox::Request {
         harness,
         auth,
@@ -1830,6 +1839,10 @@ impl Session {
         args: &[String],
         capture: bool,
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
+        self.p
+            .memory
+            .project_into(&self.p.home.join(dm_sandbox::PROJECTION))
+            .await?;
         let plan = dm_sandbox::prepare(&dm_sandbox::Request {
             harness: self.harness,
             auth: self.auth,

@@ -269,6 +269,12 @@ pub const INSIDE_SOCKET: &str = "/run/memory/egress.sock";
 pub const INSIDE_MEMORY: &str = "/opt/memory/memory";
 /// The loopback address the relay listens on inside.
 pub const INSIDE_RELAY: &str = "127.0.0.1:4100";
+/// Where the record's projection, the memory as read-only files, appears inside when
+/// the launcher rendered one.
+pub const INSIDE_PROJECTION: &str = "/memory";
+/// Where the launcher renders the projection on the host, under the private home so
+/// every backend carries it.
+pub const PROJECTION: &str = ".memory-view";
 /// Where hooks leave notes for the launcher, under the private home.
 pub const OUTBOX: &str = ".memory-outbox";
 
@@ -459,6 +465,20 @@ fn base_env(harness_env: &[(String, String)]) -> BTreeMap<String, String> {
     env
 }
 
+/// Where the projection is, when the launcher rendered one: in the image the home
+/// crosses as one mount, so it is read where it was rendered; elsewhere it has a
+/// read-only mount of its own.
+fn projection_env(req: &Request<'_>, env: &mut BTreeMap<String, String>) {
+    if req.home.join(PROJECTION).is_dir() {
+        let inside = if req.image {
+            format!("{INSIDE_HOME}/{PROJECTION}")
+        } else {
+            INSIDE_PROJECTION.to_string()
+        };
+        env.insert("MEMORY_PROJECTION".into(), inside);
+    }
+}
+
 /// Everything mounted into the sandbox, in order, and the directory the harness's own
 /// binaries want on PATH.
 fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<PathBuf>) {
@@ -480,6 +500,16 @@ fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<Pat
         target: req.workdir_inside().to_path_buf(),
         read_only: false,
     });
+    // the projection is rendered under the home, which is read-write; it is mounted
+    // again at its own path read-only, so the files cannot be edited into lies
+    let projection = req.home.join(PROJECTION);
+    if projection.is_dir() {
+        mounts.push(Mount {
+            source: projection,
+            target: PathBuf::from(INSIDE_PROJECTION),
+            read_only: true,
+        });
+    }
     mounts.push(Mount {
         source: req.egress_socket.to_path_buf(),
         target: PathBuf::from(INSIDE_SOCKET),
@@ -543,6 +573,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
     };
 
     let mut env = base_env(req.harness_env);
+    projection_env(req, &mut env);
     let (mounts, extra_path) = match req.rootfs {
         Some(rootfs) => {
             let mut m = rootfs_mounts(rootfs);
@@ -623,12 +654,20 @@ fn setup_claude(
     Ok(())
 }
 
-/// The hooks that leave a handoff the agent did not write: before compaction and at
+/// The hooks that leave a handoff the agent did not write, before compaction and at
+/// session end, and the one that turns a read of the projection into a `get`, before a
+/// tool runs. Where the projection is mounted is set with the environment, below. The
+/// hook before compaction and at
 /// session end, the `memory` binary inside reads the event and the transcript and
 /// drops a note in the outbox for the launcher to file. Merged into the user settings
 /// in the private home, which the launcher owns.
 fn claude_hooks(path: &Path) -> Result<(), Error> {
-    merge_hooks(path, "claude", &["PreCompact", "SessionEnd"], 30)
+    merge_hooks(
+        path,
+        "claude",
+        &["PreCompact", "SessionEnd", "PreToolUse"],
+        30,
+    )
 }
 
 /// Merge the two hooks into a JSON settings file that may hold other things: Claude
@@ -1207,6 +1246,56 @@ mod tests {
             plan.links,
             vec![(PathBuf::from("bin"), PathBuf::from("usr/bin"))],
             "merged-usr links come from the rootfs, not the host"
+        );
+    }
+
+    #[test]
+    fn the_projection_is_mounted_read_only_and_named_when_rendered() {
+        let f = fixture();
+        let (_home, plan) = f
+            .plan(Harness::Claude, AuthMode::Subscription, "h", &[], true)
+            .unwrap();
+        assert!(
+            !plan.env.contains_key("MEMORY_PROJECTION")
+                && !plan
+                    .mounts
+                    .iter()
+                    .any(|m| m.target == Path::new(INSIDE_PROJECTION)),
+            "nothing rendered, nothing mounted"
+        );
+        std::fs::create_dir_all(f.root.join("h2").join(PROJECTION)).unwrap();
+        let (home, plan) = f
+            .plan(Harness::Claude, AuthMode::Subscription, "h2", &[], true)
+            .unwrap();
+        let m = plan
+            .mounts
+            .iter()
+            .find(|m| m.target == Path::new(INSIDE_PROJECTION))
+            .expect("the projection is mounted");
+        assert!(
+            m.read_only,
+            "read-only: the files cannot be edited into lies"
+        );
+        assert_eq!(m.source, home.join(PROJECTION));
+        let home_at = plan
+            .mounts
+            .iter()
+            .position(|m| m.target == Path::new(INSIDE_HOME))
+            .unwrap();
+        let view_at = plan
+            .mounts
+            .iter()
+            .position(|m| m.target == Path::new(INSIDE_PROJECTION))
+            .unwrap();
+        assert!(
+            home_at < view_at,
+            "the home is mounted before what it holds"
+        );
+        assert_eq!(plan.env["MEMORY_PROJECTION"], INSIDE_PROJECTION);
+        let settings = json_file(&home.join(".claude/settings.json"));
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "/opt/memory/memory hook claude"
         );
     }
 

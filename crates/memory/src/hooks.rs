@@ -1,8 +1,11 @@
-//! Handoffs the harness did not write: a hook the launcher installs in the harness fires
-//! when context is about to be compacted and when the session ends, and leaves a note
-//! made from the transcript's tail in an outbox in the private home. The launcher files
-//! the notes as handoffs when the run ends. Files, not a client, because the hook runs
-//! inside the sandbox where the only thing it needs to reach is a directory.
+//! Hooks the launcher installs in the harness. Two leave handoffs the harness did not
+//! write: when context is about to be compacted and when the session ends, a note made
+//! from the transcript's tail lands in an outbox in the private home, and the launcher
+//! files the notes as handoffs when the run ends. Files, not a client, because the only
+//! thing those need to reach is a directory. The third fires before a tool runs: a read
+//! of the projection, the memory as files, becomes a `get` on the memory server, so the
+//! filter, the label and the funnel apply to a file read as to a tool call; the server
+//! is reached over the relay, the one route out of the sandbox.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -30,6 +33,110 @@ pub struct HookInput {
     /// SessionEnd: why.
     #[serde(default)]
     pub reason: Option<String>,
+    /// PreToolUse: the tool about to run.
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// PreToolUse: its input, in the tool's own shape.
+    #[serde(default)]
+    pub tool_input: Value,
+}
+
+/// What the hook tells the harness about a tool call. Nothing said is allowed; a denial
+/// carries its reason, which the harness shows the model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Not the hook's business, or a read the memory served.
+    Allow,
+    /// Refused, and why.
+    Deny(String),
+}
+
+impl Decision {
+    /// The hook's standard output, in Claude Code's shape; nothing for an allow.
+    #[must_use]
+    pub fn output(&self) -> Option<String> {
+        match self {
+            Decision::Allow => None,
+            Decision::Deny(reason) => Some(
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason,
+                    }
+                })
+                .to_string(),
+            ),
+        }
+    }
+}
+
+/// The path a tool call is about, for the tools that read files: `file_path` for a
+/// read, `path` for a search over a tree.
+fn path_of(input: &Value) -> Option<PathBuf> {
+    input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+}
+
+/// Decide a tool call against the projection at `projection`. A read of an entry file
+/// is served through `get`, which returns the server's refusal in words when it has
+/// one; a read of the summaries page is free, as a list is; a search over the
+/// projection is refused, since a `grep -r` over bodies is a full-corpus read the
+/// memory would not have served. Anything outside the projection is not the hook's.
+pub fn decide<F>(tool: &str, input: &Value, projection: &Path, get: F) -> Decision
+where
+    F: FnOnce(&str) -> Result<(), String>,
+{
+    let Some(path) = path_of(input) else {
+        return Decision::Allow;
+    };
+    if !path.starts_with(projection) {
+        return Decision::Allow;
+    }
+    match tool {
+        "Read" | "read_file" | "view" => match dm_server::projection::id_of(&path) {
+            Some(id) => match get(id) {
+                Ok(()) => Decision::Allow,
+                Err(why) => Decision::Deny(format!(
+                    "the memory refused {id}: {why}. Its summary is in the README beside it;                      the memory's `search` tool finds what you may read."
+                )),
+            },
+            None => Decision::Allow,
+        },
+        _ => Decision::Deny(format!(
+            "{} is the memory's projection: its bodies are read one file at a time, each              read a `get` the memory serves and counts. Use the memory's `search` tool, or              open one entry file.",
+            projection.display()
+        )),
+    }
+}
+
+/// The PreToolUse hook: decide against the projection the environment names, reaching
+/// the memory server at the MCP URL the environment names. With neither set there is
+/// no projection and nothing to decide.
+async fn pre_tool(input: &HookInput) -> Decision {
+    let (Some(projection), Some(url)) = (
+        std::env::var_os("MEMORY_PROJECTION").map(PathBuf::from),
+        std::env::var("MEMORY_MCP_URL").ok(),
+    ) else {
+        return Decision::Allow;
+    };
+    let tool = input.tool_name.clone().unwrap_or_default();
+    // the id to fetch is decided first, then fetched: the decision is pure, the fetch is not
+    let mut wanted: Option<String> = None;
+    let d = decide(&tool, &input.tool_input, &projection, |id| {
+        wanted = Some(id.to_string());
+        Ok(())
+    });
+    let Some(id) = wanted else {
+        return d;
+    };
+    match crate::mcp_http::call_tool(&url, "get", serde_json::json!({ "id": id })).await {
+        Ok(_) => Decision::Allow,
+        Err(why) => decide(&tool, &input.tool_input, &projection, |_| Err(why)),
+    }
 }
 
 /// Why a note was left; part of its filename so the launcher can tell them apart.
@@ -195,8 +302,9 @@ fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-/// Run as the hook: read the event from standard input, leave a note in the outbox.
-/// Exit 0 whatever happens, so a hook never blocks the harness.
+/// Run as the hook: read the event from standard input; before a tool, decide and say
+/// so on standard output; otherwise leave a note in the outbox. Exit 0 whatever
+/// happens, so a hook never blocks the harness.
 ///
 /// # Errors
 ///
@@ -205,6 +313,15 @@ pub fn run(outbox: &Path) -> Fallible<()> {
     let mut text = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
     let input: HookInput = serde_json::from_str(&text)?;
+    if input.hook_event_name == "PreToolUse" {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        if let Some(out) = rt.block_on(pre_tool(&input)).output() {
+            println!("{out}");
+        }
+        return Ok(());
+    }
     let Some(event) = Event::from_name(&input.hook_event_name) else {
         return Ok(());
     };
@@ -353,6 +470,8 @@ not json
             transcript_path: Some("/home/user/.claude/projects/p/s.jsonl".into()),
             trigger: Some("auto".into()),
             reason: None,
+            tool_name: None,
+            tool_input: Value::Null,
         };
         let (title, body) = note(&input, Event::PreCompact, "**user**\n\nhi");
         assert_eq!(title, "Session abcdef12 before compaction (auto)");
@@ -366,6 +485,8 @@ not json
                 transcript_path: None,
                 trigger: None,
                 reason: Some("other".into()),
+                tool_name: None,
+                tool_input: Value::Null,
             },
             Event::SessionEnd,
             "",
@@ -387,5 +508,79 @@ not json
         assert_eq!(n[0].title, "Compact");
         assert_eq!(n[1].event, Event::SessionEnd);
         assert!(notes(&dir.path().join("missing")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_read_of_the_projection_is_a_get_and_a_search_over_it_is_refused() {
+        let view = Path::new("/memory");
+        let read = |p: &str| serde_json::json!({ "file_path": p });
+        let mut asked = Vec::new();
+        let d = decide("Read", &read("/memory/dom-me/mem-me-abc1.md"), view, |id| {
+            asked.push(id.to_string());
+            Ok(())
+        });
+        assert_eq!(
+            (d, asked),
+            (Decision::Allow, vec!["mem-me-abc1".to_string()])
+        );
+        let d = decide("Read", &read("/memory/dom-me/mem-me-abc1.md"), view, |_| {
+            Err("not found: mem-me-abc1".into())
+        });
+        match d {
+            Decision::Deny(why) => assert!(why.contains("not found") && why.contains("search")),
+            Decision::Allow => panic!("a refusal is a denial"),
+        }
+        assert_eq!(
+            decide("Read", &read("/memory/dom-me/README.md"), view, |_| panic!(
+                "free"
+            )),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide("Read", &read("/work/src/main.rs"), view, |_| panic!(
+                "not ours"
+            )),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide("Read", &read("/memory-else/x.md"), view, |_| panic!(
+                "not ours"
+            )),
+            Decision::Allow,
+            "a prefix of the name is not the directory"
+        );
+        let grep = serde_json::json!({ "pattern": "key", "path": "/memory/dom-me" });
+        assert!(matches!(
+            decide("Grep", &grep, view, |_| panic!("no get")),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            decide(
+                "Glob",
+                &serde_json::json!({ "pattern": "**/*.md", "path": "/memory" }),
+                view,
+                |_| Ok(())
+            ),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            decide(
+                "Bash",
+                &serde_json::json!({ "command": "cat /memory/x" }),
+                view,
+                |_| Ok(())
+            ),
+            Decision::Allow,
+            "a shell is not observed here; the plan says so"
+        );
+        let out = Decision::Deny("why".into()).output().unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(Decision::Allow.output(), None);
+        let input: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/memory/a/mem-a-1.md"}}"#,
+        )
+        .unwrap();
+        assert_eq!(input.tool_name.as_deref(), Some("Read"));
     }
 }
