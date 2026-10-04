@@ -683,10 +683,10 @@ fn claude_hooks(path: &Path) -> Result<(), Error> {
     )
 }
 
-/// Merge the two hooks into a JSON settings file that may hold other things: Claude
-/// Code's `settings.json`, Codex's `hooks.json`, Gemini CLI's `settings.json`. All three
-/// share the shape, `hooks → event → matcher groups → command handlers`; they differ in
-/// the name of the compaction event and in how long a session-end hook may run.
+/// Merge the hooks for `events` into a JSON settings file that may hold other things:
+/// Claude Code's `settings.json`, Codex's `hooks.json`, Qwen Code's `settings.json`.
+/// All share the shape, `hooks → event → matcher groups → command handlers`; they differ
+/// in the name of the compaction event and in how long a session-end hook may run.
 fn merge_hooks(path: &Path, harness: &str, events: &[&str], timeout: u32) -> Result<(), Error> {
     let mut settings: serde_json::Value = std::fs::read_to_string(path)
         .ok()
@@ -772,13 +772,11 @@ url = "{relay}/mcp"
             }
         }
     }
-    // Codex gives a session-end hook three seconds at most
-    merge_hooks(
-        &req.home.join(".codex/hooks.json"),
-        "codex",
-        &["PreCompact", "SessionEnd"],
-        3,
-    )?;
+    // Codex gives a session-end hook three seconds at most; the projection's guard
+    // before a tool runs has the time a tool hook may take
+    let hooks = req.home.join(".codex/hooks.json");
+    merge_hooks(&hooks, "codex", &["PreCompact", "SessionEnd"], 3)?;
+    merge_hooks(&hooks, "codex", &["PreToolUse"], 30)?;
     env.insert("CODEX_HOME".into(), format!("{INSIDE_HOME}/.codex"));
     Ok(())
 }
@@ -817,7 +815,8 @@ fn setup_gemini(
         "hooks": [{ "type": "command", "command": format!("{INSIDE_MEMORY} hook gemini"), "timeout": 10_000 }]
     }]);
     let settings = serde_json::json!({
-        "hooks": { "PreCompress": hook, "SessionEnd": hook },
+        // BeforeTool is Gemini's name for the event before a tool runs
+        "hooks": { "PreCompress": hook, "SessionEnd": hook, "BeforeTool": hook },
         "security": { "auth": { "selectedType": auth_type } },
         "general": { "enableAutoUpdate": false },
         "privacy": { "usageStatisticsEnabled": false },
@@ -1482,6 +1481,13 @@ mod tests {
         );
         assert_eq!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
         assert!(hooks["hooks"]["PreCompact"].is_array());
+        // the projection's guard, with the time a tool hook may take rather than the
+        // three seconds Codex gives a session's end
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "/opt/memory/memory hook codex"
+        );
+        assert_eq!(hooks["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 30);
         assert_eq!(plan.env["MEMORY_OUTBOX"], "/home/user/.memory-outbox");
         assert_eq!(plan.env["DM_EGRESS_TOKEN"], "egress");
         let (home, _) = f
@@ -1581,6 +1587,11 @@ mod tests {
         assert_eq!(
             s["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 10_000,
             "milliseconds, for Gemini"
+        );
+        // Gemini CLI's name for the event before a tool runs
+        assert_eq!(
+            s["hooks"]["BeforeTool"][0]["hooks"][0]["command"],
+            "/opt/memory/memory hook gemini"
         );
         assert_eq!(
             plan.env["GOOGLE_GEMINI_BASE_URL"],

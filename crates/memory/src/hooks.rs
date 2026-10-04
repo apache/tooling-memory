@@ -81,18 +81,20 @@ pub enum Decision {
 }
 
 impl Decision {
-    /// The hook's standard output in the harness's shape. Claude Code reads a
-    /// `hookSpecificOutput` and takes silence as allowed; Antigravity CLI wants a
+    /// The hook's standard output in the harness's shape. Claude Code, Codex and Qwen
+    /// Code read a `hookSpecificOutput` and take silence as allowed; Gemini CLI reads a
+    /// top-level `decision` and takes silence as allowed; Antigravity CLI wants a
     /// `decision` either way, since an empty object is refused as invalid.
     #[must_use]
     pub fn output(&self, harness: &str) -> Option<String> {
-        if harness == "antigravity" {
-            return Some(match self {
-                Decision::Allow => serde_json::json!({ "decision": "allow" }).to_string(),
+        if harness == "antigravity" || harness == "gemini" {
+            return match self {
+                Decision::Allow if harness == "gemini" => None,
+                Decision::Allow => Some(serde_json::json!({ "decision": "allow" }).to_string()),
                 Decision::Deny(reason) => {
-                    serde_json::json!({ "decision": "deny", "reason": reason }).to_string()
+                    Some(serde_json::json!({ "decision": "deny", "reason": reason }).to_string())
                 }
-            });
+            };
         }
         match self {
             Decision::Allow => None,
@@ -110,15 +112,25 @@ impl Decision {
     }
 }
 
+/// The name of the event before a tool runs: `PreToolUse` in Claude Code, Codex, Qwen
+/// Code and Antigravity CLI, `BeforeTool` in Gemini CLI.
+#[must_use]
+pub fn pre_tool_event(name: &str) -> bool {
+    matches!(name, "PreToolUse" | "BeforeTool")
+}
+
 /// The path a tool call is about, for the tools that touch files: `file_path` for a
 /// read or an edit, `notebook_path` for a notebook, `path` for a search over a tree,
 /// and for a search without one, its pattern when the pattern is a path.
 fn path_of(input: &Value) -> Option<PathBuf> {
-    // Claude Code's names, then Antigravity CLI's, which are PascalCase
+    // Claude Code's names, Gemini CLI's and Qwen Code's (`absolute_path` is what
+    // `read_file` took before `file_path`), then Antigravity CLI's, which are PascalCase
     [
         "file_path",
+        "absolute_path",
         "notebook_path",
         "path",
+        "dir_path",
         "pattern",
         "AbsolutePath",
         "SearchPath",
@@ -197,10 +209,37 @@ fn searches(tool: &str) -> bool {
             | "grep"
             | "glob"
             | "search_files"
+            | "search_file_content"
             | "list_directory"
             | "grep_search"
+            | "grep_files"
             | "find_by_name"
             | "list_dir"
+    )
+}
+
+/// Whether a read of many files at once, Gemini CLI's and Qwen Code's
+/// `read_many_files`, reaches into `projection`: any of its paths or globs is under
+/// the projection, holds it, or climbs. Such a read is a search over bodies, whatever
+/// else it lists.
+fn reads_many_into(tool: &str, input: &Value, projection: &Path) -> bool {
+    tool == "read_many_files"
+        && ["paths", "include"].iter().any(|k| {
+            input.get(*k).and_then(Value::as_array).is_some_and(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .any(|p| glob_reaches(p, projection))
+            })
+        })
+}
+
+/// Why a tool is refused over the projection as a whole.
+fn whole_of(projection: &Path) -> String {
+    format!(
+        "{} is the memory's projection: its bodies are read one file at a time, each \
+         read a `get` the memory serves and counts. Use the memory's `search` tool, or \
+         open one entry file.",
+        projection.display()
     )
 }
 
@@ -215,10 +254,13 @@ pub fn decide<F>(tool: &str, input: &Value, projection: &Path, session: &str, ge
 where
     F: FnOnce(&str) -> Result<(), String>,
 {
+    let projection = normalise(projection);
     let Some(path) = path_of(input) else {
+        if reads_many_into(tool, input, &projection) {
+            return Decision::Deny(whole_of(&projection));
+        }
         return Decision::Allow;
     };
-    let projection = normalise(projection);
     // a search over an absolute ancestor of the projection covers it; a relative path
     // is the working tree's, which does not hold the projection
     let covers = searches(tool) && path.is_absolute() && projection.starts_with(&path);
@@ -233,12 +275,7 @@ where
     if !path.starts_with(&projection) && !covers && !by_pattern {
         return Decision::Allow;
     }
-    let whole = format!(
-        "{} is the memory's projection: its bodies are read one file at a time, each \
-         read a `get` the memory serves and counts. Use the memory's `search` tool, or \
-         open one entry file.",
-        projection.display()
-    );
+    let whole = whole_of(&projection);
     if !reads_one(tool) {
         return Decision::Deny(whole);
     }
@@ -516,7 +553,7 @@ pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
     let mut text = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
     let input: HookInput = serde_json::from_str(&text)?;
-    if input.hook_event_name == "PreToolUse" {
+    if pre_tool_event(&input.hook_event_name) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -820,6 +857,87 @@ not json
         )
         .unwrap();
         assert_eq!(input.tool_name.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn gemini_s_before_tool_is_a_pre_tool_event_answered_with_a_decision() {
+        // Gemini CLI names the event BeforeTool and reads a top-level decision
+        assert!(pre_tool_event("BeforeTool") && pre_tool_event("PreToolUse"));
+        assert!(!pre_tool_event("AfterTool"));
+        let v: Value =
+            serde_json::from_str(&Decision::Deny("why".into()).output("gemini").unwrap()).unwrap();
+        assert_eq!(
+            (v["decision"].as_str(), v["reason"].as_str()),
+            (Some("deny"), Some("why"))
+        );
+        assert_eq!(Decision::Allow.output("gemini"), None, "silence is allowed");
+        // Codex and Qwen Code read Claude Code's shape
+        for h in ["codex", "qwen"] {
+            let out = Decision::Deny("why".into()).output(h).unwrap();
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{h}");
+        }
+    }
+
+    #[test]
+    fn the_file_tools_of_gemini_qwen_and_codex_are_known_by_their_own_argument_names() {
+        let view = Path::new("/memory");
+        // Gemini's read_file took absolute_path before file_path; both are the file
+        let mut asked = Vec::new();
+        let d = decide(
+            "read_file",
+            &serde_json::json!({ "absolute_path": "/memory/dom-me/mem-me-abc1.md" }),
+            view,
+            SID,
+            |id| {
+                asked.push(id.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            (d, asked),
+            (Decision::Allow, vec!["mem-me-abc1".to_string()])
+        );
+        // list_directory names its directory dir_path
+        assert!(matches!(
+            decide(
+                "list_directory",
+                &serde_json::json!({ "dir_path": "/memory/dom-me" }),
+                view,
+                SID,
+                |_| panic!("a list is not a get")
+            ),
+            Decision::Deny(_)
+        ));
+        // Codex's grep_files over the projection is a search over bodies
+        assert!(matches!(
+            decide(
+                "grep_files",
+                &serde_json::json!({ "pattern": "x", "path": "/memory" }),
+                view,
+                SID,
+                |_| panic!("a search is not a get")
+            ),
+            Decision::Deny(_)
+        ));
+        // read_many_files is a read of many files: refused when any is the projection's
+        // or holds it, free when none is
+        let many = |paths: &[&str]| {
+            decide(
+                "read_many_files",
+                &serde_json::json!({ "paths": paths }),
+                view,
+                SID,
+                |_| panic!("many is not one"),
+            )
+        };
+        assert!(matches!(
+            many(&["/work/a.md", "/memory/dom-me/mem-me-abc1.md"]),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(many(&["/"]), Decision::Deny(_)));
+        assert_eq!(many(&["/work/a.md", "/work/b.md"]), Decision::Allow);
+        assert_eq!(many(&[]), Decision::Allow);
     }
 
     #[test]

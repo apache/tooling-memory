@@ -162,10 +162,13 @@ though the harness does not.
 
 ## Handoffs the harness did not write
 
-The launcher installs two hooks in each harness's settings in the private home: before
-context is compacted, and at session end. Claude Code and Codex call the first PreCompact
-and Gemini CLI calls it PreCompress; Codex allows a session-end hook three seconds, which
-is plenty for one file read and one file write. Each runs the `memory` binary inside the
+The launcher installs three hooks in each harness's settings in the private home: before
+context is compacted, at session end, and before a tool runs. Claude Code and Codex call
+the first PreCompact and Gemini CLI calls it PreCompress; Codex allows a session-end hook
+three seconds, which is plenty for one file read and one file write; the third is
+PreToolUse in Claude Code and Codex and BeforeTool in Gemini CLI, and guards the
+projection, the record's read-only files at `/memory`: a read of an entry file becomes
+a `get`, and a search over the projection is refused (PLAN.md, M4b). Each runs the `memory` binary inside the
 sandbox, which reads the event and the transcript's tail and leaves a note in an outbox in
 the private home. When the run ends, the launcher files the notes as handoffs, marked as
 left by the hook rather than the agent and pointing at the full transcript. A note from
