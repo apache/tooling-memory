@@ -81,6 +81,17 @@ pub struct Removed {
     pub version: String,
     /// The digest of the text that was removed, so a copy can be recognised later.
     pub digest: String,
+    /// The digest of the body alone, trimmed, so a copy whose frontmatter was edited is
+    /// recognised too. Absent when the version did not parse as an entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_digest: Option<String>,
+}
+
+/// The digest an erasure keeps of a body: the text alone, trimmed, so the same words
+/// under other frontmatter or a trailing newline are the same body.
+#[must_use]
+pub fn body_digest(body: &str) -> String {
+    crate::digest(body.trim())
 }
 
 /// The erasure record and the receipt, together.
@@ -173,6 +184,7 @@ mod tests {
             removed: vec![Removed {
                 version: "current".into(),
                 digest: "ab".repeat(32),
+                body_digest: Some(body_digest("The body.\n")),
             }],
             flagged: vec!["mem-me-00000002".into()],
             unresolved: vec!["exports issued before the erasure".into()],
@@ -180,6 +192,8 @@ mod tests {
         let text = r.to_yaml();
         assert!(text.contains("reason: requested"));
         assert_eq!(Receipt::from_yaml(&text).unwrap(), r);
+        assert_eq!(body_digest("The body.\n"), body_digest("\n\nThe body."));
+        assert_ne!(body_digest("The body."), body_digest("The body, edited."));
         assert_eq!("legal".parse::<Reason>().unwrap(), Reason::Legal);
         assert!("because".parse::<Reason>().is_err());
         assert_eq!(Reason::Sensitive.to_string(), "sensitive");

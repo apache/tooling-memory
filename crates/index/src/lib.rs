@@ -558,18 +558,20 @@ impl Index {
         }))
     }
 
-    /// The id already indexed with this origin, if any. Unfiltered on purpose: it serves
-    /// the import path's dedup, which runs as the owner, and reveals only an id.
+    /// The id already indexed in `domain` with this origin, if any. Unfiltered by label
+    /// on purpose: it serves the import path's dedup, which runs as the owner, and
+    /// reveals only an id. Scoped to the domain, since one domain's record says nothing
+    /// about another's.
     ///
     /// # Errors
     ///
     /// A database error.
-    pub fn by_origin(&self, origin: &str) -> Result<Option<String>, Error> {
+    pub fn by_origin(&self, domain: &str, origin: &str) -> Result<Option<String>, Error> {
         Ok(self
             .conn
             .query_row(
-                "SELECT id FROM entries WHERE origin = ?1 LIMIT 1",
-                params![origin],
+                "SELECT id FROM entries WHERE domain = ?1 AND origin = ?2 LIMIT 1",
+                params![domain, origin],
                 |r| r.get(0),
             )
             .optional()?)
@@ -872,10 +874,17 @@ mod tests {
         assert_eq!(m.digest, dm_core::digest(&e.render()));
         assert_eq!(m.hit.title, "Imported");
         assert_eq!(
-            ix.by_origin("github:apache/x#12").unwrap().as_deref(),
+            ix.by_origin("dom-a", "github:apache/x#12")
+                .unwrap()
+                .as_deref(),
             Some("mem-a-1")
         );
-        assert_eq!(ix.by_origin("github:apache/x#13").unwrap(), None);
+        assert_eq!(ix.by_origin("dom-a", "github:apache/x#13").unwrap(), None);
+        assert_eq!(
+            ix.by_origin("dom-b", "github:apache/x#12").unwrap(),
+            None,
+            "another domain's entry is not this domain's duplicate"
+        );
         assert!(ix.meta("mem-a-none", &f).unwrap().is_none());
     }
 

@@ -44,20 +44,48 @@ impl Memory {
                 Err(Error::NotFound(_)) => continue,
                 Err(e) => return Err(e),
             };
+            // the record's word, should the index be behind it
+            if entry.front.classification > ceiling {
+                continue;
+            }
             out.push((task, entry));
         }
         Ok(out)
     }
 
     /// Record where a completed task's handoff was posted back, so it is posted once.
+    /// Only a task of `domain` at or under `ceiling`, the tap's, since a tap may say
+    /// where it posted what it was handed and nothing about the rest; `to` is one line.
     ///
     /// # Errors
     ///
-    /// A ledger error, including a task that is not completed or was posted already, or
-    /// a task outside the grants.
-    pub async fn post(&self, id: &str, to: &str) -> Result<Task, Error> {
+    /// [`Error::Denied`] for a task of another domain, above the ceiling, or a `to`
+    /// that is not one line of at most 2048 characters; a ledger error, including a
+    /// task that is not completed or was posted already; or a task outside the grants.
+    pub async fn post(
+        &self,
+        id: &str,
+        to: &str,
+        domain: &str,
+        ceiling: Label,
+    ) -> Result<Task, Error> {
+        if to.is_empty() || to.chars().count() > 2048 || to.chars().any(char::is_control) {
+            return Err(Error::Denied(
+                "where it was posted is one line of at most 2048 characters".into(),
+            ));
+        }
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id)?)?;
+        let task = l.get(id)?;
+        self.task_in_grants(&task)?;
+        if task.spec.domain != domain {
+            return Err(Error::Denied(format!("{id} is not a task of {domain}")));
+        }
+        if task.spec.classification > ceiling {
+            return Err(Error::Denied(format!(
+                "{id} is {} which is above the ceiling {ceiling}",
+                task.spec.classification
+            )));
+        }
         Ok(l.post(id, to)?)
     }
 }
@@ -121,6 +149,9 @@ mod tests {
             Some("Done, internally.\n"),
         )
         .await;
+        // claimed, not done; before the restricted one, since a claim raises the
+        // session's label and a later task would be filed at it
+        let open = done(&m, Some("github:acme/x#3"), Label::Internal, None).await;
         let restricted = done(
             &m,
             Some("github:acme/x#2"),
@@ -129,7 +160,6 @@ mod tests {
         )
         .await;
         let local = done(&m, None, Label::Internal, Some("Done here.\n")).await;
-        let open = done(&m, Some("github:acme/x#3"), Label::Internal, None).await;
 
         let tap = Memory::open(dir.path())
             .unwrap()
@@ -150,10 +180,14 @@ mod tests {
         assert!(tap.unposted("dom-else", Label::Restricted).await.is_err());
 
         assert!(matches!(
-            tap.post(&open, "https://x/1").await,
+            tap.post(&open, "https://x/1", "dom-me", Label::Internal)
+                .await,
             Err(Error::Ledger(_))
         ));
-        let posted = tap.post(&internal, "https://x/1").await.unwrap();
+        let posted = tap
+            .post(&internal, "https://x/1", "dom-me", Label::Internal)
+            .await
+            .unwrap();
         assert_eq!(posted.posted_to.as_deref(), Some("https://x/1"));
         assert!(tap
             .unposted("dom-me", Label::Internal)
@@ -161,9 +195,103 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(matches!(
-            tap.post(&internal, "https://x/2").await,
+            tap.post(&internal, "https://x/2", "dom-me", Label::Internal)
+                .await,
             Err(Error::Ledger(_))
         ));
         assert_eq!(m.get_task(&local).await.unwrap().posted_to, None);
+    }
+
+    /// A second domain granted, and a task from upstream completed in it by the owner;
+    /// the owner's session and the task's id.
+    async fn done_elsewhere(root: &Path) -> (Memory, String) {
+        let grants = root.join(crate::GRANTS_FILE);
+        let mut text = std::fs::read_to_string(&grants).unwrap();
+        text.push_str("\n[domains.dom-other]\ndefault_classification = \"internal\"\n");
+        std::fs::write(&grants, text).unwrap();
+        let owner = Memory::open(root).unwrap().without_read_log();
+        let other = owner
+            .create_task(dm_ledger::TaskSpec {
+                domain: "dom-other".into(),
+                title: "Elsewhere".into(),
+                body: "Do it.\n".into(),
+                requirements: vec![],
+                depends_on: vec![],
+                origin: Some("github:acme/x#3".into()),
+                upstream_event: Some("open:2026-10-01T09:00:00Z".into()),
+                created_by: String::new(),
+                classification: Label::Internal,
+                priority: 0,
+            })
+            .await
+            .unwrap()
+            .task
+            .id;
+        owner.admit(&other).await.unwrap();
+        owner
+            .claim(&other, time::Duration::minutes(5))
+            .await
+            .unwrap();
+        let h = owner
+            .write(WriteRequest {
+                domain: Some("dom-other".into()),
+                entry_type: EntryType::Handoff,
+                body: "Done elsewhere.\n".into(),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        owner.complete(&other, &h.id).await.unwrap();
+        (owner, other)
+    }
+
+    #[tokio::test]
+    async fn post_refuses_a_task_outside_the_tap_s_domain_or_above_its_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let restricted = done(
+            &m,
+            Some("github:acme/x#2"),
+            Label::Restricted,
+            Some("The key is in the vault.\n"),
+        )
+        .await;
+        let (owner, other) = done_elsewhere(dir.path()).await;
+        let tap = Memory::open(dir.path())
+            .unwrap()
+            .with_author("tap:comments")
+            .without_read_log();
+        assert!(tap
+            .unposted("dom-me", Label::Internal)
+            .await
+            .unwrap()
+            .is_empty());
+        for (id, why) in [
+            (&restricted, "above the ceiling"),
+            (&other, "another domain"),
+        ] {
+            assert!(
+                matches!(
+                    tap.post(id, "https://x/1", "dom-me", Label::Internal).await,
+                    Err(Error::Denied(_))
+                ),
+                "{why}"
+            );
+            assert_eq!(owner.get_task(id).await.unwrap().posted_to, None, "{why}");
+        }
+        assert!(matches!(
+            tap.post(&other, "https://x/\u{7}", "dom-other", Label::Internal)
+                .await,
+            Err(Error::Denied(_))
+        ));
+        assert!(matches!(
+            tap.post(&other, &"x".repeat(3000), "dom-other", Label::Internal)
+                .await,
+            Err(Error::Denied(_))
+        ));
+        assert!(tap
+            .post(&other, "https://x/1", "dom-other", Label::Internal)
+            .await
+            .is_ok());
     }
 }

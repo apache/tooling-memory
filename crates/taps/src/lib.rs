@@ -170,6 +170,8 @@ struct State {
     memory: Arc<Memory>,
     domain: String,
     limits: wasmtime::StoreLimits,
+    /// The tasks `completed` handed out this run: the only ones `posted` may name.
+    handed: std::collections::HashSet<String>,
 }
 
 impl WasiView for State {
@@ -228,7 +230,10 @@ impl Host for State {
             Ok(done) => Ok(done
                 .into_iter()
                 .map(|(task, handoff)| Done {
-                    id: task.id,
+                    id: {
+                        self.handed.insert(task.id.clone());
+                        task.id
+                    },
                     title: task.spec.title,
                     origin: task.spec.origin.unwrap_or_default(),
                     upstream_event: task.spec.upstream_event.unwrap_or_default(),
@@ -241,9 +246,13 @@ impl Host for State {
     }
 
     async fn posted(&mut self, id: String, to: String) -> wasmtime::Result<Result<(), String>> {
+        // a tap says where it posted what it was handed, and nothing about the rest
+        if !self.handed.contains(&id) {
+            return Ok(Err(format!("{id} was not handed to this run")));
+        }
         Ok(self
             .memory
-            .post(&id, &to)
+            .post(&id, &to, &self.domain, self.hooks.ceiling)
             .await
             .map(|_| ())
             .map_err(|e| e.to_string()))
@@ -361,6 +370,7 @@ pub async fn run(
         limits: wasmtime::StoreLimitsBuilder::new()
             .memory_size(limits.memory)
             .build(),
+        handed: std::collections::HashSet::new(),
     };
     let mut store = Store::new(&engine, state);
     store.limiter(|s| &mut s.limits);

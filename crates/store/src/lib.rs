@@ -24,7 +24,7 @@
 //! current and archived, and the stub is written over each of them in place, with the
 //! receipt beside the record saying what was removed.
 
-use dm_core::erasure::{Receipt, Removed};
+use dm_core::erasure::{body_digest, Receipt, Removed};
 use dm_core::{digest, Entry, Status};
 use opendal::Operator;
 use std::path::Path;
@@ -270,14 +270,17 @@ impl Store {
                 domain: domain.to_string(),
                 id: id.to_string(),
             })?;
+        let of_body = |text: &str| Entry::parse(text).ok().map(|e| body_digest(&e.body));
         let mut out = vec![Removed {
             version: "current".into(),
             digest: digest(&current),
+            body_digest: of_body(&current),
         }];
         for version in self.history(domain, id).await? {
             out.push(Removed {
                 version: version.name,
                 digest: digest(&version.text),
+                body_digest: of_body(&version.text),
             });
         }
         Ok(out)
@@ -701,6 +704,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed, before, "the current version and two archived ones");
+        assert_eq!(
+            removed[0].body_digest.as_deref(),
+            Some(dm_core::erasure::body_digest("version 3 of the secret\n").as_str())
+        );
         assert_eq!(removed[0].version, "current");
         assert_eq!(removed[0].digest, digest(&current.render()));
         let after = s.get("dom-a", "mem-a-1").await.unwrap().unwrap();
@@ -720,6 +727,7 @@ mod tests {
             unresolved: vec![],
         };
         s.put_receipt(&receipt).await.unwrap();
+        assert!(receipt.to_yaml().contains("body_digest:"));
         assert_eq!(
             s.receipt("dom-a", "mem-a-1").await.unwrap().as_ref(),
             Some(&receipt)

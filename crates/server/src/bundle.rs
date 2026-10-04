@@ -10,6 +10,7 @@
 //! anything is read, and an entry whose digest does not match its manifest line is
 //! refused before anything is written.
 
+use dm_core::erasure::body_digest;
 use dm_core::manifest::{Manifest, ManifestEntry};
 use dm_core::{digest, Entry, Label, ReadFilter, TrustTier};
 use dm_index::{Hit, Index};
@@ -143,8 +144,10 @@ pub async fn export(
 
 /// Import a bundle from `src` into `into_domain`. `owner` is this record's owner; a bundle
 /// the same owner exported keeps its trust tiers, every other bundle lands at raw. An
-/// entry whose text's digest is in `erased`, what this domain's receipts list as removed,
-/// is refused and named rather than written back.
+/// entry whose text's digest, or whose trimmed body's, is in `erased`, what this
+/// domain's receipts list as removed, is refused and named rather than written back.
+/// Recognition is by digest: a copy that was reworded is a new text, and the receipt
+/// says so.
 ///
 /// # Errors
 ///
@@ -191,11 +194,12 @@ pub async fn import(
                 m.path
             )));
         }
-        if erased.contains(&m.digest) {
+        let entry = Entry::parse(&text)?;
+        if erased.contains(&m.digest) || erased.contains(&body_digest(&entry.body)) {
             out.erased.push(m.id.clone());
             continue;
         }
-        checked.push(Entry::parse(&text)?);
+        checked.push(entry);
     }
 
     // Pass two: land what is new.
@@ -206,7 +210,7 @@ pub async fn import(
                 manifest.exported_by, manifest.domain, entry.front.id
             )
         });
-        if index.by_origin(&origin)?.is_some() {
+        if index.by_origin(into_domain, &origin)?.is_some() {
             out.skipped.push(entry.front.id.clone());
             continue;
         }

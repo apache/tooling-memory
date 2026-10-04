@@ -154,8 +154,11 @@ impl Guest for Component {
                     let to = serde_json::from_str::<Comment>(&text)
                         .map(|c| c.html_url)
                         .unwrap_or(url);
-                    posted(&done.id, &to)?;
-                    report.posted += 1;
+                    // the comment is up; a refusal to record it costs this one, not the run
+                    match posted(&done.id, &to) {
+                        Ok(()) => report.posted += 1,
+                        Err(e) => failed.push(format!("#{number}: posted, not recorded: {e}")),
+                    }
                 }
                 Ok((status, text)) => failed.push(format!(
                     "#{number}: {status} {}",

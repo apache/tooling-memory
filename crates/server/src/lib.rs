@@ -806,6 +806,7 @@ const UNRESOLVED: &[&str] = &[
     "transcripts of sessions that read it",
     "search queries and recall questions in the read log",
     "the history of entries that cite it, and the ledger's handoffs, which are not scanned",
+    "copies the digests do not recognise: a reworded one is a new text to an import",
 ];
 
 /// Whether `text` names `id`: the whole id, not a prefix of a longer one, and not the
@@ -894,7 +895,11 @@ impl Memory {
             .receipts(&domain)
             .await?
             .into_iter()
-            .flat_map(|r| r.removed.into_iter().map(|v| v.digest))
+            .flat_map(|r| {
+                r.removed
+                    .into_iter()
+                    .flat_map(|v| std::iter::once(v.digest).chain(v.body_digest))
+            })
             .collect();
         Ok(bundle::import(
             &self.store,
@@ -1576,5 +1581,78 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// A second domain in the grants file, so a root holds two.
+    fn grant_domain(root: &Path, domain: &str) {
+        let grants = root.join(GRANTS_FILE);
+        let mut text = std::fs::read_to_string(&grants).unwrap();
+        text.push_str(&format!(
+            "\n[domains.{domain}]\ndefault_classification = \"internal\"\n"
+        ));
+        std::fs::write(&grants, text).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_edited_copy_of_an_erased_body_is_refused_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let (m, [a, ..], _) = vault(&root).await;
+        let handed_out = dir.path().join("handed-out");
+        m.export(Some("dom-me"), Label::Internal, &handed_out)
+            .await
+            .unwrap();
+        m.erase(&a, Reason::Requested).await.unwrap();
+        // one byte appended and the manifest regenerated: the text's digest is new
+        let file = handed_out.join(format!("{a}.md"));
+        let edited = format!("{}\n", std::fs::read_to_string(&file).unwrap());
+        std::fs::write(&file, &edited).unwrap();
+        let mpath = handed_out.join("manifest.yaml");
+        let mut manifest =
+            dm_core::manifest::Manifest::from_yaml(&std::fs::read_to_string(&mpath).unwrap())
+                .unwrap();
+        manifest
+            .entries
+            .iter_mut()
+            .find(|e| e.id == a)
+            .unwrap()
+            .digest = dm_core::digest(&edited);
+        std::fs::write(&mpath, manifest.to_yaml()).unwrap();
+        let im = m.import(&handed_out, Some("dom-me")).await.unwrap();
+        assert_eq!(im.erased, vec![a.clone()], "{im:?}");
+        drop(m);
+        for (path, bytes) in files_under(&root) {
+            assert!(
+                !bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+                "{} holds the erased body after the import",
+                path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_bundle_lands_in_each_domain_that_imports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let m = mem(&root);
+        m.write(req("Shared knowledge.\n")).await.unwrap();
+        let out = dir.path().join("out");
+        m.export(Some("dom-me"), Label::Internal, &out)
+            .await
+            .unwrap();
+        grant_domain(&root, "dom-x");
+        grant_domain(&root, "dom-y");
+        let m = Memory::open(&root).unwrap();
+        let x = m.import(&out, Some("dom-x")).await.unwrap();
+        let y = m.import(&out, Some("dom-y")).await.unwrap();
+        assert_eq!((x.written.len(), x.skipped.len()), (1, 0), "{x:?}");
+        assert_eq!(
+            (y.written.len(), y.skipped.len()),
+            (1, 0),
+            "the other domain's copy is not this domain's duplicate: {y:?}"
+        );
+        let again = m.import(&out, Some("dom-y")).await.unwrap();
+        assert_eq!((again.written.len(), again.skipped.len()), (0, 1));
     }
 }
