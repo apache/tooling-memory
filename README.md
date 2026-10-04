@@ -50,9 +50,16 @@ memory get mem-me-xxxxxxxx
 memory task create "Finish the import" --priority 5
 memory task admit task-me-xxxxxxxx
 memory task claim-next
+memory recall "how does the import retry?"          # the pack, synthesis owed to the caller
+memory recall "how does the import retry?" --provider anthropic   # the brief, a key or the gateway
 memory export ../bundle --max-label internal
+memory erase mem-me-xxxxxxxx --reason requested      # the owner only; a stub and a receipt remain
+memory tap install github-issues taps/target/wasm32-wasip2/release/tap_github_issues.wasm
+memory tap run github-issues --config '{"repo":"owner/name"}'
+memory web            # the web terminal and the browser reader on http://127.0.0.1:4200
 memory reindex
 memory savings        # the paper's read-path claims, measured on this record
+memory golden golden/docs.toml   # recall scored on a question suite
 ```
 
 `crates/memory/tests/cli.rs` runs the seven steps PLAN.md calls M0, end to end, against the
@@ -80,4 +87,9 @@ built binary.
 M0 code complete as of 2 October 2026, plus the confined launcher: Claude Code, Codex,
 Gemini CLI, Copilot CLI and OpenCode run in native Linux namespaces with the memory
 server attached over MCP and model calls forwarded and metered through the egress, on
-your own logins or on keys the egress holds. See [PLAN.md](PLAN.md).
+your own logins or on keys the egress holds. First cuts landed 3 and 4 October: `recall`
+in two tiers with a golden suite; erasure with a stub and a receipt; taps as WASI
+components, GitHub issues in and handoffs posted back as comments; the browser reader
+over an exported bundle, searched with the server's own index compiled to WebAssembly;
+and the projection, the record as read-only files beside the working tree with a
+pre-read hook that makes every open a `get`. See [PLAN.md](PLAN.md).
