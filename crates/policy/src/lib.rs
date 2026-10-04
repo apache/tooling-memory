@@ -130,6 +130,7 @@ impl Grants {
             "github",
             "xai",
             "dashscope",
+            "grok",
             "llmao",
         ] {
             destinations.insert(
@@ -419,7 +420,7 @@ ceiling = "public"
         assert!(text.contains("[domains.dom-me]"), "{text}");
         assert!(text.contains("[destinations.anthropic]"), "{text}");
         // every destination the launcher's harnesses route to by default has a ceiling
-        for d in ["dashscope", "google", "chatgpt", "github", "xai"] {
+        for d in ["dashscope", "grok", "google", "chatgpt", "github", "xai"] {
             assert_eq!(back.ceiling(d), Some(Label::Internal), "{d}");
         }
         assert_eq!(back.ceiling("qwen"), None, "no such destination");

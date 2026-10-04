@@ -133,6 +133,8 @@ enum HarnessArg {
     Antigravity,
     /// Alibaba's Qwen Code.
     Qwen,
+    /// xAI's Grok Build, `grok`.
+    Grok,
     Copilot,
     Opencode,
     /// A program: the first argument after `--` is run as given, with the egress and
@@ -148,6 +150,7 @@ impl From<HarnessArg> for Harness {
             HarnessArg::Gemini => Harness::Gemini,
             HarnessArg::Antigravity => Harness::Antigravity,
             HarnessArg::Qwen => Harness::Qwen,
+            HarnessArg::Grok => Harness::Grok,
             HarnessArg::Copilot => Harness::Copilot,
             HarnessArg::Opencode => Harness::OpenCode,
             HarnessArg::Command => Harness::Command,
@@ -432,7 +435,7 @@ enum Command {
     /// input and leave a note in the outbox for the launcher to file as a handoff.
     #[command(hide = true)]
     Hook {
-        /// Which harness's hook format: claude, codex, gemini, antigravity or qwen.
+        /// Which harness's hook format: claude, codex, gemini, antigravity, qwen or grok.
         harness: String,
     },
     /// A web terminal on the launcher: sessions in pseudo-terminals streamed to the
@@ -923,6 +926,17 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
                 "cloudcode-pa.googleapis.com",
                 "daily-cloudcode-pa.googleapis.com",
             ]),
+        // a Grok Build login talks to Grok's cli-chat-proxy and websocket relays and
+        // refreshes at auth.x.ai; no override is known to carry a session token, so
+        // the route is a tunnel, pinned without metering, as Copilot's is
+        "grok" => Destination::tunnel([
+            "cli-chat-proxy.grok.com",
+            "code.grok.com",
+            "grok.com",
+            ".grok.com",
+            "auth.x.ai",
+            "api.x.ai",
+        ]),
         // Qwen's free OAuth tier ended in April 2026; the harness exits on it
         "dashscope" | "qwen" => {
             return Err(
@@ -2033,6 +2047,7 @@ fn run_unconfined(
         Harness::Gemini
         | Harness::Antigravity
         | Harness::Qwen
+        | Harness::Grok
         | Harness::Copilot
         | Harness::OpenCode
         | Harness::Command => {
@@ -2360,6 +2375,27 @@ mod backend_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("overlap"), "a tree holding the root: {err}");
+    }
+
+    #[test]
+    fn a_grok_login_is_a_tunnel_to_grok_s_own_hosts() {
+        // a login talks to the cli-chat-proxy and websocket relays on grok.com, and
+        // refreshes at auth.x.ai: no override is known to carry a session token, so
+        // the route is a tunnel, pinned without metering
+        let d = pass_through_provider("grok").unwrap();
+        assert!(d.upstream.is_empty(), "a tunnel, not a forward");
+        for host in [
+            "cli-chat-proxy.grok.com",
+            "code.grok.com",
+            "grok.com",
+            "auth.x.ai",
+        ] {
+            assert!(
+                d.tunnel_hosts.iter().any(|h| h == host),
+                "{host}: {:?}",
+                d.tunnel_hosts
+            );
+        }
     }
 
     #[test]

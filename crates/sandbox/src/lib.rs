@@ -6,7 +6,7 @@
 //! on loopback that forwards to the socket, and the egress is the only process with the
 //! network.
 //!
-//! Seven harnesses are known. Each needs three things from the launcher, and the adapter
+//! Eight harnesses are known. Each needs three things from the launcher, and the adapter
 //! for each is the `setup_*` function below:
 //!
 //! | Harness | Model calls | Memory over MCP | Config the launcher owns |
@@ -16,6 +16,7 @@
 //! | Gemini CLI | `GOOGLE_GEMINI_BASE_URL` | `mcpServers.<id>.httpUrl` | `~/.gemini/settings.json` |
 //! | Antigravity CLI | `GOOGLE_GEMINI_BASE_URL`; a login tunnels | `mcpServers.<id>.serverUrl` | `~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/` |
 //! | Qwen Code | `OPENAI_BASE_URL`; key only | `mcpServers.<id>.httpUrl` | `~/.qwen/settings.json` |
+//! | Grok Build | `GROK_XAI_API_BASE_URL`; a login tunnels | `mcp_servers.<id>.url` | `~/.grok/config.toml` |
 //! | Copilot CLI | no override; `HTTPS_PROXY` to the egress, which tunnels to allowed hosts | `mcp-config.json` | `COPILOT_HOME` |
 //! | OpenCode | `provider.<id>.options.baseURL` | `mcp.<id>.url` | `XDG_CONFIG_HOME/opencode/opencode.json` |
 //!
@@ -79,6 +80,8 @@ pub enum Harness {
     Antigravity,
     /// Alibaba's Qwen Code, a Gemini CLI fork that speaks OpenAI's API.
     Qwen,
+    /// xAI's Grok Build, `grok`.
+    Grok,
     /// GitHub Copilot CLI.
     Copilot,
     /// OpenCode.
@@ -99,6 +102,7 @@ impl Harness {
             Harness::Gemini => "gemini",
             Harness::Antigravity => "agy",
             Harness::Qwen => "qwen",
+            Harness::Grok => "grok",
             Harness::Copilot => "copilot",
             Harness::OpenCode => "opencode",
             Harness::Command => "command",
@@ -113,18 +117,21 @@ impl Harness {
             Harness::Codex | Harness::Command => "openai",
             Harness::Gemini | Harness::Antigravity => "gemini",
             Harness::Qwen => "dashscope",
+            Harness::Grok => "xai",
             Harness::Copilot => "github",
         }
     }
 
     /// The destination a login, rather than a key, talks to. Differs where the
     /// subscription backend is not the public API: Codex's ChatGPT login talks to
-    /// the ChatGPT backend, Gemini's Google login to Code Assist.
+    /// the ChatGPT backend, Gemini's Google login to Code Assist, Grok Build's login to
+    /// Grok's own proxy and relays.
     #[must_use]
     pub fn subscription_provider(self) -> &'static str {
         match self {
             Harness::Codex => "chatgpt",
             Harness::Gemini | Harness::Antigravity => "google",
+            Harness::Grok => "grok",
             other => other.provider(),
         }
     }
@@ -159,7 +166,7 @@ impl Harness {
                 "accept-edits".into(),
             ],
             // Qwen Code kept Gemini CLI's yolo, as a flag of its own
-            Harness::Qwen => vec!["-p".into(), p, "--yolo".into()],
+            Harness::Qwen | Harness::Grok => vec!["-p".into(), p, "--yolo".into()],
             Harness::Copilot => vec!["-p".into(), p, "--allow-all-tools".into()],
             Harness::OpenCode => vec!["run".into(), p],
             // a program has no headless form of its own; the prompt is its first argument
@@ -174,7 +181,11 @@ impl Harness {
             Harness::Claude | Harness::Copilot | Harness::Antigravity => {
                 vec!["--model".into(), model.into()]
             }
-            Harness::Codex | Harness::Gemini | Harness::Qwen | Harness::OpenCode => {
+            Harness::Codex
+            | Harness::Gemini
+            | Harness::Qwen
+            | Harness::Grok
+            | Harness::OpenCode => {
                 vec!["-m".into(), model.into()]
             }
             Harness::Command => Vec::new(),
@@ -257,7 +268,8 @@ pub struct Request<'a> {
     pub harness_args: &'a [String],
     /// The host's home, read only for the login file a subscription mode copies in:
     /// Claude Code's `.claude/.credentials.json`, Codex's `.codex/auth.json`, Gemini's
-    /// `.gemini/oauth_creds.json`. Nothing else is read from it and it is never mounted.
+    /// `.gemini/oauth_creds.json`, Grok Build's `.grok/auth.json`. Nothing else is read
+    /// from it and it is never mounted.
     pub host_home: Option<&'a Path>,
     /// Credentials the harness itself must hold, passed into its environment. For
     /// subscription modes that are a token rather than a file, such as Copilot's
@@ -627,16 +639,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         "--".into(),
         harness_bin.display().to_string(),
     ];
-    match req.harness {
-        Harness::Claude => setup_claude(req, &relay, &mut env, &mut argv)?,
-        Harness::Codex => setup_codex(req, &relay, &provider, &mut env)?,
-        Harness::Gemini => setup_gemini(req, &relay, &mut env)?,
-        Harness::Antigravity => setup_antigravity(req, &relay, &mut env)?,
-        Harness::Qwen => setup_qwen(req, &relay, &provider, &mut env)?,
-        Harness::Copilot => setup_copilot(req, &relay, &mut env)?,
-        Harness::OpenCode => setup_opencode(req, &relay, &provider, &mut env)?,
-        Harness::Command => setup_command(req, &relay, &provider, &mut env),
-    }
+    setup_harness(req, &relay, &provider, &mut env, &mut argv)?;
     argv.extend(harness_args.iter().cloned());
 
     Ok(Plan {
@@ -648,6 +651,31 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         handling_cap: req.destination_ceiling,
         links,
     })
+}
+
+/// The adapter for the requested harness: each writes its config into the private home
+/// and sets the environment that points it at the relay.
+fn setup_harness(
+    req: &Request<'_>,
+    relay: &str,
+    provider: &str,
+    env: &mut BTreeMap<String, String>,
+    argv: &mut Vec<String>,
+) -> Result<(), Error> {
+    match req.harness {
+        Harness::Claude => setup_claude(req, relay, env, argv),
+        Harness::Codex => setup_codex(req, relay, provider, env),
+        Harness::Gemini => setup_gemini(req, relay, env),
+        Harness::Antigravity => setup_antigravity(req, relay, env),
+        Harness::Qwen => setup_qwen(req, relay, provider, env),
+        Harness::Grok => setup_grok(req, relay, env),
+        Harness::Copilot => setup_copilot(req, relay, env),
+        Harness::OpenCode => setup_opencode(req, relay, provider, env),
+        Harness::Command => {
+            setup_command(req, relay, provider, env);
+            Ok(())
+        }
+    }
 }
 
 fn setup_claude(
@@ -968,6 +996,57 @@ fn setup_qwen(
     )
 }
 
+/// Grok Build is a Rust binary that keeps its config in `~/.grok/config.toml`. Only
+/// API-key inference reads `GROK_XAI_API_BASE_URL`, so a key is `XAI_API_KEY` behind it;
+/// a login is the token file `grok login` left, copied in, and its calls go to Grok's
+/// own proxy and websocket relays, which have no override known to carry a session
+/// token, so the harness's HTTPS goes through the egress as a tunnel to those hosts.
+/// MCP servers and hooks live in the same file; a hook group takes no matcher, since
+/// Grok's matcher is a regex and an absent one selects every tool, and its timeout is
+/// in seconds with a default of five, too short for a `get`.
+fn setup_grok(
+    req: &Request<'_>,
+    relay: &str,
+    env: &mut BTreeMap<String, String>,
+) -> Result<(), Error> {
+    if req.auth == AuthMode::Subscription {
+        copy_login(req, ".grok/auth.json", "`grok login`")?;
+        proxy_via(relay, env);
+    } else {
+        env.insert("GROK_XAI_API_BASE_URL".into(), format!("{relay}/xai/v1"));
+        // the egress injects the real key; this one only has to exist
+        env.insert("XAI_API_KEY".into(), "egress".into());
+    }
+    let hook = |event: &str| {
+        format!(
+            r#"[[hooks.{event}]]
+hooks = [{{ type = "command", command = "{INSIDE_MEMORY} hook grok", timeout = 30 }}]
+"#
+        )
+    };
+    let config = format!(
+        r#"# written by memory launch; edits are overwritten
+[cli]
+auto_update = false
+
+[features]
+telemetry = false
+feedback = false
+remote_fetch = false
+
+[mcp_servers.memory]
+url = "{relay}/mcp"
+
+{}{}{}"#,
+        hook("PreToolUse"),
+        hook("SessionEnd"),
+        hook("PreCompact"),
+    );
+    write(&req.home.join(".grok/config.toml"), &config)?;
+    env.insert("GROK_DISABLE_AUTOUPDATER".into(), "1".into());
+    Ok(())
+}
+
 fn setup_copilot(
     req: &Request<'_>,
     relay: &str,
@@ -1206,7 +1285,7 @@ mod tests {
         let bins = dir.path().join("bins");
         std::fs::create_dir_all(&bins).unwrap();
         for b in [
-            "claude", "codex", "gemini", "agy", "qwen", "copilot", "opencode",
+            "claude", "codex", "gemini", "agy", "qwen", "grok", "copilot", "opencode",
         ] {
             fake_bin(&bins, b);
         }
@@ -2065,6 +2144,82 @@ mod tests {
                 harness.binary()
             );
         }
+    }
+
+    #[test]
+    fn grok_plan_key_points_the_api_at_the_egress() {
+        let f = fixture();
+        let (home, plan) = f
+            .plan(Harness::Grok, AuthMode::Key, "k1", &[], false)
+            .unwrap();
+        // only API-key inference reads this base; the egress holds the real key
+        assert_eq!(
+            plan.env["GROK_XAI_API_BASE_URL"],
+            "http://127.0.0.1:4100/xai/v1"
+        );
+        assert_eq!(plan.env["XAI_API_KEY"], "egress");
+        assert!(
+            !plan.env.contains_key("HTTPS_PROXY"),
+            "a key needs no tunnel"
+        );
+        let cfg = std::fs::read_to_string(home.join(".grok/config.toml")).unwrap();
+        for line in [
+            "[mcp_servers.memory]",
+            "url = \"http://127.0.0.1:4100/mcp\"",
+            "auto_update = false",
+            "telemetry = false",
+            "[[hooks.PreToolUse]]",
+            "[[hooks.SessionEnd]]",
+            "[[hooks.PreCompact]]",
+        ] {
+            assert!(cfg.contains(line), "{line} in\n{cfg}");
+        }
+        assert_eq!(
+            cfg.matches("command = \"/opt/memory/memory hook grok\", timeout = 30")
+                .count(),
+            3,
+            "{cfg}"
+        );
+        assert!(
+            !cfg.contains("matcher"),
+            "no matcher: Grok's is a regex, and `*` alone is not one"
+        );
+        assert_eq!(plan.env["MEMORY_MCP_URL"], "http://127.0.0.1:4100/mcp");
+        assert!(
+            plan.argv.iter().any(|a| a.ends_with("grok")),
+            "{:?}",
+            plan.argv
+        );
+        assert_eq!(Harness::Grok.headless("hi"), vec!["-p", "hi", "--yolo"]);
+        assert_eq!(Harness::Grok.model_flag("m"), vec!["-m", "m"]);
+        assert_eq!(Harness::Grok.provider(), "xai");
+        assert_eq!(Harness::Grok.subscription_provider(), "grok");
+        assert!(!Harness::Grok.accepts_provider());
+    }
+
+    #[test]
+    fn grok_plan_login_is_the_auth_file_behind_a_tunnel() {
+        let f = fixture();
+        // a login is the token file `grok login` left; without it, nothing to copy
+        assert!(matches!(
+            f.plan(Harness::Grok, AuthMode::Subscription, "k2", &[], false),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::create_dir_all(f.host_home.join(".grok")).unwrap();
+        std::fs::write(
+            f.host_home.join(".grok/auth.json"),
+            r#"{"access_token":"x"}"#,
+        )
+        .unwrap();
+        let (home, plan) = f
+            .plan(Harness::Grok, AuthMode::Subscription, "k3", &[], true)
+            .unwrap();
+        assert!(home.join(".grok/auth.json").is_file(), "login copied in");
+        assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
+        assert!(!plan.env.contains_key("XAI_API_KEY"));
+        assert!(!plan.env.contains_key("GROK_XAI_API_BASE_URL"));
+        let cfg = std::fs::read_to_string(home.join(".grok/config.toml")).unwrap();
+        assert!(cfg.contains("[mcp_servers.memory]"), "{cfg}");
     }
 
     fn assert_qwen_hooks(settings: &serde_json::Value) {

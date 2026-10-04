@@ -13,6 +13,7 @@ ARG GEMINI_CLI=0.62.0
 ARG COPILOT=1.0.91
 ARG OPENCODE=1.18.34
 ARG QWEN_CODE=0.24.7
+ARG GROK=1.0.46
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -32,9 +33,10 @@ RUN npm install -g --no-fund --no-audit \
       "@github/copilot@${COPILOT}" \
       "opencode-ai@${OPENCODE}" \
       "@qwen-code/qwen-code@${QWEN_CODE}" \
+      "@xai-official/grok@${GROK}" \
  && npm cache clean --force \
  && claude --version && codex --version && gemini --version && copilot --version && opencode --version \
- && qwen --version
+ && qwen --version && grok --version
 
 # The harness runs as `user`, uid 1000, with its private home mounted in at /home/user.
 RUN userdel -r ubuntu 2>/dev/null || true \

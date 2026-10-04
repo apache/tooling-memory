@@ -49,7 +49,7 @@ memory task admit task-me-xxxxxxxx
 make work HARNESS=codex AUTH=key
 ```
 
-Seven harnesses, one launcher. Each needed the same three things, and the table is the
+Eight harnesses, one launcher. Each needed the same three things, and the table is the
 whole of what differs:
 
 | Harness | Model calls reach the egress by | Memory over MCP by | `AUTH` modes |
@@ -59,6 +59,7 @@ whole of what differs:
 | Gemini CLI | `GOOGLE_GEMINI_BASE_URL`; with a Google login, `CODE_ASSIST_ENDPOINT` | `mcpServers.<id>.httpUrl` | subscription, key |
 | Antigravity CLI (`agy`) | `GOOGLE_GEMINI_BASE_URL`, once its settings name the Gemini API as the model provider; with a Google login, `HTTPS_PROXY` to the egress, which tunnels only to Google's login and Cloud Code hosts, pinned without metering | `mcpServers.<id>.serverUrl` in `~/.gemini/config/mcp_config.json` | subscription (the token file `agy` left under `~/.gemini/antigravity-cli`), key. Not in the harness image yet. Written from the docs and the issue tracker, not a run: the first launch on a real machine is the test |
 | Qwen Code | `OPENAI_BASE_URL`, once its settings select the OpenAI auth type | `mcpServers.<id>.httpUrl` | key only, since Qwen's free login tier ended in April 2026; `dashscope` by default, `--provider openai` or `xai` |
+| Grok Build (`grok`) | `GROK_XAI_API_BASE_URL`, which only API-key inference reads; with a Grok login, `HTTPS_PROXY` to the egress, which tunnels only to Grok's proxy and relay hosts and `auth.x.ai`, pinned without metering | `mcp_servers.<id>.url` in `config.toml` | subscription, key |
 | Copilot CLI | no override exists; `HTTPS_PROXY` to the egress, which tunnels only to GitHub's Copilot hosts | `mcp-config.json` | subscription (`GH_TOKEN`) |
 | OpenCode | `provider.<id>.options.baseURL`; on a GitHub Copilot login, `HTTPS_PROXY` and the GitHub tunnel | `mcp.<id>.url` | key; `--provider openai` or `xai`; subscription with `--provider github-copilot`, which GitHub supports |
 | `command` | the program itself: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_GEMINI_BASE_URL` in its environment | `MEMORY_MCP_URL` in its environment | key, gateway; `--provider` picks the destination |
@@ -167,7 +168,7 @@ The launcher installs three hooks in each harness's settings in the private home
 context is compacted, at session end, and before a tool runs. Claude Code and Codex call
 the first PreCompact and Gemini CLI calls it PreCompress; Codex allows a session-end hook
 three seconds, which is plenty for one file read and one file write; the third is
-PreToolUse in Claude Code, Codex and Qwen Code and BeforeTool in Gemini CLI, and guards
+PreToolUse in Claude Code, Codex, Qwen Code and Grok Build and BeforeTool in Gemini CLI, and guards
 the projection, the record's read-only files at `/memory`: a read of an entry file
 becomes a `get`, and a search over the projection is refused (PLAN.md, M4b). Gemini CLI
 and Qwen Code refuse their file tools a path outside the workspace, so the launcher

@@ -46,6 +46,33 @@ pub struct HookInput {
 }
 
 impl HookInput {
+    /// Read one event. Grok Build writes its camelCase keys and the snake_case
+    /// aliases side by side, with Claude's PascalCase event name under the snake key
+    /// only; a key present in both spellings is read from the snake one, since a
+    /// field and its alias together are a duplicate to the deserializer.
+    ///
+    /// # Errors
+    ///
+    /// When the text is not a hook event.
+    pub fn parse(text: &str) -> Result<HookInput, serde_json::Error> {
+        let mut v: Value = serde_json::from_str(text)?;
+        if let Some(map) = v.as_object_mut() {
+            for (camel, snake) in [
+                ("hookEventName", "hook_event_name"),
+                ("sessionId", "session_id"),
+                ("conversationId", "session_id"),
+                ("transcriptPath", "transcript_path"),
+                ("toolName", "tool_name"),
+                ("toolInput", "tool_input"),
+            ] {
+                if map.contains_key(snake) {
+                    map.remove(camel);
+                }
+            }
+        }
+        serde_json::from_value(v)
+    }
+
     /// The tool about to run and its input, from whichever shape the harness sent.
     fn tool(&self) -> (String, Value) {
         if let Some(call) = &self.tool_call {
@@ -83,11 +110,12 @@ pub enum Decision {
 impl Decision {
     /// The hook's standard output in the harness's shape. Claude Code, Codex and Qwen
     /// Code read a `hookSpecificOutput` and take silence as allowed; Gemini CLI reads a
-    /// top-level `decision` and takes silence as allowed; Antigravity CLI wants a
-    /// `decision` either way, since an empty object is refused as invalid.
+    /// top-level `decision` and takes silence as allowed; Antigravity CLI and Grok
+    /// Build want a `decision` either way, since an empty answer is refused or logged
+    /// as a broken hook.
     #[must_use]
     pub fn output(&self, harness: &str) -> Option<String> {
-        if harness == "antigravity" || harness == "gemini" {
+        if matches!(harness, "antigravity" | "gemini" | "grok") {
             return match self {
                 Decision::Allow if harness == "gemini" => None,
                 Decision::Allow => Some(serde_json::json!({ "decision": "allow" }).to_string()),
@@ -124,13 +152,16 @@ pub fn pre_tool_event(name: &str) -> bool {
 /// and for a search without one, its pattern when the pattern is a path.
 fn path_of(input: &Value) -> Option<PathBuf> {
     // Claude Code's names, Gemini CLI's and Qwen Code's (`absolute_path` is what
-    // `read_file` took before `file_path`), then Antigravity CLI's, which are PascalCase
+    // `read_file` took before `file_path`), Grok Build's `target_file` and
+    // `target_directory`, then Antigravity CLI's, which are PascalCase
     [
         "file_path",
         "absolute_path",
         "notebook_path",
+        "target_file",
         "path",
         "dir_path",
+        "target_directory",
         "pattern",
         "AbsolutePath",
         "SearchPath",
@@ -570,7 +601,7 @@ fn short(id: &str) -> &str {
 pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
     let mut text = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
-    let input: HookInput = serde_json::from_str(&text)?;
+    let input = HookInput::parse(&text)?;
     if pre_tool_event(&input.hook_event_name) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -999,6 +1030,70 @@ not json
             ),
             Decision::Deny(_)
         ));
+    }
+
+    #[test]
+    fn grok_s_hook_sends_both_spellings_at_once_and_wants_a_decision() {
+        // Grok Build writes its camelCase keys and the snake_case aliases side by side,
+        // with Claude's PascalCase event name under the snake key only
+        let text = r#"{"hookEventName":"pre_tool_use","hook_event_name":"PreToolUse","sessionId":"s1","session_id":"s1","cwd":"/work","workspaceRoot":"/work","timestamp":"t","toolName":"read_file","tool_name":"read_file","toolUseId":"u1","toolInput":{"target_file":"/memory/dom-me/mem-me-abc1.md"},"tool_input":{"target_file":"/memory/dom-me/mem-me-abc1.md"},"toolInputTruncated":false}"#;
+        let input = HookInput::parse(text).unwrap();
+        assert_eq!(input.hook_event_name, "PreToolUse");
+        assert_eq!(input.session_id, "s1");
+        let (tool, args) = input.tool();
+        assert_eq!(tool, "read_file");
+        let mut asked = Vec::new();
+        let d = decide("read_file", &args, Path::new("/memory"), SID, |id| {
+            asked.push(id.to_string());
+            Ok(())
+        });
+        assert_eq!(
+            (d, asked),
+            (Decision::Allow, vec!["mem-me-abc1".to_string()])
+        );
+        // its own argument names for a list and a search
+        assert!(matches!(
+            decide(
+                "list_dir",
+                &serde_json::json!({ "target_directory": "/memory/dom-me" }),
+                Path::new("/memory"),
+                SID,
+                |_| panic!("a list is not a get")
+            ),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            decide(
+                "grep",
+                &serde_json::json!({ "pattern": "x", "path": "/", "glob": "*.md" }),
+                Path::new("/memory"),
+                SID,
+                |_| panic!("a search is not a get")
+            ),
+            Decision::Deny(_)
+        ));
+        // a decision either way, as agy wants
+        let v: Value = serde_json::from_str(&Decision::Allow.output("grok").unwrap()).unwrap();
+        assert_eq!(v["decision"], "allow");
+        let v: Value =
+            serde_json::from_str(&Decision::Deny("why".into()).output("grok").unwrap()).unwrap();
+        assert_eq!(
+            (v["decision"].as_str(), v["reason"].as_str()),
+            (Some("deny"), Some("why"))
+        );
+        // the other shapes still parse through the same door
+        assert_eq!(
+            HookInput::parse(r#"{"hook_event_name":"SessionEnd","session_id":"a"}"#)
+                .unwrap()
+                .hook_event_name,
+            "SessionEnd"
+        );
+        assert_eq!(
+            HookInput::parse(r#"{"hookEventName":"Stop","conversationId":"c"}"#)
+                .unwrap()
+                .session_id,
+            "c"
+        );
     }
 
     #[test]
