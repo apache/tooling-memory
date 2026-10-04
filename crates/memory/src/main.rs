@@ -923,9 +923,14 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
                 "cloudcode-pa.googleapis.com",
                 "daily-cloudcode-pa.googleapis.com",
             ]),
-        // a Qwen login's model host is named by the credential itself and has no
-        // override: a tunnel to Qwen's hosts, pinned without metering, as Copilot's is
-        "qwen" => Destination::tunnel(["chat.qwen.ai", "portal.qwen.ai", ".qwen.ai"]),
+        // Qwen's free OAuth tier ended in April 2026; the harness exits on it
+        "dashscope" | "qwen" => {
+            return Err(
+                "qwen has no login mode: Qwen's free OAuth tier ended in April 2026; \
+                        use --auth key with DASHSCOPE_API_KEY"
+                    .into(),
+            )
+        }
         other => return Err(format!("no subscription-mode destination named {other}").into()),
     })
 }
@@ -2358,22 +2363,25 @@ mod backend_tests {
     }
 
     #[test]
-    fn qwen_s_destinations_are_a_keyed_forward_and_a_login_tunnel() {
-        // the DashScope compatible endpoint, keyed from DASHSCOPE_API_KEY
-        match keyed_provider("dashscope") {
-            Ok(d) => assert!(d.upstream.contains("dashscope"), "{}", d.upstream),
-            Err(e) => assert!(e.to_string().contains("DASHSCOPE_API_KEY"), "{e}"),
+    fn dashscope_is_a_keyed_forward_and_has_no_login_mode() {
+        // the DashScope compatible endpoint, keyed from DASHSCOPE_API_KEY; the harness
+        // appends /v1 to it, so the base ends at compatible-mode
+        let err = keyed_provider("dashscope").err().map(|e| e.to_string());
+        if let Some(e) = &err {
+            assert!(e.contains("DASHSCOPE_API_KEY"), "{e}");
         }
-        // a Qwen OAuth login talks to Qwen's own hosts, which have no override:
-        // a tunnel, pinned without metering
-        let d = pass_through_provider("qwen").unwrap();
-        assert!(d.upstream.is_empty(), "a tunnel, not a forward");
-        for host in ["chat.qwen.ai", "portal.qwen.ai"] {
-            assert!(
-                d.tunnel_hosts.iter().any(|h| h == host),
-                "{host}: {:?}",
-                d.tunnel_hosts
-            );
+        std::env::set_var("DASHSCOPE_API_KEY", "k");
+        let d = keyed_provider("dashscope").unwrap();
+        std::env::remove_var("DASHSCOPE_API_KEY");
+        assert_eq!(
+            d.upstream,
+            "https://dashscope-intl.aliyuncs.com/compatible-mode"
+        );
+        assert!(d.tunnel_hosts.is_empty(), "a forward, metered");
+        // Qwen OAuth ended in April 2026: no subscription destination, under either name
+        for name in ["dashscope", "qwen"] {
+            let e = pass_through_provider(name).unwrap_err().to_string();
+            assert!(e.contains("DASHSCOPE_API_KEY"), "{name}: {e}");
         }
         assert_eq!(crate::model::default_model("dashscope"), "qwen-flash");
     }

@@ -935,6 +935,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_upstream_base_with_a_path_keeps_it() {
+        // DashScope's compatible endpoint lives under a path; the harness's /v1/...
+        // goes after it, not in place of it
+        assert_eq!(
+            upstream_url(
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/",
+                "v1/chat/completions",
+                &"/dashscope/v1/chat/completions".parse().unwrap(),
+                true
+            ),
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+        );
+    }
+
+    #[tokio::test]
     async fn a_key_in_the_query_is_dropped_when_the_egress_injects() {
         assert_eq!(
             upstream_url(

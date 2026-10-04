@@ -188,16 +188,30 @@ fn globs(tool: &str) -> bool {
     matches!(tool, "Glob" | "glob" | "find_by_name")
 }
 
-/// Whether a glob pattern can reach into `projection`: it climbs with `..`, or its
-/// literal prefix, up to the first wildcard, is the projection or an ancestor of it.
+/// Whether a glob pattern, or a plain path, can reach into `projection`: it climbs with
+/// a `..` component, or its literal prefix, up to the first wildcard, is under the
+/// projection or names it or an ancestor of it. Paths are compared by component, so a
+/// sibling whose name merely starts with the projection's is not the projection; a
+/// prefix cut by a wildcard is compared as text, since `/mem*` does match `/memory`.
 fn glob_reaches(pattern: &str, projection: &Path) -> bool {
-    if pattern.contains("..") {
+    use std::path::Component;
+    if Path::new(pattern)
+        .components()
+        .any(|c| c == Component::ParentDir)
+    {
         return true;
     }
-    let literal = &pattern[..pattern.find(['*', '?', '[']).unwrap_or(pattern.len())];
-    let projection = projection.to_string_lossy();
-    literal.starts_with(projection.as_ref())
-        || (literal.starts_with('/') && projection.starts_with(literal))
+    let wild = pattern.find(['*', '?', '[']);
+    let literal = &pattern[..wild.unwrap_or(pattern.len())];
+    if !literal.starts_with('/') {
+        return false;
+    }
+    let under = Path::new(literal).starts_with(projection);
+    let above = match wild {
+        Some(_) => projection.to_string_lossy().starts_with(literal),
+        None => projection.starts_with(Path::new(literal)),
+    };
+    under || above
 }
 
 /// A tool that searches a tree, by path or by glob.
@@ -450,8 +464,12 @@ fn turns_in(v: &Value) -> Vec<Turn> {
                 .replace("</USER_REQUEST>", "");
             return keep(who, text).into_iter().collect();
         }
+        // Claude Code's message has content; Qwen Code's is the Gemini API's, with parts
         if role == "user" || role == "assistant" {
-            if let Some(c) = v.get("message").and_then(|m| m.get("content")) {
+            if let Some(c) = v
+                .get("message")
+                .and_then(|m| m.get("content").or_else(|| m.get("parts")))
+            {
                 return keep(role, text_of(c)).into_iter().collect();
             }
         }
@@ -713,6 +731,21 @@ not json
             t.starts_with("**user**\n\nHello there.") && t.ends_with("General Kenobi."),
             "{t}"
         );
+        // Qwen Code: one record a line, the message in the Gemini API's shape, parts
+        // rather than content
+        let qwen = concat!(
+            r#"{"type":"user","message":{"role":"user","parts":[{"text":"Hello there."}]},"timestamp":"t"}"#,
+            "\n",
+            r#"{"type":"tool_result","message":{"role":"user","parts":[{"functionResponse":{"name":"read_file"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"model","parts":[{"text":"General Kenobi."}]}}"#,
+            "\n",
+        );
+        let t = transcript_tail(qwen, 10, 10_000);
+        assert!(
+            t.starts_with("**user**\n\nHello there.") && t.ends_with("General Kenobi."),
+            "{t}"
+        );
         assert_eq!(Event::from_name("PreCompress"), Some(Event::PreCompact));
         assert_eq!(Event::from_name("Nope"), None);
         let agy = concat!(
@@ -909,17 +942,28 @@ not json
             ),
             Decision::Deny(_)
         ));
-        // Codex's grep_files over the projection is a search over bodies
-        assert!(matches!(
-            decide(
-                "grep_files",
-                &serde_json::json!({ "pattern": "x", "path": "/memory" }),
-                view,
-                SID,
-                |_| panic!("a search is not a get")
-            ),
-            Decision::Deny(_)
-        ));
+        // Codex's grep_files and Gemini's older search_file_content over a directory
+        // that holds the projection are searches over bodies
+        for tool in ["grep_files", "search_file_content"] {
+            assert!(
+                matches!(
+                    decide(
+                        tool,
+                        &serde_json::json!({ "pattern": "x", "path": "/" }),
+                        view,
+                        SID,
+                        |_| panic!("a search is not a get")
+                    ),
+                    Decision::Deny(_)
+                ),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_of_many_files_is_a_search_when_any_of_them_reaches_the_projection() {
+        let view = Path::new("/memory");
         // read_many_files is a read of many files: refused when any is the projection's
         // or holds it, free when none is
         let many = |paths: &[&str]| {
@@ -938,6 +982,23 @@ not json
         assert!(matches!(many(&["/"]), Decision::Deny(_)));
         assert_eq!(many(&["/work/a.md", "/work/b.md"]), Decision::Allow);
         assert_eq!(many(&[]), Decision::Allow);
+        // a sibling whose name merely starts with the projection's is not the projection,
+        // and two dots inside a name are not a climb
+        assert_eq!(
+            many(&["/memory-notes/*.md", "/work/a..b.md"]),
+            Decision::Allow
+        );
+        // `include` is the spelling Gemini CLI's read_many_files sends today
+        assert!(matches!(
+            decide(
+                "read_many_files",
+                &serde_json::json!({ "include": ["/memory/**/*.md"] }),
+                view,
+                SID,
+                |_| panic!("many is not one")
+            ),
+            Decision::Deny(_)
+        ));
     }
 
     #[test]
@@ -1174,6 +1235,17 @@ not json
             ),
             Decision::Allow,
             "a relative glob in the working tree"
+        );
+        assert_eq!(
+            decide(
+                "Glob",
+                &serde_json::json!({ "pattern": "/memory-notes/*.md", "path": "/work" }),
+                view,
+                SID,
+                |_| Ok(())
+            ),
+            Decision::Allow,
+            "a sibling whose name starts with the projection's"
         );
         // the same tree under another name
         let mut via_proc = Vec::new();

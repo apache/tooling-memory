@@ -15,7 +15,7 @@
 //! | Codex | `model_providers.<id>.base_url` | `mcp_servers.<id>.url` | `CODEX_HOME/config.toml` |
 //! | Gemini CLI | `GOOGLE_GEMINI_BASE_URL` | `mcpServers.<id>.httpUrl` | `~/.gemini/settings.json` |
 //! | Antigravity CLI | `GOOGLE_GEMINI_BASE_URL`; a login tunnels | `mcpServers.<id>.serverUrl` | `~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/` |
-//! | Qwen Code | `OPENAI_BASE_URL`; a login tunnels | `mcpServers.<id>.httpUrl` | `~/.qwen/settings.json` |
+//! | Qwen Code | `OPENAI_BASE_URL`; key only | `mcpServers.<id>.httpUrl` | `~/.qwen/settings.json` |
 //! | Copilot CLI | no override; `HTTPS_PROXY` to the egress, which tunnels to allowed hosts | `mcp-config.json` | `COPILOT_HOME` |
 //! | OpenCode | `provider.<id>.options.baseURL` | `mcp.<id>.url` | `XDG_CONFIG_HOME/opencode/opencode.json` |
 //!
@@ -119,14 +119,12 @@ impl Harness {
 
     /// The destination a login, rather than a key, talks to. Differs where the
     /// subscription backend is not the public API: Codex's ChatGPT login talks to
-    /// the ChatGPT backend, Gemini's Google login to Code Assist, Qwen Code's Qwen
-    /// login to Qwen's own hosts.
+    /// the ChatGPT backend, Gemini's Google login to Code Assist.
     #[must_use]
     pub fn subscription_provider(self) -> &'static str {
         match self {
             Harness::Codex => "chatgpt",
             Harness::Gemini | Harness::Antigravity => "google",
-            Harness::Qwen => "qwen",
             other => other.provider(),
         }
     }
@@ -259,8 +257,7 @@ pub struct Request<'a> {
     pub harness_args: &'a [String],
     /// The host's home, read only for the login file a subscription mode copies in:
     /// Claude Code's `.claude/.credentials.json`, Codex's `.codex/auth.json`, Gemini's
-    /// `.gemini/oauth_creds.json`, Qwen Code's `.qwen/oauth_creds.json`. Nothing else is
-    /// read from it and it is never mounted.
+    /// `.gemini/oauth_creds.json`. Nothing else is read from it and it is never mounted.
     pub host_home: Option<&'a Path>,
     /// Credentials the harness itself must hold, passed into its environment. For
     /// subscription modes that are a token rather than a file, such as Copilot's
@@ -824,19 +821,24 @@ fn setup_gemini(
     } else {
         "gemini-api-key"
     };
-    // Gemini's hook timeout is in milliseconds, unlike Claude Code's and Codex's seconds
-    let hook = serde_json::json!([{
-        "matcher": "*",
-        "hooks": [{ "type": "command", "command": format!("{INSIDE_MEMORY} hook gemini"), "timeout": 10_000 }]
-    }]);
-    let settings = serde_json::json!({
-        // BeforeTool is Gemini's name for the event before a tool runs
-        "hooks": { "PreCompress": hook, "SessionEnd": hook, "BeforeTool": hook },
+    // Gemini's hook timeout is in milliseconds, unlike Claude Code's and Codex's seconds.
+    // BeforeTool is Gemini's name for the event before a tool runs; the hook waits ten
+    // seconds on the memory server and Gemini continues when it kills a hook, so this
+    // one gets longer than that wait, or a stalled server would be a read let through
+    let hook = |timeout: u32| {
+        serde_json::json!([{
+            "matcher": "*",
+            "hooks": [{ "type": "command", "command": format!("{INSIDE_MEMORY} hook gemini"), "timeout": timeout }]
+        }])
+    };
+    let mut settings = serde_json::json!({
+        "hooks": { "PreCompress": hook(10_000), "SessionEnd": hook(10_000), "BeforeTool": hook(30_000) },
         "security": { "auth": { "selectedType": auth_type } },
         "general": { "enableAutoUpdate": false },
         "privacy": { "usageStatisticsEnabled": false },
         "mcpServers": { "memory": { "httpUrl": format!("{relay}/mcp") } }
     });
+    include_projection(req, &mut settings);
     write(
         &req.home.join(".gemini/settings.json"),
         &serde_json::to_string_pretty(&settings).unwrap_or_default(),
@@ -844,6 +846,16 @@ fn setup_gemini(
     // the working tree is the one thing mounted read-write; it is trusted by construction
     env.insert("GEMINI_CLI_TRUST_WORKSPACE".into(), "true".into());
     Ok(())
+}
+
+/// Gemini CLI and its forks refuse their file tools a path outside the workspace, and a
+/// model so refused falls back to a shell the hook does not see; when the projection is
+/// mounted, the settings include it in the workspace, so a read of it goes through the
+/// tool, and the hook, as a `get`.
+fn include_projection(req: &Request<'_>, settings: &mut serde_json::Value) {
+    if req.projection.is_some_and(Path::is_dir) {
+        settings["context"]["includeDirectories"] = serde_json::json!([INSIDE_PROJECTION]);
+    }
 }
 
 /// Antigravity CLI keeps Gemini CLI's variables for a key, `GEMINI_API_KEY` behind
@@ -916,37 +928,33 @@ fn setup_antigravity(
 /// Qwen Code is Gemini CLI's fork for Alibaba's models and speaks OpenAI's API: a key is
 /// `OPENAI_API_KEY` behind `OPENAI_BASE_URL`, read once its settings select the OpenAI
 /// auth type, and DashScope's compatible endpoint is the default destination, any
-/// other OpenAI-compatible one on request. A Qwen login is the credential file the
-/// host's login left under `~/.qwen`, with the harness's HTTPS through the egress as a
-/// tunnel to Qwen's hosts, since the login's endpoint comes from the credential itself.
-/// MCP servers and hooks live in the settings, the hooks in Claude Code's shape with
-/// timeouts in seconds.
+/// other OpenAI-compatible one on request. There is no login mode: Qwen's free OAuth
+/// tier ended in April 2026 and the harness exits when it is selected. MCP servers and
+/// hooks live in the settings, the hooks in Claude Code's shape with timeouts in
+/// seconds.
 fn setup_qwen(
     req: &Request<'_>,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
-    let subscription = req.auth == AuthMode::Subscription;
-    if subscription {
-        copy_login(
-            req,
-            ".qwen/oauth_creds.json",
-            "a Qwen Code login (run `qwen` once on the host and pick Qwen OAuth)",
-        )?;
-        proxy_via(relay, env);
-    } else {
-        env.insert("OPENAI_BASE_URL".into(), format!("{relay}/{provider}/v1"));
-        // the egress injects the real key; this one only has to exist
-        env.insert("OPENAI_API_KEY".into(), "egress".into());
+    if req.auth == AuthMode::Subscription {
+        return Err(Error::Unsupported(
+            "qwen has no login mode: Qwen's free OAuth tier ended in April 2026; use \
+             --auth key with DASHSCOPE_API_KEY (or --provider openai with OPENAI_API_KEY)"
+                .into(),
+        ));
     }
-    let auth_type = if subscription { "qwen-oauth" } else { "openai" };
-    let settings = serde_json::json!({
-        "security": { "auth": { "selectedType": auth_type } },
+    env.insert("OPENAI_BASE_URL".into(), format!("{relay}/{provider}/v1"));
+    // the egress injects the real key; this one only has to exist
+    env.insert("OPENAI_API_KEY".into(), "egress".into());
+    let mut settings = serde_json::json!({
+        "security": { "auth": { "selectedType": "openai" } },
         "general": { "enableAutoUpdate": false },
         "privacy": { "usageStatisticsEnabled": false },
         "mcpServers": { "memory": { "httpUrl": format!("{relay}/mcp") } }
     });
+    include_projection(req, &mut settings);
     let path = req.home.join(".qwen/settings.json");
     write(
         &path,
@@ -1652,10 +1660,17 @@ mod tests {
             s["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 10_000,
             "milliseconds, for Gemini"
         );
-        // Gemini CLI's name for the event before a tool runs
+        // Gemini CLI's name for the event before a tool runs; it waits ten seconds on
+        // the memory server, so its own timeout must be longer, or a stalled server
+        // is a read let through, since Gemini continues when a hook is killed
         assert_eq!(
             s["hooks"]["BeforeTool"][0]["hooks"][0]["command"],
             "/opt/memory/memory hook gemini"
+        );
+        assert_eq!(s["hooks"]["BeforeTool"][0]["hooks"][0]["timeout"], 30_000);
+        assert!(
+            s.get("context").is_none(),
+            "no projection, no directory to include"
         );
         assert_eq!(
             plan.env["GOOGLE_GEMINI_BASE_URL"],
@@ -2018,6 +2033,40 @@ mod tests {
         assert!(!Harness::Antigravity.accepts_provider());
     }
 
+    #[test]
+    fn gemini_and_qwen_are_told_the_projection_is_theirs_to_read() {
+        // both refuse their file tools a path outside the workspace, so the model would
+        // fall back to a shell the hook does not see; the projection is included
+        let f = fixture();
+        for (harness, settings) in [
+            (Harness::Gemini, ".gemini/settings.json"),
+            (Harness::Qwen, ".qwen/settings.json"),
+        ] {
+            let rendered = f.root.join(PROJECTION).join(harness.binary());
+            std::fs::create_dir_all(&rendered).unwrap();
+            let (home, plan) = f
+                .plan_full(
+                    harness,
+                    AuthMode::Key,
+                    None,
+                    harness.binary(),
+                    &[],
+                    false,
+                    &[],
+                    Some(&rendered),
+                )
+                .unwrap();
+            assert_eq!(plan.env["MEMORY_PROJECTION"], INSIDE_PROJECTION);
+            let s = json_file(&home.join(settings));
+            assert_eq!(
+                s["context"]["includeDirectories"],
+                serde_json::json!([INSIDE_PROJECTION]),
+                "{}",
+                harness.binary()
+            );
+        }
+    }
+
     fn assert_qwen_hooks(settings: &serde_json::Value) {
         // Claude Code's shape, with timeouts in seconds, for all three events
         for event in ["PreCompact", "SessionEnd", "PreToolUse"] {
@@ -2088,36 +2137,34 @@ mod tests {
         assert_eq!(headless, vec!["-p", "hi", "--yolo"]);
         assert_eq!(Harness::Qwen.model_flag("m"), vec!["-m", "m"]);
         assert_eq!(Harness::Qwen.provider(), "dashscope");
-        assert_eq!(Harness::Qwen.subscription_provider(), "qwen");
+        assert_eq!(Harness::Qwen.subscription_provider(), "dashscope");
         assert!(Harness::Qwen.accepts_provider());
     }
 
     #[test]
-    fn qwen_plan_login_is_the_credential_file_behind_a_tunnel() {
+    fn qwen_has_no_login_mode_since_its_free_tier_ended() {
         let f = fixture();
-        // a Qwen OAuth login needs the credential file the host's login left
-        assert!(matches!(
-            f.plan(Harness::Qwen, AuthMode::Subscription, "q3", &[], false),
-            Err(Error::Unsupported(_))
-        ));
+        // Qwen OAuth was discontinued in April 2026 and the harness exits on it; a
+        // cached credential on the host changes nothing, and the refusal says what to
+        // use instead
         std::fs::create_dir_all(f.host_home.join(".qwen")).unwrap();
         std::fs::write(
             f.host_home.join(".qwen/oauth_creds.json"),
-            r#"{"access_token":"x","resource_url":"portal.qwen.ai"}"#,
+            r#"{"access_token":"x"}"#,
         )
         .unwrap();
-        let (home, plan) = f
-            .plan(Harness::Qwen, AuthMode::Subscription, "q4", &[], true)
-            .unwrap();
+        for creds in [false, true] {
+            match f.plan(Harness::Qwen, AuthMode::Subscription, "q3", &[], creds) {
+                Err(Error::Unsupported(why)) => assert!(
+                    why.contains("--auth key") && why.contains("DASHSCOPE_API_KEY"),
+                    "{why}"
+                ),
+                other => panic!("a login mode: {other:?}"),
+            }
+        }
         assert!(
-            home.join(".qwen/oauth_creds.json").is_file(),
-            "login copied in"
+            !f.root.join("q3/.qwen/oauth_creds.json").exists(),
+            "nothing copied in"
         );
-        assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
-        assert!(!plan.env.contains_key("OPENAI_API_KEY"));
-        assert!(!plan.env.contains_key("OPENAI_BASE_URL"));
-        let s = json_file(&home.join(".qwen/settings.json"));
-        assert_eq!(s["security"]["auth"]["selectedType"], "qwen-oauth");
-        assert_qwen_hooks(&s);
     }
 }
