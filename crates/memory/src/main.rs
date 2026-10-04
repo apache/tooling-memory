@@ -927,8 +927,10 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
                 "daily-cloudcode-pa.googleapis.com",
             ]),
         // a Grok Build login talks to Grok's cli-chat-proxy and websocket relays and
-        // refreshes at auth.x.ai; no override is known to carry a session token, so
-        // the route is a tunnel, pinned without metering, as Copilot's is
+        // refreshes at auth.x.ai; a tunnel, pinned without metering, in this first
+        // cut. The proxy has an override, GROK_CLI_CHAT_PROXY_BASE_URL, and speaks the
+        // Responses API, so a forward with pass-through auth and tunnels only for the
+        // websocket and login hosts is the metered route to prove on a real login
         "grok" => Destination::tunnel([
             "cli-chat-proxy.grok.com",
             "code.grok.com",
@@ -2380,8 +2382,7 @@ mod backend_tests {
     #[test]
     fn a_grok_login_is_a_tunnel_to_grok_s_own_hosts() {
         // a login talks to the cli-chat-proxy and websocket relays on grok.com, and
-        // refreshes at auth.x.ai: no override is known to carry a session token, so
-        // the route is a tunnel, pinned without metering
+        // refreshes at auth.x.ai: a tunnel in this first cut, pinned without metering
         let d = pass_through_provider("grok").unwrap();
         assert!(d.upstream.is_empty(), "a tunnel, not a forward");
         for host in [

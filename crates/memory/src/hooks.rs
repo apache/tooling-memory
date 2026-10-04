@@ -358,6 +358,37 @@ where
     }
 }
 
+/// The answer to input the hook could not read. Grok Build truncates a payload over its
+/// size cap to one JSON string and lets a tool through when the hook says nothing, so
+/// there the answer is a refusal, which it honours on any event that takes one; the
+/// other harnesses take silence as nothing decided, which refuses nothing but also
+/// lets no truncated call through, since they do not truncate.
+#[must_use]
+pub fn unreadable(harness: &str) -> Option<String> {
+    (harness == "grok").then(|| {
+        serde_json::json!({
+            "decision": "deny",
+            "reason": "the memory's hook could not read this tool call, so it is refused; \
+                       a smaller call, or the memory's `search` and `get` tools, will do",
+        })
+        .to_string()
+    })
+}
+
+/// The transcript to read for a hook event: the file the harness named, unless it is
+/// Grok Build's `updates.jsonl`, the ACP log, with the chat history beside it, which is
+/// the shape the tail reader knows.
+#[must_use]
+pub fn transcript_file(path: &Path) -> PathBuf {
+    if path.file_name().is_some_and(|n| n == "updates.jsonl") {
+        let history = path.with_file_name("chat_history.jsonl");
+        if history.is_file() {
+            return history;
+        }
+    }
+    path.to_path_buf()
+}
+
 /// How long the hook waits for the memory server before it refuses: inside the hook's
 /// own timeout, so a stalled relay is a refusal and not a read let through.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -495,12 +526,14 @@ fn turns_in(v: &Value) -> Vec<Turn> {
                 .replace("</USER_REQUEST>", "");
             return keep(who, text).into_iter().collect();
         }
-        // Claude Code's message has content; Qwen Code's is the Gemini API's, with parts
+        // Claude Code's message has content; Qwen Code's is the Gemini API's, with
+        // parts; Grok Build's item carries its content at the top
         if role == "user" || role == "assistant" {
-            if let Some(c) = v
-                .get("message")
-                .and_then(|m| m.get("content").or_else(|| m.get("parts")))
-            {
+            let content = match v.get("message") {
+                Some(m) => m.get("content").or_else(|| m.get("parts")),
+                None => v.get("content"),
+            };
+            if let Some(c) = content {
                 return keep(role, text_of(c)).into_iter().collect();
             }
         }
@@ -601,7 +634,15 @@ fn short(id: &str) -> &str {
 pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
     let mut text = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
-    let input = HookInput::parse(&text)?;
+    let input = match HookInput::parse(&text) {
+        Ok(input) => input,
+        Err(e) => {
+            if let Some(out) = unreadable(harness) {
+                println!("{out}");
+            }
+            return Err(e.into());
+        }
+    };
     if pre_tool_event(&input.hook_event_name) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -619,8 +660,8 @@ pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
     };
     let transcript = input
         .transcript_path
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(transcript_file(p)).ok())
         .unwrap_or_default();
     let tail = transcript_tail(&transcript, 10, 6000);
     let (_, body) = note(&input, event, &tail);
@@ -777,6 +818,22 @@ not json
             t.starts_with("**user**\n\nHello there.") && t.ends_with("General Kenobi."),
             "{t}"
         );
+        // Grok Build's chat history: typed items with the content at the top, parts
+        // for the user and a string for the assistant
+        let grok = concat!(
+            r#"{"type":"system","content":"be brief"}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"Hello there."}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":"General Kenobi.","tool_calls":[]}"#,
+            "\n",
+        );
+        let t = transcript_tail(grok, 10, 10_000);
+        assert!(
+            t.starts_with("**user**\n\nHello there.") && t.ends_with("General Kenobi."),
+            "{t}"
+        );
+        assert!(!t.contains("be brief"), "a system item is not a turn: {t}");
         assert_eq!(Event::from_name("PreCompress"), Some(Event::PreCompact));
         assert_eq!(Event::from_name("Nope"), None);
         let agy = concat!(
@@ -1093,6 +1150,34 @@ not json
                 .unwrap()
                 .session_id,
             "c"
+        );
+    }
+
+    #[test]
+    fn grok_s_unreadable_input_is_refused_and_its_history_is_read_beside_the_log() {
+        // Grok truncates a payload over its size cap to one JSON string and lets a
+        // tool through when the hook says nothing; the answer to input that cannot be
+        // read is a refusal there, and silence where silence already refuses
+        let v: Value = serde_json::from_str(&unreadable("grok").unwrap()).unwrap();
+        assert_eq!(v["decision"], "deny");
+        assert!(v["reason"].as_str().is_some_and(|r| !r.is_empty()));
+        assert_eq!(unreadable("claude"), None);
+        assert_eq!(unreadable("gemini"), None);
+        // the hook is handed updates.jsonl, the ACP log; the chat history beside it is
+        // the transcript the tail reader knows
+        let dir = tempfile::tempdir().unwrap();
+        let updates = dir.path().join("updates.jsonl");
+        std::fs::write(&updates, "{}").unwrap();
+        assert_eq!(transcript_file(&updates), updates, "nothing beside it yet");
+        let history = dir.path().join("chat_history.jsonl");
+        std::fs::write(&history, "{}").unwrap();
+        assert_eq!(transcript_file(&updates), history);
+        let other = dir.path().join("t.jsonl");
+        std::fs::write(&other, "{}").unwrap();
+        assert_eq!(
+            transcript_file(&other),
+            other,
+            "only the ACP log has a twin"
         );
     }
 

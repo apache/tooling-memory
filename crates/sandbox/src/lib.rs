@@ -999,11 +999,13 @@ fn setup_qwen(
 /// Grok Build is a Rust binary that keeps its config in `~/.grok/config.toml`. Only
 /// API-key inference reads `GROK_XAI_API_BASE_URL`, so a key is `XAI_API_KEY` behind it;
 /// a login is the token file `grok login` left, copied in, and its calls go to Grok's
-/// own proxy and websocket relays, which have no override known to carry a session
-/// token, so the harness's HTTPS goes through the egress as a tunnel to those hosts.
-/// MCP servers and hooks live in the same file; a hook group takes no matcher, since
-/// Grok's matcher is a regex and an absent one selects every tool, and its timeout is
-/// in seconds with a default of five, too short for a `get`.
+/// own proxy and websocket relays, through the egress as a tunnel to those hosts in this
+/// first cut: the proxy has an override, `GROK_CLI_CHAT_PROXY_BASE_URL`, and speaks the
+/// Responses API, so a forward through it is the metered route to prove on a real
+/// login. A stored session token outranks a key and goes to the proxy, so a key run
+/// removes one left in the home by an earlier login run. MCP servers and hooks live in
+/// the same file; a hook group takes no matcher, since an absent one selects every
+/// tool, and its timeout is in seconds with a default of five, too short for a `get`.
 fn setup_grok(
     req: &Request<'_>,
     relay: &str,
@@ -1016,6 +1018,12 @@ fn setup_grok(
         env.insert("GROK_XAI_API_BASE_URL".into(), format!("{relay}/xai/v1"));
         // the egress injects the real key; this one only has to exist
         env.insert("XAI_API_KEY".into(), "egress".into());
+        let stale = req.home.join(".grok/auth.json");
+        if let Err(e) = std::fs::remove_file(&stale) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(io(&stale)(e));
+            }
+        }
     }
     let hook = |event: &str| {
         format!(
@@ -2182,7 +2190,7 @@ mod tests {
         );
         assert!(
             !cfg.contains("matcher"),
-            "no matcher: Grok's is a regex, and `*` alone is not one"
+            "no matcher: an absent one selects every tool"
         );
         assert_eq!(plan.env["MEMORY_MCP_URL"], "http://127.0.0.1:4100/mcp");
         assert!(
@@ -2220,6 +2228,16 @@ mod tests {
         assert!(!plan.env.contains_key("GROK_XAI_API_BASE_URL"));
         let cfg = std::fs::read_to_string(home.join(".grok/config.toml")).unwrap();
         assert!(cfg.contains("[mcp_servers.memory]"), "{cfg}");
+        // a stored session token outranks XAI_API_KEY and goes to Grok's own proxy,
+        // not the key's base, so a key run into the same persisted home removes it
+        let (home, plan) = f
+            .plan(Harness::Grok, AuthMode::Key, "k3", &[], true)
+            .unwrap();
+        assert_eq!(plan.env["XAI_API_KEY"], "egress");
+        assert!(
+            !home.join(".grok/auth.json").exists(),
+            "a login left behind would carry the key run past the egress"
+        );
     }
 
     fn assert_qwen_hooks(settings: &serde_json::Value) {

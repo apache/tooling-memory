@@ -155,10 +155,18 @@ pub fn newest_transcript(home: &Path) -> Option<std::path::PathBuf> {
             if p.is_dir() {
                 walk(&p, out, depth + 1);
             } else if p.extension().is_some_and(|x| x == "jsonl") {
-                // agy keeps a full log beside the transcript proper; the proper one is
-                // the shape the tail reader knows
+                // agy keeps a full log beside the transcript proper, and Grok Build
+                // three logs beside its chat history; the proper one is the shape the
+                // tail reader knows
                 let twin = p.with_file_name("transcript.jsonl");
                 if p.file_name().is_some_and(|n| n == "transcript_full.jsonl") && twin.is_file() {
+                    continue;
+                }
+                let history = p.with_file_name("chat_history.jsonl");
+                let grok_log = p.file_name().is_some_and(|n| {
+                    n == "updates.jsonl" || n == "prompt_history.jsonl" || n == "events.jsonl"
+                });
+                if grok_log && history.is_file() {
                     continue;
                 }
                 if let Ok(m) = p.metadata().and_then(|m| m.modified()) {
@@ -216,5 +224,17 @@ mod tests {
         let newest = newest_transcript(dir.path()).unwrap();
         assert!(newest.ends_with("rollout.jsonl"), "{newest:?}");
         assert!(newest_transcript(&dir.path().join("none")).is_none());
+        // Grok keeps four logs side by side; the chat history is the one in a shape
+        // the tail reader knows, however the others' times fall
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let g = dir.path().join(".grok/sessions/work/s1");
+        std::fs::create_dir_all(&g).unwrap();
+        std::fs::write(g.join("chat_history.jsonl"), "{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for sibling in ["updates.jsonl", "prompt_history.jsonl", "events.jsonl"] {
+            std::fs::write(g.join(sibling), "{}").unwrap();
+        }
+        let newest = newest_transcript(dir.path()).unwrap();
+        assert!(newest.ends_with("chat_history.jsonl"), "{newest:?}");
     }
 }
