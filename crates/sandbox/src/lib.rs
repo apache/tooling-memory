@@ -251,6 +251,9 @@ pub struct Request<'a> {
     /// so a Linux run is the same environment as a run in the image elsewhere. Implies
     /// `image`.
     pub rootfs: Option<&'a Path>,
+    /// The record's projection the launcher rendered for this session, on the host, to
+    /// mount read-only at [`INSIDE_PROJECTION`]; `None` when there is none.
+    pub projection: Option<&'a Path>,
 }
 
 impl Request<'_> {
@@ -272,9 +275,10 @@ pub const INSIDE_RELAY: &str = "127.0.0.1:4100";
 /// Where the record's projection, the memory as read-only files, appears inside when
 /// the launcher rendered one.
 pub const INSIDE_PROJECTION: &str = "/memory";
-/// Where the launcher renders the projection on the host, under the private home so
-/// every backend carries it.
-pub const PROJECTION: &str = ".memory-view";
+/// Where the launcher renders the projection on the host, relative to the record root,
+/// one directory per harness: the launcher's own, never under the private home the
+/// harness can write.
+pub const PROJECTION: &str = "state/projection";
 /// Where hooks leave notes for the launcher, under the private home.
 pub const OUTBOX: &str = ".memory-outbox";
 
@@ -465,17 +469,11 @@ fn base_env(harness_env: &[(String, String)]) -> BTreeMap<String, String> {
     env
 }
 
-/// Where the projection is, when the launcher rendered one: in the image the home
-/// crosses as one mount, so it is read where it was rendered; elsewhere it has a
-/// read-only mount of its own.
+/// Where the projection is inside, when the launcher rendered one: the same read-only
+/// mount on every backend, so the hook has one path to know.
 fn projection_env(req: &Request<'_>, env: &mut BTreeMap<String, String>) {
-    if req.home.join(PROJECTION).is_dir() {
-        let inside = if req.image {
-            format!("{INSIDE_HOME}/{PROJECTION}")
-        } else {
-            INSIDE_PROJECTION.to_string()
-        };
-        env.insert("MEMORY_PROJECTION".into(), inside);
+    if req.projection.is_some_and(Path::is_dir) {
+        env.insert("MEMORY_PROJECTION".into(), INSIDE_PROJECTION.to_string());
     }
 }
 
@@ -500,12 +498,11 @@ fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<Pat
         target: req.workdir_inside().to_path_buf(),
         read_only: false,
     });
-    // the projection is rendered under the home, which is read-write; it is mounted
-    // again at its own path read-only, so the files cannot be edited into lies
-    let projection = req.home.join(PROJECTION);
-    if projection.is_dir() {
+    // the projection is the launcher's own directory, mounted read-only: the harness
+    // reads it there and nowhere else, and cannot edit it into lies
+    if let Some(projection) = req.projection.filter(|p| p.is_dir()) {
         mounts.push(Mount {
-            source: projection,
+            source: projection.to_path_buf(),
             target: PathBuf::from(INSIDE_PROJECTION),
             read_only: true,
         });
@@ -1106,6 +1103,30 @@ mod tests {
             creds: bool,
             harness_env: &[(String, String)],
         ) -> Result<(PathBuf, Plan), Error> {
+            self.plan_full(
+                harness,
+                auth,
+                provider,
+                home,
+                args,
+                creds,
+                harness_env,
+                None,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)] // the test's twin of Request
+        fn plan_full(
+            &self,
+            harness: Harness,
+            auth: AuthMode,
+            provider: Option<&str>,
+            home: &str,
+            args: &[String],
+            creds: bool,
+            harness_env: &[(String, String)],
+            projection: Option<&Path>,
+        ) -> Result<(PathBuf, Plan), Error> {
             let home = self.root.join(home);
             let _path = path_lock();
             let old = std::env::var_os("PATH").unwrap_or_default();
@@ -1131,6 +1152,7 @@ mod tests {
                 image: false,
                 workdir_inside: None,
                 rootfs: None,
+                projection,
             });
             std::env::set_var("PATH", old);
             r.map(|p| (home, p))
@@ -1214,6 +1236,7 @@ mod tests {
             image: false,
             workdir_inside: None,
             rootfs: Some(&rootfs),
+            projection: None,
         })
         .unwrap();
         let from_rootfs = |t: &str| {
@@ -1263,9 +1286,19 @@ mod tests {
                     .any(|m| m.target == Path::new(INSIDE_PROJECTION)),
             "nothing rendered, nothing mounted"
         );
-        std::fs::create_dir_all(f.root.join("h2").join(PROJECTION)).unwrap();
+        let rendered = f.root.join(PROJECTION).join("claude");
+        std::fs::create_dir_all(&rendered).unwrap();
         let (home, plan) = f
-            .plan(Harness::Claude, AuthMode::Subscription, "h2", &[], true)
+            .plan_full(
+                Harness::Claude,
+                AuthMode::Subscription,
+                None,
+                "h2",
+                &[],
+                true,
+                &[],
+                Some(&rendered),
+            )
             .unwrap();
         let m = plan
             .mounts
@@ -1276,20 +1309,10 @@ mod tests {
             m.read_only,
             "read-only: the files cannot be edited into lies"
         );
-        assert_eq!(m.source, home.join(PROJECTION));
-        let home_at = plan
-            .mounts
-            .iter()
-            .position(|m| m.target == Path::new(INSIDE_HOME))
-            .unwrap();
-        let view_at = plan
-            .mounts
-            .iter()
-            .position(|m| m.target == Path::new(INSIDE_PROJECTION))
-            .unwrap();
+        assert_eq!(m.source, rendered);
         assert!(
-            home_at < view_at,
-            "the home is mounted before what it holds"
+            !m.source.starts_with(&home),
+            "the launcher's own directory, not the home the harness writes"
         );
         assert_eq!(plan.env["MEMORY_PROJECTION"], INSIDE_PROJECTION);
         let settings = json_file(&home.join(".claude/settings.json"));
@@ -1696,6 +1719,7 @@ mod tests {
         let old = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", &empty);
         let r = prepare(&Request {
+            projection: None,
             harness: Harness::Codex,
             auth: AuthMode::Key,
             provider: None,

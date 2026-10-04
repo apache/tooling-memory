@@ -71,21 +71,54 @@ impl Decision {
     }
 }
 
-/// The path a tool call is about, for the tools that read files: `file_path` for a
-/// read, `path` for a search over a tree.
+/// The path a tool call is about, for the tools that touch files: `file_path` for a
+/// read or an edit, `notebook_path` for a notebook, `path` for a search over a tree,
+/// and for a search without one, its pattern when the pattern is a path.
 fn path_of(input: &Value) -> Option<PathBuf> {
-    input
-        .get("file_path")
-        .or_else(|| input.get("path"))
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
+    ["file_path", "notebook_path", "path", "pattern"]
+        .iter()
+        .find_map(|k| input.get(*k).and_then(Value::as_str))
+        .filter(|p| !p.is_empty())
+        .map(|p| normalise(Path::new(p)))
+}
+
+/// A path with `.` and `..` folded away lexically, so `/memory/../memory/x` is
+/// `/memory/x` and `/memory/..` is `/`.
+fn normalise(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// A tool that reads one file.
+fn reads_one(tool: &str) -> bool {
+    matches!(tool, "Read" | "read_file" | "view" | "NotebookRead")
+}
+
+/// A tool that searches a tree, by path or by glob.
+fn searches(tool: &str) -> bool {
+    matches!(
+        tool,
+        "Grep" | "Glob" | "grep" | "glob" | "search_files" | "list_directory"
+    )
 }
 
 /// Decide a tool call against the projection at `projection`. A read of an entry file
 /// is served through `get`, which returns the server's refusal in words when it has
-/// one; a read of the summaries page is free, as a list is; a search over the
-/// projection is refused, since a `grep -r` over bodies is a full-corpus read the
-/// memory would not have served. Anything outside the projection is not the hook's.
+/// one; a read of the summaries page is free, as a list is; any other name under the
+/// projection is refused, whatever put it there; a search over the projection, or over
+/// a directory that holds it, is refused, since a `grep -r` over bodies is a
+/// full-corpus read the memory would not have served; so is a write, which the mount
+/// refuses anyway. Anything outside the projection is not the hook's.
 pub fn decide<F>(tool: &str, input: &Value, projection: &Path, get: F) -> Decision
 where
     F: FnOnce(&str) -> Result<(), String>,
@@ -93,23 +126,35 @@ where
     let Some(path) = path_of(input) else {
         return Decision::Allow;
     };
-    if !path.starts_with(projection) {
+    let projection = normalise(projection);
+    let covers = searches(tool) && projection.starts_with(&path);
+    if !path.starts_with(&projection) && !covers {
         return Decision::Allow;
     }
-    match tool {
-        "Read" | "read_file" | "view" => match dm_server::projection::id_of(&path) {
-            Some(id) => match get(id) {
-                Ok(()) => Decision::Allow,
-                Err(why) => Decision::Deny(format!(
-                    "the memory refused {id}: {why}. Its summary is in the README beside it;                      the memory's `search` tool finds what you may read."
-                )),
-            },
-            None => Decision::Allow,
+    let whole = format!(
+        "{} is the memory's projection: its bodies are read one file at a time, each \
+         read a `get` the memory serves and counts. Use the memory's `search` tool, or \
+         open one entry file.",
+        projection.display()
+    );
+    if !reads_one(tool) {
+        return Decision::Deny(whole);
+    }
+    if path
+        .file_name()
+        .is_some_and(|n| n == dm_server::projection::SUMMARIES)
+    {
+        return Decision::Allow;
+    }
+    match dm_server::projection::id_of(&path) {
+        Some(id) => match get(id) {
+            Ok(()) => Decision::Allow,
+            Err(why) => Decision::Deny(format!(
+                "the memory refused {id}: {why}. Its summary is in the README beside it; \
+                 the memory's `search` tool finds what you may read."
+            )),
         },
-        _ => Decision::Deny(format!(
-            "{} is the memory's projection: its bodies are read one file at a time, each              read a `get` the memory serves and counts. Use the memory's `search` tool, or              open one entry file.",
-            projection.display()
-        )),
+        None => Decision::Deny(whole),
     }
 }
 
@@ -510,10 +555,13 @@ not json
         assert!(notes(&dir.path().join("missing")).unwrap().is_empty());
     }
 
+    fn read(p: &str) -> Value {
+        serde_json::json!({ "file_path": p })
+    }
+
     #[test]
-    fn a_read_of_the_projection_is_a_get_and_a_search_over_it_is_refused() {
+    fn a_read_of_an_entry_file_is_a_get_and_the_summaries_page_is_free() {
         let view = Path::new("/memory");
-        let read = |p: &str| serde_json::json!({ "file_path": p });
         let mut asked = Vec::new();
         let d = decide("Read", &read("/memory/dom-me/mem-me-abc1.md"), view, |id| {
             asked.push(id.to_string());
@@ -536,33 +584,77 @@ not json
             )),
             Decision::Allow
         );
-        assert_eq!(
-            decide("Read", &read("/work/src/main.rs"), view, |_| panic!(
-                "not ours"
-            )),
-            Decision::Allow
+        // a path folded through `..` is the entry's, and is fetched
+        let mut folded = Vec::new();
+        let d = decide(
+            "Read",
+            &read("/memory/../memory/dom-me/mem-me-abc1.md"),
+            view,
+            |id| {
+                folded.push(id.to_string());
+                Ok(())
+            },
         );
         assert_eq!(
-            decide("Read", &read("/memory-else/x.md"), view, |_| panic!(
-                "not ours"
-            )),
-            Decision::Allow,
-            "a prefix of the name is not the directory"
+            (d, folded),
+            (Decision::Allow, vec!["mem-me-abc1".to_string()])
         );
-        let grep = serde_json::json!({ "pattern": "key", "path": "/memory/dom-me" });
-        assert!(matches!(
-            decide("Grep", &grep, view, |_| panic!("no get")),
-            Decision::Deny(_)
-        ));
         assert!(matches!(
             decide(
-                "Glob",
-                &serde_json::json!({ "pattern": "**/*.md", "path": "/memory" }),
+                "NotebookRead",
+                &serde_json::json!({ "notebook_path": "/memory/dom-me/mem-me-abc1.md" }),
                 view,
-                |_| Ok(())
+                |_| Err("not found".into())
             ),
             Decision::Deny(_)
         ));
+        let out = Decision::Deny("why".into()).output().unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(Decision::Allow.output(), None);
+        let input: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/memory/a/mem-a-1.md"}}"#,
+        )
+        .unwrap();
+        assert_eq!(input.tool_name.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn under_the_projection_only_an_entry_file_opens_and_outside_it_nothing_is_decided() {
+        let view = Path::new("/memory");
+        // a stray name, a leftover sibling, a path folded out and back in to a stray name
+        for p in [
+            "/memory/dom-me/planted.md",
+            "/memory/dom-me/mem-me-abc1.md.tmp",
+            "/memory/../etc/passwd/../../memory/dom-me/x",
+        ] {
+            assert!(
+                matches!(
+                    decide("Read", &read(p), view, |_| Ok(())),
+                    Decision::Deny(_)
+                ),
+                "{p}"
+            );
+        }
+        for p in [
+            "/work/src/main.rs",
+            "/memory-else/x.md",
+            "/home/user/.memory-view/x.md",
+        ] {
+            assert_eq!(
+                decide("Read", &read(p), view, |_| panic!("not ours")),
+                Decision::Allow,
+                "{p}"
+            );
+        }
+        for tool in ["Edit", "Write", "MultiEdit"] {
+            assert!(matches!(
+                decide(tool, &read("/memory/dom-me/mem-me-abc1.md"), view, |_| Ok(
+                    ()
+                )),
+                Decision::Deny(_)
+            ));
+        }
         assert_eq!(
             decide(
                 "Bash",
@@ -573,14 +665,34 @@ not json
             Decision::Allow,
             "a shell is not observed here; the plan says so"
         );
-        let out = Decision::Deny("why".into()).output().unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
-        assert_eq!(Decision::Allow.output(), None);
-        let input: HookInput = serde_json::from_str(
-            r#"{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/memory/a/mem-a-1.md"}}"#,
-        )
-        .unwrap();
-        assert_eq!(input.tool_name.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn a_search_over_the_projection_or_over_what_holds_it_is_refused() {
+        let view = Path::new("/memory");
+        for input in [
+            serde_json::json!({ "pattern": "key", "path": "/memory/dom-me" }),
+            serde_json::json!({ "pattern": "key", "path": "/" }),
+            serde_json::json!({ "pattern": "key", "path": "/memory/.." }),
+            serde_json::json!({ "pattern": "/memory/**/*.md" }),
+        ] {
+            for tool in ["Grep", "Glob"] {
+                assert!(
+                    matches!(decide(tool, &input, view, |_| Ok(())), Decision::Deny(_)),
+                    "{tool} {input}"
+                );
+            }
+        }
+        for input in [
+            serde_json::json!({ "pattern": "key", "path": "/work" }),
+            serde_json::json!({ "pattern": "key" }),
+            serde_json::json!({ "pattern": "**/*.md", "path": "/memor" }),
+        ] {
+            assert_eq!(
+                decide("Grep", &input, view, |_| Ok(())),
+                Decision::Allow,
+                "beside the projection, or in the working tree: {input}"
+            );
+        }
     }
 }

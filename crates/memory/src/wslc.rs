@@ -216,6 +216,7 @@ fn harness_run_args(
     n: usize,
     image: &str,
     volume: &str,
+    root_m: &str,
     home_m: &str,
     work_m: &str,
 ) -> Vec<String> {
@@ -231,6 +232,13 @@ fn harness_run_args(
     a.push(format!("{home_m}:{INSIDE_HOME}"));
     a.push("-v".into());
     a.push(format!("{work_m}:{INSIDE_WORK}"));
+    if let Some(projection) = &req.projection {
+        a.push("-v".into());
+        a.push(format!(
+            "{root_m}/{projection}:{}:ro",
+            dm_sandbox::INSIDE_PROJECTION
+        ));
+    }
     a.push("-w".into());
     a.push(req.cwd.clone());
     for (k, v) in &req.env {
@@ -316,7 +324,7 @@ pub fn run(l: &Launch) -> Fallible<i32> {
             .args(["logs", "-f", &egress])
             .stdin(Stdio::null())
             .spawn()?;
-        let code = drive(&egress, &volume, &l.image, &home_m, &work_m);
+        let code = drive(&egress, &volume, &l.image, &root_m, &home_m, &work_m);
         logs.kill().ok();
         logs.wait().ok();
         code
@@ -440,7 +448,14 @@ fn ensure_running(name: &str, create: impl FnOnce() -> Vec<String>) -> Fallible<
 }
 
 /// Serve the inside's requests until it writes `done`.
-fn drive(egress: &str, volume: &str, image: &str, home_m: &str, work_m: &str) -> Fallible<i32> {
+fn drive(
+    egress: &str,
+    volume: &str,
+    image: &str,
+    root_m: &str,
+    home_m: &str,
+    work_m: &str,
+) -> Fallible<i32> {
     let mut n = 0;
     loop {
         let listing = match run_ok(&s(&["exec", egress, "ls", REQUEST_DIR_INSIDE])) {
@@ -478,7 +493,7 @@ fn drive(egress: &str, volume: &str, image: &str, home_m: &str, work_m: &str) ->
                 &format!("{REQUEST_DIR_INSIDE}/{req_name}"),
             ]))?;
             let req: RunRequest = serde_json::from_str(&text)?;
-            let args = harness_run_args(&req, n, image, volume, home_m, work_m);
+            let args = harness_run_args(&req, n, image, volume, root_m, home_m, work_m);
             // the harness's terminal is ours; its exit code goes to the inside via the volume
             Command::new(wslc()).args(&args).status()?;
             n += 1;
@@ -509,6 +524,7 @@ mod tests {
             ]),
             cwd: "/work".into(),
             home: "state/sandbox/claude".into(),
+            projection: Some("state/projection/claude".into()),
             interactive,
         }
     }
@@ -520,11 +536,16 @@ mod tests {
             3,
             "img:dev",
             "vol",
+            r"\\wsl.localhost\U\home\me\memory",
             r"\\wsl.localhost\U\home\me\memory\state\sandbox\claude",
             r"\\wsl.localhost\U\home\me\proj",
         );
         let joined = a.join(" ");
         assert!(joined.contains("--network none"), "{joined}");
+        assert!(
+            joined.contains(r"\memory/state/projection/claude:/memory:ro"),
+            "the projection is mounted read-only: {joined}"
+        );
         assert!(joined.contains("-u 1000:1000"), "{joined}");
         assert!(joined.contains("vol:/run/memory"), "{joined}");
         assert!(joined.contains(r"\proj:/work"), "{joined}");
@@ -535,7 +556,13 @@ mod tests {
         );
         assert!(a.contains(&"-i".to_string()) && !a.contains(&"-it".to_string()));
         assert_eq!(&a[a.len() - 6..], &request(false).argv[..]);
-        let a = harness_run_args(&request(true), 0, "img:dev", "vol", "h", "w");
+        let mut without = request(true);
+        without.projection = None;
+        let a = harness_run_args(&without, 0, "img:dev", "vol", "r", "h", "w");
+        assert!(
+            !a.join(" ").contains(":/memory"),
+            "nothing rendered, nothing mounted"
+        );
         let joined = a.join(" ");
         assert!(a.contains(&"-it".to_string()));
         assert!(

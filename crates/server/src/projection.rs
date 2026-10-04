@@ -8,7 +8,7 @@
 //! `get` is.
 
 use crate::{Error, Memory};
-use dm_core::digest;
+use dm_core::{digest, Entry};
 use dm_index::Hit;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -79,57 +79,106 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
     }
 }
 
+/// A directory of the projection, made if missing and never a symlink: the projection
+/// is written by the launcher, and a link planted where it writes would carry its files
+/// elsewhere.
+fn own_dir(path: &Path) -> Result<(), Error> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(Error::Denied(format!(
+                "{} is not a directory of the projection's own",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(path).map_err(io(path))
+}
+
 impl Memory {
     /// Render every granted domain under `dir`: `<dir>/<domain>/README.md` and one file
-    /// per active entry the session's filter lists. A file whose text is already current
-    /// is left alone, so a refresh touches only what changed; a file for an entry the
-    /// filter no longer lists, erased, demoted or above the handling, is removed.
+    /// per active entry the session's filter lists, as the record holds it now: an entry
+    /// the index lists but the record has since demoted or raised above the session's
+    /// handling is left out, as `get` would refuse it. A file whose text is already
+    /// current is left alone, so a refresh touches only what changed; a file for an
+    /// entry no longer listed, erased, demoted or above the handling, is removed. A
+    /// symlink anywhere in the way is refused rather than followed.
     ///
     /// # Errors
     ///
-    /// An index, store or I/O error.
+    /// An index, store or I/O error, or a path in the projection that is not its own.
     pub async fn project_into(&self, dir: &Path) -> Result<Projected, Error> {
+        own_dir(dir)?;
         let mut done = Projected::default();
         for domain in self.domains() {
             let f = self.filter_for(Some(&domain))?;
             let hits = self.index.lock().await.list(&f, None, usize::MAX / 2)?;
             let dom_dir = dir.join(&domain);
-            std::fs::create_dir_all(&dom_dir).map_err(io(&dom_dir))?;
+            own_dir(&dom_dir)?;
             let mut keep: BTreeSet<PathBuf> = BTreeSet::new();
+            let mut listed = Vec::with_capacity(hits.len());
             for h in &hits {
                 let Some(text) = self.store.get_text(&domain, &h.id).await? else {
                     continue;
                 };
+                let served = Entry::parse(&text).is_ok_and(|e| {
+                    e.is_active()
+                        && e.front.classification <= f.handling
+                        && e.front.id == h.id
+                        && e.front.domain == domain
+                });
+                if !served {
+                    continue;
+                }
                 let path = dom_dir.join(entry_file(&h.id));
                 keep.insert(path.clone());
-                let current = std::fs::read_to_string(&path).ok();
+                let current = read_own(&path);
                 if current.as_deref().map(digest) != Some(digest(&text)) {
                     write_atomically(&path, &text)?;
                     done.written += 1;
                 }
+                listed.push(h.clone());
             }
             let summaries = dom_dir.join(SUMMARIES);
-            write_atomically(&summaries, &render_summaries(&domain, &hits))?;
+            write_atomically(&summaries, &render_summaries(&domain, &listed))?;
             keep.insert(summaries);
             for stale in std::fs::read_dir(&dom_dir).map_err(io(&dom_dir))?.flatten() {
                 let path = stale.path();
-                if path.is_file() && !keep.contains(&path) {
+                let kind = stale.file_type().map_err(io(&path))?;
+                if (kind.is_file() || kind.is_symlink()) && !keep.contains(&path) {
                     std::fs::remove_file(&path).map_err(io(&path))?;
                     done.removed += 1;
                 }
             }
-            done.listed += hits.len();
+            done.listed += listed.len();
         }
         Ok(done)
     }
 }
 
-/// Write through a sibling and rename, so a reader never sees half a file.
+/// The text of a projected file, if it is a plain file of the projection's own; a
+/// symlink in its place is not read and is replaced.
+fn read_own(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    meta.is_file().then(|| std::fs::read_to_string(path).ok())?
+}
+
+/// Write through a sibling and rename, so a reader never sees half a file. The sibling
+/// is made fresh: whatever stood under its name, a link included, is removed first,
+/// and the rename replaces the target's name rather than writing through it.
 fn write_atomically(path: &Path, text: &str) -> Result<(), Error> {
+    use std::io::Write;
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     let tmp = path.with_file_name(name);
-    std::fs::write(&tmp, text).map_err(io(&tmp))?;
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io(&tmp))?;
+    f.write_all(text.as_bytes()).map_err(io(&tmp))?;
+    drop(f);
     std::fs::rename(&tmp, path).map_err(io(path))?;
     Ok(())
 }
@@ -269,5 +318,105 @@ mod tests {
                 .is_file(),
             "an import renders"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_in_the_projection_is_refused_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let view = dir.path().join("view");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.txt"), "keep me").unwrap();
+        let m = Memory::init(&root, "human:test:me", "dom-me")
+            .unwrap()
+            .without_read_log();
+        m.write(WriteRequest {
+            body: "An entry.\n".into(),
+            ..WriteRequest::default()
+        })
+        .await
+        .unwrap();
+        // the domain's directory planted as a link to somewhere else
+        std::fs::create_dir_all(&view).unwrap();
+        std::os::unix::fs::symlink(&outside, view.join("dom-me")).unwrap();
+        assert!(
+            matches!(m.project_into(&view).await, Err(Error::Denied(_))),
+            "a linked directory is refused"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(
+            !outside.join(SUMMARIES).exists(),
+            "nothing was written outside"
+        );
+        // the view itself as a link
+        let view2 = dir.path().join("view2");
+        std::os::unix::fs::symlink(&outside, &view2).unwrap();
+        assert!(matches!(
+            m.project_into(&view2).await,
+            Err(Error::Denied(_))
+        ));
+        // a sibling planted where the atomic write lands: replaced, never written through
+        std::fs::remove_file(view.join("dom-me")).unwrap();
+        std::fs::create_dir_all(view.join("dom-me")).unwrap();
+        let planted = outside.join("planted.txt");
+        std::fs::write(&planted, "mine").unwrap();
+        std::os::unix::fs::symlink(&planted, view.join("dom-me").join("README.md.tmp")).unwrap();
+        std::os::unix::fs::symlink(&planted, view.join("dom-me").join("stray.md")).unwrap();
+        let p = m.project_into(&view).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "mine");
+        assert!(p.removed >= 1, "the stray link is removed: {p:?}");
+        assert!(!view.join("dom-me").join("stray.md").exists());
+        assert!(
+            std::fs::symlink_metadata(view.join("dom-me").join(SUMMARIES))
+                .unwrap()
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_record_s_word_decides_what_is_rendered_not_the_index_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let view = dir.path().join("view");
+        let m = Memory::init(&root, "human:test:me", "dom-me")
+            .unwrap()
+            .without_read_log();
+        let demoted = m
+            .write(WriteRequest {
+                body: "Demoted behind the index's back.\n".into(),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let raised = m
+            .write(WriteRequest {
+                title: Some("Raised later".into()),
+                body: "secret body B\n".into(),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        // another process moved the record on and its index step was lost
+        m.store.demote("dom-me", &demoted.id).await.unwrap();
+        let mut e = m.store.get("dom-me", &raised.id).await.unwrap().unwrap();
+        e.front.classification = Label::Restricted;
+        m.store.put(&e).await.unwrap();
+        let capped = Memory::open(&root)
+            .unwrap()
+            .without_read_log()
+            .with_handling_cap(Label::Internal);
+        let p = capped.project_into(&view).await.unwrap();
+        assert_eq!((p.written, p.listed), (0, 0), "{p:?}");
+        let dom = view.join("dom-me");
+        assert!(!dom.join(entry_file(&demoted.id)).exists());
+        assert!(!dom.join(entry_file(&raised.id)).exists());
+        assert!(!std::fs::read_to_string(dom.join(SUMMARIES))
+            .unwrap()
+            .contains("Raised later"));
     }
 }

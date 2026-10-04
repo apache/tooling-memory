@@ -960,6 +960,8 @@ struct Prepared {
     deputy: Option<Arc<dyn Deputy>>,
     socket: PathBuf,
     home: PathBuf,
+    /// Where the record is projected as files for the session, the launcher's own.
+    projection: PathBuf,
     ceiling: Label,
     ceiling_of: String,
     provider: String,
@@ -985,10 +987,11 @@ async fn prepare_launch(
         format!("grants.toml has no [destinations.{ceiling_of}]; add one with a ceiling")
     })?;
     let home = root.join("state/sandbox").join(harness.binary());
+    let projection = root.join(dm_sandbox::PROJECTION).join(harness.binary());
     let memory = Arc::new(
         memory
             .with_handling_cap(ceiling)
-            .with_projection(home.join(dm_sandbox::PROJECTION)),
+            .with_projection(projection.clone()),
     );
     let mut destinations = HashMap::new();
     destinations.insert(name.clone(), destination);
@@ -1019,6 +1022,7 @@ async fn prepare_launch(
             .unwrap_or_else(|| run_dir.join(format!("egress-{}.sock", std::process::id()))),
         root: root.to_path_buf(),
         home,
+        projection,
         ceiling,
         ceiling_of,
         provider: name,
@@ -1052,9 +1056,7 @@ async fn run_confined(
     rootfs: Option<&Path>,
 ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
     let host_home = home_dir();
-    p.memory
-        .project_into(&p.home.join(dm_sandbox::PROJECTION))
-        .await?;
+    p.memory.project_into(&p.projection).await?;
     let plan = dm_sandbox::prepare(&dm_sandbox::Request {
         harness,
         auth,
@@ -1070,6 +1072,7 @@ async fn run_confined(
         image: false,
         workdir_inside: None,
         rootfs,
+        projection: Some(&p.projection),
     })?;
     Ok(tokio::task::spawn_blocking(move || {
         if capture {
@@ -1839,10 +1842,7 @@ impl Session {
         args: &[String],
         capture: bool,
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
-        self.p
-            .memory
-            .project_into(&self.p.home.join(dm_sandbox::PROJECTION))
-            .await?;
+        self.p.memory.project_into(&self.p.projection).await?;
         let plan = dm_sandbox::prepare(&dm_sandbox::Request {
             harness: self.harness,
             auth: self.auth,
@@ -1858,6 +1858,7 @@ impl Session {
             image: true,
             workdir_inside: Some(&r.workdir_inside),
             rootfs: None,
+            projection: Some(&self.p.projection),
         })?;
         let n = r.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let home_rel = self
@@ -1871,6 +1872,13 @@ impl Session {
             env: plan.env,
             cwd: plan.cwd.display().to_string(),
             home: home_rel,
+            projection: self
+                .p
+                .projection
+                .strip_prefix(&self.p.root)
+                .ok()
+                .filter(|_| self.p.projection.is_dir())
+                .map(|p| p.to_string_lossy().replace('\\', "/")),
             interactive: !capture,
         };
         let tmp = r.dir.join(format!("{}.tmp", requests::RunRequest::file(n)));
