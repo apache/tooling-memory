@@ -19,13 +19,14 @@ pub const OUTBOX: &str = ".memory-outbox";
 /// What Claude Code passes on standard input. Other harnesses' hooks map onto this.
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
-    /// Which event.
+    /// Which event. Antigravity CLI names it in camelCase, as it does every key.
+    #[serde(alias = "hookEventName", alias = "event")]
     pub hook_event_name: String,
-    /// The harness's own session id.
-    #[serde(default)]
+    /// The harness's own session id; Antigravity's conversation id.
+    #[serde(default, alias = "conversationId")]
     pub session_id: String,
     /// The transcript, a JSON Lines file.
-    #[serde(default)]
+    #[serde(default, alias = "transcriptPath")]
     pub transcript_path: Option<PathBuf>,
     /// PreCompact: manual or auto.
     #[serde(default)]
@@ -39,6 +40,34 @@ pub struct HookInput {
     /// PreToolUse: its input, in the tool's own shape.
     #[serde(default)]
     pub tool_input: Value,
+    /// PreToolUse as Antigravity CLI sends it: the tool's name and arguments together.
+    #[serde(default, alias = "toolCall")]
+    pub tool_call: Option<Value>,
+}
+
+impl HookInput {
+    /// The tool about to run and its input, from whichever shape the harness sent.
+    fn tool(&self) -> (String, Value) {
+        if let Some(call) = &self.tool_call {
+            let name = call
+                .get("name")
+                .or_else(|| call.get("toolName"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let input = call
+                .get("args")
+                .or_else(|| call.get("arguments"))
+                .or_else(|| call.get("input"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            return (name, input);
+        }
+        (
+            self.tool_name.clone().unwrap_or_default(),
+            self.tool_input.clone(),
+        )
+    }
 }
 
 /// What the hook tells the harness about a tool call. Nothing said is allowed; a denial
@@ -52,9 +81,19 @@ pub enum Decision {
 }
 
 impl Decision {
-    /// The hook's standard output, in Claude Code's shape; nothing for an allow.
+    /// The hook's standard output in the harness's shape. Claude Code reads a
+    /// `hookSpecificOutput` and takes silence as allowed; Antigravity CLI wants a
+    /// `decision` either way, since an empty object is refused as invalid.
     #[must_use]
-    pub fn output(&self) -> Option<String> {
+    pub fn output(&self, harness: &str) -> Option<String> {
+        if harness == "antigravity" {
+            return Some(match self {
+                Decision::Allow => serde_json::json!({ "decision": "allow" }).to_string(),
+                Decision::Deny(reason) => {
+                    serde_json::json!({ "decision": "deny", "reason": reason }).to_string()
+                }
+            });
+        }
         match self {
             Decision::Allow => None,
             Decision::Deny(reason) => Some(
@@ -113,9 +152,12 @@ fn normalise(path: &Path) -> PathBuf {
     out
 }
 
-/// A tool that reads one file.
+/// A tool that reads one file, under the names the harnesses give it.
 fn reads_one(tool: &str) -> bool {
-    matches!(tool, "Read" | "read_file" | "view" | "NotebookRead")
+    matches!(
+        tool,
+        "Read" | "read_file" | "view" | "view_file" | "NotebookRead" | "read_resource"
+    )
 }
 
 /// A tool that lists files by glob.
@@ -232,17 +274,17 @@ async fn pre_tool_with(
     let Some(projection) = projection else {
         return Decision::Allow;
     };
-    let tool = input.tool_name.clone().unwrap_or_default();
+    let (tool, tool_input) = input.tool();
     // the id to fetch is decided first, then fetched: the decision is pure, the fetch is not
     let mut wanted: Option<String> = None;
-    let d = decide(&tool, &input.tool_input, projection, session, |id| {
+    let d = decide(&tool, &tool_input, projection, session, |id| {
         wanted = Some(id.to_string());
         Ok(())
     });
     let Some(id) = wanted else {
         return d;
     };
-    let refused = |why: String| decide(&tool, &input.tool_input, projection, session, |_| Err(why));
+    let refused = |why: String| decide(&tool, &tool_input, projection, session, |_| Err(why));
     let Some(url) = url else {
         return refused(
             "the memory server's address is not set, so nothing here can be read".into(),
@@ -279,7 +321,8 @@ impl Event {
         match name {
             // Claude Code and Codex say PreCompact; Gemini CLI says PreCompress
             "PreCompact" | "PreCompress" => Some(Event::PreCompact),
-            "SessionEnd" => Some(Event::SessionEnd),
+            // Antigravity CLI says Stop
+            "SessionEnd" | "Stop" => Some(Event::SessionEnd),
             _ => None,
         }
     }
@@ -327,6 +370,7 @@ fn text_of(content: &Value) -> String {
 /// Claude Code: `{"type":"user"|"assistant","message":{"content":…}}`, one turn a line.
 /// Codex: `{"type":"response_item","payload":{"type":"message","role":…,"content":[{"text":…}]}}`.
 /// Gemini CLI: a patch log, `{"$set":{"messages":[{"type":"user"|"gemini","content":[{"text":…}]}]}}`.
+/// Antigravity CLI: `{"type":"USER_INPUT"|"PLANNER_RESPONSE","content":"…"}`, one a line.
 fn turns_in(v: &Value) -> Vec<Turn> {
     let keep = |role: &str, text: String| {
         let text = text.trim().to_string();
@@ -336,6 +380,15 @@ fn turns_in(v: &Value) -> Vec<Turn> {
         })
     };
     if let Some(role) = v.get("type").and_then(Value::as_str) {
+        let planner = match role {
+            "USER_INPUT" => Some("user"),
+            "PLANNER_RESPONSE" => Some("assistant"),
+            _ => None,
+        };
+        if let Some(who) = planner {
+            let text = v.get("content").map(text_of).unwrap_or_default();
+            return keep(who, text).into_iter().collect();
+        }
         if role == "user" || role == "assistant" {
             if let Some(c) = v.get("message").and_then(|m| m.get("content")) {
                 return keep(role, text_of(c)).into_iter().collect();
@@ -435,7 +488,7 @@ fn short(id: &str) -> &str {
 /// # Errors
 ///
 /// When the input is not a hook event or the outbox cannot be written.
-pub fn run(outbox: &Path) -> Fallible<()> {
+pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
     let mut text = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
     let input: HookInput = serde_json::from_str(&text)?;
@@ -443,7 +496,7 @@ pub fn run(outbox: &Path) -> Fallible<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        if let Some(out) = rt.block_on(pre_tool(&input)).output() {
+        if let Some(out) = rt.block_on(pre_tool(&input)).output(harness) {
             println!("{out}");
         }
         return Ok(());
@@ -587,7 +640,19 @@ not json
             "{t}"
         );
         assert_eq!(Event::from_name("PreCompress"), Some(Event::PreCompact));
-        assert_eq!(Event::from_name("Stop"), None);
+        assert_eq!(Event::from_name("Nope"), None);
+        let agy = concat!(
+            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","content":"Load T0."}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","source":"MODEL","content":"T0 says: one handoff."}"#,
+            "\n",
+            r#"{"type":"TOOL_CALL","content":"ignored"}"#,
+        );
+        let t = transcript_tail(agy, 10, 10_000);
+        assert_eq!(
+            t,
+            "**user**\n\nLoad T0.\n\n**assistant**\n\nT0 says: one handoff."
+        );
     }
 
     #[test]
@@ -600,6 +665,7 @@ not json
             reason: None,
             tool_name: None,
             tool_input: Value::Null,
+            tool_call: None,
         };
         let (title, body) = note(&input, Event::PreCompact, "**user**\n\nhi");
         assert_eq!(title, "Session abcdef12 before compaction (auto)");
@@ -615,6 +681,7 @@ not json
                 reason: Some("other".into()),
                 tool_name: None,
                 tool_input: Value::Null,
+                tool_call: None,
             },
             Event::SessionEnd,
             "",
@@ -707,15 +774,42 @@ not json
             ),
             Decision::Deny(_)
         ));
-        let out = Decision::Deny("why".into()).output().unwrap();
+        let out = Decision::Deny("why".into()).output("claude").unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
-        assert_eq!(Decision::Allow.output(), None);
+        assert_eq!(Decision::Allow.output("claude"), None);
         let input: HookInput = serde_json::from_str(
             r#"{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/memory/a/mem-a-1.md"}}"#,
         )
         .unwrap();
         assert_eq!(input.tool_name.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn antigravity_s_hook_shape_is_read_and_answered() {
+        // agy wants a decision either way: an empty answer is refused as invalid
+        let v: Value =
+            serde_json::from_str(&Decision::Allow.output("antigravity").unwrap()).unwrap();
+        assert_eq!(v["decision"], "allow");
+        let v: Value =
+            serde_json::from_str(&Decision::Deny("why".into()).output("antigravity").unwrap())
+                .unwrap();
+        assert_eq!(
+            (v["decision"].as_str(), v["reason"].as_str()),
+            (Some("deny"), Some("why"))
+        );
+        // agy's shape of the same event
+        let agy: HookInput = serde_json::from_str(
+            r#"{"hookEventName":"PreToolUse","conversationId":"c1","workspacePaths":["/work"],"transcriptPath":"/home/user/t.jsonl","toolCall":{"name":"view_file","args":{"file_path":"/memory/dom-me/mem-me-abc1.md"}},"stepIdx":3}"#,
+        )
+        .unwrap();
+        assert_eq!(agy.hook_event_name, "PreToolUse");
+        assert_eq!(agy.session_id, "c1");
+        let (tool, input) = agy.tool();
+        assert_eq!(tool, "view_file");
+        assert_eq!(input["file_path"], "/memory/dom-me/mem-me-abc1.md");
+        assert!(reads_one(&tool));
+        assert_eq!(Event::from_name("Stop"), Some(Event::SessionEnd));
     }
 
     #[test]

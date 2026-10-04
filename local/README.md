@@ -49,7 +49,7 @@ memory task admit task-me-xxxxxxxx
 make work HARNESS=codex AUTH=key
 ```
 
-Five harnesses, one launcher. Each needed the same three things, and the table is the whole
+Six harnesses, one launcher. Each needed the same three things, and the table is the whole
 of what differs:
 
 | Harness | Model calls reach the egress by | Memory over MCP by | `AUTH` modes |
@@ -57,6 +57,7 @@ of what differs:
 | Claude Code | `ANTHROPIC_BASE_URL` | `--mcp-config` | subscription, key, gateway |
 | Codex | `model_providers.<id>.base_url` in `config.toml`; with a ChatGPT login, a CONNECT tunnel to the ChatGPT hosts | `mcp_servers.<id>.url` | subscription, key, gateway; `--provider xai` for Grok |
 | Gemini CLI | `GOOGLE_GEMINI_BASE_URL`; with a Google login, `CODE_ASSIST_ENDPOINT` | `mcpServers.<id>.httpUrl` | subscription, key |
+| Antigravity CLI (`agy`) | `GOOGLE_GEMINI_BASE_URL`, once its settings name the Gemini API as the model provider; with a Google login, `HTTPS_PROXY` to the egress, which tunnels only to Google's hosts | `mcpServers.<id>.serverUrl` in `~/.gemini/config/mcp_config.json` | subscription (the token file `agy` left under `~/.gemini/antigravity-cli`), key |
 | Copilot CLI | no override exists; `HTTPS_PROXY` to the egress, which tunnels only to GitHub's Copilot hosts | `mcp-config.json` | subscription (`GH_TOKEN`) |
 | OpenCode | `provider.<id>.options.baseURL`; on a GitHub Copilot login, `HTTPS_PROXY` and the GitHub tunnel | `mcp.<id>.url` | key; `--provider openai` or `xai`; subscription with `--provider github-copilot`, which GitHub supports |
 | `command` | the program itself: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_GEMINI_BASE_URL` in its environment | `MEMORY_MCP_URL` in its environment | key, gateway; `--provider` picks the destination |

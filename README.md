@@ -27,7 +27,7 @@ export MEMORY_ROOT=~/memory
 
 To run a harness confined, with the memory server attached and every model call metered,
 interactively, on a prompt, or on the next task from the ledger,
-see [local/README.md](local/README.md): `make launch` runs Claude Code, Codex, Gemini CLI,
+see [local/README.md](local/README.md): `make launch` runs Claude Code, Codex, Gemini CLI, Antigravity CLI,
 Copilot CLI or OpenCode in native namespaces with no network except the egress, from the
 harness image once `make unpack` has put it in place. The gateway half of that page runs LiteLLM
 locally so the Foundation's shape can be tried end to end.

@@ -73,6 +73,8 @@ pub enum Harness {
     Codex,
     /// Google's Gemini CLI.
     Gemini,
+    /// Google's Antigravity CLI, `agy`, which replaced Gemini CLI for individual accounts.
+    Antigravity,
     /// GitHub Copilot CLI.
     Copilot,
     /// OpenCode.
@@ -91,6 +93,7 @@ impl Harness {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
             Harness::Gemini => "gemini",
+            Harness::Antigravity => "agy",
             Harness::Copilot => "copilot",
             Harness::OpenCode => "opencode",
             Harness::Command => "command",
@@ -103,7 +106,7 @@ impl Harness {
         match self {
             Harness::Claude | Harness::OpenCode => "anthropic",
             Harness::Codex | Harness::Command => "openai",
-            Harness::Gemini => "gemini",
+            Harness::Gemini | Harness::Antigravity => "gemini",
             Harness::Copilot => "github",
         }
     }
@@ -115,7 +118,7 @@ impl Harness {
     pub fn subscription_provider(self) -> &'static str {
         match self {
             Harness::Codex => "chatgpt",
-            Harness::Gemini => "google",
+            Harness::Gemini | Harness::Antigravity => "google",
             other => other.provider(),
         }
     }
@@ -141,6 +144,14 @@ impl Harness {
                 p,
             ],
             Harness::Gemini => vec!["-p".into(), p, "--approval-mode".into(), "yolo".into()],
+            // agy split Gemini CLI's yolo into two: every permission, and file edits
+            Harness::Antigravity => vec![
+                "-p".into(),
+                p,
+                "--dangerously-skip-permissions".into(),
+                "--mode".into(),
+                "accept-edits".into(),
+            ],
             Harness::Copilot => vec!["-p".into(), p, "--allow-all-tools".into()],
             Harness::OpenCode => vec!["run".into(), p],
             // a program has no headless form of its own; the prompt is its first argument
@@ -152,7 +163,9 @@ impl Harness {
     #[must_use]
     pub fn model_flag(self, model: &str) -> Vec<String> {
         match self {
-            Harness::Claude | Harness::Copilot => vec!["--model".into(), model.into()],
+            Harness::Claude | Harness::Copilot | Harness::Antigravity => {
+                vec!["--model".into(), model.into()]
+            }
             Harness::Codex | Harness::Gemini | Harness::OpenCode => {
                 vec!["-m".into(), model.into()]
             }
@@ -607,6 +620,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         Harness::Claude => setup_claude(req, &relay, &mut env, &mut argv)?,
         Harness::Codex => setup_codex(req, &relay, &provider, &mut env)?,
         Harness::Gemini => setup_gemini(req, &relay, &mut env)?,
+        Harness::Antigravity => setup_antigravity(req, &relay, &mut env)?,
         Harness::Copilot => setup_copilot(req, &relay, &mut env)?,
         Harness::OpenCode => setup_opencode(req, &relay, &provider, &mut env)?,
         Harness::Command => setup_command(req, &relay, &provider, &mut env),
@@ -815,6 +829,64 @@ fn setup_gemini(
     )?;
     // the working tree is the one thing mounted read-write; it is trusted by construction
     env.insert("GEMINI_CLI_TRUST_WORKSPACE".into(), "true".into());
+    Ok(())
+}
+
+/// Antigravity CLI keeps Gemini CLI's variables for a key, `GEMINI_API_KEY` behind
+/// `GOOGLE_GEMINI_BASE_URL`, once its settings name the Gemini API as the model
+/// provider; a Google login is a token file the host's login left, with its HTTPS through
+/// the egress as a tunnel to Google's hosts, since the login's endpoint has no override
+/// of its own that is known to work. MCP servers and hooks live in files of their own
+/// under `.gemini/config`, not in the settings, and a remote server is `serverUrl`.
+fn setup_antigravity(
+    req: &Request<'_>,
+    relay: &str,
+    env: &mut BTreeMap<String, String>,
+) -> Result<(), Error> {
+    let subscription = req.auth == AuthMode::Subscription;
+    let mut settings = serde_json::json!({});
+    if subscription {
+        copy_login(
+            req,
+            ".gemini/antigravity-cli/antigravity-oauth-token",
+            "an Antigravity CLI Google login (run `agy` once on the host)",
+        )?;
+        let _ = copy_login(req, ".gemini/google_accounts.json", "");
+        proxy_via(relay, env);
+        env.insert("CODE_ASSIST_ENDPOINT".into(), format!("{relay}/google"));
+        if let Some(project) = env_passthrough("GOOGLE_CLOUD_PROJECT") {
+            env.insert("GOOGLE_CLOUD_PROJECT".into(), project);
+        }
+    } else {
+        // the key is read only when the settings say so; the egress holds the real one
+        settings["modelProvider"] = "gemini".into();
+        env.insert("GOOGLE_GEMINI_BASE_URL".into(), format!("{relay}/gemini"));
+        env.insert("GEMINI_API_KEY".into(), "egress".into());
+    }
+    write(
+        &req.home.join(".gemini/antigravity-cli/settings.json"),
+        &serde_json::to_string_pretty(&settings).unwrap_or_default(),
+    )?;
+    let mcp = serde_json::json!({
+        "mcpServers": { "memory": { "serverUrl": format!("{relay}/mcp") } }
+    });
+    write(
+        &req.home.join(".gemini/config/mcp_config.json"),
+        &serde_json::to_string_pretty(&mcp).unwrap_or_default(),
+    )?;
+    // agy's hooks: an event's list of matcher and command; `Stop` is its session end
+    // and `PreToolUse` guards the projection; it has no pre-compaction event
+    let hook = serde_json::json!([{
+        "matcher": "*",
+        "command": format!("{INSIDE_MEMORY} hook antigravity"),
+        "timeout": 30
+    }]);
+    let hooks = serde_json::json!({ "Stop": hook, "PreToolUse": hook });
+    write(
+        &req.home.join(".gemini/config/hooks.json"),
+        &serde_json::to_string_pretty(&hooks).unwrap_or_default(),
+    )?;
+    env.insert("AGY_CLI_DISABLE_AUTO_UPDATE".into(), "true".into());
     Ok(())
 }
 
@@ -1055,7 +1127,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bins = dir.path().join("bins");
         std::fs::create_dir_all(&bins).unwrap();
-        for b in ["claude", "codex", "gemini", "copilot", "opencode"] {
+        for b in ["claude", "codex", "gemini", "agy", "copilot", "opencode"] {
             fake_bin(&bins, b);
         }
         let memory_bin = fake_bin(&bins, "memory");
@@ -1743,5 +1815,106 @@ mod tests {
         });
         std::env::set_var("PATH", old);
         assert!(matches!(r, Err(Error::NoHarness(_))));
+    }
+
+    #[test]
+    fn antigravity_plan_key_and_login() {
+        let f = fixture();
+        let (home, plan) = f
+            .plan(Harness::Antigravity, AuthMode::Key, "a1", &[], false)
+            .unwrap();
+        assert_eq!(
+            plan.env["GOOGLE_GEMINI_BASE_URL"],
+            "http://127.0.0.1:4100/gemini"
+        );
+        assert_eq!(plan.env["GEMINI_API_KEY"], "egress");
+        assert_eq!(plan.env["AGY_CLI_DISABLE_AUTO_UPDATE"], "true");
+        assert!(
+            !plan.env.contains_key("HTTPS_PROXY"),
+            "a key needs no tunnel"
+        );
+        let settings = json_file(&home.join(".gemini/antigravity-cli/settings.json"));
+        assert_eq!(
+            settings["modelProvider"], "gemini",
+            "the key is read only when the settings name the Gemini API"
+        );
+        let mcp = json_file(&home.join(".gemini/config/mcp_config.json"));
+        assert_eq!(
+            mcp["mcpServers"]["memory"]["serverUrl"],
+            "http://127.0.0.1:4100/mcp"
+        );
+        assert!(
+            mcp["mcpServers"]["memory"].get("url").is_none(),
+            "serverUrl, not url"
+        );
+        let hooks = json_file(&home.join(".gemini/config/hooks.json"));
+        assert_eq!(
+            hooks["Stop"][0]["command"],
+            "/opt/memory/memory hook antigravity"
+        );
+        assert_eq!(hooks["PreToolUse"][0]["matcher"], "*");
+        assert!(
+            hooks.get("SessionEnd").is_none(),
+            "agy's session end is Stop"
+        );
+        assert_eq!(plan.env["MEMORY_MCP_URL"], "http://127.0.0.1:4100/mcp");
+        assert!(
+            plan.argv.iter().any(|a| a.ends_with("agy")),
+            "{:?}",
+            plan.argv
+        );
+    }
+
+    #[test]
+    fn antigravity_plan_login_and_shape() {
+        let f = fixture();
+        // a Google login needs the token file the host's login left
+        assert!(matches!(
+            f.plan(
+                Harness::Antigravity,
+                AuthMode::Subscription,
+                "a2",
+                &[],
+                false
+            ),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::create_dir_all(f.host_home.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(
+            f.host_home
+                .join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            "tok",
+        )
+        .unwrap();
+        let (home, plan) = f
+            .plan(
+                Harness::Antigravity,
+                AuthMode::Subscription,
+                "a3",
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+                .unwrap(),
+            "tok"
+        );
+        assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
+        assert_eq!(
+            plan.env["CODE_ASSIST_ENDPOINT"],
+            "http://127.0.0.1:4100/google"
+        );
+        assert!(!plan.env.contains_key("GEMINI_API_KEY"));
+        let settings = json_file(&home.join(".gemini/antigravity-cli/settings.json"));
+        assert!(settings.get("modelProvider").is_none());
+        let headless = Harness::Antigravity.headless("hi");
+        assert_eq!(headless[0], "-p");
+        assert!(headless.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(headless.windows(2).any(|w| w == ["--mode", "accept-edits"]));
+        assert_eq!(Harness::Antigravity.model_flag("m"), vec!["--model", "m"]);
+        assert_eq!(Harness::Antigravity.provider(), "gemini");
+        assert_eq!(Harness::Antigravity.subscription_provider(), "google");
+        assert!(!Harness::Antigravity.accepts_provider());
     }
 }

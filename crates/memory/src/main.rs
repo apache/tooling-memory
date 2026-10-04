@@ -129,6 +129,8 @@ enum HarnessArg {
     Claude,
     Codex,
     Gemini,
+    /// Google's Antigravity CLI, `agy`.
+    Antigravity,
     Copilot,
     Opencode,
     /// A program: the first argument after `--` is run as given, with the egress and
@@ -142,6 +144,7 @@ impl From<HarnessArg> for Harness {
             HarnessArg::Claude => Harness::Claude,
             HarnessArg::Codex => Harness::Codex,
             HarnessArg::Gemini => Harness::Gemini,
+            HarnessArg::Antigravity => Harness::Antigravity,
             HarnessArg::Copilot => Harness::Copilot,
             HarnessArg::Opencode => Harness::OpenCode,
             HarnessArg::Command => Harness::Command,
@@ -713,9 +716,10 @@ fn main() {
         let outbox = std::env::var_os("MEMORY_OUTBOX")
             .map(PathBuf::from)
             .or_else(|| home_dir().map(|h| h.join(hooks::OUTBOX)));
+        let harness = args.get(2).and_then(|a| a.to_str()).unwrap_or("claude");
         match outbox {
             Some(outbox) => {
-                if let Err(e) = hooks::run(&outbox) {
+                if let Err(e) = hooks::run(&outbox, harness) {
                     eprintln!("memory hook: {e}");
                 }
             }
@@ -2000,7 +2004,11 @@ fn run_unconfined(
                 .arg("--strict-mcp-config");
             cmd.env("MEMORY_OUTBOX", home.join(hooks::OUTBOX));
         }
-        Harness::Gemini | Harness::Copilot | Harness::OpenCode | Harness::Command => {
+        Harness::Gemini
+        | Harness::Antigravity
+        | Harness::Copilot
+        | Harness::OpenCode
+        | Harness::Command => {
             return Err(format!(
                 "--unconfined is wired for claude and codex only so far; {} runs confined",
                 harness.binary()
