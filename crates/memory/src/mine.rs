@@ -155,6 +155,12 @@ pub fn newest_transcript(home: &Path) -> Option<std::path::PathBuf> {
             if p.is_dir() {
                 walk(&p, out, depth + 1);
             } else if p.extension().is_some_and(|x| x == "jsonl") {
+                // agy keeps a full log beside the transcript proper; the proper one is
+                // the shape the tail reader knows
+                let twin = p.with_file_name("transcript.jsonl");
+                if p.file_name().is_some_and(|n| n == "transcript_full.jsonl") && twin.is_file() {
+                    continue;
+                }
                 if let Ok(m) = p.metadata().and_then(|m| m.modified()) {
                     out.push((m, p));
                 }

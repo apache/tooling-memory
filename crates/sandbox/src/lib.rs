@@ -852,8 +852,9 @@ fn setup_antigravity(
             "an Antigravity CLI Google login (run `agy` once on the host)",
         )?;
         let _ = copy_login(req, ".gemini/google_accounts.json", "");
+        // the login's model host is one the egress tunnels to; no endpoint override
+        // for it is known, so the route is pinned egress without metering
         proxy_via(relay, env);
-        env.insert("CODE_ASSIST_ENDPOINT".into(), format!("{relay}/google"));
         if let Some(project) = env_passthrough("GOOGLE_CLOUD_PROJECT") {
             env.insert("GOOGLE_CLOUD_PROJECT".into(), project);
         }
@@ -874,14 +875,22 @@ fn setup_antigravity(
         &req.home.join(".gemini/config/mcp_config.json"),
         &serde_json::to_string_pretty(&mcp).unwrap_or_default(),
     )?;
-    // agy's hooks: an event's list of matcher and command; `Stop` is its session end
-    // and `PreToolUse` guards the projection; it has no pre-compaction event
-    let hook = serde_json::json!([{
-        "matcher": "*",
+    // agy's hooks: named groups of events; the tool events take matcher groups like
+    // Claude Code's, the loop events a flat list of handlers. `Stop` is the end of a
+    // turn, which the hook folds into one note, and `PreToolUse` guards the projection
+    // in interactive runs; the headless flag that skips permissions skips this layer
+    // too, so a `work` run has no observation here. There is no pre-compaction event.
+    let command = serde_json::json!({
+        "type": "command",
         "command": format!("{INSIDE_MEMORY} hook antigravity"),
         "timeout": 30
-    }]);
-    let hooks = serde_json::json!({ "Stop": hook, "PreToolUse": hook });
+    });
+    let hooks = serde_json::json!({
+        "memory": {
+            "PreToolUse": [{ "matcher": "*", "hooks": [command] }],
+            "Stop": [command]
+        }
+    });
     write(
         &req.home.join(".gemini/config/hooks.json"),
         &serde_json::to_string_pretty(&hooks).unwrap_or_default(),
@@ -1817,6 +1826,31 @@ mod tests {
         assert!(matches!(r, Err(Error::NoHarness(_))));
     }
 
+    /// agy's hooks file: a named group, tool events in matcher groups, loop events flat.
+    fn assert_agy_hooks(home: &Path) {
+        let hooks = json_file(&home.join(".gemini/config/hooks.json"));
+        let group = &hooks["memory"];
+        assert_eq!(
+            group["Stop"][0]["command"], "/opt/memory/memory hook antigravity",
+            "a loop event is a flat list of handlers"
+        );
+        assert_eq!(group["Stop"][0]["type"], "command");
+        assert_eq!(group["PreToolUse"][0]["matcher"], "*");
+        assert_eq!(
+            group["PreToolUse"][0]["hooks"][0]["command"], "/opt/memory/memory hook antigravity",
+            "a tool event is a matcher group"
+        );
+        assert_eq!(group["PreToolUse"][0]["hooks"][0]["timeout"], 30);
+        assert!(
+            hooks.get("Stop").is_none(),
+            "events sit under a named group"
+        );
+        assert!(
+            group.get("SessionEnd").is_none(),
+            "agy's session end is Stop"
+        );
+    }
+
     #[test]
     fn antigravity_plan_key_and_login() {
         let f = fixture();
@@ -1847,16 +1881,7 @@ mod tests {
             mcp["mcpServers"]["memory"].get("url").is_none(),
             "serverUrl, not url"
         );
-        let hooks = json_file(&home.join(".gemini/config/hooks.json"));
-        assert_eq!(
-            hooks["Stop"][0]["command"],
-            "/opt/memory/memory hook antigravity"
-        );
-        assert_eq!(hooks["PreToolUse"][0]["matcher"], "*");
-        assert!(
-            hooks.get("SessionEnd").is_none(),
-            "agy's session end is Stop"
-        );
+        assert_agy_hooks(&home);
         assert_eq!(plan.env["MEMORY_MCP_URL"], "http://127.0.0.1:4100/mcp");
         assert!(
             plan.argv.iter().any(|a| a.ends_with("agy")),
@@ -1901,9 +1926,9 @@ mod tests {
             "tok"
         );
         assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
-        assert_eq!(
-            plan.env["CODE_ASSIST_ENDPOINT"],
-            "http://127.0.0.1:4100/google"
+        assert!(
+            !plan.env.contains_key("CODE_ASSIST_ENDPOINT"),
+            "Gemini CLI's variable; nothing shows agy reads it"
         );
         assert!(!plan.env.contains_key("GEMINI_API_KEY"));
         let settings = json_file(&home.join(".gemini/antigravity-cli/settings.json"));

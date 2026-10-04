@@ -428,7 +428,7 @@ enum Command {
     /// input and leave a note in the outbox for the launcher to file as a handoff.
     #[command(hide = true)]
     Hook {
-        /// Which harness's hook format; claude for now.
+        /// Which harness's hook format: claude, codex, gemini or antigravity.
         harness: String,
     },
     /// A web terminal on the launcher: sessions in pseudo-terminals streamed to the
@@ -903,8 +903,16 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
                 .with_tunnels(["auth.openai.com"])
         }
         "chatgpt" => Destination::tunnel(["chatgpt.com", ".chatgpt.com", "auth.openai.com"]),
+        // Gemini CLI's login is forwarded and metered through its endpoint override;
+        // Antigravity CLI's has none, so its model host is tunnelled, pinned without
+        // metering, as Copilot's is
         "google" => Destination::forward("https://cloudcode-pa.googleapis.com", Auth::PassThrough)
-            .with_tunnels(["oauth2.googleapis.com", "accounts.google.com"]),
+            .with_tunnels([
+                "oauth2.googleapis.com",
+                "accounts.google.com",
+                "cloudcode-pa.googleapis.com",
+                "daily-cloudcode-pa.googleapis.com",
+            ]),
         other => return Err(format!("no subscription-mode destination named {other}").into()),
     })
 }

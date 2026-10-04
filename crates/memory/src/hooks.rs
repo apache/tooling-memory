@@ -114,15 +114,26 @@ impl Decision {
 /// read or an edit, `notebook_path` for a notebook, `path` for a search over a tree,
 /// and for a search without one, its pattern when the pattern is a path.
 fn path_of(input: &Value) -> Option<PathBuf> {
-    ["file_path", "notebook_path", "path", "pattern"]
-        .iter()
-        .find_map(|k| {
-            input
-                .get(*k)
-                .and_then(Value::as_str)
-                .filter(|p| !p.is_empty())
-        })
-        .map(|p| normalise(Path::new(p)))
+    // Claude Code's names, then Antigravity CLI's, which are PascalCase
+    [
+        "file_path",
+        "notebook_path",
+        "path",
+        "pattern",
+        "AbsolutePath",
+        "SearchPath",
+        "DirectoryPath",
+        "SearchDirectory",
+        "Pattern",
+    ]
+    .iter()
+    .find_map(|k| {
+        input
+            .get(*k)
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+    })
+    .map(|p| normalise(Path::new(p)))
 }
 
 /// A path with `.` and `..` folded away lexically, so `/memory/../memory/x` is
@@ -162,7 +173,7 @@ fn reads_one(tool: &str) -> bool {
 
 /// A tool that lists files by glob.
 fn globs(tool: &str) -> bool {
-    matches!(tool, "Glob" | "glob")
+    matches!(tool, "Glob" | "glob" | "find_by_name")
 }
 
 /// Whether a glob pattern can reach into `projection`: it climbs with `..`, or its
@@ -181,7 +192,15 @@ fn glob_reaches(pattern: &str, projection: &Path) -> bool {
 fn searches(tool: &str) -> bool {
     matches!(
         tool,
-        "Grep" | "Glob" | "grep" | "glob" | "search_files" | "list_directory"
+        "Grep"
+            | "Glob"
+            | "grep"
+            | "glob"
+            | "search_files"
+            | "list_directory"
+            | "grep_search"
+            | "find_by_name"
+            | "list_dir"
     )
 }
 
@@ -208,6 +227,7 @@ where
     let by_pattern = globs(tool)
         && input
             .get("pattern")
+            .or_else(|| input.get("Pattern"))
             .and_then(Value::as_str)
             .is_some_and(|pat| glob_reaches(pat, &projection));
     if !path.starts_with(&projection) && !covers && !by_pattern {
@@ -387,6 +407,10 @@ fn turns_in(v: &Value) -> Vec<Turn> {
         };
         if let Some(who) = planner {
             let text = v.get("content").map(text_of).unwrap_or_default();
+            // agy wraps what the user typed in a request tag
+            let text = text
+                .replace("<USER_REQUEST>", "")
+                .replace("</USER_REQUEST>", "");
             return keep(who, text).into_iter().collect();
         }
         if role == "user" || role == "assistant" {
@@ -502,6 +526,9 @@ pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
         return Ok(());
     }
     let Some(event) = Event::from_name(&input.hook_event_name) else {
+        if harness == "antigravity" {
+            println!("{{}}");
+        }
         return Ok(());
     };
     let transcript = input
@@ -513,10 +540,20 @@ pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
     let (_, body) = note(&input, event, &tail);
     std::fs::create_dir_all(outbox)?;
     let stamp = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
-    let name = format!("{stamp}-{}.md", event.suffix());
+    // agy's Stop fires at the end of every turn, not once a session: its note is
+    // named by the conversation and rewritten, so the outbox holds the last one
+    let name = if harness == "antigravity" && event == Event::SessionEnd {
+        format!("agy-{}-{}.md", short(&input.session_id), event.suffix())
+    } else {
+        format!("{stamp}-{}.md", event.suffix())
+    };
     let tmp = outbox.join(format!("{name}.tmp"));
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, outbox.join(name))?;
+    // agy wants a JSON object from every hook; the others take silence
+    if harness == "antigravity" {
+        println!("{{}}");
+    }
     Ok(())
 }
 
@@ -642,7 +679,7 @@ not json
         assert_eq!(Event::from_name("PreCompress"), Some(Event::PreCompact));
         assert_eq!(Event::from_name("Nope"), None);
         let agy = concat!(
-            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","content":"Load T0."}"#,
+            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","content":"<USER_REQUEST>Load T0.</USER_REQUEST>"}"#,
             "\n",
             r#"{"type":"PLANNER_RESPONSE","source":"MODEL","content":"T0 says: one handoff."}"#,
             "\n",
@@ -800,15 +837,61 @@ not json
         );
         // agy's shape of the same event
         let agy: HookInput = serde_json::from_str(
-            r#"{"hookEventName":"PreToolUse","conversationId":"c1","workspacePaths":["/work"],"transcriptPath":"/home/user/t.jsonl","toolCall":{"name":"view_file","args":{"file_path":"/memory/dom-me/mem-me-abc1.md"}},"stepIdx":3}"#,
+            r#"{"hookEventName":"PreToolUse","conversationId":"c1","workspacePaths":["/work"],"transcriptPath":"/home/user/t.jsonl","toolCall":{"name":"view_file","args":{"AbsolutePath":"/memory/dom-me/mem-me-abc1.md","StartLine":1}},"stepIdx":3}"#,
         )
         .unwrap();
         assert_eq!(agy.hook_event_name, "PreToolUse");
         assert_eq!(agy.session_id, "c1");
         let (tool, input) = agy.tool();
         assert_eq!(tool, "view_file");
-        assert_eq!(input["file_path"], "/memory/dom-me/mem-me-abc1.md");
         assert!(reads_one(&tool));
+        // agy's own argument names, PascalCase: a read is a get, a search is refused
+        let view = Path::new("/memory");
+        let mut fetched = Vec::new();
+        let d = decide(&tool, &input, view, SID, |id| {
+            fetched.push(id.to_string());
+            Ok(())
+        });
+        assert_eq!(
+            (d, fetched),
+            (Decision::Allow, vec!["mem-me-abc1".to_string()])
+        );
+        for (tool, input) in [
+            (
+                "grep_search",
+                serde_json::json!({ "SearchPath": "/memory", "Query": "key" }),
+            ),
+            (
+                "list_dir",
+                serde_json::json!({ "DirectoryPath": "/memory/dom-me" }),
+            ),
+            (
+                "find_by_name",
+                serde_json::json!({ "SearchDirectory": "/work", "Pattern": "/memory/**" }),
+            ),
+            (
+                "find_by_name",
+                serde_json::json!({ "SearchDirectory": "/", "Pattern": "*.md" }),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    decide(tool, &input, view, SID, |_| Ok(())),
+                    Decision::Deny(_)
+                ),
+                "{tool} {input}"
+            );
+        }
+        assert_eq!(
+            decide(
+                "grep_search",
+                &serde_json::json!({ "SearchPath": "/work", "Query": "x" }),
+                view,
+                SID,
+                |_| Ok(())
+            ),
+            Decision::Allow
+        );
         assert_eq!(Event::from_name("Stop"), Some(Event::SessionEnd));
     }
 
