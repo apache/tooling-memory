@@ -988,11 +988,13 @@ async fn prepare_launch(
     })?;
     let home = root.join("state/sandbox").join(harness.binary());
     let projection = root.join(dm_sandbox::PROJECTION).join(harness.binary());
-    let memory = Arc::new(
+    let memory = memory.with_handling_cap(ceiling);
+    // a confined harness reads the projection; the bare command has no mount for it
+    let memory = Arc::new(if harness == Harness::Command {
         memory
-            .with_handling_cap(ceiling)
-            .with_projection(projection.clone()),
-    );
+    } else {
+        memory.with_projection(projection.clone())
+    });
     let mut destinations = HashMap::new();
     destinations.insert(name.clone(), destination);
     let egress = Egress::new(

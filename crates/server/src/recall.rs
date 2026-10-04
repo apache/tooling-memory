@@ -787,6 +787,13 @@ pub fn to_json(r: &Recall) -> Value {
     };
     let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
     if let Some(o) = v.as_object_mut() {
+        let next = match &r.projected {
+            Some(file) => format!(
+                "{next} This recall is also a file, `{file}` under the memory's projection \
+                 directory (`/memory` in a confined run), readable without a further get."
+            ),
+            None => next.to_string(),
+        };
         o.insert("next".into(), Value::from(next));
     }
     v

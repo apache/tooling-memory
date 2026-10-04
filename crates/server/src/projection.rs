@@ -111,7 +111,13 @@ impl Memory {
     /// An index, store or I/O error, or a path in the projection that is not its own.
     pub async fn project_into(&self, dir: &Path) -> Result<Projected, Error> {
         self.own_below(dir)?;
+        if self.domains().iter().any(|d| d == RECALLS) {
+            return Err(Error::Denied(format!(
+                "a domain named {RECALLS} cannot be projected beside the recall pages"
+            )));
+        }
         let mut done = Projected::default();
+        done.removed += self.sweep_recalls(dir, true)?;
         for domain in self.domains() {
             let f = self.filter_for(Some(&domain))?;
             let hits = self.index.lock().await.list(&f, None, usize::MAX / 2)?;
@@ -175,31 +181,102 @@ impl Memory {
         Ok(())
     }
 
-    /// Land a recall as a file under the projection's `recall/` directory, when the
-    /// session has a projection, and name it on the recall relative to the projection.
-    /// The pack was served to this session already, so the file is read free. A render
-    /// that fails is said on standard error and does not fail the recall.
+    /// Land a recall as a file under the projection's `recall/<session>/` directory,
+    /// when the session has a projection, and name it on the recall relative to the
+    /// projection. The pack was served to this session already, so the file is read
+    /// free; the directory is this session's, swept by the next session's first render
+    /// and by an erasure, since a page holds bodies. A render that fails is said on
+    /// standard error and does not fail the recall.
     pub(crate) async fn project_recall(&self, r: &mut crate::recall::Recall) {
         let Some(dir) = &self.projection else {
             return;
         };
-        let now = time::OffsetDateTime::now_utc();
-        let name = format!(
-            "{}-{:09}.md",
-            now.format(time::macros::format_description!(
-                "[year][month][day]T[hour][minute][second]"
-            ))
-            .unwrap_or_default(),
-            now.nanosecond()
-        );
-        let landed = self
-            .own_below(&dir.join(RECALLS))
-            .and_then(|()| write_atomically(&dir.join(RECALLS).join(&name), &render_recall(r)));
+        let mine = dir.join(RECALLS).join(&self.session_id);
+        let landed = self.own_below(&mine).and_then(|()| {
+            let now = time::OffsetDateTime::now_utc();
+            let stamp = now
+                .format(time::macros::format_description!(
+                    "[year][month][day]T[hour][minute][second]"
+                ))
+                .unwrap_or_default();
+            write_fresh(
+                &mine,
+                &format!("{stamp}-{:09}", now.nanosecond()),
+                &render_recall(r),
+            )
+        });
         match landed {
-            Ok(()) => r.projected = Some(format!("{RECALLS}/{name}")),
+            Ok(name) => r.projected = Some(format!("{RECALLS}/{}/{name}", self.session_id)),
             Err(e) => eprintln!("memory: projection at {}: {e}", dir.display()),
         }
     }
+
+    /// Remove every recall page under the projection: another session's on this
+    /// session's first render, every session's after an erasure, since a page holds
+    /// bodies as they were served.
+    fn sweep_recalls(&self, dir: &Path, keep_own: bool) -> Result<usize, Error> {
+        let recalls = dir.join(RECALLS);
+        let Ok(entries) = std::fs::read_dir(&recalls) else {
+            return Ok(0);
+        };
+        let mut swept = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let own = entry.file_name() == std::ffi::OsStr::new(&self.session_id);
+            if own && keep_own {
+                continue;
+            }
+            let kind = entry.file_type().map_err(io(&path))?;
+            if kind.is_dir() {
+                std::fs::remove_dir_all(&path).map_err(io(&path))?;
+            } else {
+                std::fs::remove_file(&path).map_err(io(&path))?;
+            }
+            swept += 1;
+        }
+        Ok(swept)
+    }
+
+    /// After an erasure: every recall page goes, this session's included, and the
+    /// domains are rendered again.
+    pub(crate) async fn refresh_projection_after_erasure(&self) {
+        if let Some(dir) = &self.projection {
+            if let Err(e) = self.sweep_recalls(dir, false) {
+                eprintln!("memory: projection at {}: {e}", dir.display());
+            }
+        }
+        self.refresh_projection().await;
+    }
+}
+
+/// A new file in `dir` named `stem.md`, or `stem-1.md` and on when the name is taken,
+/// written once and never over another; the name it got.
+fn write_fresh(dir: &Path, stem: &str, text: &str) -> Result<String, Error> {
+    use std::io::Write;
+    for n in 0..1000 {
+        let name = if n == 0 {
+            format!("{stem}.md")
+        } else {
+            format!("{stem}-{n}.md")
+        };
+        let path = dir.join(&name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(text.as_bytes()).map_err(io(&path))?;
+                return Ok(name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io(&path)(e)),
+        }
+    }
+    Err(Error::Denied(format!(
+        "{} has a thousand pages of one stamp",
+        dir.display()
+    )))
 }
 
 /// A recall as a page: the question, the brief or the note that synthesis is owed, the
@@ -548,7 +625,10 @@ mod tests {
             .await
             .unwrap();
         let rel = r.projected.clone().expect("the recall landed");
-        assert!(rel.starts_with("recall/") && rel.ends_with(".md"), "{rel}");
+        assert!(
+            rel.starts_with(&format!("recall/{}/", m.session_id())) && rel.ends_with(".md"),
+            "{rel}"
+        );
         let text = std::fs::read_to_string(view.join(&rel)).unwrap();
         assert!(text.starts_with("# how does the retry work?"), "{text}");
         assert!(
@@ -561,6 +641,13 @@ mod tests {
         );
         let json = crate::recall::to_json(&r);
         assert_eq!(json["projected"], rel);
+        // a second recall in the same session is another page beside it
+        let again = m
+            .recall("retry", None, None, crate::recall::Budget::default())
+            .await
+            .unwrap();
+        assert_ne!(again.projected, r.projected);
+        assert!(view.join(&rel).is_file() && view.join(again.projected.unwrap()).is_file());
         // without a projection, nothing lands and nothing is named
         let plain = Memory::open(&root).unwrap().without_read_log();
         let r = plain
@@ -568,5 +655,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.projected, None);
+    }
+
+    #[tokio::test]
+    async fn recall_pages_do_not_outlive_the_session_or_the_bodies_they_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let view = dir.path().join("view");
+        let m = Memory::init(&root, "human:test:me", "dom-me")
+            .unwrap()
+            .without_read_log()
+            .with_projection(view.clone());
+        let secret = m
+            .write(WriteRequest {
+                title: Some("The key".into()),
+                body: "The signing key lives in the vault.\n".into(),
+                classification: Some(Label::Restricted),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let r = m
+            .recall(
+                "where is the key?",
+                None,
+                None,
+                crate::recall::Budget::default(),
+            )
+            .await
+            .unwrap();
+        let page = view.join(r.projected.unwrap());
+        assert!(std::fs::read_to_string(&page).unwrap().contains("vault"));
+        // another session at a lower handling renders: the page is not its to read
+        let capped = Memory::open(&root)
+            .unwrap()
+            .without_read_log()
+            .with_handling_cap(Label::Internal)
+            .with_projection(view.clone());
+        capped.project_into(&view).await.unwrap();
+        assert!(!page.exists(), "another session's render sweeps the page");
+        // this session recalls again, then erases: its own page goes too
+        let r = m
+            .recall(
+                "where is the key?",
+                None,
+                None,
+                crate::recall::Budget::default(),
+            )
+            .await
+            .unwrap();
+        let page = view.join(r.projected.unwrap());
+        assert!(page.exists());
+        m.erase(&secret.id, Reason::Sensitive).await.unwrap();
+        assert!(!page.exists(), "an erasure sweeps every recall page");
+        assert!(!view.join(RECALLS).join(m.session_id()).exists());
+        // a domain named like the recall directory cannot be projected beside it
+        let clash = Memory::init(&dir.path().join("clash"), "human:test:me", RECALLS)
+            .unwrap()
+            .without_read_log();
+        assert!(matches!(
+            clash.project_into(&dir.path().join("clash-view")).await,
+            Err(Error::Denied(_))
+        ));
     }
 }

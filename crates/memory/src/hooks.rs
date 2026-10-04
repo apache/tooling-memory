@@ -186,11 +186,12 @@ where
     {
         return Decision::Allow;
     }
-    // a recall's page: what it holds was served to this session when the recall ran
+    // a recall's page, `recall/<session>/<stamp>.md` directly under the projection:
+    // what it holds was served to this session when the recall ran
     let recall_page = path
         .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|d| d == dm_server::projection::RECALLS)
+        .and_then(Path::parent)
+        .is_some_and(|d| d == projection.join(dm_server::projection::RECALLS))
         && path.extension().is_some_and(|e| e == "md");
     if recall_page {
         return Decision::Allow;
@@ -657,19 +658,6 @@ not json
             )),
             Decision::Allow
         );
-        assert_eq!(
-            decide(
-                "Read",
-                &read("/memory/recall/20261004T101010-000000001.md"),
-                view,
-                |_| panic!("free: served when the recall ran")
-            ),
-            Decision::Allow
-        );
-        assert!(matches!(
-            decide("Read", &read("/memory/recall/notes.txt"), view, |_| Ok(())),
-            Decision::Deny(_)
-        ));
         // a path folded through `..` is the entry's, and is fetched
         let mut folded = Vec::new();
         let d = decide(
@@ -703,6 +691,49 @@ not json
         )
         .unwrap();
         assert_eq!(input.tool_name.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn a_recall_page_is_free_by_place_not_by_name() {
+        let view = Path::new("/memory");
+        assert_eq!(
+            decide(
+                "Read",
+                &read("/memory/recall/sess-abc12345/20261004T101010-000000001.md"),
+                view,
+                |_| panic!("free: served when the recall ran")
+            ),
+            Decision::Allow
+        );
+        // by place, not by name: a file beside the pages, a `recall` directory inside a
+        // domain, and an entry file in a domain named `recall` are not pages
+        for p in [
+            "/memory/recall/sess-abc12345/notes.txt",
+            "/memory/recall/20261004T101010-000000001.md",
+        ] {
+            assert!(
+                matches!(
+                    decide("Read", &read(p), view, |_| Ok(())),
+                    Decision::Deny(_)
+                ),
+                "{p}"
+            );
+        }
+        let mut fetched = Vec::new();
+        decide(
+            "Read",
+            &read("/memory/recall/mem-recall-abc1.md"),
+            view,
+            |id| {
+                fetched.push(id.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            fetched,
+            vec!["mem-recall-abc1".to_string()],
+            "an entry file under a domain called recall is still a get"
+        );
     }
 
     #[test]

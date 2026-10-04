@@ -798,7 +798,7 @@ impl Memory {
                 .push("the versions removed were not recorded: the stub was there first".into());
         }
         self.store.put_receipt(&receipt).await?;
-        self.refresh_projection().await;
+        self.refresh_projection_after_erasure().await;
         Ok(receipt)
     }
 
