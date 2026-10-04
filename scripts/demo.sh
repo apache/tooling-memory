@@ -5,7 +5,8 @@
 #   scripts/demo.sh <demo-root> <markdown-dir>... 
 #
 # Needs target/release/memory (make build) and a harness login; HARNESS and AUTH override
-# the defaults (claude, subscription). Rerunning reuses the record and adds another task.
+# the defaults (claude, subscription). Rerunning reuses the record and adds another task;
+# the entry the erasure step writes and erases is new each run, so the corpus is kept.
 set -eu
 root=${1:?demo root}; shift
 [ $# -ge 1 ] || { echo "give one or more directories or files of Markdown to seed from" >&2; exit 2; }
@@ -48,6 +49,19 @@ id=$("$memory" --root "$root" task create "$title" --body "$body" --priority 5 |
 echo "== task $id filed and admitted; a ${HARNESS:-claude} session claims and works it"
 work=$(mktemp -d)
 ( cd "$work" && "$memory" --root "$root" work --harness "${HARNESS:-claude}" --auth "${AUTH:-subscription}" --lease-seconds 300 ) || true
+echo
+view="$root/state/sandbox/${HARNESS:-claude}/.memory-view/dom-demo"
+if [ -f "$view/README.md" ]; then
+  echo "== the projection that session saw at /memory: the record as read-only files, each open a get"
+  sed -n '1,6p' "$view/README.md"
+  echo "... $(ls "$view" | wc -l | tr -d ' ') files"
+  echo
+fi
+echo "== erasure: a throwaway entry, erased by the owner; the stub and the receipt remain"
+gone=$(echo "A note that should never have been written: the demo passphrase is kestrel-91." \
+  | "$memory" --root "$root" write --title "Written in error" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+"$memory" --root "$root" erase "$gone" --reason mistaken | sed -n '1,14p'
+echo "search for the passphrase after the erasure: $("$memory" --root "$root" search "kestrel-91")"
 echo
 if [ -n "${LLMAO_KEY:-}" ]; then
   echo "== recall through the gateway: the deputy reads, a cited brief comes back"
