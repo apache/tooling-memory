@@ -186,6 +186,15 @@ where
     {
         return Decision::Allow;
     }
+    // a recall's page: what it holds was served to this session when the recall ran
+    let recall_page = path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|d| d == dm_server::projection::RECALLS)
+        && path.extension().is_some_and(|e| e == "md");
+    if recall_page {
+        return Decision::Allow;
+    }
     match dm_server::projection::id_of(&path) {
         Some(id) => match get(id) {
             Ok(()) => Decision::Allow,
@@ -648,6 +657,19 @@ not json
             )),
             Decision::Allow
         );
+        assert_eq!(
+            decide(
+                "Read",
+                &read("/memory/recall/20261004T101010-000000001.md"),
+                view,
+                |_| panic!("free: served when the recall ran")
+            ),
+            Decision::Allow
+        );
+        assert!(matches!(
+            decide("Read", &read("/memory/recall/notes.txt"), view, |_| Ok(())),
+            Decision::Deny(_)
+        ));
         // a path folded through `..` is the entry's, and is fetched
         let mut folded = Vec::new();
         let d = decide(

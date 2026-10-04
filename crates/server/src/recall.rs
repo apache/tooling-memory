@@ -265,6 +265,10 @@ pub struct Recall {
     pub pack: Pack,
     /// Search rounds spent.
     pub hops: usize,
+    /// Where this recall landed as a file, relative to the session's projection, when
+    /// the session has one; reading it there is free, since the pack was served here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected: Option<String>,
 }
 
 /// A small model the service may spend on a session's behalf. The launcher provides
@@ -708,7 +712,7 @@ impl Memory {
             false,
             Some("brief"),
         );
-        Ok(Recall {
+        let mut r = Recall {
             question: question.to_string(),
             synthesis: Synthesis::Server {
                 model: deputy.model(),
@@ -717,7 +721,10 @@ impl Memory {
             citations,
             pack,
             hops,
-        })
+            projected: None,
+        };
+        self.project_recall(&mut r).await;
+        Ok(r)
     }
 
     /// The caller-executed tier: the pack at the depth asked for, or the session's
@@ -741,14 +748,17 @@ impl Memory {
             false,
             Some(&format!("pack:{depth}")),
         );
-        Ok(Recall {
+        let mut r = Recall {
             question: question.to_string(),
             synthesis: Synthesis::Owed,
             brief: None,
             citations: pack.ids(),
             pack,
             hops: 1,
-        })
+            projected: None,
+        };
+        self.project_recall(&mut r).await;
+        Ok(r)
     }
 
     async fn ask(

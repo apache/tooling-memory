@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 /// The summaries page in each domain's directory.
 pub const SUMMARIES: &str = "README.md";
+/// The directory, beside the domains, where a session's recalls land as files.
+pub const RECALLS: &str = "recall";
 
 /// The file an entry is projected as.
 #[must_use]
@@ -108,18 +110,7 @@ impl Memory {
     ///
     /// An index, store or I/O error, or a path in the projection that is not its own.
     pub async fn project_into(&self, dir: &Path) -> Result<Projected, Error> {
-        // every component below the root, or below the directory's parent when it is
-        // elsewhere, is checked and made in turn, so a link higher up is not followed
-        let mut step = if dir.starts_with(&self.root) {
-            self.root.clone()
-        } else {
-            dir.parent().map(Path::to_path_buf).unwrap_or_default()
-        };
-        let below = dir.strip_prefix(&step).unwrap_or(dir).to_path_buf();
-        for component in below.components() {
-            step.push(component);
-            own_dir(&step)?;
-        }
+        self.own_below(dir)?;
         let mut done = Projected::default();
         for domain in self.domains() {
             let f = self.filter_for(Some(&domain))?;
@@ -165,6 +156,90 @@ impl Memory {
         }
         Ok(done)
     }
+}
+
+impl Memory {
+    /// Every component of `dir` below the root, or below the directory's parent when it
+    /// is elsewhere, checked and made in turn, so a link higher up is not followed.
+    fn own_below(&self, dir: &Path) -> Result<(), Error> {
+        let mut step = if dir.starts_with(&self.root) {
+            self.root.clone()
+        } else {
+            dir.parent().map(Path::to_path_buf).unwrap_or_default()
+        };
+        let below = dir.strip_prefix(&step).unwrap_or(dir).to_path_buf();
+        for component in below.components() {
+            step.push(component);
+            own_dir(&step)?;
+        }
+        Ok(())
+    }
+
+    /// Land a recall as a file under the projection's `recall/` directory, when the
+    /// session has a projection, and name it on the recall relative to the projection.
+    /// The pack was served to this session already, so the file is read free. A render
+    /// that fails is said on standard error and does not fail the recall.
+    pub(crate) async fn project_recall(&self, r: &mut crate::recall::Recall) {
+        let Some(dir) = &self.projection else {
+            return;
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let name = format!(
+            "{}-{:09}.md",
+            now.format(time::macros::format_description!(
+                "[year][month][day]T[hour][minute][second]"
+            ))
+            .unwrap_or_default(),
+            now.nanosecond()
+        );
+        let landed = self
+            .own_below(&dir.join(RECALLS))
+            .and_then(|()| write_atomically(&dir.join(RECALLS).join(&name), &render_recall(r)));
+        match landed {
+            Ok(()) => r.projected = Some(format!("{RECALLS}/{name}")),
+            Err(e) => eprintln!("memory: projection at {}: {e}", dir.display()),
+        }
+    }
+}
+
+/// A recall as a page: the question, the brief or the note that synthesis is owed, the
+/// citations, and the pack's pieces as they were served.
+#[must_use]
+pub fn render_recall(r: &crate::recall::Recall) -> String {
+    use crate::recall::Synthesis;
+    let mut out = format!("# {}\n\n", r.question.trim());
+    match &r.synthesis {
+        Synthesis::Server { model } => {
+            out.push_str(&format!("Brief by {model}.\n\n"));
+            if let Some(brief) = &r.brief {
+                out.push_str(brief.trim());
+                out.push_str("\n\n");
+            }
+        }
+        Synthesis::Owed => out.push_str(
+            "Synthesis owed: no model wrote a brief; the pieces below are the pack, at the \
+             depth asked for, for the reader to answer from.\n\n",
+        ),
+    }
+    out.push_str(&format!(
+        "Cites: {}. Pack: {} pieces at {} depth, {} tokens, {} hop(s).\n\n",
+        r.citations.join(", "),
+        r.pack.pieces.len(),
+        r.pack.depth,
+        r.pack.tokens,
+        r.hops
+    ));
+    for p in &r.pack.pieces {
+        out.push_str(&format!(
+            "## {} ({}, {}, {})\n\n{}\n\n",
+            p.title, p.id, p.entry_type, p.classification, p.summary
+        ));
+        if let Some(body) = &p.body {
+            out.push_str(body.trim_end());
+            out.push_str("\n\n");
+        }
+    }
+    out
 }
 
 /// The text of a projected file, if it is a plain file of the projection's own; a
@@ -445,5 +520,53 @@ mod tests {
         assert!(!std::fs::read_to_string(dom.join(SUMMARIES))
             .unwrap()
             .contains("Raised later"));
+    }
+
+    #[tokio::test]
+    async fn a_recall_lands_as_a_file_the_session_can_read_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let view = dir.path().join("view");
+        let m = Memory::init(&root, "human:test:me", "dom-me")
+            .unwrap()
+            .without_read_log()
+            .with_projection(view.clone());
+        m.write(WriteRequest {
+            title: Some("Retry policy".into()),
+            body: "Operation R retries with exponential backoff.\n".into(),
+            ..WriteRequest::default()
+        })
+        .await
+        .unwrap();
+        let r = m
+            .recall(
+                "how does the retry work?",
+                None,
+                None,
+                crate::recall::Budget::default(),
+            )
+            .await
+            .unwrap();
+        let rel = r.projected.clone().expect("the recall landed");
+        assert!(rel.starts_with("recall/") && rel.ends_with(".md"), "{rel}");
+        let text = std::fs::read_to_string(view.join(&rel)).unwrap();
+        assert!(text.starts_with("# how does the retry work?"), "{text}");
+        assert!(
+            text.contains("Synthesis owed") && text.contains("Retry policy"),
+            "{text}"
+        );
+        assert!(
+            text.contains("exponential backoff"),
+            "the pack's body is in the file"
+        );
+        let json = crate::recall::to_json(&r);
+        assert_eq!(json["projected"], rel);
+        // without a projection, nothing lands and nothing is named
+        let plain = Memory::open(&root).unwrap().without_read_log();
+        let r = plain
+            .recall("retry", None, None, crate::recall::Budget::default())
+            .await
+            .unwrap();
+        assert_eq!(r.projected, None);
     }
 }
