@@ -11,6 +11,7 @@ pub fn default_model(destination: &str) -> &'static str {
         "anthropic" | "llmao" => "claude-haiku-4-5-20251001",
         "gemini" | "google" => "gemini-2.5-flash",
         "xai" => "grok-4-fast",
+        "dashscope" => "qwen-flash",
         _ => "gpt-5-mini",
     }
 }

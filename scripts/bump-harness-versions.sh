@@ -16,6 +16,7 @@ bump CODEX @openai/codex
 bump GEMINI_CLI @google/gemini-cli
 bump COPILOT @github/copilot
 bump OPENCODE opencode-ai
+bump QWEN_CODE @qwen-code/qwen-code
 # Node: the latest release on the LTS line the Dockerfile is on
 cur=$(sed -n 's/^ARG NODE_VERSION=\(.*\)$/\1/p' "$df")
 major=${cur%%.*}

@@ -131,6 +131,8 @@ enum HarnessArg {
     Gemini,
     /// Google's Antigravity CLI, `agy`.
     Antigravity,
+    /// Alibaba's Qwen Code.
+    Qwen,
     Copilot,
     Opencode,
     /// A program: the first argument after `--` is run as given, with the egress and
@@ -145,6 +147,7 @@ impl From<HarnessArg> for Harness {
             HarnessArg::Codex => Harness::Codex,
             HarnessArg::Gemini => Harness::Gemini,
             HarnessArg::Antigravity => Harness::Antigravity,
+            HarnessArg::Qwen => Harness::Qwen,
             HarnessArg::Copilot => Harness::Copilot,
             HarnessArg::Opencode => Harness::OpenCode,
             HarnessArg::Command => Harness::Command,
@@ -230,15 +233,16 @@ enum Command {
     },
     /// Run a harness confined: no network except the egress, the memory server attached,
     /// model calls forwarded and metered. Credentials come from this process's
-    /// environment: ANTHROPIC_API_KEY or OPENAI_API_KEY for --auth key, LLMAO_KEY (and
-    /// LLMAO_URL) for --auth gateway, the harness's own login for --auth subscription.
+    /// environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, XAI_API_KEY or
+    /// DASHSCOPE_API_KEY for --auth key, LLMAO_KEY (and LLMAO_URL) for --auth gateway,
+    /// the harness's own login for --auth subscription.
     Launch {
         #[arg(long, value_enum, default_value = "claude")]
         harness: HarnessArg,
         #[arg(long, value_enum, default_value = "subscription")]
         auth: AuthArg,
-        /// Send model calls to another destination: openai, xai (Grok), or a name from
-        /// grants.toml. Codex and OpenCode only.
+        /// Send model calls to another destination: openai, xai (Grok), dashscope, or a
+        /// name from grants.toml. Codex, Qwen Code and OpenCode only.
         #[arg(long)]
         provider: Option<String>,
         /// The working tree the harness may read and write. Defaults to the current directory.
@@ -288,7 +292,7 @@ enum Command {
         harness: HarnessArg,
         #[arg(long, value_enum, default_value = "subscription")]
         auth: AuthArg,
-        /// Send model calls to another destination. Codex and OpenCode only.
+        /// Send model calls to another destination. Codex, Qwen Code and OpenCode only.
         #[arg(long)]
         provider: Option<String>,
         /// The working tree the harness may read and write. Defaults to the current directory.
@@ -428,7 +432,7 @@ enum Command {
     /// input and leave a note in the outbox for the launcher to file as a handoff.
     #[command(hide = true)]
     Hook {
-        /// Which harness's hook format: claude, codex, gemini or antigravity.
+        /// Which harness's hook format: claude, codex, gemini, antigravity or qwen.
         harness: String,
     },
     /// A web terminal on the launcher: sessions in pseudo-terminals streamed to the
@@ -881,6 +885,12 @@ fn keyed_provider(name: &str) -> Result<Destination, Box<dyn std::error::Error>>
                 value: need("GEMINI_API_KEY", "--auth key to gemini")?,
             },
         ),
+        // Alibaba's models over OpenAI's API, at the international endpoint; the
+        // harness appends /v1 as it does at OpenAI
+        "dashscope" => Destination::forward(
+            "https://dashscope-intl.aliyuncs.com/compatible-mode",
+            bearer(need("DASHSCOPE_API_KEY", "--auth key to dashscope")?),
+        ),
         other => return Err(format!("no key-mode destination named {other}").into()),
     })
 }
@@ -913,6 +923,9 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
                 "cloudcode-pa.googleapis.com",
                 "daily-cloudcode-pa.googleapis.com",
             ]),
+        // a Qwen login's model host is named by the credential itself and has no
+        // override: a tunnel to Qwen's hosts, pinned without metering, as Copilot's is
+        "qwen" => Destination::tunnel(["chat.qwen.ai", "portal.qwen.ai", ".qwen.ai"]),
         other => return Err(format!("no subscription-mode destination named {other}").into()),
     })
 }
@@ -2014,6 +2027,7 @@ fn run_unconfined(
         }
         Harness::Gemini
         | Harness::Antigravity
+        | Harness::Qwen
         | Harness::Copilot
         | Harness::OpenCode
         | Harness::Command => {
@@ -2341,6 +2355,27 @@ mod backend_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("overlap"), "a tree holding the root: {err}");
+    }
+
+    #[test]
+    fn qwen_s_destinations_are_a_keyed_forward_and_a_login_tunnel() {
+        // the DashScope compatible endpoint, keyed from DASHSCOPE_API_KEY
+        match keyed_provider("dashscope") {
+            Ok(d) => assert!(d.upstream.contains("dashscope"), "{}", d.upstream),
+            Err(e) => assert!(e.to_string().contains("DASHSCOPE_API_KEY"), "{e}"),
+        }
+        // a Qwen OAuth login talks to Qwen's own hosts, which have no override:
+        // a tunnel, pinned without metering
+        let d = pass_through_provider("qwen").unwrap();
+        assert!(d.upstream.is_empty(), "a tunnel, not a forward");
+        for host in ["chat.qwen.ai", "portal.qwen.ai"] {
+            assert!(
+                d.tunnel_hosts.iter().any(|h| h == host),
+                "{host}: {:?}",
+                d.tunnel_hosts
+            );
+        }
+        assert_eq!(crate::model::default_model("dashscope"), "qwen-flash");
     }
 
     #[test]

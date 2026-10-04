@@ -28,9 +28,9 @@ export MEMORY_ROOT=~/memory
 To run a harness confined, with the memory server attached and every model call metered,
 interactively, on a prompt, or on the next task from the ledger,
 see [local/README.md](local/README.md): `make launch` runs Claude Code, Codex, Gemini CLI,
-Copilot CLI or OpenCode in native namespaces with no network except the egress, from the
-harness image once `make unpack` has put it in place, and Antigravity CLI from the host's
-own install, since the image does not carry it yet. The gateway half of that page runs LiteLLM
+Qwen Code, Copilot CLI or OpenCode in native namespaces with no network except the egress,
+from the harness image once `make unpack` has put it in place, and Antigravity CLI from the
+host's own install, since the image does not carry it yet. The gateway half of that page runs LiteLLM
 locally so the Foundation's shape can be tried end to end.
 
 Or point a harness at the memory server alone over stdio. For Claude Code:
@@ -80,7 +80,7 @@ built binary.
 | `crates/wslc-api` | The WSL containers C API, bound by hand, Windows only |
 | `crates/web` | The web terminal: sessions in pseudo-terminals, a reading pane over the record |
 | `crates/memory` | The binary |
-| `images/harness` | The harness image: five harnesses, Node, Python, and `memory`, pinned |
+| `images/harness` | The harness image: six harnesses, Node, Python, and `memory`, pinned |
 | `docs/` | The paper, its case study, the stack |
 
 ## Status

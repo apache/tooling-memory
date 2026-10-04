@@ -1,6 +1,6 @@
 # The harness image
 
-One image with the five harnesses `memory launch` knows, Node, and the `memory` binary,
+One image with six of the seven harnesses `memory launch` knows, Node, and the `memory` binary,
 built from the Dockerfile here. `make image` copies the release binary in and builds with
 `wslc build` (Windows, WSL containers) or `podman build` where that is what is present. The
 tag is `durable-memory/harness:dev`; `MEMORY_IMAGE` or `--image` overrides it at launch.
@@ -18,7 +18,7 @@ those move, and on a clock for the one that moves silently:
 | When | What | Why |
 |---|---|---|
 | A pin changes | `.github/workflows/image.yml` builds with the release binary and publishes to GHCR, tagged by commit and as `latest`; the digest it prints is what machines should run | A new harness version is a deliberate, reviewed change |
-| Daily, 05:41 UTC | `scripts/bump-harness-versions.sh` checks npm and nodejs.org for newer versions of the five harnesses and the Node line, and opens or updates a pull request bumping the pins | Security releases of a harness land within a day; a person still merges |
+| Daily, 05:41 UTC | `scripts/bump-harness-versions.sh` checks npm and nodejs.org for newer versions of the six harnesses and the Node line, and opens or updates a pull request bumping the pins | Security releases of a harness land within a day; a person still merges |
 | Weekly, Monday 04:17 UTC | A rebuild with `--pull`, nothing else changed | `ubuntu:24.04` moves under its tag and apt has security updates; a weekly rebuild takes them without anyone bumping anything |
 | Urgent | Bump the pin by hand and merge | The daily check is the floor, not the ceiling |
 

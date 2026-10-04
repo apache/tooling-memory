@@ -6,7 +6,7 @@
 //! on loopback that forwards to the socket, and the egress is the only process with the
 //! network.
 //!
-//! Five harnesses are known. Each needs three things from the launcher, and the adapter
+//! Seven harnesses are known. Each needs three things from the launcher, and the adapter
 //! for each is the `setup_*` function below:
 //!
 //! | Harness | Model calls | Memory over MCP | Config the launcher owns |
@@ -14,6 +14,8 @@
 //! | Claude Code | `ANTHROPIC_BASE_URL` | `--mcp-config` file | `~/.claude.json` |
 //! | Codex | `model_providers.<id>.base_url` | `mcp_servers.<id>.url` | `CODEX_HOME/config.toml` |
 //! | Gemini CLI | `GOOGLE_GEMINI_BASE_URL` | `mcpServers.<id>.httpUrl` | `~/.gemini/settings.json` |
+//! | Antigravity CLI | `GOOGLE_GEMINI_BASE_URL`; a login tunnels | `mcpServers.<id>.serverUrl` | `~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/` |
+//! | Qwen Code | `OPENAI_BASE_URL`; a login tunnels | `mcpServers.<id>.httpUrl` | `~/.qwen/settings.json` |
 //! | Copilot CLI | no override; `HTTPS_PROXY` to the egress, which tunnels to allowed hosts | `mcp-config.json` | `COPILOT_HOME` |
 //! | OpenCode | `provider.<id>.options.baseURL` | `mcp.<id>.url` | `XDG_CONFIG_HOME/opencode/opencode.json` |
 //!
@@ -75,6 +77,8 @@ pub enum Harness {
     Gemini,
     /// Google's Antigravity CLI, `agy`, which replaced Gemini CLI for individual accounts.
     Antigravity,
+    /// Alibaba's Qwen Code, a Gemini CLI fork that speaks OpenAI's API.
+    Qwen,
     /// GitHub Copilot CLI.
     Copilot,
     /// OpenCode.
@@ -94,6 +98,7 @@ impl Harness {
             Harness::Codex => "codex",
             Harness::Gemini => "gemini",
             Harness::Antigravity => "agy",
+            Harness::Qwen => "qwen",
             Harness::Copilot => "copilot",
             Harness::OpenCode => "opencode",
             Harness::Command => "command",
@@ -107,18 +112,21 @@ impl Harness {
             Harness::Claude | Harness::OpenCode => "anthropic",
             Harness::Codex | Harness::Command => "openai",
             Harness::Gemini | Harness::Antigravity => "gemini",
+            Harness::Qwen => "dashscope",
             Harness::Copilot => "github",
         }
     }
 
     /// The destination a login, rather than a key, talks to. Differs where the
     /// subscription backend is not the public API: Codex's ChatGPT login talks to
-    /// the ChatGPT backend, Gemini's Google login to Code Assist.
+    /// the ChatGPT backend, Gemini's Google login to Code Assist, Qwen Code's Qwen
+    /// login to Qwen's own hosts.
     #[must_use]
     pub fn subscription_provider(self) -> &'static str {
         match self {
             Harness::Codex => "chatgpt",
             Harness::Gemini | Harness::Antigravity => "google",
+            Harness::Qwen => "qwen",
             other => other.provider(),
         }
     }
@@ -152,6 +160,8 @@ impl Harness {
                 "--mode".into(),
                 "accept-edits".into(),
             ],
+            // Qwen Code kept Gemini CLI's yolo, as a flag of its own
+            Harness::Qwen => vec!["-p".into(), p, "--yolo".into()],
             Harness::Copilot => vec!["-p".into(), p, "--allow-all-tools".into()],
             Harness::OpenCode => vec!["run".into(), p],
             // a program has no headless form of its own; the prompt is its first argument
@@ -166,7 +176,7 @@ impl Harness {
             Harness::Claude | Harness::Copilot | Harness::Antigravity => {
                 vec!["--model".into(), model.into()]
             }
-            Harness::Codex | Harness::Gemini | Harness::OpenCode => {
+            Harness::Codex | Harness::Gemini | Harness::Qwen | Harness::OpenCode => {
                 vec!["-m".into(), model.into()]
             }
             Harness::Command => Vec::new(),
@@ -176,7 +186,10 @@ impl Harness {
     /// Whether `--provider` may point this harness at another destination.
     #[must_use]
     pub fn accepts_provider(self) -> bool {
-        matches!(self, Harness::Codex | Harness::OpenCode | Harness::Command)
+        matches!(
+            self,
+            Harness::Codex | Harness::Qwen | Harness::OpenCode | Harness::Command
+        )
     }
 }
 
@@ -246,7 +259,8 @@ pub struct Request<'a> {
     pub harness_args: &'a [String],
     /// The host's home, read only for the login file a subscription mode copies in:
     /// Claude Code's `.claude/.credentials.json`, Codex's `.codex/auth.json`, Gemini's
-    /// `.gemini/oauth_creds.json`. Nothing else is read from it and it is never mounted.
+    /// `.gemini/oauth_creds.json`, Qwen Code's `.qwen/oauth_creds.json`. Nothing else is
+    /// read from it and it is never mounted.
     pub host_home: Option<&'a Path>,
     /// Credentials the harness itself must hold, passed into its environment. For
     /// subscription modes that are a token rather than a file, such as Copilot's
@@ -621,6 +635,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         Harness::Codex => setup_codex(req, &relay, &provider, &mut env)?,
         Harness::Gemini => setup_gemini(req, &relay, &mut env)?,
         Harness::Antigravity => setup_antigravity(req, &relay, &mut env)?,
+        Harness::Qwen => setup_qwen(req, &relay, &provider, &mut env)?,
         Harness::Copilot => setup_copilot(req, &relay, &mut env)?,
         Harness::OpenCode => setup_opencode(req, &relay, &provider, &mut env)?,
         Harness::Command => setup_command(req, &relay, &provider, &mut env),
@@ -898,6 +913,53 @@ fn setup_antigravity(
     Ok(())
 }
 
+/// Qwen Code is Gemini CLI's fork for Alibaba's models and speaks OpenAI's API: a key is
+/// `OPENAI_API_KEY` behind `OPENAI_BASE_URL`, read once its settings select the OpenAI
+/// auth type, and DashScope's compatible endpoint is the default destination, any
+/// other OpenAI-compatible one on request. A Qwen login is the credential file the
+/// host's login left under `~/.qwen`, with the harness's HTTPS through the egress as a
+/// tunnel to Qwen's hosts, since the login's endpoint comes from the credential itself.
+/// MCP servers and hooks live in the settings, the hooks in Claude Code's shape with
+/// timeouts in seconds.
+fn setup_qwen(
+    req: &Request<'_>,
+    relay: &str,
+    provider: &str,
+    env: &mut BTreeMap<String, String>,
+) -> Result<(), Error> {
+    let subscription = req.auth == AuthMode::Subscription;
+    if subscription {
+        copy_login(
+            req,
+            ".qwen/oauth_creds.json",
+            "a Qwen Code login (run `qwen` once on the host and pick Qwen OAuth)",
+        )?;
+        proxy_via(relay, env);
+    } else {
+        env.insert("OPENAI_BASE_URL".into(), format!("{relay}/{provider}/v1"));
+        // the egress injects the real key; this one only has to exist
+        env.insert("OPENAI_API_KEY".into(), "egress".into());
+    }
+    let auth_type = if subscription { "qwen-oauth" } else { "openai" };
+    let settings = serde_json::json!({
+        "security": { "auth": { "selectedType": auth_type } },
+        "general": { "enableAutoUpdate": false },
+        "privacy": { "usageStatisticsEnabled": false },
+        "mcpServers": { "memory": { "httpUrl": format!("{relay}/mcp") } }
+    });
+    let path = req.home.join(".qwen/settings.json");
+    write(
+        &path,
+        &serde_json::to_string_pretty(&settings).unwrap_or_default(),
+    )?;
+    merge_hooks(
+        &path,
+        "qwen",
+        &["PreCompact", "SessionEnd", "PreToolUse"],
+        30,
+    )
+}
+
 fn setup_copilot(
     req: &Request<'_>,
     relay: &str,
@@ -1135,7 +1197,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bins = dir.path().join("bins");
         std::fs::create_dir_all(&bins).unwrap();
-        for b in ["claude", "codex", "gemini", "agy", "copilot", "opencode"] {
+        for b in [
+            "claude", "codex", "gemini", "agy", "qwen", "copilot", "opencode",
+        ] {
             fake_bin(&bins, b);
         }
         let memory_bin = fake_bin(&bins, "memory");
@@ -1952,5 +2016,108 @@ mod tests {
         assert_eq!(Harness::Antigravity.provider(), "gemini");
         assert_eq!(Harness::Antigravity.subscription_provider(), "google");
         assert!(!Harness::Antigravity.accepts_provider());
+    }
+
+    fn assert_qwen_hooks(settings: &serde_json::Value) {
+        // Claude Code's shape, with timeouts in seconds, for all three events
+        for event in ["PreCompact", "SessionEnd", "PreToolUse"] {
+            let group = &settings["hooks"][event][0];
+            assert_eq!(group["matcher"], "*", "{event}");
+            assert_eq!(
+                group["hooks"][0]["command"], "/opt/memory/memory hook qwen",
+                "{event}"
+            );
+            assert_eq!(group["hooks"][0]["timeout"], 30, "{event}: seconds");
+        }
+    }
+
+    #[test]
+    fn qwen_plan_key_and_provider() {
+        let f = fixture();
+        let (home, plan) = f
+            .plan(Harness::Qwen, AuthMode::Key, "q1", &[], false)
+            .unwrap();
+        // an OpenAI-compatible harness: DashScope's compatible endpoint by default,
+        // behind the egress, with the egress holding the real key
+        assert_eq!(
+            plan.env["OPENAI_BASE_URL"],
+            "http://127.0.0.1:4100/dashscope/v1"
+        );
+        assert_eq!(plan.env["OPENAI_API_KEY"], "egress");
+        assert!(
+            !plan.env.contains_key("HTTPS_PROXY"),
+            "a key needs no tunnel"
+        );
+        let s = json_file(&home.join(".qwen/settings.json"));
+        assert_eq!(s["security"]["auth"]["selectedType"], "openai");
+        assert_eq!(
+            s["mcpServers"]["memory"]["httpUrl"],
+            "http://127.0.0.1:4100/mcp"
+        );
+        assert_eq!(s["general"]["enableAutoUpdate"], false);
+        assert_eq!(s["privacy"]["usageStatisticsEnabled"], false);
+        assert_qwen_hooks(&s);
+        assert_eq!(plan.env["MEMORY_MCP_URL"], "http://127.0.0.1:4100/mcp");
+        assert!(
+            plan.argv.iter().any(|a| a.ends_with("qwen")),
+            "{:?}",
+            plan.argv
+        );
+    }
+
+    #[test]
+    fn qwen_takes_a_provider_and_keeps_gemini_s_headless_shape() {
+        let f = fixture();
+        // another OpenAI-compatible destination on request
+        let (_, plan) = f
+            .plan_with(
+                Harness::Qwen,
+                AuthMode::Key,
+                Some("openai"),
+                "q2",
+                &[],
+                false,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            plan.env["OPENAI_BASE_URL"],
+            "http://127.0.0.1:4100/openai/v1"
+        );
+        let headless = Harness::Qwen.headless("hi");
+        assert_eq!(headless, vec!["-p", "hi", "--yolo"]);
+        assert_eq!(Harness::Qwen.model_flag("m"), vec!["-m", "m"]);
+        assert_eq!(Harness::Qwen.provider(), "dashscope");
+        assert_eq!(Harness::Qwen.subscription_provider(), "qwen");
+        assert!(Harness::Qwen.accepts_provider());
+    }
+
+    #[test]
+    fn qwen_plan_login_is_the_credential_file_behind_a_tunnel() {
+        let f = fixture();
+        // a Qwen OAuth login needs the credential file the host's login left
+        assert!(matches!(
+            f.plan(Harness::Qwen, AuthMode::Subscription, "q3", &[], false),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::create_dir_all(f.host_home.join(".qwen")).unwrap();
+        std::fs::write(
+            f.host_home.join(".qwen/oauth_creds.json"),
+            r#"{"access_token":"x","resource_url":"portal.qwen.ai"}"#,
+        )
+        .unwrap();
+        let (home, plan) = f
+            .plan(Harness::Qwen, AuthMode::Subscription, "q4", &[], true)
+            .unwrap();
+        assert!(
+            home.join(".qwen/oauth_creds.json").is_file(),
+            "login copied in"
+        );
+        assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
+        assert!(!plan.env.contains_key("OPENAI_API_KEY"));
+        assert!(!plan.env.contains_key("OPENAI_BASE_URL"));
+        let s = json_file(&home.join(".qwen/settings.json"));
+        assert_eq!(s["security"]["auth"]["selectedType"], "qwen-oauth");
+        assert_qwen_hooks(&s);
     }
 }

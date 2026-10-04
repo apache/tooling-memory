@@ -49,8 +49,8 @@ memory task admit task-me-xxxxxxxx
 make work HARNESS=codex AUTH=key
 ```
 
-Six harnesses, one launcher. Each needed the same three things, and the table is the whole
-of what differs:
+Seven harnesses, one launcher. Each needed the same three things, and the table is the
+whole of what differs:
 
 | Harness | Model calls reach the egress by | Memory over MCP by | `AUTH` modes |
 |---|---|---|---|
@@ -58,6 +58,7 @@ of what differs:
 | Codex | `model_providers.<id>.base_url` in `config.toml`; with a ChatGPT login, a CONNECT tunnel to the ChatGPT hosts | `mcp_servers.<id>.url` | subscription, key, gateway; `--provider xai` for Grok |
 | Gemini CLI | `GOOGLE_GEMINI_BASE_URL`; with a Google login, `CODE_ASSIST_ENDPOINT` | `mcpServers.<id>.httpUrl` | subscription, key |
 | Antigravity CLI (`agy`) | `GOOGLE_GEMINI_BASE_URL`, once its settings name the Gemini API as the model provider; with a Google login, `HTTPS_PROXY` to the egress, which tunnels only to Google's login and Cloud Code hosts, pinned without metering | `mcpServers.<id>.serverUrl` in `~/.gemini/config/mcp_config.json` | subscription (the token file `agy` left under `~/.gemini/antigravity-cli`), key. Not in the harness image yet. Written from the docs and the issue tracker, not a run: the first launch on a real machine is the test |
+| Qwen Code | `OPENAI_BASE_URL`, once its settings select the OpenAI auth type; with a Qwen login, `HTTPS_PROXY` to the egress, which tunnels only to Qwen's hosts, pinned without metering | `mcpServers.<id>.httpUrl` | subscription, key; `--provider openai` or `xai`, `dashscope` by default |
 | Copilot CLI | no override exists; `HTTPS_PROXY` to the egress, which tunnels only to GitHub's Copilot hosts | `mcp-config.json` | subscription (`GH_TOKEN`) |
 | OpenCode | `provider.<id>.options.baseURL`; on a GitHub Copilot login, `HTTPS_PROXY` and the GitHub tunnel | `mcp.<id>.url` | key; `--provider openai` or `xai`; subscription with `--provider github-copilot`, which GitHub supports |
 | `command` | the program itself: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_GEMINI_BASE_URL` in its environment | `MEMORY_MCP_URL` in its environment | key, gateway; `--provider` picks the destination |
