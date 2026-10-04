@@ -77,15 +77,29 @@ impl Decision {
 fn path_of(input: &Value) -> Option<PathBuf> {
     ["file_path", "notebook_path", "path", "pattern"]
         .iter()
-        .find_map(|k| input.get(*k).and_then(Value::as_str))
-        .filter(|p| !p.is_empty())
+        .find_map(|k| {
+            input
+                .get(*k)
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty())
+        })
         .map(|p| normalise(Path::new(p)))
 }
 
 /// A path with `.` and `..` folded away lexically, so `/memory/../memory/x` is
-/// `/memory/x` and `/memory/..` is `/`.
+/// `/memory/x` and `/memory/..` is `/`; a path through a process's root in `/proc`,
+/// which is the same tree under another name, is read from the root.
 fn normalise(path: &Path) -> PathBuf {
     use std::path::Component;
+    let text = path.to_string_lossy();
+    let via_proc = text
+        .strip_prefix("/proc/")
+        .and_then(|rest| rest.split_once("/root"))
+        .filter(|(pid, _)| {
+            *pid == "self" || *pid == "thread-self" || pid.bytes().all(|b| b.is_ascii_digit())
+        })
+        .map(|(_, rest)| format!("/{}", rest.trim_start_matches('/')));
+    let path = via_proc.as_deref().map_or(path, Path::new);
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {
@@ -102,6 +116,23 @@ fn normalise(path: &Path) -> PathBuf {
 /// A tool that reads one file.
 fn reads_one(tool: &str) -> bool {
     matches!(tool, "Read" | "read_file" | "view" | "NotebookRead")
+}
+
+/// A tool that lists files by glob.
+fn globs(tool: &str) -> bool {
+    matches!(tool, "Glob" | "glob")
+}
+
+/// Whether a glob pattern can reach into `projection`: it climbs with `..`, or its
+/// literal prefix, up to the first wildcard, is the projection or an ancestor of it.
+fn glob_reaches(pattern: &str, projection: &Path) -> bool {
+    if pattern.contains("..") {
+        return true;
+    }
+    let literal = &pattern[..pattern.find(['*', '?', '[']).unwrap_or(pattern.len())];
+    let projection = projection.to_string_lossy();
+    literal.starts_with(projection.as_ref())
+        || (literal.starts_with('/') && projection.starts_with(literal))
 }
 
 /// A tool that searches a tree, by path or by glob.
@@ -130,12 +161,13 @@ where
     // a search over an absolute ancestor of the projection covers it; a relative path
     // is the working tree's, which does not hold the projection
     let covers = searches(tool) && path.is_absolute() && projection.starts_with(&path);
-    // a search by pattern reaches wherever the pattern says, whatever its path says
-    let by_pattern = searches(tool)
+    // a glob reaches wherever its pattern says, whatever its path says; a grep's
+    // pattern is a regex over text, not a place
+    let by_pattern = globs(tool)
         && input
             .get("pattern")
             .and_then(Value::as_str)
-            .is_some_and(|pat| pat.contains(projection.to_string_lossy().as_ref()));
+            .is_some_and(|pat| glob_reaches(pat, &projection));
     if !path.starts_with(&projection) && !covers && !by_pattern {
         return Decision::Allow;
     }
@@ -715,17 +747,69 @@ not json
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_glob_s_pattern_is_a_place_and_a_grep_s_is_text() {
+        let view = Path::new("/memory");
         // what the second pass got through: a pattern reaching the projection beside a
         // path that does not
         for input in [
             serde_json::json!({ "pattern": "/memory/**/*.md", "path": "/work" }),
             serde_json::json!({ "pattern": "../memory/**/*.md", "path": "/work" }),
+            serde_json::json!({ "pattern": "/mem*/**/*.md", "path": "/work" }),
+            serde_json::json!({ "pattern": "/memory/**/*.md", "path": "" }),
         ] {
             assert!(
                 matches!(decide("Glob", &input, view, |_| Ok(())), Decision::Deny(_)),
                 "{input}"
             );
         }
+        // a grep's pattern is a regex over text: the projection's name in it is a word
+        for input in [
+            serde_json::json!({ "pattern": "/memory", "path": "/work" }),
+            serde_json::json!({ "pattern": "INSIDE_PROJECTION = \"/memory\"", "path": "/work" }),
+        ] {
+            assert_eq!(
+                decide("Grep", &input, view, |_| Ok(())),
+                Decision::Allow,
+                "{input}"
+            );
+        }
+        assert_eq!(
+            decide(
+                "Glob",
+                &serde_json::json!({ "pattern": "**/memory/**", "path": "/work" }),
+                view,
+                |_| Ok(())
+            ),
+            Decision::Allow,
+            "a relative glob in the working tree"
+        );
+        // the same tree under another name
+        let mut via_proc = Vec::new();
+        let d = decide(
+            "Read",
+            &read("/proc/self/root/memory/dom-me/mem-me-abc1.md"),
+            view,
+            |id| {
+                via_proc.push(id.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            (d, via_proc),
+            (Decision::Allow, vec!["mem-me-abc1".to_string()])
+        );
+        assert!(matches!(
+            decide(
+                "Read",
+                &read("/proc/1/root/memory/dom-me/stray.md"),
+                view,
+                |_| Ok(())
+            ),
+            Decision::Deny(_)
+        ));
         for input in [
             serde_json::json!({ "pattern": "key", "path": "/work" }),
             serde_json::json!({ "pattern": "key" }),

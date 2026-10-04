@@ -108,7 +108,18 @@ impl Memory {
     ///
     /// An index, store or I/O error, or a path in the projection that is not its own.
     pub async fn project_into(&self, dir: &Path) -> Result<Projected, Error> {
-        own_dir(dir)?;
+        // every component below the root, or below the directory's parent when it is
+        // elsewhere, is checked and made in turn, so a link higher up is not followed
+        let mut step = if dir.starts_with(&self.root) {
+            self.root.clone()
+        } else {
+            dir.parent().map(Path::to_path_buf).unwrap_or_default()
+        };
+        let below = dir.strip_prefix(&step).unwrap_or(dir).to_path_buf();
+        for component in below.components() {
+            step.push(component);
+            own_dir(&step)?;
+        }
         let mut done = Projected::default();
         for domain in self.domains() {
             let f = self.filter_for(Some(&domain))?;
@@ -360,6 +371,19 @@ mod tests {
             m.project_into(&view2).await,
             Err(Error::Denied(_))
         ));
+        // a link above the leaf, under the root: state/projection itself
+        std::os::unix::fs::symlink(&outside, root.join("state/projection")).unwrap();
+        assert!(
+            matches!(
+                m.project_into(&root.join("state/projection/claude")).await,
+                Err(Error::Denied(_))
+            ),
+            "a linked parent is refused, not walked"
+        );
+        assert!(
+            !outside.join("claude").exists(),
+            "nothing was made in the link's target"
+        );
         // a sibling planted where the atomic write lands: replaced, never written through
         std::fs::remove_file(view.join("dom-me")).unwrap();
         std::fs::create_dir_all(view.join("dom-me")).unwrap();
@@ -369,7 +393,10 @@ mod tests {
         std::os::unix::fs::symlink(&planted, view.join("dom-me").join("stray.md")).unwrap();
         let p = m.project_into(&view).await.unwrap();
         assert_eq!(std::fs::read_to_string(&planted).unwrap(), "mine");
-        assert!(p.removed >= 1, "the stray link is removed: {p:?}");
+        assert_eq!(
+            p.removed, 1,
+            "the stray link is removed, the sibling replaced: {p:?}"
+        );
         assert!(!view.join("dom-me").join("stray.md").exists());
         assert!(
             std::fs::symlink_metadata(view.join("dom-me").join(SUMMARIES))

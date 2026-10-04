@@ -1505,9 +1505,9 @@ fn inside_args_for_launch(
     Ok(inside_args)
 }
 
-/// The working tree, canonical. A tree that holds the record root is refused: the tree
-/// is mounted read-write, and the root, its state and its projection are the
-/// launcher's alone.
+/// The working tree, canonical. A tree that holds the record root, or sits inside it,
+/// is refused: the tree is mounted read-write, and the root, its record, its state and
+/// its projection are the launcher's alone.
 fn resolve_workdir(
     root: &Path,
     workdir: Option<PathBuf>,
@@ -1518,10 +1518,10 @@ fn resolve_workdir(
     };
     let w = std::fs::canonicalize(&w)?;
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    if root.starts_with(&w) {
+    if root.starts_with(&w) || w.starts_with(&root) {
         return Err(format!(
-            "the working tree {} holds the record root {}; run from another directory or \
-             pass --workdir",
+            "the working tree {} and the record root {} overlap; run from another \
+             directory or pass --workdir",
             w.display(),
             root.display()
         )
@@ -2282,6 +2282,26 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[test]
+    fn the_working_tree_and_the_root_may_not_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("memory");
+        std::fs::create_dir_all(root.join("state/projection/claude")).unwrap();
+        let beside = dir.path().join("proj");
+        std::fs::create_dir_all(&beside).unwrap();
+        assert!(resolve_workdir(&root, Some(beside)).is_ok(), "beside: fine");
+        for inside in ["state", "state/projection/claude", "."] {
+            let err = resolve_workdir(&root, Some(root.join(inside)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("overlap"), "{inside}: {err}");
+        }
+        let err = resolve_workdir(&root, Some(dir.path().to_path_buf()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overlap"), "a tree holding the root: {err}");
+    }
 
     #[test]
     fn an_empty_variable_is_a_missing_one() {

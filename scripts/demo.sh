@@ -50,7 +50,7 @@ echo "== task $id filed and admitted; a ${HARNESS:-claude} session claims and wo
 work=$(mktemp -d)
 ( cd "$work" && "$memory" --root "$root" work --harness "${HARNESS:-claude}" --auth "${AUTH:-subscription}" --lease-seconds 300 ) || true
 echo
-view="$root/state/sandbox/${HARNESS:-claude}/.memory-view/dom-demo"
+view="$root/state/projection/${HARNESS:-claude}/dom-demo"
 if [ -f "$view/README.md" ]; then
   echo "== the projection that session saw at /memory: the record as read-only files, each open a get"
   sed -n '1,6p' "$view/README.md"

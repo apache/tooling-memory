@@ -289,8 +289,11 @@ fn host_logins() -> Fallible<(Option<String>, Vec<String>)> {
 /// The projection's mount path, from the launch and the host's own view of the root,
 /// when the launcher rendered one.
 fn projection_mount(l: &Launch) -> Fallible<Option<String>> {
+    // made here, so the first launch on a root mounts it and the inside's render lands
+    // where the container already looks
     let dir = l.root.join(dm_sandbox::PROJECTION).join(l.harness.binary());
-    dir.is_dir().then(|| mount_path(&dir)).transpose()
+    std::fs::create_dir_all(&dir)?;
+    Ok(Some(mount_path(&dir)?))
 }
 
 /// Run a launch through WSL containers. Returns the exit code the inside reports.
