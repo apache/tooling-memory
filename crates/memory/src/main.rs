@@ -968,6 +968,9 @@ struct Prepared {
     harness_env: Vec<(String, String)>,
 }
 
+/// `projected` says whether this invocation mounts the projection for a harness; a tool
+/// run on the host, `recall` or `golden` say, mounts nothing and renders nothing.
+#[allow(clippy::too_many_arguments)] // one argument per thing a launch is given
 async fn prepare_launch(
     root: &Path,
     harness: Harness,
@@ -975,6 +978,7 @@ async fn prepare_launch(
     provider: Option<&str>,
     socket: Option<PathBuf>,
     recall_model: Option<&str>,
+    projected: bool,
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
     let Route {
         name,
@@ -989,11 +993,10 @@ async fn prepare_launch(
     let home = root.join("state/sandbox").join(harness.binary());
     let projection = root.join(dm_sandbox::PROJECTION).join(harness.binary());
     let memory = memory.with_handling_cap(ceiling);
-    // a confined harness reads the projection; the bare command has no mount for it
-    let memory = Arc::new(if harness == Harness::Command {
-        memory
-    } else {
+    let memory = Arc::new(if projected {
         memory.with_projection(projection.clone())
+    } else {
+        memory
     });
     let mut destinations = HashMap::new();
     destinations.insert(name.clone(), destination);
@@ -1059,7 +1062,7 @@ async fn run_confined(
 ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
     let host_home = home_dir();
     p.memory.project_into(&p.projection).await?;
-    let plan = dm_sandbox::prepare(&dm_sandbox::Request {
+    let mut plan = dm_sandbox::prepare(&dm_sandbox::Request {
         harness,
         auth,
         provider: Some(p.provider.as_str()),
@@ -1076,6 +1079,9 @@ async fn run_confined(
         rootfs,
         projection: Some(&p.projection),
     })?;
+    // the hook frees a recall page of this session only
+    plan.env
+        .insert("MEMORY_SESSION".into(), p.memory.session_id().to_string());
     Ok(tokio::task::spawn_blocking(move || {
         if capture {
             dm_sandbox::run_captured(&plan)
@@ -1156,6 +1162,7 @@ async fn golden_cmd(
                 Some(&provider),
                 None,
                 model,
+                false,
             )
             .await?;
             // the suite's reads are a measurement, not a session's
@@ -1189,6 +1196,31 @@ async fn tap_cmd(root: &Path, op: TapOp) -> Fallible {
 }
 
 /// `mine` and the C API check.
+/// `memory mine`: a transcript read by a small model through the session's destination.
+async fn mine_cmd(
+    root: &Path,
+    transcript: &Path,
+    auth: AuthArg,
+    provider: &str,
+    model: Option<String>,
+) -> Fallible {
+    let p = prepare_launch(
+        root,
+        Harness::Command,
+        auth.into(),
+        Some(provider),
+        None,
+        None,
+        false,
+    )
+    .await?;
+    let client = work::client(p.memory.clone()).await?;
+    let model = model.unwrap_or_else(|| mine::default_model(&p.provider).to_string());
+    let ids = mine::mine(&p.egress, &client, &p.provider, &model, transcript).await?;
+    println!("{}", serde_json::to_string_pretty(&ids)?);
+    Ok(())
+}
+
 async fn tools_cmd(root: &Path, command: Command) -> Fallible {
     match command {
         Command::Mine {
@@ -1196,22 +1228,7 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
             auth,
             provider,
             model,
-        } => {
-            let p = prepare_launch(
-                root,
-                Harness::Command,
-                auth.into(),
-                Some(&provider),
-                None,
-                None,
-            )
-            .await?;
-            let client = work::client(p.memory.clone()).await?;
-            let model = model.unwrap_or_else(|| mine::default_model(&p.provider).to_string());
-            let ids = mine::mine(&p.egress, &client, &p.provider, &model, &transcript).await?;
-            println!("{}", serde_json::to_string_pretty(&ids)?);
-            Ok(())
-        }
+        } => mine_cmd(root, &transcript, auth, &provider, model).await,
         Command::Recall {
             question,
             domain,
@@ -1227,6 +1244,7 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
                 Some(&provider),
                 None,
                 model.as_deref(),
+                false,
             )
             .await?;
             let r = p
@@ -1638,7 +1656,7 @@ impl Session {
             Runner::Requests(r) => Some(r.dir.join("egress.sock")),
             _ => None,
         };
-        let p = prepare_launch(root, harness, auth, provider, socket, None).await?;
+        let p = prepare_launch(root, harness, auth, provider, socket, None, true).await?;
 
         #[cfg(unix)]
         let serve_unix = {
@@ -1862,7 +1880,7 @@ impl Session {
         capture: bool,
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
         self.p.memory.project_into(&self.p.projection).await?;
-        let plan = dm_sandbox::prepare(&dm_sandbox::Request {
+        let mut plan = dm_sandbox::prepare(&dm_sandbox::Request {
             harness: self.harness,
             auth: self.auth,
             provider: Some(self.p.provider.as_str()),
@@ -1879,6 +1897,10 @@ impl Session {
             rootfs: None,
             projection: Some(&self.p.projection),
         })?;
+        plan.env.insert(
+            "MEMORY_SESSION".into(),
+            self.p.memory.session_id().to_string(),
+        );
         let n = r.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let home_rel = self
             .p

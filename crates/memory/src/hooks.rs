@@ -150,7 +150,7 @@ fn searches(tool: &str) -> bool {
 /// a directory that holds it, is refused, since a `grep -r` over bodies is a
 /// full-corpus read the memory would not have served; so is a write, which the mount
 /// refuses anyway. Anything outside the projection is not the hook's.
-pub fn decide<F>(tool: &str, input: &Value, projection: &Path, get: F) -> Decision
+pub fn decide<F>(tool: &str, input: &Value, projection: &Path, session: &str, get: F) -> Decision
 where
     F: FnOnce(&str) -> Result<(), String>,
 {
@@ -186,12 +186,18 @@ where
     {
         return Decision::Allow;
     }
-    // a recall's page, `recall/<session>/<stamp>.md` directly under the projection:
-    // what it holds was served to this session when the recall ran
-    let recall_page = path
-        .parent()
-        .and_then(Path::parent)
-        .is_some_and(|d| d == projection.join(dm_server::projection::RECALLS))
+    // this session's recall page, `recall/<session>/<stamp>.md` directly under the
+    // projection: what it holds was served to this session when the recall ran;
+    // another session's pages are not this one's to read
+    let recall_page = !session.is_empty()
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|s| s == session)
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|d| d == projection.join(dm_server::projection::RECALLS))
         && path.extension().is_some_and(|e| e == "md");
     if recall_page {
         return Decision::Allow;
@@ -219,6 +225,7 @@ const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 async fn pre_tool_with(
     input: &HookInput,
     projection: Option<&Path>,
+    session: &str,
     url: Option<&str>,
     wait: std::time::Duration,
 ) -> Decision {
@@ -228,25 +235,24 @@ async fn pre_tool_with(
     let tool = input.tool_name.clone().unwrap_or_default();
     // the id to fetch is decided first, then fetched: the decision is pure, the fetch is not
     let mut wanted: Option<String> = None;
-    let d = decide(&tool, &input.tool_input, projection, |id| {
+    let d = decide(&tool, &input.tool_input, projection, session, |id| {
         wanted = Some(id.to_string());
         Ok(())
     });
     let Some(id) = wanted else {
         return d;
     };
+    let refused = |why: String| decide(&tool, &input.tool_input, projection, session, |_| Err(why));
     let Some(url) = url else {
-        return decide(&tool, &input.tool_input, projection, |_| {
-            Err("the memory server's address is not set, so nothing here can be read".into())
-        });
+        return refused(
+            "the memory server's address is not set, so nothing here can be read".into(),
+        );
     };
     let call = crate::mcp_http::call_tool(url, "get", serde_json::json!({ "id": id }));
     match tokio::time::timeout(wait, call).await {
         Ok(Ok(_)) => Decision::Allow,
-        Ok(Err(why)) => decide(&tool, &input.tool_input, projection, |_| Err(why)),
-        Err(_) => decide(&tool, &input.tool_input, projection, |_| {
-            Err(format!("the memory server did not answer within {wait:?}"))
-        }),
+        Ok(Err(why)) => refused(why),
+        Err(_) => refused(format!("the memory server did not answer within {wait:?}")),
     }
 }
 
@@ -254,8 +260,9 @@ async fn pre_tool_with(
 /// come from the environment the launcher set.
 async fn pre_tool(input: &HookInput) -> Decision {
     let projection = std::env::var_os("MEMORY_PROJECTION").map(PathBuf::from);
+    let session = std::env::var("MEMORY_SESSION").unwrap_or_default();
     let url = std::env::var("MEMORY_MCP_URL").ok();
-    pre_tool_with(input, projection.as_deref(), url.as_deref(), WAIT).await
+    pre_tool_with(input, projection.as_deref(), &session, url.as_deref(), WAIT).await
 }
 
 /// Why a note was left; part of its filename so the launcher can tell them apart.
@@ -520,6 +527,8 @@ pub fn notes(outbox: &Path) -> Fallible<Vec<Note>> {
 mod tests {
     use super::*;
 
+    const SID: &str = "sess-abc12345";
+
     const TRANSCRIPT: &str = r#"{"type":"user","message":{"role":"user","content":"Load T0 and summarise it."}}
 {"type":"cost-state","x":1}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Loading T0."},{"type":"tool_use","name":"mcp__memory__t0","input":{}}]}}
@@ -637,25 +646,39 @@ not json
     fn a_read_of_an_entry_file_is_a_get_and_the_summaries_page_is_free() {
         let view = Path::new("/memory");
         let mut asked = Vec::new();
-        let d = decide("Read", &read("/memory/dom-me/mem-me-abc1.md"), view, |id| {
-            asked.push(id.to_string());
-            Ok(())
-        });
+        let d = decide(
+            "Read",
+            &read("/memory/dom-me/mem-me-abc1.md"),
+            view,
+            SID,
+            |id| {
+                asked.push(id.to_string());
+                Ok(())
+            },
+        );
         assert_eq!(
             (d, asked),
             (Decision::Allow, vec!["mem-me-abc1".to_string()])
         );
-        let d = decide("Read", &read("/memory/dom-me/mem-me-abc1.md"), view, |_| {
-            Err("not found: mem-me-abc1".into())
-        });
+        let d = decide(
+            "Read",
+            &read("/memory/dom-me/mem-me-abc1.md"),
+            view,
+            SID,
+            |_| Err("not found: mem-me-abc1".into()),
+        );
         match d {
             Decision::Deny(why) => assert!(why.contains("not found") && why.contains("search")),
             Decision::Allow => panic!("a refusal is a denial"),
         }
         assert_eq!(
-            decide("Read", &read("/memory/dom-me/README.md"), view, |_| panic!(
-                "free"
-            )),
+            decide(
+                "Read",
+                &read("/memory/dom-me/README.md"),
+                view,
+                SID,
+                |_| panic!("free")
+            ),
             Decision::Allow
         );
         // a path folded through `..` is the entry's, and is fetched
@@ -664,6 +687,7 @@ not json
             "Read",
             &read("/memory/../memory/dom-me/mem-me-abc1.md"),
             view,
+            SID,
             |id| {
                 folded.push(id.to_string());
                 Ok(())
@@ -678,6 +702,7 @@ not json
                 "NotebookRead",
                 &serde_json::json!({ "notebook_path": "/memory/dom-me/mem-me-abc1.md" }),
                 view,
+                SID,
                 |_| Err("not found".into())
             ),
             Decision::Deny(_)
@@ -701,6 +726,7 @@ not json
                 "Read",
                 &read("/memory/recall/sess-abc12345/20261004T101010-000000001.md"),
                 view,
+                SID,
                 |_| panic!("free: served when the recall ran")
             ),
             Decision::Allow
@@ -710,10 +736,12 @@ not json
         for p in [
             "/memory/recall/sess-abc12345/notes.txt",
             "/memory/recall/20261004T101010-000000001.md",
+            "/memory/recall/sess-other999/20261004T101010-000000001.md",
+            "/memory/dom-me/recall/sess-abc12345/20261004T101010-000000001.md",
         ] {
             assert!(
                 matches!(
-                    decide("Read", &read(p), view, |_| Ok(())),
+                    decide("Read", &read(p), view, SID, |_| Ok(())),
                     Decision::Deny(_)
                 ),
                 "{p}"
@@ -724,6 +752,7 @@ not json
             "Read",
             &read("/memory/recall/mem-recall-abc1.md"),
             view,
+            SID,
             |id| {
                 fetched.push(id.to_string());
                 Ok(())
@@ -747,7 +776,7 @@ not json
         ] {
             assert!(
                 matches!(
-                    decide("Read", &read(p), view, |_| Ok(())),
+                    decide("Read", &read(p), view, SID, |_| Ok(())),
                     Decision::Deny(_)
                 ),
                 "{p}"
@@ -759,16 +788,20 @@ not json
             "/home/user/.memory-view/x.md",
         ] {
             assert_eq!(
-                decide("Read", &read(p), view, |_| panic!("not ours")),
+                decide("Read", &read(p), view, SID, |_| panic!("not ours")),
                 Decision::Allow,
                 "{p}"
             );
         }
         for tool in ["Edit", "Write", "MultiEdit"] {
             assert!(matches!(
-                decide(tool, &read("/memory/dom-me/mem-me-abc1.md"), view, |_| Ok(
-                    ()
-                )),
+                decide(
+                    tool,
+                    &read("/memory/dom-me/mem-me-abc1.md"),
+                    view,
+                    SID,
+                    |_| Ok(())
+                ),
                 Decision::Deny(_)
             ));
         }
@@ -777,6 +810,7 @@ not json
                 "Bash",
                 &serde_json::json!({ "command": "cat /memory/x" }),
                 view,
+                SID,
                 |_| Ok(())
             ),
             Decision::Allow,
@@ -795,7 +829,10 @@ not json
         ] {
             for tool in ["Grep", "Glob"] {
                 assert!(
-                    matches!(decide(tool, &input, view, |_| Ok(())), Decision::Deny(_)),
+                    matches!(
+                        decide(tool, &input, view, SID, |_| Ok(())),
+                        Decision::Deny(_)
+                    ),
                     "{tool} {input}"
                 );
             }
@@ -814,7 +851,10 @@ not json
             serde_json::json!({ "pattern": "/memory/**/*.md", "path": "" }),
         ] {
             assert!(
-                matches!(decide("Glob", &input, view, |_| Ok(())), Decision::Deny(_)),
+                matches!(
+                    decide("Glob", &input, view, SID, |_| Ok(())),
+                    Decision::Deny(_)
+                ),
                 "{input}"
             );
         }
@@ -824,7 +864,7 @@ not json
             serde_json::json!({ "pattern": "INSIDE_PROJECTION = \"/memory\"", "path": "/work" }),
         ] {
             assert_eq!(
-                decide("Grep", &input, view, |_| Ok(())),
+                decide("Grep", &input, view, SID, |_| Ok(())),
                 Decision::Allow,
                 "{input}"
             );
@@ -834,6 +874,7 @@ not json
                 "Glob",
                 &serde_json::json!({ "pattern": "**/memory/**", "path": "/work" }),
                 view,
+                SID,
                 |_| Ok(())
             ),
             Decision::Allow,
@@ -845,6 +886,7 @@ not json
             "Read",
             &read("/proc/self/root/memory/dom-me/mem-me-abc1.md"),
             view,
+            SID,
             |id| {
                 via_proc.push(id.to_string());
                 Ok(())
@@ -859,6 +901,7 @@ not json
                 "Read",
                 &read("/proc/1/root/memory/dom-me/stray.md"),
                 view,
+                SID,
                 |_| Ok(())
             ),
             Decision::Deny(_)
@@ -873,7 +916,7 @@ not json
             serde_json::json!({ "pattern": "key", "path": "./src" }),
         ] {
             assert_eq!(
-                decide("Grep", &input, view, |_| Ok(())),
+                decide("Grep", &input, view, SID, |_| Ok(())),
                 Decision::Allow,
                 "beside the projection, or in the working tree: {input}"
             );
@@ -893,19 +936,26 @@ not json
         let entry = read_input("/memory/dom-me/mem-me-abc1.md");
         let wait = std::time::Duration::from_millis(200);
         assert_eq!(
-            pre_tool_with(&entry, None, None, wait).await,
+            pre_tool_with(&entry, None, SID, None, wait).await,
             Decision::Allow,
             "no projection, nothing to decide"
         );
         assert!(
             matches!(
-                pre_tool_with(&entry, Some(view), None, wait).await,
+                pre_tool_with(&entry, Some(view), SID, None, wait).await,
                 Decision::Deny(_)
             ),
             "a projection with no server address is refused, not let through"
         );
         assert_eq!(
-            pre_tool_with(&read_input("/work/src/main.rs"), Some(view), None, wait).await,
+            pre_tool_with(
+                &read_input("/work/src/main.rs"),
+                Some(view),
+                SID,
+                None,
+                wait
+            )
+            .await,
             Decision::Allow,
             "outside the projection nothing is decided, server or not"
         );
@@ -921,7 +971,7 @@ not json
             }
         });
         let started = std::time::Instant::now();
-        let d = pre_tool_with(&entry, Some(view), Some(&url), wait).await;
+        let d = pre_tool_with(&entry, Some(view), SID, Some(&url), wait).await;
         hold.abort();
         assert!(
             matches!(&d, Decision::Deny(why) if why.contains("did not answer")),

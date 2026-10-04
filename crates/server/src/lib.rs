@@ -229,17 +229,6 @@ impl Memory {
         self
     }
 
-    /// Render the projection again, when there is one. A render that fails is said on
-    /// standard error and does not fail the write that caused it: the record is the
-    /// truth and the projection follows it on the next event.
-    async fn refresh_projection(&self) {
-        if let Some(dir) = &self.projection {
-            if let Err(e) = self.project_into(dir).await {
-                eprintln!("memory: projection at {}: {e}", dir.display());
-            }
-        }
-    }
-
     /// Read without recording: for a report or a tool whose reads are not a session's.
     #[must_use]
     pub fn without_read_log(self) -> Memory {

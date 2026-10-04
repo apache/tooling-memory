@@ -74,6 +74,14 @@ pub struct Projected {
     pub listed: usize,
 }
 
+impl std::ops::AddAssign for Projected {
+    fn add_assign(&mut self, other: Projected) {
+        self.written += other.written;
+        self.removed += other.removed;
+        self.listed += other.listed;
+    }
+}
+
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
     move |source| Error::Io {
         path: path.display().to_string(),
@@ -111,14 +119,26 @@ impl Memory {
     /// An index, store or I/O error, or a path in the projection that is not its own.
     pub async fn project_into(&self, dir: &Path) -> Result<Projected, Error> {
         self.own_below(dir)?;
-        if self.domains().iter().any(|d| d == RECALLS) {
-            return Err(Error::Denied(format!(
-                "a domain named {RECALLS} cannot be projected beside the recall pages"
-            )));
-        }
         let mut done = Projected::default();
+        // a launch's render: what another session left as recall pages is not this
+        // session's to read, and goes
         done.removed += self.sweep_recalls(dir, true)?;
+        done += self.render(dir).await?;
+        Ok(done)
+    }
+
+    /// The domains rendered under `dir`, without touching the recall pages: what a
+    /// write refreshes.
+    async fn render(&self, dir: &Path) -> Result<Projected, Error> {
+        let mut done = Projected::default();
         for domain in self.domains() {
+            if domain == RECALLS {
+                // a domain by that name would sit where the recall pages do
+                eprintln!(
+                    "memory: the domain {RECALLS} is not projected: the name is the recall pages'"
+                );
+                continue;
+            }
             let f = self.filter_for(Some(&domain))?;
             let hits = self.index.lock().await.list(&f, None, usize::MAX / 2)?;
             let dom_dir = dir.join(&domain);
@@ -216,11 +236,21 @@ impl Memory {
     /// bodies as they were served.
     fn sweep_recalls(&self, dir: &Path, keep_own: bool) -> Result<usize, Error> {
         let recalls = dir.join(RECALLS);
-        let Ok(entries) = std::fs::read_dir(&recalls) else {
-            return Ok(0);
-        };
+        match std::fs::symlink_metadata(&recalls) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(io(&recalls)(e)),
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(Error::Denied(format!(
+                    "{} is not a directory of the projection's own",
+                    recalls.display()
+                )))
+            }
+            Ok(_) => {}
+        }
+        let entries = std::fs::read_dir(&recalls).map_err(io(&recalls))?;
         let mut swept = 0;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(io(&recalls))?;
             let path = entry.path();
             let own = entry.file_name() == std::ffi::OsStr::new(&self.session_id);
             if own && keep_own {
@@ -235,6 +265,15 @@ impl Memory {
             swept += 1;
         }
         Ok(swept)
+    }
+
+    /// After a write: the domains rendered again, the recall pages left as they are.
+    pub(crate) async fn refresh_projection(&self) {
+        if let Some(dir) = &self.projection {
+            if let Err(e) = self.render(dir).await {
+                eprintln!("memory: projection at {}: {e}", dir.display());
+            }
+        }
     }
 
     /// After an erasure: every recall page goes, this session's included, and the
@@ -265,8 +304,20 @@ fn write_fresh(dir: &Path, stem: &str, text: &str) -> Result<String, Error> {
             .create_new(true)
             .open(&path)
         {
-            Ok(mut f) => {
-                f.write_all(text.as_bytes()).map_err(io(&path))?;
+            Ok(reserved) => {
+                drop(reserved);
+                // written beside and renamed over the reserved name, so a reader never
+                // sees half a page
+                let tmp = dir.join(format!("{name}.tmp"));
+                let _ = std::fs::remove_file(&tmp);
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+                    .map_err(io(&tmp))?;
+                f.write_all(text.as_bytes()).map_err(io(&tmp))?;
+                drop(f);
+                std::fs::rename(&tmp, &path).map_err(io(&path))?;
                 return Ok(name);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -709,13 +760,72 @@ mod tests {
         m.erase(&secret.id, Reason::Sensitive).await.unwrap();
         assert!(!page.exists(), "an erasure sweeps every recall page");
         assert!(!view.join(RECALLS).join(m.session_id()).exists());
-        // a domain named like the recall directory cannot be projected beside it
+        // a domain named like the recall directory is left out, and the launch goes on
         let clash = Memory::init(&dir.path().join("clash"), "human:test:me", RECALLS)
             .unwrap()
             .without_read_log();
-        assert!(matches!(
-            clash.project_into(&dir.path().join("clash-view")).await,
-            Err(Error::Denied(_))
-        ));
+        let clash_view = dir.path().join("clash-view");
+        let p = clash.project_into(&clash_view).await.unwrap();
+        assert_eq!(p.listed, 0);
+        assert!(!clash_view.join(RECALLS).join(SUMMARIES).exists());
+    }
+
+    #[tokio::test]
+    async fn a_write_keeps_another_session_s_pages_and_the_sweep_follows_no_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let view = dir.path().join("view");
+        let a = Memory::init(&root, "human:test:me", "dom-me")
+            .unwrap()
+            .without_read_log()
+            .with_projection(view.clone());
+        a.write(WriteRequest {
+            body: "First.\n".into(),
+            ..WriteRequest::default()
+        })
+        .await
+        .unwrap();
+        let page_a = view.join(
+            a.recall("first", None, None, crate::recall::Budget::default())
+                .await
+                .unwrap()
+                .projected
+                .unwrap(),
+        );
+        let b = Memory::open(&root)
+            .unwrap()
+            .without_read_log()
+            .with_projection(view.clone());
+        b.project_into(&view).await.unwrap();
+        assert!(
+            !page_a.exists(),
+            "a launch's render sweeps the other session's pages"
+        );
+        let page_b = view.join(
+            b.recall("first", None, None, crate::recall::Budget::default())
+                .await
+                .unwrap()
+                .projected
+                .unwrap(),
+        );
+        a.write(WriteRequest {
+            body: "Second.\n".into(),
+            ..WriteRequest::default()
+        })
+        .await
+        .unwrap();
+        assert!(
+            page_b.exists(),
+            "a write's refresh leaves the other session's pages"
+        );
+        #[cfg(unix)]
+        {
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(outside.join("keep")).unwrap();
+            std::fs::remove_dir_all(view.join(RECALLS)).unwrap();
+            std::os::unix::fs::symlink(&outside, view.join(RECALLS)).unwrap();
+            assert!(matches!(a.project_into(&view).await, Err(Error::Denied(_))));
+            assert!(outside.join("keep").is_dir(), "the sweep followed no link");
+        }
     }
 }
