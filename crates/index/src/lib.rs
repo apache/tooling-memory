@@ -24,6 +24,12 @@ pub enum Error {
     /// SQLite refused or failed.
     #[error("index: {0}")]
     Db(#[from] rusqlite::Error),
+    /// Another connection kept the write-ahead log from being checkpointed, so bytes
+    /// removed from the tables are still in it.
+    #[error(
+        "index: another connection holds the write-ahead log; what was removed is still in it"
+    )]
+    Held,
     /// A row holds something the index did not write. The index is corrupt; rebuild it.
     #[error("index row for {id}: {what}")]
     BadRow {
@@ -238,7 +244,11 @@ impl Index {
     }
 
     fn init(conn: Connection) -> Result<Index, Error> {
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        // secure_delete overwrites what a delete frees, so a removed body does not wait
+        // in a free page for the next write
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;",
+        )?;
         conn.execute_batch(SCHEMA)?;
         Ok(Index { conn })
     }
@@ -313,13 +323,37 @@ impl Index {
     ///
     /// A database error.
     pub fn vacuum(&mut self) -> Result<(), Error> {
-        self.conn.execute_batch(
-            "INSERT INTO entries_fts(entries_fts) VALUES('optimize');
-             PRAGMA wal_checkpoint(TRUNCATE);
-             VACUUM;
-             PRAGMA wal_checkpoint(TRUNCATE);",
-        )?;
-        Ok(())
+        self.conn
+            .execute_batch("INSERT INTO entries_fts(entries_fts) VALUES('optimize');")?;
+        self.checkpoint()?;
+        self.conn.execute_batch("VACUUM;")?;
+        self.checkpoint()
+    }
+
+    /// Fold the write-ahead log into the file and truncate it, waiting a little for a
+    /// reader mid-query; [`Error::Held`] when it still could not, since the log then
+    /// still holds what the tables no longer do.
+    fn checkpoint(&self) -> Result<(), Error> {
+        // a short wait per try: a held log is answered, not waited out
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(200))?;
+        let mut held = true;
+        for _ in 0..5 {
+            let busy: i64 = self
+                .conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+            if busy == 0 {
+                held = false;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        if held {
+            Err(Error::Held)
+        } else {
+            Ok(())
+        }
     }
 
     /// Replace the whole index with what the record holds. One transaction: a reader
@@ -891,5 +925,38 @@ mod tests {
             !bytes.windows(marker.len()).any(|w| w == marker),
             "the removed body is still in the index's files"
         );
+    }
+
+    #[test]
+    fn vacuum_says_so_when_another_connection_keeps_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let marker = b"passphrase-Qz7xx";
+        let mut ix = Index::open(&path).unwrap();
+        let body = format!("The body says {m}.\n", m = String::from_utf8_lossy(marker));
+        ix.upsert(&entry("dom-a", "mem-a-1", "A title", &body))
+            .unwrap();
+        ix.upsert(&entry("dom-a", "mem-a-2", "Other", "kept\n"))
+            .unwrap();
+        // another process, mid-query, holds a read snapshot of the log
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        let mut stmt = reader.prepare("SELECT id FROM entries").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let _first = rows.next().unwrap();
+        assert!(ix.remove("mem-a-1").unwrap());
+        assert!(
+            matches!(ix.vacuum(), Err(Error::Held)),
+            "a vacuum that could not checkpoint the log says so"
+        );
+        drop(rows);
+        drop(stmt);
+        ix.vacuum().unwrap();
+        drop(reader);
+        drop(ix);
+        let bytes = index_bytes(dir.path());
+        assert!(!bytes.windows(marker.len()).any(|w| w == marker));
     }
 }

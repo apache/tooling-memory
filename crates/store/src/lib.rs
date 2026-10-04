@@ -255,44 +255,56 @@ impl Store {
         self.put(&entry).await
     }
 
-    /// Erase an entry: `stub` is written over its current version and over every
-    /// archived one, so no version keeps the body, and nothing is archived on the way.
-    /// Returns what was removed, the current version first, each with the digest of the
-    /// text it had, so a copy met later can be recognised.
+    /// Every version of an entry with the digest of its text, the current one first, as
+    /// an erasure will list them: read before anything is removed, so the receipt can be
+    /// written first.
     ///
     /// # Errors
     ///
     /// [`Error::NotFound`] when there is no such entry, a bad name, or a backend error.
-    pub async fn erase(&self, stub: &Entry) -> Result<Vec<Removed>, Error> {
-        let domain = stub.front.domain.as_str();
-        let id = stub.front.id.as_str();
-        let path = current_path(domain, id)?;
+    pub async fn digests(&self, domain: &str, id: &str) -> Result<Vec<Removed>, Error> {
         let current = self
-            .read_text(&path)
+            .read_text(&current_path(domain, id)?)
             .await?
             .ok_or_else(|| Error::NotFound {
                 domain: domain.to_string(),
                 id: id.to_string(),
             })?;
-        let text = stub.render();
-        let mut removed = vec![Removed {
+        let mut out = vec![Removed {
             version: "current".into(),
             digest: digest(&current),
         }];
-        let dir = history_dir(domain, id)?;
         for version in self.history(domain, id).await? {
-            self.op
-                .write(
-                    &format!("{dir}{}.md", version.name),
-                    text.clone().into_bytes(),
-                )
-                .await?;
-            removed.push(Removed {
+            out.push(Removed {
                 version: version.name,
                 digest: digest(&version.text),
             });
         }
-        self.op.write(&path, text.into_bytes()).await?;
+        Ok(out)
+    }
+
+    /// Erase the entry at `domain` and `id`: `stub` is written over its current version
+    /// and over every archived one, so no version keeps the body, and nothing is
+    /// archived on the way. Returns what was removed, as [`Store::digests`] lists it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when there is no such entry, a bad name, or a backend error.
+    pub async fn erase(&self, domain: &str, id: &str, stub: &Entry) -> Result<Vec<Removed>, Error> {
+        let removed = self.digests(domain, id).await?;
+        let text = stub.render();
+        let dir = history_dir(domain, id)?;
+        for version in removed.iter().skip(1) {
+            self.op
+                .write(
+                    &format!("{dir}{}.md", version.version),
+                    text.clone().into_bytes(),
+                )
+                .await?;
+        }
+        self.op
+            .write(&current_path(domain, id)?, text.into_bytes())
+            .await?;
         Ok(removed)
     }
 
@@ -320,6 +332,34 @@ impl Store {
                 .map(Some)
                 .map_err(|source| Error::Entry { path, source }),
         }
+    }
+
+    /// Every receipt in a domain, by id.
+    ///
+    /// # Errors
+    ///
+    /// A bad name, a backend error, or a receipt that does not parse.
+    pub async fn receipts(&self, domain: &str) -> Result<Vec<Receipt>, Error> {
+        let dir = format!("{RECORD}/{}/{ERASURES}/", valid_name(domain)?);
+        if !self.op.exists(&dir).await? {
+            return Ok(Vec::new());
+        }
+        let mut ids: Vec<String> = self
+            .op
+            .list(&dir)
+            .await?
+            .into_iter()
+            .filter(|e| e.metadata().is_file())
+            .filter_map(|e| e.name().strip_suffix(".yaml").map(str::to_string))
+            .collect();
+        ids.sort();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(r) = self.receipt(domain, &id).await? {
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 
     /// Ids with a current version in a domain, tombstones included, sorted.
@@ -617,6 +657,25 @@ mod tests {
         ));
     }
 
+    /// How many files are under `dir`, and which of them mention `word`.
+    fn files_under(dir: &Path, word: &str) -> (usize, Vec<std::path::PathBuf>) {
+        let (mut files, mut holding) = (0, Vec::new());
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for f in std::fs::read_dir(&d).unwrap().flatten() {
+                if f.path().is_dir() {
+                    stack.push(f.path());
+                } else {
+                    files += 1;
+                    if std::fs::read_to_string(f.path()).unwrap().contains(word) {
+                        holding.push(f.path());
+                    }
+                }
+            }
+        }
+        (files, holding)
+    }
+
     #[tokio::test]
     async fn erasure_writes_the_stub_over_every_version_and_keeps_a_receipt() {
         use dm_core::erasure::{stub, Reason, Receipt};
@@ -635,12 +694,13 @@ mod tests {
             .await
             .unwrap();
         let current = s.get("dom-a", "mem-a-1").await.unwrap().unwrap();
-        let removed = s.erase(&stub(&current, Reason::Mistaken)).await.unwrap();
-        assert_eq!(
-            removed.len(),
-            3,
-            "the current version and two archived ones"
-        );
+        let before = s.digests("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(before.len(), 3, "read before anything is removed");
+        let removed = s
+            .erase("dom-a", "mem-a-1", &stub(&current, Reason::Mistaken))
+            .await
+            .unwrap();
+        assert_eq!(removed, before, "the current version and two archived ones");
         assert_eq!(removed[0].version, "current");
         assert_eq!(removed[0].digest, digest(&current.render()));
         let after = s.get("dom-a", "mem-a-1").await.unwrap().unwrap();
@@ -660,30 +720,24 @@ mod tests {
             unresolved: vec![],
         };
         s.put_receipt(&receipt).await.unwrap();
-        assert_eq!(s.receipt("dom-a", "mem-a-1").await.unwrap(), Some(receipt));
+        assert_eq!(
+            s.receipt("dom-a", "mem-a-1").await.unwrap().as_ref(),
+            Some(&receipt)
+        );
         assert_eq!(s.receipt("dom-a", "mem-a-2").await.unwrap(), None);
+        assert_eq!(s.receipts("dom-a").await.unwrap(), vec![receipt]);
+        assert!(s.receipts("dom-b").await.unwrap().is_empty());
         // the word is in no file under the root, and the other entry is untouched
-        let mut stack = vec![dir.path().to_path_buf()];
-        let mut files = 0;
-        while let Some(d) = stack.pop() {
-            for f in std::fs::read_dir(&d).unwrap().flatten() {
-                if f.path().is_dir() {
-                    stack.push(f.path());
-                } else {
-                    files += 1;
-                    let text = std::fs::read_to_string(f.path()).unwrap();
-                    assert!(!text.contains("secret"), "{}:\n{text}", f.path().display());
-                }
-            }
-        }
+        let (files, holding) = files_under(dir.path(), "secret");
+        assert!(holding.is_empty(), "{holding:?}");
         assert_eq!(
             files, 5,
             "current, two archived, the receipt, the other entry"
         );
         assert_eq!(s.list("dom-a").await.unwrap(), vec!["mem-a-1", "mem-a-2"]);
+        let missing = stub(&entry("dom-a", "mem-a-9", "x\n"), Reason::Legal);
         assert!(matches!(
-            s.erase(&stub(&entry("dom-a", "mem-a-9", "x\n"), Reason::Legal))
-                .await,
+            s.erase("dom-a", "mem-a-9", &missing).await,
             Err(Error::NotFound { .. })
         ));
     }

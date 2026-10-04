@@ -20,6 +20,7 @@ use dm_ledger::{Claim, Created, Ledger, Task, TaskSpec};
 use dm_policy::{Grants, Session};
 use dm_store::Store;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
@@ -365,8 +366,8 @@ impl Memory {
 
     /// One entry, body included, if the filter admits it. Raises the session label.
     /// The index decides admission and the record serves the body, always; a current
-    /// version the record has moved above the session's handling is refused, whatever
-    /// the index row said. When the body is the version a pack pushed to this session,
+    /// version the record has moved above the session's handling, or out of the active
+    /// set, is refused, whatever the index row said. When the body is the version a pack pushed to this session,
     /// the read log says so. Two admitted gets inside one turn mark the session as one
     /// that fans out.
     ///
@@ -386,7 +387,9 @@ impl Memory {
             .get(&meta.hit.domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        if !lock(&self.session).observe(entry.front.classification) {
+        if !lock(&self.session).observe(entry.front.classification)
+            || (!entry.is_active() && !f.include_inactive)
+        {
             self.forget_pushed(id);
             return Err(Error::NotFound(id.to_string()));
         }
@@ -692,16 +695,21 @@ impl Memory {
 
     /// Erase an entry: the body leaves every version in the record and the index, the
     /// stub, the erasure record and the receipt remain. Only the owner may, and only
-    /// once. Entries that cite the erased one are flagged for review today rather than
-    /// re-derived here. The bundles served from this root for the domain are removed,
-    /// since each held a copy; exports already handed out, and the transcripts of
-    /// sessions that read the entry, are beyond reach and the receipt says so.
+    /// once. The receipt is written first, with the versions about to be removed and a
+    /// line saying the erasure has not finished; then the record, the citing entries,
+    /// the index, the served bundles; then the receipt again without that line. A run
+    /// that stops short leaves that receipt, and the next run picks up where it stopped,
+    /// keeping the first run's reason. Entries that cite the erased one are flagged for
+    /// review today rather than re-derived here. Exports already handed out, the
+    /// transcripts of sessions that read the entry, and the queries in the read log are
+    /// beyond reach and the receipt says so.
     ///
     /// # Errors
     ///
     /// [`Error::Denied`] for a session that is not the owner or an entry already
     /// erased, [`Error::NotFound`] for an entry in no granted domain, or a store, index
-    /// or I/O error.
+    /// or I/O error; an index another connection holds is [`dm_index::Error::Held`],
+    /// and the erasure is finished by running it again.
     pub async fn erase(&self, id: &str, reason: Reason) -> Result<Receipt, Error> {
         if self.author != self.grants.owner {
             return Err(Error::Denied(format!(
@@ -710,12 +718,45 @@ impl Memory {
             )));
         }
         let (domain, entry) = self.find(id).await?;
-        if entry.front.status == Some(Status::Erased) {
-            return Err(Error::Denied(format!("{id} is already erased")));
+        let stubbed = entry.front.status == Some(Status::Erased);
+        let mut receipt = match self.store.receipt(&domain, id).await? {
+            Some(r) if r.is_finished() => {
+                return Err(Error::Denied(format!("{id} is already erased")));
+            }
+            Some(unfinished) => unfinished,
+            None => {
+                let removed = if stubbed {
+                    // a stub with no receipt: the versions it replaced are not known
+                    Vec::new()
+                } else {
+                    self.store.digests(&domain, id).await?
+                };
+                let pending = Receipt {
+                    id: id.to_string(),
+                    domain: domain.clone(),
+                    erased_at: OffsetDateTime::now_utc(),
+                    erased_by: self.author.clone(),
+                    reason,
+                    removed,
+                    flagged: Vec::new(),
+                    unresolved: vec![erasure::UNFINISHED.into()],
+                };
+                self.store.put_receipt(&pending).await?;
+                pending
+            }
+        };
+        if !stubbed {
+            let mut stub = erasure::stub(&entry, receipt.reason);
+            stub.front.domain.clone_from(&domain);
+            stub.front.id = id.to_string();
+            self.store.erase(&domain, id, &stub).await?;
         }
-        let stub = erasure::stub(&entry, reason);
-        let removed = self.store.erase(&stub).await?;
-        let flagged = self.flag_citers(id).await?;
+        let stub = self
+            .store
+            .get(&domain, id)
+            .await?
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        receipt.flagged = self.flag_citers(id).await?;
         {
             let mut ix = self.index.lock().await;
             ix.remove(id)?;
@@ -724,19 +765,12 @@ impl Memory {
         }
         self.forget_pushed(id);
         self.drop_bundles(&domain)?;
-        let receipt = Receipt {
-            id: id.to_string(),
-            domain,
-            erased_at: OffsetDateTime::now_utc(),
-            erased_by: self.author.clone(),
-            reason,
-            removed,
-            flagged,
-            unresolved: vec![
-                "exports issued before the erasure".into(),
-                "transcripts of sessions that read it".into(),
-            ],
-        };
+        receipt.unresolved = UNRESOLVED.iter().map(|u| (*u).to_string()).collect();
+        if receipt.removed.is_empty() {
+            receipt
+                .unresolved
+                .push("the versions removed were not recorded: the stub was there first".into());
+        }
         self.store.put_receipt(&receipt).await?;
         Ok(receipt)
     }
@@ -764,7 +798,31 @@ impl Memory {
         }
         Err(Error::NotFound(id.to_string()))
     }
+}
 
+/// What an erasure here cannot reach, named on every receipt so nobody believes it did.
+const UNRESOLVED: &[&str] = &[
+    "exports issued before the erasure",
+    "transcripts of sessions that read it",
+    "search queries and recall questions in the read log",
+    "the history of entries that cite it, and the ledger's handoffs, which are not scanned",
+];
+
+/// Whether `text` names `id`: the whole id, not a prefix of a longer one, and not the
+/// tail of one.
+fn cites(text: &str, id: &str) -> bool {
+    let id_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices(id).any(|(i, _)| {
+        let before = text[..i].chars().next_back().is_none_or(|c| !id_char(c));
+        let after = text[i + id.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !id_char(c));
+        before && after
+    })
+}
+
+impl Memory {
     /// Flag every granted entry that names `id`, in its body, its sources or as the
     /// entry it supersedes: its review date becomes today, so curation re-derives it from
     /// what remains or erases it too. Returns the ids flagged.
@@ -779,10 +837,10 @@ impl Memory {
                 let Some(mut e) = self.store.get(&domain, &other).await? else {
                     continue;
                 };
-                let cites = e.body.contains(id)
-                    || e.front.source.iter().any(|s| s.contains(id))
+                let names_it = cites(&e.body, id)
+                    || e.front.source.iter().any(|s| cites(s, id))
                     || e.front.supersedes.as_deref() == Some(id);
-                if !cites || e.front.status == Some(Status::Erased) {
+                if !names_it || e.front.status == Some(Status::Erased) {
                     continue;
                 }
                 e.front.review_by = Some(today);
@@ -797,15 +855,16 @@ impl Memory {
     /// Remove the bundles served from this root for a domain, at every label, and the
     /// working copies an export in progress leaves beside them.
     fn drop_bundles(&self, domain: &str) -> Result<(), Error> {
-        let dir = self.root.join(bundle::BUNDLES_DIR);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Ok(());
-        };
-        let prefix = format!("{domain}-");
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&prefix) && entry.path().is_dir() {
-                std::fs::remove_dir_all(entry.path()).map_err(io(&entry.path()))?;
+        for label in [Label::Public, Label::Internal, Label::Restricted] {
+            let dir = bundle::bundle_dir(&self.root, domain, label);
+            let name = dir.file_name().unwrap_or_default().to_os_string();
+            for suffix in ["", ".new", ".old"] {
+                let mut n = name.clone();
+                n.push(suffix);
+                let path = dir.with_file_name(n);
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path).map_err(io(&path))?;
+                }
             }
         }
         Ok(())
@@ -830,6 +889,13 @@ impl Memory {
             .map(|d| d.default_classification)
             .unwrap_or_default();
         let mut ix = self.index.lock().await;
+        let erased: HashSet<String> = self
+            .store
+            .receipts(&domain)
+            .await?
+            .into_iter()
+            .flat_map(|r| r.removed.into_iter().map(|v| v.digest))
+            .collect();
         Ok(bundle::import(
             &self.store,
             &mut ix,
@@ -837,6 +903,7 @@ impl Memory {
             src,
             &domain,
             default,
+            &erased,
         )
         .await?)
     }
@@ -1259,11 +1326,11 @@ mod tests {
 
     const MARKER: &str = "passphrase-Qz7xx";
 
-    /// A root with a secret entry, an entry citing it, an unrelated one and a served
-    /// bundle holding a copy; the ids in that order, and the bundle's directory.
-    async fn vault(dir: &Path) -> (Memory, [String; 3], PathBuf) {
+    /// A root with a secret entry, an entry citing it in its body, an unrelated one, one
+    /// citing it as a source, one superseding it, and a served bundle holding a copy;
+    /// the ids in that order, and the bundle's directory. The read log stays on.
+    async fn vault(dir: &Path) -> (Memory, [String; 5], PathBuf) {
         let m = mem(dir);
-        m.disable_read_log();
         let a = m
             .write(req(&format!("The vault opens with {MARKER}.\n")))
             .await
@@ -1273,20 +1340,33 @@ mod tests {
             .await
             .unwrap();
         let c = m.write(req("Unrelated, and stays so.\n")).await.unwrap();
+        let d = m
+            .write(WriteRequest {
+                source: vec![a.id.clone()],
+                ..req("Distilled from the vault entry.\n")
+            })
+            .await
+            .unwrap();
+        let e = m
+            .write(WriteRequest {
+                supersedes: Some(a.id.clone()),
+                ..req("The vault now opens otherwise.\n")
+            })
+            .await
+            .unwrap();
         let bundle = bundle::bundle_dir(dir, "dom-me", Label::Internal);
         m.export(Some("dom-me"), Label::Internal, &bundle)
             .await
             .unwrap();
         assert!(bundle.join(format!("{}.md", a.id)).is_file());
-        (m, [a.id, b.id, c.id], bundle)
+        (m, [a.id, b.id, c.id, d.id, e.id], bundle)
     }
 
     #[tokio::test]
     async fn only_the_owner_erases_and_only_an_entry_that_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let (m, [a, _, _], _) = vault(dir.path()).await;
+        let (m, [a, ..], _) = vault(dir.path()).await;
         let agent = Memory::open(dir.path()).unwrap().with_author("agent:x");
-        agent.disable_read_log();
         assert!(
             matches!(
                 agent.erase(&a, Reason::Requested).await,
@@ -1298,7 +1378,11 @@ mod tests {
             m.erase("mem-me-nothere", Reason::Requested).await,
             Err(Error::NotFound(_))
         ));
-        assert!(m.get(&a).await.is_ok(), "a refused erasure changes nothing");
+        let kept = m.store.get("dom-me", &a).await.unwrap().unwrap();
+        assert!(
+            kept.body.contains(MARKER),
+            "a refused erasure changes nothing"
+        );
     }
 
     #[tokio::test]
@@ -1306,21 +1390,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (m, ids, bundle) = vault(dir.path()).await;
         let marker = MARKER;
-        let (a, b, c) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        let [a, b, c, d, e] = ids;
         let r = m.erase(&a, Reason::Requested).await.unwrap();
         assert_eq!((r.id.as_str(), r.domain.as_str()), (a.as_str(), "dom-me"));
         assert_eq!(r.reason, Reason::Requested);
         assert_eq!(r.erased_by, "human:test:me");
-        assert_eq!(r.removed.len(), 1);
+        assert_eq!(
+            r.removed.len(),
+            2,
+            "the current version and the one superseding archived"
+        );
         assert_eq!(r.removed[0].version, "current");
-        assert_eq!(r.flagged, vec![b.clone()], "the citing entry is flagged");
+        let mut flagged = r.flagged.clone();
+        flagged.sort();
+        let mut citing = vec![b.clone(), d.clone(), e.clone()];
+        citing.sort();
+        assert_eq!(flagged, citing, "body, source and supersedes all cite");
         assert!(r.unresolved.iter().any(|u| u.contains("exports")));
 
         assert!(
             matches!(m.get(&a).await, Err(Error::NotFound(_))),
             "the stub is not an active entry"
         );
-        assert!(m.search(marker, None, 10).await.unwrap().is_empty());
+        let hits = m.search("vault", None, 10).await.unwrap();
+        assert!(
+            hits.iter()
+                .all(|h| h.id != a && !h.summary.contains(marker)),
+            "{hits:?}"
+        );
         assert!(m
             .search("vault", None, 10)
             .await
@@ -1360,6 +1457,121 @@ mod tests {
         for (path, bytes) in files_under(dir.path()) {
             assert!(
                 !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                "{} still holds the erased body",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_citation_is_the_whole_id_not_a_prefix_of_a_longer_one() {
+        assert!(cites("See mem-me-e52gu4j6.", "mem-me-e52gu4j6"));
+        assert!(cites("(mem-me-e52gu4j6)", "mem-me-e52gu4j6"));
+        assert!(cites("mem-me-e52gu4j6", "mem-me-e52gu4j6"));
+        assert!(!cites("See mem-me-e52gu4j6zz.", "mem-me-e52gu4j6"));
+        assert!(!cites("xmem-me-e52gu4j6", "mem-me-e52gu4j6"));
+        assert!(!cites("nothing here", "mem-me-e52gu4j6"));
+    }
+
+    #[tokio::test]
+    async fn an_older_bundle_cannot_bring_an_erased_body_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let (m, [a, ..], _) = vault(&root).await;
+        let handed_out = dir.path().join("handed-out");
+        m.export(Some("dom-me"), Label::Internal, &handed_out)
+            .await
+            .unwrap();
+        m.erase(&a, Reason::Requested).await.unwrap();
+        let im = m.import(&handed_out, Some("dom-me")).await.unwrap();
+        assert_eq!(im.erased, vec![a.clone()], "{im:?}");
+        assert!(!im.written.contains(&a));
+        let hits = m.search("vault", None, 10).await.unwrap();
+        assert!(hits.iter().all(|h| !h.summary.contains(MARKER)), "{hits:?}");
+        drop(m);
+        for (path, bytes) in files_under(&root) {
+            assert!(
+                !bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+                "{} holds the erased body after the import",
+                path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_record_s_status_wins_over_the_index_s_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let w = m.write(req("Still indexed as active.\n")).await.unwrap();
+        // the record moves on without the index: another process demoted it
+        m.store.demote("dom-me", &w.id).await.unwrap();
+        assert!(
+            matches!(m.get(&w.id).await, Err(Error::NotFound(_))),
+            "an inactive record is not served because the index is behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_erasure_refused_before_the_record_step_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, [a, ..], _) = vault(dir.path()).await;
+        // the receipt cannot be written: the erasures directory is a file
+        std::fs::write(dir.path().join("record/dom-me/.erasures"), "x").unwrap();
+        assert!(m.erase(&a, Reason::Legal).await.is_err());
+        let still = m.store.get("dom-me", &a).await.unwrap().unwrap();
+        assert!(still.body.contains(MARKER), "nothing was removed");
+        assert!(
+            !matches!(m.receipt(&a).await, Ok(Some(_))),
+            "no receipt was written"
+        );
+        std::fs::remove_file(dir.path().join("record/dom-me/.erasures")).unwrap();
+        let r = m.erase(&a, Reason::Legal).await.unwrap();
+        assert!(r.is_finished(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn an_erasure_that_stops_short_finishes_on_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, [a, ..], bundle) = vault(dir.path()).await;
+        // another process is mid-query on the index, so its log cannot be checkpointed
+        let reader = rusqlite::Connection::open(dir.path().join(INDEX_FILE)).unwrap();
+        let mut stmt = reader.prepare("SELECT id FROM entries").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let _first = rows.next().unwrap();
+        let first = m.erase(&a, Reason::Sensitive).await;
+        assert!(
+            matches!(first, Err(Error::Index(dm_index::Error::Held))),
+            "{first:?}"
+        );
+        drop(rows);
+        drop(stmt);
+        drop(reader);
+        assert!(
+            matches!(m.get(&a).await, Err(Error::NotFound(_))),
+            "the stub is not served"
+        );
+        let pending = m.receipt(&a).await.unwrap().unwrap();
+        assert!(!pending.is_finished(), "{pending:?}");
+        assert_eq!(pending.removed.len(), 2);
+        assert!(bundle.exists(), "the bundle step had not run");
+        let again = m.erase(&a, Reason::Legal).await.unwrap();
+        assert!(again.is_finished(), "{again:?}");
+        assert_eq!(
+            again.reason,
+            Reason::Sensitive,
+            "the first run's reason stands"
+        );
+        assert_eq!(again.removed, pending.removed);
+        assert!(!bundle.exists());
+        assert!(matches!(
+            m.erase(&a, Reason::Legal).await,
+            Err(Error::Denied(_))
+        ));
+        drop(m);
+        for (path, bytes) in files_under(dir.path()) {
+            assert!(
+                !bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
                 "{} still holds the erased body",
                 path.display()
             );

@@ -14,6 +14,7 @@ use dm_core::manifest::{Manifest, ManifestEntry};
 use dm_core::{digest, Entry, Label, ReadFilter, TrustTier};
 use dm_index::{Hit, Index};
 use dm_store::Store;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// What can go wrong at the bundle boundary.
@@ -62,6 +63,9 @@ pub struct Imported {
     pub written: Vec<String>,
     /// Ids skipped because their origin was already in the index.
     pub skipped: Vec<String>,
+    /// Ids refused because their text was erased from this domain: the receipt kept the
+    /// digest, and a bundle from before the erasure still carries the body.
+    pub erased: Vec<String>,
 }
 
 /// Where the binary keeps the bundles it serves, under the root's state.
@@ -138,7 +142,9 @@ pub async fn export(
 }
 
 /// Import a bundle from `src` into `into_domain`. `owner` is this record's owner; a bundle
-/// the same owner exported keeps its trust tiers, every other bundle lands at raw.
+/// the same owner exported keeps its trust tiers, every other bundle lands at raw. An
+/// entry whose text's digest is in `erased`, what this domain's receipts list as removed,
+/// is refused and named rather than written back.
 ///
 /// # Errors
 ///
@@ -151,6 +157,7 @@ pub async fn import(
     src: &Path,
     into_domain: &str,
     default_classification: Label,
+    erased: &HashSet<String>,
 ) -> Result<Imported, Error> {
     let mpath = src.join("manifest.yaml");
     let mtext = std::fs::read_to_string(&mpath).map_err(io(&mpath))?;
@@ -165,7 +172,9 @@ pub async fn import(
     let same_owner = manifest.exported_by == owner;
 
     // Pass one: every path and digest, before anything is written. A bundle with one bad
-    // entry is refused whole, so a partial import never happens.
+    // entry is refused whole, so a partial import never happens. Text this domain erased
+    // is known by its digest and is not an error: the bundle is older than the erasure.
+    let mut out = Imported::default();
     let mut checked: Vec<Entry> = Vec::with_capacity(manifest.entries.len());
     for m in &manifest.entries {
         if m.path.contains(['/', '\\']) || m.path.starts_with('.') || m.path.is_empty() {
@@ -182,11 +191,14 @@ pub async fn import(
                 m.path
             )));
         }
+        if erased.contains(&m.digest) {
+            out.erased.push(m.id.clone());
+            continue;
+        }
         checked.push(Entry::parse(&text)?);
     }
 
     // Pass two: land what is new.
-    let mut out = Imported::default();
     for mut entry in checked {
         let origin = entry.front.origin.clone().unwrap_or_else(|| {
             format!(

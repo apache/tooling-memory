@@ -53,12 +53,17 @@ impl std::fmt::Display for Reason {
 
 /// The stub that stands where the entry was: its frontmatter with no body, no summary,
 /// and `status: erased`. When the erasure was asked for by the person it concerns, the
-/// stub keeps neither the author nor the sources, since those are about that person too.
+/// stub keeps neither the author nor the sources, since those are about that person too;
+/// the title goes with them, and goes too when the material was above what the record
+/// may hold, since a title says what the body said.
 #[must_use]
 pub fn stub(entry: &Entry, reason: Reason) -> Entry {
     let mut front = entry.front.clone();
     front.status = Some(Status::Erased);
     front.summary = None;
+    if matches!(reason, Reason::Requested | Reason::Sensitive) {
+        front.title = None;
+    }
     if reason == Reason::Requested {
         front.author = "erased".into();
         front.source.clear();
@@ -102,7 +107,19 @@ pub struct Receipt {
     pub unresolved: Vec<String>,
 }
 
+/// The line a receipt carries while an erasure has not finished: the record step is done
+/// and the rest is owed. Running the erasure again finishes it and drops the line.
+pub const UNFINISHED: &str =
+    "the index, the served bundles and the citing entries: the erasure did not finish; run it again";
+
 impl Receipt {
+    /// Whether every step ran; a receipt written between the record step and the rest
+    /// says so in `unresolved`.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        !self.unresolved.iter().any(|u| u == UNFINISHED)
+    }
+
     /// The receipt as the record keeps it.
     ///
     /// # Panics
@@ -126,6 +143,24 @@ impl Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_receipt_knows_whether_it_finished() {
+        let mut r = Receipt {
+            id: "mem-me-1".into(),
+            domain: "dom-me".into(),
+            erased_at: OffsetDateTime::UNIX_EPOCH,
+            erased_by: "human:test:me".into(),
+            reason: Reason::Legal,
+            removed: vec![],
+            flagged: vec![],
+            unresolved: vec![],
+        };
+        assert!(r.is_finished());
+        r.unresolved.push(UNFINISHED.into());
+        assert!(!r.is_finished());
+        assert!(!Receipt::from_yaml(&r.to_yaml()).unwrap().is_finished());
+    }
 
     #[test]
     fn a_receipt_round_trips_and_reasons_parse() {
@@ -153,19 +188,23 @@ mod tests {
 
     #[test]
     fn a_stub_keeps_the_frontmatter_and_nothing_the_body_said() {
-        let text = "---\nid: mem-me-1\ntype: fact\ndomain: dom-me\nauthor: human:test:me\ncreated: 2026-10-01T10:00:00Z\nsource:\n- https://example.test/x\nsummary: the secret summary\n---\nThe secret body.\n";
+        let text = "---\nid: mem-me-1\ntype: fact\ndomain: dom-me\nauthor: human:test:me\ncreated: 2026-10-01T10:00:00Z\nsource:\n- https://example.test/x\nsummary: the secret summary\ntitle: Alice's diagnosis\n---\nThe secret body.\n";
         let e = Entry::parse(text).unwrap();
-        let s = stub(&e, Reason::Sensitive);
+        let s = stub(&e, Reason::Mistaken);
         assert_eq!(s.front.status, Some(Status::Erased));
         assert_eq!(s.body, "");
         assert_eq!(s.front.summary, None);
         assert_eq!(s.front.author, "human:test:me");
         assert_eq!(s.front.source.len(), 1);
+        assert_eq!(s.front.title.as_deref(), Some("Alice's diagnosis"));
         let rendered = s.render();
         assert!(!rendered.contains("secret"), "{rendered}");
         assert_eq!(Entry::parse(&rendered).unwrap(), s, "a stub round-trips");
         let r = stub(&e, Reason::Requested);
         assert_eq!(r.front.author, "erased");
         assert!(r.front.source.is_empty());
+        assert_eq!(r.front.title, None, "a title is about the person too");
+        assert_eq!(stub(&e, Reason::Sensitive).front.title, None);
+        assert!(stub(&e, Reason::Legal).front.title.is_some());
     }
 }

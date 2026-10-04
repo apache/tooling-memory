@@ -2159,9 +2159,10 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         Command::Import { src, domain } => {
             let im = m.import(&src, domain.as_deref()).await?;
             println!(
-                "imported {} entries, skipped {} already present",
+                "imported {} entries, skipped {} already present, refused {} erased here",
                 im.written.len(),
-                im.skipped.len()
+                im.skipped.len(),
+                im.erased.len()
             );
             Ok(())
         }

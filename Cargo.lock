@@ -860,6 +860,7 @@ dependencies = [
  "dm-policy",
  "dm-store",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
