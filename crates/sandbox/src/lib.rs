@@ -570,6 +570,8 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
     };
 
     let mut env = base_env(req.harness_env);
+    // the memory server's address, for the hooks as for the harness
+    env.insert("MEMORY_MCP_URL".into(), format!("{relay}/mcp"));
     projection_env(req, &mut env);
     let (mounts, extra_path) = match req.rootfs {
         Some(rootfs) => {
@@ -1315,6 +1317,10 @@ mod tests {
             "the launcher's own directory, not the home the harness writes"
         );
         assert_eq!(plan.env["MEMORY_PROJECTION"], INSIDE_PROJECTION);
+        assert_eq!(
+            plan.env["MEMORY_MCP_URL"], "http://127.0.0.1:4100/mcp",
+            "the hook needs the server's address to turn an open into a get"
+        );
         let settings = json_file(&home.join(".claude/settings.json"));
         assert_eq!(
             settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],

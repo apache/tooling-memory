@@ -216,7 +216,7 @@ fn harness_run_args(
     n: usize,
     image: &str,
     volume: &str,
-    root_m: &str,
+    projection_m: Option<&str>,
     home_m: &str,
     work_m: &str,
 ) -> Vec<String> {
@@ -232,10 +232,12 @@ fn harness_run_args(
     a.push(format!("{home_m}:{INSIDE_HOME}"));
     a.push("-v".into());
     a.push(format!("{work_m}:{INSIDE_WORK}"));
-    if let Some(projection) = &req.projection {
+    // the projection's path is the host's own, from the launch, never the request's:
+    // the request file sits in a volume the harness container can write
+    if let Some(projection_m) = projection_m {
         a.push("-v".into());
         a.push(format!(
-            "{root_m}/{projection}:{}:ro",
+            "{projection_m}:{}:ro",
             dm_sandbox::INSIDE_PROJECTION
         ));
     }
@@ -261,20 +263,9 @@ fn harness_run_args(
     a
 }
 
-/// Run a launch through WSL containers. Returns the exit code the inside reports.
-///
-/// # Errors
-///
-/// When `wslc` is not there, the image is missing, or a container cannot be started.
-pub fn run(l: &Launch) -> Fallible<i32> {
-    let pid = std::process::id();
-    let volume = format!("memory-run-{pid}");
-    let egress = format!("memory-egress-{pid}");
-    let root_m = mount_path(&l.root)?;
-    let work_m = mount_path(&l.workdir)?;
-    let home_dir = l.root.join("state/sandbox").join(l.harness.binary());
-    std::fs::create_dir_all(&home_dir)?;
-    let home_m = mount_path(&home_dir)?;
+/// The host home's mount path and the login directories under it that a subscription
+/// mode copies from, when there are any; nothing else of the host home is mounted.
+fn host_logins() -> Fallible<(Option<String>, Vec<String>)> {
     let host_home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from);
@@ -292,6 +283,32 @@ pub fn run(l: &Launch) -> Fallible<i32> {
         Some(h) if !login_dirs.is_empty() => Some(mount_path(h)?),
         _ => None,
     };
+    Ok((host_home_m, login_dirs))
+}
+
+/// The projection's mount path, from the launch and the host's own view of the root,
+/// when the launcher rendered one.
+fn projection_mount(l: &Launch) -> Fallible<Option<String>> {
+    let dir = l.root.join(dm_sandbox::PROJECTION).join(l.harness.binary());
+    dir.is_dir().then(|| mount_path(&dir)).transpose()
+}
+
+/// Run a launch through WSL containers. Returns the exit code the inside reports.
+///
+/// # Errors
+///
+/// When `wslc` is not there, the image is missing, or a container cannot be started.
+pub fn run(l: &Launch) -> Fallible<i32> {
+    let pid = std::process::id();
+    let volume = format!("memory-run-{pid}");
+    let egress = format!("memory-egress-{pid}");
+    let root_m = mount_path(&l.root)?;
+    let work_m = mount_path(&l.workdir)?;
+    let home_dir = l.root.join("state/sandbox").join(l.harness.binary());
+    std::fs::create_dir_all(&home_dir)?;
+    let home_m = mount_path(&home_dir)?;
+    let projection_m = projection_mount(l)?;
+    let (host_home_m, login_dirs) = host_logins()?;
 
     let (extra, network) = if l.auth == AuthMode::Gateway {
         let key = gateway_up(&l.root)?;
@@ -324,7 +341,14 @@ pub fn run(l: &Launch) -> Fallible<i32> {
             .args(["logs", "-f", &egress])
             .stdin(Stdio::null())
             .spawn()?;
-        let code = drive(&egress, &volume, &l.image, &root_m, &home_m, &work_m);
+        let code = drive(
+            &egress,
+            &volume,
+            &l.image,
+            projection_m.as_deref(),
+            &home_m,
+            &work_m,
+        );
         logs.kill().ok();
         logs.wait().ok();
         code
@@ -452,7 +476,7 @@ fn drive(
     egress: &str,
     volume: &str,
     image: &str,
-    root_m: &str,
+    projection_m: Option<&str>,
     home_m: &str,
     work_m: &str,
 ) -> Fallible<i32> {
@@ -493,7 +517,7 @@ fn drive(
                 &format!("{REQUEST_DIR_INSIDE}/{req_name}"),
             ]))?;
             let req: RunRequest = serde_json::from_str(&text)?;
-            let args = harness_run_args(&req, n, image, volume, root_m, home_m, work_m);
+            let args = harness_run_args(&req, n, image, volume, projection_m, home_m, work_m);
             // the harness's terminal is ours; its exit code goes to the inside via the volume
             Command::new(wslc()).args(&args).status()?;
             n += 1;
@@ -524,7 +548,6 @@ mod tests {
             ]),
             cwd: "/work".into(),
             home: "state/sandbox/claude".into(),
-            projection: Some("state/projection/claude".into()),
             interactive,
         }
     }
@@ -536,15 +559,15 @@ mod tests {
             3,
             "img:dev",
             "vol",
-            r"\\wsl.localhost\U\home\me\memory",
+            Some(r"\\wsl.localhost\U\home\me\memory\state\projection\claude"),
             r"\\wsl.localhost\U\home\me\memory\state\sandbox\claude",
             r"\\wsl.localhost\U\home\me\proj",
         );
         let joined = a.join(" ");
         assert!(joined.contains("--network none"), "{joined}");
         assert!(
-            joined.contains(r"\memory/state/projection/claude:/memory:ro"),
-            "the projection is mounted read-only: {joined}"
+            joined.contains(r"\projection\claude:/memory:ro"),
+            "the projection is mounted read-only, from the host's own path: {joined}"
         );
         assert!(joined.contains("-u 1000:1000"), "{joined}");
         assert!(joined.contains("vol:/run/memory"), "{joined}");
@@ -556,9 +579,7 @@ mod tests {
         );
         assert!(a.contains(&"-i".to_string()) && !a.contains(&"-it".to_string()));
         assert_eq!(&a[a.len() - 6..], &request(false).argv[..]);
-        let mut without = request(true);
-        without.projection = None;
-        let a = harness_run_args(&without, 0, "img:dev", "vol", "r", "h", "w");
+        let a = harness_run_args(&request(true), 0, "img:dev", "vol", None, "h", "w");
         assert!(
             !a.join(" ").contains(":/memory"),
             "nothing rendered, nothing mounted"

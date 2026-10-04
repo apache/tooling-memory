@@ -127,8 +127,16 @@ where
         return Decision::Allow;
     };
     let projection = normalise(projection);
-    let covers = searches(tool) && projection.starts_with(&path);
-    if !path.starts_with(&projection) && !covers {
+    // a search over an absolute ancestor of the projection covers it; a relative path
+    // is the working tree's, which does not hold the projection
+    let covers = searches(tool) && path.is_absolute() && projection.starts_with(&path);
+    // a search by pattern reaches wherever the pattern says, whatever its path says
+    let by_pattern = searches(tool)
+        && input
+            .get("pattern")
+            .and_then(Value::as_str)
+            .is_some_and(|pat| pat.contains(projection.to_string_lossy().as_ref()));
+    if !path.starts_with(&projection) && !covers && !by_pattern {
         return Decision::Allow;
     }
     let whole = format!(
@@ -158,30 +166,54 @@ where
     }
 }
 
-/// The PreToolUse hook: decide against the projection the environment names, reaching
-/// the memory server at the MCP URL the environment names. With neither set there is
-/// no projection and nothing to decide.
-async fn pre_tool(input: &HookInput) -> Decision {
-    let (Some(projection), Some(url)) = (
-        std::env::var_os("MEMORY_PROJECTION").map(PathBuf::from),
-        std::env::var("MEMORY_MCP_URL").ok(),
-    ) else {
+/// How long the hook waits for the memory server before it refuses: inside the hook's
+/// own timeout, so a stalled relay is a refusal and not a read let through.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The PreToolUse hook against `projection`, reaching the memory server at `url` and
+/// waiting `wait` for it. No projection, nothing to decide. A projection with no
+/// server, a server that does not answer in time, or one that refuses are all
+/// refusals: the hook fails closed.
+async fn pre_tool_with(
+    input: &HookInput,
+    projection: Option<&Path>,
+    url: Option<&str>,
+    wait: std::time::Duration,
+) -> Decision {
+    let Some(projection) = projection else {
         return Decision::Allow;
     };
     let tool = input.tool_name.clone().unwrap_or_default();
     // the id to fetch is decided first, then fetched: the decision is pure, the fetch is not
     let mut wanted: Option<String> = None;
-    let d = decide(&tool, &input.tool_input, &projection, |id| {
+    let d = decide(&tool, &input.tool_input, projection, |id| {
         wanted = Some(id.to_string());
         Ok(())
     });
     let Some(id) = wanted else {
         return d;
     };
-    match crate::mcp_http::call_tool(&url, "get", serde_json::json!({ "id": id })).await {
-        Ok(_) => Decision::Allow,
-        Err(why) => decide(&tool, &input.tool_input, &projection, |_| Err(why)),
+    let Some(url) = url else {
+        return decide(&tool, &input.tool_input, projection, |_| {
+            Err("the memory server's address is not set, so nothing here can be read".into())
+        });
+    };
+    let call = crate::mcp_http::call_tool(url, "get", serde_json::json!({ "id": id }));
+    match tokio::time::timeout(wait, call).await {
+        Ok(Ok(_)) => Decision::Allow,
+        Ok(Err(why)) => decide(&tool, &input.tool_input, projection, |_| Err(why)),
+        Err(_) => decide(&tool, &input.tool_input, projection, |_| {
+            Err(format!("the memory server did not answer within {wait:?}"))
+        }),
     }
+}
+
+/// The PreToolUse hook as the sandbox runs it: the projection and the server's address
+/// come from the environment the launcher set.
+async fn pre_tool(input: &HookInput) -> Decision {
+    let projection = std::env::var_os("MEMORY_PROJECTION").map(PathBuf::from);
+    let url = std::env::var("MEMORY_MCP_URL").ok();
+    pre_tool_with(input, projection.as_deref(), url.as_deref(), WAIT).await
 }
 
 /// Why a note was left; part of its filename so the launcher can tell them apart.
@@ -683,10 +715,25 @@ not json
                 );
             }
         }
+        // what the second pass got through: a pattern reaching the projection beside a
+        // path that does not
+        for input in [
+            serde_json::json!({ "pattern": "/memory/**/*.md", "path": "/work" }),
+            serde_json::json!({ "pattern": "../memory/**/*.md", "path": "/work" }),
+        ] {
+            assert!(
+                matches!(decide("Glob", &input, view, |_| Ok(())), Decision::Deny(_)),
+                "{input}"
+            );
+        }
         for input in [
             serde_json::json!({ "pattern": "key", "path": "/work" }),
             serde_json::json!({ "pattern": "key" }),
             serde_json::json!({ "pattern": "**/*.md", "path": "/memor" }),
+            // Claude Code's own spelling of the working tree, and its parent
+            serde_json::json!({ "pattern": "key", "path": "." }),
+            serde_json::json!({ "pattern": "key", "path": ".." }),
+            serde_json::json!({ "pattern": "key", "path": "./src" }),
         ] {
             assert_eq!(
                 decide("Grep", &input, view, |_| Ok(())),
@@ -694,5 +741,55 @@ not json
                 "beside the projection, or in the working tree: {input}"
             );
         }
+    }
+
+    fn read_input(p: &str) -> HookInput {
+        serde_json::from_str(&format!(
+            r#"{{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{{"file_path":"{p}"}}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_hook_fails_closed_without_a_server_or_without_an_answer() {
+        let view = Path::new("/memory");
+        let entry = read_input("/memory/dom-me/mem-me-abc1.md");
+        let wait = std::time::Duration::from_millis(200);
+        assert_eq!(
+            pre_tool_with(&entry, None, None, wait).await,
+            Decision::Allow,
+            "no projection, nothing to decide"
+        );
+        assert!(
+            matches!(
+                pre_tool_with(&entry, Some(view), None, wait).await,
+                Decision::Deny(_)
+            ),
+            "a projection with no server address is refused, not let through"
+        );
+        assert_eq!(
+            pre_tool_with(&read_input("/work/src/main.rs"), Some(view), None, wait).await,
+            Decision::Allow,
+            "outside the projection nothing is decided, server or not"
+        );
+        // a server that accepts and never answers
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let hold = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            loop {
+                if let Ok((s, _)) = listener.accept().await {
+                    kept.push(s);
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        let d = pre_tool_with(&entry, Some(view), Some(&url), wait).await;
+        hold.abort();
+        assert!(
+            matches!(&d, Decision::Deny(why) if why.contains("did not answer")),
+            "{d:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

@@ -1107,7 +1107,7 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     let config = dm_web::Config {
         root: root.to_path_buf(),
         memory_binary: std::env::current_exe()?,
-        workdir: resolve_workdir(workdir)?,
+        workdir: resolve_workdir(root, workdir)?,
         harness: Harness::from(harness).binary().to_string(),
         auth: match AuthMode::from(auth) {
             AuthMode::Subscription => "subscription",
@@ -1300,7 +1300,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     else {
         unreachable!("routed by launch_cmd")
     };
-    let workdir = resolve_workdir(workdir)?;
+    let workdir = resolve_workdir(root, workdir)?;
     if backend_of(backend, unconfined, root) == Backend::Wslc {
         let inside_args =
             inside_args_for_launch(prompt.as_deref(), prompt_file.as_deref(), no_handoff, &args)?;
@@ -1362,7 +1362,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
     else {
         unreachable!("routed by launch_cmd")
     };
-    let workdir = resolve_workdir(workdir)?;
+    let workdir = resolve_workdir(root, workdir)?;
     if backend_of(backend, unconfined, root) == Backend::Wslc {
         let mut inside_args = vec!["--work".to_string()];
         if let Some(d) = &domain {
@@ -1505,12 +1505,29 @@ fn inside_args_for_launch(
     Ok(inside_args)
 }
 
-fn resolve_workdir(workdir: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// The working tree, canonical. A tree that holds the record root is refused: the tree
+/// is mounted read-write, and the root, its state and its projection are the
+/// launcher's alone.
+fn resolve_workdir(
+    root: &Path,
+    workdir: Option<PathBuf>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let w = match workdir {
         Some(w) => w,
         None => std::env::current_dir()?,
     };
-    Ok(std::fs::canonicalize(&w)?)
+    let w = std::fs::canonicalize(&w)?;
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if root.starts_with(&w) {
+        return Err(format!(
+            "the working tree {} holds the record root {}; run from another directory or \
+             pass --workdir",
+            w.display(),
+            root.display()
+        )
+        .into());
+    }
+    Ok(w)
 }
 
 /// Which backend a launch resolves to.
@@ -1872,13 +1889,6 @@ impl Session {
             env: plan.env,
             cwd: plan.cwd.display().to_string(),
             home: home_rel,
-            projection: self
-                .p
-                .projection
-                .strip_prefix(&self.p.root)
-                .ok()
-                .filter(|_| self.p.projection.is_dir())
-                .map(|p| p.to_string_lossy().replace('\\', "/")),
             interactive: !capture,
         };
         let tmp = r.dir.join(format!("{}.tmp", requests::RunRequest::file(n)));

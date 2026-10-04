@@ -26,10 +26,6 @@ pub struct RunRequest {
     /// The private home, relative to the record root, for the host to mount at
     /// `/home/user`.
     pub home: String,
-    /// The record's projection, relative to the record root, for the host to mount
-    /// read-only at `/memory`; absent when none was rendered.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projection: Option<String>,
     /// Attached to the terminal, or run with its output captured.
     pub interactive: bool,
 }
@@ -65,7 +61,6 @@ mod tests {
             env: BTreeMap::new(),
             cwd: "/work".into(),
             home: "state/sandbox/claude".into(),
-            projection: None,
             interactive: true,
         };
         let back: RunRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
