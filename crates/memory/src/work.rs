@@ -122,12 +122,19 @@ pub async fn interactive(session: &Session, args: &[String]) -> Fallible<i32> {
 /// # Errors
 ///
 /// When the harness cannot be run or the memory server cannot be reached.
-pub async fn prompted(session: &Session, prompt: &str, no_handoff: bool) -> Fallible<i32> {
+pub async fn prompted(
+    session: &Session,
+    prompt: &str,
+    args: &[String],
+    no_handoff: bool,
+) -> Fallible<i32> {
     let client = client(session.memory()).await?;
     let before = handoff_ids(&client, None).await?;
-    let (code, output) = session
-        .run(&session.harness().headless(prompt), true)
-        .await?;
+    // the harness's own arguments follow its headless form, where every harness takes
+    // a flag after the prompt
+    let mut argv = session.harness().headless(prompt);
+    argv.extend(args.iter().cloned());
+    let (code, output) = session.run(&argv, true).await?;
     if let Some(out) = &output {
         print!("{out}");
         if !out.ends_with('\n') {

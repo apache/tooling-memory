@@ -14,6 +14,8 @@ use time::OffsetDateTime;
 pub struct SessionTotals {
     /// The memory session id.
     pub session: String,
+    /// Whether any of it was reported by the harness rather than observed by the egress.
+    pub reported: bool,
     /// How many calls.
     pub calls: u64,
     /// Summed input tokens, cache reads excluded.
@@ -43,6 +45,9 @@ pub struct Totals {
     pub destination: String,
     /// The model the provider reported, or "?" when it did not.
     pub model: String,
+    /// Who counted: [`SOURCE_EGRESS`] for calls the proxy saw, [`SOURCE_HARNESS`]
+    /// for what the harness reported about a tunnelled login.
+    pub source: String,
     /// How many calls.
     pub calls: u64,
     /// Summed input tokens.
@@ -76,6 +81,24 @@ CREATE TABLE IF NOT EXISTS usage (
 CREATE INDEX IF NOT EXISTS usage_dest ON usage (destination, model);
 ";
 
+/// Where a usage row came from.
+pub const SOURCE_EGRESS: &str = "egress";
+/// A row the harness reported about itself, read from its transcript after the run.
+/// Rows of this source carry status 0: there was no response to take a status from.
+pub const SOURCE_HARNESS: &str = "harness";
+
+/// Older databases have no `source` column; give them one, and call every row they
+/// hold egress-observed, which is all they could have been.
+fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_source = conn
+        .prepare("SELECT 1 FROM pragma_table_info('usage') WHERE name = 'source'")?
+        .exists([])?;
+    if !has_source {
+        conn.execute_batch("ALTER TABLE usage ADD COLUMN source TEXT NOT NULL DEFAULT 'egress';")?;
+    }
+    Ok(())
+}
+
 fn lock(m: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -89,6 +112,7 @@ impl Telemetry {
     pub fn open(path: &Path) -> Result<Telemetry, Error> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Telemetry {
             conn: Mutex::new(conn),
         })
@@ -102,6 +126,7 @@ impl Telemetry {
     pub fn in_memory() -> Result<Telemetry, Error> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Telemetry {
             conn: Mutex::new(conn),
         })
@@ -119,12 +144,38 @@ impl Telemetry {
         status: u16,
         usage: &Usage,
     ) -> Result<(), Error> {
+        self.insert(session, destination, status, usage, SOURCE_EGRESS)
+    }
+
+    /// Record what a harness reported about itself: usage read from its transcript
+    /// after a run whose calls went through a tunnel the egress could not meter.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn record_reported(
+        &self,
+        session: &str,
+        destination: &str,
+        usage: &Usage,
+    ) -> Result<(), Error> {
+        self.insert(session, destination, 0, usage, SOURCE_HARNESS)
+    }
+
+    fn insert(
+        &self,
+        session: &str,
+        destination: &str,
+        status: u16,
+        usage: &Usage,
+        source: &str,
+    ) -> Result<(), Error> {
         let at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_default();
         lock(&self.conn).execute(
-            "INSERT INTO usage (at, session, destination, model, status, input_tokens, output_tokens, cache_read, cache_write)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO usage (at, session, destination, model, status, input_tokens, output_tokens, cache_read, cache_write, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 at,
                 session,
@@ -135,6 +186,7 @@ impl Telemetry {
                 i64::try_from(usage.output_tokens).unwrap_or(i64::MAX),
                 i64::try_from(usage.cache_read_tokens).unwrap_or(i64::MAX),
                 i64::try_from(usage.cache_write_tokens).unwrap_or(i64::MAX),
+                source,
             ],
         )?;
         Ok(())
@@ -149,7 +201,7 @@ impl Telemetry {
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT session, COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read),
-                    SUM(cache_write), MIN(at)
+                    SUM(cache_write), MIN(at), MAX(source = 'harness')
              FROM usage WHERE model NOT LIKE 'http %' AND model != 'tunnel'
              GROUP BY session ORDER BY MIN(at)",
         )?;
@@ -165,6 +217,7 @@ impl Telemetry {
                 cache_read_tokens: u(4)?,
                 cache_write_tokens: u(5)?,
                 started: r.get(6)?,
+                reported: r.get::<_, i64>(7)? != 0,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -179,8 +232,8 @@ impl Telemetry {
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT destination, COALESCE(model, '?'), COUNT(*), SUM(input_tokens), SUM(output_tokens),
-                    SUM(cache_read), SUM(cache_write)
-             FROM usage GROUP BY destination, model
+                    SUM(cache_read), SUM(cache_write), source
+             FROM usage GROUP BY destination, model, source
              ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -190,6 +243,7 @@ impl Telemetry {
             Ok(Totals {
                 destination: r.get(0)?,
                 model: r.get(1)?,
+                source: r.get(7)?,
                 calls: u(2)?,
                 input_tokens: u(3)?,
                 output_tokens: u(4)?,

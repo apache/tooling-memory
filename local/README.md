@@ -11,7 +11,7 @@ forwards model calls to the provider or the gateway, checks the session label ag
 destination's ceiling first, and reads token usage out of every response.
 
 ```sh
-make launch                                   # claude, your own login, confined
+make launch HARNESS=claude                    # claude, your own login, confined
 make launch HARNESS=codex                     # codex, your ChatGPT login
 make launch HARNESS=codex AUTH=key            # codex, OPENAI_API_KEY from local/.env
 make launch HARNESS=gemini                    # gemini, your Google login
@@ -19,13 +19,21 @@ make launch HARNESS=gemini AUTH=key           # gemini, GEMINI_API_KEY
 make launch HARNESS=copilot                   # copilot, your GitHub login (GH_TOKEN)
 make launch HARNESS=opencode AUTH=key         # opencode, ANTHROPIC_API_KEY
 make launch HARNESS=opencode AUTH=key PROVIDER=xai   # the same harness, Grok behind it
-make launch AUTH=gateway                      # claude through the local LiteLLM
-make launch ARGS='-p "load T0 and summarise"' # arguments go to the harness
-make launch PROMPT='load T0 and summarise'    # non-interactive, in the harness's headless form
-make work                                     # claim the next task from the ledger and run it
-make work LOOP=1                              # keep claiming until interrupted
+make launch HARNESS=claude AUTH=gateway       # claude through the local LiteLLM
+LLMAO_URL=https://llm.apache.org make launch HARNESS=codex AUTH=gateway MODEL=qwen3.8-27b
+                                              # the Foundation gateway, with the PAT in local/.virtual-key
+make launch HARNESS=muse AUTH=key             # Muse Code, META_API_KEY
+make launch HARNESS=claude MODEL=claude-sonnet-5-5   # the model, in the harness's own flag
+make launch HARNESS=claude SUBAGENTS=board    # a subagent the harness would spawn is a task instead
+make launch HARNESS=claude ARGS='-p "load T0 and summarise"'  # arguments go to the harness
+make launch HARNESS=claude PROMPT='load T0 and summarise'  # non-interactive, in the harness's headless form
+make work HARNESS=claude                      # claim the next task from the ledger and run it
+make work HARNESS=claude LOOP=1               # keep claiming until interrupted
 make usage                                    # tokens by destination and model
 ```
+
+`HARNESS=` is required, in `make` as in `memory launch --harness`: there is no default
+harness, so a run is never the wrong harness by omission.
 
 Three ways to run, one launcher. Interactive is the harness as you know it. `PROMPT` runs the
 harness's headless form with the harness's own permission prompts off, since nobody is
@@ -60,13 +68,50 @@ whole of what differs:
 | Antigravity CLI (`agy`) | `GOOGLE_GEMINI_BASE_URL`, once its settings name the Gemini API as the model provider; with a Google login, `HTTPS_PROXY` to the egress, which tunnels only to Google's login and Cloud Code hosts, pinned without metering | `mcpServers.<id>.serverUrl` in `~/.gemini/config/mcp_config.json` | subscription (the token file `agy` left under `~/.gemini/antigravity-cli`), key. Not in the harness image yet. Written from the docs and the issue tracker, not a run: the first launch on a real machine is the test |
 | Qwen Code | `OPENAI_BASE_URL`, once its settings select the OpenAI auth type | `mcpServers.<id>.httpUrl` | key only, since Qwen's free login tier ended in April 2026; `dashscope` by default, `--provider openai` or `xai` |
 | Grok Build (`grok`) | `GROK_XAI_API_BASE_URL`, which only API-key inference reads; with a Grok login, `HTTPS_PROXY` to the egress, which tunnels only to Grok's proxy and relay hosts and `auth.x.ai`, pinned without metering | `mcp_servers.<id>.url` in `config.toml` | subscription, key |
+| Muse Code (`muse`) | `--base-url` on `exec`, which the launcher puts after the prompt, since only the subcommand takes it; a key is `META_API_KEY`, which outranks a login | `mcp_servers.<id>` as a `streamable_http` entry in `~/.config/muse/settings.json`, which must carry `schema_version` | key, to Meta's Model API at `api.meta.ai`; subscription as the file `muse login` leaves, copied in, forwarded through the same base. Hooks are Claude Code's shape and events under `hooks` in the same file; the session store is binary journals and a hook gets no transcript path, so the headless run is `exec --json`, whose record stream the launcher keeps as the transcript. Written from a real install run on its offline echo provider and against a local listener, not from a model call: the first launch on a key is the test |
 | Copilot CLI | no override exists; `HTTPS_PROXY` to the egress, which tunnels only to GitHub's Copilot hosts | `mcp-config.json` | subscription (`GH_TOKEN`) |
 | OpenCode | `provider.<id>.options.baseURL`; on a GitHub Copilot login, `HTTPS_PROXY` and the GitHub tunnel | `mcp.<id>.url` | key; `--provider openai` or `xai`; subscription with `--provider github-copilot`, which GitHub supports |
 | `command` | the program itself: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_GEMINI_BASE_URL` in its environment | `MEMORY_MCP_URL` in its environment | key, gateway; `--provider` picks the destination |
 
 Copilot is the odd one: with no base-URL override, its HTTPS goes through the egress as a
 CONNECT tunnel to an allowlist of hosts. That is pinned egress without metering: TLS runs
-end to end, so the egress sees no tokens and checks the ceiling when the tunnel opens.
+end to end, so the egress sees no tokens and checks the ceiling when the tunnel opens. What
+a tunnelled run cost is then what the harness says it cost: after the run the launcher reads
+the transcript the harness left and records its own token counts, Codex's running total
+from its rollout and Claude Code's per-call usage, into the same telemetry marked `harness`
+rather than `egress`, so `memory usage` and the savings funnel show them, flagged as
+self-reported. Copilot CLI leaves no transcript, so a Copilot run stays uncounted. Under a
+subscription a count is a quantity, not a bill: Codex also reports how much of the plan's
+window a run used, and the launcher prints that.
+
+The Foundation's gateway, `llm.apache.org`, with the PAT llmao issued in `local/.virtual-key`
+and `LLMAO_URL` pointing at it: through the gateway every harness has one destination,
+`llmao`, with the gateway's ceiling, and one model, named with `MODEL=`. Tried here on
+5 October against the three open models it served then (`qwen3.8-27b`, `gemma4-26b`,
+`qwen3-8b`), each a prompted run asking for one word:
+
+| Harness | Through the Foundation gateway | Why |
+|---|---|---|
+| Codex | works, metered | Responses API under `/v1` |
+| Qwen Code | works, metered | chat completions under `/v1` |
+| OpenCode | works, metered, as `llmao/<model>`; the launcher declares the model in the provider config, since models.dev is out of reach | chat completions |
+| Claude Code | reaches the model, then refused: the model and every role route (`--model`); Claude Code's default effort, `high`, is Anthropic-only and vLLM takes `low`, `medium` and `xhigh`, so on the gateway route the launcher sets `CLAUDE_CODE_EFFORT_LEVEL=medium`, which `-- --effort <level>` overrides; the first real turn then fails with `System message must be at the beginning` from the Qwen chat template behind LiteLLM's Anthropic-to-OpenAI translation. Plain Messages calls with a system prompt and tools pass, so it is Claude Code's request shape meeting that translation; one to raise with llmao | Anthropic Messages at the root |
+| Grok Build | no: it checks a model id against its own catalog before any call (`unknown model id`) | client-side allowlist |
+| Muse Code | no: its first call is its own model catalog, `GET /muse-code/models`, which it addresses at the base URL's origin, so the egress is asked for a destination named `muse-code`, and a generic gateway has no such catalog anyway | catalog first |
+| Gemini CLI, Antigravity | no: the gateway has no `generateContent` route | API shape |
+| Copilot CLI | no: no base-URL override | GitHub only |
+
+`--model` passes a model in the harness's own flag, after the prompt, where every harness,
+subcommand or not, accepts one; for Claude Code it also sets every role's default, since
+Claude Code picks a model per role and a gateway that serves one model answers for that
+one only. `--subagents board`, the default in `work`, turns a call that would spawn or
+orchestrate subagents into tasks: Claude Code's `Agent` and `Workflow` tools and Codex's
+`spawn_agent` are caught by the pre-tool hook, each prompt is filed on the ledger as a
+task of its own, born proposed, and the call is refused with the task ids, so the harness
+carries on with its own part and the board runs the rest. A `Workflow` script is one task
+per `agent()` call whose prompt is a literal, titled by its `label`; a script the hook
+cannot read is one task holding the script. The fan-out, the waits and the merges the
+script would have done are the board's: a task's result comes back as a handoff.
 Grok is not a harness but a destination: any OpenAI-shaped harness reaches it with
 `--provider xai` and `XAI_API_KEY`. `command` is not a harness either but a program: the
 first argument after `--` runs as given, confined, with the egress and the memory server in
@@ -114,8 +159,9 @@ The ChatGPT and Google logins talk to backends that are not the public API. Gemi
 Assist is forwarded and metered like the rest, with only the token refresh tunnelled. The
 ChatGPT backend refuses relayed requests: its bot protection answers a forwarded call with
 a challenge page, and Codex speaks websockets first, which a forwarding proxy cannot carry.
-So a Codex login is a tunnel, like Copilot's: pinned egress without metering. Proven here on
-a ChatGPT login: Codex loaded T0 over MCP, its hooks fired, and it completed a ledger task.
+So a Codex login is a tunnel, like Copilot's: pinned egress, with the usage taken from
+Codex's own rollout afterwards. Proven here on a ChatGPT login: Codex loaded T0 over MCP,
+its hooks fired, and it completed a ledger task.
 Two things Codex needs that a bare release tarball lacks: the `codex-code-mode-host` helper
 beside the binary, which its tools go through (the npm install and the harness image have
 it; the launcher warns when it is missing), and, headless, its own approval and hook-trust
@@ -240,10 +286,12 @@ runtime holds it (`wslc` from a WSL distribution, otherwise podman or docker) in
 record's state as a plain directory, about twenty seconds for the two gigabytes, and from
 then on `make launch` on Linux pivots into that directory instead of mounting this
 machine's `/usr`, at no extra cost per run since it is only bind mounts. Unpack again when
-the image changes: the image's harnesses, Node, `/etc`
-and `memory` binary, read-only, with only the private home, the working tree and the
-egress socket added. A Linux run and a run under WSL containers are then the same
-environment. `--backend namespaces` goes back to the host's binaries; `--backend image`
+the image changes: the image's harnesses, Node and `/etc`, read-only, with only the
+private home, the working tree and the egress socket added. The `memory` binary inside, the
+relay and the hooks, is the launcher's own, mounted over the image's copy, so a change to
+the hooks is live on the next Linux launch without a rebuild; under WSL containers there is
+no such mount and the image's copy runs, so there a hook change wants `make image` first.
+A Linux run and a run under WSL containers are then the same environment. `--backend namespaces` goes back to the host's binaries; `--backend image`
 insists on the image.
 
 ## In the harness image, under WSL containers: `--backend wslc`

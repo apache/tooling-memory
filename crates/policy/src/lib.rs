@@ -131,6 +131,7 @@ impl Grants {
             "xai",
             "dashscope",
             "grok",
+            "meta",
             "llmao",
         ] {
             destinations.insert(

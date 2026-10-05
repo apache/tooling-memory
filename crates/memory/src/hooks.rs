@@ -432,12 +432,80 @@ async fn pre_tool_with(
 }
 
 /// The PreToolUse hook as the sandbox runs it: the projection and the server's address
-/// come from the environment the launcher set.
+/// come from the environment the launcher set. With `MEMORY_SUBAGENTS=board`, a call
+/// that would spawn or orchestrate subagents is filed on the task board instead.
 async fn pre_tool(input: &HookInput) -> Decision {
     let projection = std::env::var_os("MEMORY_PROJECTION").map(PathBuf::from);
     let session = std::env::var("MEMORY_SESSION").unwrap_or_default();
     let url = std::env::var("MEMORY_MCP_URL").ok();
+    if std::env::var("MEMORY_SUBAGENTS").is_ok_and(|v| v == "board") {
+        let (tool, tool_input) = input.tool();
+        if crate::board::delegates(&tool) {
+            return delegate(&tool, &tool_input, &session, url.as_deref(), WAIT).await;
+        }
+    }
     pre_tool_with(input, projection.as_deref(), &session, url.as_deref(), WAIT).await
+}
+
+/// File what a subagent call asks for as tasks, and refuse the call with their ids.
+/// A call with nothing readable in it is let through: there is nothing to file. A
+/// server that cannot be reached is a refusal that says so, since letting the harness
+/// orchestrate after all would be the one thing the mode exists to prevent.
+async fn delegate(
+    tool: &str,
+    tool_input: &Value,
+    session: &str,
+    url: Option<&str>,
+    wait: std::time::Duration,
+) -> Decision {
+    let units = crate::board::units_of(tool, tool_input);
+    if units.is_empty() {
+        return Decision::Allow;
+    }
+    let Some(url) = url else {
+        return Decision::Deny(
+            "subagents go to the task board here, and the memory server's address is not set, so nothing can be filed; do this part yourself".into(),
+        );
+    };
+    let mut ids = Vec::new();
+    for u in units {
+        let body = format!(
+            "{}\n\n---\nFiled from session {session}: the harness asked for a subagent (`{tool}`) and the board runs it instead.",
+            u.body
+        );
+        let call = crate::mcp_http::call_tool(
+            url,
+            "create_task",
+            serde_json::json!({ "title": u.title, "body": body }),
+        );
+        match tokio::time::timeout(wait, call).await {
+            Ok(Ok(v)) => {
+                // the server answers with JSON in a text block
+                let text = v
+                    .pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                let answer: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+                let id = answer
+                    .pointer("/task/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                ids.push(id);
+            }
+            Ok(Err(why)) => {
+                return Decision::Deny(format!(
+                    "subagents go to the task board here, and filing failed: {why}; do this part yourself"
+                ))
+            }
+            Err(_) => {
+                return Decision::Deny(format!(
+                    "subagents go to the task board here, and the memory server did not answer within {wait:?}; do this part yourself"
+                ))
+            }
+        }
+    }
+    Decision::Deny(crate::board::refusal(&ids))
 }
 
 /// Why a note was left; part of its filename so the launcher can tell them apart.
@@ -504,6 +572,8 @@ fn text_of(content: &Value) -> String {
 /// Codex: `{"type":"response_item","payload":{"type":"message","role":…,"content":[{"text":…}]}}`.
 /// Gemini CLI: a patch log, `{"$set":{"messages":[{"type":"user"|"gemini","content":[{"text":…}]}]}}`.
 /// Antigravity CLI: `{"type":"USER_INPUT"|"PLANNER_RESPONSE","content":"…"}`, one a line.
+/// Muse Code: the JSONL its headless run prints, records with a `payload_type`; the
+/// prompt is `turn.input.user` and the answer is `run.terminal.completed`.
 fn turns_in(v: &Value) -> Vec<Turn> {
     let keep = |role: &str, text: String| {
         let text = text.trim().to_string();
@@ -512,6 +582,21 @@ fn turns_in(v: &Value) -> Vec<Turn> {
             text,
         })
     };
+    if let Some(kind) = v.get("payload_type").and_then(Value::as_str) {
+        let payload = v.get("payload").unwrap_or(&Value::Null);
+        let turn = match kind {
+            "turn.input.user" => payload
+                .get("prompt")
+                .and_then(Value::as_str)
+                .and_then(|t| keep("user", t.to_string())),
+            "run.terminal.completed" => payload
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(|t| keep("assistant", t.to_string())),
+            _ => None,
+        };
+        return turn.into_iter().collect();
+    }
     if let Some(role) = v.get("type").and_then(Value::as_str) {
         let planner = match role {
             "USER_INPUT" => Some("user"),
@@ -634,6 +719,18 @@ fn short(id: &str) -> &str {
 pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
     let mut text = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+    if std::env::var_os("MEMORY_HOOK_DEBUG").is_some() {
+        // what the harness really sends, for an adapter written from its docs
+        std::fs::create_dir_all(outbox).ok();
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(outbox.join("hook-debug.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{harness} {}", text.trim());
+        }
+    }
     let input = match HookInput::parse(&text) {
         Ok(input) => input,
         Err(e) => {
@@ -769,6 +866,26 @@ not json
             "{capped}"
         );
         assert_eq!(transcript_tail("", 10, 100), "");
+    }
+
+    #[test]
+    fn muse_s_headless_stream_is_read() {
+        // Muse Code's headless stream: records typed by payload, the prompt in
+        // turn.input.user and the answer in run.terminal.completed
+        let muse = concat!(
+            r#"{"payload_type":"turn.input.user","payload":{"prompt":"what is the plan?"}}"#,
+            "\n",
+            r#"{"payload_type":"run.output.delta","payload":{"text":"The"}}"#,
+            "\n",
+            r#"{"payload_type":"run.terminal.completed","payload":{"terminal":"completed","text":"The plan is M7."}}"#,
+            "\n",
+        );
+        let t = transcript_tail(muse, 10, 10_000);
+        assert!(
+            t.contains("what is the plan?") && t.contains("The plan is M7."),
+            "{t}"
+        );
+        assert!(!t.contains("\"The\""), "deltas are not turns: {t}");
     }
 
     #[test]
@@ -1000,6 +1117,8 @@ not json
         }
     }
 
+    // the hook runs inside the Linux sandbox; these are unix paths
+    #[cfg(unix)]
     #[test]
     fn the_file_tools_of_gemini_qwen_and_codex_are_known_by_their_own_argument_names() {
         let view = Path::new("/memory");
@@ -1089,6 +1208,8 @@ not json
         ));
     }
 
+    // the hook runs inside the Linux sandbox; these are unix paths
+    #[cfg(unix)]
     #[test]
     fn grok_s_hook_sends_both_spellings_at_once_and_wants_a_decision() {
         // Grok Build writes its camelCase keys and the snake_case aliases side by side,
@@ -1181,6 +1302,8 @@ not json
         );
     }
 
+    // the hook runs inside the Linux sandbox; these are unix paths
+    #[cfg(unix)]
     #[test]
     fn antigravity_s_hook_shape_is_read_and_answered() {
         // agy wants a decision either way: an empty answer is refused as invalid
@@ -1354,6 +1477,8 @@ not json
         );
     }
 
+    // the hook runs inside the Linux sandbox; these are unix paths
+    #[cfg(unix)]
     #[test]
     fn a_search_over_the_projection_or_over_what_holds_it_is_refused() {
         let view = Path::new("/memory");
@@ -1375,6 +1500,8 @@ not json
         }
     }
 
+    // the hook runs inside the Linux sandbox; these are unix paths
+    #[cfg(unix)]
     #[test]
     fn a_glob_s_pattern_is_a_place_and_a_grep_s_is_text() {
         let view = Path::new("/memory");

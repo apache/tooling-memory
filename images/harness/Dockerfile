@@ -38,6 +38,14 @@ RUN npm install -g --no-fund --no-audit \
  && claude --version && codex --version && gemini --version && copilot --version && opencode --version \
  && qwen --version && grok --version
 
+# Muse Code is a launcher script that fetches a statically linked binary from Meta's
+# release channel; the channel, not a version, is what pins it, so the version the
+# image carries is the channel's at build time, printed here. The launcher is told
+# never to update at run time.
+RUN curl -fsSL https://dev.meta.ai/install.sh | MUSE_INSTALL_DIR=/usr/local/bin bash \
+ && MUSE_LOGIN=0 MUSE_NO_AUTO_UPDATE=1 muse --version
+ENV MUSE_NO_AUTO_UPDATE=1
+
 # The harness runs as `user`, uid 1000, with its private home mounted in at /home/user.
 RUN userdel -r ubuntu 2>/dev/null || true \
  && useradd -u 1000 -m -d /home/user -s /bin/bash user \

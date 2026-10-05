@@ -6,8 +6,10 @@
 //! `MEMORY_ROOT`) and, for `launch`, reads the one or two credentials it needs from its own
 //! environment and never passes them inside.
 
+mod board;
 mod deputy;
 mod golden;
+mod harness_usage;
 mod hooks;
 mod image;
 mod mcp_http;
@@ -124,6 +126,16 @@ impl From<StatusArg> for Status {
     }
 }
 
+/// Where a subagent the harness would spawn runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum SubagentsArg {
+    /// In the harness, as it would without the launcher.
+    #[default]
+    Harness,
+    /// Filed on the task board as a task of its own; the call is refused with its id.
+    Board,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum HarnessArg {
     Claude,
@@ -135,6 +147,8 @@ enum HarnessArg {
     Qwen,
     /// xAI's Grok Build, `grok`.
     Grok,
+    /// Meta's Muse Code, `muse`.
+    Muse,
     Copilot,
     Opencode,
     /// A program: the first argument after `--` is run as given, with the egress and
@@ -151,6 +165,7 @@ impl From<HarnessArg> for Harness {
             HarnessArg::Antigravity => Harness::Antigravity,
             HarnessArg::Qwen => Harness::Qwen,
             HarnessArg::Grok => Harness::Grok,
+            HarnessArg::Muse => Harness::Muse,
             HarnessArg::Copilot => Harness::Copilot,
             HarnessArg::Opencode => Harness::OpenCode,
             HarnessArg::Command => Harness::Command,
@@ -240,7 +255,8 @@ enum Command {
     /// DASHSCOPE_API_KEY for --auth key, LLMAO_KEY (and LLMAO_URL) for --auth gateway,
     /// the harness's own login for --auth subscription.
     Launch {
-        #[arg(long, value_enum, default_value = "claude")]
+        /// Which harness. No default: say which one.
+        #[arg(long, value_enum)]
         harness: HarnessArg,
         #[arg(long, value_enum, default_value = "subscription")]
         auth: AuthArg,
@@ -278,6 +294,14 @@ enum Command {
         /// As --prompt, read from a file.
         #[arg(long)]
         prompt_file: Option<PathBuf>,
+        /// The model the harness runs, in its own flag; for Claude Code also every
+        /// role's default, so a gateway that serves one model is asked for that one.
+        #[arg(long)]
+        model: Option<String>,
+        /// Where a subagent the harness would spawn runs: in the harness, or filed on
+        /// the task board as a task of its own and refused here.
+        #[arg(long, value_enum, default_value = "harness")]
+        subagents: SubagentsArg,
         /// With --prompt: a run that leaves no handoff is fine.
         #[arg(long)]
         no_handoff: bool,
@@ -301,7 +325,8 @@ enum Command {
     /// harness completed stays complete; anything else goes back to the pool with the
     /// harness's output filed as a handoff. One invocation, one task; --loop keeps going.
     Work {
-        #[arg(long, value_enum, default_value = "claude")]
+        /// Which harness. No default: say which one.
+        #[arg(long, value_enum)]
         harness: HarnessArg,
         #[arg(long, value_enum, default_value = "subscription")]
         auth: AuthArg,
@@ -342,6 +367,13 @@ enum Command {
         /// With --loop: how long to wait when the queue is empty.
         #[arg(long, default_value_t = 30)]
         idle_seconds: u64,
+        /// The model the harness runs, in its own flag.
+        #[arg(long)]
+        model: Option<String>,
+        /// Where a subagent the harness would spawn runs. On the board by default here:
+        /// a task's fan-out is more tasks, which the board claims and runs.
+        #[arg(long, value_enum, default_value = "board")]
+        subagents: SubagentsArg,
         /// After each task, mine the session's transcript for entries.
         #[arg(long)]
         mine: bool,
@@ -398,6 +430,10 @@ enum Command {
         /// Task mode.
         #[arg(long)]
         work: bool,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_enum, default_value = "harness")]
+        subagents: SubagentsArg,
         #[arg(long)]
         domain: Option<String>,
         #[arg(long, default_value_t = 900)]
@@ -831,27 +867,7 @@ async fn run_cli() -> Fallible {
         Command::Relay { .. } => unreachable!("handled in main"),
         Command::Usage => {
             let t = Telemetry::open(&root.join("state/telemetry.db"))?;
-            let rows = t.summary()?;
-            if rows.is_empty() {
-                println!("no model calls recorded");
-                return Ok(());
-            }
-            println!(
-                "{:<12} {:<28} {:>6} {:>10} {:>10} {:>10} {:>10}",
-                "destination", "model", "calls", "input", "output", "cache_rd", "cache_wr"
-            );
-            for r in rows {
-                println!(
-                    "{:<12} {:<28} {:>6} {:>10} {:>10} {:>10} {:>10}",
-                    r.destination,
-                    r.model,
-                    r.calls,
-                    r.input_tokens,
-                    r.output_tokens,
-                    r.cache_read_tokens,
-                    r.cache_write_tokens
-                );
-            }
+            print_usage(&t.summary()?);
             Ok(())
         }
         Command::Task { op } => task(&Memory::open(&root)?, op).await,
@@ -1020,6 +1036,13 @@ fn keyed_provider(name: &str) -> Result<Destination, Box<dyn std::error::Error>>
             "https://dashscope-intl.aliyuncs.com/compatible-mode",
             bearer(need("DASHSCOPE_API_KEY", "--auth key to dashscope")?),
         ),
+        // Meta's Model API: OpenAI's shapes under /v1 and Anthropic's at the root, and
+        // Muse Code's own model catalog at /v1/muse-code/models, so the whole host
+        "meta" => Destination::forward(
+            "https://api.meta.ai",
+            bearer(need("META_API_KEY", "--auth key to meta")?),
+        )
+        .with_origin_paths(),
         other => return Err(format!("no key-mode destination named {other}").into()),
     })
 }
@@ -1045,6 +1068,13 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
         // Gemini CLI's login is forwarded and metered through its endpoint override;
         // Antigravity CLI's has none, so its model host is tunnelled, pinned without
         // metering, as Copilot's is
+        // a Muse login talks to the same host a key does, through --base-url, so it is
+        // forwarded and metered, with the account's login host tunnelled for a refresh;
+        // written from the docs and a run on a key, not from a login: the first launch
+        // on a real login is the test
+        "meta" => Destination::forward("https://api.meta.ai", Auth::PassThrough)
+            .with_tunnels(["auth.meta.com"])
+            .with_origin_paths(),
         "google" => Destination::forward("https://cloudcode-pa.googleapis.com", Auth::PassThrough)
             .with_tunnels([
                 "oauth2.googleapis.com",
@@ -1087,7 +1117,13 @@ fn route_for(
     } else {
         harness.provider()
     };
-    let name = provider.unwrap_or(default).to_string();
+    // through the gateway there is one destination, whatever the harness, and its
+    // ceiling is the gateway's: the harness's base path and the egress's check agree
+    let name = if auth == AuthMode::Gateway {
+        "llmao".to_string()
+    } else {
+        provider.unwrap_or(default).to_string()
+    };
     let mut harness_env = Vec::new();
     let (destination, ceiling_of) = match auth {
         AuthMode::Subscription => {
@@ -1140,6 +1176,11 @@ struct Prepared {
     /// Where the memory's own calls go, and under what.
     server: ServerRoute,
     harness_env: Vec<(String, String)>,
+    /// The model the run was given, for the adapters whose config names it.
+    model: Option<String>,
+    /// Whether the egress meters this route. A tunnel is pinned without metering, so
+    /// the launcher reads what the harness reports about itself afterwards instead.
+    metered: bool,
 }
 
 /// `projected` says whether this invocation mounts the projection for a harness; a tool
@@ -1174,6 +1215,7 @@ async fn prepare_launch(
     } else {
         memory
     });
+    let metered = !destination.upstream.is_empty();
     let mut destinations = HashMap::new();
     destinations.insert(name.clone(), destination);
     if let Some(extra) = extra {
@@ -1212,7 +1254,61 @@ async fn prepare_launch(
         provider: name,
         server,
         harness_env,
+        model: None,
+        metered,
     })
+}
+
+/// What a tunnelled harness reported about itself, read from the transcript it left and
+/// recorded beside what the egress observed, marked as the harness's own count.
+fn record_reported_usage(p: &Prepared) {
+    let Some(t) = mine::newest_transcript(&p.home) else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&t) else {
+        return;
+    };
+    let reported = harness_usage::from_transcript(&text);
+    for usage in reported.by_model.values() {
+        if let Err(e) =
+            p.egress
+                .telemetry()
+                .record_reported(p.memory.session_id(), &p.provider, usage)
+        {
+            eprintln!("memory: could not record reported usage: {e}");
+        }
+    }
+    if let Some((pct, window)) = reported.plan_used_percent {
+        eprintln!(
+            "memory: the harness reports {pct:.1}% of its plan's {}-hour window used",
+            window / 60
+        );
+    }
+}
+
+/// `memory usage`: the telemetry by destination, model and who counted.
+fn print_usage(rows: &[dm_egress::telemetry::Totals]) {
+    if rows.is_empty() {
+        println!("no model calls recorded");
+        return;
+    }
+    println!(
+        "{:<12} {:<28} {:<8} {:>6} {:>10} {:>10} {:>10} {:>10}",
+        "destination", "model", "source", "calls", "input", "output", "cache_rd", "cache_wr"
+    );
+    for r in rows {
+        println!(
+            "{:<12} {:<28} {:<8} {:>6} {:>10} {:>10} {:>10} {:>10}",
+            r.destination,
+            r.model,
+            r.source,
+            r.calls,
+            r.input_tokens,
+            r.output_tokens,
+            r.cache_read_tokens,
+            r.cache_write_tokens
+        );
+    }
 }
 
 fn report_usage(egress: &Egress) {
@@ -1225,8 +1321,14 @@ fn report_usage(egress: &Egress) {
     eprintln!("memory: usage this root, by destination and model:");
     for r in rows {
         eprintln!(
-            "  {:<10} {:<26} calls {:>4}  in {:>8}  out {:>8}  cache {:>8}",
-            r.destination, r.model, r.calls, r.input_tokens, r.output_tokens, r.cache_read_tokens
+            "  {:<10} {:<26} {:<8} calls {:>4}  in {:>8}  out {:>8}  cache {:>8}",
+            r.destination,
+            r.model,
+            r.source,
+            r.calls,
+            r.input_tokens,
+            r.output_tokens,
+            r.cache_read_tokens
         );
     }
 }
@@ -1254,6 +1356,7 @@ async fn run_confined(
         harness_args: args,
         host_home: host_home.as_deref(),
         harness_env: &p.harness_env,
+        model: p.model.as_deref(),
         image: false,
         workdir_inside: None,
         rootfs,
@@ -1490,6 +1593,8 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         image,
         prompt,
         prompt_file,
+        model,
+        subagents,
         no_handoff,
         mine: mine_after,
         mine_model,
@@ -1501,8 +1606,13 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     };
     let workdir = resolve_workdir(root, workdir)?;
     if backend_of(backend, unconfined, root) == Backend::Wslc {
-        let inside_args =
-            inside_args_for_launch(prompt.as_deref(), prompt_file.as_deref(), no_handoff, &args)?;
+        let mut inside_args = run_options_args(model.as_deref(), subagents);
+        inside_args.extend(inside_args_for_launch(
+            prompt.as_deref(),
+            prompt_file.as_deref(),
+            no_handoff,
+            &args,
+        )?);
         let code = wslc::run(&wslc::Launch {
             root: root.to_path_buf(),
             harness: harness.into(),
@@ -1533,11 +1643,15 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         },
         workdir,
         runner_for(backend_of(backend, unconfined, root), root)?,
-        program,
+        RunOptions {
+            model,
+            subagents,
+            program,
+        },
     )
     .await?;
     let code = match prompt {
-        Some(prompt) => work::prompted(&session, &prompt, no_handoff).await?,
+        Some(prompt) => work::prompted(&session, &prompt, &args, no_handoff).await?,
         None => work::interactive(&session, &args).await?,
     };
     if mine_after {
@@ -1562,6 +1676,8 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         lease_seconds,
         keep_going,
         idle_seconds,
+        model,
+        subagents,
         mine: mine_after,
         mine_model,
         mine_via,
@@ -1571,7 +1687,8 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
     };
     let workdir = resolve_workdir(root, workdir)?;
     if backend_of(backend, unconfined, root) == Backend::Wslc {
-        let mut inside_args = vec!["--work".to_string()];
+        let mut inside_args = run_options_args(model.as_deref(), subagents);
+        inside_args.push("--work".to_string());
         if let Some(d) = &domain {
             inside_args.extend(["--domain".to_string(), d.clone()]);
         }
@@ -1604,7 +1721,11 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         },
         workdir,
         runner_for(backend_of(backend, unconfined, root), root)?,
-        Vec::new(),
+        RunOptions {
+            model,
+            subagents,
+            program: Vec::new(),
+        },
     )
     .await?;
     let options = work::Options {
@@ -1636,6 +1757,8 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
         prompt_file,
         no_handoff,
         work,
+        model,
+        subagents,
         domain,
         lease_seconds,
         keep_going,
@@ -1665,7 +1788,11 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
         },
         PathBuf::from("/"),
         runner,
-        program,
+        RunOptions {
+            model,
+            subagents,
+            program,
+        },
     )
     .await?;
     let code = if work {
@@ -1684,7 +1811,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
             (None, None) => None,
         };
         match prompt {
-            Some(prompt) => work::prompted(&session, &prompt, no_handoff).await?,
+            Some(prompt) => work::prompted(&session, &prompt, &args, no_handoff).await?,
             None => work::interactive(&session, &args).await?,
         }
     };
@@ -1694,6 +1821,58 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
 
 /// A command harness's program is fixed for the session and everything else is a run's
 /// arguments; for the other harnesses all of it is the run's.
+/// The run options as arguments for the `inside` process of the `wslc` backend.
+fn run_options_args(model: Option<&str>, subagents: SubagentsArg) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(m) = model {
+        out.extend(["--model".to_string(), m.to_string()]);
+    }
+    if subagents == SubagentsArg::Board {
+        out.extend(["--subagents".to_string(), "board".to_string()]);
+    }
+    out
+}
+
+/// What a run is given beyond the harness and its auth: a model, where subagents go,
+/// and, for a `command` harness, the program and its fixed arguments.
+#[derive(Clone, Debug, Default)]
+struct RunOptions {
+    model: Option<String>,
+    subagents: SubagentsArg,
+    program: Vec<String>,
+}
+
+/// The environment the run options add: the board for subagents, and for Claude Code
+/// the model as every role's default, since it picks a model per role and a gateway
+/// that serves one model answers only for that one.
+fn apply_run_options(p: &mut Prepared, harness: Harness, auth: AuthMode, options: &RunOptions) {
+    p.model.clone_from(&options.model);
+    if harness == Harness::Claude && auth == AuthMode::Gateway {
+        // Claude Code asks for `high` effort by default, which only Anthropic's models
+        // take; a gateway's open models take low, medium and xhigh, so medium goes in
+        // the environment, and `-- --effort <level>` still overrides it
+        p.harness_env
+            .push(("CLAUDE_CODE_EFFORT_LEVEL".to_string(), "medium".to_string()));
+    }
+    if options.subagents == SubagentsArg::Board {
+        // the pre-tool hook files a subagent call on the board and refuses it
+        p.harness_env
+            .push(("MEMORY_SUBAGENTS".to_string(), "board".to_string()));
+    }
+    if let (Some(m), Harness::Claude) = (&options.model, harness) {
+        for k in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            p.harness_env.push((k.to_string(), m.clone()));
+        }
+    }
+}
+
 fn split_program(harness: Harness, args: Vec<String>) -> (Vec<String>, Vec<String>) {
     if harness == Harness::Command {
         (args, Vec::new())
@@ -1807,6 +1986,9 @@ pub struct Session {
     /// For a `command` harness: the program and its fixed arguments, which every run
     /// starts with; a prompt or task comes after them.
     program: Vec<String>,
+    /// The model, in the harness's own flag, after every run's arguments: a flag after
+    /// the prompt is where every harness, subcommand or not, accepts one.
+    model: Option<String>,
     #[cfg(unix)]
     serve_unix: tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
 }
@@ -1848,7 +2030,7 @@ impl Session {
         creds: Credentials<'_>,
         workdir: PathBuf,
         mut runner: Runner,
-        program: Vec<String>,
+        options: RunOptions,
     ) -> Result<Session, Box<dyn std::error::Error>> {
         let socket = match &runner {
             Runner::Requests(r) => Some(r.dir.join("egress.sock")),
@@ -1920,7 +2102,8 @@ impl Session {
             auth,
             workdir,
             runner,
-            program,
+            program: options.program,
+            model: options.model,
             #[cfg(unix)]
             serve_unix,
         })
@@ -2026,7 +2209,16 @@ impl Session {
         args: &[String],
         capture: bool,
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
-        let full: Vec<String> = [self.program.as_slice(), args].concat();
+        let mut full: Vec<String> = [self.program.as_slice(), args].concat();
+        if let Some(m) = &self.model {
+            // OpenCode names a model by its provider, which here is the destination
+            let m = if self.harness == Harness::OpenCode && !m.contains('/') {
+                format!("{}/{m}", self.p.provider)
+            } else {
+                m.clone()
+            };
+            full.extend(self.harness.model_flag(&m));
+        }
         let args = full.as_slice();
         match &self.runner {
             Runner::Unconfined(Some((addr, _))) => run_unconfined(
@@ -2087,6 +2279,7 @@ impl Session {
             harness_args: args,
             host_home: r.host_home.as_deref(),
             harness_env: &self.p.harness_env,
+            model: self.p.model.as_deref(),
             image: true,
             workdir_inside: Some(&r.workdir_inside),
             rootfs: None,
@@ -2141,6 +2334,9 @@ impl Session {
         {
             self.serve_unix.abort();
             std::fs::remove_file(&self.p.socket).ok();
+        }
+        if !self.p.metered {
+            record_reported_usage(&self.p);
         }
         report_usage(&self.p.egress);
         if let Runner::Requests(r) = &self.runner {
@@ -2199,6 +2395,7 @@ fn run_unconfined(
         | Harness::Antigravity
         | Harness::Qwen
         | Harness::Grok
+        | Harness::Muse
         | Harness::Copilot
         | Harness::OpenCode
         | Harness::Command => {
@@ -2507,6 +2704,16 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[test]
+    fn run_options_cross_to_the_inside_process_as_flags() {
+        assert!(run_options_args(None, SubagentsArg::Harness).is_empty());
+        assert_eq!(
+            run_options_args(Some("qwen3.8-27b"), SubagentsArg::Board),
+            vec!["--model", "qwen3.8-27b", "--subagents", "board"]
+        );
+        assert_eq!(SubagentsArg::default(), SubagentsArg::Harness);
+    }
 
     #[test]
     fn the_working_tree_and_the_root_may_not_overlap() {

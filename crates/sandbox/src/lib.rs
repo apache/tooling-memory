@@ -82,6 +82,8 @@ pub enum Harness {
     Qwen,
     /// xAI's Grok Build, `grok`.
     Grok,
+    /// Meta's Muse Code, `muse`.
+    Muse,
     /// GitHub Copilot CLI.
     Copilot,
     /// OpenCode.
@@ -103,6 +105,7 @@ impl Harness {
             Harness::Antigravity => "agy",
             Harness::Qwen => "qwen",
             Harness::Grok => "grok",
+            Harness::Muse => "muse",
             Harness::Copilot => "copilot",
             Harness::OpenCode => "opencode",
             Harness::Command => "command",
@@ -118,6 +121,7 @@ impl Harness {
             Harness::Gemini | Harness::Antigravity => "gemini",
             Harness::Qwen => "dashscope",
             Harness::Grok => "xai",
+            Harness::Muse => "meta",
             Harness::Copilot => "github",
         }
     }
@@ -167,6 +171,10 @@ impl Harness {
             ],
             // Qwen Code kept Gemini CLI's yolo, as a flag of its own
             Harness::Qwen | Harness::Grok => vec!["-p".into(), p, "--yolo".into()],
+            // Muse's own approval and bubblewrap sandbox are off, since ours is the
+            // boundary; --json makes its run a readable record, since its session store
+            // is binary journals, and the launcher keeps that stream as the transcript
+            Harness::Muse => vec!["exec".into(), "--yolo".into(), "--json".into(), p],
             Harness::Copilot => vec!["-p".into(), p, "--allow-all-tools".into()],
             Harness::OpenCode => vec!["run".into(), p],
             // a program has no headless form of its own; the prompt is its first argument
@@ -178,7 +186,7 @@ impl Harness {
     #[must_use]
     pub fn model_flag(self, model: &str) -> Vec<String> {
         match self {
-            Harness::Claude | Harness::Copilot | Harness::Antigravity => {
+            Harness::Claude | Harness::Copilot | Harness::Antigravity | Harness::Muse => {
                 vec!["--model".into(), model.into()]
             }
             Harness::Codex
@@ -275,6 +283,9 @@ pub struct Request<'a> {
     /// subscription modes that are a token rather than a file, such as Copilot's
     /// `GH_TOKEN`.
     pub harness_env: &'a [(String, String)],
+    /// The model the run was given, for an adapter whose config has to name it:
+    /// OpenCode lists a custom provider's models, and cannot ask models.dev here.
+    pub model: Option<&'a str>,
     /// The harness runs in the harness image rather than from this host's binaries: the
     /// harness is at `/usr/local/bin/<name>`, the memory binary is already inside, and
     /// nothing of the host's system is mounted. Set by the `wslc` backend.
@@ -492,6 +503,9 @@ fn base_env(harness_env: &[(String, String)]) -> BTreeMap<String, String> {
         "LC_ALL",
         "NO_COLOR",
         "FORCE_COLOR",
+        // the hooks log what they are sent, for an adapter written from a harness's docs
+        "MEMORY_HOOK_DEBUG",
+        "MEMORY_EGRESS_DEBUG",
     ] {
         if let Ok(v) = std::env::var(k) {
             env.insert(k.into(), v);
@@ -569,6 +583,29 @@ fn image_mounts(req: &Request<'_>) -> Vec<Mount> {
     ]
 }
 
+/// The destination this run's model calls go to: the harness's own, the one asked for
+/// where the harness takes one, or the gateway's when the gateway is the route.
+fn provider_of(req: &Request<'_>) -> Result<String, Error> {
+    let own = [req.harness.provider(), req.harness.subscription_provider()];
+    Ok(match req.provider {
+        Some(p)
+            if req.harness.accepts_provider()
+                || own.contains(&p)
+                || req.auth == AuthMode::Gateway =>
+        {
+            p.to_string()
+        }
+        Some(p) => {
+            return Err(Error::Unsupported(format!(
+                "{} does not take --provider ({p}); its model calls go to {}",
+                req.harness.binary(),
+                req.harness.provider()
+            )))
+        }
+        None => req.harness.provider().to_string(),
+    })
+}
+
 /// Build the plan: write the harness's configuration into the private home and decide
 /// mounts, environment, and command.
 ///
@@ -592,18 +629,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
     };
     std::fs::create_dir_all(req.home).map_err(io(req.home))?;
     let relay = format!("http://{INSIDE_RELAY}");
-    let own = [req.harness.provider(), req.harness.subscription_provider()];
-    let provider = match req.provider {
-        Some(p) if req.harness.accepts_provider() || own.contains(&p) => p.to_string(),
-        Some(p) => {
-            return Err(Error::Unsupported(format!(
-                "{} does not take --provider ({p}); its model calls go to {}",
-                req.harness.binary(),
-                req.harness.provider()
-            )))
-        }
-        None => req.harness.provider().to_string(),
-    };
+    let provider = provider_of(req)?;
 
     let mut env = base_env(req.harness_env);
     // the memory server's address, for the hooks as for the harness
@@ -612,6 +638,14 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
     let (mounts, extra_path) = match req.rootfs {
         Some(rootfs) => {
             let mut m = rootfs_mounts(rootfs);
+            // the launcher's own binary over the image's copy, so the relay and the
+            // hooks inside are the launcher's build, not the image's; a container
+            // backend has no such mount and runs what its image carries
+            m.push(Mount {
+                source: req.memory_binary.to_path_buf(),
+                target: PathBuf::from(INSIDE_MEMORY),
+                read_only: true,
+            });
             m.extend(image_mounts(req));
             m.push(Mount {
                 source: req.egress_socket.to_path_buf(),
@@ -639,8 +673,13 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         "--".into(),
         harness_bin.display().to_string(),
     ];
-    setup_harness(req, &relay, &provider, &mut env, &mut argv)?;
+    // what an adapter adds before the harness's own arguments, and what it adds after
+    // them: a harness whose flags belong to a subcommand, as Muse's do to `exec`,
+    // takes them at the end, where every one of them accepts options after the prompt
+    let mut tail = Vec::new();
+    setup_harness(req, &relay, &provider, &mut env, &mut argv, &mut tail)?;
     argv.extend(harness_args.iter().cloned());
+    argv.extend(tail);
 
     Ok(Plan {
         mounts,
@@ -661,14 +700,16 @@ fn setup_harness(
     provider: &str,
     env: &mut BTreeMap<String, String>,
     argv: &mut Vec<String>,
+    tail: &mut Vec<String>,
 ) -> Result<(), Error> {
     match req.harness {
-        Harness::Claude => setup_claude(req, relay, env, argv),
+        Harness::Claude => setup_claude(req, relay, provider, env, argv),
         Harness::Codex => setup_codex(req, relay, provider, env),
-        Harness::Gemini => setup_gemini(req, relay, env),
-        Harness::Antigravity => setup_antigravity(req, relay, env),
+        Harness::Gemini => setup_gemini(req, relay, provider, env),
+        Harness::Antigravity => setup_antigravity(req, relay, provider, env),
         Harness::Qwen => setup_qwen(req, relay, provider, env),
-        Harness::Grok => setup_grok(req, relay, env),
+        Harness::Grok => setup_grok(req, relay, provider, env),
+        Harness::Muse => setup_muse(req, relay, provider, env, tail),
         Harness::Copilot => setup_copilot(req, relay, env),
         Harness::OpenCode => setup_opencode(req, relay, provider, env),
         Harness::Command => {
@@ -681,6 +722,7 @@ fn setup_harness(
 fn setup_claude(
     req: &Request<'_>,
     relay: &str,
+    provider: &str,
     env: &mut BTreeMap<String, String>,
     argv: &mut Vec<String>,
 ) -> Result<(), Error> {
@@ -690,7 +732,8 @@ fn setup_claude(
     write(&req.home.join(".claude-mcp.json"), &mcp.to_string())?;
     claude_global_config(&req.home.join(".claude.json"), req.workdir_inside())?;
     claude_hooks(&req.home.join(".claude/settings.json"))?;
-    env.insert("ANTHROPIC_BASE_URL".into(), format!("{relay}/anthropic"));
+    // anthropic, or the gateway's destination when that is the route
+    env.insert("ANTHROPIC_BASE_URL".into(), format!("{relay}/{provider}"));
     env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
     match req.auth {
         AuthMode::Subscription => {
@@ -824,6 +867,7 @@ url = "{relay}/mcp"
 fn setup_gemini(
     req: &Request<'_>,
     relay: &str,
+    provider: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
     let subscription = req.auth == AuthMode::Subscription;
@@ -840,7 +884,10 @@ fn setup_gemini(
             env.insert("GOOGLE_CLOUD_PROJECT".into(), project);
         }
     } else {
-        env.insert("GOOGLE_GEMINI_BASE_URL".into(), format!("{relay}/gemini"));
+        env.insert(
+            "GOOGLE_GEMINI_BASE_URL".into(),
+            format!("{relay}/{provider}"),
+        );
         // the egress injects the real key as x-goog-api-key and drops any ?key= it sees
         env.insert("GEMINI_API_KEY".into(), "egress".into());
     }
@@ -895,6 +942,7 @@ fn include_projection(req: &Request<'_>, settings: &mut serde_json::Value) {
 fn setup_antigravity(
     req: &Request<'_>,
     relay: &str,
+    provider: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
     let subscription = req.auth == AuthMode::Subscription;
@@ -915,7 +963,10 @@ fn setup_antigravity(
     } else {
         // the key is read only when the settings say so; the egress holds the real one
         settings["modelProvider"] = "gemini".into();
-        env.insert("GOOGLE_GEMINI_BASE_URL".into(), format!("{relay}/gemini"));
+        env.insert(
+            "GOOGLE_GEMINI_BASE_URL".into(),
+            format!("{relay}/{provider}"),
+        );
         env.insert("GEMINI_API_KEY".into(), "egress".into());
     }
     write(
@@ -1009,13 +1060,18 @@ fn setup_qwen(
 fn setup_grok(
     req: &Request<'_>,
     relay: &str,
+    provider: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
     if req.auth == AuthMode::Subscription {
         copy_login(req, ".grok/auth.json", "`grok login`")?;
         proxy_via(relay, env);
     } else {
-        env.insert("GROK_XAI_API_BASE_URL".into(), format!("{relay}/xai/v1"));
+        // xai on a key; the gateway's destination when that is the route
+        env.insert(
+            "GROK_XAI_API_BASE_URL".into(),
+            format!("{relay}/{provider}/v1"),
+        );
         // the egress injects the real key; this one only has to exist
         env.insert("XAI_API_KEY".into(), "egress".into());
         let stale = req.home.join(".grok/auth.json");
@@ -1053,6 +1109,63 @@ url = "{relay}/mcp"
     write(&req.home.join(".grok/config.toml"), &config)?;
     env.insert("GROK_DISABLE_AUTOUPDATER".into(), "1".into());
     Ok(())
+}
+
+/// Muse Code is a statically linked binary behind a self-updating launcher. Its settings
+/// are `~/.config/muse/settings.json`, which must carry `schema_version`, with MCP
+/// servers under `mcp_servers` as `streamable_http` entries and hooks in Claude Code's
+/// shape under `hooks`, which it reads with the same events and answers; it hands a hook
+/// no transcript path, since its session store is binary journals. The model endpoint
+/// is set with `--base-url`, which only its `exec` subcommand and the TUI take, so it
+/// goes after the harness's arguments; a key is `META_API_KEY`, which outranks the
+/// login, so a key run never sees a login the home kept. The first call on that base is
+/// `GET /muse-code/models`, the model catalog, before any inference, so the destination
+/// must forward the whole of `api.meta.ai`, not a path under it. A login is the file
+/// `muse login` leaves, copied in; its calls go to the same host, so the same forward
+/// carries them as a pass-through, which is the metered route to prove on a real login.
+/// The launcher's update check is off, since the image pins what it carries.
+fn setup_muse(
+    req: &Request<'_>,
+    relay: &str,
+    provider: &str,
+    env: &mut BTreeMap<String, String>,
+    tail: &mut Vec<String>,
+) -> Result<(), Error> {
+    if req.auth == AuthMode::Subscription {
+        copy_login(req, ".config/muse/auth.json", "`muse login`")?;
+    } else {
+        // the egress injects the real key; this one only has to exist
+        env.insert("META_API_KEY".into(), "egress".into());
+    }
+    env.insert("MUSE_NO_AUTO_UPDATE".into(), "1".into());
+    env.insert("MUSE_LOGIN".into(), "0".into());
+    tail.extend(["--base-url".to_string(), format!("{relay}/{provider}/v1")]);
+    let path = req.home.join(".config/muse/settings.json");
+    let mut settings: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !settings.is_object() {
+        settings = serde_json::json!({});
+    }
+    settings["schema_version"] = serde_json::json!(1);
+    settings["mcp_servers"]["memory"] = serde_json::json!({
+        "transport": "streamable_http",
+        "url": format!("{relay}/mcp"),
+        "mode": "required",
+        "enabled": true
+    });
+    settings["telemetry"] = serde_json::json!({ "enabled": false });
+    write(
+        &path,
+        &serde_json::to_string_pretty(&settings).unwrap_or_default(),
+    )?;
+    merge_hooks(
+        &path,
+        "muse",
+        &["PreCompact", "SessionEnd", "PreToolUse"],
+        30,
+    )
 }
 
 fn setup_copilot(
@@ -1184,7 +1297,13 @@ fn setup_opencode(
                 "options": {
                     "baseURL": format!("{relay}/{provider}/v1"),
                     "apiKey": "egress"
-                }
+                },
+                // a model OpenCode's catalog does not know, such as a gateway's, has
+                // to be declared, since models.dev is out of reach from here
+                "models": req.model.map_or_else(
+                    || serde_json::json!({}),
+                    |m| serde_json::json!({ m: { "name": m } })
+                )
             }
         },
         "mcp": {
@@ -1293,7 +1412,7 @@ mod tests {
         let bins = dir.path().join("bins");
         std::fs::create_dir_all(&bins).unwrap();
         for b in [
-            "claude", "codex", "gemini", "agy", "qwen", "grok", "copilot", "opencode",
+            "claude", "codex", "gemini", "agy", "qwen", "grok", "muse", "copilot", "opencode",
         ] {
             fake_bin(&bins, b);
         }
@@ -1390,6 +1509,7 @@ mod tests {
                 harness_args: args,
                 host_home: creds.then_some(self.host_home.as_path()),
                 harness_env,
+                model: None,
                 image: false,
                 workdir_inside: None,
                 rootfs: None,
@@ -1474,6 +1594,7 @@ mod tests {
             harness_args: &[],
             host_home: None,
             harness_env: &[],
+            model: None,
             image: false,
             workdir_inside: None,
             rootfs: Some(&rootfs),
@@ -1488,19 +1609,27 @@ mod tests {
         };
         assert_eq!(from_rootfs("/usr"), Some(true));
         assert_eq!(from_rootfs("/etc"), Some(true));
-        assert_eq!(from_rootfs("/opt"), Some(true), "the image's memory binary");
+        assert_eq!(from_rootfs("/opt"), Some(true), "the image's /opt");
+        // and over its copy of the binary, the launcher's own, after the rootfs mounts
+        let opt = plan
+            .mounts
+            .iter()
+            .position(|m| m.target == Path::new("/opt"))
+            .unwrap();
+        let own = plan
+            .mounts
+            .iter()
+            .position(|m| m.target == Path::new(INSIDE_MEMORY))
+            .unwrap();
+        assert!(own > opt, "{:?}", plan.mounts);
+        assert_eq!(plan.mounts[own].source, f.memory_bin);
+        assert!(plan.mounts[own].read_only);
         assert_eq!(from_rootfs("/var"), Some(true));
         assert!(
             !plan.mounts.iter().any(|m| m.source == Path::new("/usr")),
             "nothing of the host's system"
         );
-        assert!(
-            !plan
-                .mounts
-                .iter()
-                .any(|m| m.target == Path::new(INSIDE_MEMORY)),
-            "the binary comes with the image"
-        );
+
         assert!(plan
             .mounts
             .iter()
@@ -1998,6 +2127,7 @@ mod tests {
             workdir_inside: None,
             rootfs: None,
             harness_env: &[],
+            model: None,
         });
         std::env::set_var("PATH", old);
         assert!(matches!(r, Err(Error::NoHarness(_))));
@@ -2152,6 +2282,94 @@ mod tests {
                 harness.binary()
             );
         }
+    }
+
+    #[test]
+    fn muse_plan_key_points_exec_at_the_egress_after_the_prompt() {
+        let f = fixture();
+        let args = Harness::Muse.headless("hi");
+        let (home, plan) = f
+            .plan(Harness::Muse, AuthMode::Key, "k1", &args, false)
+            .unwrap();
+        assert_eq!(plan.env["META_API_KEY"], "egress");
+        assert_eq!(plan.env["MUSE_NO_AUTO_UPDATE"], "1");
+        assert!(
+            !plan.env.contains_key("HTTPS_PROXY"),
+            "a key needs no tunnel"
+        );
+        // only exec takes --base-url, so it follows the prompt, where exec accepts it
+        let argv = &plan.argv;
+        let exec = argv.iter().position(|a| a == "exec").unwrap();
+        let base = argv.iter().position(|a| a == "--base-url").unwrap();
+        assert!(exec < base, "{argv:?}");
+        assert_eq!(argv[base + 1], "http://127.0.0.1:4100/meta/v1");
+        assert!(argv[exec..base].iter().any(|a| a == "hi"), "{argv:?}");
+        assert_eq!(
+            Harness::Muse.headless("hi"),
+            vec!["exec", "--yolo", "--json", "hi"]
+        );
+        assert_eq!(Harness::Muse.model_flag("m"), vec!["--model", "m"]);
+        assert_eq!(Harness::Muse.provider(), "meta");
+        assert_eq!(Harness::Muse.subscription_provider(), "meta");
+        assert!(!Harness::Muse.accepts_provider());
+        drop(home);
+    }
+
+    #[test]
+    fn muse_settings_carry_the_schema_version_the_mcp_server_and_the_hooks() {
+        let f = fixture();
+        let (home, _) = f
+            .plan(Harness::Muse, AuthMode::Key, "k1", &[], false)
+            .unwrap();
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".config/muse/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["schema_version"], 1);
+        assert_eq!(
+            settings["mcp_servers"]["memory"]["transport"],
+            "streamable_http"
+        );
+        assert_eq!(
+            settings["mcp_servers"]["memory"]["url"],
+            "http://127.0.0.1:4100/mcp"
+        );
+        for e in ["PreCompact", "SessionEnd", "PreToolUse"] {
+            assert_eq!(
+                settings["hooks"][e][0]["hooks"][0]["command"], "/opt/memory/memory hook muse",
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn muse_plan_login_is_the_auth_file_forwarded() {
+        let f = fixture();
+        assert!(matches!(
+            f.plan(Harness::Muse, AuthMode::Subscription, "k2", &[], false),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::create_dir_all(f.host_home.join(".config/muse")).unwrap();
+        std::fs::write(
+            f.host_home.join(".config/muse/auth.json"),
+            r#"{"session":"x"}"#,
+        )
+        .unwrap();
+        let (home, plan) = f
+            .plan(Harness::Muse, AuthMode::Subscription, "k3", &[], true)
+            .unwrap();
+        assert!(
+            home.join(".config/muse/auth.json").is_file(),
+            "login copied in"
+        );
+        assert!(
+            !plan.env.contains_key("META_API_KEY"),
+            "a key would outrank the login"
+        );
+        assert!(plan
+            .argv
+            .iter()
+            .any(|a| a == "http://127.0.0.1:4100/meta/v1"));
     }
 
     #[test]

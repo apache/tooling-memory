@@ -9,7 +9,9 @@
 //!   destination the grants file names, with the session label checked against the
 //!   destination's ceiling before anything leaves, and token usage read out of every
 //!   response on the way back;
-//! - nothing else. A path that names no destination is a 404.
+//! - nothing else. A path that names no destination is a 404, unless the session's only
+//!   destination says its harness addresses calls at the origin, as Muse Code does its
+//!   model catalog: then the whole path goes there.
 //!
 //! Credentials for a destination live here, injected on the way out, unless the mode is
 //! pass-through, in which case the harness holds its own (a subscription login) and the
@@ -66,6 +68,11 @@ pub struct Destination {
     /// A tunnel is pinned egress without metering: TLS runs end to end, so the egress
     /// sees no usage and checks the ceiling only when the tunnel opens.
     pub tunnel_hosts: Vec<String>,
+    /// Whether the harness addresses some calls at the base URL's origin rather than
+    /// under the base's path, as Muse Code does its model catalog. A path that names
+    /// no destination then goes here whole, when this is the session's only
+    /// destination; otherwise such a path is a 404.
+    pub origin_paths: bool,
 }
 
 impl Destination {
@@ -76,6 +83,7 @@ impl Destination {
             upstream: upstream.into(),
             auth,
             tunnel_hosts: Vec::new(),
+            origin_paths: false,
         }
     }
 
@@ -86,6 +94,7 @@ impl Destination {
             upstream: String::new(),
             auth: Auth::PassThrough,
             tunnel_hosts: hosts.into_iter().map(Into::into).collect(),
+            origin_paths: false,
         }
     }
 
@@ -97,6 +106,13 @@ impl Destination {
         hosts: impl IntoIterator<Item = impl Into<String>>,
     ) -> Destination {
         self.tunnel_hosts.extend(hosts.into_iter().map(Into::into));
+        self
+    }
+
+    /// The harness addresses some calls at the origin; see [`Destination::origin_paths`].
+    #[must_use]
+    pub fn with_origin_paths(mut self) -> Destination {
+        self.origin_paths = true;
         self
     }
 }
@@ -369,6 +385,29 @@ fn upstream_url(base: &str, rest: &str, uri: &Uri, strip_credentials: bool) -> S
     url
 }
 
+/// A path whose first segment names no destination, when the session's only destination
+/// is addressed at the origin: that one, with the whole path as the remainder. Muse Code
+/// asks for its model catalog at `/muse-code/models` on the base URL's origin, whatever
+/// path the base carries.
+fn only_destination(inner: &Inner, destination: String, rest: String) -> (String, String) {
+    if inner.destinations.contains_key(&destination) || inner.destinations.len() != 1 {
+        return (destination, rest);
+    }
+    let Some((only, d)) = inner.destinations.iter().next() else {
+        return (destination, rest);
+    };
+    if !d.origin_paths {
+        return (destination, rest);
+    }
+    let only = only.clone();
+    let whole = if rest.is_empty() {
+        destination
+    } else {
+        format!("{destination}/{rest}")
+    };
+    (only, whole)
+}
+
 /// The destination for a request, or the response that refuses it: unknown name, or a
 /// session label above the destination's ceiling.
 fn admit(inner: &Inner, destination: &str) -> Result<Destination, Box<Response>> {
@@ -515,6 +554,7 @@ fn upstream_request(
 
 async fn proxy(egress: Egress, destination: String, rest: String, req: Request) -> Response {
     let inner = &egress.inner;
+    let (destination, rest) = only_destination(inner, destination, rest);
     let dest = match admit(inner, &destination) {
         Ok(d) => d,
         Err(refusal) => return *refusal,
@@ -778,6 +818,48 @@ mod tests {
             e.call("nowhere", "v1/x", &serde_json::json!({})).await,
             Err(Error::Refused(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_path_naming_no_destination_goes_to_the_only_one_whole() {
+        // Muse Code asks for its catalog at the origin, not under the base's path
+        let seen = Arc::new(tokio::sync::Mutex::new(None::<String>));
+        let seen2 = seen.clone();
+        let fake = Router::new().route(
+            "/muse-code/models",
+            any(move |req: Request| {
+                let seen = seen2.clone();
+                async move {
+                    *seen.lock().await = Some(req.uri().to_string());
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"models":[{"id":"muse-spark-1.3"}]}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let (_d, e) = fixture(Some((
+            "anthropic",
+            Destination::forward(format!("http://{addr}"), Auth::PassThrough).with_origin_paths(),
+        )))
+        .await;
+        let r = e
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/muse-code/models")
+                    .method("GET")
+                    .header("authorization", "Bearer k")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(seen.lock().await.clone().unwrap(), "/muse-code/models");
     }
 
     #[tokio::test]

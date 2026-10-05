@@ -84,6 +84,8 @@ pub struct SessionRow {
     pub cache_read_tokens: u64,
     /// Model calls.
     pub calls: u64,
+    /// Whether the harness counted (a tunnelled login) rather than the egress.
+    pub reported: bool,
 }
 
 /// Transcripts the harnesses left in their private homes under the record's state.
@@ -229,6 +231,7 @@ fn funnel(root: &Path, report: &mut Report) -> Fallible<()> {
             row.input_tokens = s.input_tokens;
             row.cache_read_tokens = s.cache_read_tokens;
             row.calls = s.calls;
+            row.reported = s.reported;
         }
     }
     report.sessions = rows
@@ -321,16 +324,24 @@ pub fn render(r: &Report) -> String {
         "\nFunnel: tokens memory served each session, beside what its model calls ingested\n",
     );
     s.push_str("  session        reads   served   model calls   input    cache read\n");
+    let mut any_reported = false;
     for row in &r.sessions {
+        any_reported |= row.reported;
         s.push_str(&format!(
-            "  {:<13} {:>5}  {:>7}   {:>11}  {:>6}  {:>10}\n",
+            "  {:<13} {:>5}  {:>7}   {:>11}  {:>6}  {:>10}{}\n",
             row.session,
             row.reads,
             row.served_tokens,
             row.calls,
             row.input_tokens,
-            row.cache_read_tokens
+            row.cache_read_tokens,
+            if row.reported { " *" } else { "" }
         ));
+    }
+    if any_reported {
+        s.push_str(
+            "  * counted by the harness itself: a tunnelled login the egress could not meter\n",
+        );
     }
     if r.sessions.is_empty() {
         s.push_str("  nothing recorded yet\n");
