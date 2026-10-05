@@ -100,8 +100,9 @@ make launch HARNESS=claude AUTH=subscription SERVER_AUTH=gateway
 make launch HARNESS=grok AUTH=gateway ARGS='-m <a model id the gateway serves>'
 ```
 
-`SERVER_AUTH=key` with `SERVER_PROVIDER` works the same way with a provider key. The
-gateway's route is named `llmao` and takes the `[destinations.llmao]` ceiling. Taps never
+`SERVER_AUTH=key` with `SERVER_PROVIDER` works the same way with a provider key; the
+gateway takes no provider name. The gateway's route is named `llmao` and takes the
+`[destinations.llmao]` ceiling. `memory web` does not pass these flags yet. Taps never
 use either: a tap's credential is the variable its grant names, `GH_TOKEN` say, which the
 host injects as a bearer the tap never sees, under whatever `AUTH` the harness runs.
 

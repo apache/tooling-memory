@@ -907,6 +907,13 @@ fn server_route(
                 .into(),
         );
     }
+    if mode == AuthMode::Gateway && server_provider.is_some() {
+        return Err(
+            "--server-provider names a destination for --server-auth key; the gateway \
+                    is one destination and takes no name"
+                .into(),
+        );
+    }
     let mut route = route_for(Harness::Command, mode, server_provider)?;
     if mode == AuthMode::Gateway {
         route.name = "llmao".into();
@@ -2521,8 +2528,28 @@ mod backend_tests {
         assert!(err.contains("overlap"), "a tree holding the root: {err}");
     }
 
+    /// Set these for a test and put back what was there, so a developer's own keys
+    /// survive the run.
+    fn with_env<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+        let kept: Vec<(&str, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        let out = f();
+        for (k, v) in kept {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        out
+    }
+
     #[test]
-    fn the_server_s_own_calls_take_their_own_route_when_given_one() {
+    fn the_server_s_own_calls_follow_the_harness_unless_given_a_route() {
         // the harness on a personal login: its route is pass-through, named for the provider
         let harness = route_for(Harness::Claude, AuthMode::Subscription, None).unwrap();
         assert_eq!(harness.name, "anthropic");
@@ -2543,60 +2570,73 @@ mod backend_tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("harness's alone"), "{e}");
-        // the gateway: a route of its own, named for the gateway so it never shares the
-        // harness's name, with the gateway's ceiling
-        std::env::set_var("LLMAO_KEY", "pat");
-        let (server, extra) = server_route(
-            &harness,
-            AuthMode::Subscription,
-            Some(AuthMode::Gateway),
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            (server.auth, server.provider.as_str()),
-            (AuthMode::Gateway, "llmao")
-        );
-        let extra = extra.expect("a destination to register");
-        assert_eq!(
-            (extra.name.as_str(), extra.ceiling_of.as_str()),
-            ("llmao", "llmao")
-        );
-        assert_eq!(extra.destination.upstream, "http://127.0.0.1:4000");
-        // a key to the provider the harness's login already names would collide under
-        // one name with a different destination; refused rather than guessed
-        std::env::set_var("ANTHROPIC_API_KEY", "k");
-        let e = server_route(
-            &harness,
-            AuthMode::Subscription,
-            Some(AuthMode::Key),
-            Some("anthropic"),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            e.contains("anthropic") && e.contains("--server-provider"),
-            "{e}"
-        );
         // the same key route as the harness's is the harness's, registered once
-        std::env::set_var("OPENAI_API_KEY", "k");
-        let keyed = route_for(Harness::Codex, AuthMode::Key, Some("openai")).unwrap();
-        let (server, extra) =
-            server_route(&keyed, AuthMode::Key, Some(AuthMode::Key), Some("openai")).unwrap();
-        assert_eq!(
-            (server.auth, server.provider.as_str()),
-            (AuthMode::Key, "openai")
-        );
-        assert!(extra.is_none());
-        std::env::remove_var("LLMAO_KEY");
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        with_env(&[("OPENAI_API_KEY", "k")], || {
+            let keyed = route_for(Harness::Codex, AuthMode::Key, Some("openai")).unwrap();
+            let (server, extra) =
+                server_route(&keyed, AuthMode::Key, Some(AuthMode::Key), Some("openai")).unwrap();
+            assert_eq!(
+                (server.auth, server.provider.as_str()),
+                (AuthMode::Key, "openai")
+            );
+            assert!(extra.is_none());
+        });
         // mining goes through the harness only when the server's calls have no
         // credential of their own
         assert!(via_harness(MineVia::Auto, AuthMode::Subscription));
         assert!(!via_harness(MineVia::Auto, AuthMode::Gateway));
         assert!(via_harness(MineVia::Harness, AuthMode::Gateway));
         assert!(!via_harness(MineVia::Api, AuthMode::Subscription));
+    }
+
+    #[test]
+    fn the_server_s_gateway_route_is_named_for_the_gateway_and_a_clash_is_refused() {
+        let harness = route_for(Harness::Claude, AuthMode::Subscription, None).unwrap();
+        with_env(&[("LLMAO_KEY", "pat"), ("ANTHROPIC_API_KEY", "k")], || {
+            // the gateway: a route of its own, named for the gateway so it never shares
+            // the harness's name, with the gateway's ceiling
+            let (server, extra) = server_route(
+                &harness,
+                AuthMode::Subscription,
+                Some(AuthMode::Gateway),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                (server.auth, server.provider.as_str()),
+                (AuthMode::Gateway, "llmao")
+            );
+            let extra = extra.expect("a destination to register");
+            assert_eq!(
+                (extra.name.as_str(), extra.ceiling_of.as_str()),
+                ("llmao", "llmao")
+            );
+            assert_eq!(extra.destination.upstream, "http://127.0.0.1:4000");
+            // it takes no provider name
+            let e = server_route(
+                &harness,
+                AuthMode::Subscription,
+                Some(AuthMode::Gateway),
+                Some("openai"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("takes no name"), "{e}");
+            // a key to the provider the harness's login already names would collide
+            // under one name with a different destination; refused rather than guessed
+            let e = server_route(
+                &harness,
+                AuthMode::Subscription,
+                Some(AuthMode::Key),
+                Some("anthropic"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains("anthropic") && e.contains("--server-provider"),
+                "{e}"
+            );
+        });
     }
 
     #[test]
