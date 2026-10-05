@@ -248,6 +248,16 @@ enum Command {
         /// name from grants.toml. Codex, Qwen Code and OpenCode only.
         #[arg(long)]
         provider: Option<String>,
+        /// A credential of their own for the memory's calls, the recall deputy and
+        /// mining, so a harness on a personal login can leave them to an institution's
+        /// gateway: key or gateway. They follow --auth otherwise, and a login gives
+        /// them nothing.
+        #[arg(long, value_enum)]
+        server_auth: Option<AuthArg>,
+        /// Where the memory's own calls go under --server-auth key; the gateway needs
+        /// no name.
+        #[arg(long)]
+        server_provider: Option<String>,
         /// The working tree the harness may read and write. Defaults to the current directory.
         #[arg(long)]
         workdir: Option<PathBuf>,
@@ -298,6 +308,16 @@ enum Command {
         /// Send model calls to another destination. Codex, Qwen Code and OpenCode only.
         #[arg(long)]
         provider: Option<String>,
+        /// A credential of their own for the memory's calls, the recall deputy and
+        /// mining, so a harness on a personal login can leave them to an institution's
+        /// gateway: key or gateway. They follow --auth otherwise, and a login gives
+        /// them nothing.
+        #[arg(long, value_enum)]
+        server_auth: Option<AuthArg>,
+        /// Where the memory's own calls go under --server-auth key; the gateway needs
+        /// no name.
+        #[arg(long)]
+        server_provider: Option<String>,
         /// The working tree the harness may read and write. Defaults to the current directory.
         #[arg(long)]
         workdir: Option<PathBuf>,
@@ -356,6 +376,10 @@ enum Command {
         auth: AuthArg,
         #[arg(long)]
         provider: Option<String>,
+        #[arg(long, value_enum)]
+        server_auth: Option<AuthArg>,
+        #[arg(long)]
+        server_provider: Option<String>,
         /// The shared volume.
         #[arg(long)]
         requests: PathBuf,
@@ -839,11 +863,106 @@ async fn run_cli() -> Fallible {
 /// What one launch needs for its model calls: the destination name as the harness will
 /// address it, the destination itself, the grants entry whose ceiling caps the session,
 /// and any credential the harness must hold itself.
+#[derive(Debug)]
 struct Route {
     name: String,
     destination: Destination,
     ceiling_of: String,
     harness_env: Vec<(String, String)>,
+}
+
+/// The route the memory's own model calls take: the recall deputy and mining. By default
+/// the harness's; `--server-auth` gives them a credential of their own, so a harness on
+/// a personal login can leave them to an institution's gateway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServerRoute {
+    /// How those calls authenticate; a login means they are not made at all.
+    auth: AuthMode,
+    /// The egress destination they go to.
+    provider: String,
+}
+
+/// The server's route beside the harness's, and the destination to register for it when
+/// it is not the harness's own. The gateway's route is named for the gateway, so it
+/// never shares the harness's name; a key to a provider the harness's login already
+/// names would, with a different destination behind it, and is refused rather than
+/// guessed at.
+fn server_route(
+    harness: &Route,
+    auth: AuthMode,
+    server_auth: Option<AuthMode>,
+    server_provider: Option<&str>,
+) -> Result<(ServerRoute, Option<Route>), Box<dyn std::error::Error>> {
+    let follows = ServerRoute {
+        auth,
+        provider: harness.name.clone(),
+    };
+    let Some(mode) = server_auth else {
+        return Ok((follows, None));
+    };
+    if mode == AuthMode::Subscription {
+        return Err(
+            "a subscription login is the harness's alone and cannot stand in for the \
+                    memory's own calls; --server-auth takes key or gateway"
+                .into(),
+        );
+    }
+    let mut route = route_for(Harness::Command, mode, server_provider)?;
+    if mode == AuthMode::Gateway {
+        route.name = "llmao".into();
+    }
+    let server = ServerRoute {
+        auth: mode,
+        provider: route.name.clone(),
+    };
+    if route.name != harness.name {
+        return Ok((server, Some(route)));
+    }
+    // the same name under the same mode is the same route, built by the same arm; under
+    // another mode it is another destination, a login's pass-through beside a key's
+    // injection say, which one name cannot hold
+    if mode == auth {
+        return Ok((server, None));
+    }
+    Err(format!(
+        "the memory's own route would share the name {} with the harness's while going \
+         somewhere else; use --server-auth gateway, or --server-provider with another name",
+        route.name
+    )
+    .into())
+}
+
+/// What a session authenticates with: the harness's route, and the memory's own when it
+/// has one.
+#[derive(Clone, Copy, Debug)]
+struct Credentials<'a> {
+    auth: AuthMode,
+    provider: Option<&'a str>,
+    server_auth: Option<AuthMode>,
+    server_provider: Option<&'a str>,
+}
+
+impl<'a> Credentials<'a> {
+    /// One route for everything: a tool run on the host, where the harness is the
+    /// launcher itself.
+    fn keyed(auth: AuthMode, provider: &'a str) -> Credentials<'a> {
+        Credentials {
+            auth,
+            provider: Some(provider),
+            server_auth: None,
+            server_provider: None,
+        }
+    }
+}
+
+/// Whether mining runs as a prompted run of the harness: asked for, or by default when
+/// the memory's own calls have no credential of their own.
+fn via_harness(via: MineVia, server_auth: AuthMode) -> bool {
+    match via {
+        MineVia::Harness => true,
+        MineVia::Api => false,
+        MineVia::Auto => server_auth == AuthMode::Subscription,
+    }
 }
 
 /// A variable's value, if it carries one: a variable set to nothing is not set.
@@ -1011,6 +1130,8 @@ struct Prepared {
     ceiling: Label,
     ceiling_of: String,
     provider: String,
+    /// Where the memory's own calls go, and under what.
+    server: ServerRoute,
     harness_env: Vec<(String, String)>,
 }
 
@@ -1020,18 +1141,20 @@ struct Prepared {
 async fn prepare_launch(
     root: &Path,
     harness: Harness,
-    auth: AuthMode,
-    provider: Option<&str>,
+    creds: Credentials<'_>,
     socket: Option<PathBuf>,
     recall_model: Option<&str>,
     projected: bool,
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
+    let auth = creds.auth;
+    let route = route_for(harness, auth, creds.provider)?;
+    let (server, extra) = server_route(&route, auth, creds.server_auth, creds.server_provider)?;
     let Route {
         name,
         destination,
         ceiling_of,
         harness_env,
-    } = route_for(harness, auth, provider)?;
+    } = route;
     let memory = Memory::open(root)?.with_author(format!("agent:{}", harness.binary()));
     let ceiling = memory.grants().ceiling(&ceiling_of).ok_or_else(|| {
         format!("grants.toml has no [destinations.{ceiling_of}]; add one with a ceiling")
@@ -1046,6 +1169,9 @@ async fn prepare_launch(
     });
     let mut destinations = HashMap::new();
     destinations.insert(name.clone(), destination);
+    if let Some(extra) = extra {
+        destinations.insert(extra.name, extra.destination);
+    }
     let egress = Egress::new(
         memory.clone(),
         destinations,
@@ -1053,10 +1179,10 @@ async fn prepare_launch(
     )?;
     // a key or the gateway is the launcher's credential, so the server may spend a
     // small model on recall; a subscription login is the harness's alone
-    let deputy: Option<Arc<dyn Deputy>> = (auth != AuthMode::Subscription).then(|| {
+    let deputy: Option<Arc<dyn Deputy>> = (server.auth != AuthMode::Subscription).then(|| {
         Arc::new(deputy::EgressDeputy::new(
             egress.clone(),
-            &name,
+            &server.provider,
             recall_model,
         )) as Arc<dyn Deputy>
     });
@@ -1077,6 +1203,7 @@ async fn prepare_launch(
         ceiling,
         ceiling_of,
         provider: name,
+        server,
         harness_env,
     })
 }
@@ -1204,8 +1331,7 @@ async fn golden_cmd(
             let p = prepare_launch(
                 root,
                 Harness::Command,
-                deputy_auth(auth)?,
-                Some(&provider),
+                Credentials::keyed(deputy_auth(auth)?, &provider),
                 None,
                 model,
                 false,
@@ -1253,8 +1379,7 @@ async fn mine_cmd(
     let p = prepare_launch(
         root,
         Harness::Command,
-        auth.into(),
-        Some(provider),
+        Credentials::keyed(auth.into(), provider),
         None,
         None,
         false,
@@ -1286,8 +1411,7 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
             let p = prepare_launch(
                 root,
                 Harness::Command,
-                deputy_auth(auth)?,
-                Some(&provider),
+                Credentials::keyed(deputy_auth(auth)?, &provider),
                 None,
                 model.as_deref(),
                 false,
@@ -1351,6 +1475,8 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         harness,
         auth,
         provider,
+        server_auth,
+        server_provider,
         workdir,
         unconfined,
         backend,
@@ -1375,6 +1501,8 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
             harness: harness.into(),
             auth: auth.into(),
             provider,
+            server_auth: server_auth.map(AuthMode::from),
+            server_provider,
             workdir,
             image,
             inside_args,
@@ -1390,8 +1518,12 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     let session = Session::start(
         root,
         harness.into(),
-        auth.into(),
-        provider.as_deref(),
+        Credentials {
+            auth: auth.into(),
+            provider: provider.as_deref(),
+            server_auth: server_auth.map(AuthMode::from),
+            server_provider: server_provider.as_deref(),
+        },
         workdir,
         runner_for(backend_of(backend, unconfined, root), root)?,
         program,
@@ -1413,6 +1545,8 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         harness,
         auth,
         provider,
+        server_auth,
+        server_provider,
         workdir,
         unconfined,
         backend,
@@ -1444,6 +1578,8 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
             harness: harness.into(),
             auth: auth.into(),
             provider,
+            server_auth: server_auth.map(AuthMode::from),
+            server_provider,
             workdir,
             image,
             inside_args,
@@ -1453,8 +1589,12 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
     let session = Session::start(
         root,
         harness.into(),
-        auth.into(),
-        provider.as_deref(),
+        Credentials {
+            auth: auth.into(),
+            provider: provider.as_deref(),
+            server_auth: server_auth.map(AuthMode::from),
+            server_provider: server_provider.as_deref(),
+        },
         workdir,
         runner_for(backend_of(backend, unconfined, root), root)?,
         Vec::new(),
@@ -1480,6 +1620,8 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
         harness,
         auth,
         provider,
+        server_auth,
+        server_provider,
         requests,
         host_home,
         workdir_inside,
@@ -1508,8 +1650,12 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
     let session = Session::start(
         root,
         harness.into(),
-        auth.into(),
-        provider.as_deref(),
+        Credentials {
+            auth: auth.into(),
+            provider: provider.as_deref(),
+            server_auth: server_auth.map(AuthMode::from),
+            server_provider: server_provider.as_deref(),
+        },
         PathBuf::from("/"),
         runner,
         program,
@@ -1692,8 +1838,7 @@ impl Session {
     async fn start(
         root: &Path,
         harness: Harness,
-        auth: AuthMode,
-        provider: Option<&str>,
+        creds: Credentials<'_>,
         workdir: PathBuf,
         mut runner: Runner,
         program: Vec<String>,
@@ -1702,7 +1847,8 @@ impl Session {
             Runner::Requests(r) => Some(r.dir.join("egress.sock")),
             _ => None,
         };
-        let p = prepare_launch(root, harness, auth, provider, socket, None, true).await?;
+        let auth = creds.auth;
+        let p = prepare_launch(root, harness, creds, socket, None, true).await?;
 
         #[cfg(unix)]
         let serve_unix = {
@@ -1807,11 +1953,7 @@ impl Session {
     /// that credential belongs to the harness and may be used by nothing else; by choice
     /// otherwise.
     pub fn mines_via_harness(&self, via: MineVia) -> bool {
-        match via {
-            MineVia::Harness => true,
-            MineVia::Api => false,
-            MineVia::Auto => self.auth == AuthMode::Subscription,
-        }
+        via_harness(via, self.p.server.auth)
     }
 
     /// Mine the newest transcript in the private home, if there is one. Through the
@@ -1831,14 +1973,14 @@ impl Session {
             return Ok(Vec::new());
         };
         let model = model.map_or_else(
-            || mine::default_model(&self.p.provider).to_string(),
+            || mine::default_model(&self.p.server.provider).to_string(),
             str::to_string,
         );
         let client = work::client(self.p.memory.clone()).await?;
         let ids = if self.mines_via_harness(via) {
             self.mine_via_harness(&client, &model, &t).await?
         } else {
-            mine::mine(&self.p.egress, &client, &self.p.provider, &model, &t).await?
+            mine::mine(&self.p.egress, &client, &self.p.server.provider, &model, &t).await?
         };
         eprintln!("memory: mined {} entries from {}", ids.len(), t.display());
         client.close().await.ok();
@@ -2377,6 +2519,84 @@ mod backend_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("overlap"), "a tree holding the root: {err}");
+    }
+
+    #[test]
+    fn the_server_s_own_calls_take_their_own_route_when_given_one() {
+        // the harness on a personal login: its route is pass-through, named for the provider
+        let harness = route_for(Harness::Claude, AuthMode::Subscription, None).unwrap();
+        assert_eq!(harness.name, "anthropic");
+        // nothing asked: the server's calls follow the harness, so a login gives no deputy
+        let (server, extra) = server_route(&harness, AuthMode::Subscription, None, None).unwrap();
+        assert_eq!(
+            (server.auth, server.provider.as_str()),
+            (AuthMode::Subscription, "anthropic")
+        );
+        assert!(extra.is_none());
+        // a login cannot stand in for the server's calls
+        let e = server_route(
+            &harness,
+            AuthMode::Subscription,
+            Some(AuthMode::Subscription),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("harness's alone"), "{e}");
+        // the gateway: a route of its own, named for the gateway so it never shares the
+        // harness's name, with the gateway's ceiling
+        std::env::set_var("LLMAO_KEY", "pat");
+        let (server, extra) = server_route(
+            &harness,
+            AuthMode::Subscription,
+            Some(AuthMode::Gateway),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (server.auth, server.provider.as_str()),
+            (AuthMode::Gateway, "llmao")
+        );
+        let extra = extra.expect("a destination to register");
+        assert_eq!(
+            (extra.name.as_str(), extra.ceiling_of.as_str()),
+            ("llmao", "llmao")
+        );
+        assert_eq!(extra.destination.upstream, "http://127.0.0.1:4000");
+        // a key to the provider the harness's login already names would collide under
+        // one name with a different destination; refused rather than guessed
+        std::env::set_var("ANTHROPIC_API_KEY", "k");
+        let e = server_route(
+            &harness,
+            AuthMode::Subscription,
+            Some(AuthMode::Key),
+            Some("anthropic"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("anthropic") && e.contains("--server-provider"),
+            "{e}"
+        );
+        // the same key route as the harness's is the harness's, registered once
+        std::env::set_var("OPENAI_API_KEY", "k");
+        let keyed = route_for(Harness::Codex, AuthMode::Key, Some("openai")).unwrap();
+        let (server, extra) =
+            server_route(&keyed, AuthMode::Key, Some(AuthMode::Key), Some("openai")).unwrap();
+        assert_eq!(
+            (server.auth, server.provider.as_str()),
+            (AuthMode::Key, "openai")
+        );
+        assert!(extra.is_none());
+        std::env::remove_var("LLMAO_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        // mining goes through the harness only when the server's calls have no
+        // credential of their own
+        assert!(via_harness(MineVia::Auto, AuthMode::Subscription));
+        assert!(!via_harness(MineVia::Auto, AuthMode::Gateway));
+        assert!(via_harness(MineVia::Harness, AuthMode::Gateway));
+        assert!(!via_harness(MineVia::Api, AuthMode::Subscription));
     }
 
     #[test]

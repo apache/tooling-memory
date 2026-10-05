@@ -88,7 +88,22 @@ host, through the same tunnel Copilot CLI uses.
 |---|---|---|---|
 | `subscription` | the provider | the harness's own login: Claude Code's credentials file, Codex's `auth.json`, Gemini's `oauth_creds.json`, Copilot's `GH_TOKEN` | the harness, inside its private home or environment |
 | `key` | the provider | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` or `XAI_API_KEY` from `local/.env` | the egress; the harness gets a placeholder |
-| `gateway` | LiteLLM on 127.0.0.1:4000 | `local/.virtual-key` | the egress; the harness gets a placeholder |
+| `gateway` | LiteLLM on 127.0.0.1:4000, or the institution's at `LLMAO_URL` | `local/.virtual-key`, a virtual key or an llmao PAT | the egress; the harness gets a placeholder |
+
+The memory makes calls of its own: the recall deputy that writes a brief, and mining a
+transcript. By default they follow `AUTH`, which on a login means they are not made, since
+the login is the harness's alone. `SERVER_AUTH=gateway` gives them a credential of their
+own, so a harness on a personal login leaves the memory's calls to the institution:
+
+```sh
+make launch HARNESS=claude AUTH=subscription SERVER_AUTH=gateway
+make launch HARNESS=grok AUTH=gateway ARGS='-m <a model id the gateway serves>'
+```
+
+`SERVER_AUTH=key` with `SERVER_PROVIDER` works the same way with a provider key. The
+gateway's route is named `llmao` and takes the `[destinations.llmao]` ceiling. Taps never
+use either: a tap's credential is the variable its grant names, `GH_TOKEN` say, which the
+host injects as a bearer the tap never sees, under whatever `AUTH` the harness runs.
 
 A login is made once on the host, in the harness's own way, and the launcher copies that
 one file into the private home. For Claude Code, `claude` and its login prompt; for Codex,

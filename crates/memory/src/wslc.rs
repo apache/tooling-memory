@@ -67,6 +67,10 @@ pub struct Launch {
     pub auth: AuthMode,
     /// Another destination, where the harness allows it.
     pub provider: Option<String>,
+    /// A credential of their own for the memory's calls, when they have one.
+    pub server_auth: Option<AuthMode>,
+    /// Where those calls go under a key.
+    pub server_provider: Option<String>,
     /// The working tree on this host.
     pub workdir: PathBuf,
     /// The harness image.
@@ -195,8 +199,22 @@ fn egress_run_args(
         a.push("--provider".into());
         a.push(p.clone());
     }
+    if let Some(s) = l.server_auth {
+        a.push("--server-auth".into());
+        a.push(auth_name(s).into());
+    }
+    if let Some(p) = &l.server_provider {
+        a.push("--server-provider".into());
+        a.push(p.clone());
+    }
     a.extend(l.inside_args.iter().cloned());
     a
+}
+
+/// Whether this launch needs the gateway inside the VM: the harness's route or the
+/// memory's own asks for it.
+fn wants_gateway(l: &Launch) -> bool {
+    l.auth == AuthMode::Gateway || l.server_auth == Some(AuthMode::Gateway)
 }
 
 fn auth_name(a: AuthMode) -> &'static str {
@@ -313,7 +331,7 @@ pub fn run(l: &Launch) -> Fallible<i32> {
     let projection_m = projection_mount(l)?;
     let (host_home_m, login_dirs) = host_logins()?;
 
-    let (extra, network) = if l.auth == AuthMode::Gateway {
+    let (extra, network) = if wants_gateway(l) {
         let key = gateway_up(&l.root)?;
         (
             vec![
@@ -603,6 +621,8 @@ mod tests {
             harness: Harness::Codex,
             auth: AuthMode::Key,
             provider: Some("xai".into()),
+            server_auth: Some(AuthMode::Gateway),
+            server_provider: Some("llmao".into()),
             workdir: "/home/me/proj".into(),
             image: "img:dev".into(),
             inside_args: vec!["--prompt".into(), "hello".into()],
@@ -645,9 +665,19 @@ mod tests {
             "{joined}"
         );
         assert!(
-            joined.ends_with("--harness codex --auth key --provider xai --prompt hello"),
+            joined.ends_with(
+                "--harness codex --auth key --provider xai --server-auth gateway \
+                 --server-provider llmao --prompt hello"
+            ),
             "{joined}"
         );
+        // the server's route alone wanting the gateway is enough to bring it up
+        assert!(wants_gateway(&l));
+        assert!(!wants_gateway(&Launch {
+            server_auth: None,
+            server_provider: None,
+            ..l
+        }));
     }
 
     #[test]
