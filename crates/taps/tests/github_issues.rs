@@ -20,8 +20,9 @@ use dm_server::Memory;
 use dm_taps::Limits;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod common;
 
@@ -35,6 +36,8 @@ fn component() -> &'static Path {
 struct Seen {
     authorization: Arc<Mutex<Vec<String>>>,
     paths: Arc<Mutex<Vec<String>>>,
+    /// Whether the `slow` owner has answered, twenty seconds after it was asked.
+    slow_answered: Arc<AtomicBool>,
 }
 
 impl Seen {
@@ -65,6 +68,7 @@ async fn issues(
     seen.paths.lock().unwrap().push(uri.to_string());
     if owner == "slow" {
         tokio::time::sleep(Duration::from_secs(20)).await;
+        seen.slow_answered.store(true, Ordering::SeqCst);
         return Json(json!([])).into_response();
     }
     if uri.query().is_some_and(|q| q.contains("page=2")) {
@@ -327,12 +331,11 @@ async fn a_label_above_the_ceiling_stops_the_tap_s_outbound_calls() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_run_is_bounded_by_its_wall_clock() {
-    let (authority, _seen) = fake_github().await;
+    let (authority, seen) = fake_github().await;
     let dir = tempfile::tempdir().unwrap();
     let (memory, grant) = root_with_tap(dir.path(), vec![authority.clone()]);
     let config = config_for(&authority, "slow/repo");
-    let started = Instant::now();
-    let err = run(
+    let outcome = run(
         &memory,
         &grant,
         None,
@@ -342,18 +345,18 @@ async fn a_run_is_bounded_by_its_wall_clock() {
             ..Limits::default()
         },
     )
-    .await
-    .unwrap_err();
+    .await;
+    // the tap asked, and the run was over before the answer came: it was cut off, not
+    // waited out, however long compiling the component took first
+    assert_eq!(seen.paths().len(), 1);
+    assert!(
+        !seen.slow_answered.load(Ordering::SeqCst),
+        "the run waited for the slow answer: {outcome:?}"
+    );
+    let err = outcome.unwrap_err();
     assert!(
         matches!(err, dm_taps::Error::Runtime(ref m) if m.contains("wall clock")),
         "{err}"
-    );
-    // compiling the component is inside `run` and takes seconds in a debug build; the
-    // fake would hold the tap for twenty, so well under that is the bound holding
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "{:?}",
-        started.elapsed()
     );
 }
 
