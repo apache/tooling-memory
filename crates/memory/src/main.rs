@@ -1283,10 +1283,12 @@ fn route_for(
             // a gateway translates Anthropic's shape for other models, whose chat
             // templates refuse Claude Code's trailing system-role message
             // and Muse Code asks for 128k output tokens whatever the model's window,
-            // so a cap that leaves a 131k-context model room for the prompt
+            // so a cap that leaves a 131k-context model room for the prompt; and its
+            // Gemini adapter drops a tool result Antigravity sends under the model's role
             (
                 Destination::forward(url, bearer(key))
                     .with_folded_system_messages()
+                    .with_function_responses_in_user_turns()
                     .with_max_output_tokens(32_768),
                 "llmao".to_string(),
             )
@@ -2074,7 +2076,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
             server_provider: server_provider.as_deref(),
         },
         workdir,
-        runner_for(backend_of(backend, unconfined, root), root)?,
+        runner_for(backend_of(backend, unconfined, root, harness.into()), root)?,
         RunOptions {
             model,
             subagents,
@@ -2151,7 +2153,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
             server_provider: server_provider.as_deref(),
         },
         workdir,
-        runner_for(backend_of(backend, unconfined, root), root)?,
+        runner_for(backend_of(backend, unconfined, root, harness.into()), root)?,
         RunOptions {
             model,
             subagents,
@@ -2365,6 +2367,20 @@ fn resolve_workdir(
     Ok(w)
 }
 
+/// The model as the harness names it on this route. OpenCode names a model by its
+/// provider, which here is the destination. Antigravity CLI takes a model outside
+/// Google's catalog only as `gemini-api://<model>`, sent to its base URL as
+/// `v1beta/models/<model>`, and a gateway's models are never in that catalog.
+fn model_for(harness: Harness, auth: AuthMode, provider: &str, model: &str) -> String {
+    match harness {
+        Harness::OpenCode if !model.contains('/') => format!("{provider}/{model}"),
+        Harness::Antigravity if auth == AuthMode::Gateway && !model.contains("://") => {
+            format!("gemini-api://{model}")
+        }
+        _ => model.to_string(),
+    }
+}
+
 /// Which backend a launch resolves to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
@@ -2375,9 +2391,9 @@ enum Backend {
 }
 
 /// Which backend a launch resolves to. `auto` on Linux is the unpacked image when there
-/// is one, so homogeneity is the default once you have it, and the host's binaries
-/// otherwise.
-fn backend_of(arg: BackendArg, unconfined: bool, root: &Path) -> Backend {
+/// is one that carries the harness, so homogeneity is the default once you have it, and
+/// the host's binaries otherwise: Antigravity CLI, say, which the image does not carry.
+fn backend_of(arg: BackendArg, unconfined: bool, root: &Path, harness: Harness) -> Backend {
     if unconfined {
         return Backend::None;
     }
@@ -2388,7 +2404,7 @@ fn backend_of(arg: BackendArg, unconfined: bool, root: &Path) -> Backend {
         BackendArg::None => Backend::None,
         BackendArg::Auto => {
             if cfg!(target_os = "linux") {
-                if image::present(root).is_some() {
+                if image::present(root).is_some_and(|r| image::carries(&r, harness)) {
                     Backend::Image
                 } else {
                     Backend::Namespaces
@@ -2625,6 +2641,7 @@ impl Session {
             return Ok(Vec::new());
         };
         let mut args = self.harness.headless(&mine::prompt_for(&excerpt));
+        let model = &model_for(self.harness, self.auth, &self.p.provider, model);
         args.extend(self.harness.model_flag(model));
         let (code, output) = self.run(&args, true).await?;
         // the mining run is not a session anyone continues: its own hook notes go
@@ -3353,37 +3370,96 @@ mod backend_tests {
     }
 
     #[test]
+    fn a_model_is_named_as_the_harness_takes_it_on_the_route() {
+        let at = |h, a| model_for(h, a, "llmao", "gemma4-26b");
+        assert_eq!(
+            at(Harness::Antigravity, AuthMode::Gateway),
+            "gemini-api://gemma4-26b",
+            "a gateway's model is outside Antigravity's catalog"
+        );
+        assert_eq!(at(Harness::Antigravity, AuthMode::Key), "gemma4-26b");
+        assert_eq!(
+            model_for(
+                Harness::Antigravity,
+                AuthMode::Gateway,
+                "llmao",
+                "gemini-api://x"
+            ),
+            "gemini-api://x",
+            "named in full already"
+        );
+        assert_eq!(at(Harness::OpenCode, AuthMode::Gateway), "llmao/gemma4-26b");
+        assert_eq!(at(Harness::Gemini, AuthMode::Gateway), "gemma4-26b");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn auto_takes_the_image_only_for_a_harness_it_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = image::rootfs_dir(dir.path());
+        std::fs::create_dir_all(r.join("usr/local/bin")).unwrap();
+        std::fs::create_dir_all(r.join("opt/memory")).unwrap();
+        std::fs::write(r.join("opt/memory/memory"), "").unwrap();
+        // npm's entries are links to its own tree, which the host need not have
+        std::os::unix::fs::symlink(
+            "/usr/local/lib/node_modules/claude/cli.js",
+            r.join("usr/local/bin/claude"),
+        )
+        .unwrap();
+        assert_eq!(
+            backend_of(BackendArg::Auto, false, dir.path(), Harness::Claude),
+            Backend::Image
+        );
+        // a harness the image does not carry runs from this host's install
+        assert_eq!(
+            backend_of(BackendArg::Auto, false, dir.path(), Harness::Antigravity),
+            Backend::Namespaces
+        );
+        // a program is whatever the command names, wherever it lives
+        assert_eq!(
+            backend_of(BackendArg::Auto, false, dir.path(), Harness::Command),
+            Backend::Image
+        );
+        // asked for by name, the image is what it gets
+        assert_eq!(
+            backend_of(BackendArg::Image, false, dir.path(), Harness::Antigravity),
+            Backend::Image
+        );
+    }
+
+    #[test]
     fn unconfined_wins_and_auto_prefers_the_image_when_unpacked() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            backend_of(BackendArg::Wslc, true, dir.path()),
+            backend_of(BackendArg::Wslc, true, dir.path(), Harness::Claude),
             Backend::None
         );
         assert_eq!(
-            backend_of(BackendArg::Wslc, false, dir.path()),
+            backend_of(BackendArg::Wslc, false, dir.path(), Harness::Claude),
             Backend::Wslc
         );
         assert_eq!(
-            backend_of(BackendArg::Image, false, dir.path()),
+            backend_of(BackendArg::Image, false, dir.path(), Harness::Claude),
             Backend::Image
         );
         assert_eq!(
-            backend_of(BackendArg::None, false, dir.path()),
+            backend_of(BackendArg::None, false, dir.path(), Harness::Claude),
             Backend::None
         );
         assert_eq!(
-            backend_of(BackendArg::Namespaces, false, dir.path()),
+            backend_of(BackendArg::Namespaces, false, dir.path(), Harness::Claude),
             Backend::Namespaces
         );
-        let auto = backend_of(BackendArg::Auto, false, dir.path());
+        let auto = backend_of(BackendArg::Auto, false, dir.path(), Harness::Claude);
         if cfg!(target_os = "linux") {
             assert_eq!(auto, Backend::Namespaces, "no image unpacked yet");
             let r = image::rootfs_dir(dir.path());
             std::fs::create_dir_all(r.join("usr/local/bin")).unwrap();
             std::fs::create_dir_all(r.join("opt/memory")).unwrap();
             std::fs::write(r.join("opt/memory/memory"), "").unwrap();
+            std::fs::write(r.join("usr/local/bin/claude"), "").unwrap();
             assert_eq!(
-                backend_of(BackendArg::Auto, false, dir.path()),
+                backend_of(BackendArg::Auto, false, dir.path(), Harness::Claude),
                 Backend::Image
             );
             assert!(matches!(

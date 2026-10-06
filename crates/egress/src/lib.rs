@@ -80,6 +80,11 @@ pub struct Destination {
     /// translating to another model's chat template refuses (`System message must be at
     /// the beginning`); folding it is what the template wants and loses nothing.
     pub fold_system_messages: bool,
+    /// Whether a Gemini API request's `functionResponse` parts are moved out of a
+    /// `model` turn into a `user` turn after it, on the way out. Antigravity CLI sends a
+    /// tool's result under the model's role, which Google's API takes and LiteLLM's
+    /// Gemini adapter drops, so the model answers without the result.
+    pub fold_function_responses: bool,
     /// A cap on the output tokens a request asks for, on the way out. Muse Code asks
     /// for 128k whatever the catalog says, which a 131k-context model refuses once the
     /// prompt is counted; a gateway's models are better served by a cap.
@@ -96,6 +101,7 @@ impl Destination {
             tunnel_hosts: Vec::new(),
             origin_paths: false,
             fold_system_messages: false,
+            fold_function_responses: false,
             max_output_tokens: None,
         }
     }
@@ -109,6 +115,7 @@ impl Destination {
             tunnel_hosts: hosts.into_iter().map(Into::into).collect(),
             origin_paths: false,
             fold_system_messages: false,
+            fold_function_responses: false,
             max_output_tokens: None,
         }
     }
@@ -136,6 +143,14 @@ impl Destination {
     #[must_use]
     pub fn with_folded_system_messages(mut self) -> Destination {
         self.fold_system_messages = true;
+        self
+    }
+
+    /// Move `functionResponse` parts into a `user` turn; see
+    /// [`Destination::fold_function_responses`].
+    #[must_use]
+    pub fn with_function_responses_in_user_turns(mut self) -> Destination {
+        self.fold_function_responses = true;
         self
     }
 
@@ -669,6 +684,48 @@ pub fn fold_system_messages(body: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&v).ok()
 }
 
+/// A Gemini API body with each `model` turn's `functionResponse` parts moved into a
+/// `user` turn right after it, the turn left out when nothing else was in it; `None`
+/// when there are none or the body is not a JSON object.
+///
+/// TODO(fix upstream): LiteLLM's GoogleGenAI adapter
+/// (`litellm/google_genai/adapters/transformation.py`, `_transform_contents_to_messages`)
+/// translates a `functionResponse` only in a `user` turn and drops it from a `model`
+/// one, as of 1.102.0 and main. Remove this fold once LiteLLM takes it in any role.
+#[must_use]
+pub fn fold_function_responses(body: &[u8]) -> Option<Vec<u8>> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let contents = v.get_mut("contents")?.as_array_mut()?;
+    let mut out = Vec::with_capacity(contents.len());
+    let mut moved = false;
+    for mut turn in contents.drain(..) {
+        let from_model = turn.get("role").and_then(serde_json::Value::as_str) == Some("model");
+        let parts = turn
+            .get_mut("parts")
+            .and_then(serde_json::Value::as_array_mut);
+        let Some(parts) = parts.filter(|_| from_model) else {
+            out.push(turn);
+            continue;
+        };
+        let (responses, rest): (Vec<_>, Vec<_>) = parts
+            .drain(..)
+            .partition(|p| p.get("functionResponse").is_some());
+        if responses.is_empty() {
+            *parts = rest;
+            out.push(turn);
+            continue;
+        }
+        moved = true;
+        if !rest.is_empty() {
+            *parts = rest;
+            out.push(turn);
+        }
+        out.push(serde_json::json!({ "role": "user", "parts": responses }));
+    }
+    *contents = out;
+    moved.then(|| serde_json::to_vec(&v).ok()).flatten()
+}
+
 /// A request the destination wants shaped is read whole and rewritten: a Messages
 /// request with its system role folded, a request asking for more output tokens than
 /// the cap. Everything else streams through untouched.
@@ -679,10 +736,12 @@ async fn shaped(
 ) -> Result<(Request, Option<Bytes>), Box<Response>> {
     let path = rest.trim_end_matches('/');
     let fold = dest.fold_system_messages && path.ends_with("messages");
+    let fold_responses = dest.fold_function_responses
+        && (path.ends_with(":generateContent") || path.ends_with(":streamGenerateContent"));
     let cap = dest.max_output_tokens.filter(|_| {
         path.ends_with("messages") || path.ends_with("responses") || path.ends_with("completions")
     });
-    if req.method() != Method::POST || (!fold && cap.is_none()) {
+    if req.method() != Method::POST || (!fold && !fold_responses && cap.is_none()) {
         return Ok((req, None));
     }
     let (parts, body) = req.into_parts();
@@ -696,6 +755,11 @@ async fn shaped(
     let mut out = bytes.clone();
     if fold {
         if let Some(folded) = fold_system_messages(&out) {
+            out = Bytes::from(folded);
+        }
+    }
+    if fold_responses {
+        if let Some(folded) = fold_function_responses(&out) {
             out = Bytes::from(folded);
         }
     }
@@ -1010,6 +1074,58 @@ mod tests {
             e.call("nowhere", "v1/x", &serde_json::json!({})).await,
             Err(Error::Refused(_))
         ));
+    }
+
+    #[test]
+    fn antigravity_s_tool_results_move_from_the_model_s_turn_to_the_user_s() {
+        // as Antigravity CLI sends them: the call and its result, both under the model
+        let body = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "read it"}]},
+                {"role": "model", "parts": [{"functionCall": {"id": "c1", "name": "view_file", "args": {}}}]},
+                {"role": "model", "parts": [{"functionResponse": {"id": "c1", "name": "view_file", "response": {"output": "zebra"}}}]},
+                {"role": "model", "parts": [
+                    {"text": "and one more"},
+                    {"functionCall": {"id": "c2", "name": "view_file", "args": {}}},
+                    {"functionResponse": {"id": "c2", "name": "view_file", "response": {"output": "okapi"}}}
+                ]}
+            ],
+            "tools": []
+        });
+        let out = fold_function_responses(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let roles: Vec<&str> = v["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "model", "user", "model", "user"]);
+        assert_eq!(
+            v["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
+            "zebra"
+        );
+        assert_eq!(
+            v["contents"][3]["parts"].as_array().unwrap().len(),
+            2,
+            "text and call stay"
+        );
+        assert_eq!(
+            v["contents"][4]["parts"][0]["functionResponse"]["response"]["output"],
+            "okapi"
+        );
+        assert_eq!(
+            v["tools"],
+            serde_json::json!([]),
+            "the rest of the body is kept"
+        );
+        // a user's result, and a body with none, are left as they are
+        let plain = serde_json::json!({ "contents": [
+            {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {}}}]}
+        ]});
+        assert!(fold_function_responses(&serde_json::to_vec(&plain).unwrap()).is_none());
+        assert!(fold_function_responses(b"not json").is_none());
     }
 
     #[test]

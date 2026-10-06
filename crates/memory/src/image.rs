@@ -6,6 +6,7 @@
 //! distribution, otherwise `podman` or `docker`. The result is a plain directory, which is
 //! all the sandbox needs.
 
+use dm_sandbox::Harness;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -107,6 +108,19 @@ pub fn unpack(root: &Path, image: &str) -> Fallible<PathBuf> {
 pub fn present(root: &Path) -> Option<PathBuf> {
     let r = rootfs_dir(root);
     (r.join("usr/local/bin").is_dir() && r.join("opt/memory/memory").is_file()).then_some(r)
+}
+
+/// Whether the unpacked rootfs carries the harness. A `command` runs whatever it names,
+/// so the image serves it as it is. The entry is checked, not its target: npm's are
+/// links into the image's own tree.
+#[must_use]
+pub fn carries(rootfs: &Path, harness: Harness) -> bool {
+    harness == Harness::Command
+        || rootfs
+            .join("usr/local/bin")
+            .join(harness.binary())
+            .symlink_metadata()
+            .is_ok()
 }
 
 #[cfg(test)]
