@@ -279,10 +279,40 @@ and wrong for the Foundation, where the front desk mints a virtual key per princ
 ## The WSL containers C API
 
 `wslcsdk.dll` is what Microsoft supports for production, and it does not ship with WSL: it
-comes in the `Microsoft.WSL.Containers` NuGet package. The binding is in
-`crates/memory/src/wslc_api.rs`, Windows only, loaded at run time, and `memory
-wslc-api-check` proves it as far as creating and terminating a session. Running containers
-through it is next, and needs the image provisioned into the API's own session store.
+comes in the `Microsoft.WSL.Containers` NuGet package, as
+`runtimes/win-x64/native/wslcsdk.dll`, and goes beside `memory.exe`. The binding is
+`crates/wslc-api`, Windows only and loaded at run time; the backend over it is
+`crates/memory/src/wslc_api.rs`. On Windows, `--backend wslc` uses it wherever it can
+serve, the same two containers as over the command line, and `--wslc-via cli` or `api`
+says which way explicitly:
+
+```sh
+memory.exe launch --harness claude --backend wslc --prompt 'say pong'    # over the API
+memory.exe work --harness claude --backend wslc                          # a task, over the API
+```
+
+What the API cannot do stays on the command line: an interactive launch, since the API
+gives a process no terminal, and `--auth gateway`, since it makes no networks. Under the
+default `--wslc-via auto` a missing DLL, or a root with nowhere for a session disk, sends
+the launch to the command line with a line saying why; from a WSL distribution it is the
+command line always.
+
+A session made through the API is a VM of its own with its own image store, which the
+command line's images are not in. The first launch provisions it: `wslc save` the image,
+then load it, about three minutes for the harness image's 3 GB; after that the store is
+trusted and a launch prints the image's short id. After `make image`,
+`memory wslc-api-check --refresh` loads the rebuilt one; an image the command line does not
+have is pulled from its registry instead. `memory wslc-api-check` on its own provisions if
+needed and runs one container, with the time each step took.
+
+The session lives while `memory.exe` holds it, so its VM boots on every launch, six to eight
+seconds here where the command line's long-lived VM is already up; the container itself
+takes about two. Ctrl-C ends the session and everything in it. A session disk cannot live on
+a `\\wsl.localhost` share, so a record root there needs `--wslc-storage` (or
+`MEMORY_WSLC_STORAGE`) naming a local directory; otherwise the disks go under the root's
+`state/wslc-api`. One session holds a disk at a time, so concurrent launches take numbered
+slots, each provisioned once, and a slot whose launcher was killed is ended and taken back
+by the next launch.
 
 ## In the harness image, on Linux: `make unpack`
 

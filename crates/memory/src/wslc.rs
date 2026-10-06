@@ -24,11 +24,11 @@ type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 pub const DEFAULT_IMAGE: &str = "durable-memory/harness:dev";
 
 /// The record inside the egress container.
-const INSIDE_ROOT: &str = "/memory";
+pub(crate) const INSIDE_ROOT: &str = "/memory";
 /// The host's login directories, read-only, inside the egress container.
-const INSIDE_HOST_HOME: &str = "/host-home";
+pub(crate) const INSIDE_HOST_HOME: &str = "/host-home";
 /// The working tree inside the harness container.
-const INSIDE_WORK: &str = "/work";
+pub(crate) const INSIDE_WORK: &str = "/work";
 
 /// Variables the inside may need, passed to the egress container when set here.
 const PASS_ENV: &[&str] = &[
@@ -78,11 +78,55 @@ pub struct Launch {
     /// The flags for `memory inside` that say what to run: `--prompt`, `--work`, and so
     /// on, followed by `--` and the harness's own arguments.
     pub inside_args: Vec<String>,
+    /// Attached to the terminal: no prompt and no task.
+    pub interactive: bool,
+    /// How the host drives WSL containers.
+    pub via: Via,
+    /// Where the C API's session disks live, when not under the root.
+    #[cfg_attr(not(windows), allow(dead_code))] // the C API is Windows only
+    pub storage: Option<PathBuf>,
 }
 
+/// How the host drives WSL containers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Via {
+    /// The C API on Windows where the launch allows it, the command line otherwise.
+    #[default]
+    Auto,
+    /// The `wslc` command line.
+    Cli,
+    /// The C API in `wslcsdk.dll`: Windows, and neither interactive nor the gateway.
+    Api,
+}
+
+/// Which way a launch goes. The API gives a process no terminal and makes no networks,
+/// so an interactive launch and the gateway inside the VM need the command line;
+/// `auto` picks the API wherever it can serve.
+///
+/// # Errors
+///
+/// When the API is asked for and cannot serve this launch.
+pub(crate) fn via_for(l: &Launch, windows: bool) -> Result<Via, String> {
+    let blocker = if !windows {
+        Some(dm_wslc_api::WINDOWS_ONLY)
+    } else if l.interactive {
+        Some("the C API gives a process no terminal, so an interactive launch goes through the command line")
+    } else if wants_gateway(l) {
+        Some("the gateway inside the VM needs a network of its own, which the C API cannot make, so --auth gateway goes through the command line")
+    } else {
+        None
+    };
+    match (l.via, blocker) {
+        (Via::Cli, _) | (Via::Auto, Some(_)) => Ok(Via::Cli),
+        (Via::Api | Via::Auto, None) => Ok(Via::Api),
+        (Via::Api, Some(why)) => Err(format!(
+            "--wslc-via api: {why}; pass --wslc-via cli or auto"
+        )),
+    }
+}
 /// The `wslc` command: `wslc.exe` through interop from a WSL distribution, `wslc` on
 /// Windows itself.
-fn wslc() -> &'static str {
+pub(crate) fn wslc() -> &'static str {
     if which("wslc.exe") {
         "wslc.exe"
     } else {
@@ -97,7 +141,7 @@ fn which(name: &str) -> bool {
 
 /// A host path as `wslc` must see it: from inside a WSL distribution that is the UNC
 /// name `wslpath -w` gives; on Windows it is the path itself.
-fn mount_path(p: &Path) -> Fallible<String> {
+pub(crate) fn mount_path(p: &Path) -> Fallible<String> {
     if std::env::var_os("WSL_DISTRO_NAME").is_none() {
         return Ok(p.display().to_string());
     }
@@ -113,7 +157,7 @@ fn mount_path(p: &Path) -> Fallible<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn run_ok(args: &[String]) -> Fallible<String> {
+pub(crate) fn run_ok(args: &[String]) -> Fallible<String> {
     let out = Command::new(wslc())
         .args(args)
         .stdin(Stdio::null())
@@ -163,23 +207,36 @@ fn egress_run_args(
             ));
         }
     }
+    for (k, v) in egress_env(extra) {
+        a.push("-e".into());
+        a.push(format!("{k}={v}"));
+    }
+    a.push(l.image.clone());
+    a.extend(inside_command(l));
+    a
+}
+
+/// The egress container's environment: what `PASS_ENV` names and is set here, then what
+/// the launch adds, which wins.
+pub(crate) fn egress_env(extra: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env = Vec::new();
     for k in PASS_ENV {
         if extra.iter().any(|(ek, _)| ek == k) {
             continue;
         }
         if let Ok(v) = std::env::var(k) {
             if !v.is_empty() {
-                a.push("-e".into());
-                a.push(format!("{k}={v}"));
+                env.push(((*k).to_string(), v));
             }
         }
     }
-    for (k, v) in extra {
-        a.push("-e".into());
-        a.push(format!("{k}={v}"));
-    }
-    a.push(l.image.clone());
-    a.extend(s(&[
+    env.extend(extra.iter().cloned());
+    env
+}
+
+/// The egress container's command: this binary as `memory inside`, told what to run.
+pub(crate) fn inside_command(l: &Launch) -> Vec<String> {
+    let mut a = s(&[
         "/opt/memory/memory",
         "--root",
         INSIDE_ROOT,
@@ -193,7 +250,7 @@ fn egress_run_args(
         "--harness",
         l.harness.binary(),
         "--auth",
-    ]));
+    ]);
     a.push(auth_name(l.auth).into());
     if let Some(p) = &l.provider {
         a.push("--provider".into());
@@ -266,24 +323,30 @@ fn harness_run_args(
         a.push(format!("{k}={v}"));
     }
     a.push(image.to_string());
-    a.push("/bin/sh".into());
-    a.push("-c".into());
+    a.extend(wrapped(req, n));
+    a
+}
+
+/// A request's command in the shell wrapper that leaves its exit code (and, when
+/// captured, its output) in the shared volume for the inside to read.
+pub(crate) fn wrapped(req: &RunRequest, n: usize) -> Vec<String> {
     let exit = RunRequest::exit_file(n);
-    a.push(if req.interactive {
+    let script = if req.interactive {
         format!("\"$0\" \"$@\"; echo $? > {exit}")
     } else {
         format!(
             "\"$0\" \"$@\" > {}; echo $? > {exit}",
             RunRequest::out_file(n)
         )
-    });
+    };
+    let mut a = vec!["/bin/sh".to_string(), "-c".to_string(), script];
     a.extend(req.argv.iter().cloned());
     a
 }
 
 /// The host home's mount path and the login directories under it that a subscription
 /// mode copies from, when there are any; nothing else of the host home is mounted.
-fn host_logins() -> Fallible<(Option<String>, Vec<String>)> {
+pub(crate) fn host_logins() -> Fallible<(Option<String>, Vec<String>)> {
     let host_home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from);
@@ -306,7 +369,7 @@ fn host_logins() -> Fallible<(Option<String>, Vec<String>)> {
 
 /// The projection's mount path, from the launch and the host's own view of the root,
 /// when the launcher rendered one.
-fn projection_mount(l: &Launch) -> Fallible<Option<String>> {
+pub(crate) fn projection_mount(l: &Launch) -> Fallible<Option<String>> {
     // made here, so the first launch on a root mounts it and the inside's render lands
     // where the container already looks
     let dir = l.root.join(dm_sandbox::PROJECTION).join(l.harness.binary());
@@ -314,12 +377,48 @@ fn projection_mount(l: &Launch) -> Fallible<Option<String>> {
     Ok(Some(mount_path(&dir)?))
 }
 
-/// Run a launch through WSL containers. Returns the exit code the inside reports.
+/// Run a launch through WSL containers, over the C API or the command line as
+/// [`via_for`] decides. Returns the exit code the inside reports.
 ///
 /// # Errors
 ///
-/// When `wslc` is not there, the image is missing, or a container cannot be started.
+/// When the way asked for cannot serve the launch, `wslc` or the DLL is not there, the
+/// image cannot be had, or a container cannot be started.
 pub fn run(l: &Launch) -> Fallible<i32> {
+    match via_for(l, cfg!(windows))? {
+        Via::Api => run_api(l),
+        _ => run_cli(l),
+    }
+}
+
+/// Over the C API. Under `auto`, what keeps the API from serving, a missing DLL or a
+/// root with nowhere for a session disk, sends the launch to the command line instead.
+#[cfg(windows)]
+fn run_api(l: &Launch) -> Fallible<i32> {
+    let ready = crate::wslc_api::storage_for(&l.root, l.storage.as_deref())
+        .map_err(|e| e.to_string())
+        .and_then(|storage| {
+            dm_wslc_api::Api::load()
+                .map(|api| (api, storage))
+                .map_err(|e| e.to_string())
+        });
+    match ready {
+        Ok((api, storage)) => crate::wslc_api::run(l, &api, &storage),
+        Err(why) if l.via == Via::Auto => {
+            eprintln!("memory: not over the C API ({why}); driving the wslc command line");
+            run_cli(l)
+        }
+        Err(why) => Err(why.into()),
+    }
+}
+
+#[cfg(not(windows))]
+fn run_api(_: &Launch) -> Fallible<i32> {
+    Err(dm_wslc_api::WINDOWS_ONLY.into())
+}
+
+/// Run a launch through the `wslc` command line.
+fn run_cli(l: &Launch) -> Fallible<i32> {
     let pid = std::process::id();
     let volume = format!("memory-run-{pid}");
     let egress = format!("memory-egress-{pid}");
@@ -626,6 +725,9 @@ mod tests {
             workdir: "/home/me/proj".into(),
             image: "img:dev".into(),
             inside_args: vec!["--prompt".into(), "hello".into()],
+            interactive: false,
+            via: Via::Auto,
+            storage: None,
         };
         let dirs = vec![".codex".to_string()];
         let a = egress_run_args(
@@ -678,6 +780,70 @@ mod tests {
             server_provider: None,
             ..l
         }));
+    }
+
+    #[test]
+    fn the_api_serves_where_it_can_and_says_why_where_it_cannot() {
+        let l = l_default();
+        assert_eq!(via_for(&l, true), Ok(Via::Api));
+        assert_eq!(
+            via_for(&l, false),
+            Ok(Via::Cli),
+            "off Windows, the command line"
+        );
+        let interactive = Launch {
+            interactive: true,
+            ..l
+        };
+        assert_eq!(via_for(&interactive, true), Ok(Via::Cli));
+        let asked = Launch {
+            via: Via::Api,
+            ..interactive
+        };
+        assert!(via_for(&asked, true).unwrap_err().contains("no terminal"));
+        let gateway = Launch {
+            interactive: false,
+            server_auth: Some(AuthMode::Gateway),
+            ..asked
+        };
+        assert!(via_for(&gateway, true)
+            .unwrap_err()
+            .contains("network of its own"));
+        assert!(via_for(
+            &Launch {
+                server_auth: None,
+                ..gateway
+            },
+            false
+        )
+        .unwrap_err()
+        .contains("Windows only"));
+        let cli = Launch {
+            via: Via::Cli,
+            ..l_default()
+        };
+        assert_eq!(
+            via_for(&cli, true),
+            Ok(Via::Cli),
+            "asked for, always served"
+        );
+    }
+
+    fn l_default() -> Launch {
+        Launch {
+            root: "/m".into(),
+            harness: Harness::Claude,
+            auth: AuthMode::Key,
+            provider: None,
+            server_auth: None,
+            server_provider: None,
+            workdir: "/w".into(),
+            image: "img".into(),
+            inside_args: Vec::new(),
+            interactive: false,
+            via: Via::Auto,
+            storage: None,
+        }
     }
 
     #[test]

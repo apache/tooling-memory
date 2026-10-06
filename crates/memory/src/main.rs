@@ -20,6 +20,7 @@ mod savings;
 mod taps;
 mod work;
 mod wslc;
+mod wslc_api;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dm_core::{EntryType, Label};
@@ -287,6 +288,14 @@ enum Command {
         /// The harness image for the `wslc` backend.
         #[arg(long, env = "MEMORY_IMAGE", default_value = wslc::DEFAULT_IMAGE)]
         image: String,
+        /// How the `wslc` backend drives WSL containers: the C API on Windows where it
+        /// can serve (not interactive, not the gateway), or the command line.
+        #[arg(long, value_enum, env = "MEMORY_WSLC_VIA", default_value = "auto")]
+        wslc_via: wslc::Via,
+        /// Where the C API keeps its session disks; under the root's state by default,
+        /// and needed when the root is a `\\wsl.localhost` path.
+        #[arg(long, env = "MEMORY_WSLC_STORAGE")]
+        wslc_storage: Option<PathBuf>,
         /// Non-interactive: run this prompt in the harness's headless form, print its
         /// answer, and exit when it does. The run is expected to leave a handoff.
         #[arg(long, conflicts_with = "prompt_file")]
@@ -355,6 +364,14 @@ enum Command {
         /// The harness image for the `wslc` backend.
         #[arg(long, env = "MEMORY_IMAGE", default_value = wslc::DEFAULT_IMAGE)]
         image: String,
+        /// How the `wslc` backend drives WSL containers: the C API on Windows where it
+        /// can serve (not interactive, not the gateway), or the command line.
+        #[arg(long, value_enum, env = "MEMORY_WSLC_VIA", default_value = "auto")]
+        wslc_via: wslc::Via,
+        /// Where the C API keeps its session disks; under the root's state by default,
+        /// and needed when the root is a `\\wsl.localhost` path.
+        #[arg(long, env = "MEMORY_WSLC_STORAGE")]
+        wslc_storage: Option<PathBuf>,
         /// Claim from this domain; the only granted domain when omitted.
         #[arg(long)]
         domain: Option<String>,
@@ -404,9 +421,21 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
-    /// Prove the WSL containers C API binding: create and terminate a session. Windows.
+    /// Prove the WSL containers C API end to end: take a session, provision the image
+    /// into its store, and run a container from it. Windows.
     #[command(hide = true)]
-    WslcApiCheck,
+    WslcApiCheck {
+        /// The image to provision and run.
+        #[arg(long, env = "MEMORY_IMAGE", default_value = wslc::DEFAULT_IMAGE)]
+        image: String,
+        /// Where the session disks live; under the root's state by default.
+        #[arg(long, env = "MEMORY_WSLC_STORAGE")]
+        wslc_storage: Option<PathBuf>,
+        /// Provision again from the command line's copy, or the registry's, even when
+        /// the session's store has the image: after `make image`.
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Inside the egress container of the `wslc` backend: open the memory, serve the
     /// egress on the shared volume, and run `launch` or `work` by writing run requests
     /// the host turns into harness containers.
@@ -857,7 +886,7 @@ async fn run_cli() -> Fallible {
         cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
         cmd @ (Command::Mine { .. }
         | Command::Models { .. }
-        | Command::WslcApiCheck
+        | Command::WslcApiCheck { .. }
         | Command::Savings { .. }
         | Command::Golden { .. }
         | Command::Recall {
@@ -1620,12 +1649,11 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
                 .await?;
             json(&recall::to_json(&r))
         }
-        Command::WslcApiCheck => {
-            let storage = root.join("state/wslc-api");
-            std::fs::create_dir_all(&storage)?;
-            println!("{}", dm_wslc_api::check("memory-check", &storage)?);
-            Ok(())
-        }
+        Command::WslcApiCheck {
+            image,
+            wslc_storage,
+            refresh,
+        } => wslc_api_check(root, &image, wslc_storage.as_deref(), refresh),
         Command::Golden {
             suite,
             k,
@@ -1650,6 +1678,21 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
     }
 }
 
+/// `wslc-api-check`: the C API end to end, on Windows.
+fn wslc_api_check(root: &Path, image: &str, storage: Option<&Path>, refresh: bool) -> Fallible {
+    #[cfg(windows)]
+    {
+        let storage = wslc_api::storage_for(root, storage)?;
+        println!("{}", wslc_api::check(&storage, image, refresh)?);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (root, image, storage, refresh);
+        Err(dm_wslc_api::WINDOWS_ONLY.into())
+    }
+}
+
 /// `launch`, `work` and `inside`: start a session, run it once or per task, exit with
 /// the code. On the `wslc` backend the host hands the whole thing to the egress
 /// container, which runs this same code as `inside`.
@@ -1662,7 +1705,12 @@ async fn launch_cmd(root: &Path, command: Command) -> Fallible {
     }
 }
 
-async fn cmd_launch(root: &Path, command: Command) -> Fallible {
+/// A `launch` the `wslc` backend runs, when that is where it runs: the egress container
+/// is told what to run, and everything else happens inside it.
+fn wslc_for_launch(
+    root: &Path,
+    command: &Command,
+) -> Result<Option<wslc::Launch>, Box<dyn std::error::Error>> {
     let Command::Launch {
         harness,
         auth,
@@ -1673,6 +1721,111 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         unconfined,
         backend,
         image,
+        wslc_via,
+        wslc_storage,
+        prompt,
+        prompt_file,
+        model,
+        subagents,
+        no_handoff,
+        args,
+        ..
+    } = command
+    else {
+        return Ok(None);
+    };
+    if backend_of(*backend, *unconfined, root) != Backend::Wslc {
+        return Ok(None);
+    }
+    let mut inside_args = run_options_args(model.as_deref(), *subagents);
+    inside_args.extend(inside_args_for_launch(
+        prompt.as_deref(),
+        prompt_file.as_deref(),
+        *no_handoff,
+        args,
+    )?);
+    Ok(Some(wslc::Launch {
+        root: root.to_path_buf(),
+        harness: (*harness).into(),
+        auth: (*auth).into(),
+        provider: provider.clone(),
+        server_auth: server_auth.map(AuthMode::from),
+        server_provider: server_provider.clone(),
+        workdir: resolve_workdir(root, workdir.clone())?,
+        image: image.clone(),
+        inside_args,
+        interactive: prompt.is_none() && prompt_file.is_none(),
+        via: *wslc_via,
+        storage: wslc_storage.clone(),
+    }))
+}
+
+/// A `work` the `wslc` backend runs, when that is where it runs.
+fn wslc_for_work(
+    root: &Path,
+    command: &Command,
+) -> Result<Option<wslc::Launch>, Box<dyn std::error::Error>> {
+    let Command::Work {
+        harness,
+        auth,
+        provider,
+        server_auth,
+        server_provider,
+        workdir,
+        unconfined,
+        backend,
+        image,
+        wslc_via,
+        wslc_storage,
+        domain,
+        lease_seconds,
+        keep_going,
+        idle_seconds,
+        model,
+        subagents,
+        ..
+    } = command
+    else {
+        return Ok(None);
+    };
+    if backend_of(*backend, *unconfined, root) != Backend::Wslc {
+        return Ok(None);
+    }
+    Ok(Some(wslc::Launch {
+        root: root.to_path_buf(),
+        harness: (*harness).into(),
+        auth: (*auth).into(),
+        provider: provider.clone(),
+        server_auth: server_auth.map(AuthMode::from),
+        server_provider: server_provider.clone(),
+        workdir: resolve_workdir(root, workdir.clone())?,
+        image: image.clone(),
+        inside_args: work_inside_args(
+            run_options_args(model.as_deref(), *subagents),
+            domain.as_deref(),
+            *lease_seconds,
+            *keep_going,
+            *idle_seconds,
+        ),
+        interactive: false,
+        via: *wslc_via,
+        storage: wslc_storage.clone(),
+    }))
+}
+
+async fn cmd_launch(root: &Path, command: Command) -> Fallible {
+    if let Some(l) = wslc_for_launch(root, &command)? {
+        std::process::exit(wslc::run(&l)?);
+    }
+    let Command::Launch {
+        harness,
+        auth,
+        provider,
+        server_auth,
+        server_provider,
+        workdir,
+        unconfined,
+        backend,
         prompt,
         prompt_file,
         model,
@@ -1682,32 +1835,12 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         mine_model,
         mine_via,
         args,
+        ..
     } = command
     else {
         unreachable!("routed by launch_cmd")
     };
     let workdir = resolve_workdir(root, workdir)?;
-    if backend_of(backend, unconfined, root) == Backend::Wslc {
-        let mut inside_args = run_options_args(model.as_deref(), subagents);
-        inside_args.extend(inside_args_for_launch(
-            prompt.as_deref(),
-            prompt_file.as_deref(),
-            no_handoff,
-            &args,
-        )?);
-        let code = wslc::run(&wslc::Launch {
-            root: root.to_path_buf(),
-            harness: harness.into(),
-            auth: auth.into(),
-            provider,
-            server_auth: server_auth.map(AuthMode::from),
-            server_provider,
-            workdir,
-            image,
-            inside_args,
-        })?;
-        std::process::exit(code);
-    }
     let prompt = match (prompt, prompt_file) {
         (Some(p), _) => Some(p),
         (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
@@ -1764,6 +1897,9 @@ fn work_inside_args(
 }
 
 async fn cmd_work(root: &Path, command: Command) -> Fallible {
+    if let Some(l) = wslc_for_work(root, &command)? {
+        std::process::exit(wslc::run(&l)?);
+    }
     let Command::Work {
         harness,
         auth,
@@ -1773,7 +1909,6 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         workdir,
         unconfined,
         backend,
-        image,
         domain,
         lease_seconds,
         keep_going,
@@ -1783,32 +1918,12 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         mine: mine_after,
         mine_model,
         mine_via,
+        ..
     } = command
     else {
         unreachable!("routed by launch_cmd")
     };
     let workdir = resolve_workdir(root, workdir)?;
-    if backend_of(backend, unconfined, root) == Backend::Wslc {
-        let inside_args = work_inside_args(
-            run_options_args(model.as_deref(), subagents),
-            domain.as_deref(),
-            lease_seconds,
-            keep_going,
-            idle_seconds,
-        );
-        let code = wslc::run(&wslc::Launch {
-            root: root.to_path_buf(),
-            harness: harness.into(),
-            auth: auth.into(),
-            provider,
-            server_auth: server_auth.map(AuthMode::from),
-            server_provider,
-            workdir,
-            image,
-            inside_args,
-        })?;
-        std::process::exit(code);
-    }
     let session = Session::start(
         root,
         harness.into(),
@@ -2740,7 +2855,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Web { .. }
         | Command::Mine { .. }
         | Command::Models { .. }
-        | Command::WslcApiCheck
+        | Command::WslcApiCheck { .. }
         | Command::Savings { .. }
         | Command::Golden { .. }
         | Command::Hook { .. }
