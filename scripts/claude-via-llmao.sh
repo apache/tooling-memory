@@ -32,7 +32,7 @@ if [ "$gateway" = 1 ] && [ ! -f "$key_file" ]; then
 fi
 : "${MEMORY_ROOT:?set MEMORY_ROOT in local/.env}"
 
-bin="$here/target/release/memory"
+bin="$here/target/release/amem"
 if [ ! -x "$bin" ]; then
     echo "no $bin; run: cargo build --release" >&2
     exit 1

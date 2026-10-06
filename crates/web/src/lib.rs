@@ -4,8 +4,8 @@
 //! whether or not a browser is attached. Its output goes into a ring buffer and to every
 //! attached websocket; a browser that connects, or reconnects, gets the ring first, so a
 //! refresh or a dropped connection lands in the same place. Beside the terminal a reading
-//! pane renders entries from the record as they land. Loopback only; identity in front of
-//! it comes later.
+//! pane renders entries from the record as they land. Loopback only, and behind a token:
+//! see [`access`].
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -26,7 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
+pub mod access;
 mod pages;
+
+pub use access::Access;
 
 /// What can go wrong.
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +68,8 @@ pub struct Config {
     pub backend: String,
     /// For tests: run this command verbatim instead of the launcher.
     pub command_override: Option<Vec<String>>,
+    /// Who may call: the token, and origins besides the server's own.
+    pub access: Access,
 }
 
 /// A request to start a session.
@@ -152,12 +157,9 @@ fn now() -> String {
         .unwrap_or_default()
 }
 
-fn new_id() -> String {
-    let n = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
-    format!(
-        "{:x}",
-        n as u64 ^ u64::from(std::process::id()).rotate_left(32)
-    )
+/// A session id: unguessable, since a websocket to it is a keyboard on the harness.
+fn new_id() -> Result<String, Error> {
+    Ok(access::random_hex::<16>()?)
 }
 
 /// The harness a request names, or the one the server preselects; a request that
@@ -272,6 +274,7 @@ async fn models_via_launcher(
 impl App {
     fn start(&self, req: &NewSession) -> Result<Arc<Session>, Error> {
         let argv = launch_argv(&self.config, req).map_err(Error::Request)?;
+        let id = new_id()?;
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -300,7 +303,6 @@ impl App {
             .take_writer()
             .map_err(|e| Error::Session(e.to_string()))?;
         let (live, _) = broadcast::channel(1024);
-        let id = new_id();
         let session = Arc::new(Session {
             info: Mutex::new(SessionInfo {
                 id: id.clone(),
@@ -439,6 +441,16 @@ async fn ws_session(session: Arc<Session>, socket: WebSocket) {
         }
     }
     incoming.abort();
+}
+
+/// That this is a server over a record, for a launcher deciding whether to start one;
+/// behind the token, so an answer means the caller holds it.
+async fn health(State(app): State<App>) -> Json<Value> {
+    Json(json!({
+        "server": "amem",
+        "version": env!("CARGO_PKG_VERSION"),
+        "root": app.config.root.display().to_string(),
+    }))
 }
 
 async fn index() -> Html<&'static str> {
@@ -759,6 +771,7 @@ async fn bundle_file(
 /// When the record cannot be opened.
 pub fn router(config: Config) -> Result<Router, Error> {
     let memory = Arc::new(Memory::open(&config.root)?);
+    let access = config.access.clone();
     let app = App {
         config,
         memory,
@@ -767,6 +780,7 @@ pub fn router(config: Config) -> Result<Router, Error> {
     };
     Ok(Router::new()
         .route("/", get(index))
+        .route("/api/health", get(health))
         .route("/vendor/{name}", get(vendor))
         .route("/s/{id}", get(session_page))
         .route("/ws/{id}", get(ws))
@@ -781,22 +795,32 @@ pub fn router(config: Config) -> Result<Router, Error> {
         .route("/reader", get(reader))
         .route("/reader/{name}", get(reader_asset))
         .route("/bundle/{domain}/{label}/{file}", get(bundle_file))
-        .with_state(app))
+        .with_state(app)
+        .layer(axum::middleware::from_fn_with_state(access, access::gate)))
 }
 
-/// Serve on `listen` until the process ends.
+/// A listener on `listen`, which must be a loopback address: the server has no identity
+/// in front of it but the token, and a token on the network is a password in the clear.
 ///
 /// # Errors
 ///
-/// When the address cannot be bound or the record cannot be opened.
-pub async fn serve(config: Config, listen: &str) -> Result<(), Error> {
+/// When the address is not loopback or cannot be bound.
+pub async fn bind(listen: &str) -> Result<tokio::net::TcpListener, Error> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    eprintln!(
-        "memory: web terminal on http://{} · record {} · sessions start in {}",
-        listener.local_addr()?,
-        config.root.display(),
-        config.workdir.display()
-    );
+    if !listener.local_addr()?.ip().is_loopback() {
+        return Err(Error::Request(format!(
+            "{listen} is not a loopback address; the web server listens on 127.0.0.1 or ::1 only"
+        )));
+    }
+    Ok(listener)
+}
+
+/// Serve on a listener from [`bind`] until the process ends.
+///
+/// # Errors
+///
+/// When the record cannot be opened or the listener fails.
+pub async fn serve(config: Config, listener: tokio::net::TcpListener) -> Result<(), Error> {
     let app = router(config)?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -815,8 +839,14 @@ mod tests {
             auth: "subscription".into(),
             backend: "auto".into(),
             command_override: Some(command.iter().map(|s| (*s).to_string()).collect()),
+            access: Access {
+                token: TOKEN.into(),
+                origins: vec![],
+            },
         }
     }
+
+    const TOKEN: &str = "test-token";
 
     #[test]
     fn the_launcher_command_line_follows_the_request() {
@@ -940,7 +970,7 @@ mod tests {
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         let body = body.unwrap_or("");
         let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         s.write_all(req.as_bytes()).await.unwrap();
@@ -957,6 +987,116 @@ mod tests {
             .map(|(_, b)| b.to_string())
             .unwrap_or_default();
         (status, body)
+    }
+
+    /// One request as written, headers and all; the status and the head of the reply.
+    async fn raw(addr: std::net::SocketAddr, request: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(request.as_bytes()).await.unwrap();
+        let mut out = vec![0u8; 4096];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out[..n]).into_owned();
+        let status = text
+            .split(' ')
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        (status, text)
+    }
+
+    #[tokio::test]
+    async fn the_gate_wants_a_loopback_host_its_own_origin_and_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let get = |path: &str, extra: &str| {
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Connection: close\r\n\r\n")
+        };
+        let bearer = format!("Authorization: Bearer {TOKEN}\r\n");
+
+        // the record behind the API wants the token; the page that says how to get it does not
+        assert_eq!(raw(addr, &get("/api/sessions", "")).await.0, 401);
+        assert_eq!(
+            raw(
+                addr,
+                &get("/api/sessions", "Authorization: Bearer nope\r\n")
+            )
+            .await
+            .0,
+            401
+        );
+        assert_eq!(raw(addr, &get("/api/sessions", &bearer)).await.0, 200);
+        assert_eq!(raw(addr, &get("/", "")).await.0, 200);
+        assert_eq!(
+            raw(addr, &get("/bundle/dom-me/internal/manifest.yaml", ""))
+                .await
+                .0,
+            401
+        );
+
+        // a name that rebinds to loopback arrives with its own Host, token or not
+        let rebound = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: attacker.example:{}\r\n{bearer}Connection: close\r\n\r\n",
+            addr.port()
+        );
+        assert_eq!(raw(addr, &rebound).await.0, 403);
+
+        // a page from another origin, another port on this host included, is refused
+        for origin in ["https://attacker.example", "http://127.0.0.1:1", "null"] {
+            let r = get("/api/sessions", &format!("{bearer}Origin: {origin}\r\n"));
+            assert_eq!(raw(addr, &r).await.0, 403, "{origin}");
+        }
+        let own = get(
+            "/api/sessions",
+            &format!("{bearer}Origin: http://{addr}\r\n"),
+        );
+        assert_eq!(raw(addr, &own).await.0, 200);
+
+        // the landing link trades the token for a cookie and drops it from the address
+        let (status, head) = raw(addr, &get(&format!("/reader?bundle=x&token={TOKEN}"), "")).await;
+        assert_eq!(status, 303, "{head}");
+        assert!(head.contains("location: /reader?bundle=x\r\n"), "{head}");
+        let cookie = format!("amem-{}={TOKEN}", addr.port());
+        assert!(
+            head.contains(&format!(
+                "set-cookie: {cookie}; Path=/; HttpOnly; SameSite=Strict"
+            )),
+            "{head}"
+        );
+        let with_cookie = get("/api/sessions", &format!("Cookie: other=1; {cookie}\r\n"));
+        assert_eq!(raw(addr, &with_cookie).await.0, 200);
+        let other_port = get("/api/sessions", &format!("Cookie: amem-1={TOKEN}\r\n"));
+        assert_eq!(raw(addr, &other_port).await.0, 401);
+        assert_eq!(raw(addr, &get("/?token=wrong", "")).await.0, 401);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_websocket_from_another_origin_is_refused_whatever_it_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["sh", "-c", "sleep 5"]).await;
+        let (status, body) = http(addr, "POST", "/api/sessions", Some(r#"{"auth":"key"}"#)).await;
+        assert_eq!(status, 200, "{body}");
+        let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(id.len(), 32, "a session id is 128 random bits: {id}");
+        let upgrade = |origin: &str, auth: &str| {
+            format!(
+                "GET /ws/{id} HTTP/1.1\r\nHost: {addr}\r\n{auth}Origin: {origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+        };
+        let cookie = format!("Cookie: amem-{}={TOKEN}\r\n", addr.port());
+        let (status, _) = raw(addr, &upgrade("https://attacker.example", &cookie)).await;
+        assert_eq!(status, 403);
+        let (status, _) = raw(addr, &upgrade(&format!("http://{addr}"), "")).await;
+        assert_eq!(status, 401);
+        let (status, head) = raw(addr, &upgrade(&format!("http://{addr}"), &cookie)).await;
+        assert_eq!(status, 101, "{head}");
     }
 
     async fn get_json(addr: std::net::SocketAddr, path: &str) -> (u16, Value) {
@@ -999,9 +1139,13 @@ mod tests {
         id: &str,
     ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
     {
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/{id}"))
-            .await
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/ws/{id}")
+            .into_client_request()
             .unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         ws
     }
 

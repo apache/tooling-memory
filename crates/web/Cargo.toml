@@ -12,6 +12,7 @@ bytes = "1"
 dm-core = { version = "0.1.0", path = "../core" }
 dm-server = { version = "0.1.0", path = "../server" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom = "0.4"
 portable-pty = "0.9"
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0.151"

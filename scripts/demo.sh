@@ -4,14 +4,14 @@
 #
 #   scripts/demo.sh <demo-root> <markdown-dir>... 
 #
-# Needs target/release/memory (make build) and a harness login; HARNESS and AUTH override
+# Needs target/release/amem (make build) and a harness login; HARNESS and AUTH override
 # the defaults (claude, subscription). Rerunning reuses the record and adds another task;
 # the entry the erasure step writes and erases is new each run, so the corpus is kept.
 set -eu
 root=${1:?demo root}; shift
 [ $# -ge 1 ] || { echo "give one or more directories or files of Markdown to seed from" >&2; exit 2; }
 here=$(cd "$(dirname "$0")/.." && pwd)
-memory="$here/target/release/memory"
+memory="$here/target/release/amem"
 [ -x "$memory" ] || { echo "build first: make build" >&2; exit 2; }
 if [ ! -f "$root/grants.toml" ]; then
   "$memory" --root "$root" init --owner "human:demo:$(id -un)" --domain dom-demo

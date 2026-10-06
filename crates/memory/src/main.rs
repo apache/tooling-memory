@@ -1,13 +1,17 @@
-//! The `memory` binary: the per-session memory server, the egress, the launcher, and the
-//! command line.
+//! `amem`: the per-session memory server, the egress, the launcher, and the command
+//! line. With no subcommand it opens the browser on the web launcher, starting it first
+//! when it is not already running.
 //!
 //! Every subcommand is a thin call into the library crates; the MCP server and the command
-//! line see the same operations. The binary resolves its mounts at startup (`--root`, or
-//! `MEMORY_ROOT`) and, for `launch`, reads the one or two credentials it needs from its own
-//! environment and never passes them inside.
+//! line see the same operations. The binary resolves its mounts at startup (`--root`,
+//! `MEMORY_ROOT`, or `~/memory`) and, for `launch`, reads the one or two credentials it
+//! needs from its own environment, filled from the root's `credentials.env`, and never
+//! passes them inside.
 
 mod board;
+mod credentials;
 mod deputy;
+mod doctor;
 mod golden;
 mod harness_usage;
 mod hooks;
@@ -15,6 +19,7 @@ mod image;
 mod mcp_http;
 mod mine;
 mod model;
+mod open;
 mod requests;
 mod savings;
 mod taps;
@@ -38,16 +43,18 @@ use time::Duration;
 
 #[derive(Parser)]
 #[command(
-    name = "memory",
+    name = "amem",
     version,
-    about = "Durable memory for disposable agents: one root, served over MCP, with a confined launcher for the harness."
+    about = "Durable memory for disposable agents: one root, served over MCP, with a confined launcher for the harness.",
+    after_help = "With no command, amem opens the web launcher in the browser, starting it when it is not running. `amem doctor` says what this host can run."
 )]
 struct Cli {
-    /// The memory root: grants.toml, record/, state/. The only path this process touches.
+    /// The memory root: grants.toml, credentials.env, record/, state/. The only path
+    /// this process touches. Defaults to ~/memory.
     #[arg(long, env = "MEMORY_ROOT", global = true)]
     root: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// How much of each hit a search or a recall carries.
@@ -541,11 +548,16 @@ enum Command {
         harness: String,
     },
     /// A web terminal on the launcher: sessions in pseudo-terminals streamed to the
-    /// browser, with a reading pane over the record. Loopback only.
+    /// browser, with a reading pane over the record. Loopback only, behind a token kept
+    /// in state/web.json. When one is already running over this root, opens that instead.
     Web {
-        /// Where to listen.
-        #[arg(long, default_value = "127.0.0.1:4200")]
-        listen: String,
+        /// Where to listen; a loopback address. Defaults to 127.0.0.1:4200, or the next
+        /// free port above it.
+        #[arg(long)]
+        listen: Option<String>,
+        /// Print the link instead of opening a browser on it.
+        #[arg(long)]
+        no_open: bool,
         /// The harness the form preselects; each session names its own.
         #[arg(long, value_enum)]
         harness: Option<HarnessArg>,
@@ -556,6 +568,17 @@ enum Command {
         /// The working tree sessions start in. Defaults to the current directory.
         #[arg(long)]
         workdir: Option<PathBuf>,
+    },
+    /// What this host can run: the root and its grants, the credentials and logins
+    /// found, the harnesses on the PATH and in the image, the backend, and whether the
+    /// gateway answers. Names credentials, never their values.
+    Doctor {
+        /// The report as JSON, for the web launcher.
+        #[arg(long)]
+        json: bool,
+        /// Skip the network: do not ask the gateway whether it answers.
+        #[arg(long)]
+        offline: bool,
     },
     /// The harness image on this host.
     Image {
@@ -806,11 +829,11 @@ fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
     if args.get(1).is_some_and(|a| a == "relay") || args.get(3).is_some_and(|a| a == "relay") {
         let cli = Cli::parse();
-        if let Command::Relay {
+        if let Some(Command::Relay {
             socket,
             listen,
             argv,
-        } = cli.command
+        }) = cli.command
         {
             match relay(&socket, &listen, &argv) {
                 Ok(code) => std::process::exit(code),
@@ -837,12 +860,24 @@ fn main() {
         }
         std::process::exit(0);
     }
+    let cli = Cli::parse();
+    let Some(root) = cli.root.clone().or_else(credentials::default_root) else {
+        eprintln!("error: give --root, or set MEMORY_ROOT; there is no home for ~/memory");
+        std::process::exit(1);
+    };
+    // the environment is written here, while this is the only thread
+    let at_start = credentials::KNOWN
+        .iter()
+        .filter(|(k, _)| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+        .map(|(k, _)| (*k).to_string())
+        .collect::<Vec<_>>();
+    credentials::load(&root);
     // The command futures are large and Windows gives the main thread one megabyte, so
     // the CLI runs on a thread with room; the runtime starts there.
     let outcome = std::thread::Builder::new()
-        .name("memory".into())
+        .name("amem".into())
         .stack_size(64 << 20)
-        .spawn(|| run_cli().map_err(|e| e.to_string()))
+        .spawn(move || run_cli(cli, root, at_start).map_err(|e| e.to_string()))
         .and_then(|h| {
             h.join()
                 .map_err(|_| std::io::Error::other("the CLI thread panicked"))
@@ -861,10 +896,29 @@ fn main() {
 }
 
 #[tokio::main]
-async fn run_cli() -> Fallible {
-    let cli = Cli::parse();
-    let root = cli.root.ok_or("give --root, or set MEMORY_ROOT")?;
-    match cli.command {
+async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
+    let Some(command) = cli.command else {
+        return web_cmd(
+            &root,
+            Command::Web {
+                listen: None,
+                no_open: false,
+                harness: None,
+                auth: AuthArg::Subscription,
+                backend: BackendArg::Auto,
+                workdir: None,
+            },
+        )
+        .await;
+    };
+    if !root.exists() && !matches!(command, Command::Init { .. } | Command::Doctor { .. }) {
+        return Err(format!(
+            "no record at {}: run `amem init` to make one there, or give --root (or MEMORY_ROOT)",
+            root.display()
+        )
+        .into());
+    }
+    match command {
         Command::Init { owner, domain } => {
             let m = Memory::init(&root, &owner.unwrap_or_else(default_owner), &domain)?;
             println!(
@@ -887,6 +941,7 @@ async fn run_cli() -> Fallible {
         }
         Command::Hook { .. } => unreachable!("handled in main before the root is needed"),
         cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
+        Command::Doctor { json, offline } => doctor::run(&root, &at_start, json, offline).await,
         cmd @ (Command::Mine { .. }
         | Command::Models { .. }
         | Command::WslcApiCheck { .. }
@@ -1169,7 +1224,11 @@ fn route_for(
     let (destination, ceiling_of) = match auth {
         AuthMode::Subscription => {
             if harness == Harness::Copilot {
-                harness_env.push(("GH_TOKEN".to_string(), need("GH_TOKEN", "copilot")?));
+                let token = crate::credentials::gh_token().ok_or(
+                    "copilot needs GH_TOKEN in the launcher's environment or credentials.env, \
+                     or a `gh auth login` on this host",
+                )?;
+                harness_env.push(("GH_TOKEN".to_string(), token));
             }
             let ceiling_of = if name == "github-copilot" {
                 "github".to_string()
@@ -1433,6 +1492,7 @@ async fn run_confined(
 async fn web_cmd(root: &Path, command: Command) -> Fallible {
     let Command::Web {
         listen,
+        no_open,
         harness,
         auth,
         backend,
@@ -1441,6 +1501,25 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     else {
         unreachable!("routed by run_cli")
     };
+    if Memory::open(root).is_err() {
+        return Err(format!(
+            "no record at {}: run `amem init` to make one, or give --root; `amem doctor` says more",
+            root.display()
+        )
+        .into());
+    }
+    let token = open::token(root)?;
+    // one server per root: when it is already up, the browser goes to it
+    if listen.is_none() {
+        if let Some(url) = open::load(root).and_then(|s| s.url) {
+            if open::answers(&url, &token, root).await {
+                open::show(&format!("{url}/?token={token}"), !no_open);
+                return Ok(());
+            }
+        }
+    }
+    let listener = open::bind(listen.as_deref()).await?;
+    let url = format!("http://{}", listener.local_addr()?);
     let backend_name = match backend {
         BackendArg::Auto => "auto",
         BackendArg::Namespaces => "namespaces",
@@ -1461,8 +1540,30 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         .to_string(),
         backend: backend_name.to_string(),
         command_override: None,
+        access: dm_web::Access {
+            token: token.clone(),
+            origins: Vec::new(),
+        },
     };
-    dm_web::serve(config, &listen).await?;
+    open::save(
+        root,
+        &open::State {
+            token: token.clone(),
+            url: Some(url.clone()),
+        },
+    )?;
+    eprintln!(
+        "amem: web launcher over {} · sessions start in {} · ctrl-c stops it",
+        root.display(),
+        config.workdir.display()
+    );
+    open::show(&format!("{url}/?token={token}"), !no_open);
+    tokio::select! {
+        r = dm_web::serve(config, listener) => r?,
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    // the address goes with the process; the token stays for the next one
+    open::save(root, &open::State { token, url: None })?;
     Ok(())
 }
 
@@ -1568,10 +1669,24 @@ async fn models_cmd(root: &Path, auth: AuthArg, provider: Option<String>) -> Fal
             "openai".to_string()
         }
     });
+    let (destination, models) = list_models(root, auth, &provider).await?;
+    println!(
+        "{}",
+        serde_json::json!({ "destination": destination, "models": models })
+    );
+    Ok(())
+}
+
+/// The models a destination lists, through the egress as a session would reach it.
+async fn list_models(
+    root: &Path,
+    auth: AuthMode,
+    provider: &str,
+) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
     let p = prepare_launch(
         root,
         Harness::Command,
-        Credentials::keyed(auth, &provider),
+        Credentials::keyed(auth, provider),
         None,
         None,
         false,
@@ -1584,12 +1699,7 @@ async fn models_cmd(root: &Path, auth: AuthArg, provider: Option<String>) -> Fal
         "v1/models"
     };
     let v = p.egress.get(&p.provider, path).await?;
-    let models = model_ids(&v);
-    println!(
-        "{}",
-        serde_json::json!({ "destination": p.provider, "models": models })
-    );
-    Ok(())
+    Ok((p.provider.clone(), model_ids(&v)))
 }
 
 /// Model ids out of a listing in OpenAI's shape (`data[].id`), Google's
@@ -2863,6 +2973,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Savings { .. }
         | Command::Golden { .. }
         | Command::Hook { .. }
+        | Command::Doctor { .. }
         | Command::Relay { .. }
         | Command::Usage
         | Command::Task { .. }

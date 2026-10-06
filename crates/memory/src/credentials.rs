@@ -1,0 +1,235 @@
+//! The credentials a launch reads, kept under the root in `credentials.env` so that
+//! `amem` finds them without a wrapper sourcing a file first. The environment wins over
+//! the file: a variable set for one run is a choice made for that run.
+//!
+//! The file names only the variables the launcher reads; any other line is reported and
+//! skipped, so the file cannot become a way to set `PATH` or `LD_PRELOAD` for the
+//! harness. On Unix a file that others can read is refused, as ssh refuses a key.
+
+use std::path::{Path, PathBuf};
+
+/// The file, relative to the root.
+pub const FILE: &str = "credentials.env";
+
+/// What the launcher reads, and what each opens.
+pub const KNOWN: &[(&str, &str)] = &[
+    ("ANTHROPIC_API_KEY", "--auth key to anthropic"),
+    ("OPENAI_API_KEY", "--auth key to openai"),
+    ("GEMINI_API_KEY", "--auth key to gemini"),
+    ("XAI_API_KEY", "--auth key to xai"),
+    ("DASHSCOPE_API_KEY", "--auth key to dashscope"),
+    ("META_API_KEY", "--auth key to meta"),
+    ("LLMAO_KEY", "--auth gateway"),
+    (
+        "LLMAO_URL",
+        "the gateway's address, when it is not the local one",
+    ),
+    ("GH_TOKEN", "copilot, on your GitHub login"),
+    (
+        "GOOGLE_CLOUD_PROJECT",
+        "gemini on a Google login with a project of its own",
+    ),
+    (
+        "LITELLM_MASTER_KEY",
+        "--auth gateway on the wslc backend, which runs its own gateway",
+    ),
+    ("POSTGRES_PASSWORD", "that gateway's database"),
+];
+
+/// The key variable for a key-mode destination.
+#[must_use]
+pub fn key_var(destination: &str) -> Option<&'static str> {
+    Some(match destination {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "gemini" => "GEMINI_API_KEY",
+        "xai" => "XAI_API_KEY",
+        "dashscope" => "DASHSCOPE_API_KEY",
+        "meta" => "META_API_KEY",
+        _ => return None,
+    })
+}
+
+/// The file as read: the pairs it sets, and what was wrong with it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Read {
+    /// Known names and their values, in file order.
+    pub pairs: Vec<(String, String)>,
+    /// One line per problem, for the operator.
+    pub problems: Vec<String>,
+}
+
+/// Parse `NAME=value` lines; `#` comments, blank lines, an `export ` prefix and one
+/// level of matching quotes are allowed.
+#[must_use]
+pub fn parse(text: &str) -> Read {
+    let mut r = Read::default();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((name, value)) = line.split_once('=') else {
+            r.problems.push(format!("line {}: not NAME=value", n + 1));
+            continue;
+        };
+        let name = name.trim();
+        if !KNOWN.iter().any(|(k, _)| *k == name) {
+            r.problems.push(format!(
+                "line {}: {name} is not a credential amem reads; skipped",
+                n + 1
+            ));
+            continue;
+        }
+        let value = value.trim();
+        let value = ['"', '\'']
+            .iter()
+            .find_map(|q| value.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
+            .unwrap_or(value);
+        r.pairs.push((name.to_string(), value.to_string()));
+    }
+    r
+}
+
+/// Whether others than the owner can read the file.
+#[cfg(unix)]
+fn too_open(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o077 != 0)
+}
+
+#[cfg(not(unix))]
+fn too_open(_: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// The file under `root`: absent is not an error, readable by others is.
+///
+/// # Errors
+///
+/// When the file is readable by others, or cannot be read.
+pub fn read(root: &Path) -> Result<Option<Read>, String> {
+    let path = root.join(FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    if too_open(&path).map_err(|e| format!("{}: {e}", path.display()))? {
+        return Err(format!(
+            "{} is readable by others; run `chmod 600 {}`",
+            path.display(),
+            path.display()
+        ));
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some(parse(&text)))
+}
+
+/// Set what the file names and the environment does not, at startup, before any other
+/// thread exists. Problems are reported and do not stop the command.
+pub fn load(root: &Path) {
+    match read(root) {
+        Ok(None) => {}
+        Ok(Some(r)) => {
+            for p in &r.problems {
+                eprintln!("amem: {}: {p}", root.join(FILE).display());
+            }
+            for (k, v) in r.pairs {
+                if std::env::var_os(&k).is_none_or(|e| e.is_empty()) {
+                    std::env::set_var(k, v);
+                }
+            }
+        }
+        Err(e) => eprintln!("amem: not loaded: {e}"),
+    }
+}
+
+/// Where a variable's value comes from, for `doctor`: the environment, the file, or a
+/// helper; never the value itself.
+#[must_use]
+pub fn source(name: &str, file: Option<&Read>, at_start: &[String]) -> Option<&'static str> {
+    if at_start.iter().any(|n| n == name) {
+        return Some("environment");
+    }
+    if file.is_some_and(|r| r.pairs.iter().any(|(k, v)| k == name && !v.is_empty())) {
+        return Some(FILE);
+    }
+    None
+}
+
+/// The GitHub token: `GH_TOKEN`, else what `gh auth token` prints. The CLI keeps the
+/// token in the system keyring, so asking it is how a login on this host is found.
+#[must_use]
+pub fn gh_token() -> Option<String> {
+    if let Some(t) = std::env::var("GH_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+    {
+        return Some(t);
+    }
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !t.is_empty()).then_some(t)
+}
+
+/// The default root when neither `--root` nor `MEMORY_ROOT` names one: `~/memory`.
+#[must_use]
+pub fn default_root() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| PathBuf::from(h).join("memory"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_names_are_read_and_others_are_skipped_with_a_reason() {
+        let r = parse(
+            "# keys\n\nexport ANTHROPIC_API_KEY=\"sk-a\"\nLLMAO_KEY='pat'\nGH_TOKEN=gho\n\
+             LD_PRELOAD=/tmp/x.so\nPATH=/evil\njunk\n",
+        );
+        assert_eq!(
+            r.pairs,
+            vec![
+                ("ANTHROPIC_API_KEY".into(), "sk-a".into()),
+                ("LLMAO_KEY".into(), "pat".into()),
+                ("GH_TOKEN".into(), "gho".into()),
+            ]
+        );
+        assert_eq!(r.problems.len(), 3, "{:?}", r.problems);
+        assert!(r.problems[0].contains("LD_PRELOAD"), "{:?}", r.problems);
+        assert!(r.problems[2].contains("line 8"), "{:?}", r.problems);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_others_can_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(FILE);
+        std::fs::write(&f, "OPENAI_API_KEY=k\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = read(dir.path()).unwrap_err();
+        assert!(e.contains("chmod 600"), "{e}");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let r = read(dir.path()).unwrap().unwrap();
+        assert_eq!(r.pairs, vec![("OPENAI_API_KEY".into(), "k".into())]);
+        assert!(read(&dir.path().join("none")).unwrap().is_none());
+    }
+
+    #[test]
+    fn every_key_destination_names_a_known_variable() {
+        for d in ["anthropic", "openai", "gemini", "xai", "dashscope", "meta"] {
+            let v = key_var(d).unwrap();
+            assert!(KNOWN.iter().any(|(k, _)| *k == v), "{d}");
+        }
+        assert_eq!(key_var("llmao"), None);
+    }
+}

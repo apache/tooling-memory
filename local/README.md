@@ -1,6 +1,6 @@
 # Running it locally
 
-## Confined: `memory launch`
+## Confined: `amem launch`
 
 The way to run a harness. It needs no containers. The harness gets its own user, mount,
 network, pid, uts and ipc namespaces, built natively by the `memory` binary with no
@@ -33,7 +33,7 @@ make work HARNESS=claude LOOP=1               # keep claiming until interrupted
 make usage                                    # tokens by destination and model
 ```
 
-`HARNESS=` is required, in `make` as in `memory launch --harness`: there is no default
+`HARNESS=` is required, in `make` as in `amem launch --harness`: there is no default
 harness, so a run is never the wrong harness by omission.
 
 Three ways to run, one launcher. Interactive is the harness as you know it. `PROMPT` runs the
@@ -53,8 +53,8 @@ server's own tool surface, as a client like the harness, so the ledger's rules l
 place and a launcher that is behind still works.
 
 ```sh
-memory task create "Finish the import" --body "Steps 3 to 5." --priority 5
-memory task admit task-me-xxxxxxxx
+amem task create "Finish the import" --body "Steps 3 to 5." --priority 5
+amem task admit task-me-xxxxxxxx
 make work HARNESS=codex AUTH=key
 ```
 
@@ -81,7 +81,7 @@ end to end, so the egress sees no tokens and checks the ceiling when the tunnel 
 a tunnelled run cost is then what the harness says it cost: after the run the launcher reads
 the transcript the harness left and records its own token counts, Codex's running total
 from its rollout and Claude Code's per-call usage, into the same telemetry marked `harness`
-rather than `egress`, so `memory usage` and the savings funnel show them, flagged as
+rather than `egress`, so `amem usage` and the savings funnel show them, flagged as
 self-reported. Copilot CLI leaves no transcript, so a Copilot run stays uncounted. Under a
 subscription a count is a quantity, not a bill: Codex also reports how much of the plan's
 window a run used, and the launcher prints that.
@@ -150,7 +150,7 @@ make launch HARNESS=grok AUTH=gateway ARGS='-m <a model id the gateway serves>'
 
 `SERVER_AUTH=key` with `SERVER_PROVIDER` works the same way with a provider key; the
 gateway takes no provider name. The gateway's route is named `llmao` and takes the
-`[destinations.llmao]` ceiling. `memory web` does not pass these flags yet. Taps never
+`[destinations.llmao]` ceiling. `amem web` does not pass these flags yet. Taps never
 use either: a tap's credential is the variable its grant names, `GH_TOKEN` say, which the
 host injects as a bearer the tap never sees, under whatever `AUTH` the harness runs.
 
@@ -198,7 +198,7 @@ hand it is:
 
 ```sh
 memory --root ~/memory-demo init --owner human:asf:you --domain dom-demo
-scripts/seed-corpus.py --root ~/memory-demo --memory target/release/memory docs
+scripts/seed-corpus.py --root ~/memory-demo --memory target/release/amem docs
 memory --root ~/memory-demo task create "Answer: what did DR-19 decide, and why?" \
   --body "Search the record, open only what you need, answer in a handoff with the entry ids you cite, then complete." --priority 5
 memory --root ~/memory-demo task admit task-demo-xxxxxxxx
@@ -212,16 +212,21 @@ corpus of 76k, and T0 plus the handoff was 58% of replaying that session's trans
 Search ANDs every word as a phrase, the known-item case; when that finds nothing it
 retries with any word, still ranked by BM25, so a question in natural language lands too.
 
-## In the browser: `make web`
+## In the browser: `amem`
 
-`make web` serves a web terminal on 127.0.0.1:4200. The front page lists sessions and
+`amem`, with no command, serves a web terminal on 127.0.0.1:4200 (or the next free port)
+and opens the browser on it; run again, it finds the server already running over the root
+and opens that. `make web` does the same with `local/.env` and the virtual key in its
+environment. The server answers loopback names only, refuses requests and websockets from
+pages on other origins, and wants the token in `state/web.json` past its static pages:
+the link `amem` opens carries it once and trades it for a cookie. The front page lists sessions and
 starts one from a form: the harness, named, since there is no default; the auth mode; the
 destination, where the mode names one; the model, picked from what the destination lists
-or typed, the list fetched through `memory models`, which routes as a launch would with
+or typed, the list fetched through `amem models`, which routes as a launch would with
 the destination's credential and asks for its `/v1/models`; where subagents go; a prompt,
-or interactive; or the next task from the ledger. The form shows the `memory launch` line
+or interactive; or the next task from the ledger. The form shows the `amem launch` line
 it will run as you fill it in. Each
-session is `memory launch` (or `memory work`) in a pseudo-terminal the server keeps
+session is `amem launch` (or `amem work`) in a pseudo-terminal the server keeps
 alive whether or not a browser is attached, with the same confinement as from a shell.
 Its output goes into a two-megabyte ring on the server and to every attached browser, so
 a refresh, a dropped connection or a second browser replays the scrollback and lands in
@@ -258,7 +263,7 @@ shapes: Claude Code's one turn a line, Codex's rollout items, Gemini's patch log
 
 The third source of memory the harness did not write, after the hooks and the kept
 transcript, and the only one that costs a model call. `--mine` on `launch` or `work`, or
-`memory mine <transcript>`, asks a small model through the session's own destination to
+`amem mine <transcript>`, asks a small model through the session's own destination to
 read the transcript's tail and propose entries: facts, decisions, conventions, methods.
 They land at raw tier with low confidence and the transcript as their source, for a person
 to confirm or drop; nothing mined is trusted on arrival. The default model is a small one
@@ -371,7 +376,7 @@ it gets.
 ```
   claude ──ANTHROPIC_BASE_URL──▶ litellm:4000 ──ANTHROPIC_API_KEY──▶ Anthropic
     │                               └── postgres (keys, spend)
-    └──stdio──▶ memory serve --root $MEMORY_ROOT
+    └──stdio──▶ amem serve --root $MEMORY_ROOT
 ```
 
 ## Once
@@ -383,7 +388,7 @@ cp local/.env.example local/.env      # fill in ANTHROPIC_API_KEY and MEMORY_ROO
 cargo build --release
 make local-up                         # LiteLLM and Postgres, on 127.0.0.1:4000
 make local-key                        # mints a virtual key into local/.virtual-key
-make local-memory                     # memory init at MEMORY_ROOT, if not there yet
+make local-memory                     # amem init at MEMORY_ROOT, if not there yet
 ```
 
 ## Every time

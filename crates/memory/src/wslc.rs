@@ -224,10 +224,11 @@ pub(crate) fn egress_env(extra: &[(String, String)]) -> Vec<(String, String)> {
         if extra.iter().any(|(ek, _)| ek == k) {
             continue;
         }
-        if let Ok(v) = std::env::var(k) {
-            if !v.is_empty() {
-                env.push(((*k).to_string(), v));
-            }
+        // a GitHub login lives in gh's keyring, where the container cannot ask for it
+        let v = std::env::var(k).ok().filter(|v| !v.is_empty());
+        let v = if *k == "GH_TOKEN" { v.or_else(crate::credentials::gh_token) } else { v };
+        if let Some(v) = v {
+            env.push(((*k).to_string(), v));
         }
     }
     env.extend(extra.iter().cloned());

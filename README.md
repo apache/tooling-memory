@@ -6,12 +6,12 @@ The design is the paper in [docs/](docs/durable-memory-for-disposable-agents.md)
 
 ## What you get
 
-A per-session memory server, `memory`, that an agent harness reaches over MCP. It holds the record as Markdown files with frontmatter, an index and a task ledger in one SQLite file, and a grants file the owner edits. An agent starts empty, loads a small index called T0, writes a handoff when it stops, and the next agent continues from the handoff rather than a transcript.
+A per-session memory server, `amem`, that an agent harness reaches over MCP. It holds the record as Markdown files with frontmatter, an index and a task ledger in one SQLite file, and a grants file the owner edits. An agent starts empty, loads a small index called T0, writes a handoff when it stops, and the next agent continues from the handoff rather than a transcript.
 
 ```
-  harness (Claude Code, Codex, ...) ──MCP──▶ memory ──▶ record/   Markdown, versioned
-                                              ├──▶ index.db  SQLite FTS5 + ledger
-                                              └──▶ grants.toml
+  harness (Claude Code, Codex, ...) ──MCP──▶ amem ──▶ record/   Markdown, versioned
+                                            ├──▶ index.db  SQLite FTS5 + ledger
+                                            └──▶ grants.toml
 ```
 
 ## Build and run
@@ -19,11 +19,20 @@ A per-session memory server, `memory`, that an agent harness reaches over MCP. I
 Rust stable, then:
 
 ```sh
-cargo build --release
-export MEMORY_ROOT=~/memory
-./target/release/memory init --domain dom-me
-./target/release/memory t0
+cargo install --path crates/memory --locked   # or `make install`; puts `amem` on the PATH
+amem init --domain dom-me                     # a record at ~/memory; --root or MEMORY_ROOT for elsewhere
+amem doctor                                   # what this host can run, and what is missing
+amem                                          # the web launcher, opened in the browser
 ```
+
+`amem` with no command starts the web launcher over the record, or finds the one already
+running, and opens the browser on it with a link that carries the server's token. The
+server listens on loopback only and answers nothing past its static pages without that
+token; it lives in `~/memory/state/web.json`, owner-only, and survives a restart, so an
+open tab keeps working. Credentials the launcher needs, the API keys, `LLMAO_KEY` for the
+gateway, `GH_TOKEN` for Copilot, go in `~/memory/credentials.env` as `NAME=value`, mode
+600; the environment wins over the file, and a `gh auth login` stands in for `GH_TOKEN`.
+`amem doctor` names which are found where, never their values.
 
 To run a harness confined, with the memory server attached and every model call metered,
 interactively, on a prompt, or on the next task from the ledger,
@@ -36,7 +45,7 @@ locally so the Foundation's shape can be tried end to end.
 Or point a harness at the memory server alone over stdio. For Claude Code:
 
 ```sh
-claude mcp add memory -- /path/to/memory --root ~/memory serve --author "agent:claude-code"
+claude mcp add memory -- /path/to/amem --root ~/memory serve --author "agent:claude-code"
 ```
 
 The agent gets `t0`, `search`, `get`, `write`, `list`, the ledger tools, and a
@@ -45,22 +54,23 @@ The agent gets `t0`, `search`, `get`, `write`, `list`, the ledger tools, and a
 From the command line, the same operations:
 
 ```sh
-echo "Stopped at step 3. Next: digests." | memory write --kind handoff --title "Import, step 3"
-memory search digests
-memory get mem-me-xxxxxxxx
-memory task create "Finish the import" --priority 5
-memory task admit task-me-xxxxxxxx
-memory task claim-next
-memory recall "how does the import retry?"          # the pack, synthesis owed to the caller
-memory recall "how does the import retry?" --provider anthropic   # the brief, a key or the gateway
-memory export ../bundle --max-label internal
-memory erase mem-me-xxxxxxxx --reason requested      # the owner only; a stub and a receipt remain
-memory tap install github-issues taps/target/wasm32-wasip2/release/tap_github_issues.wasm
-memory tap run github-issues --config '{"repo":"owner/name"}'
-memory web            # the web terminal and the browser reader on http://127.0.0.1:4200
-memory reindex
-memory savings        # the paper's read-path claims, measured on this record
-memory golden golden/docs.toml   # recall scored on a question suite
+echo "Stopped at step 3. Next: digests." | amem write --kind handoff --title "Import, step 3"
+amem search digests
+amem get mem-me-xxxxxxxx
+amem task create "Finish the import" --priority 5
+amem task admit task-me-xxxxxxxx
+amem task claim-next
+amem recall "how does the import retry?"          # the pack, synthesis owed to the caller
+amem recall "how does the import retry?" --provider anthropic   # the brief, a key or the gateway
+amem export ../bundle --max-label internal
+amem erase mem-me-xxxxxxxx --reason requested      # the owner only; a stub and a receipt remain
+amem tap install github-issues taps/target/wasm32-wasip2/release/tap_github_issues.wasm
+amem tap run github-issues --config '{"repo":"owner/name"}'
+amem                # the web launcher and the browser reader, opened in the browser
+amem doctor         # logins, keys, harnesses, backend and gateway, checked
+amem reindex
+amem savings        # the paper's read-path claims, measured on this record
+amem golden golden/docs.toml   # recall scored on a question suite
 ```
 
 `crates/memory/tests/cli.rs` runs the seven steps PLAN.md calls M0, end to end, against the
@@ -79,7 +89,7 @@ built binary.
 | `crates/client` | A typed MCP client for the ledger and the record; what the launcher's task mode and an orchestrator use |
 | `crates/wslc-api` | The WSL containers C API, bound by hand, Windows only |
 | `crates/web` | The web terminal: sessions in pseudo-terminals, a reading pane over the record |
-| `crates/memory` | The binary |
+| `crates/memory` | The binary, `amem` |
 | `images/harness` | The harness image: seven harnesses, Node, Python, and `memory`, pinned |
 | `docs/` | The paper, its case study, the stack |
 

@@ -73,8 +73,13 @@ function fill(select, values, keep, placeholder) {
   if (before && values.includes(before)) select.value = before;
 }
 
+// a page opened without the link amem printed, or after the token changed, has no token
+const NO_TOKEN = 'This page has no token for this server. Run amem again, or open the link it printed.';
+
 async function loadOptions() {
-  options = await (await fetch('/api/options')).json();
+  const r = await fetch('/api/options');
+  if (r.status === 401) { $('form-hint').textContent = NO_TOKEN; $('start').disabled = true; return; }
+  options = await r.json();
   fill($('harness'), options.harnesses, false, 'choose…');
   if (options.defaults.harness) $('harness').value = options.defaults.harness;
   fill($('auth'), options.auth, false);
@@ -151,6 +156,7 @@ form.addEventListener('submit', async (e) => {
 
 async function refresh() {
   const r = await fetch('/api/sessions');
+  if (!r.ok) return;
   const list = await r.json();
   const ul = $('sessions');
   if (!list.length) { ul.innerHTML = '<li class="status">none yet</li>'; return; }
@@ -158,7 +164,7 @@ async function refresh() {
     `<li><a href="/s/${s.id}">${esc(s.title)}</a><span class="status">${s.alive ? 'running' : 'exited ' + (s.exit ?? '?')} · ${s.started.slice(11,19)}Z</span></li>`).join('');
 }
 const esc = (t) => t.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-loadOptions().then(preview);
+loadOptions().then(() => { if (options) preview(); });
 refresh(); setInterval(refresh, 3000);
 </script>
 </body>

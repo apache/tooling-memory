@@ -102,7 +102,11 @@ async fn seed(root: &Path) -> Vec<String> {
     ids
 }
 
-/// `memory web` over `root`, on a loopback port.
+/// The token the test server is started with; the page is opened on the landing link
+/// that carries it, as `amem` opens it.
+const TOKEN: &str = "reader-test-token";
+
+/// `amem web` over `root`, on a loopback port.
 async fn web(dir: &Path, root: PathBuf) -> SocketAddr {
     let app = dm_web::router(dm_web::Config {
         root,
@@ -112,6 +116,10 @@ async fn web(dir: &Path, root: PathBuf) -> SocketAddr {
         auth: "subscription".into(),
         backend: "auto".into(),
         command_override: Some(vec!["true".into()]),
+        access: dm_web::Access {
+            token: TOKEN.into(),
+            origins: vec![],
+        },
     })
     .unwrap();
     serve(app).await
@@ -149,6 +157,7 @@ async fn static_host(dir: PathBuf) -> SocketAddr {
 
 /// The page at `url` after its asynchronous work, as the browser serialises it.
 async fn dump(url: String) -> String {
+    let url = format!("{url}&token={TOKEN}");
     let chrome = chrome();
     let out = tokio::time::timeout(
         Duration::from_secs(120),

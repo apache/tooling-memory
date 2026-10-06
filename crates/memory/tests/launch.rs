@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 fn memory() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_memory"))
+    Command::new(env!("CARGO_BIN_EXE_amem"))
 }
 
 /// A fake `claude` that writes its environment and arguments to a file in the working
@@ -590,7 +590,7 @@ fn hook_notes_become_handoffs_when_the_run_left_none() {
     ]);
     cmd.env("PATH", path_with(&bins));
     cmd.env("ANTHROPIC_API_KEY", "sk-ant-placeholder");
-    cmd.env("MEMORY_BIN", env!("CARGO_BIN_EXE_memory"));
+    cmd.env("MEMORY_BIN", env!("CARGO_BIN_EXE_amem"));
     cmd.stdin(Stdio::null());
     let out = cmd.output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);

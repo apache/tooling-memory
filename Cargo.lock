@@ -24,6 +24,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
+name = "amem"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "dm-client",
+ "dm-core",
+ "dm-egress",
+ "dm-index",
+ "dm-ledger",
+ "dm-sandbox",
+ "dm-server",
+ "dm-taps",
+ "dm-web",
+ "dm-wslc-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -912,6 +936,7 @@ dependencies = [
  "dm-core",
  "dm-server",
  "futures-util",
+ "getrandom 0.4.3",
  "portable-pty",
  "serde",
  "serde_json",
@@ -1803,30 +1828,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57804b2c9b69967f1536a56f86297e367a33b19e98852ed624b84551cdbc0d90"
 dependencies = [
  "rustix",
-]
-
-[[package]]
-name = "memory"
-version = "0.1.0"
-dependencies = [
- "axum",
- "clap",
- "dm-client",
- "dm-core",
- "dm-egress",
- "dm-index",
- "dm-ledger",
- "dm-sandbox",
- "dm-server",
- "dm-taps",
- "dm-web",
- "dm-wslc-api",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "tokio",
- "toml",
 ]
 
 [[package]]

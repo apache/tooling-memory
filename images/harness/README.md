@@ -1,6 +1,6 @@
 # The harness image
 
-One image with seven of the eight harnesses `memory launch` knows, Node, and the `memory` binary,
+One image with seven of the eight harnesses `amem launch` knows, Node, and the `memory` binary,
 built from the Dockerfile here. `make image` copies the release binary in and builds with
 `wslc build` (Windows, WSL containers) or `podman build` where that is what is present. The
 tag is `durable-memory/harness:dev`; `MEMORY_IMAGE` or `--image` overrides it at launch.
@@ -11,7 +11,7 @@ machine, independent of what a developer's WSL or laptop contains. The versions 
 
 ## When it is rebuilt
 
-Never on a run. `memory launch` uses the image it is given and fails fast if it is missing.
+Never on a run. `amem launch` uses the image it is given and fails fast if it is missing.
 The image's inputs are the pins in the Dockerfile and the base image, so it is rebuilt when
 those move, and on a clock for the one that moves silently:
 

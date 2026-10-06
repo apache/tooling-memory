@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 fn memory(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_memory"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_amem"));
     cmd.arg("--root").arg(root).args(args);
     cmd.stdin(if stdin.is_some() {
         Stdio::piped()
@@ -362,11 +362,29 @@ fn holds(root: &Path, needle: &[u8]) -> Option<PathBuf> {
 
 #[test]
 fn no_root_is_a_clear_error() {
-    let out = Command::new(env!("CARGO_BIN_EXE_memory"))
+    // with no --root and no MEMORY_ROOT the root is ~/memory, and a missing one says so
+    let home = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_amem"))
         .env_remove("MEMORY_ROOT")
+        .env("HOME", home.path())
         .arg("t0")
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--root"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&home.path().join("memory").display().to_string()),
+        "{err}"
+    );
+    assert!(err.contains("amem init") && err.contains("--root"), "{err}");
+    // and with no home either, there is nowhere to default to
+    let out = Command::new(env!("CARGO_BIN_EXE_amem"))
+        .env_remove("MEMORY_ROOT")
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .arg("t0")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("give --root"));
 }

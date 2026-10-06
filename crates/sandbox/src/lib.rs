@@ -219,6 +219,47 @@ impl Harness {
         }
     }
 
+    /// Every harness, in the order the launcher lists them.
+    pub const ALL: [Harness; 10] = [
+        Harness::Claude,
+        Harness::Codex,
+        Harness::Gemini,
+        Harness::Antigravity,
+        Harness::Qwen,
+        Harness::Grok,
+        Harness::Muse,
+        Harness::Copilot,
+        Harness::OpenCode,
+        Harness::Command,
+    ];
+
+    /// The file a subscription login leaves under the home, which subscription mode
+    /// copies in, and how to make it. Copilot's login is `GH_TOKEN`, not a file; Qwen
+    /// has no login mode and a command has no login of its own.
+    #[must_use]
+    pub fn login(self) -> Option<Login> {
+        let (file, how) = match self {
+            Harness::Claude => (".claude/.credentials.json", "a Claude Code login"),
+            Harness::Codex => (
+                ".codex/auth.json",
+                "`codex login` (or `codex login --device-auth`)",
+            ),
+            Harness::Gemini => (".gemini/oauth_creds.json", "a Gemini CLI Google login"),
+            Harness::Antigravity => (
+                ".gemini/antigravity-cli/antigravity-oauth-token",
+                "an Antigravity CLI Google login (run `agy` once on the host)",
+            ),
+            Harness::Grok => (".grok/auth.json", "`grok login`"),
+            Harness::Muse => (".config/muse/auth.json", "`muse login`"),
+            Harness::OpenCode => (
+                ".local/share/opencode/auth.json",
+                "an OpenCode GitHub Copilot login (`opencode auth login`, GitHub Copilot)",
+            ),
+            Harness::Qwen | Harness::Copilot | Harness::Command => return None,
+        };
+        Some(Login { file, how })
+    }
+
     /// Whether `--provider` may point this harness at another destination.
     #[must_use]
     pub fn accepts_provider(self) -> bool {
@@ -227,6 +268,15 @@ impl Harness {
             Harness::Codex | Harness::Qwen | Harness::OpenCode | Harness::Pi | Harness::Command
         )
     }
+}
+
+/// Where a harness's login lives under the home, and what makes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Login {
+    /// Relative to the home.
+    pub file: &'static str,
+    /// What to run, or do, on the host to leave it there.
+    pub how: &'static str,
 }
 
 /// How the harness's model calls are authenticated.
@@ -357,6 +407,15 @@ fn write(path: &Path, text: &str) -> Result<(), Error> {
 
 /// Copy one login file from the host's home into the sandbox's private home, at the same
 /// relative path. The harness then finds its own login where it expects it.
+/// Copy the harness's own login in, as [`Harness::login`] names it.
+fn copy_own_login(req: &Request<'_>) -> Result<(), Error> {
+    let login = req
+        .harness
+        .login()
+        .ok_or_else(|| Error::Unsupported(format!("{} has no login file", req.harness.binary())))?;
+    copy_login(req, login.file, login.how)
+}
+
 fn copy_login(req: &Request<'_>, rel: &str, login: &str) -> Result<(), Error> {
     let src = req.host_home.map(|h| h.join(rel)).filter(|p| p.is_file());
     let Some(src) = src else {
@@ -757,7 +816,7 @@ fn setup_claude(
     env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
     match req.auth {
         AuthMode::Subscription => {
-            copy_login(req, ".claude/.credentials.json", "a Claude Code login")?;
+            copy_own_login(req)?;
         }
         AuthMode::Gateway | AuthMode::Key => {
             // the egress injects the real credential; this one only has to exist
@@ -821,11 +880,7 @@ fn setup_codex(
         // a ChatGPT login talks to the ChatGPT backend, which refuses relayed requests, so
         // Codex's HTTPS goes through the egress as a tunnel to the ChatGPT hosts, as
         // Copilot CLI's does; the built-in provider and its backend stay as they are
-        copy_login(
-            req,
-            ".codex/auth.json",
-            "`codex login` (or `codex login --device-auth`)",
-        )?;
+        copy_own_login(req)?;
         proxy_via(relay, env);
         // the forward variant, kept for diagnosis: the backend behind the egress
         let base = if std::env::var_os("MEMORY_CHATGPT_FORWARD").is_some() {
@@ -895,7 +950,7 @@ fn setup_gemini(
         // a Google login talks to Code Assist, not the Gemini API: its endpoint moves to
         // the egress, and the token refresh at oauth2.googleapis.com goes through the
         // egress as a tunnel
-        copy_login(req, ".gemini/oauth_creds.json", "a Gemini CLI Google login")?;
+        copy_own_login(req)?;
         // which account and tier; optional, Gemini asks Google again without it
         let _ = copy_login(req, ".gemini/google_accounts.json", "");
         proxy_via(relay, env);
@@ -968,11 +1023,7 @@ fn setup_antigravity(
     let subscription = req.auth == AuthMode::Subscription;
     let mut settings = serde_json::json!({});
     if subscription {
-        copy_login(
-            req,
-            ".gemini/antigravity-cli/antigravity-oauth-token",
-            "an Antigravity CLI Google login (run `agy` once on the host)",
-        )?;
+        copy_own_login(req)?;
         let _ = copy_login(req, ".gemini/google_accounts.json", "");
         // the login's model host is one the egress tunnels to; no endpoint override
         // for it is known, so the route is pinned egress without metering
@@ -1087,7 +1138,7 @@ fn setup_grok(
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
     if req.auth == AuthMode::Subscription {
-        copy_login(req, ".grok/auth.json", "`grok login`")?;
+        copy_own_login(req)?;
         proxy_via(relay, env);
     } else {
         // xai on a key; the gateway's destination when that is the route
@@ -1173,7 +1224,7 @@ fn setup_muse(
     tail: &mut Vec<String>,
 ) -> Result<(), Error> {
     if req.auth == AuthMode::Subscription {
-        copy_login(req, ".config/muse/auth.json", "`muse login`")?;
+        copy_own_login(req)?;
     } else {
         // the egress injects the real key; this one only has to exist
         env.insert("META_API_KEY".into(), "egress".into());
@@ -1383,11 +1434,7 @@ fn setup_opencode_copilot(
     relay: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
-    copy_login(
-        req,
-        ".local/share/opencode/auth.json",
-        "an OpenCode GitHub Copilot login (`opencode auth login`, GitHub Copilot)",
-    )?;
+    copy_own_login(req)?;
     proxy_via(relay, env);
     let config = serde_json::json!({
         "$schema": "https://opencode.ai/config.json",

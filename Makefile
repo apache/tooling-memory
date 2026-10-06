@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build \
+.PHONY: install init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build \
 	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
@@ -54,7 +54,7 @@ launch: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
-	target/release/memory --root "$$MEMORY_ROOT" launch --harness $(HARNESS) --auth $(AUTH) \
+	target/release/amem --root "$$MEMORY_ROOT" launch --harness $(HARNESS) --auth $(AUTH) \
 		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(SERVER_FLAGS) $(if $(MODEL),--model $(MODEL),) \
 		$(if $(SUBAGENTS),--subagents $(SUBAGENTS),) $(if $(PROMPT),--prompt '$(PROMPT)',) -- $(ARGS)
 
@@ -62,7 +62,7 @@ launch: build
 # copied in beside the Dockerfile, then built with wslc on Windows/WSL or podman elsewhere.
 IMAGE ?= durable-memory/harness:dev
 image: build
-	@cp target/release/memory images/harness/memory
+	@cp target/release/amem images/harness/memory
 	@if command -v wslc.exe >/dev/null 2>&1; then \
 		wslc.exe build -t $(IMAGE) "$$(wslpath -w images/harness)"; \
 	elif command -v wslc >/dev/null 2>&1; then wslc build -t $(IMAGE) images/harness; \
@@ -72,14 +72,15 @@ image: build
 # this, `make launch` on Linux runs in the image by default.
 unpack: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \
-	target/release/memory --root "$$MEMORY_ROOT" image unpack --image $(IMAGE)
+	target/release/amem --root "$$MEMORY_ROOT" image unpack --image $(IMAGE)
 
-# The web terminal on 127.0.0.1:4200: sessions start from the browser.
+# The web launcher, opened in the browser, with local/.env and the virtual key in its
+# environment. Outside this checkout, `amem` alone does this from credentials.env.
 web: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
-	target/release/memory --root "$$MEMORY_ROOT" web --harness $(HARNESS) --auth $(AUTH) --backend $(BACKEND)
+	target/release/amem --root "$$MEMORY_ROOT" web $(if $(HARNESS),--harness $(HARNESS),) --auth $(AUTH) --backend $(BACKEND)
 
 # Claim the next task from the ledger and run the harness on it. LOOP=1 keeps claiming.
 work: build
@@ -87,7 +88,7 @@ work: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
-	target/release/memory --root "$$MEMORY_ROOT" work --harness $(HARNESS) --auth $(AUTH) \
+	target/release/amem --root "$$MEMORY_ROOT" work --harness $(HARNESS) --auth $(AUTH) \
 		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(SERVER_FLAGS) $(if $(MODEL),--model $(MODEL),) \
 		$(if $(SUBAGENTS),--subagents $(SUBAGENTS),) $(if $(LOOP),--loop,)
 
@@ -102,7 +103,7 @@ demo: build
 
 # The paper's read-path claims measured on this record.
 savings: build
-	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" savings $(if $(QUERY),--query '$(QUERY)',)
+	@set -a; . ./$(LOCAL_ENV); set +a; target/release/amem --root "$$MEMORY_ROOT" savings $(if $(QUERY),--query '$(QUERY)',)
 
 # A golden suite scored against a record: SUITE (default golden/docs.toml, which fits the
 # demo corpus) on ROOT (default DEMO_ROOT). PROVIDER adds the deputy's brief to the score.
@@ -111,15 +112,15 @@ GOLDEN_AUTH ?= key
 golden: build
 	@set -a; [ -f $(LOCAL_ENV) ] && . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$${LLMAO_KEY:-$$(cat local/.virtual-key 2>/dev/null)}" \
-	target/release/memory --root "$${ROOT:-$(DEMO_ROOT)}" golden $(SUITE) $(if $(PROVIDER),--provider $(PROVIDER) --auth $(GOLDEN_AUTH),)
+	target/release/amem --root "$${ROOT:-$(DEMO_ROOT)}" golden $(SUITE) $(if $(PROVIDER),--provider $(PROVIDER) --auth $(GOLDEN_AUTH),)
 
 usage:
-	@set -a; . ./$(LOCAL_ENV); set +a; target/release/memory --root "$$MEMORY_ROOT" usage
+	@set -a; . ./$(LOCAL_ENV); set +a; target/release/amem --root "$$MEMORY_ROOT" usage
 
 local-memory:
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	if [ -f "$$MEMORY_ROOT/grants.toml" ]; then echo "memory root at $$MEMORY_ROOT"; \
-	else target/release/memory --root "$$MEMORY_ROOT" init --domain dom-me; fi
+	else target/release/amem --root "$$MEMORY_ROOT" init --domain dom-me; fi
 
 # `make check` is the pre-commit gate: fast, and what every commit must pass.
 check: wasip2-target fmt-check clippy test guard-test docs-only-test taps-check
@@ -204,5 +205,9 @@ taps-build:
 build:
 	cargo build --release
 
+# `amem` on the PATH, from this checkout.
+install:
+	cargo install --path crates/memory --locked
+
 run:
-	cargo run -q -p memory -- $(ARGS)
+	cargo run -q -p amem -- $(ARGS)

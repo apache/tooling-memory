@@ -65,7 +65,13 @@ function connect() {
     }
     term.write(new Uint8Array(e.data));
   };
-  ws.onclose = () => { if (closedByServer) return; status.textContent = 'reconnecting'; setTimeout(connect, 1000); };
+  ws.onclose = async () => {
+    if (closedByServer) return;
+    // a refused upgrade looks like any closed socket; ask whether the page has a token
+    const r = await fetch(`/api/sessions/${id}`).catch(() => null);
+    if (r && r.status === 401) { status.textContent = 'no token: run amem again, or open the link it printed'; return; }
+    status.textContent = 'reconnecting'; setTimeout(connect, 1000);
+  };
 }
 connect();
 term.onData((d) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: d })); });

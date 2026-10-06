@@ -83,7 +83,7 @@ is held to the same rules by reading them.
 | `crates/server` | the memory surface: the service, T0, bundles, MCP | native |
 | `crates/egress` | the one way out: forwarding proxy with ceilings and usage, MCP over HTTP | native |
 | `crates/sandbox` | confinement: the plan, and a namespaces backend for Linux | native |
-| `crates/memory` | the binary: serve, launch, relay, and the command line | native |
+| `crates/memory` | the binary, `amem`: serve, launch, relay, doctor, and the command line | native |
 
 Rust stable, one workspace, `cargo` on the host. A rule that applies everywhere belongs
 here; one that applies to a crate belongs in an `AGENTS.md` in that crate, where it is read

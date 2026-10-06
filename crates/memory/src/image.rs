@@ -17,7 +17,8 @@ pub fn rootfs_dir(root: &Path) -> PathBuf {
     root.join("state/images/harness/rootfs")
 }
 
-fn on_path(name: &str) -> bool {
+/// Whether `name` is a file in a directory on the PATH.
+pub(crate) fn on_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
 }

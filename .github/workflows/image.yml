@@ -62,7 +62,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build the memory binary
-        run: cargo build --release --locked -p memory && cp target/release/memory images/harness/memory
+        run: cargo build --release --locked -p amem && cp target/release/amem images/harness/memory
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Build and publish

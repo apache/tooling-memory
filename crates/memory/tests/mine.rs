@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn memory() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_memory"))
+    Command::new(env!("CARGO_BIN_EXE_amem"))
 }
 
 /// A one-request HTTP server that answers like an OpenAI-compatible gateway with two
