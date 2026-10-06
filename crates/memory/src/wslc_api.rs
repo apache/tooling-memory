@@ -696,13 +696,14 @@ mod tests {
             root: r"C:\memory".into(),
             work: r"C:\proj".into(),
             home: r"C:\memory\state\sandbox\claude".into(),
-            projection: Some(r"C:\memory\state\projection\claude".into()),
+            projection: Some(r"C:\memory\state\projection\claude\run-7".into()),
             host_home: Some((r"C:\Users\me".into(), vec![".claude".into()])),
         }
     }
 
     fn launch() -> Launch {
         Launch {
+            projection: "run-7".into(),
             root: r"C:\memory".into(),
             harness: Harness::Claude,
             auth: AuthMode::Subscription,
@@ -763,7 +764,7 @@ mod tests {
             .find(|b| b.container == INSIDE_PROJECTION)
             .unwrap();
         assert!(projection.read_only, "the projection is read-only");
-        assert_eq!(projection.host, r"C:\memory\state\projection\claude");
+        assert_eq!(projection.host, r"C:\memory\state\projection\claude\run-7");
         assert!(
             s.binds.iter().all(|b| b.host != mounts().root),
             "never the record root, only its projection"

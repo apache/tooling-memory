@@ -2025,6 +2025,7 @@ fn wslc_for_launch(
         args,
     )?);
     Ok(Some(wslc::Launch {
+        projection: wslc::projection_name(),
         root: root.to_path_buf(),
         harness: (*harness).into(),
         auth: (*auth).into(),
@@ -2072,6 +2073,7 @@ fn wslc_for_work(
         return Ok(None);
     }
     Ok(Some(wslc::Launch {
+        projection: wslc::projection_name(),
         root: root.to_path_buf(),
         harness: (*harness).into(),
         auth: (*auth).into(),

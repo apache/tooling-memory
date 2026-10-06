@@ -59,6 +59,9 @@ const LITELLM_CONFIG: &str = include_str!("../../../local/litellm.yaml");
 
 /// What to run.
 pub struct Launch {
+    /// This run's projection directory name under `state/projection/<harness>/`, which
+    /// the container mounts and the inside renders under: [`projection_name`]'s.
+    pub projection: String,
     /// The record on this host.
     pub root: PathBuf,
     /// Which harness.
@@ -180,13 +183,11 @@ fn s(v: &[&str]) -> Vec<String> {
 
 /// The arguments of the egress container's `wslc run`. `extra` is environment the
 /// launch adds, such as the gateway's address inside the VM; `network` joins a network.
-#[allow(clippy::too_many_arguments)] // one argument per thing the egress container is given
 fn egress_run_args(
     l: &Launch,
     name: &str,
     volume: &str,
     root_m: &str,
-    projection: &str,
     host_home: Option<(&str, &[String])>,
     extra: &[(String, String)],
     network: Option<&str>,
@@ -255,7 +256,7 @@ pub(crate) fn inside_command(l: &Launch) -> Vec<String> {
         "--workdir-inside",
         INSIDE_WORK,
         "--projection",
-        projection,
+        &l.projection,
         "--harness",
         l.harness.binary(),
         "--auth",
@@ -376,14 +377,32 @@ pub(crate) fn host_logins() -> Fallible<(Option<String>, Vec<String>)> {
     Ok((host_home_m, login_dirs))
 }
 
-/// The projection's mount path, from the launch and the host's own view of the root,
-/// when the launcher rendered one.
+/// This run's projection directory on the host, `state/projection/<harness>/<name>`,
+/// made here so the container mounts it before the inside renders into it, and its mount
+/// path. One per run, since two sessions of a harness at different ceilings would
+/// otherwise each read what the other rendered; [`run`] removes it when the run ends.
 pub(crate) fn projection_mount(l: &Launch) -> Fallible<Option<String>> {
-    // made here, so the first launch on a root mounts it and the inside's render lands
-    // where the container already looks
-    let dir = l.root.join(dm_sandbox::PROJECTION).join(l.harness.binary());
+    let dir = projection_dir(l);
     std::fs::create_dir_all(&dir)?;
     Ok(Some(mount_path(&dir)?))
+}
+
+/// A fresh name for a run's projection: the pid alone could come round again on a root a
+/// killed run left a render in.
+#[must_use]
+pub fn projection_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    format!("run-{}-{nanos:08x}", std::process::id())
+}
+
+fn projection_dir(l: &Launch) -> PathBuf {
+    l.root
+        .join(dm_sandbox::PROJECTION)
+        .join(l.harness.binary())
+        .join(&l.projection)
 }
 
 /// Run a launch through WSL containers, over the C API or the command line as
@@ -394,10 +413,12 @@ pub(crate) fn projection_mount(l: &Launch) -> Fallible<Option<String>> {
 /// When the way asked for cannot serve the launch, `wslc` or the DLL is not there, the
 /// image cannot be had, or a container cannot be started.
 pub fn run(l: &Launch) -> Fallible<i32> {
-    match via_for(l, cfg!(windows))? {
+    let code = match via_for(l, cfg!(windows))? {
         Via::Api => run_api(l),
         _ => run_cli(l),
-    }
+    };
+    std::fs::remove_dir_all(projection_dir(l)).ok();
+    code
 }
 
 /// Over the C API. Under `auto`, what keeps the API from serving, a missing DLL or a
@@ -436,16 +457,7 @@ fn run_cli(l: &Launch) -> Fallible<i32> {
     let home_dir = l.root.join("state/sandbox").join(l.harness.binary());
     std::fs::create_dir_all(&home_dir)?;
     let home_m = mount_path(&home_dir)?;
-    // made here, so the container mounts it before the inside renders into it; the pid
-    // alone could come round again on a root a killed run left a render in
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or_default();
-    let projection = format!("run-{pid}-{nanos:08x}");
-    let projection_host = projection_dir(l, &projection);
-    std::fs::create_dir_all(&projection_host)?;
-    let projection_m = Some(mount_path(&projection_host)?);
+    let projection_m = projection_mount(l)?;
     let (host_home_m, login_dirs) = host_logins()?;
 
     let (extra, network) = if wants_gateway(l) {
@@ -470,7 +482,6 @@ fn run_cli(l: &Launch) -> Fallible<i32> {
             &egress,
             &volume,
             &root_m,
-            &projection,
             host_home_m.as_deref().map(|m| (m, login_dirs.as_slice())),
             &extra,
             network,
@@ -504,7 +515,6 @@ fn run_cli(l: &Launch) -> Fallible<i32> {
         .stderr(Stdio::null())
         .status()
         .ok();
-    std::fs::remove_dir_all(&projection_host).ok();
     result
 }
 
@@ -736,6 +746,7 @@ mod tests {
     #[test]
     fn the_egress_container_gets_the_record_the_volume_and_the_logins_read_only() {
         let l = Launch {
+            projection: "run-7".into(),
             root: "/home/me/memory".into(),
             harness: Harness::Codex,
             auth: AuthMode::Key,
@@ -755,7 +766,6 @@ mod tests {
             "eg",
             "vol",
             "/home/me/memory",
-            "run-7",
             Some(("/home/me", &dirs)),
             &[(
                 "LLMAO_URL".to_string(),
@@ -856,6 +866,7 @@ mod tests {
 
     fn l_default() -> Launch {
         Launch {
+            projection: "run-7".into(),
             root: "/m".into(),
             harness: Harness::Claude,
             auth: AuthMode::Key,
