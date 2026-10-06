@@ -528,7 +528,9 @@ fn ready(h: Harness, auth: AuthMode, f: &Found) -> Ready {
         (Harness::Copilot, AuthMode::Subscription) => {
             (!f.github).then(|| "GH_TOKEN or gh login".to_string())
         }
-        (Harness::Copilot, _) | (Harness::Qwen, AuthMode::Subscription) => return no("n/a"),
+        (Harness::Copilot, _) | (Harness::Qwen | Harness::Pi, AuthMode::Subscription) => {
+            return no("n/a")
+        }
         (_, AuthMode::Subscription) => (!f.logged_in.contains(&h)).then(|| "login".to_string()),
         (_, AuthMode::Key) => {
             let var = credentials::key_var(h.provider()).unwrap_or("a key");

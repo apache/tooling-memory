@@ -220,7 +220,7 @@ impl Harness {
     }
 
     /// Every harness, in the order the launcher lists them.
-    pub const ALL: [Harness; 10] = [
+    pub const ALL: [Harness; 11] = [
         Harness::Claude,
         Harness::Codex,
         Harness::Gemini,
@@ -230,12 +230,14 @@ impl Harness {
         Harness::Muse,
         Harness::Copilot,
         Harness::OpenCode,
+        Harness::Pi,
         Harness::Command,
     ];
 
     /// The file a subscription login leaves under the home, which subscription mode
     /// copies in, and how to make it. Copilot's login is `GH_TOKEN`, not a file; Qwen
-    /// has no login mode and a command has no login of its own.
+    /// and pi have no login mode the launcher can carry, and a command has no login of
+    /// its own.
     #[must_use]
     pub fn login(self) -> Option<Login> {
         let (file, how) = match self {
@@ -255,7 +257,7 @@ impl Harness {
                 ".local/share/opencode/auth.json",
                 "an OpenCode GitHub Copilot login (`opencode auth login`, GitHub Copilot)",
             ),
-            Harness::Qwen | Harness::Copilot | Harness::Command => return None,
+            Harness::Qwen | Harness::Copilot | Harness::Pi | Harness::Command => return None,
         };
         Some(Login { file, how })
     }
@@ -1562,6 +1564,29 @@ pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_harness_is_in_the_list() {
+        // a harness added to the enum and not here stops this compiling
+        let listed = |h: Harness| match h {
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Gemini
+            | Harness::Antigravity
+            | Harness::Qwen
+            | Harness::Grok
+            | Harness::Muse
+            | Harness::Copilot
+            | Harness::OpenCode
+            | Harness::Pi
+            | Harness::Command => Harness::ALL.contains(&h),
+        };
+        for h in Harness::ALL {
+            assert!(listed(h));
+        }
+        assert_eq!(Harness::ALL.len(), 11);
+        assert!(Harness::ALL.contains(&Harness::Pi));
+    }
 
     /// Tests that change the process's PATH take this, since cargo runs tests in
     /// parallel and PATH is one variable for the whole process.

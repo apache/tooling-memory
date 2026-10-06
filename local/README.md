@@ -316,8 +316,8 @@ A session made through the API is a VM of its own with its own image store, whic
 command line's images are not in. The first launch provisions it: `wslc save` the image,
 then load it, about three minutes for the harness image's 3 GB; after that the store is
 trusted and a launch prints the image's short id. After `make image`,
-`memory wslc-api-check --refresh` loads the rebuilt one; an image the command line does not
-have is pulled from its registry instead. `memory wslc-api-check` on its own provisions if
+`amem wslc-api-check --refresh` loads the rebuilt one; an image the command line does not
+have is pulled from its registry instead. `amem wslc-api-check` on its own provisions if
 needed and runs one container, with the time each step took.
 
 The session lives while `memory.exe` holds it, so its VM boots on every launch, six to eight
