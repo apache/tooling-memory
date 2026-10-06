@@ -229,6 +229,52 @@ fn confined_launch_has_no_network_and_no_host_home() {
     assert!(stderr.contains("confined to"), "{stderr}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_s_projection_holds_its_own_render_and_nothing_another_left() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    // what another session of the same harness, at a higher ceiling, left in the
+    // directory sessions of this harness once shared
+    let shared = root.join("state/projection/claude/dom-other");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(
+        shared.join("README.md"),
+        "- [The key](mem-x.md) · restricted: the signing key lives in the vault\n",
+    )
+    .unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_harness(
+        &work,
+        "{ echo \"seen=$(ls /memory | tr '\\n' ',')\"; cat /memory/dom-other/README.md 2>&1; } > ./fake-claude.out\nexit 0",
+    );
+
+    let out = launch(&root, &bins, &work, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let text = read_out(&work);
+    assert!(
+        text.contains("seen=dom-me,"),
+        "its own render is mounted: {text}"
+    );
+    assert!(
+        !text.contains("signing key"),
+        "another session's render is not this one's to read: {text}"
+    );
+    // and the run takes its own render away with it
+    let left: Vec<_> = std::fs::read_dir(root.join("state/projection/claude"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec!["dom-other".to_string()], "{left:?}");
+}
+
 // ---- non-interactive: a prompt, and a task from the ledger ----
 
 /// A fake harness from a shell body. It receives the launcher's arguments; `$*` holds

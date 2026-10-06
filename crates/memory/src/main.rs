@@ -484,6 +484,9 @@ enum Command {
         /// Where the working tree appears in the harness container.
         #[arg(long, default_value = "/work")]
         workdir_inside: PathBuf,
+        /// The projection's directory name, which the launcher outside chose and mounts.
+        #[arg(long)]
+        projection: Option<String>,
         #[arg(long, conflicts_with = "prompt_file")]
         prompt: Option<String>,
         #[arg(long)]
@@ -1333,8 +1336,31 @@ struct Prepared {
     metered: bool,
 }
 
-/// `projected` says whether this invocation mounts the projection for a harness; a tool
-/// run on the host, `recall` or `golden` say, mounts nothing and renders nothing.
+/// Whether a launch renders the projection, and under what name. A tool run on the host,
+/// `recall` or `golden` say, mounts nothing and renders nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Projected<'a> {
+    No,
+    /// Under this session's id.
+    AsSession,
+    /// Under a name the launcher outside chose, for a backend that mounts the directory
+    /// before the session inside it exists.
+    Named(&'a str),
+}
+
+/// A projection's directory name as the command line gives it: one path component, so it
+/// cannot name a directory outside the harness's own.
+fn projection_name(name: &str) -> Result<&str, Box<dyn std::error::Error>> {
+    if !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        Ok(name)
+    } else {
+        Err(format!("--projection {name:?} is not a name: letters, digits and '-'").into())
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // one argument per thing a launch is given
 async fn prepare_launch(
     root: &Path,
@@ -1342,7 +1368,7 @@ async fn prepare_launch(
     creds: Credentials<'_>,
     socket: Option<PathBuf>,
     recall_model: Option<&str>,
-    projected: bool,
+    projected: Projected<'_>,
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
     let auth = creds.auth;
     let route = route_for(harness, auth, creds.provider)?;
@@ -1358,9 +1384,18 @@ async fn prepare_launch(
         format!("grants.toml has no [destinations.{ceiling_of}]; add one with a ceiling")
     })?;
     let home = root.join("state/sandbox").join(harness.binary());
-    let projection = root.join(dm_sandbox::PROJECTION).join(harness.binary());
+    // one directory per session: two sessions of a harness at different ceilings would
+    // otherwise each read what the other rendered
+    let projection_dir = match projected {
+        Projected::Named(n) => projection_name(n)?.to_string(),
+        Projected::No | Projected::AsSession => memory.session_id().to_string(),
+    };
+    let projection = root
+        .join(dm_sandbox::PROJECTION)
+        .join(harness.binary())
+        .join(projection_dir);
     let memory = memory.with_handling_cap(ceiling);
-    let memory = Arc::new(if projected {
+    let memory = Arc::new(if projected != Projected::No {
         memory.with_projection(projection.clone())
     } else {
         memory
@@ -1704,7 +1739,7 @@ async fn golden_cmd(
                 Credentials::keyed(deputy_auth(auth)?, &provider),
                 None,
                 model,
-                false,
+                Projected::No,
             )
             .await?;
             // the suite's reads are a measurement, not a session's
@@ -1752,7 +1787,7 @@ async fn mine_cmd(
         Credentials::keyed(auth.into(), provider),
         None,
         None,
-        false,
+        Projected::No,
     )
     .await?;
     let client = work::client(p.memory.clone()).await?;
@@ -1795,7 +1830,7 @@ async fn list_models(
         Credentials::keyed(auth, provider),
         None,
         None,
-        false,
+        Projected::No,
     )
     .await?;
     // Google lists under v1beta; everyone else speaks OpenAI's list, Anthropic included
@@ -1854,7 +1889,7 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
                 Credentials::keyed(deputy_auth(auth)?, &provider),
                 None,
                 model.as_deref(),
-                false,
+                Projected::No,
             )
             .await?;
             let r = p
@@ -2186,6 +2221,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
         requests,
         host_home,
         workdir_inside,
+        projection,
         prompt,
         prompt_file,
         no_handoff,
@@ -2221,11 +2257,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
         },
         PathBuf::from("/"),
         runner,
-        RunOptions {
-            model,
-            subagents,
-            program,
-        },
+        RunOptions::new(model, subagents, program, projection),
     )
     .await?;
     let code = if work {
@@ -2273,11 +2305,29 @@ struct RunOptions {
     model: Option<String>,
     subagents: SubagentsArg,
     program: Vec<String>,
+    /// The projection's directory name, when the launcher outside chose it.
+    projection: Option<String>,
 }
 
 /// The environment the run options add: the board for subagents, and for Claude Code
 /// the model as every role's default, since it picks a model per role and a gateway
 /// that serves one model answers only for that one.
+impl RunOptions {
+    fn new(
+        model: Option<String>,
+        subagents: SubagentsArg,
+        program: Vec<String>,
+        projection: Option<String>,
+    ) -> RunOptions {
+        RunOptions {
+            model,
+            subagents,
+            program,
+            projection,
+        }
+    }
+}
+
 fn apply_run_options(p: &mut Prepared, harness: Harness, auth: AuthMode, options: &RunOptions) {
     p.model.clone_from(&options.model);
     if harness == Harness::Claude && auth == AuthMode::Gateway {
@@ -2490,7 +2540,11 @@ impl Session {
             _ => None,
         };
         let auth = creds.auth;
-        let mut p = prepare_launch(root, harness, creds, socket, None, true).await?;
+        let projected = options
+            .projection
+            .as_deref()
+            .map_or(Projected::AsSession, Projected::Named);
+        let mut p = prepare_launch(root, harness, creds, socket, None, projected).await?;
         apply_run_options(&mut p, harness, auth, &options);
 
         #[cfg(unix)]
@@ -2794,6 +2848,8 @@ impl Session {
             record_reported_usage(&self.p);
         }
         report_usage(&self.p.egress);
+        // the render was this session's alone, and goes with it
+        std::fs::remove_dir_all(&self.p.projection).ok();
         if let Runner::Requests(r) = &self.runner {
             std::fs::write(r.dir.join(requests::DONE), code.to_string()).ok();
         }
@@ -3166,6 +3222,24 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[test]
+    fn a_projection_name_from_the_command_line_is_one_component() {
+        assert!(projection_name("run-4242").is_ok());
+        assert!(projection_name("sess-ab12").is_ok());
+        for bad in [
+            "",
+            "..",
+            "../claude",
+            "a/b",
+            "/abs",
+            "a\\b",
+            "run 1",
+            &"x".repeat(65),
+        ] {
+            assert!(projection_name(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn model_ids_are_read_from_either_listing_shape() {

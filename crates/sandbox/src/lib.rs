@@ -690,6 +690,29 @@ fn provider_of(req: &Request<'_>) -> Result<String, Error> {
     })
 }
 
+/// The sandbox's own mounts go on top of the working tree, and would hide it or a part
+/// of it; the home is mounted before the tree, so a tree under it stays.
+fn refuse_a_hidden_workdir(req: &Request<'_>) -> Result<(), Error> {
+    let inside = req.workdir_inside();
+    let own = [
+        Path::new(INSIDE_PROJECTION),
+        Path::new(INSIDE_MEMORY)
+            .parent()
+            .unwrap_or(Path::new(INSIDE_MEMORY)),
+        Path::new(INSIDE_SOCKET)
+            .parent()
+            .unwrap_or(Path::new(INSIDE_SOCKET)),
+    ];
+    match own.into_iter().find(|own| inside.starts_with(own)) {
+        Some(own) => Err(Error::Unsupported(format!(
+            "the working tree {} would sit under the sandbox's own {}; run from another directory",
+            inside.display(),
+            own.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Build the plan: write the harness's configuration into the private home and decide
 /// mounts, environment, and command.
 ///
@@ -698,6 +721,7 @@ fn provider_of(req: &Request<'_>) -> Result<String, Error> {
 /// A harness not on PATH, an unsupported harness, auth and provider combination, or a
 /// file under the home that cannot be written.
 pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
+    refuse_a_hidden_workdir(req)?;
     let image = req.image || req.rootfs.is_some();
     let harness_bin = if req.harness == Harness::Command {
         program_of(req.harness_args, image)?
@@ -1930,6 +1954,46 @@ mod tests {
             m.read_only,
             "read-only: the files cannot be edited into lies"
         );
+    }
+
+    #[test]
+    fn a_working_tree_under_the_sandbox_s_own_mounts_is_refused() {
+        let f = fixture();
+        let args = vec!["true".to_string()];
+        let plan_at = |workdir: &str| {
+            prepare(&Request {
+                harness: Harness::Command,
+                auth: AuthMode::Key,
+                provider: None,
+                workdir: Path::new(workdir),
+                home: &f.root.join("h"),
+                egress_socket: &f.sock,
+                memory_binary: &f.memory_bin,
+                destination_ceiling: Label::Public,
+                harness_args: &args,
+                host_home: None,
+                harness_env: &[],
+                model: None,
+                image: false,
+                workdir_inside: None,
+                rootfs: None,
+                projection: None,
+            })
+        };
+        for under in ["/memory", "/memory/w", "/opt/memory/w", "/run/memory/w"] {
+            assert!(
+                matches!(plan_at(under), Err(Error::Unsupported(ref m)) if m.contains("sandbox's own")),
+                "{under} would be hidden by a mount the sandbox makes after it"
+            );
+        }
+        // the home is mounted before the tree, so a tree under it stays; and a sibling
+        // whose name only starts the same is not under it
+        for fine in ["/home/user/proj", "/memoryless/w", "/opt/memory-tools"] {
+            assert!(
+                !matches!(plan_at(fine), Err(Error::Unsupported(ref m)) if m.contains("sandbox's own")),
+                "{fine}"
+            );
+        }
     }
 
     #[test]

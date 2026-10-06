@@ -180,11 +180,13 @@ fn s(v: &[&str]) -> Vec<String> {
 
 /// The arguments of the egress container's `wslc run`. `extra` is environment the
 /// launch adds, such as the gateway's address inside the VM; `network` joins a network.
+#[allow(clippy::too_many_arguments)] // one argument per thing the egress container is given
 fn egress_run_args(
     l: &Launch,
     name: &str,
     volume: &str,
     root_m: &str,
+    projection: &str,
     host_home: Option<(&str, &[String])>,
     extra: &[(String, String)],
     network: Option<&str>,
@@ -252,6 +254,8 @@ pub(crate) fn inside_command(l: &Launch) -> Vec<String> {
         INSIDE_HOST_HOME,
         "--workdir-inside",
         INSIDE_WORK,
+        "--projection",
+        projection,
         "--harness",
         l.harness.binary(),
         "--auth",
@@ -432,7 +436,11 @@ fn run_cli(l: &Launch) -> Fallible<i32> {
     let home_dir = l.root.join("state/sandbox").join(l.harness.binary());
     std::fs::create_dir_all(&home_dir)?;
     let home_m = mount_path(&home_dir)?;
-    let projection_m = projection_mount(l)?;
+    // made here, so the container mounts it before the inside renders into it
+    let projection = format!("run-{pid}");
+    let projection_host = projection_dir(l, &projection);
+    std::fs::create_dir_all(&projection_host)?;
+    let projection_m = Some(mount_path(&projection_host)?);
     let (host_home_m, login_dirs) = host_logins()?;
 
     let (extra, network) = if wants_gateway(l) {
@@ -457,6 +465,7 @@ fn run_cli(l: &Launch) -> Fallible<i32> {
             &egress,
             &volume,
             &root_m,
+            &projection,
             host_home_m.as_deref().map(|m| (m, login_dirs.as_slice())),
             &extra,
             network,
@@ -490,6 +499,7 @@ fn run_cli(l: &Launch) -> Fallible<i32> {
         .stderr(Stdio::null())
         .status()
         .ok();
+    std::fs::remove_dir_all(&projection_host).ok();
     result
 }
 
@@ -740,6 +750,7 @@ mod tests {
             "eg",
             "vol",
             "/home/me/memory",
+            "run-7",
             Some(("/home/me", &dirs)),
             &[(
                 "LLMAO_URL".to_string(),
@@ -770,6 +781,10 @@ mod tests {
                 "img:dev /opt/memory/memory --root /memory inside --requests /run/memory"
             ),
             "{joined}"
+        );
+        assert!(
+            joined.contains("--projection run-7 --harness codex"),
+            "the inside renders under the name the outside mounts: {joined}"
         );
         assert!(
             joined.ends_with(
