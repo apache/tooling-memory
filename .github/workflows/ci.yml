@@ -13,8 +13,8 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Whether this push or pull request changes only Markdown, which cannot change what
-  # builds (scripts/docs-only.sh). The jobs below skip on a yes; a job skipped by its
+  # Whether this push or pull request changes only Markdown outside the code, which cannot
+  # change what builds (scripts/docs-only.sh says which files those are). The jobs below skip on a yes; a job skipped by its
   # condition reports success, so a required check does not sit waiting for it. Anything
   # the diff cannot answer, a first push or a rewritten base, runs everything.
   changes:
@@ -30,8 +30,11 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          if files=$(git diff --name-only --no-renames "$BASE" "$GITHUB_SHA") &&
-              printf '%s\n' "$files" | sh scripts/docs-only.sh; then
+          # judged by the base's copy of the script, so a change to it cannot skip the
+          # job that tests it; a base without one runs everything
+          if judge=$(git show "$BASE:scripts/docs-only.sh") &&
+              files=$(git diff --name-only --no-renames "$BASE" "$GITHUB_SHA") &&
+              printf '%s\n' "$files" | sh -c "$judge"; then
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
             echo "only Markdown changed; the build and test jobs skip"
           else

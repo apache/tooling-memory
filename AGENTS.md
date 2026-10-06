@@ -21,8 +21,9 @@ with an explicit request from the user, ask before overriding it.
 - **`make check` must pass before you commit.** It runs `cargo fmt --check`, `cargo clippy`
   with warnings as errors, `cargo test`, and the guard's own tests. Fix every error and
   warning. Do not commit with `--no-verify`. `make init` installs it as the pre-commit hook.
-  A change that touches only Markdown skips it, in the hook and in CI, because no crate
-  embeds a `.md` file; `scripts/docs-only.sh` decides, and its test holds the premise.
+  A change that touches only Markdown outside `crates/` and `taps/` (an `AGENTS.md` there
+  counts as Markdown) skips it, in the hook and in CI, because nothing builds from or reads
+  those files; `scripts/docs-only.sh` decides, and its test holds the premise.
 - **Show a new assertion failing before you trust it.** Run it against the code as it was
   before your change, and put what it reported in the pull request. A test that has only
   ever passed has not been shown to test anything. Assert the rule, not a bound on it.

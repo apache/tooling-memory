@@ -47,14 +47,18 @@ fn chrome() -> PathBuf {
 }
 
 /// The Playwright image's Chrome, through scripts/chrome-container.sh, when a container
-/// runtime is on the path: a host with no Chrome, or one without the libraries it needs.
+/// runtime answers: a host with no Chrome, or one without the libraries it needs. Linux
+/// only, where the container's host network is this host's and reaches the test's server;
+/// elsewhere a container runs in a virtual machine whose loopback is its own.
 fn chrome_in_a_container() -> Option<PathBuf> {
-    if !cfg!(unix) {
+    if !cfg!(target_os = "linux") {
         return None;
     }
+    // `info` asks the daemon, so a runtime that is installed but cannot run a container
+    // leaves the clear message above rather than a failed `run`
     let runs = |runtime: &str| {
         std::process::Command::new(runtime)
-            .arg("--version")
+            .arg("info")
             .output()
             .is_ok_and(|o| o.status.success())
     };

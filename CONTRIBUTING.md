@@ -28,7 +28,7 @@ make check       # format, clippy, tests, guard and docs-only tests
 
 | Command | What it runs |
 | ------- | ------------ |
-| `make check` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the guard and docs-only tests. The pre-commit gate; a commit of Markdown alone runs the guard tests instead |
+| `make check` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the guard and docs-only tests. The pre-commit gate; a commit of Markdown alone, outside `crates/` and `taps/`, runs the guard tests instead |
 | `make test` | `cargo test` alone |
 | `make fmt` | `cargo fmt`, rewriting in place |
 | `make run ARGS='...'` | the `memory` binary, for example `ARGS='init /tmp/m --domain dom-me'` |

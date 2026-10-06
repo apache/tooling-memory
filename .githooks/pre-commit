@@ -1,8 +1,8 @@
 #!/bin/sh
 # Installed by `make init` (git config core.hooksPath .githooks).
 # The gate is `make check`; a commit that skips it moves the failure to CI at best. A
-# commit that stages only Markdown runs the guard's tests instead, since it cannot change
-# what builds (scripts/docs-only.sh).
+# commit that stages only Markdown outside the code runs the guard's tests instead, since
+# it cannot change what builds (scripts/docs-only.sh says which files those are).
 set -eu
 cd "$(git rev-parse --show-toplevel)"
 if git diff --cached --name-only --no-renames | sh scripts/docs-only.sh; then
