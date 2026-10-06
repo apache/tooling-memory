@@ -27,3 +27,14 @@ test('a recent entry opens when clicked', async ({ signedIn: page }) => {
   await expect(page.locator('#kind')).toContainText('fact');
   expect(ids()).toHaveLength(3);
 });
+
+test('a title is shown as text, never run as markup', async ({ signedIn: page }) => {
+  await page.locator('#harness').selectOption('claude');
+  await page.getByRole('button', { name: 'Start' }).click();
+  await expect(page.locator('.xterm-rows')).toContainText('e2e session: ready');
+  const title = '<img src=x onerror="window.pwned=1">';
+  execFileSync(amem, ['--root', root, 'write', '--kind', 'fact', '--title', title, '--body', 'x'], { cwd: '/tmp' });
+  await expect(page.locator('#recent')).toContainText(title);
+  await expect(page.locator('#recent img')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { pwned?: number }).pwned)).toBeUndefined();
+});
