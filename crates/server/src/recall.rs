@@ -1024,20 +1024,20 @@ mod tests {
     struct Scripted {
         answers: Mutex<Vec<String>>,
         prompts: Mutex<Vec<String>>,
-        /// Sleep this long before every answer.
-        delay: Duration,
+        /// Sleep this long before the answer to each call in turn; none past the list.
+        delays: Vec<Duration>,
     }
 
     impl Scripted {
         fn new(answers: &[&str]) -> Arc<Scripted> {
-            Scripted::slow(answers, Duration::ZERO)
+            Scripted::paced(answers, &[])
         }
 
-        fn slow(answers: &[&str], delay: Duration) -> Arc<Scripted> {
+        fn paced(answers: &[&str], delays: &[Duration]) -> Arc<Scripted> {
             Arc::new(Scripted {
                 answers: Mutex::new(answers.iter().rev().map(|s| (*s).to_string()).collect()),
                 prompts: Mutex::new(Vec::new()),
-                delay,
+                delays: delays.to_vec(),
             })
         }
     }
@@ -1052,8 +1052,12 @@ mod tests {
             prompt: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async move {
-                self.prompts.lock().unwrap().push(prompt.to_string());
-                tokio::time::sleep(self.delay).await;
+                let call = {
+                    let mut prompts = self.prompts.lock().unwrap();
+                    prompts.push(prompt.to_string());
+                    prompts.len() - 1
+                };
+                tokio::time::sleep(self.delays.get(call).copied().unwrap_or_default()).await;
                 self.answers
                     .lock()
                     .unwrap()
@@ -1424,8 +1428,11 @@ mod tests {
         assert_eq!(a.queries, ["q1", "q2"]);
     }
 
-    /// A deputy that never answers.
-    struct Hangs;
+    /// A deputy that answers only after a minute, and records when it has.
+    #[derive(Default)]
+    struct Hangs {
+        answered: std::sync::atomic::AtomicBool,
+    }
 
     impl Deputy for Hangs {
         fn model(&self) -> String {
@@ -1437,7 +1444,9 @@ mod tests {
             _prompt: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                self.answered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(String::new())
             })
         }
@@ -1454,9 +1463,9 @@ mod tests {
             vec![],
         )
         .await;
-        let deputy: Arc<dyn Deputy> = Arc::new(Hangs);
+        let hangs = Arc::new(Hangs::default());
+        let deputy: Arc<dyn Deputy> = hangs.clone();
         m.set_deputy(&deputy);
-        let started = Instant::now();
         let err = m
             .recall(
                 "retry",
@@ -1473,7 +1482,11 @@ mod tests {
             matches!(err, Error::Deputy(ref s) if s.contains("within")),
             "{err}"
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // the recall was over before the deputy answered: cut off, not waited out
+        assert!(
+            !hangs.answered.load(std::sync::atomic::Ordering::SeqCst),
+            "the recall waited for the deputy"
+        );
     }
 
     #[tokio::test]
@@ -1664,13 +1677,15 @@ mod tests {
             vec![],
         )
         .await;
-        // each call is under the wall; the two together are not
-        let deputy = Scripted::slow(
+        // each call is well under the wall and the two together well over it, with
+        // seconds of slack either side, so load on the machine moves neither: a second
+        // hop given a wall of its own would answer, and one sharing the first's cannot
+        let deputy = Scripted::paced(
             &[
                 &format!("{{\"brief\": \"first [{retry}]\", \"missing\": [\"attempts\"]}}"),
                 "{\"brief\": \"second\"}",
             ],
-            Duration::from_millis(200),
+            &[Duration::from_millis(2500), Duration::from_millis(2500)],
         );
         let strong: Arc<dyn Deputy> = deputy.clone();
         m.set_deputy(&strong);
@@ -1680,7 +1695,7 @@ mod tests {
                 None,
                 None,
                 Budget {
-                    wall: Duration::from_millis(300),
+                    wall: Duration::from_secs(4),
                     ..Budget::default()
                 },
             )
