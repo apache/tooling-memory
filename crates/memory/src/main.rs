@@ -3279,6 +3279,9 @@ mod backend_tests {
         std::fs::create_dir_all(busy.join("dom-me")).unwrap();
         assert!(at(Projected::Named("run-8-busy")).await.is_err());
         assert!(busy.join("dom-me").exists(), "and is left as it was");
+        // the empty one the launcher outside made for it is the session's to render into
+        std::fs::create_dir_all(base.join("run-9-empty")).unwrap();
+        assert!(at(Projected::Named("run-9-empty")).await.is_ok());
     }
 
     #[test]

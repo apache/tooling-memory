@@ -335,17 +335,16 @@ impl Memory {
                 }
             }
             let summaries = dom.join(SUMMARIES);
-            if let Some(text) = read_own(&summaries) {
-                // a line is the entry's when its own link names the file: a title holds
-                // no bracket, so the first `](` is the link, and a summary that cites
-                // the file further along is another entry's line
+            if let Some(text) = summaries_of(&summaries)? {
                 let own = format!("]({file})");
-                let is_own = |line: &str| {
-                    line.starts_with("- [")
-                        && line.find("](").is_some_and(|i| line[i..].starts_with(&own))
-                };
-                if text.lines().any(is_own) {
-                    let kept: Vec<&str> = text.lines().filter(|line| !is_own(line)).collect();
+                let gone = own_lines(&text, &own);
+                if gone.iter().any(|g| *g) {
+                    let kept: Vec<&str> = text
+                        .lines()
+                        .zip(&gone)
+                        .filter(|(_, g)| !**g)
+                        .map(|(line, _)| line)
+                        .collect();
                     // the header counts the lines, as render_summaries wrote it
                     let listed = kept.iter().filter(|line| line.starts_with("- [")).count();
                     let page: String = kept
@@ -458,6 +457,39 @@ pub fn render_recall(r: &crate::recall::Recall) -> String {
         }
     }
     out
+}
+
+/// Which lines of a summaries page are the entry's whose link is `own`, `](<file>)`. A
+/// line is when its own link names the file: a title holds no bracket, so its first `](`
+/// is the link, and a summary citing the file further along is another entry's line. A
+/// page rendered before titles lost their newlines can hold a title split over lines:
+/// there the line holding the link is the entry's, and so is the line it continues.
+fn own_lines(text: &str, own: &str) -> Vec<bool> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut gone = vec![false; lines.len()];
+    for (n, line) in lines.iter().enumerate() {
+        let link_first = line.find("](").is_some_and(|i| line[i..].starts_with(own));
+        if line.starts_with("- [") {
+            gone[n] = link_first;
+        } else if link_first {
+            gone[n] = true;
+            if let Some(start) = (0..n).rev().find(|&k| lines[k].starts_with("- [")) {
+                if (start..n).all(|k| !lines[k].contains("](")) {
+                    gone[start..n].iter_mut().for_each(|g| *g = true);
+                }
+            }
+        }
+    }
+    gone
+}
+
+/// A summaries page's text: none when there is none or a link stands in its place, and
+/// an error when a page of its own cannot be read, so the sweep says it missed it.
+fn summaries_of(path: &Path) -> Result<Option<String>, Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => std::fs::read_to_string(path).map(Some).map_err(io(path)),
+        _ => Ok(None),
+    }
 }
 
 /// The directories directly under `dir`, links and files left out. One that cannot be

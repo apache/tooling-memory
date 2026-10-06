@@ -398,7 +398,7 @@ pub fn projection_name() -> String {
     format!("run-{}-{nanos:08x}", std::process::id())
 }
 
-fn projection_dir(l: &Launch) -> PathBuf {
+pub(crate) fn projection_dir(l: &Launch) -> PathBuf {
     l.root
         .join(dm_sandbox::PROJECTION)
         .join(l.harness.binary())

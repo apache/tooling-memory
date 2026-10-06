@@ -394,13 +394,18 @@ mod on_windows {
 
     /// On Ctrl-C, end the session, and every container in it with it, then exit as an
     /// interrupted process does; otherwise the session outlives this process for a while.
-    fn end_on_interrupt(session: &Arc<Session>) -> Option<tokio::task::JoinHandle<()>> {
+    /// The run's projection goes too: no later run mounts or renders it again.
+    fn end_on_interrupt(
+        session: &Arc<Session>,
+        projection: PathBuf,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let rt = tokio::runtime::Handle::try_current().ok()?;
         let s = session.clone();
         Some(rt.spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
                 eprintln!("memory: interrupted; ending the session");
                 s.terminate().ok();
+                std::fs::remove_dir_all(&projection).ok();
                 std::process::exit(130);
             }
         }))
@@ -492,7 +497,7 @@ mod on_windows {
     pub(crate) fn run(l: &Launch, api: &Arc<Api>, storage: &Path) -> Fallible<i32> {
         let (session, slot) = open_slot(api, storage)?;
         let session = Arc::new(session);
-        let interrupt = end_on_interrupt(&session);
+        let interrupt = end_on_interrupt(&session, wslc::projection_dir(l));
         let volume = format!("memory-run-{}", std::process::id());
         sweep(&session, &slot, &volume);
         ensure_image(&session, &l.image, false, &slot)?;

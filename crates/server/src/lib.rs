@@ -783,13 +783,7 @@ impl Memory {
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
         let missed = self.erase_from_projections(&domain, id);
-        receipt.unresolved = UNRESOLVED.iter().map(|u| (*u).to_string()).collect();
-        if receipt.removed.is_empty() {
-            receipt
-                .unresolved
-                .push("the versions removed were not recorded: the stub was there first".into());
-        }
-        receipt.unresolved.extend(missed);
+        close_receipt(&mut receipt, missed);
         self.store.put_receipt(&receipt).await?;
         self.refresh_projection_after_erasure().await;
         Ok(receipt)
@@ -821,6 +815,22 @@ impl Memory {
 }
 
 /// What an erasure here cannot reach, named on every receipt so nobody believes it did.
+/// What the receipt still owes once every step ran: the standing list, the versions it
+/// could not name, and the renders the sweep missed. A missed render leaves the erasure
+/// unfinished, so running it again sweeps again.
+fn close_receipt(receipt: &mut Receipt, missed: Vec<String>) {
+    receipt.unresolved = UNRESOLVED.iter().map(|u| (*u).to_string()).collect();
+    if receipt.removed.is_empty() {
+        receipt
+            .unresolved
+            .push("the versions removed were not recorded: the stub was there first".into());
+    }
+    if !missed.is_empty() {
+        receipt.unresolved.push(erasure::UNFINISHED.into());
+    }
+    receipt.unresolved.extend(missed);
+}
+
 const UNRESOLVED: &[&str] = &[
     "exports issued before the erasure",
     "transcripts of sessions that read it",
@@ -1513,6 +1523,11 @@ mod tests {
         // a render from before renders were per session, at <harness>/ itself
         let old = base.join("gemini");
         m.project_into(&old).await.unwrap();
+        // as main rendered a title with a newline in it: over two lines
+        let page = std::fs::read_to_string(old.join("dom-me/README.md")).unwrap();
+        let split = page.replace("Alice diagnosis -  Alice", "Alice diagnosis\n-  Alice");
+        assert_ne!(page, split, "{page}");
+        std::fs::write(old.join("dom-me/README.md"), split).unwrap();
         let page = old.join(projection::RECALLS).join("sess-old");
         std::fs::create_dir_all(&page).unwrap();
         std::fs::write(page.join("p.md"), format!("served: {MARKER}\n")).unwrap();
@@ -1524,8 +1539,16 @@ mod tests {
             "Unrelated, half.\n",
         )
         .unwrap();
+        // a render killed while it wrote its summaries: the page half written, none whole
+        let killed = base.join("claude/sess-killed/dom-me");
+        std::fs::create_dir_all(&killed).unwrap();
+        std::fs::write(killed.join("README.md.tmp"), "- [Alice diagnosis, half\n").unwrap();
         m.erase(&c, Reason::Requested).await.unwrap();
         m.erase(&titled, Reason::Requested).await.unwrap();
+        assert!(
+            !killed.join("README.md.tmp").exists(),
+            "a half-written page goes"
+        );
         for p in [&old, &live] {
             assert!(
                 !p.join(format!("dom-me/{c}.md")).exists(),
@@ -1562,7 +1585,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (m, ids, _bundle) = vault(dir.path()).await;
-        let [_a, b, c, _d, _e] = ids;
+        let [_a, b, c, d, e] = ids;
         // state/projection a link out of the root, onto something that looks like one
         let outside = tempfile::tempdir().unwrap();
         let precious = outside.path().join("proj/work/recall/precious");
@@ -1592,6 +1615,55 @@ mod tests {
         std::fs::set_permissions(&dom, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             r.unresolved.iter().any(|u| u.contains("sess-locked")),
+            "{:?}",
+            r.unresolved
+        );
+        assert!(
+            !r.is_finished(),
+            "what the sweep missed, a run again sweeps"
+        );
+        let again = m.erase(&c, Reason::Requested).await.unwrap();
+        assert!(again.is_finished(), "{:?}", again.unresolved);
+        assert!(!dom.join(format!("{c}.md")).exists());
+        // a summaries page it cannot read
+        let readme = dom.join("README.md");
+        std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = m.erase(&d, Reason::Requested).await.unwrap();
+        std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            r.unresolved.iter().any(|u| u.contains("README.md")),
+            "{:?}",
+            r.unresolved
+        );
+        // and the projections it cannot list at all
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = m.erase(&e, Reason::Requested).await.unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            r.unresolved
+                .iter()
+                .any(|u| u.contains("the projections under")),
+            "{:?}",
+            r.unresolved
+        );
+        // and state itself a link out of the root
+        let dir = tempfile::tempdir().unwrap();
+        let (m, ids, _bundle) = vault(dir.path()).await;
+        let away = outside.path().join("state-away");
+        std::fs::rename(dir.path().join("state"), &away).unwrap();
+        std::os::unix::fs::symlink(&away, dir.path().join("state")).unwrap();
+        let kept = away.join("projection/proj/work/recall/precious");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("thesis.txt"), "years of work").unwrap();
+        let r = m.erase(&ids[1], Reason::Requested).await.unwrap();
+        assert!(
+            kept.join("thesis.txt").exists(),
+            "the sweep went through state"
+        );
+        assert!(
+            r.unresolved
+                .iter()
+                .any(|u| u.contains("not a directory of the root's own")),
             "{:?}",
             r.unresolved
         );
