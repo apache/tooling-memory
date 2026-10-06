@@ -9,6 +9,9 @@ description = "A hand-made binding to the WSL containers C API (wslcsdk.dll), Wi
 [target.'cfg(windows)'.dependencies]
 libloading = "0.8"
 
+# One of the two crates that may use `unsafe` (AGENTS.md): it calls wslcsdk.dll through a
+# binding made by hand from the SDK header. Every block carries a SAFETY comment and
+# clippy's undocumented_unsafe_blocks is on. The rest mirrors the workspace lints.
 [lints.rust]
 missing_docs = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }

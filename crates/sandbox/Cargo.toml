@@ -12,8 +12,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0.151"
 thiserror.workspace = true
 
-# The one crate that may use `unsafe`: `pre_exec` runs between fork and exec, which is
-# where namespaces and mounts have to happen. Every block carries a SAFETY comment and
+# One of the two crates that may use `unsafe` (AGENTS.md): `pre_exec` runs between fork
+# and exec, which is where namespaces and mounts have to happen. Every block carries a SAFETY comment and
 # clippy's undocumented_unsafe_blocks is on. The rest mirrors the workspace lints.
 [lints.rust]
 missing_docs = "warn"
