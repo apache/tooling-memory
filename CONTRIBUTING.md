@@ -9,6 +9,11 @@
 - A C toolchain for the bundled SQLite (`build-essential` on Debian and Ubuntu, the Visual
   Studio Build Tools on Windows).
 - `make`. On Windows, run the targets from Git Bash or WSL.
+- For the browser reader's tests, a Chrome or Chromium, or Podman or Docker: with no
+  Chrome installed they run the one in the Playwright image through
+  `scripts/chrome-container.sh`, which pulls the image on first use
+  (`podman pull mcr.microsoft.com/playwright:v1.61.1-noble` ahead of time keeps that out
+  of the test's two minutes). `CHROME=<path>` picks one outright.
 
 ## Setup
 

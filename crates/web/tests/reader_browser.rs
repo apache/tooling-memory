@@ -42,7 +42,24 @@ fn chrome() -> PathBuf {
     candidates
         .into_iter()
         .find(|p| p.is_file())
-        .expect("no Chrome or Chromium found; install one or set CHROME=<path> for the reader test")
+        .or_else(chrome_in_a_container)
+        .expect("no Chrome, Chromium or container runtime found; install one or set CHROME=<path> for the reader test")
+}
+
+/// The Playwright image's Chrome, through scripts/chrome-container.sh, when a container
+/// runtime is on the path: a host with no Chrome, or one without the libraries it needs.
+fn chrome_in_a_container() -> Option<PathBuf> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let runs = |runtime: &str| {
+        std::process::Command::new(runtime)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    (runs("podman") || runs("docker"))
+        .then(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/chrome-container.sh"))
 }
 
 /// A record with three entries, one of them restricted and one carrying an event
