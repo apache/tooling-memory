@@ -142,3 +142,28 @@ jobs:
         with:
           name: lcov
           path: target/lcov.info
+
+  # The browser tests: the pages driven by Chromium in the Playwright image, as
+  # `make e2e` runs them, with every page's screenshots attached to the run for review.
+  e2e:
+    name: e2e (chromium)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: make e2e
+        env:
+          CI: 'true'
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-screenshots
+          path: |
+            e2e/screenshots/
+            e2e/playwright-report/
+          retention-days: 14

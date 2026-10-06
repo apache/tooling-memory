@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: install init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build \
+.PHONY: e2e install init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build \
 	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
@@ -204,6 +204,12 @@ taps-build:
 
 build:
 	cargo build --release
+
+# The browser tests, in the Playwright image: the launch form, a session's terminal and
+# pane, the reader, the token, every page at three widths in both themes. Not part of
+# `check` or `verify`; run it for a change to the pages. FILTER= narrows to a spec or -g.
+e2e:
+	sh scripts/e2e.sh $(FILTER)
 
 # `amem` on the PATH, from this checkout.
 install:

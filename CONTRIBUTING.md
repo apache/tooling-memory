@@ -33,6 +33,7 @@ make check       # format, clippy, tests, guard and docs-only tests
 | `make fmt` | `cargo fmt`, rewriting in place |
 | `make run ARGS='...'` | the `memory` binary, for example `ARGS='init /tmp/m --domain dom-me'` |
 | `make verify` | `check` plus `cargo deny`, `cargo machete`, coverage against `COVERAGE_MIN`, and the browser builds of `dm-core`, `dm-policy` and `dm-reader`. What CI runs |
+| `make e2e` | the browser tests in `e2e/`: the pages driven by Chromium in the Playwright image, with screenshots in `e2e/screenshots/`. Needs Podman or Docker, not Node. Not part of `check` or `verify`; run it for a change to the pages. See [e2e/README.md](e2e/README.md) |
 | `make reader` | rebuilds the browser reader's glue and wasm into `crates/web/static/reader/`; needs `wasm-bindgen-cli` 0.2.129 (`cargo install wasm-bindgen-cli --version 0.2.129`). Commit the result |
 | `make coverage` | `cargo llvm-cov` over the workspace; an lcov report lands in `target/lcov.info` |
 

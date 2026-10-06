@@ -572,6 +572,10 @@ enum Command {
         /// Print the link instead of opening a browser on it.
         #[arg(long)]
         no_open: bool,
+        /// For the browser tests: every session runs this program, split on spaces, in
+        /// place of the launcher, so the pages are driven without a harness or a sandbox.
+        #[arg(long, hide = true)]
+        session_command: Option<String>,
         /// The harness the form preselects; each session names its own.
         #[arg(long, value_enum)]
         harness: Option<HarnessArg>,
@@ -944,6 +948,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
             Command::Web {
                 listen: None,
                 no_open: cli.open.no_open,
+                session_command: None,
                 harness: None,
                 auth: AuthArg::Subscription,
                 backend: BackendArg::Auto,
@@ -1527,6 +1532,7 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     let Command::Web {
         listen,
         no_open,
+        session_command,
         harness,
         auth,
         backend,
@@ -1544,36 +1550,16 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     }
     let wanted = resolve_workdir(root, workdir);
     let mut state = open::state(root).await?;
-    // one server per root: when it is already up and proves it, the browser goes to it,
-    // and a second one is not started beside it, whatever address was asked for
-    if let Some(url) = state.url.clone() {
-        if let Some(running) = open::running(&url, &state.token, root).await {
-            if listen
-                .as_deref()
-                .is_some_and(|l| format!("http://{l}") != running.url)
-            {
-                return Err(format!(
-                    "a launcher over this root is already running at {}; one per root",
-                    running.url
-                )
-                .into());
-            }
-            let pairing = open::pair(&running, &state.token)
-                .await
-                .ok_or("the running launcher gave no pairing code")?;
-            if let Ok(w) = &wanted {
-                if pairing.workdir != w.display().to_string() {
-                    eprintln!(
-                        "amem: already running over this root, with sessions starting in {}, not {}; \
-                         stop it (ctrl-c where it runs) to start them here",
-                        pairing.workdir,
-                        w.display()
-                    );
-                }
-            }
-            open::show(&running.url, &pairing.code, !no_open);
-            return Ok(());
-        }
+    if open_running(
+        root,
+        &state,
+        listen.as_deref(),
+        wanted.as_ref().ok(),
+        no_open,
+    )
+    .await?
+    {
+        return Ok(());
     }
     let workdir = wanted?;
     let listener = open::bind(listen.as_deref()).await?;
@@ -1583,7 +1569,13 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     dm_web::state::save(root, &state)?;
     let access = dm_web::Access::new(root, &state, Vec::new());
     let code = access.pairing_code()?;
-    let config = web_config(root, workdir, harness, auth, backend, access)?;
+    let config = web_config(
+        root,
+        workdir,
+        (harness, auth, backend),
+        access,
+        session_command,
+    )?;
     eprintln!(
         "amem: web launcher over {} · sessions start in {} · ctrl-c stops it",
         root.display(),
@@ -1605,13 +1597,53 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     Ok(())
 }
 
+/// One server per root: when it is already up and proves it, the browser goes to it, and
+/// a second one is not started beside it, whatever address was asked for. Whether it was.
+async fn open_running(
+    root: &Path,
+    state: &dm_web::state::WebState,
+    listen: Option<&str>,
+    wanted: Option<&PathBuf>,
+    no_open: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(url) = &state.url else {
+        return Ok(false);
+    };
+    let Some(running) = open::running(url, &state.token, root).await else {
+        return Ok(false);
+    };
+    if listen.is_some_and(|l| format!("http://{l}") != running.url) {
+        return Err(format!(
+            "a launcher over this root is already running at {}; one per root",
+            running.url
+        )
+        .into());
+    }
+    let pairing = open::pair(&running, &state.token)
+        .await
+        .ok_or("the running launcher gave no pairing code")?;
+    if let Some(w) = wanted {
+        if pairing.workdir != w.display().to_string() {
+            eprintln!(
+                "amem: already running over this root, with sessions starting in {}, not {}; \
+                 stop it (ctrl-c where it runs) to start them here",
+                pairing.workdir,
+                w.display()
+            );
+        }
+    }
+    open::show(&running.url, &pairing.code, !no_open);
+    Ok(true)
+}
+
+/// The server's configuration. `session_command`, for the browser tests, runs in each
+/// session's terminal in place of the launcher.
 fn web_config(
     root: &Path,
     workdir: PathBuf,
-    harness: Option<HarnessArg>,
-    auth: AuthArg,
-    backend: BackendArg,
+    (harness, auth, backend): (Option<HarnessArg>, AuthArg, BackendArg),
     access: dm_web::Access,
+    session_command: Option<String>,
 ) -> Result<dm_web::Config, Box<dyn std::error::Error>> {
     let backend_name = match backend {
         BackendArg::Auto => "auto",
@@ -1632,7 +1664,9 @@ fn web_config(
         }
         .to_string(),
         backend: backend_name.to_string(),
-        command_override: None,
+        command_override: session_command
+            .map(|c| c.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .filter(|c| !c.is_empty()),
         access,
     })
 }

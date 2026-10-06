@@ -1,0 +1,22 @@
+{
+  "name": "amem-e2e",
+  "private": true,
+  "description": "The web pages driven by a real browser: the launch form, a session's terminal and reading pane, the reader, the token in front of them.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "playwright test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.61.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  },
+  "overrides": {
+    "playwright-core": "1.61.1"
+  }
+}
