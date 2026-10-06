@@ -55,7 +55,7 @@ pub fn render_summaries(domain: &str, hits: &[Hit]) -> String {
     for h in hits {
         out.push_str(&format!(
             "- [{title}]({file}) · {kind} · {tier} · {label}: {summary}\n",
-            title = h.title.replace(['[', ']'], " "),
+            title = h.title.replace(['[', ']', '\n', '\r'], " "),
             file = entry_file(&h.id),
             kind = h.entry_type,
             tier = h.trust_tier,
@@ -281,44 +281,85 @@ impl Memory {
 
     /// After an erasure, in every session's projection under the root, not only this
     /// one's: a live session's, which nothing else would reach before its own next
-    /// write, and one a killed session left behind, which nothing renders again. The
-    /// entry's file goes, its line leaves the domain's summaries, and every recall page
-    /// goes, since a page holds bodies as they were served. Only real directories are
-    /// walked; a link in the tree is left where it is.
-    pub(crate) fn erase_from_projections(&self, domain: &str, id: &str) {
+    /// write, one a killed session left behind, which nothing renders again, and one
+    /// rendered at `<harness>/` itself before renders were per session. The entry's file
+    /// and any half-written copy of it go, its line leaves the domain's summaries, and
+    /// every recall page goes, since a page holds bodies as they were served. Nothing is
+    /// walked through a link: `state` and `state/projection` must be directories of the
+    /// root's own. What could not be looked at or cleaned comes back, one line each, for
+    /// the receipt.
+    pub(crate) fn erase_from_projections(&self, domain: &str, id: &str) -> Vec<String> {
         let base = self.root.join(PROJECTIONS);
-        for dir in real_subdirs(&base).iter().flat_map(|h| real_subdirs(h)) {
-            if let Err(e) = self.erase_from(&dir, domain, id) {
-                eprintln!("memory: projection at {}: {e}", dir.display());
+        let mut missed = Vec::new();
+        for step in [self.root.join("state"), base.clone()] {
+            match std::fs::symlink_metadata(&step) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return missed,
+                Ok(m) if m.is_dir() => {}
+                _ => {
+                    missed.push(format!(
+                        "the projections: {} is not a directory of the root's own",
+                        step.display()
+                    ));
+                    return missed;
+                }
             }
         }
+        let mut dirs = Vec::new();
+        for harness in real_subdirs(&base, &mut missed) {
+            dirs.extend(real_subdirs(&harness, &mut missed));
+            dirs.push(harness);
+        }
+        for dir in dirs {
+            if let Err(e) = self.erase_from(&dir, domain, id) {
+                missed.push(format!("the projection at {}: {e}", dir.display()));
+            }
+        }
+        missed
     }
 
     fn erase_from(&self, dir: &Path, domain: &str, id: &str) -> Result<(), Error> {
         let dom = dir.join(domain);
         if std::fs::symlink_metadata(&dom).is_ok_and(|m| m.is_dir()) {
-            let file = dom.join(entry_file(id));
-            match std::fs::remove_file(&file) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(io(&file)(e));
+            let file = entry_file(id);
+            for name in [
+                file.clone(),
+                format!("{file}.tmp"),
+                format!("{SUMMARIES}.tmp"),
+            ] {
+                let path = dom.join(name);
+                match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(io(&path)(e));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
             let summaries = dom.join(SUMMARIES);
-            let link = format!("]({})", entry_file(id));
-            if let Some(text) = read_own(&summaries).filter(|t| t.contains(&link)) {
-                let kept: Vec<&str> = text.lines().filter(|line| !line.contains(&link)).collect();
-                // the header counts the lines, as render_summaries wrote it
-                let listed = kept.iter().filter(|line| line.starts_with("- [")).count();
-                let page: String = kept
-                    .iter()
-                    .enumerate()
-                    .map(|(n, line)| match n {
-                        0 if line.starts_with("# ") => format!("# {domain}: {listed} entries\n"),
-                        _ => format!("{line}\n"),
-                    })
-                    .collect();
-                write_atomically(&summaries, &page)?;
+            if let Some(text) = read_own(&summaries) {
+                // a line is the entry's when its own link names the file: a title holds
+                // no bracket, so the first `](` is the link, and a summary that cites
+                // the file further along is another entry's line
+                let own = format!("]({file})");
+                let is_own = |line: &str| {
+                    line.starts_with("- [")
+                        && line.find("](").is_some_and(|i| line[i..].starts_with(&own))
+                };
+                if text.lines().any(is_own) {
+                    let kept: Vec<&str> = text.lines().filter(|line| !is_own(line)).collect();
+                    // the header counts the lines, as render_summaries wrote it
+                    let listed = kept.iter().filter(|line| line.starts_with("- [")).count();
+                    let page: String = kept
+                        .iter()
+                        .enumerate()
+                        .map(|(n, line)| match n {
+                            0 if line.starts_with("# ") => {
+                                format!("# {domain}: {listed} entries\n")
+                            }
+                            _ => format!("{line}\n"),
+                        })
+                        .collect();
+                    write_atomically(&summaries, &page)?;
+                }
             }
         }
         self.sweep_recalls(dir, false)?;
@@ -419,18 +460,25 @@ pub fn render_recall(r: &crate::recall::Recall) -> String {
     out
 }
 
-/// The directories directly under `dir`, links and files left out; none when it is not
-/// a directory.
-fn real_subdirs(dir: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                .map(|e| e.path())
-                .collect()
-        })
-        .unwrap_or_default()
+/// The directories directly under `dir`, links and files left out. One that cannot be
+/// read is said in `missed`, not taken for an empty one.
+fn real_subdirs(dir: &Path, missed: &mut Vec<String>) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            missed.push(format!("the projections under {}: {e}", dir.display()));
+            return Vec::new();
+        }
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        match entry.and_then(|e| e.file_type().map(|t| (e.path(), t))) {
+            Ok((path, kind)) if kind.is_dir() => dirs.push(path),
+            Ok(_) => {}
+            Err(e) => missed.push(format!("the projections under {}: {e}", dir.display())),
+        }
+    }
+    dirs
 }
 
 /// The text of a projected file, if it is a plain file of the projection's own; a

@@ -780,15 +780,18 @@ impl Memory {
         }
         self.forget_pushed(id);
         self.drop_bundles(&domain)?;
+        // every session's render, before the receipt says the erasure is done; what it
+        // could not reach is said on the receipt
+        let missed = self.erase_from_projections(&domain, id);
         receipt.unresolved = UNRESOLVED.iter().map(|u| (*u).to_string()).collect();
         if receipt.removed.is_empty() {
             receipt
                 .unresolved
                 .push("the versions removed were not recorded: the stub was there first".into());
         }
+        receipt.unresolved.extend(missed);
         self.store.put_receipt(&receipt).await?;
         self.refresh_projection_after_erasure().await;
-        self.erase_from_projections(&domain, id);
         Ok(receipt)
     }
 
@@ -1486,6 +1489,112 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_erasure_sweep_reaches_old_renders_and_half_written_copies_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, ids, _bundle) = vault(dir.path()).await;
+        let [_a, _b, c, _d, _e] = ids;
+        let titled = m
+            .write(WriteRequest {
+                title: Some("Alice diagnosis\n- [Alice has condition X".into()),
+                ..req("Private.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let citing = m
+            .write(req(&format!("See [the old note]({c}.md) for that.\n")))
+            .await
+            .unwrap()
+            .id;
+        let base = dir.path().join(projection::PROJECTIONS);
+        // a render from before renders were per session, at <harness>/ itself
+        let old = base.join("gemini");
+        m.project_into(&old).await.unwrap();
+        let page = old.join(projection::RECALLS).join("sess-old");
+        std::fs::create_dir_all(&page).unwrap();
+        std::fs::write(page.join("p.md"), format!("served: {MARKER}\n")).unwrap();
+        // and a session's, with a body a kill left half written
+        let live = base.join("claude/sess-live");
+        m.project_into(&live).await.unwrap();
+        std::fs::write(
+            live.join(format!("dom-me/{c}.md.tmp")),
+            "Unrelated, half.\n",
+        )
+        .unwrap();
+        m.erase(&c, Reason::Requested).await.unwrap();
+        m.erase(&titled, Reason::Requested).await.unwrap();
+        for p in [&old, &live] {
+            assert!(
+                !p.join(format!("dom-me/{c}.md")).exists(),
+                "{}",
+                p.display()
+            );
+            assert!(
+                !p.join(format!("dom-me/{c}.md.tmp")).exists(),
+                "{}",
+                p.display()
+            );
+            assert!(
+                !p.join(projection::RECALLS).exists()
+                    || std::fs::read_dir(p.join(projection::RECALLS))
+                        .unwrap()
+                        .next()
+                        .is_none()
+            );
+            let summaries = std::fs::read_to_string(p.join("dom-me/README.md")).unwrap();
+            assert!(
+                !summaries.contains("Alice"),
+                "a title is about the person too: {summaries}"
+            );
+            assert!(
+                summaries.contains(&format!("]({citing}.md)")),
+                "a line that only cites the erased file is another entry's: {summaries}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_erasure_sweep_follows_no_link_and_says_what_it_missed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (m, ids, _bundle) = vault(dir.path()).await;
+        let [_a, b, c, _d, _e] = ids;
+        // state/projection a link out of the root, onto something that looks like one
+        let outside = tempfile::tempdir().unwrap();
+        let precious = outside.path().join("proj/work/recall/precious");
+        std::fs::create_dir_all(&precious).unwrap();
+        std::fs::write(precious.join("thesis.txt"), "years of work").unwrap();
+        let base = dir.path().join(projection::PROJECTIONS);
+        std::os::unix::fs::symlink(outside.path(), &base).unwrap();
+        let r = m.erase(&b, Reason::Requested).await.unwrap();
+        assert!(
+            precious.join("thesis.txt").exists(),
+            "the sweep went through the link"
+        );
+        assert!(
+            r.unresolved
+                .iter()
+                .any(|u| u.contains("not a directory of the root's own")),
+            "{:?}",
+            r.unresolved
+        );
+        // a render it cannot clean is on the receipt, not only on standard error
+        std::fs::remove_file(&base).unwrap();
+        let locked = base.join("claude/sess-locked");
+        m.project_into(&locked).await.unwrap();
+        let dom = locked.join("dom-me");
+        std::fs::set_permissions(&dom, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = m.erase(&c, Reason::Requested).await.unwrap();
+        std::fs::set_permissions(&dom, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            r.unresolved.iter().any(|u| u.contains("sess-locked")),
+            "{:?}",
+            r.unresolved
+        );
     }
 
     #[tokio::test]

@@ -1408,6 +1408,17 @@ async fn prepare_launch(
         .join(dm_sandbox::PROJECTION)
         .join(harness.binary())
         .join(projection_dir);
+    // a name from outside is a directory made empty for this session; one with a render
+    // in it is another session's, whose recall pages and handling this one would take over
+    if matches!(projected, Projected::Named(_))
+        && std::fs::read_dir(&projection).is_ok_and(|mut d| d.next().is_some())
+    {
+        return Err(format!(
+            "the projection {} already holds a render; a session's is its own",
+            projection.display()
+        )
+        .into());
+    }
     let memory = memory.with_handling_cap(ceiling);
     let memory = Arc::new(if projected != Projected::No {
         memory.with_projection(projection.clone())
@@ -3261,6 +3272,11 @@ mod backend_tests {
         let named = at(Projected::Named("run-7-1a2b")).await.unwrap();
         assert_eq!(named.projection, base.join("run-7-1a2b"));
         assert!(at(Projected::Named("../codex")).await.is_err());
+        // a name whose directory another session already rendered into is not taken over
+        let busy = base.join("run-8-busy");
+        std::fs::create_dir_all(busy.join("dom-me")).unwrap();
+        assert!(at(Projected::Named("run-8-busy")).await.is_err());
+        assert!(busy.join("dom-me").exists(), "and is left as it was");
     }
 
     #[test]
