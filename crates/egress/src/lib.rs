@@ -232,6 +232,41 @@ impl Egress {
         &self.inner.telemetry
     }
 
+    /// A GET at a destination, from the launcher itself: a model list, say. The
+    /// destination's credential is injected as on any call; nothing is metered, since
+    /// no model answered.
+    ///
+    /// # Errors
+    ///
+    /// A destination the grants refuse, or an upstream that does not answer with JSON.
+    pub async fn get(&self, destination: &str, path: &str) -> Result<serde_json::Value, Error> {
+        let inner = &self.inner;
+        let dest =
+            admit(inner, destination).map_err(|_| Error::Refused(destination.to_string()))?;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{destination}/{}", path.trim_start_matches('/')))
+            .body(Body::empty())
+            .map_err(|e| Error::Upstream(e.to_string()))?;
+        let rest = path.trim_start_matches('/').to_string();
+        let resp = upstream_request(inner, &dest, &rest, req, None)
+            .send()
+            .await
+            .map_err(|e| Error::Upstream(e.to_string()))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::Upstream(e.to_string()))?;
+        if !status.is_success() {
+            return Err(Error::Upstream(format!(
+                "{status} from {destination}/{rest}: {}",
+                text.chars().take(300).collect::<String>()
+            )));
+        }
+        serde_json::from_str(&text).map_err(|e| Error::Upstream(format!("not JSON: {e}")))
+    }
+
     /// Call a destination directly with a JSON body, as the launcher does for its own
     /// model calls, such as mining a transcript. The same ceiling check, credential
     /// injection and usage recording as a harness's call through the proxy.
@@ -1017,6 +1052,51 @@ mod tests {
         let under = serde_json::json!({ "max_tokens": 100 });
         assert!(cap_output_tokens(&serde_json::to_vec(&under).unwrap(), 32_768).is_none());
         assert!(cap_output_tokens(b"[]", 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_get_from_the_launcher_carries_the_credential_and_returns_json() {
+        let seen = Arc::new(tokio::sync::Mutex::new(None::<HeaderMap>));
+        let seen2 = seen.clone();
+        let fake = Router::new().route(
+            "/v1/models",
+            any(move |req: Request| {
+                let seen = seen2.clone();
+                async move {
+                    *seen.lock().await = Some(req.headers().clone());
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"object":"list","data":[{"id":"m1"}]}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let (_d, e) = fixture(Some((
+            "openai",
+            Destination::forward(
+                format!("http://{addr}"),
+                Auth::Inject {
+                    header: HeaderName::from_static("authorization"),
+                    value: "Bearer real".into(),
+                },
+            ),
+        )))
+        .await;
+        let v = e.get("openai", "v1/models").await.unwrap();
+        assert_eq!(v["data"][0]["id"], "m1");
+        let h = seen.lock().await.clone().unwrap();
+        assert_eq!(h.get("authorization").unwrap(), "Bearer real");
+        assert!(matches!(
+            e.get("nowhere", "v1/models").await,
+            Err(Error::Refused(_))
+        ));
+        assert!(
+            e.telemetry().summary().unwrap().is_empty(),
+            "a listing is not a model call"
+        );
     }
 
     #[tokio::test]

@@ -5,62 +5,160 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>memory</title>
 <style>
-  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; --muted: #6b6b6b; --line: #ddd; --accent: #0a62c9; }
-  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #16181d; --muted: #9a9a9a; --line: #333; --accent: #6fb2ff; } }
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; --muted: #6b6b6b; --line: #ddd; --accent: #0a62c9; --card: #ffffff; --mono: ui-monospace, Menlo, Consolas, monospace; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #16181d; --muted: #9a9a9a; --line: #333; --accent: #6fb2ff; --card: #1c1f26; } }
   body { margin: 0; padding: 24px 16px; font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 860px; margin-inline: auto; }
   h1 { font-size: 20px; margin: 0 0 16px; }
   h2 { font-size: 15px; margin: 24px 0 8px; color: var(--muted); font-weight: 600; }
-  form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; align-items: end; }
-  label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
-  input, select, button { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--fg); }
+  form { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px 12px; align-items: end; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); min-width: 0; }
+  input, select, textarea, button { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--fg); min-width: 0; }
+  textarea { resize: vertical; min-height: 44px; font-family: inherit; }
   .wide { grid-column: 1 / -1; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .row label { display: flex; align-items: center; gap: 6px; }
   button { background: var(--accent); color: white; border: 0; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .hint { font-size: 12px; color: var(--muted); min-height: 1.2em; }
+  .cmd { font: 12px/1.5 var(--mono); color: var(--muted); background: transparent; border: 1px dashed var(--line); border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; word-break: break-all; }
   ul { list-style: none; padding: 0; margin: 0; }
   li { display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
   li a { color: var(--accent); text-decoration: none; }
   .status { color: var(--muted); font-size: 13px; }
+  @media (max-width: 640px) { form { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
 <body>
 <h1>memory</h1>
 <form id="new">
   <label>Harness
-    <select name="harness"><option>claude</option><option>codex</option><option>gemini</option><option>copilot</option><option>opencode</option></select>
+    <select name="harness" id="harness" required><option value="">choose…</option></select>
   </label>
   <label>Auth
-    <select name="auth"><option>subscription</option><option>key</option><option>gateway</option></select>
+    <select name="auth" id="auth"></select>
+  </label>
+  <label>Destination
+    <select name="provider" id="provider"><option value="">the harness's own</option></select>
+  </label>
+  <label class="wide">Model
+    <input name="model" id="model" list="models" placeholder="the harness's default" autocomplete="off">
+    <datalist id="models"></datalist>
+    <span class="hint" id="models-hint"></span>
   </label>
   <label class="wide">Prompt, or leave empty for an interactive session
-    <input name="prompt" placeholder="load T0 and summarise it">
+    <textarea name="prompt" id="prompt" placeholder="load T0 and summarise it"></textarea>
   </label>
-  <label><input type="checkbox" name="work" style="width:auto"> Work the next task from the ledger</label>
-  <button type="submit">Start</button>
+  <div class="wide row">
+    <label><input type="checkbox" name="work" id="work" style="width:auto"> Work the next task from the ledger</label>
+    <label>Subagents
+      <select name="subagents" id="subagents"></select>
+    </label>
+  </div>
+  <div class="wide cmd" id="cmd"></div>
+  <div class="wide row"><button type="submit" id="start">Start</button><span class="hint" id="form-hint"></span></div>
 </form>
 <h2>Reader</h2>
 <p class="status">Read and search a domain in the browser, no session needed: <a href="/reader">open the reader</a>.</p>
 <h2>Sessions</h2>
 <ul id="sessions"><li class="status">none yet</li></ul>
 <script>
-const form = document.getElementById('new');
+const $ = (id) => document.getElementById(id);
+const form = $('new');
+let options = null;
+
+function fill(select, values, keep, placeholder) {
+  const before = keep ? select.value : '';
+  select.innerHTML = placeholder ? `<option value="">${placeholder}</option>` : '';
+  for (const v of values) { const o = document.createElement('option'); o.value = v; o.textContent = v; select.appendChild(o); }
+  if (before && values.includes(before)) select.value = before;
+}
+
+async function loadOptions() {
+  options = await (await fetch('/api/options')).json();
+  fill($('harness'), options.harnesses, false, 'choose…');
+  if (options.defaults.harness) $('harness').value = options.defaults.harness;
+  fill($('auth'), options.auth, false);
+  $('auth').value = options.defaults.auth;
+  fill($('subagents'), options.subagents, false);
+  onAuth();
+}
+
+function onAuth() {
+  const auth = $('auth').value;
+  const dests = options.destinations[auth] || [];
+  const p = $('provider');
+  fill(p, dests, true, auth === 'subscription' ? "the harness's own" : (auth === 'gateway' ? '' : "the harness's own"));
+  if (auth === 'gateway' && dests.length) p.value = dests[0];
+  p.disabled = auth === 'subscription';
+  loadModels();
+  preview();
+}
+
+let modelsSeq = 0;
+async function loadModels() {
+  const seq = ++modelsSeq;
+  const auth = $('auth').value, provider = $('provider').value;
+  const list = $('models'), hint = $('models-hint');
+  list.innerHTML = '';
+  if (auth === 'subscription') { hint.textContent = "a login is the harness's own: leave the model to it, or name one"; return; }
+  hint.textContent = 'asking the destination for its models…';
+  try {
+    const r = await fetch(`/api/models?auth=${encodeURIComponent(auth)}&provider=${encodeURIComponent(provider)}`);
+    if (seq !== modelsSeq) return;
+    if (!r.ok) { hint.textContent = `no list: ${(await r.text()).slice(0, 160)}`; return; }
+    const v = await r.json();
+    for (const m of v.models || []) { const o = document.createElement('option'); o.value = m; list.appendChild(o); }
+    hint.textContent = v.models && v.models.length ? `${v.models.length} model${v.models.length === 1 ? '' : 's'} at ${v.destination || provider}; pick one or type` : (v.note || 'the destination lists no models');
+    if (v.models && v.models.length === 1 && !$('model').value) $('model').value = v.models[0];
+    preview();
+  } catch (e) { if (seq === modelsSeq) hint.textContent = `no list: ${e}`; }
+}
+
+function body() {
+  const f = new FormData(form);
+  const b = { harness: f.get('harness'), auth: f.get('auth'), work: !!f.get('work'), subagents: f.get('subagents') };
+  if (f.get('provider')) b.provider = f.get('provider');
+  if ((f.get('model') || '').trim()) b.model = f.get('model').trim();
+  if (!b.work && (f.get('prompt') || '').trim()) b.prompt = f.get('prompt').trim();
+  return b;
+}
+
+function preview() {
+  const b = body();
+  const q = (s) => /[\s"']/.test(s) ? `'${s.replace(/'/g, `'\\''`)}'` : s;
+  const parts = ['memory', b.work ? 'work' : 'launch', '--harness', b.harness || '<harness>', '--auth', b.auth];
+  if (b.provider) parts.push('--provider', b.provider);
+  if (b.model) parts.push('--model', q(b.model));
+  if (b.subagents && b.subagents !== (b.work ? 'board' : 'harness')) parts.push('--subagents', b.subagents);
+  if (b.prompt) parts.push('--prompt', q(b.prompt));
+  $('cmd').textContent = parts.join(' ');
+  $('prompt').disabled = b.work;
+  $('start').disabled = !b.harness;
+  $('form-hint').textContent = b.harness ? '' : 'there is no default harness';
+}
+
+$('auth').addEventListener('change', onAuth);
+$('provider').addEventListener('change', () => { loadModels(); preview(); });
+form.addEventListener('input', preview);
+form.addEventListener('change', preview);
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const f = new FormData(form);
-  const body = { harness: f.get('harness'), auth: f.get('auth'), work: !!f.get('work') };
-  if (f.get('prompt')) body.prompt = f.get('prompt');
-  const r = await fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) { alert(await r.text()); return; }
+  const r = await fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body()) });
+  if (!r.ok) { $('form-hint').textContent = await r.text(); return; }
   const s = await r.json();
   location.href = `/s/${s.id}`;
 });
+
 async function refresh() {
   const r = await fetch('/api/sessions');
   const list = await r.json();
-  const ul = document.getElementById('sessions');
+  const ul = $('sessions');
   if (!list.length) { ul.innerHTML = '<li class="status">none yet</li>'; return; }
   ul.innerHTML = list.reverse().map(s =>
     `<li><a href="/s/${s.id}">${esc(s.title)}</a><span class="status">${s.alive ? 'running' : 'exited ' + (s.exit ?? '?')} · ${s.started.slice(11,19)}Z</span></li>`).join('');
 }
 const esc = (t) => t.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+loadOptions().then(preview);
 refresh(); setInterval(refresh, 3000);
 </script>
 </body>

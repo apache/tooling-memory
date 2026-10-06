@@ -34,6 +34,9 @@ pub enum Error {
     /// The pseudo-terminal could not be opened or the launcher could not be started.
     #[error("session: {0}")]
     Session(String),
+    /// A request the server cannot act on as given: no harness, say.
+    #[error("{0}")]
+    Request(String),
     /// The listener.
     #[error("listen: {0}")]
     Io(#[from] std::io::Error),
@@ -54,8 +57,8 @@ pub struct Config {
     pub memory_binary: PathBuf,
     /// The working tree sessions start in.
     pub workdir: PathBuf,
-    /// Default harness.
-    pub harness: String,
+    /// The harness the form preselects, if any; a request names its own.
+    pub harness: Option<String>,
     /// Default auth mode.
     pub auth: String,
     /// Default backend.
@@ -76,6 +79,12 @@ pub struct NewSession {
     /// Another destination, where the harness allows it.
     #[serde(default)]
     pub provider: Option<String>,
+    /// The model, in the harness's own flag.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Where a subagent the harness would spawn runs: harness or board.
+    #[serde(default)]
+    pub subagents: Option<String>,
     /// Non-interactive: a prompt.
     #[serde(default)]
     pub prompt: Option<String>,
@@ -151,10 +160,20 @@ fn new_id() -> String {
     )
 }
 
+/// The harness a request names, or the one the server preselects; a request that
+/// names none where the server has none is refused, since there is no default harness.
+fn harness_of(config: &Config, req: &NewSession) -> Result<String, String> {
+    req.harness
+        .clone()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| config.harness.clone())
+        .ok_or_else(|| "say which harness: there is no default".to_string())
+}
+
 /// The launcher's command line for a request.
-fn launch_argv(config: &Config, req: &NewSession) -> Vec<String> {
+fn launch_argv(config: &Config, req: &NewSession) -> Result<Vec<String>, String> {
     if let Some(c) = &config.command_override {
-        return c.clone();
+        return Ok(c.clone());
     }
     let mut a = vec![
         config.memory_binary.display().to_string(),
@@ -162,16 +181,20 @@ fn launch_argv(config: &Config, req: &NewSession) -> Vec<String> {
         config.root.display().to_string(),
         if req.work { "work" } else { "launch" }.into(),
         "--harness".into(),
-        req.harness
-            .clone()
-            .unwrap_or_else(|| config.harness.clone()),
+        harness_of(config, req)?,
         "--auth".into(),
         req.auth.clone().unwrap_or_else(|| config.auth.clone()),
         "--backend".into(),
         config.backend.clone(),
     ];
-    if let Some(p) = &req.provider {
-        a.extend(["--provider".to_string(), p.clone()]);
+    if let Some(p) = req.provider.as_deref().filter(|p| !p.is_empty()) {
+        a.extend(["--provider".to_string(), p.to_string()]);
+    }
+    if let Some(m) = req.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        a.extend(["--model".to_string(), m.trim().to_string()]);
+    }
+    if let Some(sa) = req.subagents.as_deref().filter(|s| !s.is_empty()) {
+        a.extend(["--subagents".to_string(), sa.to_string()]);
     }
     if !req.work {
         if let Some(p) = &req.prompt {
@@ -182,14 +205,14 @@ fn launch_argv(config: &Config, req: &NewSession) -> Vec<String> {
             a.extend(req.args.iter().cloned());
         }
     }
-    a
+    Ok(a)
 }
 
 fn title_for(req: &NewSession, config: &Config) -> String {
-    let h = req
-        .harness
-        .clone()
-        .unwrap_or_else(|| config.harness.clone());
+    let mut h = harness_of(config, req).unwrap_or_else(|_| "?".into());
+    if let Some(m) = req.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        h = format!("{h} on {}", m.trim());
+    }
     match (&req.prompt, req.work) {
         (_, true) => format!("{h}: next task"),
         (Some(p), _) => format!("{h}: {}", p.chars().take(60).collect::<String>()),
@@ -197,9 +220,58 @@ fn title_for(req: &NewSession, config: &Config) -> String {
     }
 }
 
+/// What the form offers: the harnesses, the auth modes, the destinations each auth mode
+/// may name, where subagents may go, and the server's defaults. One list, in Rust, so
+/// the page and the launcher agree.
+fn options(config: &Config) -> Value {
+    json!({
+        "harnesses": ["claude", "codex", "gemini", "antigravity", "qwen", "grok", "muse", "copilot", "opencode"],
+        "auth": ["subscription", "key", "gateway"],
+        "destinations": {
+            "subscription": [],
+            "key": ["anthropic", "openai", "xai", "gemini", "dashscope", "meta"],
+            "gateway": ["llmao"]
+        },
+        "subagents": ["harness", "board"],
+        "defaults": { "harness": config.harness, "auth": config.auth, "backend": config.backend }
+    })
+}
+
+/// The models a destination lists, asked of the launcher itself: `memory models` opens
+/// the record, routes as a launch would, and prints what the destination's own model
+/// list says. A login mode has no list, since the login is the harness's.
+async fn models_via_launcher(
+    config: &Config,
+    auth: &str,
+    provider: Option<&str>,
+) -> Result<Value, String> {
+    if auth == "subscription" {
+        return Ok(
+            json!({ "models": [], "note": "a login is the harness's own; name the model, or leave it to the harness" }),
+        );
+    }
+    let mut cmd = tokio::process::Command::new(&config.memory_binary);
+    cmd.arg("--root")
+        .arg(&config.root)
+        .arg("models")
+        .arg("--auth")
+        .arg(auth);
+    if let Some(p) = provider.filter(|p| !p.is_empty()) {
+        cmd.arg("--provider").arg(p);
+    }
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output())
+        .await
+        .map_err(|_| "the model list did not come back in time".to_string())?
+        .map_err(|e| format!("could not run the launcher: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("not a model list: {e}"))
+}
+
 impl App {
     fn start(&self, req: &NewSession) -> Result<Arc<Session>, Error> {
-        let argv = launch_argv(&self.config, req);
+        let argv = launch_argv(&self.config, req).map_err(Error::Request)?;
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -404,6 +476,30 @@ async fn ws(State(app): State<App>, Path(id): Path<String>, up: WebSocketUpgrade
     }
 }
 
+async fn options_api(State(app): State<App>) -> Json<Value> {
+    Json(options(&app.config))
+}
+
+/// `?auth=<mode>&provider=<destination>`.
+#[derive(Debug, Default, Deserialize)]
+struct ModelsQuery {
+    #[serde(default)]
+    auth: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+async fn models_api(
+    State(app): State<App>,
+    axum::extract::Query(q): axum::extract::Query<ModelsQuery>,
+) -> Response {
+    let auth = q.auth.clone().unwrap_or_else(|| app.config.auth.clone());
+    match models_via_launcher(&app.config, &auth, q.provider.as_deref()).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
 async fn list_sessions(State(app): State<App>) -> Json<Vec<SessionInfo>> {
     let v: Vec<SessionInfo> = lock(&app.sessions).values().map(|s| s.snapshot()).collect();
     Json(v)
@@ -412,7 +508,27 @@ async fn list_sessions(State(app): State<App>) -> Json<Vec<SessionInfo>> {
 async fn create_session(State(app): State<App>, Json(req): Json<NewSession>) -> Response {
     match app.start(&req) {
         Ok(s) => Json(s.snapshot()).into_response(),
+        Err(Error::Request(why)) => (StatusCode::BAD_REQUEST, why).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// What the session has printed so far, the ring as text: what a browser replays, for
+/// a script or a test that has no websocket.
+async fn scrollback(State(app): State<App>, Path(id): Path<String>) -> Response {
+    match app.get(&id) {
+        Some(s) => {
+            let bytes: Vec<u8> = lock(&s.ring).iter().copied().collect();
+            (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
+                String::from_utf8_lossy(&bytes).into_owned(),
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "no such session").into_response(),
     }
 }
 
@@ -654,8 +770,11 @@ pub fn router(config: Config) -> Result<Router, Error> {
         .route("/vendor/{name}", get(vendor))
         .route("/s/{id}", get(session_page))
         .route("/ws/{id}", get(ws))
+        .route("/api/options", get(options_api))
+        .route("/api/models", get(models_api))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}", get(session_info).delete(kill_session))
+        .route("/api/sessions/{id}/scrollback", get(scrollback))
         .route("/api/entries", get(entries))
         .route("/api/entry/{id}", get(entry))
         .route("/api/domains", get(domains))
@@ -692,7 +811,7 @@ mod tests {
             root: dir.join("memory"),
             memory_binary: "memory".into(),
             workdir: dir.to_path_buf(),
-            harness: "claude".into(),
+            harness: Some("claude".into()),
             auth: "subscription".into(),
             backend: "auto".into(),
             command_override: Some(command.iter().map(|s| (*s).to_string()).collect()),
@@ -712,8 +831,10 @@ mod tests {
                 prompt: Some("hi".into()),
                 work: false,
                 args: vec!["-v".into()],
+                ..NewSession::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             a.join(" "),
             format!(
@@ -727,7 +848,8 @@ mod tests {
                 work: true,
                 ..NewSession::default()
             },
-        );
+        )
+        .unwrap();
         assert!(
             a.join(" ")
                 .ends_with("work --harness claude --auth subscription --backend auto"),
@@ -743,6 +865,54 @@ mod tests {
             ),
             "claude: next task"
         );
+    }
+
+    #[test]
+    fn a_model_and_the_board_go_into_the_command_line_and_the_title() {
+        let mut c = config(std::path::Path::new("/tmp/x"), &[]);
+        c.command_override = None;
+        let req = NewSession {
+            harness: Some("muse".into()),
+            auth: Some("gateway".into()),
+            provider: Some("llmao".into()),
+            model: Some(" qwen3.8-27b ".into()),
+            subagents: Some("board".into()),
+            prompt: Some("say hi".into()),
+            ..NewSession::default()
+        };
+        let a = launch_argv(&c, &req).unwrap().join(" ");
+        assert!(
+            a.ends_with(
+                "launch --harness muse --auth gateway --backend auto --provider llmao --model qwen3.8-27b --subagents board --prompt say hi"
+            ),
+            "{a}"
+        );
+        assert_eq!(title_for(&req, &c), "muse on qwen3.8-27b: say hi");
+        // an empty model or destination is none
+        let a = launch_argv(
+            &c,
+            &NewSession {
+                harness: Some("codex".into()),
+                model: Some("  ".into()),
+                provider: Some(String::new()),
+                ..NewSession::default()
+            },
+        )
+        .unwrap()
+        .join(" ");
+        assert!(!a.contains("--model") && !a.contains("--provider"), "{a}");
+        // no harness anywhere is refused: there is no default
+        c.harness = None;
+        let err = launch_argv(&c, &NewSession::default()).unwrap_err();
+        assert!(err.contains("no default"), "{err}");
+        let o = options(&c);
+        assert_eq!(o["destinations"]["gateway"][0], "llmao");
+        assert!(o["harnesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h == "muse"));
+        assert!(o["defaults"]["harness"].is_null());
     }
 
     async fn start(
@@ -792,6 +962,35 @@ mod tests {
     async fn get_json(addr: std::net::SocketAddr, path: &str) -> (u16, Value) {
         let (status, body) = http(addr, "GET", path, None).await;
         (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_scrollback_is_the_ring_as_text_and_a_request_without_a_harness_is_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["sh", "-c", "echo hello-ring"]).await;
+        let (status, body) = http(addr, "POST", "/api/sessions", Some(r#"{"auth":"key"}"#)).await;
+        assert_eq!(status, 200, "the test config preselects claude: {body}");
+        let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (_, info) = get_json(addr, &format!("/api/sessions/{id}")).await;
+            if info["alive"] == false || tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, text) =
+            http(addr, "GET", &format!("/api/sessions/{id}/scrollback"), None).await;
+        assert_eq!(status, 200);
+        assert!(text.contains("hello-ring"), "{text}");
+        let (status, _) = http(addr, "GET", "/api/sessions/nope/scrollback", None).await;
+        assert_eq!(status, 404);
+        let (status, _) = get_json(addr, "/api/options").await;
+        assert_eq!(status, 200);
     }
 
     #[cfg(unix)]

@@ -382,6 +382,16 @@ enum Command {
         #[arg(long, value_enum, default_value = "auto")]
         mine_via: MineVia,
     },
+    /// The models a destination lists, as JSON: what the web form offers to pick from.
+    /// Routed as a launch would be, with the destination's credential; a login mode has
+    /// no list, since the login is the harness's own.
+    Models {
+        #[arg(long, value_enum, default_value = "key")]
+        auth: AuthArg,
+        /// The destination; the gateway's with --auth gateway, openai otherwise.
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Mine one transcript for entries with a small model through a destination.
     Mine {
         /// The transcript, JSON Lines, from any of the harnesses.
@@ -504,8 +514,9 @@ enum Command {
         /// Where to listen.
         #[arg(long, default_value = "127.0.0.1:4200")]
         listen: String,
-        #[arg(long, value_enum, default_value = "claude")]
-        harness: HarnessArg,
+        /// The harness the form preselects; each session names its own.
+        #[arg(long, value_enum)]
+        harness: Option<HarnessArg>,
         #[arg(long, value_enum, default_value = "subscription")]
         auth: AuthArg,
         #[arg(long, value_enum, default_value = "auto")]
@@ -845,6 +856,7 @@ async fn run_cli() -> Fallible {
         Command::Hook { .. } => unreachable!("handled in main before the root is needed"),
         cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
         cmd @ (Command::Mine { .. }
+        | Command::Models { .. }
         | Command::WslcApiCheck
         | Command::Savings { .. }
         | Command::Golden { .. }
@@ -1408,7 +1420,7 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         root: root.to_path_buf(),
         memory_binary: std::env::current_exe()?,
         workdir: resolve_workdir(root, workdir)?,
-        harness: Harness::from(harness).binary().to_string(),
+        harness: harness.map(|h| Harness::from(h).binary().to_string()),
         auth: match AuthMode::from(auth) {
             AuthMode::Subscription => "subscription",
             AuthMode::Key => "key",
@@ -1511,8 +1523,69 @@ async fn mine_cmd(
     Ok(())
 }
 
+/// `memory models`: the destination's own model list, as the web form's picker reads it.
+async fn models_cmd(root: &Path, auth: AuthArg, provider: Option<String>) -> Fallible {
+    let auth = AuthMode::from(auth);
+    if auth == AuthMode::Subscription {
+        return Err("a login is the harness's own and lists no models here; name the model, or leave it to the harness".into());
+    }
+    let provider = provider.unwrap_or_else(|| {
+        if auth == AuthMode::Gateway {
+            "llmao".to_string()
+        } else {
+            "openai".to_string()
+        }
+    });
+    let p = prepare_launch(
+        root,
+        Harness::Command,
+        Credentials::keyed(auth, &provider),
+        None,
+        None,
+        false,
+    )
+    .await?;
+    // Google lists under v1beta; everyone else speaks OpenAI's list, Anthropic included
+    let path = if matches!(p.provider.as_str(), "gemini" | "google") {
+        "v1beta/models"
+    } else {
+        "v1/models"
+    };
+    let v = p.egress.get(&p.provider, path).await?;
+    let models = model_ids(&v);
+    println!(
+        "{}",
+        serde_json::json!({ "destination": p.provider, "models": models })
+    );
+    Ok(())
+}
+
+/// Model ids out of a listing in OpenAI's shape (`data[].id`), Google's
+/// (`models[].name`, prefixed `models/`) or a plain `models[].id`.
+fn model_ids(v: &serde_json::Value) -> Vec<String> {
+    let items = v
+        .get("data")
+        .or_else(|| v.get("models"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut ids: Vec<String> = items
+        .iter()
+        .filter_map(|m| {
+            m.get("id")
+                .or_else(|| m.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.trim_start_matches("models/").to_string())
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 async fn tools_cmd(root: &Path, command: Command) -> Fallible {
     match command {
+        Command::Models { auth, provider } => models_cmd(root, auth, provider).await,
         Command::Mine {
             transcript,
             auth,
@@ -2666,6 +2739,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Image { .. }
         | Command::Web { .. }
         | Command::Mine { .. }
+        | Command::Models { .. }
         | Command::WslcApiCheck
         | Command::Savings { .. }
         | Command::Golden { .. }
@@ -2737,6 +2811,15 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[test]
+    fn model_ids_are_read_from_either_listing_shape() {
+        let openai = serde_json::json!({ "object": "list", "data": [{ "id": "b" }, { "id": "a" }, { "id": "a" }] });
+        assert_eq!(model_ids(&openai), vec!["a", "b"]);
+        let google = serde_json::json!({ "models": [{ "name": "models/gemini-2.5-flash" }] });
+        assert_eq!(model_ids(&google), vec!["gemini-2.5-flash"]);
+        assert!(model_ids(&serde_json::json!({})).is_empty());
+    }
 
     #[test]
     fn run_options_cross_to_the_inside_process_as_flags() {

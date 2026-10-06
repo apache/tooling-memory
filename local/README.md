@@ -212,17 +212,22 @@ retries with any word, still ranked by BM25, so a question in natural language l
 ## In the browser: `make web`
 
 `make web` serves a web terminal on 127.0.0.1:4200. The front page lists sessions and
-starts one: harness, auth, an optional prompt, or the next task from the ledger. Each
+starts one from a form: the harness, named, since there is no default; the auth mode; the
+destination, where the mode names one; the model, picked from what the destination lists
+or typed, the list fetched through `memory models`, which routes as a launch would with
+the destination's credential and asks for its `/v1/models`; where subagents go; a prompt,
+or interactive; or the next task from the ledger. The form shows the `memory launch` line
+it will run as you fill it in. Each
 session is `memory launch` (or `memory work`) in a pseudo-terminal the server keeps
 alive whether or not a browser is attached, with the same confinement as from a shell.
 Its output goes into a two-megabyte ring on the server and to every attached browser, so
 a refresh, a dropped connection or a second browser replays the scrollback and lands in
-the same place; resizes reach the harness. Beside the terminal a reading pane renders
+the same place; resizes reach the harness, and `/api/sessions/<id>/scrollback` returns
+the ring as text for a script with no websocket. Beside the terminal a reading pane renders
 Markdown, Mermaid included, for entries from the record: whatever the session writes
 opens as it lands, a `mem-…` id in the terminal is a link, and the recent entries are
-listed under it. Loopback only; reach it over SSH when remote. The page loads xterm.js,
-marked and mermaid from a CDN in this first cut, so the browser needs the internet even
-though the harness does not.
+listed under it. Loopback only; reach it over SSH when remote. xterm.js, marked and
+mermaid are served from the binary, so the browser needs no internet either.
 
 ## Handoffs the harness did not write
 

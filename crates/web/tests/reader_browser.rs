@@ -87,7 +87,7 @@ async fn web(dir: &Path, root: PathBuf) -> SocketAddr {
         root,
         memory_binary: "memory".into(),
         workdir: dir.to_path_buf(),
-        harness: "claude".into(),
+        harness: Some("claude".into()),
         auth: "subscription".into(),
         backend: "auto".into(),
         command_override: Some(vec!["true".into()]),
