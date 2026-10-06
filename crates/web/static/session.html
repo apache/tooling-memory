@@ -40,6 +40,7 @@
 <script src="/vendor/marked.min.js"></script>
 <script src="/vendor/mermaid.min.js"></script>
 <script src="/vendor/purify.min.js"></script>
+<script src="/amem.js"></script>
 <script>
 mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
 
@@ -54,7 +55,7 @@ term.focus();
 
 let ws, closedByServer = false;
 function connect() {
-  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/${id}`);
+  ws = amem.socket(`/ws/${id}`);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => { status.textContent = 'connected'; term.reset(); ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })); };
   ws.onmessage = (e) => {
@@ -67,13 +68,13 @@ function connect() {
   };
   ws.onclose = async () => {
     if (closedByServer) return;
-    // a refused upgrade looks like any closed socket; ask whether the page has a token
-    const r = await fetch(`/api/sessions/${id}`).catch(() => null);
-    if (r && r.status === 401) { status.textContent = 'no token: run amem again, or open the link it printed'; return; }
+    // a refused upgrade looks like any closed socket; ask whether the page has a key
+    const r = await amem.fetch(`/api/sessions/${id}`).catch(() => null);
+    if (r && r.status === 401) { status.textContent = amem.unpaired(); return; }
     status.textContent = 'reconnecting'; setTimeout(connect, 1000);
   };
 }
-connect();
+amem.ready.then(connect);
 term.onData((d) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: d })); });
 term.onResize(({ cols, rows }) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols, rows })); });
 window.addEventListener('resize', () => fit.fit());
@@ -97,7 +98,7 @@ term.registerLinkProvider({
 const seen = new Set();
 let first = true;
 async function open(entryId) {
-  const r = await fetch(`/api/entry/${entryId}`);
+  const r = await amem.fetch(`/api/entry/${entryId}`);
   if (!r.ok) return;
   const e = await r.json();
   document.getElementById('kind').textContent = `${e.type} · ${e.classification} · ${e.trust_tier}`;
@@ -110,7 +111,7 @@ async function open(entryId) {
 }
 async function poll() {
   try {
-    const r = await fetch('/api/entries');
+    const r = await amem.fetch('/api/entries');
     const list = await r.json();
     const recent = document.getElementById('recent');
     recent.innerHTML = list.slice(0, 8).map(e => `<a href="#" data-id="${e.id}">${e.type}: ${e.title}</a>`).join('');
@@ -122,7 +123,7 @@ async function poll() {
   } catch (e) { /* the server may be busy; try again */ }
 }
 poll(); setInterval(poll, 2000);
-fetch(`/api/sessions/${id}`).then(r => r.json()).then(s => { document.getElementById('title').textContent = s.title; document.title = `amem · ${s.title}`; });
+amem.fetch(`/api/sessions/${id}`).then(r => r.json()).then(s => { document.getElementById('title').textContent = s.title; document.title = `amem · ${s.title}`; });
 </script>
 </body>
 </html>

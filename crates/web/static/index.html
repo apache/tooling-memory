@@ -61,6 +61,7 @@
 <p class="status">Read and search a domain in the browser, no session needed: <a href="/reader">open the reader</a>.</p>
 <h2>Sessions</h2>
 <ul id="sessions"><li class="status">none yet</li></ul>
+<script src="/amem.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 const form = $('new');
@@ -73,12 +74,9 @@ function fill(select, values, keep, placeholder) {
   if (before && values.includes(before)) select.value = before;
 }
 
-// a page opened without the link amem printed, or after the token changed, has no token
-const NO_TOKEN = 'This page has no token for this server. Run amem again, or open the link it printed.';
-
 async function loadOptions() {
-  const r = await fetch('/api/options');
-  if (r.status === 401) { $('form-hint').textContent = NO_TOKEN; $('start').disabled = true; return; }
+  const r = await amem.fetch('/api/options');
+  if (r.status === 401) { $('form-hint').textContent = amem.unpaired(); $('start').disabled = true; return; }
   options = await r.json();
   fill($('harness'), options.harnesses, false, 'choose…');
   if (options.defaults.harness) $('harness').value = options.defaults.harness;
@@ -108,7 +106,7 @@ async function loadModels() {
   if (auth === 'subscription') { hint.textContent = "a login is the harness's own: leave the model to it, or name one"; return; }
   hint.textContent = 'asking the destination for its models…';
   try {
-    const r = await fetch(`/api/models?auth=${encodeURIComponent(auth)}&provider=${encodeURIComponent(provider)}`);
+    const r = await amem.fetch(`/api/models?auth=${encodeURIComponent(auth)}&provider=${encodeURIComponent(provider)}`);
     if (seq !== modelsSeq) return;
     if (!r.ok) { hint.textContent = `no list: ${(await r.text()).slice(0, 160)}`; return; }
     const v = await r.json();
@@ -148,14 +146,14 @@ form.addEventListener('input', preview);
 form.addEventListener('change', preview);
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const r = await fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body()) });
+  const r = await amem.fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body()) });
   if (!r.ok) { $('form-hint').textContent = await r.text(); return; }
   const s = await r.json();
   location.href = `/s/${s.id}`;
 });
 
 async function refresh() {
-  const r = await fetch('/api/sessions');
+  const r = await amem.fetch('/api/sessions');
   if (!r.ok) return;
   const list = await r.json();
   const ul = $('sessions');

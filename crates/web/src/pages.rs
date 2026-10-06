@@ -7,6 +7,8 @@ pub const INDEX: &str = include_str!("../static/index.html");
 pub const SESSION: &str = include_str!("../static/session.html");
 /// The browser reader: a bundle searched client-side with the server's own ranking.
 pub const READER: &str = include_str!("../static/reader.html");
+/// The pages' key to the server: pairing, and the bearer on every call.
+pub const AMEM_JS: &str = include_str!("../static/amem.js");
 
 /// The reader's core, built from `crates/reader` by `make reader`: the JavaScript glue
 /// and the WebAssembly it loads.

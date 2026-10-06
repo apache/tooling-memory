@@ -17,10 +17,22 @@ pub fn rootfs_dir(root: &Path) -> PathBuf {
     root.join("state/images/harness/rootfs")
 }
 
-/// Whether `name` is a file in a directory on the PATH.
+/// Whether `name` is a program in a directory on the PATH: a file, and on Unix one that
+/// may be run.
 pub(crate) fn on_path(name: &str) -> bool {
     std::env::var_os("PATH")
-        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| runnable(&d.join(name))))
+}
+
+#[cfg(unix)]
+fn runnable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn runnable(p: &Path) -> bool {
+    p.is_file()
 }
 
 /// The runtime to export from, by preference: the one that built the image here.

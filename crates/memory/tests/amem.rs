@@ -339,13 +339,56 @@ fn amem_starts_the_launcher_finds_it_again_and_opens_the_browser_on_its_link() {
             .ok()
             .filter(|t| !t.is_empty())
     });
-    assert_eq!(first.trim(), format!("{url}/?token={token}"));
+    // the opener's command line, which anyone on the host can read, carries a pairing
+    // code good once, never the token
+    let first = first.trim().to_string();
+    assert!(first.starts_with(&format!("{url}/?pair=")), "{first}");
+    assert!(!first.contains(&token), "{first}");
 
     // run again with nothing named: the one already up is found and opened, not a second
     // server started, which would run until stopped
-    let mut again = h.cmd(&[]);
+    let out = run_again(&h, &[], &browser, &mut server);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(&format!("{url}/?pair=")), "{err}");
+    assert!(
+        !err.contains("web launcher over"),
+        "a second server started: {err}"
+    );
+    let second = eventually("the second open", || {
+        let t = std::fs::read_to_string(&opened).ok()?;
+        t.lines().nth(1).map(str::to_string)
+    });
+    assert!(second.starts_with(&format!("{url}/?pair=")), "{second}");
+    assert_ne!(second, first, "each opening pairs with a code of its own");
+    let r = doctor_json(&h, &[]);
+    let web = find(&r, "web", "launcher");
+    assert_eq!(web["status"], "pass");
+    assert!(web["detail"].as_str().unwrap().contains(&url), "{web}");
+
+    // from another working tree it still opens the one running, and says where its
+    // sessions start rather than starting them there quietly
+    let elsewhere = h.path("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let elsewhere = elsewhere.display().to_string();
+    let out = run_again(
+        &h,
+        &["--workdir", &elsewhere, "--no-open"],
+        &browser,
+        &mut server,
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("already running over this root"), "{err}");
+    assert!(err.contains(&format!("not {elsewhere}")), "{err}");
+
+    stop_with_ctrl_c(&h, server, &token);
+}
+
+/// `amem` with `args`, which must finish: a second server would run until stopped.
+#[cfg(unix)]
+fn run_again(h: &Host, args: &[&str], browser: &str, server: &mut std::process::Child) -> Output {
+    let mut again = h.cmd(args);
     again
-        .env("BROWSER", &browser)
+        .env("BROWSER", browser)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut again = again.spawn().unwrap();
@@ -362,22 +405,12 @@ fn amem_starts_the_launcher_finds_it_again_and_opens_the_browser_on_its_link() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains(&format!("{url}/?token={token}")), "{err}");
-    assert!(
-        !err.contains("web launcher over"),
-        "a second server started: {err}"
-    );
-    eventually("the second open", || {
-        let t = std::fs::read_to_string(&opened).ok()?;
-        (t.lines().count() == 2).then_some(())
-    });
-    let r = doctor_json(&h, &[]);
-    let web = find(&r, "web", "launcher");
-    assert_eq!(web["status"], "pass");
-    assert!(web["detail"].as_str().unwrap().contains(&url), "{web}");
+    out
+}
 
-    // stopped with ctrl-c, the address goes and the token stays for the next server
+/// Stopped with ctrl-c, the address goes and the token stays for the next server.
+#[cfg(unix)]
+fn stop_with_ctrl_c(h: &Host, mut server: std::process::Child, token: &str) {
     let pid = server.id().to_string();
     assert!(Command::new("kill")
         .args(["-INT", &pid])
@@ -388,7 +421,7 @@ fn amem_starts_the_launcher_finds_it_again_and_opens_the_browser_on_its_link() {
     assert!(status.success(), "{status:?}");
     let state = web_state(&h.root());
     assert!(state["url"].is_null(), "{state}");
-    assert_eq!(state["token"], token.as_str());
+    assert_eq!(state["token"], token);
     let mut err = String::new();
     server
         .stderr

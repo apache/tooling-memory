@@ -83,14 +83,18 @@ pub fn parse(text: &str) -> Read {
             continue;
         }
         let value = value.trim();
+        // a quoted value is taken whole; an unquoted one ends at a ` #` comment
         let value = ['"', '\'']
             .iter()
             .find_map(|q| value.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
-            .unwrap_or(value);
+            .unwrap_or_else(|| value.split(" #").next().unwrap_or(value).trim_end());
         r.pairs.push((name.to_string(), value.to_string()));
     }
     r
 }
+
+/// Whether this platform's check can say who may read the file.
+pub const CHECKS_PERMISSIONS: bool = cfg!(unix);
 
 /// Whether others than the owner can read the file.
 #[cfg(unix)]
@@ -192,13 +196,13 @@ mod tests {
     #[test]
     fn known_names_are_read_and_others_are_skipped_with_a_reason() {
         let r = parse(
-            "# keys\n\nexport ANTHROPIC_API_KEY=\"sk-a\"\nLLMAO_KEY='pat'\nGH_TOKEN=gho\n\
+            "# keys\n\nexport ANTHROPIC_API_KEY=\"sk-a # kept\"\nLLMAO_KEY='pat'\nGH_TOKEN=gho # mine\n\
              LD_PRELOAD=/tmp/x.so\nPATH=/evil\njunk\n",
         );
         assert_eq!(
             r.pairs,
             vec![
-                ("ANTHROPIC_API_KEY".into(), "sk-a".into()),
+                ("ANTHROPIC_API_KEY".into(), "sk-a # kept".into()),
                 ("LLMAO_KEY".into(), "pat".into()),
                 ("GH_TOKEN".into(), "gho".into()),
             ]

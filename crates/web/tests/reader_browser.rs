@@ -102,8 +102,8 @@ async fn seed(root: &Path) -> Vec<String> {
     ids
 }
 
-/// The token the test server is started with; the page is opened on the landing link
-/// that carries it, as `amem` opens it.
+/// The token the test server is started with; the page is opened on a pairing link
+/// minted with it, as `amem` opens it.
 const TOKEN: &str = "reader-test-token";
 
 /// `amem web` over `root`, on a loopback port.
@@ -116,10 +116,7 @@ async fn web(dir: &Path, root: PathBuf) -> SocketAddr {
         auth: "subscription".into(),
         backend: "auto".into(),
         command_override: Some(vec!["true".into()]),
-        access: dm_web::Access {
-            token: TOKEN.into(),
-            origins: vec![],
-        },
+        access: dm_web::Access::with_token(TOKEN),
     })
     .unwrap();
     serve(app).await
@@ -155,9 +152,32 @@ async fn static_host(dir: PathBuf) -> SocketAddr {
     serve(Router::new().route("/{name}", get(file)).with_state(dir)).await
 }
 
+/// A pairing code from the server `url` is on, as `amem` asks for one with the token.
+async fn pairing_code(url: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let authority = url
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    let mut s = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let req = format!(
+        "POST /api/pair HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    let body = out.split_once("\r\n\r\n").unwrap().1;
+    serde_json::from_str::<serde_json::Value>(body).unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 /// The page at `url` after its asynchronous work, as the browser serialises it.
 async fn dump(url: String) -> String {
-    let url = format!("{url}&token={TOKEN}");
+    let url = format!("{url}&pair={}", pairing_code(&url).await);
     let chrome = chrome();
     let out = tokio::time::timeout(
         Duration::from_secs(120),

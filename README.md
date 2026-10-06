@@ -26,10 +26,11 @@ amem                                          # the web launcher, opened in the 
 ```
 
 `amem` with no command starts the web launcher over the record, or finds the one already
-running, and opens the browser on it with a link that carries the server's token. The
-server listens on loopback only and answers nothing past its static pages without that
-token; it lives in `~/memory/state/web.json`, owner-only, and survives a restart, so an
-open tab keeps working. Credentials the launcher needs, the API keys, `LLMAO_KEY` for the
+running, and opens the browser on a link that pairs it: a code good once, for two
+minutes, which the page trades for a key of its own. Run it from the project sessions
+should start in, or give `--workdir`. The server listens on loopback only, answers
+nothing past its static pages without a key, and keeps its token and the paired
+browsers in `~/memory/state/web.json`, owner-only. Credentials the launcher needs, the API keys, `LLMAO_KEY` for the
 gateway, `GH_TOKEN` for Copilot, go in `~/memory/credentials.env` as `NAME=value`, mode
 600; the environment wins over the file, and a `gh auth login` stands in for `GH_TOKEN`.
 `amem doctor` names which are found where, never their values.

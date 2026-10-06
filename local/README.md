@@ -218,8 +218,13 @@ retries with any word, still ranked by BM25, so a question in natural language l
 and opens the browser on it; run again, it finds the server already running over the root
 and opens that. `make web` does the same with `local/.env` and the virtual key in its
 environment. The server answers loopback names only, refuses requests and websockets from
-pages on other origins, and wants the token in `state/web.json` past its static pages:
-the link `amem` opens carries it once and trades it for a cookie. The front page lists sessions and
+pages on other origins, and wants a key past its static pages. The command line holds
+the server's token, in `state/web.json`, owner-only, and never sends it to a server that
+has not first answered a nonce under it, since the address in that file can outlive the
+server. A browser holds a key of its own: the link `amem` opens carries a pairing code,
+good once for two minutes, which the page trades for a key kept in its origin's storage
+and sent as a bearer, and by the terminal's websocket as a subprotocol. No cookie: a
+cookie for 127.0.0.1 goes to every port on it. The front page lists sessions and
 starts one from a form: the harness, named, since there is no default; the auth mode; the
 destination, where the mode names one; the model, picked from what the destination lists
 or typed, the list fetched through `amem models`, which routes as a launch would with

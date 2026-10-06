@@ -53,8 +53,22 @@ struct Cli {
     /// this process touches. Defaults to ~/memory.
     #[arg(long, env = "MEMORY_ROOT", global = true)]
     root: Option<PathBuf>,
+    #[command(flatten)]
+    open: OpenArgs,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// What `amem` with no command takes: `amem web`'s two everyday flags.
+#[derive(clap::Args)]
+struct OpenArgs {
+    /// Print the pairing link instead of opening a browser on it.
+    #[arg(long)]
+    no_open: bool,
+    /// The working tree sessions start in. Defaults to the current directory, which may
+    /// not hold the root.
+    #[arg(long)]
+    workdir: Option<PathBuf>,
 }
 
 /// How much of each hit a search or a recall carries.
@@ -902,11 +916,11 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
             &root,
             Command::Web {
                 listen: None,
-                no_open: false,
+                no_open: cli.open.no_open,
                 harness: None,
                 auth: AuthArg::Subscription,
                 backend: BackendArg::Auto,
-                workdir: None,
+                workdir: cli.open.workdir,
             },
         )
         .await;
@@ -1508,18 +1522,67 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         )
         .into());
     }
-    let token = open::token(root)?;
-    // one server per root: when it is already up, the browser goes to it
+    let wanted = resolve_workdir(root, workdir);
+    let mut state = open::state(root)?;
+    // one server per root: when it is already up and proves it, the browser goes to it
     if listen.is_none() {
-        if let Some(url) = open::load(root).and_then(|s| s.url) {
-            if open::answers(&url, &token, root).await {
-                open::show(&format!("{url}/?token={token}"), !no_open);
+        if let Some(url) = state.url.clone() {
+            if let Some(running) = open::running(&url, &state.token, root).await {
+                if let Ok(w) = &wanted {
+                    if running.workdir != w.display().to_string() {
+                        eprintln!(
+                            "amem: already running over this root, with sessions starting in {}, not {}; \
+                             stop it (ctrl-c where it runs) to start them here",
+                            running.workdir,
+                            w.display()
+                        );
+                    }
+                }
+                let code = open::pairing_code(&running, &state.token)
+                    .await
+                    .ok_or("the running launcher gave no pairing code")?;
+                open::show(&running.url, &code, !no_open);
                 return Ok(());
             }
         }
     }
+    let workdir = wanted?;
     let listener = open::bind(listen.as_deref()).await?;
     let url = format!("http://{}", listener.local_addr()?);
+    state.url = Some(url.clone());
+    state.workdir = Some(workdir.display().to_string());
+    dm_web::state::save(root, &state)?;
+    let access = dm_web::Access::new(Some(root.to_path_buf()), &state, Vec::new());
+    let code = access.pairing_code()?;
+    let config = web_config(root, workdir, harness, auth, backend, access)?;
+    eprintln!(
+        "amem: web launcher over {} · sessions start in {} · ctrl-c stops it",
+        root.display(),
+        config.workdir.display()
+    );
+    open::show(&url, &code, !no_open);
+    tokio::select! {
+        r = dm_web::serve(config, listener) => r?,
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    // the address goes with the process; the token and the paired browsers stay
+    let (mut after, _) = dm_web::state::load(root)?;
+    if after.token == state.token {
+        after.url = None;
+        after.workdir = None;
+        dm_web::state::save(root, &after)?;
+    }
+    Ok(())
+}
+
+fn web_config(
+    root: &Path,
+    workdir: PathBuf,
+    harness: Option<HarnessArg>,
+    auth: AuthArg,
+    backend: BackendArg,
+    access: dm_web::Access,
+) -> Result<dm_web::Config, Box<dyn std::error::Error>> {
     let backend_name = match backend {
         BackendArg::Auto => "auto",
         BackendArg::Namespaces => "namespaces",
@@ -1527,10 +1590,10 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         BackendArg::Wslc => "wslc",
         BackendArg::None => "none",
     };
-    let config = dm_web::Config {
+    Ok(dm_web::Config {
         root: root.to_path_buf(),
         memory_binary: std::env::current_exe()?,
-        workdir: resolve_workdir(root, workdir)?,
+        workdir,
         harness: harness.map(|h| Harness::from(h).binary().to_string()),
         auth: match AuthMode::from(auth) {
             AuthMode::Subscription => "subscription",
@@ -1540,31 +1603,8 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         .to_string(),
         backend: backend_name.to_string(),
         command_override: None,
-        access: dm_web::Access {
-            token: token.clone(),
-            origins: Vec::new(),
-        },
-    };
-    open::save(
-        root,
-        &open::State {
-            token: token.clone(),
-            url: Some(url.clone()),
-        },
-    )?;
-    eprintln!(
-        "amem: web launcher over {} · sessions start in {} · ctrl-c stops it",
-        root.display(),
-        config.workdir.display()
-    );
-    open::show(&format!("{url}/?token={token}"), !no_open);
-    tokio::select! {
-        r = dm_web::serve(config, listener) => r?,
-        _ = tokio::signal::ctrl_c() => {}
-    }
-    // the address goes with the process; the token stays for the next one
-    open::save(root, &open::State { token, url: None })?;
-    Ok(())
+        access,
+    })
 }
 
 /// The auth mode a deputy may run under. A subscription login is the harness's alone,

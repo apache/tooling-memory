@@ -191,7 +191,12 @@ fn credentials_file(root: &Path, checks: &mut Vec<Check>) -> Option<credentials:
                 credentials::FILE,
                 status,
                 format!(
-                    "owner-only; names {}",
+                    "{}; names {}",
+                    if credentials::CHECKS_PERMISSIONS {
+                        "owner-only"
+                    } else {
+                        "permissions not checked on this platform"
+                    },
                     if names.is_empty() {
                         "nothing".into()
                     } else {
@@ -466,16 +471,21 @@ async fn gateway(
 }
 
 async fn web(root: &Path, checks: &mut Vec<Check>) {
-    let state = open::load(root);
+    let state = dm_web::state::load(root).ok().map(|(s, _)| s);
     let running = match state
         .as_ref()
         .and_then(|s| s.url.clone().map(|u| (u, s.token.clone())))
     {
-        Some((url, token)) if open::answers(&url, &token, root).await => Some(url),
-        _ => None,
+        Some((url, token)) => open::running(&url, &token, root).await,
+        None => None,
     };
     checks.push(match running {
-        Some(url) => check("web", "launcher", Status::Pass, format!("running at {url}")),
+        Some(r) => check(
+            "web",
+            "launcher",
+            Status::Pass,
+            format!("running at {}, sessions in {}", r.url, r.workdir),
+        ),
         None => check("web", "launcher", Status::Absent, "not running").fix("amem"),
     });
 }

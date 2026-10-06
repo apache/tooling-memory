@@ -28,6 +28,7 @@ use tokio::sync::broadcast;
 
 pub mod access;
 mod pages;
+pub mod state;
 
 pub use access::Access;
 
@@ -443,14 +444,57 @@ async fn ws_session(session: Arc<Session>, socket: WebSocket) {
     incoming.abort();
 }
 
-/// That this is a server over a record, for a launcher deciding whether to start one;
-/// behind the token, so an answer means the caller holds it.
-async fn health(State(app): State<App>) -> Json<Value> {
+/// `?nonce=`: that this is a server over a record, and proof that it holds the token,
+/// for a launcher deciding whether to start one. The token is never sent to ask.
+#[derive(Deserialize)]
+struct Hello {
+    nonce: String,
+}
+
+async fn hello(
+    State(app): State<App>,
+    axum::extract::Query(q): axum::extract::Query<Hello>,
+) -> Response {
+    if q.nonce.len() < 16 || q.nonce.len() > 128 {
+        return (StatusCode::BAD_REQUEST, "a nonce of 16 to 128 characters").into_response();
+    }
     Json(json!({
         "server": "amem",
         "version": env!("CARGO_PKG_VERSION"),
+        "proof": app.config.access.proof(&q.nonce),
         "root": app.config.root.display().to_string(),
+        "workdir": app.config.workdir.display().to_string(),
     }))
+    .into_response()
+}
+
+/// A pairing code for a browser, for the token's holder.
+async fn pair(State(app): State<App>) -> Response {
+    match app.config.access.pairing_code() {
+        Ok(code) => Json(json!({ "code": code })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct Redeem {
+    code: String,
+}
+
+/// A browser's key for a pairing code.
+async fn redeem(State(app): State<App>, Json(r): Json<Redeem>) -> Response {
+    access::redeem_response(&app.config.access, &r.code)
+}
+
+async fn amem_js() -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/javascript"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        pages::AMEM_JS,
+    )
+        .into_response()
 }
 
 async fn index() -> Html<&'static str> {
@@ -483,7 +527,10 @@ async fn session_page(State(app): State<App>, Path(id): Path<String>) -> Respons
 
 async fn ws(State(app): State<App>, Path(id): Path<String>, up: WebSocketUpgrade) -> Response {
     match app.get(&id) {
-        Some(s) => up.on_upgrade(move |socket| ws_session(s, socket)),
+        // a page offers its key as a second subprotocol; the answer names the first
+        Some(s) => up
+            .protocols([access::PROTOCOL])
+            .on_upgrade(move |socket| ws_session(s, socket)),
         None => (StatusCode::NOT_FOUND, "no such session").into_response(),
     }
 }
@@ -780,7 +827,10 @@ pub fn router(config: Config) -> Result<Router, Error> {
     };
     Ok(Router::new()
         .route("/", get(index))
-        .route("/api/health", get(health))
+        .route("/amem.js", get(amem_js))
+        .route("/api/hello", get(hello))
+        .route("/api/pair", axum::routing::post(pair))
+        .route("/api/pair/redeem", axum::routing::post(redeem))
         .route("/vendor/{name}", get(vendor))
         .route("/s/{id}", get(session_page))
         .route("/ws/{id}", get(ws))
@@ -839,10 +889,7 @@ mod tests {
             auth: "subscription".into(),
             backend: "auto".into(),
             command_override: Some(command.iter().map(|s| (*s).to_string()).collect()),
-            access: Access {
-                token: TOKEN.into(),
-                origins: vec![],
-            },
+            access: Access::with_token(TOKEN),
         }
     }
 
@@ -1009,7 +1056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_gate_wants_a_loopback_host_its_own_origin_and_the_token() {
+    async fn the_gate_wants_a_loopback_host_its_own_origin_and_a_key() {
         let dir = tempfile::tempdir().unwrap();
         let (addr, _h) = start(dir.path(), &["true"]).await;
         let get = |path: &str, extra: &str| {
@@ -1017,7 +1064,7 @@ mod tests {
         };
         let bearer = format!("Authorization: Bearer {TOKEN}\r\n");
 
-        // the record behind the API wants the token; the page that says how to get it does not
+        // the record behind the API wants a key; the page that says how to get one does not
         assert_eq!(raw(addr, &get("/api/sessions", "")).await.0, 401);
         assert_eq!(
             raw(
@@ -1036,8 +1083,14 @@ mod tests {
                 .0,
             401
         );
+        // a cookie is no key: the browser would send it to every port on this host
+        let cookie = get(
+            "/api/sessions",
+            &format!("Cookie: amem-{}={TOKEN}\r\n", addr.port()),
+        );
+        assert_eq!(raw(addr, &cookie).await.0, 401);
 
-        // a name that rebinds to loopback arrives with its own Host, token or not
+        // a name that rebinds to loopback arrives with its own Host, key or not
         let rebound = format!(
             "GET /api/sessions HTTP/1.1\r\nHost: attacker.example:{}\r\n{bearer}Connection: close\r\n\r\n",
             addr.port()
@@ -1054,49 +1107,122 @@ mod tests {
             &format!("{bearer}Origin: http://{addr}\r\n"),
         );
         assert_eq!(raw(addr, &own).await.0, 200);
+    }
 
-        // the landing link trades the token for a cookie and drops it from the address
-        let (status, head) = raw(addr, &get(&format!("/reader?bundle=x&token={TOKEN}"), "")).await;
-        assert_eq!(status, 303, "{head}");
-        assert!(head.contains("location: /reader?bundle=x\r\n"), "{head}");
-        let cookie = format!("amem-{}={TOKEN}", addr.port());
-        assert!(
-            head.contains(&format!(
-                "set-cookie: {cookie}; Path=/; HttpOnly; SameSite=Strict"
-            )),
-            "{head}"
+    fn post(addr: std::net::SocketAddr, path: &str, auth: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn json_body(reply: &str) -> Value {
+        serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_token_mints_a_code_a_browser_trades_once_for_a_key_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let bearer = format!("Authorization: Bearer {TOKEN}\r\n");
+        assert_eq!(raw(addr, &post(addr, "/api/pair", "", "")).await.0, 401);
+        let (status, reply) = raw(addr, &post(addr, "/api/pair", &bearer, "")).await;
+        assert_eq!(status, 200, "{reply}");
+        let code = json_body(&reply)["code"].as_str().unwrap().to_string();
+
+        let redeem = post(
+            addr,
+            "/api/pair/redeem",
+            "",
+            &format!(r#"{{"code":"{code}"}}"#),
         );
-        let with_cookie = get("/api/sessions", &format!("Cookie: other=1; {cookie}\r\n"));
-        assert_eq!(raw(addr, &with_cookie).await.0, 200);
-        let other_port = get("/api/sessions", &format!("Cookie: amem-1={TOKEN}\r\n"));
-        assert_eq!(raw(addr, &other_port).await.0, 401);
-        assert_eq!(raw(addr, &get("/?token=wrong", "")).await.0, 401);
+        let (status, reply) = raw(addr, &redeem).await;
+        assert_eq!(status, 200, "{reply}");
+        let key = json_body(&reply)["key"].as_str().unwrap().to_string();
+        assert_ne!(key, TOKEN);
+        assert_eq!(raw(addr, &redeem).await.0, 401, "a code is single use");
+
+        let with_key = format!("Authorization: Bearer {key}\r\n");
+        let list = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: {addr}\r\n{with_key}Connection: close\r\n\r\n"
+        );
+        assert_eq!(raw(addr, &list).await.0, 200);
+        // a browser's key does not mint codes for more browsers
+        assert_eq!(
+            raw(addr, &post(addr, "/api/pair", &with_key, "")).await.0,
+            401
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_proves_the_token_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let nonce = "0123456789abcdef0123";
+        let (status, reply) = raw(
+            addr,
+            &format!("GET /api/hello?nonce={nonce} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status, 200, "{reply}");
+        assert!(!reply.contains(TOKEN));
+        let v = json_body(&reply);
+        assert_eq!(v["proof"], access::proof(TOKEN, nonce));
+        assert_eq!(v["server"], "amem");
+        assert!(v["workdir"].is_string());
+        let short =
+            format!("GET /api/hello?nonce=x HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        assert_eq!(raw(addr, &short).await.0, 400);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_websocket_from_another_origin_is_refused_whatever_it_carries() {
+    async fn a_websocket_carries_its_key_as_a_subprotocol_and_another_origin_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (addr, _h) = start(dir.path(), &["sh", "-c", "sleep 5"]).await;
-        let (status, body) = http(addr, "POST", "/api/sessions", Some(r#"{"auth":"key"}"#)).await;
-        assert_eq!(status, 200, "{body}");
-        let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert_eq!(id.len(), 32, "a session id is 128 random bits: {id}");
-        let upgrade = |origin: &str, auth: &str| {
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (status, body) =
+                http(addr, "POST", "/api/sessions", Some(r#"{"auth":"key"}"#)).await;
+            assert_eq!(status, 200, "{body}");
+            ids.push(
+                serde_json::from_str::<Value>(&body).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert!(ids
+            .iter()
+            .all(|i| i.len() == 32 && i.bytes().all(|b| b.is_ascii_hexdigit())));
+        assert_ne!(ids[0], ids[1]);
+        let id = &ids[0];
+        let upgrade = |origin: &str, protocols: &str| {
             format!(
-                "GET /ws/{id} HTTP/1.1\r\nHost: {addr}\r\n{auth}Origin: {origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+                "GET /ws/{id} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\n{protocols}Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
             )
         };
-        let cookie = format!("Cookie: amem-{}={TOKEN}\r\n", addr.port());
-        let (status, _) = raw(addr, &upgrade("https://attacker.example", &cookie)).await;
-        assert_eq!(status, 403);
-        let (status, _) = raw(addr, &upgrade(&format!("http://{addr}"), "")).await;
-        assert_eq!(status, 401);
-        let (status, head) = raw(addr, &upgrade(&format!("http://{addr}"), &cookie)).await;
+        let offered = format!("Sec-WebSocket-Protocol: amem, amem.key.{TOKEN}\r\n");
+        let own = format!("http://{addr}");
+        assert_eq!(
+            raw(addr, &upgrade("https://attacker.example", &offered))
+                .await
+                .0,
+            403
+        );
+        assert_eq!(
+            raw(addr, &upgrade(&own, "Sec-WebSocket-Protocol: amem\r\n"))
+                .await
+                .0,
+            401
+        );
+        let (status, head) = raw(addr, &upgrade(&own, &offered)).await;
         assert_eq!(status, 101, "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("sec-websocket-protocol: amem\r\n"),
+            "{head}"
+        );
     }
 
     async fn get_json(addr: std::net::SocketAddr, path: &str) -> (u16, Value) {

@@ -49,7 +49,10 @@
 </main>
 <script src="vendor/marked.min.js"></script>
 <script src="vendor/purify.min.js"></script>
+<!-- served by amem, the page carries this browser's key to it; a static copy has no amem.js and needs none -->
+<script src="amem.js"></script>
 <script type="module">
+const get = (u) => (window.amem ? window.amem.fetch(u) : fetch(u));
 import initReader, { parse_entry, parse_manifest, digest } from './reader/dm_reader.js';
 import sqlite3InitModule from './vendor/sqlite3.mjs';
 
@@ -79,10 +82,10 @@ async function boot() {
   if (params.get('bundle')) { $('bundle').value = params.get('bundle'); await loadUrl(params.get('bundle')); }
   if (params.get('q')) { $('q').value = params.get('q'); search(); }
   if (params.get('open')) open(params.get('open'));
-  // served by `memory web`, the record's own domains are one click away; a static copy
+  // served by `amem`, the record's own domains are one click away; a static copy
   // has no such endpoint and shows nothing here
   try {
-    const r = await fetch('api/domains');
+    const r = await get('api/domains');
     if (r.ok) {
       for (const d of await r.json()) {
         const b = document.createElement('button'); b.type = 'button'; b.textContent = d;
@@ -120,7 +123,7 @@ async function loadUrl(base) {
   base = base.replace(/\/+$/, '');
   status(`loading ${base}…`);
   try {
-    const m = JSON.parse(parse_manifest(await (await fetch(`${base}/manifest.yaml`)).text()));
+    const m = JSON.parse(parse_manifest(await (await get(`${base}/manifest.yaml`)).text()));
     if (m.error) throw new Error(m.error);
     manifest = m;
     let refused = 0;
@@ -130,7 +133,7 @@ async function loadUrl(base) {
       const chunk = listed.slice(i, i + 16);
       status(`loading ${base}… ${i} of ${listed.length}`);
       const texts = await Promise.all(chunk.map(async (e) => {
-        const r = await fetch(`${base}/${encodeURIComponent(e.path)}`);
+        const r = await get(`${base}/${encodeURIComponent(e.path)}`);
         return r.ok ? r.text() : null;
       }));
       chunk.forEach((e, j) => {

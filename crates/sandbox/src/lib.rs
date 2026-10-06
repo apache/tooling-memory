@@ -405,8 +405,6 @@ fn write(path: &Path, text: &str) -> Result<(), Error> {
     std::fs::write(path, text).map_err(io(path))
 }
 
-/// Copy one login file from the host's home into the sandbox's private home, at the same
-/// relative path. The harness then finds its own login where it expects it.
 /// Copy the harness's own login in, as [`Harness::login`] names it.
 fn copy_own_login(req: &Request<'_>) -> Result<(), Error> {
     let login = req
@@ -416,6 +414,8 @@ fn copy_own_login(req: &Request<'_>) -> Result<(), Error> {
     copy_login(req, login.file, login.how)
 }
 
+/// Copy one login file from the host's home into the sandbox's private home, at the same
+/// relative path. The harness then finds its own login where it expects it.
 fn copy_login(req: &Request<'_>, rel: &str, login: &str) -> Result<(), Error> {
     let src = req.host_home.map(|h| h.join(rel)).filter(|p| p.is_file());
     let Some(src) = src else {
