@@ -133,7 +133,8 @@ pub fn read(root: &Path) -> Result<Option<Read>, String> {
     }
     if too_open(&path).map_err(|e| format!("{}: {e}", path.display()))? {
         return Err(format!(
-            "{} is readable by others; run `chmod 600 {}`",
+            "{} is readable by others; run `chmod 600 {}` (on a Windows drive under WSL, which \
+             keeps no mode bits, put the root on a Linux filesystem)",
             path.display(),
             path.display()
         ));
@@ -265,5 +266,28 @@ mod tests {
             assert!(KNOWN.iter().any(|(k, _)| *k == v), "{d}");
         }
         assert_eq!(key_var("llmao"), None);
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_file() {
+        // POSTGRES_PASSWORD is read by no other test, so this one may set it
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(FILE);
+        std::fs::write(&f, "POSTGRES_PASSWORD=from-file\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::env::set_var("POSTGRES_PASSWORD", "from-environment");
+        load(dir.path());
+        assert_eq!(
+            std::env::var("POSTGRES_PASSWORD").unwrap(),
+            "from-environment"
+        );
+        std::env::remove_var("POSTGRES_PASSWORD");
+        load(dir.path());
+        assert_eq!(std::env::var("POSTGRES_PASSWORD").unwrap(), "from-file");
+        std::env::remove_var("POSTGRES_PASSWORD");
     }
 }

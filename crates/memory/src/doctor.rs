@@ -297,17 +297,18 @@ fn logins(checks: &mut Vec<Check>, found: &mut Found) {
 
 /// The first line `<binary> --version` prints, within a few seconds.
 async fn version(binary: &str) -> Option<String> {
-    let out = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::process::Command::new(binary)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let mut cmd = tokio::process::Command::new(binary);
+    // asking a harness its version needs none of the launcher's credentials
+    for (k, _) in KNOWN {
+        cmd.env_remove(k);
+    }
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
     let text = String::from_utf8_lossy(if out.stdout.is_empty() {
         &out.stderr
     } else {
@@ -471,22 +472,46 @@ async fn gateway(
 }
 
 async fn web(root: &Path, checks: &mut Vec<Check>) {
-    let state = dm_web::state::load(root).ok().map(|(s, _)| s);
-    let running = match state
-        .as_ref()
-        .and_then(|s| s.url.clone().map(|u| (u, s.token.clone())))
-    {
-        Some((url, token)) => open::running(&url, &token, root).await,
+    let loaded = match dm_web::state::load(root) {
+        Ok(l) => l,
+        Err(e) => {
+            checks.push(check(
+                "web",
+                "launcher",
+                Status::Fail,
+                format!("not checked: {e}"),
+            ));
+            return;
+        }
+    };
+    if let Some(old) = loaded.exposed {
+        let running = match &old.url {
+            Some(url) => open::running(url, &old.token, root).await,
+            None => None,
+        };
+        let detail = match running {
+            Some(r) => format!("running at {}, with a token others can read", r.url),
+            None => "its state file is readable by others".to_string(),
+        };
+        checks.push(
+            check("web", "launcher", Status::Fail, detail)
+                .fix("stop it if it runs, then amem, which replaces the token"),
+        );
+        return;
+    }
+    let running = match &loaded.state.url {
+        Some(url) => open::running(url, &loaded.state.token, root).await,
         None => None,
     };
-    checks.push(match running {
-        Some(r) => check(
+    checks.push(match (running, loaded.why) {
+        (Some(r), _) => check(
             "web",
             "launcher",
             Status::Pass,
             format!("running at {}", r.url),
         ),
-        None => check("web", "launcher", Status::Absent, "not running").fix("amem"),
+        (None, Some(why)) => check("web", "launcher", Status::Warn, why).fix("amem"),
+        (None, None) => check("web", "launcher", Status::Absent, "not running").fix("amem"),
     });
 }
 

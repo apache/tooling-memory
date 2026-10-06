@@ -879,6 +879,8 @@ fn main() {
         eprintln!("error: give --root, or set MEMORY_ROOT; there is no home for ~/memory");
         std::process::exit(1);
     };
+    // one spelling of the root: the launcher's proof, its state and its sessions name it
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
     // the environment is written here, while this is the only thread
     let at_start = credentials::KNOWN
         .iter()
@@ -909,8 +911,33 @@ fn main() {
     }
 }
 
+/// What is wrong with an invocation before anything runs: amem's own flags given to a
+/// command, which would ignore them, or a root that is not there for a command that
+/// needs one.
+fn refuse_invocation(cli: &Cli, root: &Path) -> Fallible {
+    let Some(command) = &cli.command else {
+        return Ok(());
+    };
+    if cli.open.no_open || cli.open.workdir.is_some() {
+        return Err(
+            "--workdir and --no-open before a command are amem's own; give them after \
+                    the command that takes them, as `amem web --workdir <dir>`"
+                .into(),
+        );
+    }
+    if !root.exists() && !matches!(command, Command::Init { .. } | Command::Doctor { .. }) {
+        return Err(format!(
+            "no record at {}: run `amem init` to make one there, or give --root (or MEMORY_ROOT)",
+            root.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
+    refuse_invocation(&cli, &root)?;
     let Some(command) = cli.command else {
         return web_cmd(
             &root,
@@ -925,13 +952,6 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         )
         .await;
     };
-    if !root.exists() && !matches!(command, Command::Init { .. } | Command::Doctor { .. }) {
-        return Err(format!(
-            "no record at {}: run `amem init` to make one there, or give --root (or MEMORY_ROOT)",
-            root.display()
-        )
-        .into());
-    }
     match command {
         Command::Init { owner, domain } => {
             let m = Memory::init(&root, &owner.unwrap_or_else(default_owner), &domain)?;
@@ -1523,7 +1543,7 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         .into());
     }
     let wanted = resolve_workdir(root, workdir);
-    let mut state = open::state(root)?;
+    let mut state = open::state(root).await?;
     // one server per root: when it is already up and proves it, the browser goes to it,
     // and a second one is not started beside it, whatever address was asked for
     if let Some(url) = state.url.clone() {
@@ -1576,7 +1596,7 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     }
     // the address goes with the process, and only this process's address: the token
     // stays for the next server, and no browser key survives it
-    let (mut after, _) = dm_web::state::load(root)?;
+    let mut after = dm_web::state::load(root)?.state;
     if after.token == state.token && after.url.as_deref() == Some(url.as_str()) {
         after.url = None;
         after.workdir = None;
@@ -2301,8 +2321,8 @@ fn resolve_workdir(
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if root.starts_with(&w) || w.starts_with(&root) {
         return Err(format!(
-            "the working tree {} and the record root {} overlap; run from another \
-             directory or pass --workdir",
+            "the working tree {} and the record root {} overlap: sessions would reach the \
+             record by the side door. Run amem from a project directory, or pass --workdir",
             w.display(),
             root.display()
         )
@@ -2759,6 +2779,10 @@ fn run_unconfined(
     std::fs::create_dir_all(home)?;
     let mut cmd = std::process::Command::new(harness.binary());
     cmd.current_dir(workdir);
+    // the egress holds the credentials; the harness gets what is set for it below
+    for (k, _) in credentials::KNOWN {
+        cmd.env_remove(k);
+    }
     match harness {
         Harness::Claude => {
             let mcp = serde_json::json!({

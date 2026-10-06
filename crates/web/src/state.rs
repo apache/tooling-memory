@@ -37,27 +37,41 @@ fn too_open(_: &Path) -> bool {
     false
 }
 
-/// The state, or a fresh one: with a new token when there is no file, it does not parse,
-/// or others could read it. The second value says why it is fresh, for the operator.
+/// What [`load`] found.
+#[derive(Debug)]
+pub struct Loaded {
+    /// The state to go on with: the file's, or a fresh one with a new token.
+    pub state: WebState,
+    /// Why it is fresh when the file was there, for the operator.
+    pub why: Option<String>,
+    /// The file's own state when others could read it: its token is exposed, and a
+    /// server may still be running with it.
+    pub exposed: Option<WebState>,
+}
+
+/// The state, or a fresh one with a new token when there is no file, it does not parse,
+/// or others could read it.
 ///
 /// # Errors
 ///
 /// When the file is there and cannot be read, which is not the same as not there, or
 /// when there is no randomness for a token.
-pub fn load(root: &Path) -> Result<(WebState, Option<String>), std::io::Error> {
+pub fn load(root: &Path) -> Result<Loaded, std::io::Error> {
     let p = path(root);
-    let fresh = |why: Option<String>| -> Result<(WebState, Option<String>), std::io::Error> {
-        Ok((
-            WebState {
-                token: crate::access::new_token()?,
-                ..WebState::default()
-            },
-            why,
-        ))
-    };
+    let fresh =
+        |why: Option<String>, exposed: Option<WebState>| -> Result<Loaded, std::io::Error> {
+            Ok(Loaded {
+                state: WebState {
+                    token: crate::access::new_token()?,
+                    ..WebState::default()
+                },
+                why,
+                exposed,
+            })
+        };
     let text = match std::fs::read_to_string(&p) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return fresh(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return fresh(None, None),
         Err(e) => {
             return Err(std::io::Error::new(
                 e.kind(),
@@ -65,15 +79,28 @@ pub fn load(root: &Path) -> Result<(WebState, Option<String>), std::io::Error> {
             ))
         }
     };
+    let parsed = serde_json::from_str::<WebState>(&text)
+        .ok()
+        .filter(|s| s.token.len() >= 32);
     if too_open(&p) {
-        return fresh(Some(format!(
-            "{} was readable by others; its token is replaced",
-            p.display()
-        )));
+        return fresh(
+            Some(format!(
+                "{} was readable by others; its token is replaced",
+                p.display()
+            )),
+            parsed,
+        );
     }
-    match serde_json::from_str::<WebState>(&text) {
-        Ok(s) if s.token.len() >= 32 => Ok((s, None)),
-        _ => fresh(Some(format!("{} did not read; a new token", p.display()))),
+    match parsed {
+        Some(state) => Ok(Loaded {
+            state,
+            why: None,
+            exposed: None,
+        }),
+        None => fresh(
+            Some(format!("{} did not read; a new token", p.display())),
+            None,
+        ),
     }
 }
 
@@ -105,7 +132,17 @@ pub fn save(root: &Path, state: &WebState) -> std::io::Result<()> {
         }
         std::io::Write::write_all(&mut f, serde_json::to_string_pretty(state)?.as_bytes())?;
     }
-    std::fs::rename(&tmp, &p)
+    std::fs::rename(&tmp, &p)?;
+    // a filesystem that keeps no mode bits, a Windows drive under WSL say, shows the file
+    // open to everyone whatever was asked; say so rather than mint a token every run
+    if too_open(&p) {
+        return Err(std::io::Error::other(format!(
+            "{} cannot be kept owner-only on this filesystem (a Windows drive under WSL keeps \
+             no mode bits); put the root on a Linux filesystem",
+            p.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -115,7 +152,8 @@ mod tests {
     #[test]
     fn the_state_round_trips_and_a_missing_file_is_a_fresh_token() {
         let dir = tempfile::tempdir().unwrap();
-        let (s, why) = load(dir.path()).unwrap();
+        let l = load(dir.path()).unwrap();
+        let (s, why) = (l.state, l.why);
         assert!(why.is_none());
         assert_eq!(s.token.len(), 64);
         let s = WebState {
@@ -124,7 +162,8 @@ mod tests {
             ..s
         };
         save(dir.path(), &s).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), (s, None));
+        let again = load(dir.path()).unwrap();
+        assert_eq!((again.state, again.why), (s, None));
     }
 
     #[cfg(unix)]
@@ -132,7 +171,7 @@ mod tests {
     fn a_file_others_can_read_is_not_trusted_and_is_replaced_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let (s, _) = load(dir.path()).unwrap();
+        let s = load(dir.path()).unwrap().state;
         save(dir.path(), &s).unwrap();
         let p = dir.path().join(FILE);
         assert_eq!(
@@ -140,12 +179,18 @@ mod tests {
             0o600
         );
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let (fresh, why) = load(dir.path()).unwrap();
+        let l = load(dir.path()).unwrap();
+        let fresh = l.state;
         assert_ne!(
             fresh.token, s.token,
             "a token others could read is not reused"
         );
-        assert!(why.unwrap().contains("readable by others"));
+        assert!(l.why.unwrap().contains("readable by others"));
+        assert_eq!(
+            l.exposed.unwrap().token,
+            s.token,
+            "the exposed one is handed back, to see whether a server still holds it"
+        );
         save(dir.path(), &fresh).unwrap();
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
@@ -163,7 +208,7 @@ mod tests {
         let leftover = state_dir.join(format!(".web.json.{}", std::process::id()));
         std::fs::write(&leftover, "old").unwrap();
         std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let (s, _) = load(dir.path()).unwrap();
+        let s = load(dir.path()).unwrap().state;
         save(dir.path(), &s).unwrap();
         let mode = std::fs::metadata(dir.path().join(FILE))
             .unwrap()

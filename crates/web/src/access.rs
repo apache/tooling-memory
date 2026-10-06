@@ -121,6 +121,9 @@ impl Access {
         }
         let key = random_hex::<32>()?;
         i.browsers.push(key.clone());
+        // a code passes through an opener's command line; whoever redeems it first is
+        // paired, so every pairing is said where the operator sees it
+        eprintln!("amem: a browser paired ({} so far)", i.browsers.len());
         Ok(Some(key))
     }
 

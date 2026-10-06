@@ -100,17 +100,31 @@ pub async fn pair(running: &Running, token: &str) -> Option<Pairing> {
     })
 }
 
-/// The state, saying so when it had to be replaced.
+/// The state to start from. When the file was readable by others and a server still
+/// proves the exposed token, that is refused: the server must stop before the token is
+/// replaced, or it goes on answering to a token anyone could read.
 ///
 /// # Errors
 ///
-/// When there is no randomness for a token.
-pub fn state(root: &Path) -> std::io::Result<WebState> {
-    let (s, why) = dm_web::state::load(root)?;
-    if let Some(why) = why {
+/// When the file is there and cannot be read, or a server holds an exposed token.
+pub async fn state(root: &Path) -> Result<WebState, Box<dyn std::error::Error>> {
+    let loaded = dm_web::state::load(root)?;
+    if let Some(old) = &loaded.exposed {
+        if let Some(url) = &old.url {
+            if running(url, &old.token, root).await.is_some() {
+                return Err(format!(
+                    "{} is readable by others, and the launcher at {url} holds the token in it: \
+                     stop that launcher (ctrl-c where it runs), then run amem again for a new token",
+                    root.join(dm_web::state::FILE).display()
+                )
+                .into());
+            }
+        }
+    }
+    if let Some(why) = loaded.why {
         eprintln!("amem: {why}");
     }
-    Ok(s)
+    Ok(loaded.state)
 }
 
 /// A loopback listener: the address given, or the first free port from 4200.
@@ -168,7 +182,12 @@ fn openers() -> Vec<Vec<String>> {
 
 fn browser(url: &str) -> bool {
     for argv in openers() {
-        let started = std::process::Command::new(&argv[0])
+        let mut cmd = std::process::Command::new(&argv[0]);
+        // the browser it starts needs none of the launcher's credentials
+        for (k, _) in crate::credentials::KNOWN {
+            cmd.env_remove(k);
+        }
+        let started = cmd
             .args(&argv[1..])
             .arg(url)
             .stdin(std::process::Stdio::null())

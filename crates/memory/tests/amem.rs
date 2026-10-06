@@ -380,7 +380,52 @@ fn amem_starts_the_launcher_finds_it_again_and_opens_the_browser_on_its_link() {
     assert!(err.contains("already running over this root"), "{err}");
     assert!(err.contains(&format!("not {elsewhere}")), "{err}");
 
+    // the same root spelled another way is the same root
+    let spelled = format!("{}/../home/./memory", h.path("work").display());
+    run_again(
+        &h,
+        &["--root", &spelled, "--no-open"],
+        &browser,
+        &mut server,
+    );
+
+    refuses_an_exposed_token_while_its_server_runs(&h, &mut server);
+
     stop_with_ctrl_c(&h, server, &token);
+}
+
+/// With the state file left readable by others, the token in it is exposed, and while
+/// the server that holds it runs, no new one is started beside it.
+#[cfg(unix)]
+fn refuses_an_exposed_token_while_its_server_runs(h: &Host, server: &mut std::process::Child) {
+    h.mode("home/memory/state/web.json", 0o644);
+    let mut c = h.cmd(&["--no-open"]);
+    let mut child = c
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if eventually_or_none(Duration::from_secs(10), || child.try_wait().unwrap()).is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = server.kill();
+        panic!("amem started a server beside the one holding the exposed token");
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("readable by others") && err.contains("stop that launcher"),
+        "{err}"
+    );
+    let r = doctor_json(h, &[]);
+    let web = find(&r, "web", "launcher");
+    assert_eq!(web["status"], "fail", "{web}");
+    assert!(
+        web["detail"].as_str().unwrap().contains("others can read"),
+        "{web}"
+    );
+    h.mode("home/memory/state/web.json", 0o600);
 }
 
 /// `amem` with `args`, which must finish: a second server would run until stopped.
@@ -449,4 +494,56 @@ fn the_launcher_refuses_the_network_and_a_root_that_is_not_a_record() {
         err.contains("no record at") && err.contains("amem doctor"),
         "{err}"
     );
+
+    // the first run, from the home that holds ~/memory, says where to run it instead
+    let mut c = h.cmd(&["--no-open"]);
+    let out = c.current_dir(h.path("home")).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Run amem from a project directory"), "{err}");
+
+    // amem's own flags before a command would be ignored by it, so they are refused
+    let out = h.run(&["--workdir", "/tmp", "doctor"], &[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("are amem's own"));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unconfined_harness_gets_none_of_the_launchers_credentials() {
+    let h = Host::new();
+    h.init();
+    h.file("home/.codex/auth.json", "{}");
+    let seen = h.path("seen-env");
+    // a builtin: the PATH here holds only what the test put there
+    h.script("codex", &format!("export -p > '{}'", seen.display()));
+    h.file(
+        "home/memory/credentials.env",
+        "OPENAI_API_KEY=sk-from-file\nPOSTGRES_PASSWORD=pg-from-file\n",
+    );
+    h.mode("home/memory/credentials.env", 0o600);
+    let out = h.run(
+        &[
+            "launch",
+            "--harness",
+            "codex",
+            "--auth",
+            "subscription",
+            "--unconfined",
+        ],
+        &[("GEMINI_API_KEY", "sk-from-env")],
+    );
+    let env = std::fs::read_to_string(&seen).unwrap_or_else(|_| {
+        panic!(
+            "codex did not run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert!(
+        env.contains("CODEX_HOME"),
+        "the dump is the harness's environment:\n{env}"
+    );
+    for secret in ["sk-from-file", "pg-from-file", "sk-from-env"] {
+        assert!(!env.contains(secret), "the harness saw {secret}:\n{env}");
+    }
 }
