@@ -628,21 +628,25 @@ fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<Pat
         target: req.workdir_inside().to_path_buf(),
         read_only: false,
     });
-    // the projection is the launcher's own directory, mounted read-only: the harness
-    // reads it there and nowhere else, and cannot edit it into lies
-    if let Some(projection) = req.projection.filter(|p| p.is_dir()) {
-        mounts.push(Mount {
-            source: projection.to_path_buf(),
-            target: PathBuf::from(INSIDE_PROJECTION),
-            read_only: true,
-        });
-    }
+    mounts.extend(projection_mount(req));
     mounts.push(Mount {
         source: req.egress_socket.to_path_buf(),
         target: PathBuf::from(INSIDE_SOCKET),
         read_only: false,
     });
     (mounts, extra_path)
+}
+
+/// The projection, when the launcher rendered one: its own directory, mounted read-only,
+/// so the harness reads it there and nowhere else and cannot edit it into lies. Every
+/// backend that names [`INSIDE_PROJECTION`] in the environment mounts it; a container
+/// backend does so itself, from the host's view of the path.
+fn projection_mount(req: &Request<'_>) -> Option<Mount> {
+    req.projection.filter(|p| p.is_dir()).map(|p| Mount {
+        source: p.to_path_buf(),
+        target: PathBuf::from(INSIDE_PROJECTION),
+        read_only: true,
+    })
 }
 
 /// In the harness image only the two things that are the session's: its private home
@@ -727,6 +731,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
                 read_only: true,
             });
             m.extend(image_mounts(req));
+            m.extend(projection_mount(req));
             m.push(Mount {
                 source: req.egress_socket.to_path_buf(),
                 target: PathBuf::from(INSIDE_SOCKET),
@@ -1873,6 +1878,57 @@ mod tests {
             plan.links,
             vec![(PathBuf::from("bin"), PathBuf::from("usr/bin"))],
             "merged-usr links come from the rootfs, not the host"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)] // rootfs mode is the Linux backend's
+    fn an_unpacked_image_mounts_the_projection_it_names() {
+        let f = fixture();
+        let rootfs = f.root.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("usr/local/bin")).unwrap();
+        let rendered = f.root.join(PROJECTION).join("gemini");
+        std::fs::create_dir_all(&rendered).unwrap();
+        let home = f.root.join("img-home");
+        let plan = prepare(&Request {
+            harness: Harness::Gemini,
+            auth: AuthMode::Key,
+            provider: None,
+            workdir: &f.work,
+            home: &home,
+            egress_socket: &f.sock,
+            memory_binary: &f.memory_bin,
+            destination_ceiling: Label::Public,
+            harness_args: &[],
+            host_home: None,
+            harness_env: &[],
+            model: None,
+            image: false,
+            workdir_inside: None,
+            rootfs: Some(&rootfs),
+            projection: Some(&rendered),
+        })
+        .unwrap();
+        // the environment and Gemini's workspace both name it, so it has to be there:
+        // Gemini CLI exits on an include directory that does not exist
+        assert_eq!(plan.env["MEMORY_PROJECTION"], INSIDE_PROJECTION);
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".gemini/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings["context"]["includeDirectories"],
+            serde_json::json!([INSIDE_PROJECTION])
+        );
+        let m = plan
+            .mounts
+            .iter()
+            .find(|m| m.target == Path::new(INSIDE_PROJECTION))
+            .expect("the projection the plan names is mounted");
+        assert_eq!(m.source, rendered);
+        assert!(
+            m.read_only,
+            "read-only: the files cannot be edited into lies"
         );
     }
 
