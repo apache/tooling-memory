@@ -44,6 +44,11 @@ with an explicit request from the user, ask before overriding it.
   says "SQLite" or "S3" is a bug.
 - **The CLI and the MCP server call the same library functions.** Nothing lives only in
   the binary.
+- **Before any change to the web pages, read the design book and load the
+  `frontend-design` skill.** Both, every time. [docs/design-book.html](docs/design-book.html)
+  says what each colour means and how a page is composed; `crates/web/static/tokens.css`
+  holds the same values. A new token, hue, chip, glyph or type role changes the book in
+  the same commit as the code, and its Decisions chapter says why.
 - **`unsafe` lives in one crate.** `crates/sandbox` is the only crate that may use it,
   because namespaces and mounts have to happen between fork and exec. Every block has a
   SAFETY comment. Anywhere else the workspace forbids it; do not relax that.

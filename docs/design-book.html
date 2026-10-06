@@ -1,0 +1,2223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="The amem design book: tokens, the state vocabulary, the terminal palette, the widgets of the web pages, and the decisions behind them.">
+<title>amem design book</title>
+<!--
+  The amem design book. One self-contained page: no fonts, scripts or styles are fetched.
+  The token block below is crates/web/static/tokens.css, inlined. The two must change
+  together, in the same commit, and so must any page whose look this book describes.
+-->
+<style>
+/* amem design tokens.
+
+   docs/design-book.html inlines these same values, because the book is one self-contained
+   page with nothing to fetch. The two change together, in the same commit: a token added,
+   renamed or re-valued here and not there (or there and not here) is a bug in both.
+
+   Named for meaning, never appearance: --am-fail, not --am-red. Light is the default
+   under :root; dark is designed, not inverted, and applies when the system asks for it
+   unless the page says data-theme="light", or whenever the page says data-theme="dark".
+   data-contrast="more" forces what prefers-contrast: more asks for, and
+   data-contrast="normal" declines it. */
+
+:root {
+  color-scheme: light;
+
+  /* Type. Atkinson Hyperlegible Next and Mono (Braille Institute, SIL OFL 1.1), self-hosted
+     as woff2 when the binary embeds them; until then, and wherever they fail to load, the
+     system stacks after them are the design, not a degraded copy of it. */
+  --am-font-sans: "Atkinson Hyperlegible Next", system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
+  --am-font-mono: "Atkinson Hyperlegible Mono", ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  --am-text-title: 1.75rem;
+  --am-text-section: 1.25rem;
+  --am-text-sub: 1rem;
+  --am-text-body: 1rem;
+  --am-text-ui: 0.875rem;
+  --am-text-label: 0.8125rem;
+  --am-text-data: 0.8125rem;
+  --am-text-micro: 0.75rem;
+  --am-text-term: 0.875rem;
+  --am-leading-tight: 1.2;
+  --am-leading-ui: 1.45;
+  --am-leading-body: 1.6;
+  --am-leading-term: 1.2;
+  --am-weight-regular: 400;
+  --am-weight-strong: 600;
+  --am-measure: 68ch;
+
+  /* Space: a 4px step. Radii: two. Lines: one width, two in more contrast. */
+  --am-space-1: 0.25rem;
+  --am-space-2: 0.5rem;
+  --am-space-3: 0.75rem;
+  --am-space-4: 1rem;
+  --am-space-6: 1.5rem;
+  --am-space-8: 2rem;
+  --am-space-12: 3rem;
+  --am-space-16: 4rem;
+  --am-radius-sm: 4px;
+  --am-radius: 8px;
+  --am-line: 1px;
+  --am-focus-width: 2px;
+  --am-chip-edge: 40%;
+  --am-target: 24px;
+  --am-target-touch: 44px;
+
+  /* Motion. Zero unless the reader has said motion is welcome; see the block below. */
+  --am-dur-quick: 0ms;
+  --am-dur-move: 0ms;
+  --am-ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Neutrals: violet-biased, three levels, no shadows. */
+  --am-paper: #f6f5f9;
+  --am-surface: #ffffff;
+  --am-plate: #eeecf3;
+  --am-rule: #dedbe6;
+  --am-rule-soft: #ebe9f0;
+  --am-edge: #837e92;
+  --am-ink: #1a1824;
+  --am-body: #363343;
+  --am-muted: #605c6e;
+  /* Hues: one meaning each. Every value passes 4.5:1 as text on paper, surface, plate and its own tint. */
+  --am-accent: #4a3fc4;
+  --am-on-accent: #ffffff;
+  --am-accent-tint: #ecebfb;
+  --am-live: #09697f;
+  --am-live-tint: #e1f0f4;
+  --am-ok: #1a704d;
+  --am-ok-tint: #e3f1ea;
+  --am-warn: #875a00;
+  --am-warn-tint: #fbf0d6;
+  --am-await: #8d2a7e;
+  --am-await-tint: #f6e7f3;
+  --am-fail: #bd222b;
+  --am-fail-tint: #fce8e9;
+  --am-mark: #dcd8fb;
+  /* The terminal: the xterm theme. The six hues are ANSI's six colours. */
+  --am-term-bg: #faf9fd;
+  --am-term-fg: #24212f;
+  --am-term-cursor: #4a3fc4;
+  --am-term-cursor-accent: #faf9fd;
+  --am-term-selection: #d8d5f6;
+  --am-term-black: #24212f;
+  --am-term-red: #bd222b;
+  --am-term-green: #1a704d;
+  --am-term-yellow: #875a00;
+  --am-term-blue: #4a3fc4;
+  --am-term-magenta: #8d2a7e;
+  --am-term-cyan: #09697f;
+  --am-term-white: #57536a;
+  --am-term-bright-black: #65617a;
+  --am-term-bright-red: #a3141d;
+  --am-term-bright-green: #0f5d3d;
+  --am-term-bright-yellow: #6e4800;
+  --am-term-bright-blue: #352a9e;
+  --am-term-bright-magenta: #73196a;
+  --am-term-bright-cyan: #015466;
+  --am-term-bright-white: #706c84;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    /* Neutrals: violet-biased, three levels, no shadows. */
+    --am-paper: #121119;
+    --am-surface: #1a1923;
+    --am-plate: #23212e;
+    --am-rule: #353241;
+    --am-rule-soft: #292734;
+    --am-edge: #767188;
+    --am-ink: #f2f0f8;
+    --am-body: #d0ccdc;
+    --am-muted: #9e99ae;
+    /* Hues: one meaning each. Every value passes 4.5:1 as text on paper, surface, plate and its own tint. */
+    --am-accent: #a9a3ff;
+    --am-on-accent: #16141f;
+    --am-accent-tint: #2a2650;
+    --am-live: #4cc4dc;
+    --am-live-tint: #113039;
+    --am-ok: #5fcb9a;
+    --am-ok-tint: #143026;
+    --am-warn: #e8bd52;
+    --am-warn-tint: #332a10;
+    --am-await: #e590d7;
+    --am-await-tint: #371b33;
+    --am-fail: #ff7d86;
+    --am-fail-tint: #3d1b20;
+    --am-mark: #433d7a;
+    /* The terminal: the xterm theme. The six hues are ANSI's six colours. */
+    --am-term-bg: #14131c;
+    --am-term-fg: #e4e1ed;
+    --am-term-cursor: #a9a3ff;
+    --am-term-cursor-accent: #14131c;
+    --am-term-selection: #3b3666;
+    --am-term-black: #2d2a39;
+    --am-term-red: #ff7d86;
+    --am-term-green: #5fcb9a;
+    --am-term-yellow: #e8bd52;
+    --am-term-blue: #a9a3ff;
+    --am-term-magenta: #e590d7;
+    --am-term-cyan: #4cc4dc;
+    --am-term-white: #d0ccdc;
+    --am-term-bright-black: #8f8aa3;
+    --am-term-bright-red: #ffa3aa;
+    --am-term-bright-green: #8ee0b8;
+    --am-term-bright-yellow: #f6d685;
+    --am-term-bright-blue: #c9c5ff;
+    --am-term-bright-magenta: #f3b6ea;
+    --am-term-bright-cyan: #86dcec;
+    --am-term-bright-white: #ffffff;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  /* Neutrals: violet-biased, three levels, no shadows. */
+  --am-paper: #121119;
+  --am-surface: #1a1923;
+  --am-plate: #23212e;
+  --am-rule: #353241;
+  --am-rule-soft: #292734;
+  --am-edge: #767188;
+  --am-ink: #f2f0f8;
+  --am-body: #d0ccdc;
+  --am-muted: #9e99ae;
+  /* Hues: one meaning each. Every value passes 4.5:1 as text on paper, surface, plate and its own tint. */
+  --am-accent: #a9a3ff;
+  --am-on-accent: #16141f;
+  --am-accent-tint: #2a2650;
+  --am-live: #4cc4dc;
+  --am-live-tint: #113039;
+  --am-ok: #5fcb9a;
+  --am-ok-tint: #143026;
+  --am-warn: #e8bd52;
+  --am-warn-tint: #332a10;
+  --am-await: #e590d7;
+  --am-await-tint: #371b33;
+  --am-fail: #ff7d86;
+  --am-fail-tint: #3d1b20;
+  --am-mark: #433d7a;
+  /* The terminal: the xterm theme. The six hues are ANSI's six colours. */
+  --am-term-bg: #14131c;
+  --am-term-fg: #e4e1ed;
+  --am-term-cursor: #a9a3ff;
+  --am-term-cursor-accent: #14131c;
+  --am-term-selection: #3b3666;
+  --am-term-black: #2d2a39;
+  --am-term-red: #ff7d86;
+  --am-term-green: #5fcb9a;
+  --am-term-yellow: #e8bd52;
+  --am-term-blue: #a9a3ff;
+  --am-term-magenta: #e590d7;
+  --am-term-cyan: #4cc4dc;
+  --am-term-white: #d0ccdc;
+  --am-term-bright-black: #8f8aa3;
+  --am-term-bright-red: #ffa3aa;
+  --am-term-bright-green: #8ee0b8;
+  --am-term-bright-yellow: #f6d685;
+  --am-term-bright-blue: #c9c5ff;
+  --am-term-bright-magenta: #f3b6ea;
+  --am-term-bright-cyan: #86dcec;
+  --am-term-bright-white: #ffffff;
+}
+
+/* Motion is the enhancement and stillness the default, so the durations are set only
+   where the reader has not asked for reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  :root {
+    --am-dur-quick: 120ms;
+    --am-dur-move: 200ms;
+  }
+}
+
+/* More contrast: secondary text becomes body text, every rule becomes a boundary, lines
+   thicken, and chips drop their tints for a solid edge. Each value is a reference, so it
+   holds in both themes. The selector outranks the theme blocks above. */
+@media (prefers-contrast: more) {
+  :root:not([data-contrast="normal"]) {
+    --am-muted: var(--am-body);
+    --am-rule: var(--am-edge);
+    --am-rule-soft: var(--am-edge);
+    --am-line: 2px;
+    --am-focus-width: 3px;
+    --am-chip-edge: 100%;
+    --am-accent-tint: var(--am-surface);
+    --am-live-tint: var(--am-surface);
+    --am-ok-tint: var(--am-surface);
+    --am-warn-tint: var(--am-surface);
+    --am-await-tint: var(--am-surface);
+    --am-fail-tint: var(--am-surface);
+  }
+}
+
+:root[data-contrast="more"] {
+  --am-muted: var(--am-body);
+  --am-rule: var(--am-edge);
+  --am-rule-soft: var(--am-edge);
+  --am-line: 2px;
+  --am-focus-width: 3px;
+  --am-chip-edge: 100%;
+  --am-accent-tint: var(--am-surface);
+  --am-live-tint: var(--am-surface);
+  --am-ok-tint: var(--am-surface);
+  --am-warn-tint: var(--am-surface);
+  --am-await-tint: var(--am-surface);
+  --am-fail-tint: var(--am-surface);
+}
+
+/* ---- the book's own scopes for side-by-side terminal specimens ---- */
+.bk-term-light {
+  --am-term-bg: #faf9fd;
+  --am-term-fg: #24212f;
+  --am-term-cursor: #4a3fc4;
+  --am-term-cursor-accent: #faf9fd;
+  --am-term-selection: #d8d5f6;
+  --am-term-black: #24212f;
+  --am-term-red: #bd222b;
+  --am-term-green: #1a704d;
+  --am-term-yellow: #875a00;
+  --am-term-blue: #4a3fc4;
+  --am-term-magenta: #8d2a7e;
+  --am-term-cyan: #09697f;
+  --am-term-white: #57536a;
+  --am-term-bright-black: #65617a;
+  --am-term-bright-red: #a3141d;
+  --am-term-bright-green: #0f5d3d;
+  --am-term-bright-yellow: #6e4800;
+  --am-term-bright-blue: #352a9e;
+  --am-term-bright-magenta: #73196a;
+  --am-term-bright-cyan: #015466;
+  --am-term-bright-white: #706c84;
+}
+.bk-term-dark {
+  --am-term-bg: #14131c;
+  --am-term-fg: #e4e1ed;
+  --am-term-cursor: #a9a3ff;
+  --am-term-cursor-accent: #14131c;
+  --am-term-selection: #3b3666;
+  --am-term-black: #2d2a39;
+  --am-term-red: #ff7d86;
+  --am-term-green: #5fcb9a;
+  --am-term-yellow: #e8bd52;
+  --am-term-blue: #a9a3ff;
+  --am-term-magenta: #e590d7;
+  --am-term-cyan: #4cc4dc;
+  --am-term-white: #d0ccdc;
+  --am-term-bright-black: #8f8aa3;
+  --am-term-bright-red: #ffa3aa;
+  --am-term-bright-green: #8ee0b8;
+  --am-term-bright-yellow: #f6d685;
+  --am-term-bright-blue: #c9c5ff;
+  --am-term-bright-magenta: #f3b6ea;
+  --am-term-bright-cyan: #86dcec;
+  --am-term-bright-white: #ffffff;
+}
+
+/* ======================================================================
+   Components. Prefixed am- because they are the product's, written here
+   first so the redesign can lift them as they stand. Every value is a token.
+   ====================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+.am-glyph { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
+
+/* the chip: glyph, count, word. An exception, never a fact */
+.am-chip {
+  --hue: var(--am-ink);
+  --tint: transparent;
+  display: inline-flex; align-items: center; gap: 0.3em;
+  font: var(--am-weight-strong) var(--am-text-micro)/1 var(--am-font-sans);
+  color: var(--hue); background: var(--tint);
+  border: var(--am-line) solid color-mix(in srgb, var(--hue) var(--am-chip-edge), transparent);
+  border-radius: var(--am-radius-sm);
+  padding: 0.3em 0.5em; white-space: nowrap; flex: none;
+}
+.am-chip .am-glyph { width: 12px; height: 12px; }
+.am-chip-count { font-variant-numeric: tabular-nums; font-weight: 700; }
+.am-chip--live  { --hue: var(--am-live);  --tint: var(--am-live-tint); }
+.am-chip--ok    { --hue: var(--am-ok);    --tint: var(--am-ok-tint); }
+.am-chip--warn  { --hue: var(--am-warn);  --tint: var(--am-warn-tint); }
+.am-chip--await { --hue: var(--am-await); --tint: var(--am-await-tint); }
+.am-chip--fail  { --hue: var(--am-fail);  --tint: var(--am-fail-tint); }
+.am-chip--ink   { --hue: var(--am-body);  border-color: var(--am-edge); }
+.am-chip--provisional { border-style: dashed; border-color: var(--hue); background: transparent; }
+.is-narrow .am-chip-word {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+/* more contrast brings every clipped word back */
+@media (prefers-contrast: more) {
+  :root:not([data-contrast="normal"]) .is-narrow .am-chip-word { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+}
+:root[data-contrast="more"] .is-narrow .am-chip-word { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+
+/* a state glyph in a gutter: every row has one, so it is not a chip */
+.am-state { display: inline-grid; place-items: center; width: 20px; height: 20px; flex: none; }
+.am-state .am-glyph { width: 16px; height: 16px; }
+.am-state--live { color: var(--am-live); }
+.am-state--ok { color: var(--am-ok); }
+.am-state--warn { color: var(--am-warn); }
+.am-state--await { color: var(--am-await); }
+.am-state--fail { color: var(--am-fail); }
+.am-state--ink { color: var(--am-muted); }
+
+/* label and trust marks: facts, drawn as orders, in ink */
+.am-fact { display: inline-flex; align-items: center; gap: 0.35em; color: var(--am-body); white-space: nowrap; }
+.am-fact .am-glyph { width: 14px; height: 14px; color: var(--am-ink); }
+
+/* buttons: four roles */
+.am-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.4em;
+  font: var(--am-weight-strong) var(--am-text-ui)/1 var(--am-font-sans);
+  min-height: 2.25rem; padding: 0 0.95em;
+  border-radius: var(--am-radius-sm); border: var(--am-line) solid transparent;
+  cursor: pointer; text-decoration: none; white-space: nowrap;
+  transition: background-color var(--am-dur-quick) ease-out, border-color var(--am-dur-quick) ease-out;
+}
+.am-btn .am-glyph { width: 15px; height: 15px; }
+.am-btn--primary { background: var(--am-accent); color: var(--am-on-accent); }
+.am-btn--primary:hover { background: color-mix(in srgb, var(--am-accent) 88%, var(--am-ink)); }
+.am-btn--secondary { background: var(--am-surface); color: var(--am-ink); border-color: var(--am-edge); }
+.am-btn--secondary:hover { background: var(--am-plate); }
+.am-btn--quiet { background: transparent; color: var(--am-accent); padding-inline: 0.4em; }
+.am-btn--quiet:hover { background: var(--am-accent-tint); }
+.am-btn--danger { background: var(--am-surface); color: var(--am-fail); border-color: var(--am-fail); }
+.am-btn[disabled], .am-btn[aria-disabled="true"] { cursor: not-allowed; background: var(--am-plate); color: var(--am-muted); border-color: var(--am-rule); }
+.am-btn--icon { width: 2.25rem; padding: 0; }
+
+:focus-visible { outline: var(--am-focus-width) solid var(--am-accent); outline-offset: 2px; }
+
+/* forms */
+.am-field { display: grid; gap: var(--am-space-1); min-width: 0; align-content: start; }
+.am-field > .am-seg { justify-self: start; }
+.am-field > label, .am-legend {
+  font: var(--am-weight-strong) var(--am-text-label)/1.3 var(--am-font-sans); color: var(--am-ink);
+}
+.am-hint { font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+.am-err { font: var(--am-weight-strong) var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-fail); display: flex; gap: 0.3em; align-items: center; }
+.am-ctrl {
+  font: var(--am-text-ui)/1.3 var(--am-font-sans); color: var(--am-ink);
+  background: var(--am-surface); border: var(--am-line) solid var(--am-edge);
+  border-radius: var(--am-radius-sm); min-height: 2.25rem; padding: 0.45rem 0.6rem; width: 100%; min-width: 0;
+}
+.am-ctrl:focus-visible { outline-offset: 0; border-color: var(--am-accent); }
+.am-ctrl[aria-invalid="true"] { border-color: var(--am-fail); box-shadow: inset 0 0 0 1px var(--am-fail); }
+.am-ctrl[disabled] { background: var(--am-plate); color: var(--am-muted); border-color: var(--am-rule); }
+textarea.am-ctrl { min-height: 4.5rem; resize: vertical; line-height: 1.45; }
+select.am-ctrl { appearance: none; padding-right: 2rem;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(-45deg, transparent 50%, currentColor 50%);
+  background-position: right 0.95rem center, right 0.65rem center; background-size: 0.3rem 0.3rem; background-repeat: no-repeat; }
+.am-ctrl.is-mono, .am-mono { font-family: var(--am-font-mono); }
+
+.am-seg { display: inline-flex; border: var(--am-line) solid var(--am-edge); border-radius: var(--am-radius-sm); overflow: hidden; background: var(--am-surface); max-width: 100%; }
+.am-seg label { position: relative; display: block; }
+.am-seg input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.am-seg span {
+  display: flex; align-items: center; min-height: calc(2.25rem - 2 * var(--am-line)); padding: 0 0.8em;
+  font: var(--am-text-ui)/1 var(--am-font-sans); color: var(--am-body); border-left: var(--am-line) solid var(--am-rule);
+}
+.am-seg label:first-child span { border-left: 0; }
+.am-seg input:checked + span { background: var(--am-accent-tint); color: var(--am-accent); font-weight: var(--am-weight-strong); box-shadow: inset 0 -2px 0 var(--am-accent); }
+.am-seg input:focus-visible + span { outline: var(--am-focus-width) solid var(--am-accent); outline-offset: -3px; }
+
+.am-check { display: inline-flex; align-items: center; gap: 0.5em; font: var(--am-text-ui)/1.3 var(--am-font-sans); color: var(--am-ink); cursor: pointer; min-height: var(--am-target); }
+.am-check input { width: 1.05rem; height: 1.05rem; margin: 0; accent-color: var(--am-accent); }
+
+/* the launch form */
+.am-launch { display: grid; align-items: start; gap: var(--am-space-4); grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.am-launch > * { grid-column: span 6; }
+.am-launch .c2 { grid-column: span 2; }
+.am-launch .c3 { grid-column: span 3; }
+.am-launch-foot { display: flex; align-items: center; gap: var(--am-space-3); flex-wrap: wrap; }
+
+/* the command preview: the form, said as a command. Not syntax-coloured: hues are states */
+.am-cmd {
+  display: flex; align-items: flex-start; gap: var(--am-space-2);
+  background: var(--am-plate); border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius-sm);
+  padding: var(--am-space-2) var(--am-space-2) var(--am-space-2) var(--am-space-3);
+}
+.am-cmd code { flex: 1; min-width: 0; font: var(--am-text-data)/1.6 var(--am-font-mono); color: var(--am-ink); overflow-wrap: anywhere; white-space: pre-wrap; padding-top: 0.3rem; }
+.am-cmd .f { color: var(--am-muted); }
+.am-cmd .p { color: var(--am-muted); user-select: none; }
+.am-cmd .am-btn { min-height: 1.9rem; }
+
+/* session list */
+.am-list { border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); overflow: hidden; }
+.am-srow {
+  display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; column-gap: var(--am-space-3); row-gap: 2px;
+  align-items: center; padding: var(--am-space-3) var(--am-space-4);
+  border-top: var(--am-line) solid var(--am-rule-soft); text-decoration: none; color: inherit;
+}
+.am-srow:first-child { border-top: 0; }
+.am-srow:hover { background: var(--am-plate); }
+.am-srow .am-state { grid-row: 1; }
+.am-srow-title { font: var(--am-weight-strong) var(--am-text-ui)/1.35 var(--am-font-sans); color: var(--am-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.am-srow:hover .am-srow-title, .am-srow:focus-visible .am-srow-title { text-decoration: underline; text-underline-offset: 0.15em; }
+.am-srow-meta { grid-column: 2; font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+.am-srow-chips { grid-column: 3; grid-row: 1 / span 2; display: flex; gap: var(--am-space-1); justify-content: flex-end; flex-wrap: wrap; }
+.am-time { font-variant-numeric: tabular-nums; }
+
+/* the status strip: what crosses the line, on the frame's top edge */
+.am-strip {
+  display: flex;
+  background: var(--am-surface); border-bottom: var(--am-line) solid var(--am-rule);
+}
+.am-strip-cell { flex: 0 0 auto; padding: var(--am-space-2) var(--am-space-4); white-space: nowrap; border-left: var(--am-line) solid var(--am-rule-soft); min-width: 0; }
+.am-strip-cell:first-child { border-left: 0; }
+.am-strip-cell--ceiling { flex: 0 1 auto; }
+.am-strip-cell--ceiling .am-strip-v { white-space: nowrap; }
+.am-strip-k { display: block; font: var(--am-text-micro)/1.3 var(--am-font-sans); color: var(--am-muted); }
+.am-strip-v { display: flex; flex-wrap: wrap; align-items: center; gap: var(--am-space-1) var(--am-space-2); font: var(--am-weight-strong) var(--am-text-ui)/1.5 var(--am-font-sans); color: var(--am-ink); font-variant-numeric: tabular-nums; }
+.am-strip-v .am-sub { font-weight: var(--am-weight-regular); color: var(--am-body); }
+
+/* the session frame: bar, strip, terminal well, reading pane */
+.am-frame { border: var(--am-line) solid var(--am-edge); border-radius: var(--am-radius); overflow: hidden; background: var(--am-surface); }
+.am-bar { display: flex; align-items: center; gap: var(--am-space-3); padding: var(--am-space-2) var(--am-space-4); background: var(--am-plate); border-bottom: var(--am-line) solid var(--am-rule); min-width: 0; }
+.am-bar-home { font: 700 var(--am-text-ui)/1 var(--am-font-mono); color: var(--am-accent); text-decoration: none; }
+.am-bar-title { font: var(--am-weight-strong) var(--am-text-ui)/1.3 var(--am-font-sans); color: var(--am-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.am-split { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); min-height: 22rem; }
+.am-term {
+  background: var(--am-term-bg); color: var(--am-term-fg);
+  font: var(--am-text-term)/var(--am-leading-term) var(--am-font-mono);
+  padding: var(--am-space-3) var(--am-space-4); margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;
+}
+.am-term .k0 { color: var(--am-term-black); } .am-term .k1 { color: var(--am-term-red); } .am-term .k2 { color: var(--am-term-green); }
+.am-term .k3 { color: var(--am-term-yellow); } .am-term .k4 { color: var(--am-term-blue); } .am-term .k5 { color: var(--am-term-magenta); }
+.am-term .k6 { color: var(--am-term-cyan); } .am-term .k7 { color: var(--am-term-white); } .am-term .k8 { color: var(--am-term-bright-black); }
+.am-term .k9 { color: var(--am-term-bright-red); } .am-term .k10 { color: var(--am-term-bright-green); } .am-term .k11 { color: var(--am-term-bright-yellow); }
+.am-term .k12 { color: var(--am-term-bright-blue); } .am-term .k13 { color: var(--am-term-bright-magenta); } .am-term .k14 { color: var(--am-term-bright-cyan); }
+.am-term .k15 { color: var(--am-term-bright-white); }
+.am-term .b { font-weight: 700; }
+.am-term .sel { background: var(--am-term-selection); }
+.am-term .cur { background: var(--am-term-cursor); color: var(--am-term-cursor-accent); }
+.am-term .lnk { text-decoration: underline; text-underline-offset: 0.15em; }
+.am-pane { border-left: var(--am-line) solid var(--am-rule); background: var(--am-surface); display: flex; flex-direction: column; min-width: 0; }
+.am-pane-head { display: flex; align-items: center; gap: var(--am-space-2); padding: var(--am-space-2) var(--am-space-4); border-bottom: var(--am-line) solid var(--am-rule-soft); font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+.am-pane-body { padding: var(--am-space-4); overflow: auto; flex: 1; }
+.am-recent { border-top: var(--am-line) solid var(--am-rule-soft); padding: var(--am-space-2) var(--am-space-4); display: grid; gap: 2px; font: var(--am-text-micro)/1.5 var(--am-font-sans); }
+.am-recent a { color: var(--am-accent); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.am-recent a:hover { text-decoration: underline; }
+.am-recent .is-open { color: var(--am-ink); font-weight: var(--am-weight-strong); }
+
+/* an entry, rendered: prose, at a measure */
+.am-entry-type { font: var(--am-text-micro)/1.3 var(--am-font-sans); color: var(--am-muted); }
+.am-entry h3, .am-entry-title { font: var(--am-weight-strong) var(--am-text-section)/1.25 var(--am-font-sans); color: var(--am-ink); margin: 0.15rem 0 var(--am-space-2); text-wrap: balance; }
+.am-entry-meta { display: flex; flex-wrap: wrap; gap: var(--am-space-1) var(--am-space-4); font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); margin-bottom: var(--am-space-4); padding-bottom: var(--am-space-3); border-bottom: var(--am-line) solid var(--am-rule-soft); }
+.am-id { font: var(--am-text-data)/1.4 var(--am-font-mono); color: var(--am-ink); }
+.am-prose { font: var(--am-text-body)/var(--am-leading-body) var(--am-font-sans); color: var(--am-body); max-width: var(--am-measure); }
+.am-prose p { margin: 0 0 0.85em; }
+.am-prose h4 { font: var(--am-weight-strong) var(--am-text-sub)/1.3 var(--am-font-sans); color: var(--am-ink); margin: 1.2em 0 0.4em; }
+.am-prose code { font: 0.875em var(--am-font-mono); background: var(--am-plate); color: var(--am-ink); padding: 0.05em 0.3em; border-radius: 3px; }
+.am-prose pre { background: var(--am-plate); border: var(--am-line) solid var(--am-rule-soft); border-radius: var(--am-radius-sm); padding: var(--am-space-3); overflow-x: auto; }
+.am-prose pre code { background: none; padding: 0; font-size: var(--am-text-data); line-height: 1.55; }
+.am-prose a { color: var(--am-accent); text-underline-offset: 0.15em; }
+.am-prose ul { padding-left: 1.2em; margin: 0 0 0.85em; }
+
+/* the doctor report */
+.am-doctor { display: grid; gap: var(--am-space-4); }
+.am-doctor-group h4 { font: var(--am-weight-strong) var(--am-text-sub)/1.3 var(--am-font-sans); color: var(--am-ink); margin: 0 0 var(--am-space-2); display: flex; gap: var(--am-space-2); align-items: baseline; }
+.am-doctor-group h4 small { font: var(--am-text-micro) var(--am-font-sans); color: var(--am-muted); }
+.am-check-row { display: grid; grid-template-columns: 20px minmax(9rem, 13rem) minmax(0, 1fr); gap: 2px var(--am-space-3); padding: var(--am-space-2) var(--am-space-3); border-top: var(--am-line) solid var(--am-rule-soft); align-items: start; }
+.am-check-row:first-of-type { border-top: 0; }
+.am-check-row .am-state { margin-top: 1px; }
+.am-check-what { font: var(--am-weight-strong) var(--am-text-ui)/1.45 var(--am-font-sans); color: var(--am-ink); overflow-wrap: anywhere; }
+.am-check-said { font: var(--am-text-ui)/1.45 var(--am-font-sans); color: var(--am-body); }
+.am-check-said .am-word { font-weight: var(--am-weight-strong); }
+.am-check-fix { grid-column: 3; font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+.am-check-fix code { font: var(--am-text-data) var(--am-font-mono); color: var(--am-ink); background: var(--am-plate); padding: 0.1em 0.35em; border-radius: 3px; }
+
+/* a profile */
+.am-profile { border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); padding: var(--am-space-4); display: grid; gap: var(--am-space-3); }
+.am-profile-name { font: 700 var(--am-text-sub)/1.2 var(--am-font-mono); color: var(--am-ink); }
+.am-profile dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--am-space-1) var(--am-space-4); margin: 0; font: var(--am-text-ui)/1.45 var(--am-font-sans); }
+.am-profile dt { color: var(--am-muted); }
+.am-profile dd { margin: 0; color: var(--am-ink); overflow-wrap: anywhere; }
+.am-profile-foot { display: flex; gap: var(--am-space-2); align-items: center; flex-wrap: wrap; }
+
+/* a reader result */
+.am-hits { list-style: none; margin: 0; padding: 0; max-width: none; border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); overflow: hidden; }
+.am-hit { padding: var(--am-space-3) var(--am-space-4); border-top: var(--am-line) solid var(--am-rule-soft); display: grid; gap: var(--am-space-1); }
+.am-hit:first-child { border-top: 0; }
+.am-hit.is-open { background: var(--am-accent-tint); box-shadow: inset 3px 0 0 var(--am-accent); }
+.am-hit-title { font: var(--am-weight-strong) var(--am-text-ui)/1.35 var(--am-font-sans); color: var(--am-ink); display: flex; gap: var(--am-space-2); align-items: baseline; flex-wrap: wrap; }
+.am-hit-sum { font: var(--am-text-ui)/1.45 var(--am-font-sans); color: var(--am-body); }
+.am-hit-meta { display: flex; gap: var(--am-space-1) var(--am-space-4); flex-wrap: wrap; font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); align-items: center; }
+mark { background: var(--am-mark); color: inherit; padding: 0 0.1em; border-radius: 2px; }
+
+/* empty, loading, alert, toast */
+.am-empty { border: var(--am-line) dashed var(--am-edge); border-radius: var(--am-radius); padding: var(--am-space-6) var(--am-space-4); background: var(--am-surface); display: grid; gap: var(--am-space-2); justify-items: start; }
+.am-empty b { font: var(--am-weight-strong) var(--am-text-sub)/1.3 var(--am-font-sans); color: var(--am-ink); }
+.am-empty p { margin: 0; font: var(--am-text-ui)/1.5 var(--am-font-sans); color: var(--am-body); max-width: 52ch; }
+.am-alert { --hue: var(--am-fail); --tint: var(--am-fail-tint); display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: var(--am-space-1) var(--am-space-3); padding: var(--am-space-3) var(--am-space-4); border: var(--am-line) solid color-mix(in srgb, var(--hue) 45%, transparent); border-left: 3px solid var(--hue); background: var(--tint); border-radius: var(--am-radius-sm); font: var(--am-text-ui)/1.5 var(--am-font-sans); color: var(--am-ink); }
+.am-alert > .am-glyph { color: var(--hue); width: 18px; height: 18px; margin-top: 2px; }
+.am-alert b { color: var(--am-ink); }
+.am-alert p { margin: 0; }
+.am-alert .t-micro { color: var(--am-body); }
+.am-alert .am-alert-act { grid-column: 2; display: flex; gap: var(--am-space-2); flex-wrap: wrap; margin-top: var(--am-space-1); }
+.am-alert--warn { --hue: var(--am-warn); --tint: var(--am-warn-tint); }
+.am-alert--live { --hue: var(--am-live); --tint: var(--am-live-tint); }
+.am-alert--ok { --hue: var(--am-ok); --tint: var(--am-ok-tint); }
+.am-busy { display: inline-flex; align-items: center; gap: 0.45em; font: var(--am-text-ui)/1.3 var(--am-font-sans); color: var(--am-muted); }
+.am-busy .am-glyph { width: 14px; height: 14px; }
+@media (prefers-reduced-motion: no-preference) {
+  .am-busy .am-glyph { animation: am-turn 900ms linear infinite; }
+}
+@keyframes am-turn { to { transform: rotate(360deg); } }
+.am-skel { display: block; height: 0.8rem; border-radius: 3px; background: var(--am-plate); }
+.am-kbd { font: var(--am-text-micro)/1 var(--am-font-mono); border: var(--am-line) solid var(--am-edge); border-bottom-width: 2px; border-radius: 4px; padding: 0.2em 0.4em; background: var(--am-surface); color: var(--am-ink); white-space: nowrap; }
+.am-tabs { display: flex; border-bottom: var(--am-line) solid var(--am-rule); background: var(--am-surface); }
+.am-tabs button { flex: 1; font: var(--am-weight-strong) var(--am-text-ui)/1 var(--am-font-sans); color: var(--am-muted); background: none; border: 0; min-height: var(--am-target-touch); border-bottom: 2px solid transparent; }
+.am-tabs button[aria-selected="true"] { color: var(--am-accent); border-bottom-color: var(--am-accent); }
+.am-tabs .am-chip { margin-left: 0.3em; }
+
+/* ======================================================================
+   The book itself. Prefixed bk-: none of this ships.
+   ====================================================================== */
+html { -webkit-text-size-adjust: 100%; scroll-padding-top: 1rem; }
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+body {
+  margin: 0; background: var(--am-paper); color: var(--am-body);
+  font: var(--am-text-body)/var(--am-leading-body) var(--am-font-sans);
+}
+.bk-skip { position: absolute; left: -999px; top: 0; }
+.bk-skip:focus { left: 1rem; top: 1rem; z-index: 10; background: var(--am-surface); padding: 0.5rem 0.75rem; border-radius: var(--am-radius-sm); }
+.bk-shell { display: grid; grid-template-columns: 14rem minmax(0, 1fr); gap: 3rem; max-width: 80rem; margin: 0 auto; padding: 0 2rem 6rem; }
+
+.bk-rail { position: sticky; top: 0; align-self: start; max-height: 100vh; overflow-y: auto; padding: 2.25rem 0 2rem; font-size: var(--am-text-ui); line-height: 1.4; }
+.bk-wordmark { display: flex; align-items: center; gap: 0.5rem; font: 700 1.05rem/1 var(--am-font-mono); color: var(--am-ink); text-decoration: none; margin-bottom: 1.5rem; }
+.bk-wordmark svg { width: 22px; height: 22px; color: var(--am-accent); }
+.bk-wordmark span { white-space: nowrap; font: var(--am-text-micro)/1 var(--am-font-sans); color: var(--am-muted); }
+.bk-rail ol { list-style: none; margin: 0 0 0.9rem; padding: 0; display: grid; gap: 1px; }
+.bk-rail a { display: grid; grid-template-columns: 1.6rem 1fr; padding: 0.22rem 0.4rem; border-radius: var(--am-radius-sm); color: var(--am-body); text-decoration: none; }
+.bk-rail a:hover { background: var(--am-plate); color: var(--am-ink); }
+.bk-rail a[aria-current="true"] { background: var(--am-accent-tint); color: var(--am-accent); font-weight: var(--am-weight-strong); }
+.bk-rail a i { font-style: normal; color: var(--am-muted); font-variant-numeric: tabular-nums; font-size: var(--am-text-micro); padding-top: 0.12rem; }
+.bk-part-label { font: var(--am-weight-strong) var(--am-text-micro)/1.3 var(--am-font-sans); color: var(--am-muted); margin: 0 0 0.3rem 0.4rem; }
+
+.bk-prefs { display: grid; gap: 0.6rem; margin: 0 0 1.5rem; padding: 0.75rem; border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); }
+.bk-prefs .am-seg { display: flex; justify-self: stretch; }
+.bk-prefs .am-seg label { flex: 1; }
+.bk-prefs .am-seg span { justify-content: center; padding: 0 0.4em; font-size: var(--am-text-micro); min-height: 2rem; }
+
+main { padding-top: 2.25rem; min-width: 0; }
+.bk-mast { margin-bottom: 4rem; }
+.bk-kicker { font: var(--am-text-ui)/1.4 var(--am-font-sans); color: var(--am-muted); margin: 0 0 1rem; }
+.bk-kicker code { font-family: var(--am-font-mono); font-size: 0.95em; color: var(--am-body); }
+h1 { font: 700 clamp(2.1rem, 4.6vw, 3.3rem)/1.06 var(--am-font-sans); letter-spacing: -0.022em; color: var(--am-ink); margin: 0 0 1.25rem; max-width: 18ch; text-wrap: balance; }
+.bk-stand { font-size: 1.15rem; line-height: 1.55; max-width: 60ch; color: var(--am-body); margin: 0 0 2rem; }
+.bk-hero { margin-top: 0.5rem; }
+.bk-hero-cap { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.5rem; margin-top: 1rem; font: var(--am-text-ui)/1.5 var(--am-font-sans); color: var(--am-body); }
+.bk-hero-cap b { display: block; color: var(--am-ink); font-weight: var(--am-weight-strong); }
+
+.bk-part { margin: 5rem 0 2.5rem; padding-top: 1rem; border-top: 3px solid var(--am-ink); display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; }
+.bk-part b { font: 700 1.05rem/1.2 var(--am-font-sans); color: var(--am-ink); }
+.bk-part span { color: var(--am-muted); font-size: var(--am-text-ui); max-width: 60ch; }
+
+section { margin-bottom: 4rem; scroll-margin-top: 1rem; }
+h2 { font: 700 1.6rem/1.2 var(--am-font-sans); letter-spacing: -0.012em; color: var(--am-ink); margin: 0 0 0.5rem; display: flex; gap: 0.75rem; align-items: baseline; text-wrap: balance; }
+h2 .bk-num { font: var(--am-weight-regular) 1rem/1 var(--am-font-sans); color: var(--am-accent); font-variant-numeric: tabular-nums; min-width: 1.6rem; }
+.bk-dek { max-width: 62ch; color: var(--am-muted); margin: 0 0 1.75rem 2.35rem; font-size: 1.02rem; }
+h3 { font: var(--am-weight-strong) 1.12rem/1.3 var(--am-font-sans); color: var(--am-ink); margin: 2.4rem 0 0.6rem; text-wrap: balance; }
+main p, main ul, main ol { max-width: var(--am-measure); }
+main p { margin: 0 0 1rem; }
+main ul, main ol { margin: 0 0 1rem; padding-left: 1.2rem; }
+main ul.am-hits { max-width: none; padding-left: 0; }
+main li { margin-bottom: 0.35rem; }
+main li::marker { color: var(--am-muted); }
+a { color: var(--am-accent); text-underline-offset: 0.16em; text-decoration-thickness: 1px; }
+strong { color: var(--am-ink); font-weight: 700; }
+code { font-family: var(--am-font-mono); font-size: 0.86em; }
+main p code, main li code, .bk-spec td code, .bk-note code {
+  background: var(--am-plate); color: var(--am-ink); padding: 0.06em 0.3em; border-radius: 3px; overflow-wrap: anywhere;
+}
+.bk-note { border-left: 3px solid var(--am-rule); padding: 0.1rem 0 0.1rem 1rem; margin: 1.25rem 0 1.5rem; max-width: var(--am-measure); color: var(--am-body); font-size: 0.95rem; }
+.bk-note strong:first-child { color: var(--am-ink); }
+
+.bk-plate { background: var(--am-plate); border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); padding: 1.25rem; margin: 1.25rem 0 1.75rem; overflow-x: auto; }
+.bk-plate--surface { background: var(--am-surface); }
+.bk-plate-head { display: flex; justify-content: space-between; gap: 0.5rem 1rem; flex-wrap: wrap; font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); margin-bottom: 1rem; }
+.bk-plate-head b { color: var(--am-ink); font-weight: var(--am-weight-strong); }
+
+.bk-tbl { overflow-x: auto; margin: 1rem 0 1.75rem; border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); }
+.bk-spec { border-collapse: collapse; width: 100%; font: var(--am-text-ui)/1.45 var(--am-font-sans); min-width: 36rem; }
+.bk-spec th { text-align: left; font: var(--am-weight-strong) var(--am-text-label)/1.3 var(--am-font-sans); color: var(--am-ink); padding: 0.65rem 0.8rem; background: var(--am-plate); border-bottom: var(--am-line) solid var(--am-rule); white-space: nowrap; }
+.bk-spec td { padding: 0.55rem 0.8rem; border-bottom: var(--am-line) solid var(--am-rule-soft); vertical-align: top; }
+.bk-spec tr:last-child td { border-bottom: 0; }
+.bk-spec .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bk-spec .hex { font-family: var(--am-font-mono); font-size: var(--am-text-micro); color: var(--am-muted); background: none; padding: 0; }
+.bk-spec tbody th { background: var(--am-surface); font-size: var(--am-text-ui); border-bottom: var(--am-line) solid var(--am-rule-soft); }
+.bk-spec .bk-group td { background: var(--am-plate); font-weight: var(--am-weight-strong); color: var(--am-ink); font-size: var(--am-text-label); }
+.bk-spec .none { color: var(--am-muted); }
+.sw { display: inline-grid; place-items: center; width: 2.4rem; height: 1.6rem; border-radius: 3px; border: var(--am-line) solid var(--am-rule); font: 700 0.8rem/1 var(--am-font-sans); }
+.sw--term-l { background: #faf9fd; border-color: #dedbe6; }
+.sw--term-d { background: #14131c; border-color: #353241; }
+.bk-live { display: flex; gap: 0.5rem; align-items: center; font: var(--am-text-ui)/1.4 var(--am-font-sans); color: var(--am-body); margin: 0 0 0.75rem; font-weight: var(--am-weight-strong); }
+
+/* hue cards */
+.bk-hues { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: 0.75rem; }
+.bk-hue { border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); overflow: hidden; }
+.bk-hue-pair { display: grid; grid-template-columns: 1fr 1fr; height: 3.5rem; }
+.bk-hue-pair span { display: flex; align-items: flex-end; padding: 0.35rem 0.5rem; font: var(--am-text-micro)/1 var(--am-font-mono); }
+.bk-hue-body { padding: 0.65rem 0.75rem 0.8rem; display: grid; gap: 0.3rem; font: var(--am-text-micro)/1.45 var(--am-font-sans); color: var(--am-body); }
+.bk-hue-body b { font: var(--am-weight-strong) var(--am-text-ui)/1.3 var(--am-font-sans); color: var(--am-ink); display: flex; justify-content: space-between; gap: 0.5rem; }
+.bk-hue-body b code { font-size: var(--am-text-micro); font-weight: var(--am-weight-regular); color: var(--am-muted); }
+
+.bk-levels { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); overflow: hidden; }
+.bk-levels > div { padding: 1rem; min-height: 8rem; display: grid; align-content: space-between; gap: 0.75rem; font: var(--am-text-micro)/1.4 var(--am-font-sans); }
+.bk-levels b { font: var(--am-weight-strong) var(--am-text-ui) var(--am-font-sans); color: var(--am-ink); display: block; }
+.bk-inks { display: grid; gap: 0.35rem; }
+
+.bk-type-row { display: grid; grid-template-columns: 11rem minmax(0, 1fr); gap: 1.25rem; padding: 0.9rem 0; border-top: var(--am-line) solid var(--am-rule-soft); align-items: baseline; }
+.bk-type-row:first-of-type { border-top: 0; }
+.bk-type-k { font: var(--am-weight-strong) var(--am-text-label)/1.3 var(--am-font-sans); color: var(--am-ink); }
+.bk-type-k span { display: block; font: var(--am-text-micro)/1.4 var(--am-font-mono); color: var(--am-muted); font-weight: var(--am-weight-regular); margin-top: 0.15rem; }
+.t-title { font: 700 var(--am-text-title)/var(--am-leading-tight) var(--am-font-sans); color: var(--am-ink); letter-spacing: -0.01em; }
+.t-section { font: var(--am-weight-strong) var(--am-text-section)/1.25 var(--am-font-sans); color: var(--am-ink); }
+.t-sub { font: var(--am-weight-strong) var(--am-text-sub)/1.3 var(--am-font-sans); color: var(--am-ink); }
+.t-body { font: var(--am-text-body)/var(--am-leading-body) var(--am-font-sans); color: var(--am-body); }
+.t-ui { font: var(--am-text-ui)/var(--am-leading-ui) var(--am-font-sans); color: var(--am-body); }
+.t-label { font: var(--am-weight-strong) var(--am-text-label)/1.3 var(--am-font-sans); color: var(--am-ink); }
+.t-data { font: var(--am-text-data)/1.45 var(--am-font-mono); color: var(--am-ink); }
+.t-micro { font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+.t-term { font: var(--am-text-term)/var(--am-leading-term) var(--am-font-mono); color: var(--am-term-fg); background: var(--am-term-bg); padding: 0.4rem 0.6rem; border-radius: var(--am-radius-sm); }
+.bk-glyphs { font: 1.35rem/1.6 var(--am-font-mono); color: var(--am-ink); letter-spacing: 0.06em; overflow-wrap: anywhere; }
+
+.bk-steps { display: grid; gap: 0.45rem; }
+.bk-step { display: grid; grid-template-columns: 6.5rem 1fr; gap: 1rem; align-items: center; font: var(--am-text-micro)/1 var(--am-font-mono); color: var(--am-muted); }
+.bk-step i { display: block; height: 0.75rem; background: var(--am-accent); border-radius: 2px; }
+
+.bk-ease { display: grid; grid-template-columns: 9rem 1fr 11rem; gap: 1rem; align-items: center; padding: 0.65rem 0; border-top: var(--am-line) solid var(--am-rule-soft); font: var(--am-text-ui)/1.3 var(--am-font-sans); }
+.bk-ease:first-of-type { border-top: 0; }
+.bk-ease-bar { height: 6px; background: var(--am-rule-soft); border-radius: 3px; overflow: hidden; }
+.bk-ease-bar i { display: block; height: 100%; background: var(--am-accent); }
+
+.bk-icons { display: grid; grid-template-columns: repeat(auto-fill, minmax(12.5rem, 1fr)); gap: 0.5rem; }
+.bk-icon { display: grid; grid-template-columns: 2.25rem minmax(0, 1fr); gap: 0.6rem; align-items: center; padding: 0.55rem 0.65rem; border: var(--am-line) solid var(--am-rule-soft); border-radius: var(--am-radius-sm); background: var(--am-surface); font: var(--am-text-micro)/1.35 var(--am-font-sans); color: var(--am-body); }
+.bk-icon > span:first-child { display: grid; place-items: center; width: 2.25rem; height: 2.25rem; border-radius: var(--am-radius-sm); background: var(--am-plate); }
+.bk-icon > span:first-child .am-glyph { width: 16px; height: 16px; }
+.bk-icon b { display: block; color: var(--am-ink); font: var(--am-text-micro)/1.3 var(--am-font-mono); }
+
+.bk-matrix { display: grid; grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr)); gap: 0.6rem; }
+.bk-mcell { border: var(--am-line) solid var(--am-rule-soft); border-radius: var(--am-radius-sm); background: var(--am-surface); padding: 0.7rem; display: grid; gap: 0.55rem; justify-items: start; }
+.bk-mcell > span { font: var(--am-text-micro)/1.2 var(--am-font-sans); color: var(--am-muted); }
+
+.bk-dd { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem; margin: 1.25rem 0 1.75rem; }
+.bk-dd > div { border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); padding: 1rem; background: var(--am-surface); display: grid; gap: 0.6rem; align-content: start; }
+.bk-dd-h { display: flex; gap: 0.4rem; align-items: center; font: var(--am-weight-strong) var(--am-text-label)/1 var(--am-font-sans); }
+.bk-dd-h.do { color: var(--am-ok); }
+.bk-dd-h.dont { color: var(--am-fail); }
+.bk-dd p { margin: 0; font-size: var(--am-text-micro); color: var(--am-muted); }
+
+.bk-grid2 { display: grid; align-items: start; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1rem; }
+.bk-phone { width: 360px; max-width: 100%; border: var(--am-line) solid var(--am-edge); border-radius: 14px; overflow: hidden; background: var(--am-paper); }
+.bk-phones { display: flex; gap: 1.25rem; flex-wrap: wrap; align-items: flex-start; }
+.bk-phone-cap { font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); margin-top: 0.5rem; max-width: 360px; }
+.bk-themes-side { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 1rem; }
+.bk-themes-side .am-term { border-radius: var(--am-radius); border: var(--am-line) solid; min-height: 15rem; }
+.bk-term-light.am-term { border-color: #dedbe6; }
+.bk-term-dark.am-term { border-color: #353241; }
+
+.bk-log td:first-child { min-width: 14rem; }
+.bk-log td:last-child { min-width: 9rem; }
+.bk-tag { display: inline-block; font: var(--am-weight-strong) var(--am-text-micro)/1.3 var(--am-font-sans); padding: 0.1em 0.45em; border-radius: 3px; border: var(--am-line) solid var(--am-edge); color: var(--am-body); white-space: nowrap; }
+footer.bk-foot { border-top: 3px solid var(--am-ink); padding-top: 1.25rem; margin-top: 3rem; font: var(--am-text-ui)/1.55 var(--am-font-sans); color: var(--am-muted); max-width: var(--am-measure); }
+
+@media (max-width: 960px) {
+  .bk-shell { grid-template-columns: minmax(0, 1fr); gap: 0; padding: 0 1rem 4rem; }
+  .bk-rail { position: static; max-height: none; padding-bottom: 0; }
+  .bk-rail nav { display: none; }
+  main { padding-top: 1rem; }
+  .bk-dek { margin-left: 0; }
+  .bk-hero-cap { grid-template-columns: minmax(0, 1fr); gap: 0.75rem; }
+}
+@media (max-width: 720px) {
+  .am-split { grid-template-columns: minmax(0, 1fr); }
+  .am-pane { border-left: 0; border-top: var(--am-line) solid var(--am-rule); }
+  .am-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .am-strip-cell:nth-child(n) { border-left: 0; border-top: var(--am-line) solid var(--am-rule-soft); }
+  .am-strip-cell:nth-child(-n+2) { border-top: 0; }
+  .am-strip-cell:nth-child(even) { border-left: var(--am-line) solid var(--am-rule-soft); }
+  .am-launch .c2, .am-launch .c3 { grid-column: span 6; }
+  .bk-type-row { grid-template-columns: minmax(0, 1fr); gap: 0.35rem; }
+  .bk-levels { grid-template-columns: minmax(0, 1fr); }
+  .am-check-row { grid-template-columns: 20px minmax(0, 1fr); }
+  .am-check-said, .am-check-fix { grid-column: 2; }
+  .bk-ease { grid-template-columns: 7rem 1fr; }
+  .bk-ease > :last-child { grid-column: 1 / -1; }
+  h2 { font-size: 1.35rem; }
+}
+/* inside a phone specimen the narrow rules apply whatever the window */
+.bk-phone .am-split { grid-template-columns: minmax(0, 1fr); }
+.bk-phone .am-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.bk-phone .am-strip-cell:nth-child(n) { border-left: 0; border-top: var(--am-line) solid var(--am-rule-soft); }
+.bk-phone .am-strip-cell:nth-child(-n+2) { border-top: 0; }
+.bk-phone .am-strip-cell:nth-child(even) { border-left: var(--am-line) solid var(--am-rule-soft); }
+.bk-phone .am-launch .c2, .bk-phone .am-launch .c3 { grid-column: span 6; }
+.bk-phone .am-srow { padding-inline: var(--am-space-3); }
+.bk-spec td code { overflow-wrap: normal; white-space: nowrap; }
+.bk-log td code, .bk-spec td.wrap code { white-space: normal; }
+
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<symbol id="i-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 3.5H3.5v17h4M16.5 3.5h4v17h-4"/><path d="M8 8.5h8M8 12h8M8 15.5h5"/></symbol>
+<symbol id="i-running" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2"/><circle cx="8" cy="8" r="3" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-connecting" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2" stroke-dasharray="2.7 2.2"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-done" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M5.3 8.2l1.9 1.9 3.6-3.9"/></symbol>
+<symbol id="i-ok" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 8.6l3.3 3.2L13.2 4.6"/></symbol>
+<symbol id="i-fail" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></symbol>
+<symbol id="i-warn" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2l6.3 11.2H1.7Z"/><path d="M8 6.6v3M8 11.6v.05"/></symbol>
+<symbol id="i-absent" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2" stroke-dasharray="0.1 2.6"/></symbol>
+<symbol id="i-refused" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M3.7 12.3l8.6-8.6"/></symbol>
+<symbol id="i-ceiling" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.8h11"/><path d="M8 13.6V5.8M5.2 8.5L8 5.7l2.8 2.8"/></symbol>
+<symbol id="i-admit" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 13.8V2.4h7.2v11.4"/><path d="M1.6 8.1h6.6M6 5.9l2.2 2.2L6 10.3"/></symbol>
+<symbol id="i-handoff" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.6h3.2l1 1.7h3.6l1-1.7H14v3a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1Z"/><path d="M8 2v5.6M5.7 5.4L8 7.7l2.3-2.3"/></symbol>
+<symbol id="i-lease" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M8 4.6V8l2.4 1.5"/></symbol>
+<symbol id="i-queued" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 4.6h10M3 8h10M3 11.4h6"/></symbol>
+<symbol id="i-invalid" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M5 8h6"/></symbol>
+<symbol id="i-superseded" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.4 8h8.4M8 5l3 3-3 3"/><path d="M13.6 3.2v9.6"/></symbol>
+<symbol id="i-demoted" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2v8.2M4.9 7.4L8 10.5l3.1-3.1"/><path d="M3 13.6h10"/></symbol>
+<symbol id="i-erased" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="2.4" y="2.4" width="11.2" height="11.2" rx="1.6" stroke-dasharray="2.2 2.2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><rect x="5.6" y="5.6" width="8" height="8" rx="1.4"/><path d="M10.4 5.6V3.8a1.3 1.3 0 0 0-1.3-1.3H3.8a1.3 1.3 0 0 0-1.3 1.3v5.3a1.3 1.3 0 0 0 1.3 1.3h1.8"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.6" width="12.4" height="10.8" rx="1.6"/><path d="M4.6 6.2l2 1.8-2 1.8M8.4 10h3"/></symbol>
+<symbol id="i-search" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="4.4"/><path d="M10.3 10.3l3.5 3.5"/></symbol>
+<symbol id="i-entry" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.8" y="1.8" width="10.4" height="12.4" rx="1.4"/><path d="M5.4 5.4h5.2M5.4 8h5.2M5.4 10.6h3"/></symbol>
+<symbol id="i-start" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M4.6 2.9v10.2L12.8 8Z"/></symbol>
+<symbol id="i-label-0" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="none"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="none"/></symbol>
+<symbol id="i-label-1" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="currentColor"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="none"/></symbol>
+<symbol id="i-label-2" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="currentColor"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="currentColor"/></symbol>
+<symbol id="i-trust-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/></symbol>
+<symbol id="i-trust-1" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/><path d="M8 2.4a5.6 5.6 0 0 0 0 11.2Z" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-trust-2" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6" fill="currentColor"/></symbol>
+</defs></svg>
+
+<a class="bk-skip" href="#main">Skip to the book</a>
+
+<div class="bk-shell">
+
+<aside class="bk-rail">
+  <a class="bk-wordmark" href="#top"><svg aria-hidden="true"><use href="#i-mark"/></svg>amem <span>design book</span></a>
+
+  <div class="bk-prefs" role="group" aria-label="Review this book in">
+    <div class="am-field">
+      <span class="am-legend" id="lg-theme">Theme</span>
+      <div class="am-seg" role="radiogroup" aria-labelledby="lg-theme">
+        <label><input type="radio" name="bk-theme" value="system" checked><span>System</span></label>
+        <label><input type="radio" name="bk-theme" value="light"><span>Light</span></label>
+        <label><input type="radio" name="bk-theme" value="dark"><span>Dark</span></label>
+      </div>
+    </div>
+    <div class="am-field">
+      <span class="am-legend" id="lg-contrast">Contrast</span>
+      <div class="am-seg" role="radiogroup" aria-labelledby="lg-contrast">
+        <label><input type="radio" name="bk-contrast" value="system" checked><span>System</span></label>
+        <label><input type="radio" name="bk-contrast" value="normal"><span>Normal</span></label>
+        <label><input type="radio" name="bk-contrast" value="more"><span>More</span></label>
+      </div>
+    </div>
+  </div>
+
+  <nav aria-label="Contents">
+    <div class="bk-part-label">Foundations</div>
+    <ol>
+      <li><a href="#principles"><i>01</i>Principles</a></li>
+      <li><a href="#colour"><i>02</i>Colour</a></li>
+      <li><a href="#neutrals"><i>03</i>Neutrals and surfaces</a></li>
+      <li><a href="#terminal"><i>04</i>The terminal</a></li>
+      <li><a href="#type"><i>05</i>Type</a></li>
+      <li><a href="#space"><i>06</i>Space</a></li>
+      <li><a href="#motion"><i>07</i>Motion</a></li>
+      <li><a href="#icons"><i>08</i>Iconography</a></li>
+    </ol>
+    <div class="bk-part-label">Language</div>
+    <ol>
+      <li><a href="#chip"><i>09</i>The chip</a></li>
+      <li><a href="#facts"><i>10</i>Facts every entry carries</a></li>
+      <li><a href="#states"><i>11</i>States</a></li>
+      <li><a href="#voice"><i>12</i>Voice</a></li>
+    </ol>
+    <div class="bk-part-label">Components</div>
+    <ol>
+      <li><a href="#widgets"><i>13</i>Widgets</a></li>
+      <li><a href="#forms"><i>14</i>Forms</a></li>
+      <li><a href="#feedback"><i>15</i>Feedback</a></li>
+    </ol>
+    <div class="bk-part-label">Behaviour</div>
+    <ol>
+      <li><a href="#access"><i>16</i>Accessibility</a></li>
+      <li><a href="#responsive"><i>17</i>Responsive</a></li>
+      <li><a href="#dark"><i>18</i>Dark mode</a></li>
+    </ol>
+    <div class="bk-part-label">Keeping it</div>
+    <ol>
+      <li><a href="#governance"><i>19</i>Governance</a></li>
+      <li><a href="#decisions"><i>20</i>Decisions</a></li>
+    </ol>
+  </nav>
+</aside>
+
+<main id="main">
+
+<header class="bk-mast" id="top">
+  <p class="bk-kicker">The amem design book, drafted 2026-10-06 for <code>crates/web</code>. Tokens: <code>crates/web/static/tokens.css</code>.</p>
+  <h1>The box, the record, and the line between them.</h1>
+  <p class="bk-stand">
+    amem runs a coding harness in a box with no network, keeps what it learns on a record of
+    versioned Markdown, and meters everything that crosses from one to the other. Its web pages
+    show all three at once. This book fixes how they look and what each colour means, so the
+    next page is a composition rather than an invention.
+  </p>
+
+  <div class="bk-hero">
+    <div class="am-frame" role="img" aria-label="A session page: a running Claude session on the llmao gateway, at its internal ceiling with one call refused, the terminal on the left and an entry open in the reading pane on the right.">
+      <div class="am-bar">
+        <a class="am-bar-home" href="#top" tabindex="-1">amem</a>
+        <span class="am-bar-title">claude on qwen3.8-27b: next task</span>
+        <span class="am-chip am-chip--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-running"/></svg><span class="am-chip-word">running</span></span>
+      </div>
+      <div class="am-strip">
+        <div class="am-strip-cell"><span class="am-strip-k">Destination</span><span class="am-strip-v">llmao <span class="am-sub">gateway</span></span></div>
+        <div class="am-strip-cell am-strip-cell--ceiling"><span class="am-strip-k">Label and ceiling</span><span class="am-strip-v"><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-1"/></svg>internal</span><span class="am-sub">of internal</span>
+          <span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-refused"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">refused</span></span>
+          <span class="am-chip am-chip--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg><span class="am-chip-word">at ceiling</span></span></span></div>
+        <div class="am-strip-cell"><span class="am-strip-k">Usage so far</span><span class="am-strip-v">41.2k in, 3.1k out <span class="am-sub">12 calls</span></span></div>
+        <div class="am-strip-cell"><span class="am-strip-k">Entries mined</span><span class="am-strip-v">3</span></div>
+        <div class="am-strip-cell"><span class="am-strip-k">Handoffs waiting</span><span class="am-strip-v"><span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">to read</span></span></span></div>
+      </div>
+      <div class="am-split">
+<pre class="am-term"><span class="k8">amem: confined, no network; model calls go to llmao, ceiling internal</span>
+<span class="k8">amem: claimed</span> <span class="k6">task-dm-3k9x2m1q</span><span class="k8">, lease 15 min</span>
+
+<span class="b">&gt;</span> Summarise what the record says about leases.
+
+<span class="k2">&#9679;</span> <span class="b">search_memory</span>(lease expiry renewal)
+  <span class="k8">6 hits, summaries first</span>
+<span class="k2">&#9679;</span> <span class="b">read_entry</span>(<span class="k4 lnk">mem-dm-7k2q9x4b</span>)
+  <span class="k8">decision, internal, curated</span>
+<span class="k1">&#9679;</span> <span class="b">post_comment</span>(github)
+  <span class="k1">refused: github accepts at most public; this
+  session has read internal</span>
+<span class="k2">&#9679;</span> <span class="b">propose_entry</span>(Leases expire at a fixed horizon)
+  <span class="k8">wrote</span> <span class="k4 lnk">mem-dm-p4n8w2c6</span> <span class="k8">(raw)</span>
+
+A lease is never extended past its horizon; a holder
+that misses a heartbeat loses the task at expiry.<span class="cur"> </span></pre>
+        <div class="am-pane">
+          <div class="am-pane-head"><svg class="am-glyph" aria-hidden="true"><use href="#i-entry"/></svg>Opened from the terminal</div>
+          <div class="am-pane-body am-entry">
+            <div class="am-entry-type">decision</div>
+            <div class="am-entry-title">Leases expire at a fixed horizon</div>
+            <div class="am-entry-meta">
+              <span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-1"/></svg>internal</span>
+              <span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-1"/></svg>curated</span>
+              <span class="am-id">mem-dm-7k2q9x4b</span>
+            </div>
+            <div class="am-prose">
+              <p>A claim is one transaction over the ledger. The lease it grants runs to a horizon
+              set at the claim and is never extended past it.</p>
+              <p>A holder that cannot renew loses the task at expiry, and its heartbeat,
+              release and complete are refused after that.</p>
+            </div>
+          </div>
+          <div class="am-recent">
+            <a href="#top" tabindex="-1" class="is-open">decision: Leases expire at a fixed horizon</a>
+            <a href="#top" tabindex="-1">fact: The ledger's clock is its own</a>
+            <a href="#top" tabindex="-1">handoff: Lease renewal, first pass</a>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="bk-hero-cap">
+      <div><b>The box</b>The terminal on the left is the harness, confined. Its colours are the page's colours: the red of a refused call is the red of the refused chip.</div>
+      <div><b>The line</b>The strip on the frame's top edge is what crossed: where calls go, at what label, at what cost, and what came back. It is never hidden.</div>
+      <div><b>The record</b>The pane on the right is the record, set as prose. A <code class="t-data">mem-</code> id in the terminal opens there.</div>
+    </div>
+  </div>
+</header>
+
+<div class="bk-part"><b>Foundations</b><span>What everything else is measured in.</span></div>
+
+<section id="principles">
+  <h2><span class="bk-num">01</span>Principles</h2>
+  <p class="bk-dek">Nine rules. Each one is applied somewhere in this book, and the decisions in chapter 20 say where each came from.</p>
+  <ol>
+    <li><strong>One decision, made once.</strong> Which colour a state takes, how an id is set,
+      what a disabled button says: answered here, not per page.</li>
+    <li><strong>The page and the terminal speak one palette.</strong> The six hues are ANSI's six
+      colours. Red in a harness's output and red on a chip are the same red, meaning the same
+      thing.</li>
+    <li><strong>One meaning per hue.</strong> The table in chapter 02 is exhaustive. A state that
+      is not in it has no colour.</li>
+    <li><strong>A chip marks an exception, not a fact.</strong> A label, a trust tier, a count of
+      tokens are true of every entry or every session. They are set as text in their place, not
+      as coloured badges.</li>
+    <li><strong>Colour is never the only carrier.</strong> Every state has a glyph and a word, and
+      the word is always in the accessible name.</li>
+    <li><strong>Mono means exact characters.</strong> Ids, commands, digests, paths, model names.
+      Nothing else is set in it.</li>
+    <li><strong>What crosses the line is on screen.</strong> Destination, ceiling, usage, entries
+      mined, handoffs waiting: the numbers the paper measures sit on the session's frame for as
+      long as it runs.</li>
+    <li><strong>It needs nothing it does not carry.</strong> No CDN, no fonts fetched, no build step.
+      The system font stacks are a design in their own right, not a fallback to apologise for.</li>
+    <li><strong>Both themes are designed, and a stated preference is honoured without being
+      found.</strong> Dark, more contrast and reduced motion follow the system unless the reader
+      says otherwise.</li>
+  </ol>
+</section>
+
+<section id="colour">
+  <h2><span class="bk-num">02</span>Colour</h2>
+  <p class="bk-dek">Six hues, one meaning each, and each of them one of the terminal's six colours. One value per hue per theme, and every value passes as text on every surface it can land on.</p>
+
+  <div class="bk-hues">
+    <div class="bk-hue"><div class="bk-hue-pair"><span style="background:#4a3fc4;color:#fff">#4a3fc4</span><span style="background:#a9a3ff;color:#16141f">#a9a3ff</span></div>
+      <div class="bk-hue-body"><b>Accent <code>--am-accent</code></b>You, here: the one primary action, links, focus, the selected row, your query's matches. <span class="t-micro">ANSI blue</span></div></div>
+    <div class="bk-hue"><div class="bk-hue-pair"><span style="background:#09697f;color:#fff">#09697f</span><span style="background:#4cc4dc;color:#16141f">#4cc4dc</span></div>
+      <div class="bk-hue-body"><b>Live <code>--am-live</code></b>Happening now under a holder: a running session, a claimed task, a connection being made. <span class="t-micro">ANSI cyan</span></div></div>
+    <div class="bk-hue"><div class="bk-hue-pair"><span style="background:#1a704d;color:#fff">#1a704d</span><span style="background:#5fcb9a;color:#16141f">#5fcb9a</span></div>
+      <div class="bk-hue-body"><b>Ok <code>--am-ok</code></b>Checked and good, or finished as asked: a doctor pass, a session that exited 0, a completed task. <span class="t-micro">ANSI green</span></div></div>
+    <div class="bk-hue"><div class="bk-hue-pair"><span style="background:#875a00;color:#fff">#875a00</span><span style="background:#e8bd52;color:#16141f">#e8bd52</span></div>
+      <div class="bk-hue-body"><b>Warn <code>--am-warn</code></b>Works, but look: a doctor warning, a session at its ceiling. <span class="t-micro">ANSI yellow</span></div></div>
+    <div class="bk-hue"><div class="bk-hue-pair"><span style="background:#8d2a7e;color:#fff">#8d2a7e</span><span style="background:#e590d7;color:#16141f">#e590d7</span></div>
+      <div class="bk-hue-body"><b>Await <code>--am-await</code></b>Needs a person's decision: a task proposed and not admitted, a handoff nobody has read. <span class="t-micro">ANSI magenta</span></div></div>
+    <div class="bk-hue"><div class="bk-hue-pair"><span style="background:#bd222b;color:#fff">#bd222b</span><span style="background:#ff7d86;color:#16141f">#ff7d86</span></div>
+      <div class="bk-hue-body"><b>Fail <code>--am-fail</code></b>Did not happen, or was refused: a non-zero exit, a doctor failure, a call over the ceiling, a page that cannot reach amem. <span class="t-micro">ANSI red</span></div></div>
+  </div>
+  <p class="t-micro" style="margin-top:.6rem">Each card: the light value left, the dark value right. Each hue has a tint for chip grounds, <code>--am-*-tint</code>.</p>
+
+  <h3>One meaning per hue: the state table</h3>
+  <p>
+    Every state the web pages show, from the crates that define them: <code>dm_core::Label</code>
+    and <code>TrustTier</code>, the ledger's <code>Status</code>, the policy's
+    <code>Session</code> against a destination's ceiling, and the doctor's verdicts. If a state is
+    not in this table it does not get a colour. Where the table says <em>none</em>, the state is a
+    fact and is set as text in its place.
+  </p>
+  <div class="bk-tbl">
+    <table class="bk-spec">
+      <thead><tr><th>State</th><th>Hue</th><th>Glyph</th><th>Rendered as</th><th>Where</th></tr></thead>
+      <tbody>
+        <tr class="bk-group"><td colspan="5">Session</td></tr>
+        <tr><td>Connecting, reconnecting</td><td><code>live</code>, dashed</td><td><span class="am-state am-state--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-connecting"/></svg></span></td><td><span class="am-chip am-chip--live am-chip--provisional"><svg class="am-glyph" aria-hidden="true"><use href="#i-connecting"/></svg><span class="am-chip-word">connecting</span></span></td><td>Page bar, session row gutter</td></tr>
+        <tr><td>Running</td><td><code>live</code></td><td><span class="am-state am-state--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-running"/></svg></span></td><td><span class="am-chip am-chip--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-running"/></svg><span class="am-chip-word">running</span></span></td><td>Page bar, session row gutter</td></tr>
+        <tr><td>Exited 0</td><td><code>ok</code>, glyph only</td><td><span class="am-state am-state--ok"><svg class="am-glyph" aria-hidden="true"><use href="#i-done"/></svg></span></td><td class="t-ui">exited 0 <span class="t-micro">in the row's text, no chip</span></td><td>Session row gutter</td></tr>
+        <tr><td>Exited non-zero, or killed</td><td><code>fail</code></td><td><span class="am-state am-state--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg></span></td><td><span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg><span class="am-chip-word">exited 1</span></span></td><td>Page bar, session row</td></tr>
+        <tr class="bk-group"><td colspan="5">Task, in the ledger's own words</td></tr>
+        <tr><td>Proposed</td><td><code>await</code></td><td><span class="am-state am-state--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-admit"/></svg></span></td><td><span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-admit"/></svg><span class="am-chip-word">to admit</span></span></td><td>Task row, strip</td></tr>
+        <tr><td>Admitted</td><td class="none">none</td><td><span class="am-state am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-queued"/></svg></span></td><td class="t-ui">admitted <span class="t-micro">text; waiting for a holder is the normal state</span></td><td>Task row</td></tr>
+        <tr><td>Claimed</td><td><code>live</code></td><td><span class="am-state am-state--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-lease"/></svg></span></td><td><span class="am-chip am-chip--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-lease"/></svg><span class="am-chip-word">claimed</span></span></td><td>Task row, page bar</td></tr>
+        <tr><td>Completed</td><td><code>ok</code>, glyph only</td><td><span class="am-state am-state--ok"><svg class="am-glyph" aria-hidden="true"><use href="#i-done"/></svg></span></td><td class="t-ui">completed <span class="t-micro">text, with its handoff linked</span></td><td>Task row</td></tr>
+        <tr><td>Invalidated</td><td class="none">none, outlined</td><td><span class="am-state am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-invalid"/></svg></span></td><td><span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-invalid"/></svg><span class="am-chip-word">invalidated</span></span></td><td>Task row</td></tr>
+        <tr class="bk-group"><td colspan="5">Entry label: public &lt; internal &lt; restricted</td></tr>
+        <tr><td>Public, internal, restricted</td><td class="none">none</td><td><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-0"/></svg></span> <span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-1"/></svg></span> <span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-2"/></svg></span></td><td class="t-ui">the label mark and the word, in ink</td><td>Entry meta, reader result, strip</td></tr>
+        <tr class="bk-group"><td colspan="5">Trust tier: raw &lt; curated &lt; verified</td></tr>
+        <tr><td>Raw, curated, verified</td><td class="none">none</td><td><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-0"/></svg></span> <span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-1"/></svg></span> <span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-2"/></svg></span></td><td class="t-ui">the trust mark and the word, in ink</td><td>Entry meta, reader result</td></tr>
+        <tr class="bk-group"><td colspan="5">Entry status: absent means active</td></tr>
+        <tr><td>Superseded</td><td class="none">none, outlined</td><td><span class="am-state am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-superseded"/></svg></span></td><td><span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-superseded"/></svg><span class="am-chip-word">superseded</span></span></td><td>Entry head, reader result</td></tr>
+        <tr><td>Demoted</td><td class="none">none, outlined</td><td><span class="am-state am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-demoted"/></svg></span></td><td><span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-demoted"/></svg><span class="am-chip-word">demoted</span></span></td><td>Entry head, reader result</td></tr>
+        <tr><td>Erased</td><td class="none">none, outlined</td><td><span class="am-state am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-erased"/></svg></span></td><td><span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-erased"/></svg><span class="am-chip-word">erased</span></span></td><td>Entry head, reader result</td></tr>
+        <tr class="bk-group"><td colspan="5">Ceiling: the session's label against a destination's ceiling</td></tr>
+        <tr><td>Below the ceiling</td><td class="none">none</td><td>&mdash;</td><td class="t-ui">internal <span class="t-micro">of restricted</span></td><td>Strip</td></tr>
+        <tr><td>At the ceiling</td><td><code>warn</code></td><td><span class="am-state am-state--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg></span></td><td><span class="am-chip am-chip--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg><span class="am-chip-word">at ceiling</span></span></td><td>Strip, session row</td></tr>
+        <tr><td>Over: a call refused</td><td><code>fail</code></td><td><span class="am-state am-state--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-refused"/></svg></span></td><td><span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-refused"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">refused</span></span></td><td>Strip, session row</td></tr>
+        <tr class="bk-group"><td colspan="5">Doctor check</td></tr>
+        <tr><td>Pass</td><td><code>ok</code></td><td><span class="am-state am-state--ok"><svg class="am-glyph" aria-hidden="true"><use href="#i-ok"/></svg></span></td><td class="t-ui">glyph and the verdict word in the row</td><td>Doctor report gutter</td></tr>
+        <tr><td>Warn</td><td><code>warn</code></td><td><span class="am-state am-state--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-warn"/></svg></span></td><td class="t-ui">glyph, word, and the fix</td><td>Doctor report gutter</td></tr>
+        <tr><td>Fail</td><td><code>fail</code></td><td><span class="am-state am-state--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg></span></td><td class="t-ui">glyph, word, and the fix</td><td>Doctor report gutter</td></tr>
+        <tr><td>Absent</td><td class="none">none, dotted</td><td><span class="am-state am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-absent"/></svg></span></td><td class="t-ui">glyph and word; not configured is an answer</td><td>Doctor report gutter</td></tr>
+        <tr class="bk-group"><td colspan="5">Counts on the strip</td></tr>
+        <tr><td>Handoffs waiting, one or more</td><td><code>await</code></td><td><span class="am-state am-state--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg></span></td><td><span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg><span class="am-chip-count">2</span><span class="am-chip-word">to read</span></span></td><td>Strip, session row</td></tr>
+        <tr><td>Usage, entries mined, calls</td><td class="none">none</td><td>&mdash;</td><td class="t-ui">numbers, tabular</td><td>Strip</td></tr>
+        <tr class="bk-group"><td colspan="5">The page itself</td></tr>
+        <tr><td>Selected, current, focused, matched</td><td><code>accent</code></td><td>&mdash;</td><td class="t-ui">tint and an accent edge; focus ring; <mark>match</mark></td><td>Everywhere</td></tr>
+        <tr><td>Cannot reach amem</td><td><code>fail</code></td><td><span class="am-state am-state--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg></span></td><td class="t-ui">a region alert that says what to do</td><td>Chapter 11</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Four of those deserve their reasoning stated.</p>
+  <ul>
+    <li><strong>Labels and trust take no hue.</strong> Every entry has both, so by the chip rule
+    they are facts. The obvious alternative, public green and restricted red, would spend the
+    hues that mean <em>passed</em> and <em>refused</em> on a property that is neither good nor bad;
+    a restricted entry is not a failure. They are ordered values, so they are drawn as orders: the
+    label mark fills one, two or three bars, and the trust mark fills a disc: empty, half, whole.</li>
+    <li><strong>A running session is live, not ok.</strong> Nothing has been checked yet, and a row of
+    green running sessions would read as a row of successes.</li>
+    <li><strong>Below the ceiling has no colour.</strong> It is the normal case. A session at its
+    ceiling is a warning because the filter is now hiding entries above it, which changes what
+    the harness can find; a refused call is a failure because something the harness asked for
+    did not happen.</li>
+    <li><strong>Await is violet</strong> for the same reason BAT's comments are: it is the hue that
+    says a person needs to look.</li>
+  </ul>
+
+  <h3>A chip marks an exception, not a fact</h3>
+  <p>
+    The rule that keeps the table from growing, taken from BAT unchanged. A chip says
+    <em>this departs from the normal state and may need you</em>. The test is whether the value is
+    true of every row: if it is, it is a column, a line of secondary type, or a mark in a gutter.
+    Every session has a state, so the state is a glyph in the row's gutter; only the exceptional
+    ones (exited 1, refused, to read) also take a chip.
+  </p>
+
+  <h3>Colour is never the only carrier</h3>
+  <p>
+    Every state has a glyph of its own and a word. The glyph is what meets WCAG 1.4.1 when the
+    word is clipped on a narrow screen; the word is always in the accessible name. Two states
+    sharing a hue never share a glyph: running and claimed are both live, and are a filled dot and
+    a clock.
+  </p>
+
+  <h3>Contrast, computed</h3>
+  <p>
+    Every pair the tokens are meant to be used in, both themes, with WCAG 2.2 ratios. 4.5 is the
+    floor for text, 3 for a control's boundary, a focus ring or a glyph that carries a state.
+    Decorative rules (<code>--am-rule</code>, <code>--am-rule-soft</code>) separate things that are
+    already separated by space and type, so they are exempt; anything that identifies a control
+    uses <code>--am-edge</code>. The last column is computed by this page, now, from the tokens in
+    force, so it changes when you switch the theme or the contrast above.
+  </p>
+  <p class="bk-live" id="bk-live" role="status" aria-live="polite">Computing in this browser&hellip;</p>
+  <div class="bk-tbl">
+    <table class="bk-spec" id="bk-contrast">
+      <thead><tr><th>Specimen</th><th>Pair</th><th>Used for</th><th class="num">Needs</th><th class="num">Light</th><th class="num">Dark</th><th class="num">Here, now</th></tr></thead>
+      <tbody>
+<tr data-fg="ink" data-bg="paper" data-need="4.5"><td><span class="sw" style="background:var(--am-paper);color:var(--am-ink);border-color:var(--am-edge)">Aa</span></td><td><code>ink</code> on <code>paper</code></td><td>text</td><td class="num">4.5</td><td class="num">16.12</td><td class="num">16.60</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="body" data-bg="paper" data-need="4.5"><td><span class="sw" style="background:var(--am-paper);color:var(--am-body);border-color:var(--am-edge)">Aa</span></td><td><code>body</code> on <code>paper</code></td><td>text</td><td class="num">4.5</td><td class="num">11.30</td><td class="num">11.92</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="muted" data-bg="paper" data-need="4.5"><td><span class="sw" style="background:var(--am-paper);color:var(--am-muted);border-color:var(--am-edge)">Aa</span></td><td><code>muted</code> on <code>paper</code></td><td>text</td><td class="num">4.5</td><td class="num">5.95</td><td class="num">6.81</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="ink" data-bg="surface" data-need="4.5"><td><span class="sw" style="background:var(--am-surface);color:var(--am-ink);border-color:var(--am-edge)">Aa</span></td><td><code>ink</code> on <code>surface</code></td><td>text</td><td class="num">4.5</td><td class="num">17.50</td><td class="num">15.40</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="body" data-bg="surface" data-need="4.5"><td><span class="sw" style="background:var(--am-surface);color:var(--am-body);border-color:var(--am-edge)">Aa</span></td><td><code>body</code> on <code>surface</code></td><td>text</td><td class="num">4.5</td><td class="num">12.27</td><td class="num">11.06</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="muted" data-bg="surface" data-need="4.5"><td><span class="sw" style="background:var(--am-surface);color:var(--am-muted);border-color:var(--am-edge)">Aa</span></td><td><code>muted</code> on <code>surface</code></td><td>text</td><td class="num">4.5</td><td class="num">6.45</td><td class="num">6.31</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="ink" data-bg="plate" data-need="4.5"><td><span class="sw" style="background:var(--am-plate);color:var(--am-ink);border-color:var(--am-edge)">Aa</span></td><td><code>ink</code> on <code>plate</code></td><td>text</td><td class="num">4.5</td><td class="num">14.94</td><td class="num">14.00</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="body" data-bg="plate" data-need="4.5"><td><span class="sw" style="background:var(--am-plate);color:var(--am-body);border-color:var(--am-edge)">Aa</span></td><td><code>body</code> on <code>plate</code></td><td>text</td><td class="num">4.5</td><td class="num">10.48</td><td class="num">10.05</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="muted" data-bg="plate" data-need="4.5"><td><span class="sw" style="background:var(--am-plate);color:var(--am-muted);border-color:var(--am-edge)">Aa</span></td><td><code>muted</code> on <code>plate</code></td><td>text</td><td class="num">4.5</td><td class="num">5.51</td><td class="num">5.74</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="accent" data-bg="surface" data-need="4.5"><td><span class="sw" style="background:var(--am-surface);color:var(--am-accent);border-color:var(--am-edge)">Aa</span></td><td><code>accent</code> on <code>surface</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">7.50</td><td class="num">7.76</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="accent" data-bg="paper" data-need="4.5"><td><span class="sw" style="background:var(--am-paper);color:var(--am-accent);border-color:var(--am-edge)">Aa</span></td><td><code>accent</code> on <code>paper</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">6.91</td><td class="num">8.37</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="accent" data-bg="plate" data-need="4.5"><td><span class="sw" style="background:var(--am-plate);color:var(--am-accent);border-color:var(--am-edge)">Aa</span></td><td><code>accent</code> on <code>plate</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">6.40</td><td class="num">7.05</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="accent" data-bg="accent-tint" data-need="4.5"><td><span class="sw" style="background:var(--am-accent-tint);color:var(--am-accent);border-color:var(--am-edge)">Aa</span></td><td><code>accent</code> on <code>accent-tint</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">6.37</td><td class="num">6.28</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="live" data-bg="surface" data-need="4.5"><td><span class="sw" style="background:var(--am-surface);color:var(--am-live);border-color:var(--am-edge)">Aa</span></td><td><code>live</code> on <code>surface</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">6.29</td><td class="num">8.48</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="live" data-bg="paper" data-need="4.5"><td><span class="sw" style="background:var(--am-paper);color:var(--am-live);border-color:var(--am-edge)">Aa</span></td><td><code>live</code> on <code>paper</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.79</td><td class="num">9.14</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="live" data-bg="plate" data-need="4.5"><td><span class="sw" style="background:var(--am-plate);color:var(--am-live);border-color:var(--am-edge)">Aa</span></td><td><code>live</code> on <code>plate</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.37</td><td class="num">7.71</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="live" data-bg="live-tint" data-need="4.5"><td><span class="sw" style="background:var(--am-live-tint);color:var(--am-live);border-color:var(--am-edge)">Aa</span></td><td><code>live</code> on <code>live-tint</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.38</td><td class="num">6.80</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="ok" data-bg="surface" data-need="4.5"><td><span class="sw" style="background:var(--am-surface);color:var(--am-ok);border-color:var(--am-edge)">Aa</span></td><td><code>ok</code> on <code>surface</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">6.05</td><td class="num">8.69</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="ok" data-bg="paper" data-need="4.5"><td><span class="sw" style="background:var(--am-paper);color:var(--am-ok);border-color:var(--am-edge)">Aa</span></td><td><code>ok</code> on <code>paper</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.58</td><td class="num">9.37</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="ok" data-bg="plate" data-need="4.5"><td><span class="sw" style="background:var(--am-plate);color:var(--am-ok);border-color:var(--am-edge)">Aa</span></td><td><code>ok</code> on <code>plate</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.17</td><td class="num">7.90</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="ok" data-bg="ok-tint" data-need="4.5"><td><span class="sw" style="background:var(--am-ok-tint);color:var(--am-ok);border-color:var(--am-edge)">Aa</span></td><td><code>ok</code> on <code>ok-tint</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.20</td><td class="num">7.09</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="warn" data-bg="surface" data-need="4.5"><td><span class="sw" style="background:var(--am-surface);color:var(--am-warn);border-color:var(--am-edge)">Aa</span></td><td><code>warn</code> on <code>surface</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">6.01</td><td class="num">9.80</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="warn" data-bg="paper" data-need="4.5"><td><span class="sw" style="background:var(--am-paper);color:var(--am-warn);border-color:var(--am-edge)">Aa</span></td><td><code>warn</code> on <code>paper</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.54</td><td class="num">10.56</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="warn" data-bg="plate" data-need="4.5"><td><span class="sw" style="background:var(--am-plate);color:var(--am-warn);border-color:var(--am-edge)">Aa</span></td><td><code>warn</code> on <code>plate</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.13</td><td class="num">8.91</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="warn" data-bg="warn-tint" data-need="4.5"><td><span class="sw" style="background:var(--am-warn-tint);color:var(--am-warn);border-color:var(--am-edge)">Aa</span></td><td><code>warn</code> on <code>warn-tint</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.31</td><td class="num">8.00</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="await" data-bg="surface" data-need="4.5"><td><span class="sw" style="background:var(--am-surface);color:var(--am-await);border-color:var(--am-edge)">Aa</span></td><td><code>await</code> on <code>surface</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">7.59</td><td class="num">7.71</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="await" data-bg="paper" data-need="4.5"><td><span class="sw" style="background:var(--am-paper);color:var(--am-await);border-color:var(--am-edge)">Aa</span></td><td><code>await</code> on <code>paper</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">7.00</td><td class="num">8.31</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="await" data-bg="plate" data-need="4.5"><td><span class="sw" style="background:var(--am-plate);color:var(--am-await);border-color:var(--am-edge)">Aa</span></td><td><code>await</code> on <code>plate</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">6.48</td><td class="num">7.00</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="await" data-bg="await-tint" data-need="4.5"><td><span class="sw" style="background:var(--am-await-tint);color:var(--am-await);border-color:var(--am-edge)">Aa</span></td><td><code>await</code> on <code>await-tint</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">6.38</td><td class="num">6.80</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="fail" data-bg="surface" data-need="4.5"><td><span class="sw" style="background:var(--am-surface);color:var(--am-fail);border-color:var(--am-edge)">Aa</span></td><td><code>fail</code> on <code>surface</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">6.13</td><td class="num">7.07</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="fail" data-bg="paper" data-need="4.5"><td><span class="sw" style="background:var(--am-paper);color:var(--am-fail);border-color:var(--am-edge)">Aa</span></td><td><code>fail</code> on <code>paper</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.64</td><td class="num">7.62</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="fail" data-bg="plate" data-need="4.5"><td><span class="sw" style="background:var(--am-plate);color:var(--am-fail);border-color:var(--am-edge)">Aa</span></td><td><code>fail</code> on <code>plate</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.23</td><td class="num">6.42</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="fail" data-bg="fail-tint" data-need="4.5"><td><span class="sw" style="background:var(--am-fail-tint);color:var(--am-fail);border-color:var(--am-edge)">Aa</span></td><td><code>fail</code> on <code>fail-tint</code></td><td>chip word, link or status text</td><td class="num">4.5</td><td class="num">5.21</td><td class="num">6.20</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="on-accent" data-bg="accent" data-need="4.5"><td><span class="sw" style="background:var(--am-accent);color:var(--am-on-accent);border-color:var(--am-edge)">Aa</span></td><td><code>on-accent</code> on <code>accent</code></td><td>primary button label</td><td class="num">4.5</td><td class="num">7.50</td><td class="num">8.12</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="ink" data-bg="accent-tint" data-need="4.5"><td><span class="sw" style="background:var(--am-accent-tint);color:var(--am-ink);border-color:var(--am-edge)">Aa</span></td><td><code>ink</code> on <code>accent-tint</code></td><td>selected row</td><td class="num">4.5</td><td class="num">14.87</td><td class="num">12.47</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="ink" data-bg="mark" data-need="4.5"><td><span class="sw" style="background:var(--am-mark);color:var(--am-ink);border-color:var(--am-edge)">Aa</span></td><td><code>ink</code> on <code>mark</code></td><td>search match</td><td class="num">4.5</td><td class="num">12.71</td><td class="num">8.50</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="body" data-bg="mark" data-need="4.5"><td><span class="sw" style="background:var(--am-mark);color:var(--am-body);border-color:var(--am-edge)">Aa</span></td><td><code>body</code> on <code>mark</code></td><td>search match in a summary</td><td class="num">4.5</td><td class="num">8.92</td><td class="num">6.10</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="edge" data-bg="surface" data-need="3"><td><span class="sw" style="background:var(--am-surface);color:var(--am-edge);border-color:var(--am-edge)">Aa</span></td><td><code>edge</code> on <code>surface</code></td><td>control boundary</td><td class="num">3</td><td class="num">3.91</td><td class="num">3.72</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="accent" data-bg="surface" data-need="3"><td><span class="sw" style="background:var(--am-surface);color:var(--am-accent);border-color:var(--am-edge)">Aa</span></td><td><code>accent</code> on <code>surface</code></td><td>focus ring</td><td class="num">3</td><td class="num">7.50</td><td class="num">7.76</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="edge" data-bg="paper" data-need="3"><td><span class="sw" style="background:var(--am-paper);color:var(--am-edge);border-color:var(--am-edge)">Aa</span></td><td><code>edge</code> on <code>paper</code></td><td>control boundary</td><td class="num">3</td><td class="num">3.61</td><td class="num">4.01</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="accent" data-bg="paper" data-need="3"><td><span class="sw" style="background:var(--am-paper);color:var(--am-accent);border-color:var(--am-edge)">Aa</span></td><td><code>accent</code> on <code>paper</code></td><td>focus ring</td><td class="num">3</td><td class="num">6.91</td><td class="num">8.37</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="edge" data-bg="plate" data-need="3"><td><span class="sw" style="background:var(--am-plate);color:var(--am-edge);border-color:var(--am-edge)">Aa</span></td><td><code>edge</code> on <code>plate</code></td><td>control boundary</td><td class="num">3</td><td class="num">3.34</td><td class="num">3.38</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="accent" data-bg="plate" data-need="3"><td><span class="sw" style="background:var(--am-plate);color:var(--am-accent);border-color:var(--am-edge)">Aa</span></td><td><code>accent</code> on <code>plate</code></td><td>focus ring</td><td class="num">3</td><td class="num">6.40</td><td class="num">7.05</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="term-fg" data-bg="term-bg" data-need="4.5"><td><span class="sw" style="background:var(--am-term-bg);color:var(--am-term-fg);border-color:var(--am-edge)">Aa</span></td><td><code>term-fg</code> on <code>term-bg</code></td><td>terminal text</td><td class="num">4.5</td><td class="num">15.02</td><td class="num">14.30</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="term-fg" data-bg="term-selection" data-need="4.5"><td><span class="sw" style="background:var(--am-term-selection);color:var(--am-term-fg);border-color:var(--am-edge)">Aa</span></td><td><code>term-fg</code> on <code>term-selection</code></td><td>selected terminal text</td><td class="num">4.5</td><td class="num">11.07</td><td class="num">8.55</td><td class="num" data-live>&ndash;</td></tr>
+<tr data-fg="term-cursor" data-bg="term-bg" data-need="3"><td><span class="sw" style="background:var(--am-term-bg);color:var(--am-term-cursor);border-color:var(--am-edge)">Aa</span></td><td><code>term-cursor</code> on <code>term-bg</code></td><td>cursor</td><td class="num">3</td><td class="num">7.16</td><td class="num">8.22</td><td class="num" data-live>&ndash;</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>What the pages fail today</h3>
+  <p>The same check against the colours in today's <code>index.html</code>, <code>session.html</code> and <code>reader.html</code>. These are what the redesign fixes by applying the tokens; nothing else about the pages needs to change for them.</p>
+  <div class="bk-tbl">
+    <table class="bk-spec">
+      <thead><tr><th>Pair today</th><th>Where</th><th class="num">Ratio</th><th class="num">Needs</th><th>Token that replaces it</th></tr></thead>
+      <tbody>
+        <tr><td>White on <code>#6fb2ff</code></td><td>Start button and reader Load, dark</td><td class="num">2.21</td><td class="num">4.5</td><td><code>on-accent</code> on <code>accent</code>, 8.12</td></tr>
+        <tr><td><code>#c0392b</code> on <code>#1d2027</code></td><td>Reader error status, dark</td><td class="num">3.00</td><td class="num">4.5</td><td><code>fail</code> on <code>surface</code>, 7.07</td></tr>
+        <tr><td><code>#dddddd</code> on <code>#ffffff</code></td><td>Every input and select border, light</td><td class="num">1.36</td><td class="num">3</td><td><code>edge</code> on <code>surface</code>, 3.91</td></tr>
+        <tr><td><code>#333333</code> on <code>#1c1f26</code></td><td>Every input and select border, dark</td><td class="num">1.31</td><td class="num">3</td><td><code>edge</code> on <code>surface</code>, 3.72</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="neutrals">
+  <h2><span class="bk-num">03</span>Neutrals and surfaces</h2>
+  <p class="bk-dek">Greys biased toward violet, three surface levels, and no shadows. Elevation is a contrast cost a reading tool cannot spare, and borders say the same thing for free.</p>
+
+  <div class="bk-levels">
+    <div style="background:var(--am-paper)"><div><b>Paper</b><code>--am-paper</code></div><div class="t-micro">The page. Behind everything.</div></div>
+    <div style="background:var(--am-surface);border-left:var(--am-line) solid var(--am-rule)"><div><b>Surface</b><code>--am-surface</code></div><div class="t-micro">Rows, panels, the reading pane, controls.</div></div>
+    <div style="background:var(--am-plate);border-left:var(--am-line) solid var(--am-rule)"><div><b>Plate</b><code>--am-plate</code></div><div class="t-micro">Bars, table heads, code, the command preview: things set into a surface.</div></div>
+  </div>
+
+  <div class="bk-grid2" style="margin-top:1.25rem">
+    <div class="bk-plate bk-plate--surface" style="margin:0">
+      <div class="bk-plate-head"><b>Three inks</b><span>on surface</span></div>
+      <div class="bk-inks">
+        <span style="color:var(--am-ink);font-weight:600">Ink: titles, values, anything you came to read</span>
+        <span style="color:var(--am-body)">Body: running text and secondary values</span>
+        <span style="color:var(--am-muted)">Muted: hints, keys on the strip, times</span>
+      </div>
+    </div>
+    <div class="bk-plate bk-plate--surface" style="margin:0">
+      <div class="bk-plate-head"><b>Three lines</b><span>only one of them identifies a control</span></div>
+      <div class="bk-inks">
+        <span style="border-bottom:1px solid var(--am-rule-soft);padding-bottom:.35rem">Rule soft: between rows</span>
+        <span style="border-bottom:1px solid var(--am-rule);padding-bottom:.35rem">Rule: structural edges, panels</span>
+        <span style="border:1px solid var(--am-edge);padding:.3rem .5rem;border-radius:var(--am-radius-sm)">Edge: inputs, secondary buttons, the frame. 3:1 or better</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="bk-note">
+    <strong>The edge is the one addition to BAT's neutrals.</strong> A field whose border is a
+    decorative rule fails WCAG 1.4.11: at 1.36:1, today's input border in the light theme is
+    invisible to a reader with low contrast sensitivity, and the only thing that says
+    <em>you can type here</em>. <code>--am-edge</code> passes 3:1 on all three surfaces in both
+    themes, and more contrast turns every rule into it.
+  </div>
+</section>
+
+<section id="terminal">
+  <h2><span class="bk-num">04</span>The terminal</h2>
+  <p class="bk-dek">The terminal is a surface of its own, not a widget on a page: a well with its own ground, sixteen colours that are the page's six hues and their neighbours, and a theme that follows the page's.</p>
+
+  <div class="bk-themes-side">
+<pre class="am-term bk-term-light" aria-label="Terminal specimen, light"><span class="k8">amem: confined, no network</span>
+<span class="k0">black</span>  <span class="k1">red</span>  <span class="k2">green</span>  <span class="k3">yellow</span>
+<span class="k4">blue</span>  <span class="k5">magenta</span>  <span class="k6">cyan</span>  <span class="k7">white</span>
+<span class="k8">bright black</span>  <span class="k9">bright red</span>
+<span class="k10">bright green</span>  <span class="k11">bright yellow</span>
+<span class="k12">bright blue</span>  <span class="k13">bright magenta</span>
+<span class="k14">bright cyan</span>  <span class="k15">bright white</span>
+
+<span class="k2">&#9679;</span> <span class="b">read_entry</span>(<span class="k4 lnk">mem-dm-7k2q9x4b</span>)
+<span class="sel">selected text</span> and the cursor<span class="cur"> </span></pre>
+<pre class="am-term bk-term-dark" aria-label="Terminal specimen, dark"><span class="k8">amem: confined, no network</span>
+<span class="k0">black</span>  <span class="k1">red</span>  <span class="k2">green</span>  <span class="k3">yellow</span>
+<span class="k4">blue</span>  <span class="k5">magenta</span>  <span class="k6">cyan</span>  <span class="k7">white</span>
+<span class="k8">bright black</span>  <span class="k9">bright red</span>
+<span class="k10">bright green</span>  <span class="k11">bright yellow</span>
+<span class="k12">bright blue</span>  <span class="k13">bright magenta</span>
+<span class="k14">bright cyan</span>  <span class="k15">bright white</span>
+
+<span class="k2">&#9679;</span> <span class="b">read_entry</span>(<span class="k4 lnk">mem-dm-7k2q9x4b</span>)
+<span class="sel">selected text</span> and the cursor<span class="cur"> </span></pre>
+  </div>
+  <p class="t-micro" style="margin-top:.5rem">Both palettes at once, whatever the page's theme. In the product the terminal shows the one that matches the page.</p>
+
+  <h3>The sixteen, measured</h3>
+  <p>Every colour against the terminal's own ground. A harness written for a dark terminal prints white text and expects it read, so in the light theme white and bright white are greys that pass 4.5:1 rather than near-whites that vanish. In the dark theme black stays a ground colour, which is what programs use it for.</p>
+  <div class="bk-tbl">
+    <table class="bk-spec">
+      <thead><tr><th>ANSI</th><th>Light</th><th class="num">on #faf9fd</th><th>Dark</th><th class="num">on #14131c</th></tr></thead>
+      <tbody>
+<tr><td><code>black</code></td><td><span class="sw sw--term-l" style="color:#24212f">Aa</span> <code class="hex">#24212f</code></td><td class="num">15.02</td><td><span class="sw sw--term-d" style="color:#2d2a39">Aa</span> <code class="hex">#2d2a39</code></td><td class="num">1.32 <span class="t-micro">ground</span></td></tr>
+<tr><td><code>bright-black</code></td><td><span class="sw sw--term-l" style="color:#65617a">Aa</span> <code class="hex">#65617a</code></td><td class="num">5.65</td><td><span class="sw sw--term-d" style="color:#8f8aa3">Aa</span> <code class="hex">#8f8aa3</code></td><td class="num">5.56</td></tr>
+<tr><td><code>red</code></td><td><span class="sw sw--term-l" style="color:#bd222b">Aa</span> <code class="hex">#bd222b</code></td><td class="num">5.84</td><td><span class="sw sw--term-d" style="color:#ff7d86">Aa</span> <code class="hex">#ff7d86</code></td><td class="num">7.48</td></tr>
+<tr><td><code>bright-red</code></td><td><span class="sw sw--term-l" style="color:#a3141d">Aa</span> <code class="hex">#a3141d</code></td><td class="num">7.49</td><td><span class="sw sw--term-d" style="color:#ffa3aa">Aa</span> <code class="hex">#ffa3aa</code></td><td class="num">9.71</td></tr>
+<tr><td><code>green</code></td><td><span class="sw sw--term-l" style="color:#1a704d">Aa</span> <code class="hex">#1a704d</code></td><td class="num">5.78</td><td><span class="sw sw--term-d" style="color:#5fcb9a">Aa</span> <code class="hex">#5fcb9a</code></td><td class="num">9.21</td></tr>
+<tr><td><code>bright-green</code></td><td><span class="sw sw--term-l" style="color:#0f5d3d">Aa</span> <code class="hex">#0f5d3d</code></td><td class="num">7.55</td><td><span class="sw sw--term-d" style="color:#8ee0b8">Aa</span> <code class="hex">#8ee0b8</code></td><td class="num">11.85</td></tr>
+<tr><td><code>yellow</code></td><td><span class="sw sw--term-l" style="color:#875a00">Aa</span> <code class="hex">#875a00</code></td><td class="num">5.74</td><td><span class="sw sw--term-d" style="color:#e8bd52">Aa</span> <code class="hex">#e8bd52</code></td><td class="num">10.38</td></tr>
+<tr><td><code>bright-yellow</code></td><td><span class="sw sw--term-l" style="color:#6e4800">Aa</span> <code class="hex">#6e4800</code></td><td class="num">7.74</td><td><span class="sw sw--term-d" style="color:#f6d685">Aa</span> <code class="hex">#f6d685</code></td><td class="num">13.05</td></tr>
+<tr><td><code>blue</code></td><td><span class="sw sw--term-l" style="color:#4a3fc4">Aa</span> <code class="hex">#4a3fc4</code></td><td class="num">7.16</td><td><span class="sw sw--term-d" style="color:#a9a3ff">Aa</span> <code class="hex">#a9a3ff</code></td><td class="num">8.22</td></tr>
+<tr><td><code>bright-blue</code></td><td><span class="sw sw--term-l" style="color:#352a9e">Aa</span> <code class="hex">#352a9e</code></td><td class="num">10.14</td><td><span class="sw sw--term-d" style="color:#c9c5ff">Aa</span> <code class="hex">#c9c5ff</code></td><td class="num">11.33</td></tr>
+<tr><td><code>magenta</code></td><td><span class="sw sw--term-l" style="color:#8d2a7e">Aa</span> <code class="hex">#8d2a7e</code></td><td class="num">7.25</td><td><span class="sw sw--term-d" style="color:#e590d7">Aa</span> <code class="hex">#e590d7</code></td><td class="num">8.16</td></tr>
+<tr><td><code>bright-magenta</code></td><td><span class="sw sw--term-l" style="color:#73196a">Aa</span> <code class="hex">#73196a</code></td><td class="num">9.65</td><td><span class="sw sw--term-d" style="color:#f3b6ea">Aa</span> <code class="hex">#f3b6ea</code></td><td class="num">11.14</td></tr>
+<tr><td><code>cyan</code></td><td><span class="sw sw--term-l" style="color:#09697f">Aa</span> <code class="hex">#09697f</code></td><td class="num">6.00</td><td><span class="sw sw--term-d" style="color:#4cc4dc">Aa</span> <code class="hex">#4cc4dc</code></td><td class="num">8.98</td></tr>
+<tr><td><code>bright-cyan</code></td><td><span class="sw sw--term-l" style="color:#015466">Aa</span> <code class="hex">#015466</code></td><td class="num">8.14</td><td><span class="sw sw--term-d" style="color:#86dcec">Aa</span> <code class="hex">#86dcec</code></td><td class="num">11.81</td></tr>
+<tr><td><code>white</code></td><td><span class="sw sw--term-l" style="color:#57536a">Aa</span> <code class="hex">#57536a</code></td><td class="num">7.03</td><td><span class="sw sw--term-d" style="color:#d0ccdc">Aa</span> <code class="hex">#d0ccdc</code></td><td class="num">11.72</td></tr>
+<tr><td><code>bright-white</code></td><td><span class="sw sw--term-l" style="color:#706c84">Aa</span> <code class="hex">#706c84</code></td><td class="num">4.81</td><td><span class="sw sw--term-d" style="color:#ffffff">Aa</span> <code class="hex">#ffffff</code></td><td class="num">18.43</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Rules</h3>
+  <ul>
+    <li><strong>The six normal colours are the six hues</strong>, value for value. Bright variants
+      are their lighter neighbours in dark and darker neighbours in light, so bright stays
+      legible on both grounds.</li>
+    <li><strong>The terminal follows the page's theme.</strong> A dark terminal in a light page is
+      a hole in it; a light one is designed here rather than left to the harness.</li>
+    <li><strong><code>minimumContrastRatio: 4.5</code></strong> on the xterm instance. Harnesses also
+      print 24-bit colours nobody here chose; xterm lifts any of them that would fall under the
+      floor against the ground in force.</li>
+    <li><strong>Selection is a tint of the accent</strong>, and text on it keeps 4.5:1. The cursor is
+      the accent, a block, steady: it blinks only if the reader's motion preference allows it.</li>
+    <li><strong>A <code>mem-</code> id is a link</strong>, underlined on hover as xterm draws links, and
+      opens in the reading pane.</li>
+    <li><strong>Mono at 14&nbsp;px, line height 1.2.</strong> The terminal is the one place mono is
+      set larger than data, because it is read for minutes at a time.</li>
+  </ul>
+
+  <h3>How a page reads it</h3>
+  <p>The tokens are the only source. The page builds xterm's theme from them, and builds it again when the theme changes.</p>
+  <div class="bk-plate bk-plate--surface">
+<pre class="t-data" style="margin:0;white-space:pre-wrap">const css = getComputedStyle(document.documentElement);
+const t = (n) =&gt; css.getPropertyValue(`--am-term-${n}`).trim();
+const names = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+const theme = {
+  background: t('bg'), foreground: t('fg'),
+  cursor: t('cursor'), cursorAccent: t('cursor-accent'), selectionBackground: t('selection'),
+  ...Object.fromEntries(names.map((n) =&gt; [n, t(n)])),
+  ...Object.fromEntries(names.map((n) =&gt; ['bright' + n[0].toUpperCase() + n.slice(1), t('bright-' + n)])),
+};
+term.options.theme = theme;               // and again on a theme change
+term.options.minimumContrastRatio = 4.5;</pre>
+  </div>
+  <p>Mermaid, in the reading pane, takes the same route: its <code>base</code> theme with <code>primaryColor</code> from <code>--am-surface</code>, <code>primaryBorderColor</code> from <code>--am-edge</code>, <code>primaryTextColor</code> and <code>lineColor</code> from <code>--am-ink</code> and <code>--am-muted</code>, and <code>fontFamily</code> from <code>--am-font-sans</code>. No white box behind a diagram in the dark theme, which is what <code>theme: 'neutral'</code> on a forced white ground does today.</p>
+</section>
+
+<section id="type">
+  <h2><span class="bk-num">05</span>Type</h2>
+  <p class="bk-dek">One family and its mono sibling, chosen for the characters this product cannot afford to confuse. Nine roles; a size that fits none of them is a role chosen wrongly.</p>
+
+  <h3>The faces</h3>
+  <p>
+    <strong>Atkinson Hyperlegible Next</strong> for everything read, and <strong>Atkinson
+    Hyperlegible Mono</strong> for everything whose exact characters matter. Both are by the Braille
+    Institute, released in 2025 under the SIL Open Font License 1.1, and both are variable, so two
+    woff2 files cover every weight. They are designed so that a reader with low vision can tell
+    letterforms apart, which is the same problem as telling apart the characters of an id or a
+    digest: <span class="t-data">l</span>, <span class="t-data">1</span> and <span class="t-data">I</span>;
+    <span class="t-data">0</span> and <span class="t-data">O</span>; <span class="t-data">5</span> and
+    <span class="t-data">S</span>; <span class="t-data">8</span> and <span class="t-data">B</span>.
+  </p>
+  <div class="bk-plate bk-plate--surface">
+    <div class="bk-plate-head"><b>The characters that matter</b><span>set in whatever this browser has</span></div>
+    <div class="bk-glyphs">mem-dm-0lI1O8B5 &nbsp; task-dm-3k9x2m1q &nbsp; sha256:9f0e1a7c&hellip;</div>
+  </div>
+  <p>
+    They are not fetched. Until the binary embeds the two woff2 files, and wherever they fail to
+    load, the stacks after them are the design: <code>system-ui</code> and its platform names for
+    the sans, <code>ui-monospace</code>, Cascadia Mono, SF Mono, Menlo, Consolas and DejaVu Sans
+    Mono for the mono. Every size, weight and measure in this book was checked in the fallback,
+    because that is what this page renders in until then.
+  </p>
+
+  <h3>Roles</h3>
+  <div class="bk-plate bk-plate--surface">
+    <div class="bk-type-row"><div class="bk-type-k">Title<span>sans 700 / 1.75rem / 1.2</span></div><div class="t-title">Sessions</div></div>
+    <div class="bk-type-row"><div class="bk-type-k">Section<span>sans 600 / 1.25rem</span></div><div class="t-section">Leases expire at a fixed horizon</div></div>
+    <div class="bk-type-row"><div class="bk-type-k">Subsection<span>sans 600 / 1rem</span></div><div class="t-sub">Harnesses</div></div>
+    <div class="bk-type-row"><div class="bk-type-k">Body<span>sans 400 / 1rem / 1.6</span></div><div class="t-body">A holder that cannot renew loses the task at expiry, and its heartbeat, release and complete are refused after that.</div></div>
+    <div class="bk-type-row"><div class="bk-type-k">UI<span>sans 400 / 0.875rem / 1.45</span></div><div class="t-ui">6 models at llmao; pick one or type a name</div></div>
+    <div class="bk-type-row"><div class="bk-type-k">Label<span>sans 600 / 0.8125rem</span></div><div class="t-label">Destination</div></div>
+    <div class="bk-type-row"><div class="bk-type-k">Data<span>mono 400 / 0.8125rem</span></div><div class="t-data">amem launch --harness claude --auth gateway</div></div>
+    <div class="bk-type-row"><div class="bk-type-k">Micro<span>sans 400 / 0.75rem</span></div><div class="t-micro">started 14:02:11Z, running for 6 min</div></div>
+    <div class="bk-type-row"><div class="bk-type-k">Terminal<span>mono 400 / 0.875rem / 1.2</span></div><div><span class="t-term">&gt; Summarise what the record says about leases.</span></div></div>
+  </div>
+
+  <h3>Rules</h3>
+  <ul>
+    <li><strong>Labels are sentence case and not tracked.</strong> Weight and position say
+      <em>label</em>; capitals would only say it louder.</li>
+    <li><strong>Mono only for exact characters</strong>: ids, commands, model names, digests,
+      paths, profile names. A label beside an id is sans.</li>
+    <li><strong>Entry bodies are prose</strong>, in Body at a 68&nbsp;ch measure. Code blocks inside
+      them are Data and scroll inside their own box; the pane never scrolls sideways.</li>
+    <li><strong>Every size is in rem</strong>, so the browser's text size reaches all of it,
+      including the terminal.</li>
+    <li><strong>Numbers that line up are tabular</strong>: usage, counts, times in a list.</li>
+    <li><strong>Two weights</strong>, 400 and 600, plus 700 for the title and a chip's count.</li>
+  </ul>
+</section>
+
+<section id="space">
+  <h2><span class="bk-num">06</span>Space</h2>
+  <p class="bk-dek">A 4&nbsp;px step, two radii, and one line width. Dense where it is read at speed, open where it is read slowly.</p>
+  <div class="bk-grid2">
+    <div class="bk-plate bk-plate--surface" style="margin:0">
+      <div class="bk-plate-head"><b>Steps</b><span><code>--am-space-*</code></span></div>
+      <div class="bk-steps">
+        <div class="bk-step"><span>1 &nbsp;4px</span><i style="width:4px"></i></div>
+        <div class="bk-step"><span>2 &nbsp;8px</span><i style="width:8px"></i></div>
+        <div class="bk-step"><span>3 &nbsp;12px</span><i style="width:12px"></i></div>
+        <div class="bk-step"><span>4 &nbsp;16px</span><i style="width:16px"></i></div>
+        <div class="bk-step"><span>6 &nbsp;24px</span><i style="width:24px"></i></div>
+        <div class="bk-step"><span>8 &nbsp;32px</span><i style="width:32px"></i></div>
+        <div class="bk-step"><span>12 48px</span><i style="width:48px"></i></div>
+        <div class="bk-step"><span>16 64px</span><i style="width:64px"></i></div>
+      </div>
+    </div>
+    <div>
+      <ul>
+        <li><strong>Rows</strong> 12/16: a session row, a doctor check, a reader hit.</li>
+        <li><strong>Panels</strong> 16 inside, 16 between.</li>
+        <li><strong>Sections</strong> 32 apart; a page's regions 48.</li>
+        <li><strong>Radius 4</strong> on controls, chips, the command preview. <strong>Radius 8</strong> on
+          panels, lists and the session frame. Nothing else, and no pills.</li>
+        <li><strong>Borders, not shadows.</strong> The one exception is a layer that genuinely
+          floats: a menu, the phone's reading sheet.</li>
+        <li><strong>Siblings are spaced with <code>gap</code></strong>, never with margins that
+          collapse or double.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="motion">
+  <h2><span class="bk-num">07</span>Motion</h2>
+  <p class="bk-dek">Motion explains where something went. It never decorates a state change, and it never runs unless the reader's preference allows it.</p>
+  <div class="bk-plate bk-plate--surface">
+    <div class="bk-ease"><span class="t-label">Instant, 0&nbsp;ms</span><div class="bk-ease-bar"><i style="width:100%"></i></div><span class="t-micro">state, data, selection</span></div>
+    <div class="bk-ease"><span class="t-label">Quick, 120&nbsp;ms</span><div class="bk-ease-bar"><i style="width:60%"></i></div><span class="t-micro">hover and press feedback</span></div>
+    <div class="bk-ease"><span class="t-label">Move, 200&nbsp;ms</span><div class="bk-ease-bar"><i style="width:38%"></i></div><span class="t-micro">disclosure, the phone's sheet</span></div>
+  </div>
+  <ul>
+    <li><strong>Data changes instantly.</strong> A session exiting, an entry arriving in the pane,
+      a count on the strip going up: the state is the message, and a transition only delays it.</li>
+    <li><strong>Nothing pulses.</strong> A running session's dot is still. In a list of five running
+      sessions, five pulsing dots are noise; the glyph already says live.</li>
+    <li><strong>The busy glyph turns</strong>, and only under <code>no-preference</code>. Under
+      reduced motion it stands still beside its word.</li>
+    <li><strong>Named properties only</strong>, never <code>transition: all</code>.</li>
+    <li><strong>The durations are tokens that are zero by default</strong> and take their values
+      inside <code>@media (prefers-reduced-motion: no-preference)</code>. A rule written against
+      them is already right for a reader who asked for stillness.</li>
+  </ul>
+</section>
+
+<section id="icons">
+  <h2><span class="bk-num">08</span>Iconography</h2>
+  <p class="bk-dek">Twenty-six glyphs, drawn for this product, inline SVG from one sprite. No icon font, nothing fetched. One glyph, one meaning.</p>
+  <h3>Drawing rules</h3>
+  <ul>
+    <li>16&times;16 grid, 1.5 stroke, round caps and joins. Fills only where the shape is solid by
+      nature: the running dot, the label bars, the trust disc.</li>
+    <li><code>currentColor</code> always, so a glyph takes its hue from where it sits.</li>
+    <li>12&nbsp;px in a chip, 16 in a gutter or inline, 15 in a button. No other sizes.</li>
+    <li><code>aria-hidden="true"</code> when a word is beside it; an accessible name on the control
+      when there is none.</li>
+  </ul>
+  <div class="bk-icons">
+    <div class="bk-icon"><span class="am-state--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-running"/></svg></span><span><b>running</b>a process, live</span></div>
+    <div class="bk-icon"><span class="am-state--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-connecting"/></svg></span><span><b>connecting</b>being established</span></div>
+    <div class="bk-icon"><span class="am-state--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-lease"/></svg></span><span><b>lease</b>a task claimed</span></div>
+    <div class="bk-icon"><span class="am-state--ok"><svg class="am-glyph" aria-hidden="true"><use href="#i-done"/></svg></span><span><b>done</b>finished as asked</span></div>
+    <div class="bk-icon"><span class="am-state--ok"><svg class="am-glyph" aria-hidden="true"><use href="#i-ok"/></svg></span><span><b>ok</b>checked and good</span></div>
+    <div class="bk-icon"><span class="am-state--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-warn"/></svg></span><span><b>warn</b>works, but look</span></div>
+    <div class="bk-icon"><span class="am-state--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg></span><span><b>ceiling</b>at the ceiling</span></div>
+    <div class="bk-icon"><span class="am-state--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-admit"/></svg></span><span><b>admit</b>a task to admit</span></div>
+    <div class="bk-icon"><span class="am-state--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg></span><span><b>handoff</b>a handoff to read</span></div>
+    <div class="bk-icon"><span class="am-state--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg></span><span><b>fail</b>did not happen</span></div>
+    <div class="bk-icon"><span class="am-state--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-refused"/></svg></span><span><b>refused</b>over a ceiling</span></div>
+    <div class="bk-icon"><span class="am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-absent"/></svg></span><span><b>absent</b>not configured</span></div>
+    <div class="bk-icon"><span class="am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-queued"/></svg></span><span><b>queued</b>admitted, no holder</span></div>
+    <div class="bk-icon"><span class="am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-invalid"/></svg></span><span><b>invalid</b>closed, not done</span></div>
+    <div class="bk-icon"><span class="am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-superseded"/></svg></span><span><b>superseded</b>replaced by another</span></div>
+    <div class="bk-icon"><span class="am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-demoted"/></svg></span><span><b>demoted</b>moved behind a tombstone</span></div>
+    <div class="bk-icon"><span class="am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-erased"/></svg></span><span><b>erased</b>the body is gone</span></div>
+    <div class="bk-icon"><span><svg class="am-glyph" aria-hidden="true"><use href="#i-label-0"/></svg></span><span><b>label</b>public, one bar of three</span></div>
+    <div class="bk-icon"><span><svg class="am-glyph" aria-hidden="true"><use href="#i-label-2"/></svg></span><span><b>label</b>restricted, three of three</span></div>
+    <div class="bk-icon"><span><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-1"/></svg></span><span><b>trust</b>curated, half of the disc</span></div>
+    <div class="bk-icon"><span><svg class="am-glyph" aria-hidden="true"><use href="#i-entry"/></svg></span><span><b>entry</b>an entry on the record</span></div>
+    <div class="bk-icon"><span><svg class="am-glyph" aria-hidden="true"><use href="#i-terminal"/></svg></span><span><b>terminal</b>the session's terminal</span></div>
+    <div class="bk-icon"><span><svg class="am-glyph" aria-hidden="true"><use href="#i-search"/></svg></span><span><b>search</b>search the record</span></div>
+    <div class="bk-icon"><span><svg class="am-glyph" aria-hidden="true"><use href="#i-copy"/></svg></span><span><b>copy</b>copy a command or id</span></div>
+    <div class="bk-icon"><span><svg class="am-glyph" aria-hidden="true"><use href="#i-start"/></svg></span><span><b>start</b>start a session</span></div>
+    <div class="bk-icon"><span style="color:var(--am-accent)"><svg class="am-glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-mark"/></svg></span><span><b>the mark</b>the box holding the record</span></div>
+  </div>
+</section>
+
+<div class="bk-part"><b>Language</b><span>The recurring things the pages say, and the one way each is said.</span></div>
+
+<section id="chip">
+  <h2><span class="bk-num">09</span>The chip</h2>
+  <p class="bk-dek">One component carries every exceptional state: glyph, then count, then word. This is its anatomy, its families, and the test a new one must pass.</p>
+  <div class="bk-plate bk-plate--surface">
+    <div class="bk-plate-head"><b>The full vocabulary</b><span>no further chip without a change to this book</span></div>
+    <div style="display:flex;gap:.4rem;flex-wrap:wrap">
+      <span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg><span class="am-chip-word">exited 1</span></span>
+      <span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-refused"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">refused</span></span>
+      <span class="am-chip am-chip--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg><span class="am-chip-word">at ceiling</span></span>
+      <span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-admit"/></svg><span class="am-chip-word">to admit</span></span>
+      <span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg><span class="am-chip-count">2</span><span class="am-chip-word">to read</span></span>
+      <span class="am-chip am-chip--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-running"/></svg><span class="am-chip-word">running</span></span>
+      <span class="am-chip am-chip--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-lease"/></svg><span class="am-chip-word">claimed</span></span>
+      <span class="am-chip am-chip--live am-chip--provisional"><svg class="am-glyph" aria-hidden="true"><use href="#i-connecting"/></svg><span class="am-chip-word">connecting</span></span>
+      <span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-invalid"/></svg><span class="am-chip-word">invalidated</span></span>
+      <span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-superseded"/></svg><span class="am-chip-word">superseded</span></span>
+      <span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-demoted"/></svg><span class="am-chip-word">demoted</span></span>
+      <span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-erased"/></svg><span class="am-chip-word">erased</span></span>
+    </div>
+  </div>
+
+  <h3>Anatomy</h3>
+  <ul>
+    <li><strong>Glyph</strong>, 12&nbsp;px, the carrier that survives everything else being taken away.</li>
+    <li><strong>Count</strong>, tabular and bold, only when there is more than a yes or no.</li>
+    <li><strong>Word</strong>, lower case because it reads as part of the row's sentence, and what
+      the accessible name says.</li>
+    <li><strong>Ground</strong>: the hue's tint, the hue as text, and an edge of the hue at 40%. In
+      more contrast the tint goes and the edge is the full hue.</li>
+  </ul>
+
+  <h3>Three families</h3>
+  <ul>
+    <li><strong>Tinted</strong>, in one of five state hues: the exceptions that may need you.</li>
+    <li><strong>Outlined ink</strong>: exceptions that are not alarms. An entry superseded, a task
+      invalidated. Nothing is wrong; it took a route most do not. The next state of this kind
+      joins them instead of taking a colour.</li>
+    <li><strong>Dashed</strong>: provisional. A connection not yet made. The dashed edge says
+      <em>not settled</em> without inventing a seventh hue, the device BAT uses for a change that
+      is yours and not yet committed.</li>
+  </ul>
+
+  <h3>Order, number, and the narrow screen</h3>
+  <ul>
+    <li><strong>A fixed order</strong>: fail, warn, await, live, ink. A column of chips is
+      scannable only if the same chip is always in the same place.</li>
+    <li><strong>At most three on a row</strong>; the rest are on the page the row opens.</li>
+    <li><strong>Never in a heading, never in a button</strong>, never the only content of a cell
+      whose header says the same thing.</li>
+    <li><strong>Below 480&nbsp;px chips in a row or on the strip clip their word</strong>, never removing it:
+      it stays in the accessible name and the tooltip, and the session page spells it out. In more
+      contrast the words come back at every width.</li>
+  </ul>
+  <div class="bk-plate bk-plate--surface">
+    <div class="bk-plate-head"><b>The same chips, wide and narrow</b><span>identical markup and accessible names</span></div>
+    <div style="display:grid;gap:.75rem">
+      <div style="display:flex;gap:.35rem;flex-wrap:wrap">
+        <span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-refused"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">refused</span></span>
+        <span class="am-chip am-chip--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg><span class="am-chip-word">at ceiling</span></span>
+        <span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg><span class="am-chip-count">2</span><span class="am-chip-word">to read</span></span>
+      </div>
+      <div class="is-narrow" style="display:flex;gap:.35rem;flex-wrap:wrap">
+        <span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-refused"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">refused</span></span>
+        <span class="am-chip am-chip--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg><span class="am-chip-word">at ceiling</span></span>
+        <span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg><span class="am-chip-count">2</span><span class="am-chip-word">to read</span></span>
+      </div>
+    </div>
+  </div>
+
+  <h3>Adding the next one</h3>
+  <p>
+    A state earns a chip only if it is <em>exceptional</em> (not true of most rows),
+    <em>actionable</em> (a reader would do something differently) and <em>not already implied</em>
+    by what the row says. Earning a chip is not earning a hue: a new exception that is not an alarm
+    joins the outlined ink family. A new hue is a change to the table in chapter 02, and to
+    the terminal's palette with it, which is why there will rarely be one.
+  </p>
+</section>
+
+<section id="facts">
+  <h2><span class="bk-num">10</span>Facts every entry carries</h2>
+  <p class="bk-dek">Label, trust, id, author, time. Each is rendered one way everywhere it appears: in the reading pane, a reader result, a session's recent list.</p>
+
+  <div class="bk-tbl">
+    <table class="bk-spec">
+      <thead><tr><th>Fact</th><th>Rendered</th><th>Rule</th></tr></thead>
+      <tbody>
+        <tr><td>Label</td><td><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-0"/></svg>public</span>&ensp;<span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-1"/></svg>internal</span>&ensp;<span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-2"/></svg>restricted</span></td><td>Mark and word, in ink, always both. The same mark draws a ceiling on the strip, because a ceiling is a label.</td></tr>
+        <tr><td>Trust tier</td><td><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-0"/></svg>raw</span>&ensp;<span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-1"/></svg>curated</span>&ensp;<span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-2"/></svg>verified</span></td><td>Mark and word. The paper asks for the tier to be visible on a raw entry; it is visible on every entry.</td></tr>
+        <tr><td>Id</td><td><span class="am-id">mem-dm-7k2q9x4b</span></td><td>Data type, never truncated: ids are short by design. Selectable whole; a copy button where it is the point of the row.</td></tr>
+        <tr><td>Digest</td><td><span class="am-id" title="sha256 9f0e1a7c4b2d...">9f0e1a7c4b2d</span></td><td>The first 12 hex characters, the whole in the title and in the copy. Never wrapped.</td></tr>
+        <tr><td>Type</td><td class="t-micro">decision</td><td>Micro, above the title, lower case as the record writes it. Not a chip: every entry has one.</td></tr>
+        <tr><td>Author</td><td class="t-ui">agent:claude <span class="t-micro">(model: qwen3.8-27b)</span></td><td>As the frontmatter says it. The model in muted type.</td></tr>
+        <tr><td>Time</td><td class="t-ui am-time">2026-10-04 14:02Z</td><td>Absolute, 24-hour, with the zone. Relative time only beside it, never instead.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="states">
+  <h2><span class="bk-num">11</span>States</h2>
+  <p class="bk-dek">Before a component is finished it answers every state below. Most interface bugs are a state nobody drew.</p>
+  <h3>A control's seven</h3>
+  <div class="bk-plate bk-plate--surface">
+    <div class="bk-matrix">
+      <div class="bk-mcell"><span>Default</span><button class="am-btn am-btn--secondary" type="button">Copy command</button></div>
+      <div class="bk-mcell"><span>Hover</span><button class="am-btn am-btn--secondary" type="button" style="background:var(--am-plate)">Copy command</button></div>
+      <div class="bk-mcell"><span>Focus</span><button class="am-btn am-btn--secondary" type="button" style="outline:var(--am-focus-width) solid var(--am-accent);outline-offset:2px">Copy command</button></div>
+      <div class="bk-mcell"><span>Active</span><button class="am-btn am-btn--secondary" type="button" style="background:var(--am-rule-soft);transform:translateY(1px)">Copy command</button></div>
+      <div class="bk-mcell"><span>Busy</span><button class="am-btn am-btn--secondary" type="button" aria-disabled="true" style="cursor:progress;background:var(--am-surface);color:var(--am-muted);border-color:var(--am-edge)"><span class="am-busy" style="color:inherit"><svg class="am-glyph" aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 1.8a6.2 6.2 0 1 0 6.2 6.2"/></svg>Starting</span></button></div>
+      <div class="bk-mcell"><span>Disabled, says why</span><button class="am-btn am-btn--primary" type="button" disabled>Start session</button><span class="t-micro" style="color:var(--am-body)">Choose a harness first</span></div>
+      <div class="bk-mcell"><span>Read-only</span><span class="t-ui am-mono" style="color:var(--am-ink)">gateway</span></div>
+    </div>
+  </div>
+  <ul>
+    <li><strong>Busy keeps its width and says what it is doing.</strong> &ldquo;Starting&rdquo;, not a
+      spinner in place of the label.</li>
+    <li><strong>Disabled always says why</strong>, beside the control. The Start button today goes
+      grey with &ldquo;there is no default harness&rdquo;; the rule keeps that and makes it the
+      pattern.</li>
+    <li><strong>Read-only is not disabled.</strong> A destination fixed by the auth mode is a value
+      you can read and copy, not a dead control.</li>
+  </ul>
+
+  <h3>A page's four</h3>
+  <div class="bk-grid2">
+    <div class="am-empty">
+      <b>No sessions yet</b>
+      <p>A session is a harness in the box. Start one with the form above, or run <code class="t-data">amem launch</code> in a terminal; it appears here either way.</p>
+    </div>
+    <div class="bk-plate bk-plate--surface" style="margin:0" aria-busy="true">
+      <div class="bk-plate-head"><b>Loading</b><span>after 200&nbsp;ms, never before</span></div>
+      <div style="display:grid;gap:.6rem">
+        <span class="am-busy"><svg class="am-glyph" aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 1.8a6.2 6.2 0 1 0 6.2 6.2"/></svg>Asking llmao for its models</span>
+        <span class="am-skel" style="width:70%"></span><span class="am-skel" style="width:45%"></span>
+      </div>
+    </div>
+    <div class="am-alert" role="alert">
+      <svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg>
+      <p><b>The bundle did not load.</b> <span class="am-mono">manifest.yaml</span> lists <span class="am-mono">mem-dm-p4n8w2c6.md</span>, and its digest does not match the file. The bundle has changed since it was exported.</p>
+      <div class="am-alert-act"><button class="am-btn am-btn--secondary" type="button">Load again</button></div>
+    </div>
+    <div class="am-alert" role="status">
+      <svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg>
+      <p><b>Cannot reach amem on this host.</b> The page tried for 30 seconds. The terminal above is what the session printed before the connection went; nothing has been lost from the session itself.</p>
+      <div class="am-alert-act"><button class="am-btn am-btn--secondary" type="button">Try again</button><span class="t-micro">Then check that <code class="t-data">amem web</code> is still running.</span></div>
+    </div>
+  </div>
+  <div class="bk-tbl">
+    <table class="bk-spec">
+      <thead><tr><th>State</th><th>Means</th><th>Says</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Empty, nothing yet</strong></td><td>The collection is genuinely empty</td><td>What would fill it and the action that does: &ldquo;No sessions yet. Start one with the form above.&rdquo;</td></tr>
+        <tr><td><strong>Empty, nothing matching</strong></td><td>A query or the handling bound excluded everything</td><td>Which, and the way out: &ldquo;Nothing matches <em>lease horizon</em> at internal or below. 3 restricted entries match; raise the handling to see them.&rdquo;</td></tr>
+        <tr><td><strong>Loading</strong></td><td>Work in flight over 200&nbsp;ms</td><td>What is being waited on, by name. Skeletons only where the shape is known: the session list and reader results.</td></tr>
+        <tr><td><strong>Error</strong></td><td>A region could not do its job</td><td>What failed, why if known, and the next step, in the region that failed. The rest of the page keeps working.</td></tr>
+        <tr><td><strong>Reconnecting</strong></td><td>The socket dropped; retrying</td><td>The connecting chip, dashed, in the bar. The terminal stays as it was. Input is held, not lost.</td></tr>
+        <tr><td><strong>Offline</strong></td><td>Retries ran out</td><td>The alert above. Fail hue, because the page cannot do the one thing it is for.</td></tr>
+        <tr><td><strong>Not paired</strong></td><td>Reserved. Today the web pages listen on loopback and pair with nothing</td><td>When a pairing step exists, this state names it and the command that completes it; until then it is not drawn.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="voice">
+  <h2><span class="bk-num">12</span>Voice</h2>
+  <p class="bk-dek">The repository's own prose style, carried into the interface: plain, concise, sentence case, and no exclamation marks.</p>
+  <ul>
+    <li><strong>Name things as the record and the ledger name them.</strong> Session, harness,
+      destination, ceiling, label, handling, entry, handoff, task, admit, claim. Not a friendlier
+      synonym, and not an implementation word.</li>
+    <li><strong>A control says what it does, and the result says it happened in the same
+      words.</strong> <em>Start session</em> lands on a page whose bar says <em>running</em>.
+      <em>Copy command</em> becomes <em>Copied</em>. Not <em>Success</em>.</li>
+    <li><strong>Sentence case everywhere</strong>, including labels and buttons.</li>
+    <li><strong>No exclamation marks, no apologies, no emoji.</strong> The repository forbids emoji
+      in commits and code; the interface is the same product.</li>
+    <li><strong>Counts as digits</strong>: <em>2 to read</em>, <em>12 calls</em>.</li>
+    <li><strong>An error names the operation, the cause, and the next step.</strong> It never
+      blames the reader.</li>
+  </ul>
+  <div class="bk-dd">
+    <div>
+      <span class="bk-dd-h do"><svg class="am-glyph" aria-hidden="true"><use href="#i-ok"/></svg>Write</span>
+      <span class="t-ui">The call to github was refused: this session has read internal entries and github accepts at most public. Start a fresh session for work that goes to github.</span>
+      <p>The operation, the rule it met, and what to do. It is the egress's own refusal, which already reads this way.</p>
+    </div>
+    <div>
+      <span class="bk-dd-h dont"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg>Not</span>
+      <span class="t-ui">Error: request failed (403)</span>
+      <p>True, and it leaves the reader with nowhere to go.</p>
+    </div>
+  </div>
+  <div class="bk-tbl">
+    <table class="bk-spec">
+      <thead><tr><th>Today says</th><th>Should say</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>none yet</code></td><td>No sessions yet. Start one with the form above, or run <code>amem launch</code>.</td><td>An empty state offers the action that fills it.</td></tr>
+        <tr><td><code>Start</code></td><td>Start session</td><td>A control names its object when the page has more than one thing to start.</td></tr>
+        <tr><td><code>choose&hellip;</code></td><td>Choose a harness</td><td>A placeholder is not a label, and an ellipsis is not a sentence.</td></tr>
+        <tr><td><code>the harness's own</code></td><td>The harness's own login</td><td>Says what is chosen.</td></tr>
+        <tr><td><code>exited 1 · 14:02:11Z</code></td><td>exited 1 after 3 min, started 14:02:11Z</td><td>How long it ran is the first thing a failed session's reader wants.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<div class="bk-part"><b>Components</b><span>What a page is assembled from. Each specimen is live markup on the tokens above.</span></div>
+
+<section id="widgets">
+  <h2><span class="bk-num">13</span>Widgets</h2>
+  <p class="bk-dek">Eight, and every page the web surface has or is about to have is a composition of them. A page that needs a ninth is a change to this book first.</p>
+
+  <h3>Launch form and command preview</h3>
+  <p>The form and the command are the same thing said twice. The preview is the command a reader would type for this session, so it is always visible, always copyable, and never coloured: hues are states, and a flag is not a state. Flags are muted and values are ink, which is enough to read it by.</p>
+  <div class="bk-plate bk-plate--surface">
+    <form class="am-launch" onsubmit="return false" aria-label="Start a session (specimen)">
+      <div class="am-field c3"><label for="sp-profile">Profile</label>
+        <select class="am-ctrl" id="sp-profile"><option>None, set it up here</option><option>nightly</option><option>review</option></select>
+        <span class="am-hint">From <span class="am-mono">profiles.toml</span>. Choosing one fills the form; anything you change is a flag on top.</span></div>
+      <div class="am-field c3"><label for="sp-harness">Harness</label>
+        <select class="am-ctrl" id="sp-harness"><option>claude</option><option>codex</option><option>gemini</option><option>antigravity</option><option>qwen</option><option>grok</option><option>muse</option><option>copilot</option><option>opencode</option></select></div>
+      <div class="am-field"><span class="am-legend" id="sp-auth-l">Auth</span>
+        <div class="am-seg" role="radiogroup" aria-labelledby="sp-auth-l">
+          <label><input type="radio" name="sp-auth" value="subscription"><span>Subscription</span></label>
+          <label><input type="radio" name="sp-auth" value="key"><span>Key</span></label>
+          <label><input type="radio" name="sp-auth" value="gateway" checked><span>Gateway</span></label>
+        </div></div>
+      <div class="am-field c3"><label for="sp-dest">Destination</label>
+        <select class="am-ctrl" id="sp-dest"><option>llmao</option></select>
+        <span class="am-hint">Ceiling <span class="am-fact" style="font-size:inherit"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-1"/></svg>internal</span> in <span class="am-mono">grants.toml</span>. The session reads nothing above it.</span></div>
+      <div class="am-field c3"><label for="sp-model">Model</label>
+        <input class="am-ctrl is-mono" id="sp-model" value="qwen3.8-27b" autocomplete="off">
+        <span class="am-hint">6 models at llmao; pick one or type a name</span></div>
+      <div class="am-field"><label for="sp-prompt">Prompt</label>
+        <textarea class="am-ctrl" id="sp-prompt" disabled placeholder="Load T0 and summarise it"></textarea>
+        <span class="am-hint">Not used while working the next task: the task is the prompt.</span></div>
+      <div class="am-launch-foot">
+        <label class="am-check"><input type="checkbox" checked> Work the next task from the ledger</label>
+        <span class="am-field" style="grid-auto-flow:column;align-items:center;gap:.6rem"><span class="am-legend" id="sp-sub-l">Subagents</span>
+          <span class="am-seg" role="radiogroup" aria-labelledby="sp-sub-l">
+            <label><input type="radio" name="sp-sub" value="harness"><span>Harness</span></label>
+            <label><input type="radio" name="sp-sub" value="board" checked><span>Board</span></label>
+          </span></span>
+      </div>
+      <div class="am-cmd">
+        <code><span class="p">$ </span>amem work <span class="f">--harness</span> claude <span class="f">--auth</span> gateway <span class="f">--provider</span> llmao <span class="f">--model</span> qwen3.8-27b</code>
+        <button class="am-btn am-btn--secondary" type="button" data-copy><svg class="am-glyph" aria-hidden="true"><use href="#i-copy"/></svg><span>Copy command</span></button>
+      </div>
+      <div class="am-launch-foot">
+        <button class="am-btn am-btn--primary" type="submit"><svg class="am-glyph" aria-hidden="true"><use href="#i-start"/></svg>Start session</button>
+        <span class="am-hint">Opens the session's page. It keeps running if you close it.</span>
+      </div>
+    </form>
+  </div>
+  <ul>
+    <li><strong>One primary on the page</strong>: Start session. Everything else is secondary or quiet.</li>
+    <li><strong>Auth is three segments, not a select</strong>: there are three, they change what
+      the destination can be, and all three should be seen at once.</li>
+    <li><strong>The destination says its ceiling</strong> as the hint, in the label mark. The ceiling
+      decides what the session can read, so it is shown before the session starts, not after.</li>
+    <li><strong>A disabled field says why</strong> in its hint, as the prompt does above.</li>
+    <li><strong>The subagents default goes unsaid.</strong> The preview shows a flag only when it
+      differs from what the command would do anyway, so the command stays the one a person would
+      type.</li>
+  </ul>
+
+  <h3>Session row and list</h3>
+  <p>Every session has a state, so the state is a glyph in the gutter. Only an exception takes a chip.</p>
+  <div class="am-list">
+    <a class="am-srow" href="#widgets">
+      <span class="am-state am-state--live"><svg class="am-glyph" aria-label="running" role="img"><use href="#i-running"/></svg></span>
+      <span class="am-srow-title">claude on qwen3.8-27b: next task</span>
+      <span class="am-srow-chips"><span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-refused"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">refused</span></span><span class="am-chip am-chip--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg><span class="am-chip-word">at ceiling</span></span></span>
+      <span class="am-srow-meta">llmao, running for 6 min, started <span class="am-time">14:02:11Z</span></span>
+    </a>
+    <a class="am-srow" href="#widgets">
+      <span class="am-state am-state--live"><svg class="am-glyph" aria-label="connecting" role="img"><use href="#i-connecting"/></svg></span>
+      <span class="am-srow-title">codex: load T0 and summarise it</span>
+      <span class="am-srow-chips"></span>
+      <span class="am-srow-meta">openai, connecting, started <span class="am-time">14:08:40Z</span></span>
+    </a>
+    <a class="am-srow" href="#widgets">
+      <span class="am-state am-state--fail"><svg class="am-glyph" aria-label="exited non-zero" role="img"><use href="#i-fail"/></svg></span>
+      <span class="am-srow-title">gemini on gemini-2.5-flash: review the open proposals</span>
+      <span class="am-srow-chips"><span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg><span class="am-chip-word">exited 1</span></span></span>
+      <span class="am-srow-meta">gemini, exited 1 after 3 min, started <span class="am-time">13:41:02Z</span></span>
+    </a>
+    <a class="am-srow" href="#widgets">
+      <span class="am-state am-state--ok"><svg class="am-glyph" aria-label="exited 0" role="img"><use href="#i-done"/></svg></span>
+      <span class="am-srow-title">claude: next task</span>
+      <span class="am-srow-chips"><span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">to read</span></span></span>
+      <span class="am-srow-meta">subscription, exited 0 after 22 min, started <span class="am-time">12:10:55Z</span></span>
+    </a>
+  </div>
+  <ul style="margin-top:1rem">
+    <li><strong>Newest first.</strong> The whole row is the link to the session's page.</li>
+    <li><strong>The title is the session's own</strong>, from <code>title_for</code>: harness, model
+      if named, and the prompt or &ldquo;next task&rdquo;.</li>
+    <li><strong>The meta line says destination, then state in words, then the start time</strong>,
+      with how long it ran, which is the first thing a failed session's reader wants.</li>
+  </ul>
+
+  <h3>Status strip</h3>
+  <p>The line between the box and the world, on the top edge of the session's frame. Five cells, always in this order, never hidden, never scrolled away. The values are facts; a cell takes a chip only when its value is an exception.</p>
+  <div class="am-frame">
+    <div class="am-strip">
+      <div class="am-strip-cell"><span class="am-strip-k">Destination</span><span class="am-strip-v">anthropic <span class="am-sub">key</span></span></div>
+      <div class="am-strip-cell am-strip-cell--ceiling"><span class="am-strip-k">Label and ceiling</span><span class="am-strip-v"><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-0"/></svg>public</span><span class="am-sub">of restricted</span></span></div>
+      <div class="am-strip-cell"><span class="am-strip-k">Usage so far</span><span class="am-strip-v">8.4k in, 912 out <span class="am-sub">3 calls</span></span></div>
+      <div class="am-strip-cell"><span class="am-strip-k">Entries mined</span><span class="am-strip-v">0</span></div>
+      <div class="am-strip-cell"><span class="am-strip-k">Handoffs waiting</span><span class="am-strip-v">0</span></div>
+    </div>
+  </div>
+  <p class="t-micro" style="margin-top:.5rem">A quiet session: every value a fact, no chip. Compare the hero, where the same strip carries three.</p>
+  <ul>
+    <li><strong>Label and ceiling share a cell</strong> because the ceiling is meaningful only beside
+      what the session has read. The label rises and never falls; the strip says so by showing
+      both.</li>
+    <li><strong>Usage counts tokens, not money.</strong> The egress reads tokens out of every
+      response; a price is a guess the strip does not make. There is no budget, so usage has no
+      state and no hue. A budget, when one exists, is a new state and goes through chapter 19's
+      third gate.</li>
+    <li><strong>Numbers abbreviate past 10,000</strong> (41.2k) and are exact in the title.</li>
+    <li><strong>Unknown is not zero.</strong> Where the egress cannot read usage from a response,
+      the cell says <em>not reported</em> rather than 0.</li>
+  </ul>
+
+  <h3>Terminal frame and reading pane</h3>
+  <p>The hero at the top of this book is the specimen. Its rules:</p>
+  <ul>
+    <li><strong>The terminal takes the larger share</strong>, 1.35 to 1, and the reading pane the
+      rest. Below 720&nbsp;px they become two tabs (chapter 17).</li>
+    <li><strong>The pane is the record</strong>, set as a document: type, title, the facts line,
+      then prose at the body measure. An entry the session writes opens there as it lands; a
+      <code>mem-</code> id clicked in the terminal opens there too.</li>
+    <li><strong>The pane's head says why this entry is open</strong>: <em>opened from the
+      terminal</em>, <em>written by this session</em>. The recent list under it marks the one
+      open.</li>
+    <li><strong>The frame is one object</strong>: bar, strip, well and pane share one edge and one
+      radius. The confinement is drawn: what is inside the edge is the session.</li>
+  </ul>
+
+  <h3>Doctor report</h3>
+  <p><code>amem doctor</code> says what this host can run before anything is launched. The page shows the same report the command prints, grouped as the command groups it. Every row has a verdict, so the verdict is the gutter. The rows below are illustrative: the command is coming.</p>
+  <div class="bk-plate bk-plate--surface">
+    <div class="am-doctor">
+      <div class="am-doctor-group">
+        <h4>Logins <small>under the home</small></h4>
+        <div class="am-check-row"><span class="am-state am-state--ok"><svg class="am-glyph" aria-hidden="true"><use href="#i-ok"/></svg></span><span class="am-check-what">claude</span><span class="am-check-said"><span class="am-word">Pass.</span> A subscription login is present; the harness holds it and amem passes it through.</span></div>
+        <div class="am-check-row"><span class="am-state am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-absent"/></svg></span><span class="am-check-what">codex</span><span class="am-check-said"><span class="am-word">Absent.</span> No login. A ChatGPT login is not supported yet; use a key or the gateway.</span></div>
+      </div>
+      <div class="am-doctor-group">
+        <h4>Keys and the gateway</h4>
+        <div class="am-check-row"><span class="am-state am-state--ok"><svg class="am-glyph" aria-hidden="true"><use href="#i-ok"/></svg></span><span class="am-check-what">anthropic key</span><span class="am-check-said"><span class="am-word">Pass.</span> Set; amem holds it and the harness gets a placeholder.</span></div>
+        <div class="am-check-row"><span class="am-state am-state--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg></span><span class="am-check-what">llmao</span><span class="am-check-said"><span class="am-word">Fail.</span> No answer in 5 seconds. Sessions with <span class="am-mono">--auth gateway</span> will not start.</span>
+          <span class="am-check-fix">Check the gateway is up, or launch with <code>--auth key</code>.</span></div>
+      </div>
+      <div class="am-doctor-group">
+        <h4>Harnesses <small>on the PATH, against their pins</small></h4>
+        <div class="am-check-row"><span class="am-state am-state--ok"><svg class="am-glyph" aria-hidden="true"><use href="#i-ok"/></svg></span><span class="am-check-what">claude</span><span class="am-check-said"><span class="am-word">Pass.</span> On the PATH at the pinned version.</span></div>
+        <div class="am-check-row"><span class="am-state am-state--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-warn"/></svg></span><span class="am-check-what">gemini</span><span class="am-check-said"><span class="am-word">Warn.</span> On the PATH, but older than the pin. It runs; its hooks may not.</span>
+          <span class="am-check-fix">Update it, then run <code>amem doctor</code> again.</span></div>
+        <div class="am-check-row"><span class="am-state am-state--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-absent"/></svg></span><span class="am-check-what">qwen</span><span class="am-check-said"><span class="am-word">Absent.</span> Not on the PATH or in the image.</span></div>
+      </div>
+      <div class="am-doctor-group">
+        <h4>Grants <small><span class="am-mono">grants.toml</span></small></h4>
+        <div class="am-check-row"><span class="am-state am-state--ok"><svg class="am-glyph" aria-hidden="true"><use href="#i-ok"/></svg></span><span class="am-check-what">handling</span><span class="am-check-said"><span class="am-word">Pass.</span> The owner reads up to restricted; 2 domains.</span></div>
+        <div class="am-check-row"><span class="am-state am-state--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-warn"/></svg></span><span class="am-check-what">xai</span><span class="am-check-said"><span class="am-word">Warn.</span> A key is set, but the destination has no ceiling, so every call to it is refused.</span>
+          <span class="am-check-fix">Add <code>[destinations.xai] ceiling = "public"</code> to grants.toml.</span></div>
+      </div>
+    </div>
+  </div>
+  <ul>
+    <li><strong>The verdict word starts the sentence</strong>, so the row reads without its
+      glyph and without colour.</li>
+    <li><strong>Warn and fail carry their fix</strong>, as a command or an edit, in Data type.</li>
+    <li><strong>Absent is an answer, not a blank.</strong> A row nobody configured says so, in
+      outlined ink, because saying nothing reads as &ldquo;fine&rdquo;.</li>
+    <li><strong>Order within a group is the command's</strong>, not sorted by verdict: a reader
+      comparing the page with the terminal finds the same row in the same place.</li>
+  </ul>
+
+  <h3>Profile card</h3>
+  <p>A profile is a named launch: harness, auth, destination, model, working tree, from <code>profiles.toml</code> under the root. The card is how the launch page lists them; its command is the whole point.</p>
+  <div class="bk-grid2">
+    <div class="am-profile">
+      <div class="am-profile-name">nightly</div>
+      <dl>
+        <dt>Harness</dt><dd>claude</dd>
+        <dt>Auth</dt><dd>gateway, llmao</dd>
+        <dt>Model</dt><dd class="am-mono">qwen3.8-27b</dd>
+        <dt>Ceiling</dt><dd><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-1"/></svg>internal</span></dd>
+        <dt>Works</dt><dd>the next task, subagents on the board</dd>
+      </dl>
+      <div class="am-cmd"><code><span class="p">$ </span>amem work nightly</code><button class="am-btn am-btn--secondary am-btn--icon" type="button" aria-label="Copy command" data-copy><svg class="am-glyph" aria-hidden="true"><use href="#i-copy"/></svg></button></div>
+      <div class="am-profile-foot"><button class="am-btn am-btn--primary" type="button"><svg class="am-glyph" aria-hidden="true"><use href="#i-start"/></svg>Start session</button><button class="am-btn am-btn--quiet" type="button">Open in the form</button></div>
+    </div>
+    <div class="am-profile">
+      <div class="am-profile-name">review</div>
+      <dl>
+        <dt>Harness</dt><dd>codex</dd>
+        <dt>Auth</dt><dd>key, openai</dd>
+        <dt>Model</dt><dd>the harness's default</dd>
+        <dt>Ceiling</dt><dd><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-0"/></svg>public</span></dd>
+        <dt>Works</dt><dd>an interactive session</dd>
+      </dl>
+      <div class="am-cmd"><code><span class="p">$ </span>amem review</code><button class="am-btn am-btn--secondary am-btn--icon" type="button" aria-label="Copy command" data-copy><svg class="am-glyph" aria-hidden="true"><use href="#i-copy"/></svg></button></div>
+      <div class="am-profile-foot"><button class="am-btn am-btn--secondary" type="button" aria-disabled="true"><svg class="am-glyph" aria-hidden="true"><use href="#i-start"/></svg>Start session</button><span class="am-err"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg>No openai key on this host</span></div>
+    </div>
+  </div>
+  <ul style="margin-top:1rem">
+    <li><strong>The name is mono</strong>, because it is typed.</li>
+    <li><strong>A profile this host cannot run says why</strong>, from the doctor's verdict, and its
+      Start is disabled with the reason beside it rather than failing after a click.</li>
+    <li><strong>The ceiling is on the card</strong> for the same reason it is on the form.</li>
+  </ul>
+
+  <h3>Reader result</h3>
+  <p>The browser reader searches an exported bundle in the page, summaries first. A result is the entry's title, its summary with the query's matches marked, and its facts.</p>
+  <ul class="am-hits">
+    <li class="am-hit is-open">
+      <span class="am-hit-title">Leases expire at a fixed horizon</span>
+      <span class="am-hit-sum">A claim grants a <mark>lease</mark> to a <mark>horizon</mark> set at the claim; it is never extended past it.</span>
+      <span class="am-hit-meta"><span class="t-micro">decision</span><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-1"/></svg>internal</span><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-1"/></svg>curated</span><span class="am-id">mem-dm-7k2q9x4b</span></span>
+    </li>
+    <li class="am-hit">
+      <span class="am-hit-title">Lease renewal, first pass <span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-superseded"/></svg><span class="am-chip-word">superseded</span></span></span>
+      <span class="am-hit-sum">Renewal extended the <mark>lease</mark> by its length each heartbeat. Replaced by the fixed <mark>horizon</mark>.</span>
+      <span class="am-hit-meta"><span class="t-micro">handoff</span><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-1"/></svg>internal</span><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-0"/></svg>raw</span><span class="am-id">mem-dm-2c8v5n1r</span></span>
+    </li>
+    <li class="am-hit">
+      <span class="am-hit-title">The ledger's clock is its own</span>
+      <span class="am-hit-sum">Time comes from a clock the ledger owns, so tests can move it past a <mark>lease</mark>'s expiry.</span>
+      <span class="am-hit-meta"><span class="t-micro">fact</span><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-0"/></svg>public</span><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-trust-2"/></svg>verified</span><span class="am-id">mem-dm-9w3k7h2d</span></span>
+    </li>
+  </ul>
+  <ul style="margin-top:1rem">
+    <li><strong>The open result is the accent</strong>: tint and a left edge, the one place a
+      selection is drawn, and the same in the session list and the recent list.</li>
+    <li><strong>Matches are marked in the accent family</strong>, because a match is what
+      <em>you</em> asked for. Not yellow: yellow is warn.</li>
+    <li><strong>The facts line is the same as the reading pane's</strong>, in the same order.</li>
+  </ul>
+</section>
+
+<section id="forms">
+  <h2><span class="bk-num">14</span>Forms</h2>
+  <p class="bk-dek">Few fields, all labelled, each with the hint that saves a trip to the docs.</p>
+  <div class="bk-plate bk-plate--surface">
+    <div class="bk-grid2">
+      <div class="am-field"><label for="f1">Bundle URL</label><input class="am-ctrl is-mono" id="f1" value="https://example.org/bundles/dm/"><span class="am-hint">The directory that holds <span class="am-mono">manifest.yaml</span>.</span></div>
+      <div class="am-field"><label for="f2">Bundle URL</label><input class="am-ctrl is-mono" id="f2" value="https://example.org/bundles/dm/manifest.yaml" aria-invalid="true" aria-describedby="f2e"><span class="am-err" id="f2e"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg>Name the directory, not the manifest in it.</span></div>
+      <div class="am-field"><label for="f3">Handling</label><select class="am-ctrl" id="f3"><option>restricted</option><option selected>internal</option><option>public</option></select><span class="am-hint">The highest label the reader shows.</span></div>
+      <div class="am-field"><label for="f4">Destination</label><input class="am-ctrl" id="f4" value="the harness's own login" disabled><span class="am-hint">A subscription login goes where the harness sends it.</span></div>
+    </div>
+  </div>
+  <ul>
+    <li><strong>Every field has a visible label</strong>, above it. A placeholder is an example,
+      never the label.</li>
+    <li><strong>Inputs are bordered in <code>--am-edge</code></strong>, which is 3:1 against every
+      surface; focus adds the accent ring.</li>
+    <li><strong>An error is under its field</strong>, in fail, with the glyph, saying what to do.
+      The field takes <code>aria-invalid</code> and a double-weight fail edge, so the error is not
+      carried by colour alone.</li>
+    <li><strong>Choices of three or fewer that change the rest of the form are segments</strong>;
+      longer lists are selects.</li>
+    <li><strong>Exact-character inputs are mono</strong>: model, URL, id.</li>
+    <li><strong>Targets are 36&nbsp;px tall</strong>, 44 on a touch screen.</li>
+  </ul>
+</section>
+
+<section id="feedback">
+  <h2><span class="bk-num">15</span>Feedback</h2>
+  <p class="bk-dek">Things that happen without the reader asking: a session exits, a call is refused, an entry lands, a copy succeeds.</p>
+  <div class="bk-grid2">
+    <div class="am-alert am-alert--ok" role="status"><svg class="am-glyph" aria-hidden="true"><use href="#i-done"/></svg><p><b>Copied.</b> <span class="am-mono">amem work nightly</span></p></div>
+    <div class="am-alert am-alert--warn" role="status"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg><p><b>At ceiling.</b> This session has read internal entries, the most llmao accepts. Restricted entries are now filtered from its searches.</p></div>
+    <div class="am-alert" role="alert"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg><p><b>Exited 1</b> after 3 min. The terminal holds its last output.</p></div>
+    <div class="am-alert am-alert--live" role="status"><svg class="am-glyph" aria-hidden="true"><use href="#i-entry"/></svg><p><b>Entry written:</b> Leases expire at a fixed horizon. <span class="am-id">mem-dm-p4n8w2c6</span></p></div>
+  </div>
+  <div class="bk-tbl">
+    <table class="bk-spec">
+      <thead><tr><th>Kind</th><th>Goes away</th><th>Live region</th><th>Ground</th></tr></thead>
+      <tbody>
+        <tr><td>Confirmation of the reader's own action</td><td>After 4&nbsp;s</td><td><code>polite</code></td><td>ok tint</td></tr>
+        <tr><td>Something the session did</td><td>Stays until replaced</td><td><code>polite</code></td><td>live tint</td></tr>
+        <tr><td>Warning</td><td>Stays; dismissable</td><td><code>polite</code></td><td>warn tint</td></tr>
+        <tr><td>Failure</td><td>Stays; names the next step</td><td><code>assertive</code></td><td>fail tint</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <ul>
+    <li><strong>The strip is the notification for most of this.</strong> A refused call raises the
+      refused count where the reader already looks; the alert is for a reader who is looking at
+      something else.</li>
+    <li><strong>One live region per page</strong>, two politeness levels. An entry arriving in the
+      pane is announced politely by its title.</li>
+    <li><strong>The terminal is not a live region.</strong> A screen reader user reads it with
+      xterm's screen reader mode, on demand; announcing every byte would drown everything else.</li>
+  </ul>
+</section>
+
+<div class="bk-part"><b>Behaviour</b><span>How the pages answer a keyboard, a stated preference, and a small screen.</span></div>
+
+<section id="access">
+  <h2><span class="bk-num">16</span>Accessibility</h2>
+  <p class="bk-dek">WCAG 2.2 AA as the floor, and the three preferences a reader can state to their system honoured without being found.</p>
+  <ul>
+    <li><strong>Contrast</strong>: every pair in chapter 02, both themes, passes. The table checks
+      itself in this page.</li>
+    <li><strong>The terminal takes every key, including Tab.</strong> So it is never a trap: a skip
+      link before it reaches the reading pane, and <span class="am-kbd">F6</span> moves between bar,
+      terminal and pane. Both are listed under <span class="am-kbd">?</span>.</li>
+    <li><strong>Focus</strong>: <code>:focus-visible</code>, a 2&nbsp;px accent ring, 2&nbsp;px
+      offset, on every control in both themes; 3&nbsp;px in more contrast. Never removed.</li>
+    <li><strong>Targets</strong>: 24&times;24 at least, 44 on touch.</li>
+    <li><strong>One <code>h1</code> per page</strong>, the session's title on a session page.
+      Heading levels follow structure, never size.</li>
+    <li><strong>Glyphs</strong> are <code>aria-hidden</code> beside a word; a gutter glyph standing
+      alone has <code>role="img"</code> and a name.</li>
+    <li><strong>More contrast</strong> (<code>prefers-contrast: more</code>, or
+      <code>data-contrast="more"</code>): muted text becomes body text, every rule becomes an edge,
+      lines and focus rings thicken, chips lose their tints for a solid edge, and clipped chip
+      words come back. Try it with the switch at the top of this page.</li>
+    <li><strong>Reduced motion</strong>: the durations are zero unless the reader has not asked for
+      stillness; the cursor does not blink and the busy glyph does not turn.</li>
+    <li><strong>Text size</strong>: everything is in rem, the terminal included, and the layout
+      survives 200% zoom by reflowing, never by scrolling sideways.</li>
+  </ul>
+</section>
+
+<section id="responsive">
+  <h2><span class="bk-num">17</span>Responsive</h2>
+  <p class="bk-dek">Two breakpoints, at 720 and 1100&nbsp;px, and a phone at 360&nbsp;px that works rather than merely fits.</p>
+  <div class="bk-tbl">
+    <table class="bk-spec">
+      <thead><tr><th>Width</th><th>Session page</th><th>Launch page and reader</th></tr></thead>
+      <tbody>
+        <tr><td><code>&gt; 1100</code></td><td>Terminal and pane side by side; the strip on one row</td><td>Form in two and three columns; reader results beside the open entry</td></tr>
+        <tr><td><code>720&ndash;1100</code></td><td>Side by side; the strip keeps one row and a long value wraps inside its cell</td><td>The same, narrower</td></tr>
+        <tr><td><code>&lt; 720</code></td><td>Terminal and pane become two tabs; the strip is a two-column grid; the tab for the record carries a count of entries written since it was last looked at</td><td>One column. Results, then the entry under them, with a way back</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="bk-phones">
+    <div>
+      <div class="bk-phone is-narrow">
+        <div class="am-bar"><a class="am-bar-home" href="#responsive" tabindex="-1">amem</a><span class="am-bar-title">claude: next task</span><span class="am-chip am-chip--live"><svg class="am-glyph" aria-hidden="true"><use href="#i-running"/></svg><span class="am-chip-word">running</span></span></div>
+        <div class="am-strip">
+          <div class="am-strip-cell"><span class="am-strip-k">Destination</span><span class="am-strip-v">llmao</span></div>
+          <div class="am-strip-cell am-strip-cell--ceiling"><span class="am-strip-k">Label and ceiling</span><span class="am-strip-v"><span class="am-fact"><svg class="am-glyph" aria-hidden="true"><use href="#i-label-1"/></svg>internal</span><span class="am-chip am-chip--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg><span class="am-chip-word">at ceiling</span></span></span></div>
+          <div class="am-strip-cell"><span class="am-strip-k">Usage so far</span><span class="am-strip-v">41.2k in, 3.1k out</span></div>
+          <div class="am-strip-cell"><span class="am-strip-k">Mined, waiting</span><span class="am-strip-v">3 <span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">to read</span></span></span></div>
+        </div>
+        <div class="am-tabs" role="tablist" aria-label="Session (specimen)">
+          <button role="tab" aria-selected="true" type="button">Terminal</button>
+          <button role="tab" aria-selected="false" type="button">Record <span class="am-chip am-chip--ink"><svg class="am-glyph" aria-hidden="true"><use href="#i-entry"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">new</span></span></button>
+        </div>
+<pre class="am-term" style="min-height:14rem"><span class="k2">&#9679;</span> <span class="b">read_entry</span>(<span class="k4 lnk">mem-dm-7k2q9x4b</span>)
+  <span class="k8">decision, internal, curated</span>
+<span class="k2">&#9679;</span> <span class="b">propose_entry</span>(Leases expire
+  at a fixed horizon)
+  <span class="k8">wrote</span> <span class="k4 lnk">mem-dm-p4n8w2c6</span>
+
+A lease is never extended past its
+horizon.<span class="cur"> </span></pre>
+      </div>
+      <p class="bk-phone-cap">Session page at 360&nbsp;px. The terminal is 40 columns; the strip keeps every cell, two to a row, its chips down to glyph and count. The record tab counts entries written since it was last open, in outlined ink: worth knowing, not an alarm.</p>
+    </div>
+    <div>
+      <div class="bk-phone" style="padding:var(--am-space-4)">
+        <div class="t-title" style="font-size:1.35rem;margin-bottom:.75rem">Sessions</div>
+        <div class="am-list is-narrow">
+          <a class="am-srow" href="#responsive"><span class="am-state am-state--live"><svg class="am-glyph" aria-label="running" role="img"><use href="#i-running"/></svg></span><span class="am-srow-title">claude on qwen3.8-27b: next task</span><span class="am-srow-chips"><span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-refused"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">refused</span></span><span class="am-chip am-chip--warn"><svg class="am-glyph" aria-hidden="true"><use href="#i-ceiling"/></svg><span class="am-chip-word">at ceiling</span></span></span><span class="am-srow-meta">llmao, running for 6 min</span></a>
+          <a class="am-srow" href="#responsive"><span class="am-state am-state--fail"><svg class="am-glyph" aria-label="exited non-zero" role="img"><use href="#i-fail"/></svg></span><span class="am-srow-title">gemini: review the open proposals</span><span class="am-srow-chips"><span class="am-chip am-chip--fail"><svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg><span class="am-chip-word">exited 1</span></span></span><span class="am-srow-meta">exited 1 after 3 min</span></a>
+          <a class="am-srow" href="#responsive"><span class="am-state am-state--ok"><svg class="am-glyph" aria-label="exited 0" role="img"><use href="#i-done"/></svg></span><span class="am-srow-title">claude: next task</span><span class="am-srow-chips"><span class="am-chip am-chip--await"><svg class="am-glyph" aria-hidden="true"><use href="#i-handoff"/></svg><span class="am-chip-count">1</span><span class="am-chip-word">to read</span></span></span><span class="am-srow-meta">exited 0 after 22 min</span></a>
+        </div>
+        <div class="am-launch" style="margin-top:1rem">
+          <div class="am-field c3"><label for="ph-h">Harness</label><select class="am-ctrl" id="ph-h"><option>claude</option></select></div>
+          <div class="am-field c3"><label for="ph-p">Profile</label><select class="am-ctrl" id="ph-p"><option>nightly</option></select></div>
+          <div class="am-cmd"><code><span class="p">$ </span>amem work nightly</code></div>
+          <button class="am-btn am-btn--primary" type="button" style="min-height:var(--am-target-touch)"><svg class="am-glyph" aria-hidden="true"><use href="#i-start"/></svg>Start session</button>
+        </div>
+      </div>
+      <p class="bk-phone-cap">Launch page at 360&nbsp;px. Chip words are clipped to glyph and count and stay in the accessible name; the form is one column and the primary is a touch target.</p>
+    </div>
+  </div>
+</section>
+
+<section id="dark">
+  <h2><span class="bk-num">18</span>Dark mode</h2>
+  <p class="bk-dek">Designed, not inverted. Every value has a dark partner chosen for a dark ground, and the meaning of each stays where it was.</p>
+  <ul>
+    <li><strong>The mapping does not change.</strong> Live is cyan in both, fail is red in both,
+      and the state table reads the same.</li>
+    <li><strong>The hue is the text in both themes.</strong> No darkened &ldquo;text-safe&rdquo;
+      variant exists to forget: in light every hue is dark enough to read on white, in dark light
+      enough to read on the dark grounds, and the tints are deep rather than pale.</li>
+    <li><strong>The accent fill carries dark text in dark.</strong> <code>--am-on-accent</code>
+      flips with the theme, so a rule written as <em>on-accent on accent</em> is right in both.
+      A rule that says <code>white</code> is the one about to be wrong in one of them.</li>
+    <li><strong>The terminal has its own pair</strong>, chapter 04. In dark its ground is a step
+      below the surface, so the box reads as set into the page.</li>
+    <li><strong>Three settings, two values.</strong> System, light, dark, on
+      <code>data-theme</code>; system is the attribute's absence. The choice persists per browser
+      and is a convenience, never a requirement.</li>
+  </ul>
+</section>
+
+<div class="bk-part"><b>Keeping it</b><span>How this system changes without decaying, and what was decided on the way here.</span></div>
+
+<section id="governance">
+  <h2><span class="bk-num">19</span>Governance</h2>
+  <p class="bk-dek">A system that cannot be extended gets worked around, and one anyone can extend stops being one. Three gates, matched to what is at stake.</p>
+  <div class="bk-tbl">
+    <table class="bk-spec">
+      <thead><tr><th>Change</th><th>Needs</th><th>Because</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Using the system</strong>: a page from existing widgets, a new row in the doctor, new copy</td><td>Nothing. Build it.</td><td>This is the system working. If composing a page needs a discussion, the book has failed.</td></tr>
+        <tr><td><strong>A new configuration</strong>: a widget variant, a new empty state, a new field</td><td>One line in the PR description naming the existing thing it extends</td><td>Cheap to review, and it stops two people inventing the same variant twice.</td></tr>
+        <tr><td><strong>A new token, hue, chip, glyph meaning or type role</strong></td><td>This book changed in the same PR, the state table and the contrast table with it</td><td>These are the things that decay. Each addition is locally reasonable, and that is how one colour comes to mean three things.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Rules that keep it honest</h3>
+  <ul>
+    <li><strong><code>tokens.css</code> and this book change together</strong>, in one commit. Both
+      files say so at the top. A value in one and not the other is a bug in both.</li>
+    <li><strong>The book changes in the same commit as the page it describes.</strong> A book that
+      describes last month's pages is worse than none, because it is trusted.</li>
+    <li><strong>Tokens are named for meaning</strong>: <code>--am-fail</code>, not
+      <code>--am-red</code>. When the red changes, every use is still right.</li>
+    <li><strong>Classes are scoped to their component</strong>: <code>.am-chip-count</code>, not
+      <code>.n</code>. A short generic name collides silently the moment two components nest.</li>
+    <li><strong>No colour literal outside <code>tokens.css</code></strong>, no
+      <code>transition: all</code>, no <code>px</code> font size.</li>
+    <li><strong>A new hue is a new terminal colour too.</strong> There are six ANSI colours and six
+      hues; a seventh hue has no terminal partner, which is the cost to weigh before adding one.</li>
+    <li><strong>A new pair goes in the contrast table</strong>, with its ratio in both themes, before
+      the code that uses it.</li>
+  </ul>
+</section>
+
+<section id="decisions">
+  <h2><span class="bk-num">20</span>Decisions</h2>
+  <p class="bk-dek">Every choice in this book, why, and how it stands against BAT's design book, whose approach this one follows. Grouped by date; a later change adds a group rather than editing a row.</p>
+  <div class="bk-tbl">
+    <table class="bk-spec bk-log">
+      <thead><tr><th>Decision</th><th>Why</th><th>Against BAT</th></tr></thead>
+      <tbody>
+        <tr class="bk-group"><td colspan="3">2026-10-06, the first draft</td></tr>
+        <tr><td>One meaning per hue, with an exhaustive state table; a state not in it has no colour</td><td>The only rule that keeps a status vocabulary readable at a glance.</td><td><span class="bk-tag">Taken</span></td></tr>
+        <tr><td>The six hues are ANSI's six colours, value for value</td><td>The terminal is half the session page. One palette means a red line of harness output and a red chip say the same thing, and it caps the hues at six.</td><td><span class="bk-tag">New</span> BAT has no terminal.</td></tr>
+        <tr><td>Accent is indigo, <code>#4a3fc4</code> and <code>#a9a3ff</code></td><td>A family resemblance to BAT's navy and violet, bright enough to be a fill, distinct from BAT's ASF navy so the two tools are not mistaken for each other.</td><td><span class="bk-tag">Adapted</span></td></tr>
+        <tr><td>One value per hue per theme, passing 4.5:1 as text on every surface and its own tint</td><td>BAT needs <code>--flag-text</code> and <code>--gold-text</code> because brand values fail as text. amem has no brand values to keep, so no second variant exists to forget.</td><td><span class="bk-tag">Differs</span></td></tr>
+        <tr><td>Labels and trust tiers take no hue; they are drawn as ordered marks in ink</td><td>Every entry has both, so they are facts. Traffic-light labels would spend pass and refused on a property that is neither.</td><td><span class="bk-tag">Adapted</span> from &ldquo;a chip marks an exception&rdquo;</td></tr>
+        <tr><td>Await is violet-magenta: a person needs to decide</td><td>Proposed tasks and unread handoffs wait on a human, as BAT's comments do.</td><td><span class="bk-tag">Adapted</span> from BAT's comment violet</td></tr>
+        <tr><td>Live (cyan) is separate from ok (green)</td><td>A running session or a claimed task has not succeeded at anything yet. BAT puts in-progress in green; here that would turn every running row into a success.</td><td><span class="bk-tag">Differs</span></td></tr>
+        <tr><td>Dashed means provisional: a connection not yet made</td><td>A state that is not settled, without a seventh hue.</td><td><span class="bk-tag">Adapted</span> BAT's dashed means yours, uncommitted</td></tr>
+        <tr><td>Ceiling states are below, at, and refused, where the brief said ok, near and over</td><td>The ceiling is a label, not a budget (<code>dm_policy::Session::may_send</code>); there is no &ldquo;near&rdquo; between internal and restricted. Below is the normal case and takes no hue.</td><td><span class="bk-tag">New</span></td></tr>
+        <tr><td>Task states use the ledger's names: proposed, admitted, claimed, completed, invalidated</td><td>The brief said done; the ledger says completed, and has invalidated besides. The interface uses the record's words.</td><td><span class="bk-tag">Taken</span> &ldquo;name things as the domain does&rdquo;</td></tr>
+        <tr><td>Usage is a fact with no hue; a budget, when there is one, goes through the third gate</td><td>Nothing today makes a usage figure good or bad.</td><td><span class="bk-tag">New</span></td></tr>
+        <tr><td>Neutrals biased toward violet, three surface levels (paper, surface, plate), no shadows</td><td>A reading tool cannot spare the contrast elevation costs. Cooler than BAT's paper, which is warm.</td><td><span class="bk-tag">Taken</span>, values re-chosen</td></tr>
+        <tr><td>A separate <code>--am-edge</code> at 3:1 for anything that identifies a control</td><td>BAT's inputs and today's pages draw field borders in the decorative rule, which fails WCAG 1.4.11.</td><td><span class="bk-tag">Differs</span></td></tr>
+        <tr><td>Atkinson Hyperlegible Next and Mono, OFL 1.1, self-hosted later; system stacks meanwhile</td><td>Ids and digests need characters that cannot be confused, and one family with a mono sibling keeps text and data related. BAT uses Montserrat and Open Sans because apache.org does.</td><td><span class="bk-tag">Differs</span></td></tr>
+        <tr><td>Labels are sentence case, not tracked capitals</td><td>Weight and position are enough; caps add volume, not information, and read worse at small sizes.</td><td><span class="bk-tag">Differs</span></td></tr>
+        <tr><td>Mono only for exact characters</td><td>So mono itself means something: what you could type or must copy exactly.</td><td><span class="bk-tag">Taken</span></td></tr>
+        <tr><td>A role-based type scale, nine roles, in rem</td><td>BAT's eight plus Terminal.</td><td><span class="bk-tag">Adapted</span></td></tr>
+        <tr><td>The terminal follows the page's theme, with a designed light palette and <code>minimumContrastRatio: 4.5</code></td><td>A dark box in a light page is a hole in it; harness colours nobody chose still meet the floor.</td><td><span class="bk-tag">New</span></td></tr>
+        <tr><td>Light-theme ANSI white is a legible grey; dark-theme black stays a ground</td><td>Harnesses written for dark terminals print white text and expect it read. Nothing prints black text on a dark terminal expecting the same.</td><td><span class="bk-tag">New</span></td></tr>
+        <tr><td>Three durations, zero by default, set only under <code>prefers-reduced-motion: no-preference</code>; nothing pulses</td><td>Stillness is the default and motion the enhancement.</td><td><span class="bk-tag">Taken</span>, expressed as tokens</td></tr>
+        <tr><td><code>data-theme</code> and <code>data-contrast</code> on the root, each following the system when absent</td><td>A stated preference is honoured without being found, and a reader whose answer differs from their machine's has a switch.</td><td><span class="bk-tag">Adapted</span> BAT's Appearance and comfortable mode</td></tr>
+        <tr><td>The command preview is not syntax-coloured</td><td>Hues are states; a flag is not one. Muted flags and ink values are enough.</td><td><span class="bk-tag">New</span></td></tr>
+        <tr><td>The status strip sits on the session frame's top edge and is never hidden</td><td>What crosses the line is what the paper measures; it belongs where the session is.</td><td><span class="bk-tag">New</span></td></tr>
+        <tr><td>A state that every row has is a gutter glyph; only exceptions also take a chip</td><td>BAT's checklist gutter, applied to sessions, tasks and doctor checks.</td><td><span class="bk-tag">Adapted</span></td></tr>
+        <tr><td>Chip anatomy glyph, count, word; words clip on narrow rows and stay in the accessible name</td><td>Unchanged, because it works.</td><td><span class="bk-tag">Taken</span></td></tr>
+        <tr><td>Tokens prefixed <code>--am-</code>; components <code>.am-</code>; the book's own <code>.bk-</code></td><td>Scoped names do not collide, and the prefix says which file a rule belongs in.</td><td><span class="bk-tag">Adapted</span></td></tr>
+        <tr><td>Two radii, 4 and 8</td><td>Controls and chips small, panels and the frame larger; the hierarchy is visible.</td><td><span class="bk-tag">Adapted</span> from 3 and 6</td></tr>
+        <tr><td>Glyphs drawn for this product as one inline SVG sprite on a 16 grid</td><td>No icon font, nothing fetched, an accessible name that is the word beside it.</td><td><span class="bk-tag">Taken</span></td></tr>
+        <tr><td>No ribbon, no gradient; the mark is the box holding the record, the wordmark lower case mono</td><td>BAT's ribbon is the ASF's. amem's identity is the frame drawn around the session.</td><td><span class="bk-tag">Differs</span></td></tr>
+        <tr><td>Times absolute, 24-hour, with the zone</td><td>Today's pages already print <code>14:02:11Z</code>; kept.</td><td><span class="bk-tag">Taken</span></td></tr>
+        <tr><td>The book is self-contained and checks its own contrast table live</td><td>A table that recomputes from the tokens in force cannot quietly drift from them.</td><td><span class="bk-tag">New</span></td></tr>
+        <tr><td>Three gates for change, and the book in the same commit</td><td>Unchanged, because it is what stops decay.</td><td><span class="bk-tag">Taken</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<footer class="bk-foot">
+  The amem design book. Drafted 2026-10-06 from the three pages in <code>crates/web/static</code>,
+  the label and trust orders in <code>crates/core</code>, the ledger's states, the policy's ceilings,
+  and PLAN.md's M9. It follows the approach of BAT's design book in
+  <code>tooling-agenda/docs/design-book.html</code>. Set in this browser's system fonts until the
+  binary carries its own.
+</footer>
+
+</main>
+</div>
+
+<script>
+// The book's only behaviour: the theme and contrast switches, the live contrast column,
+// the copy buttons, and the contents rail following the reader. Storage is a convenience;
+// every read and write is guarded, and the page is correct without it.
+(() => {
+  const root = document.documentElement;
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch { /* private window */ } },
+  };
+
+  // WCAG 2.2 relative luminance and contrast ratio, from the tokens in force right now
+  const lin = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+  const rgb = (hex) => { const h = hex.replace('#', ''); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); };
+  const lum = (hex) => { const [r, g, b] = rgb(hex).map(lin); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+  const ratio = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
+
+  function check() {
+    const css = getComputedStyle(root);
+    const v = (n) => css.getPropertyValue('--am-' + n).trim();
+    const rows = document.querySelectorAll('#bk-contrast tr[data-fg]');
+    let pass = 0, n = 0;
+    for (const tr of rows) {
+      const fg = v(tr.dataset.fg), bg = v(tr.dataset.bg);
+      const cell = tr.querySelector('[data-live]');
+      if (!/^#[0-9a-f]{6}$/i.test(fg) || !/^#[0-9a-f]{6}$/i.test(bg)) { cell.textContent = '?'; continue; }
+      const r = ratio(fg, bg), ok = r >= Number(tr.dataset.need);
+      cell.textContent = r.toFixed(2);
+      cell.style.color = ok ? '' : 'var(--am-fail)';
+      cell.style.fontWeight = ok ? '' : '700';
+      n += 1; pass += ok;
+    }
+    const dark = lum(v('paper')) < 0.2;
+    const more = matchMedia('(prefers-contrast: more)').matches && root.dataset.contrast !== 'normal' || root.dataset.contrast === 'more';
+    const out = document.getElementById('bk-live');
+    if (out) out.textContent = `In this browser, now: ${pass} of ${n} pairs pass, in the ${dark ? 'dark' : 'light'} theme${more ? ' with more contrast' : ''}.`;
+  }
+  for (const q of ['(prefers-color-scheme: dark)', '(prefers-contrast: more)']) {
+    const m = matchMedia(q);
+    if (m.addEventListener) m.addEventListener('change', check);
+  }
+  function apply(name, attr, value) {
+    if (value === 'system') root.removeAttribute(attr); else root.setAttribute(attr, value);
+    store.set('amem-book-' + name, value === 'system' ? null : value);
+    for (const r of document.querySelectorAll(`input[name="bk-${name}"]`)) r.checked = r.value === value;
+    check();
+  }
+  for (const [name, attr] of [['theme', 'data-theme'], ['contrast', 'data-contrast']]) {
+    const saved = store.get('amem-book-' + name);
+    if (saved) apply(name, attr, saved);
+    for (const r of document.querySelectorAll(`input[name="bk-${name}"]`)) {
+      r.addEventListener('change', () => apply(name, attr, r.value));
+    }
+  }
+
+  check();
+
+  // copy: the button says what happened, in the same word, then goes back
+  for (const b of document.querySelectorAll('[data-copy]')) {
+    b.addEventListener('click', async () => {
+      const text = b.closest('.am-cmd').querySelector('code').textContent.replace(/^\$\s*/, '');
+      const label = b.querySelector('span');
+      try { await navigator.clipboard.writeText(text); } catch { /* the specimen still shows the state */ }
+      if (label) { const was = label.textContent; label.textContent = 'Copied'; setTimeout(() => { label.textContent = was; }, 1600); }
+      else { const was = b.getAttribute('aria-label'); b.setAttribute('aria-label', 'Copied'); setTimeout(() => b.setAttribute('aria-label', was), 1600); }
+    });
+  }
+
+  // the rail marks the chapter in view
+  const links = new Map([...document.querySelectorAll('.bk-rail nav a')].map((a) => [a.getAttribute('href').slice(1), a]));
+  if ('IntersectionObserver' in window) {
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        for (const a of links.values()) a.removeAttribute('aria-current');
+        const a = links.get(e.target.id);
+        if (a) a.setAttribute('aria-current', 'true');
+      }
+    }, { rootMargin: '-15% 0px -75% 0px' });
+    for (const id of links.keys()) { const s = document.getElementById(id); if (s) io.observe(s); }
+  }
+})();
+
+</script>
+</body>
+</html>

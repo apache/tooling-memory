@@ -1,0 +1,255 @@
+/* amem design tokens.
+
+   docs/design-book.html inlines these same values, because the book is one self-contained
+   page with nothing to fetch. The two change together, in the same commit: a token added,
+   renamed or re-valued here and not there (or there and not here) is a bug in both.
+
+   Named for meaning, never appearance: --am-fail, not --am-red. Light is the default
+   under :root; dark is designed, not inverted, and applies when the system asks for it
+   unless the page says data-theme="light", or whenever the page says data-theme="dark".
+   data-contrast="more" forces what prefers-contrast: more asks for, and
+   data-contrast="normal" declines it. */
+
+:root {
+  color-scheme: light;
+
+  /* Type. Atkinson Hyperlegible Next and Mono (Braille Institute, SIL OFL 1.1), self-hosted
+     as woff2 when the binary embeds them; until then, and wherever they fail to load, the
+     system stacks after them are the design, not a degraded copy of it. */
+  --am-font-sans: "Atkinson Hyperlegible Next", system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
+  --am-font-mono: "Atkinson Hyperlegible Mono", ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  --am-text-title: 1.75rem;
+  --am-text-section: 1.25rem;
+  --am-text-sub: 1rem;
+  --am-text-body: 1rem;
+  --am-text-ui: 0.875rem;
+  --am-text-label: 0.8125rem;
+  --am-text-data: 0.8125rem;
+  --am-text-micro: 0.75rem;
+  --am-text-term: 0.875rem;
+  --am-leading-tight: 1.2;
+  --am-leading-ui: 1.45;
+  --am-leading-body: 1.6;
+  --am-leading-term: 1.2;
+  --am-weight-regular: 400;
+  --am-weight-strong: 600;
+  --am-measure: 68ch;
+
+  /* Space: a 4px step. Radii: two. Lines: one width, two in more contrast. */
+  --am-space-1: 0.25rem;
+  --am-space-2: 0.5rem;
+  --am-space-3: 0.75rem;
+  --am-space-4: 1rem;
+  --am-space-6: 1.5rem;
+  --am-space-8: 2rem;
+  --am-space-12: 3rem;
+  --am-space-16: 4rem;
+  --am-radius-sm: 4px;
+  --am-radius: 8px;
+  --am-line: 1px;
+  --am-focus-width: 2px;
+  --am-chip-edge: 40%;
+  --am-target: 24px;
+  --am-target-touch: 44px;
+
+  /* Motion. Zero unless the reader has said motion is welcome; see the block below. */
+  --am-dur-quick: 0ms;
+  --am-dur-move: 0ms;
+  --am-ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Neutrals: violet-biased, three levels, no shadows. */
+  --am-paper: #f6f5f9;
+  --am-surface: #ffffff;
+  --am-plate: #eeecf3;
+  --am-rule: #dedbe6;
+  --am-rule-soft: #ebe9f0;
+  --am-edge: #837e92;
+  --am-ink: #1a1824;
+  --am-body: #363343;
+  --am-muted: #605c6e;
+  /* Hues: one meaning each. Every value passes 4.5:1 as text on paper, surface, plate and its own tint. */
+  --am-accent: #4a3fc4;
+  --am-on-accent: #ffffff;
+  --am-accent-tint: #ecebfb;
+  --am-live: #09697f;
+  --am-live-tint: #e1f0f4;
+  --am-ok: #1a704d;
+  --am-ok-tint: #e3f1ea;
+  --am-warn: #875a00;
+  --am-warn-tint: #fbf0d6;
+  --am-await: #8d2a7e;
+  --am-await-tint: #f6e7f3;
+  --am-fail: #bd222b;
+  --am-fail-tint: #fce8e9;
+  --am-mark: #dcd8fb;
+  /* The terminal: the xterm theme. The six hues are ANSI's six colours. */
+  --am-term-bg: #faf9fd;
+  --am-term-fg: #24212f;
+  --am-term-cursor: #4a3fc4;
+  --am-term-cursor-accent: #faf9fd;
+  --am-term-selection: #d8d5f6;
+  --am-term-black: #24212f;
+  --am-term-red: #bd222b;
+  --am-term-green: #1a704d;
+  --am-term-yellow: #875a00;
+  --am-term-blue: #4a3fc4;
+  --am-term-magenta: #8d2a7e;
+  --am-term-cyan: #09697f;
+  --am-term-white: #57536a;
+  --am-term-bright-black: #65617a;
+  --am-term-bright-red: #a3141d;
+  --am-term-bright-green: #0f5d3d;
+  --am-term-bright-yellow: #6e4800;
+  --am-term-bright-blue: #352a9e;
+  --am-term-bright-magenta: #73196a;
+  --am-term-bright-cyan: #015466;
+  --am-term-bright-white: #706c84;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    /* Neutrals: violet-biased, three levels, no shadows. */
+    --am-paper: #121119;
+    --am-surface: #1a1923;
+    --am-plate: #23212e;
+    --am-rule: #353241;
+    --am-rule-soft: #292734;
+    --am-edge: #767188;
+    --am-ink: #f2f0f8;
+    --am-body: #d0ccdc;
+    --am-muted: #9e99ae;
+    /* Hues: one meaning each. Every value passes 4.5:1 as text on paper, surface, plate and its own tint. */
+    --am-accent: #a9a3ff;
+    --am-on-accent: #16141f;
+    --am-accent-tint: #2a2650;
+    --am-live: #4cc4dc;
+    --am-live-tint: #113039;
+    --am-ok: #5fcb9a;
+    --am-ok-tint: #143026;
+    --am-warn: #e8bd52;
+    --am-warn-tint: #332a10;
+    --am-await: #e590d7;
+    --am-await-tint: #371b33;
+    --am-fail: #ff7d86;
+    --am-fail-tint: #3d1b20;
+    --am-mark: #433d7a;
+    /* The terminal: the xterm theme. The six hues are ANSI's six colours. */
+    --am-term-bg: #14131c;
+    --am-term-fg: #e4e1ed;
+    --am-term-cursor: #a9a3ff;
+    --am-term-cursor-accent: #14131c;
+    --am-term-selection: #3b3666;
+    --am-term-black: #2d2a39;
+    --am-term-red: #ff7d86;
+    --am-term-green: #5fcb9a;
+    --am-term-yellow: #e8bd52;
+    --am-term-blue: #a9a3ff;
+    --am-term-magenta: #e590d7;
+    --am-term-cyan: #4cc4dc;
+    --am-term-white: #d0ccdc;
+    --am-term-bright-black: #8f8aa3;
+    --am-term-bright-red: #ffa3aa;
+    --am-term-bright-green: #8ee0b8;
+    --am-term-bright-yellow: #f6d685;
+    --am-term-bright-blue: #c9c5ff;
+    --am-term-bright-magenta: #f3b6ea;
+    --am-term-bright-cyan: #86dcec;
+    --am-term-bright-white: #ffffff;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  /* Neutrals: violet-biased, three levels, no shadows. */
+  --am-paper: #121119;
+  --am-surface: #1a1923;
+  --am-plate: #23212e;
+  --am-rule: #353241;
+  --am-rule-soft: #292734;
+  --am-edge: #767188;
+  --am-ink: #f2f0f8;
+  --am-body: #d0ccdc;
+  --am-muted: #9e99ae;
+  /* Hues: one meaning each. Every value passes 4.5:1 as text on paper, surface, plate and its own tint. */
+  --am-accent: #a9a3ff;
+  --am-on-accent: #16141f;
+  --am-accent-tint: #2a2650;
+  --am-live: #4cc4dc;
+  --am-live-tint: #113039;
+  --am-ok: #5fcb9a;
+  --am-ok-tint: #143026;
+  --am-warn: #e8bd52;
+  --am-warn-tint: #332a10;
+  --am-await: #e590d7;
+  --am-await-tint: #371b33;
+  --am-fail: #ff7d86;
+  --am-fail-tint: #3d1b20;
+  --am-mark: #433d7a;
+  /* The terminal: the xterm theme. The six hues are ANSI's six colours. */
+  --am-term-bg: #14131c;
+  --am-term-fg: #e4e1ed;
+  --am-term-cursor: #a9a3ff;
+  --am-term-cursor-accent: #14131c;
+  --am-term-selection: #3b3666;
+  --am-term-black: #2d2a39;
+  --am-term-red: #ff7d86;
+  --am-term-green: #5fcb9a;
+  --am-term-yellow: #e8bd52;
+  --am-term-blue: #a9a3ff;
+  --am-term-magenta: #e590d7;
+  --am-term-cyan: #4cc4dc;
+  --am-term-white: #d0ccdc;
+  --am-term-bright-black: #8f8aa3;
+  --am-term-bright-red: #ffa3aa;
+  --am-term-bright-green: #8ee0b8;
+  --am-term-bright-yellow: #f6d685;
+  --am-term-bright-blue: #c9c5ff;
+  --am-term-bright-magenta: #f3b6ea;
+  --am-term-bright-cyan: #86dcec;
+  --am-term-bright-white: #ffffff;
+}
+
+/* Motion is the enhancement and stillness the default, so the durations are set only
+   where the reader has not asked for reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  :root {
+    --am-dur-quick: 120ms;
+    --am-dur-move: 200ms;
+  }
+}
+
+/* More contrast: secondary text becomes body text, every rule becomes a boundary, lines
+   thicken, and chips drop their tints for a solid edge. Each value is a reference, so it
+   holds in both themes. The selector outranks the theme blocks above. */
+@media (prefers-contrast: more) {
+  :root:not([data-contrast="normal"]) {
+    --am-muted: var(--am-body);
+    --am-rule: var(--am-edge);
+    --am-rule-soft: var(--am-edge);
+    --am-line: 2px;
+    --am-focus-width: 3px;
+    --am-chip-edge: 100%;
+    --am-accent-tint: var(--am-surface);
+    --am-live-tint: var(--am-surface);
+    --am-ok-tint: var(--am-surface);
+    --am-warn-tint: var(--am-surface);
+    --am-await-tint: var(--am-surface);
+    --am-fail-tint: var(--am-surface);
+  }
+}
+
+:root[data-contrast="more"] {
+  --am-muted: var(--am-body);
+  --am-rule: var(--am-edge);
+  --am-rule-soft: var(--am-edge);
+  --am-line: 2px;
+  --am-focus-width: 3px;
+  --am-chip-edge: 100%;
+  --am-accent-tint: var(--am-surface);
+  --am-live-tint: var(--am-surface);
+  --am-ok-tint: var(--am-surface);
+  --am-warn-tint: var(--am-surface);
+  --am-await-tint: var(--am-surface);
+  --am-fail-tint: var(--am-surface);
+}
