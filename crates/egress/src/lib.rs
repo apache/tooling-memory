@@ -698,37 +698,46 @@ pub fn fold_function_responses(body: &[u8]) -> Option<Vec<u8>> {
     let contents = v.get_mut("contents")?.as_array_mut()?;
     let mut out = Vec::with_capacity(contents.len());
     let mut moved = false;
-    for mut turn in contents.drain(..) {
+    for turn in contents.drain(..) {
         let from_model = turn.get("role").and_then(serde_json::Value::as_str) == Some("model");
-        let parts = turn
-            .get_mut("parts")
-            .and_then(serde_json::Value::as_array_mut);
-        let Some(parts) = parts.filter(|_| from_model) else {
+        let parts = turn.get("parts").and_then(serde_json::Value::as_array);
+        let Some(parts) = parts.filter(|p| from_model && p.iter().any(is_function_response)) else {
             out.push(turn);
             continue;
         };
-        let (responses, rest): (Vec<_>, Vec<_>) = parts
-            .drain(..)
-            .partition(|p| p.get("functionResponse").is_some());
-        if responses.is_empty() {
-            *parts = rest;
-            out.push(turn);
-            continue;
-        }
         moved = true;
-        if !rest.is_empty() {
-            *parts = rest;
-            out.push(turn);
+        // in order: each run of results becomes a user turn where it stood, and what the
+        // model said around it stays in model turns on either side
+        let mut runs: Vec<(bool, Vec<serde_json::Value>)> = Vec::new();
+        for part in parts {
+            let result = is_function_response(part);
+            match runs.last_mut() {
+                Some((was, run)) if *was == result => run.push(part.clone()),
+                _ => runs.push((result, vec![part.clone()])),
+            }
         }
-        out.push(serde_json::json!({ "role": "user", "parts": responses }));
+        for (result, run) in runs {
+            if result {
+                out.push(serde_json::json!({ "role": "user", "parts": run }));
+            } else {
+                let mut kept = turn.clone();
+                kept["parts"] = serde_json::Value::Array(run);
+                out.push(kept);
+            }
+        }
     }
     *contents = out;
     moved.then(|| serde_json::to_vec(&v).ok()).flatten()
 }
 
-/// A request the destination wants shaped is read whole and rewritten: a Messages
-/// request with its system role folded, a request asking for more output tokens than
-/// the cap. Everything else streams through untouched.
+fn is_function_response(part: &serde_json::Value) -> bool {
+    part.get("functionResponse").is_some()
+}
+
+/// A request the destination wants shaped is read whole, up to 64 MiB, and rewritten: a
+/// Messages request with its system role folded, a Gemini request with a model turn's
+/// tool results moved to a user turn, a request asking for more output tokens than the
+/// cap. Everything else streams through untouched.
 async fn shaped(
     dest: &Destination,
     rest: &str,
@@ -776,7 +785,16 @@ async fn shaped(
             .ok()
             .and_then(|mut v| {
                 let o = v.as_object_mut()?;
-                for k in ["input", "messages", "tools", "instructions", "system"] {
+                for k in [
+                    "input",
+                    "messages",
+                    "tools",
+                    "instructions",
+                    "system",
+                    "contents",
+                    "systemInstruction",
+                    "system_instruction",
+                ] {
                     o.remove(k);
                 }
                 Some(v.to_string())
@@ -1129,6 +1147,58 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_that_goes_on_after_a_result_keeps_its_order() {
+        // a turn that goes on after a result keeps its order: the model's remark on the
+        // first result stays after it, and two results together stay together, in order
+        let interleaved = serde_json::json!({ "contents": [{"role": "model", "parts": [
+            {"functionCall": {"id": "c1", "name": "f", "args": {}}},
+            {"functionResponse": {"id": "c1", "name": "f", "response": {"output": "zebra"}}},
+            {"text": "c1 said zebra, so now c2 and c3"},
+            {"functionCall": {"id": "c2", "name": "f", "args": {}}},
+            {"functionCall": {"id": "c3", "name": "f", "args": {}}},
+            {"functionResponse": {"id": "c2", "name": "f", "response": {"output": "okapi"}}},
+            {"functionResponse": {"id": "c3", "name": "f", "response": {"output": "tapir"}}}
+        ]}]});
+        let v: serde_json::Value = serde_json::from_slice(
+            &fold_function_responses(&serde_json::to_vec(&interleaved).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let shape: Vec<(String, Vec<String>)> = v["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let parts = t["parts"].as_array().unwrap().iter().map(|p| {
+                    p.get("functionCall")
+                        .map(|c| format!("call {}", c["id"].as_str().unwrap()))
+                        .or_else(|| {
+                            p.get("functionResponse").map(|r| {
+                                format!("result {}", r["response"]["output"].as_str().unwrap())
+                            })
+                        })
+                        .unwrap_or_else(|| "text".into())
+                });
+                (t["role"].as_str().unwrap().to_string(), parts.collect())
+            })
+            .collect();
+        let expect = |role: &str, parts: &[&str]| {
+            (
+                role.to_string(),
+                parts.iter().map(|p| (*p).to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            shape,
+            vec![
+                expect("model", &["call c1"]),
+                expect("user", &["result zebra"]),
+                expect("model", &["text", "call c2", "call c3"]),
+                expect("user", &["result okapi", "result tapir"]),
+            ]
+        );
+    }
+
+    #[test]
     fn claude_code_s_trailing_system_message_is_folded_into_system() {
         let body = serde_json::json!({
             "model": "m",
@@ -1295,6 +1365,77 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(seen.lock().await.clone().unwrap(), "/muse-code/models");
+    }
+
+    #[tokio::test]
+    async fn the_fold_applies_on_a_gemini_path_of_a_destination_that_asks_for_it_only() {
+        // a fake upstream that keeps every body it is sent
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen2 = seen.clone();
+        let fake = Router::new().fallback(any(move |req: Request| {
+            let seen = seen2.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let b = to_bytes(body, 1 << 20).await.unwrap();
+                seen.lock().await.push((
+                    parts.uri.path().to_string(),
+                    String::from_utf8_lossy(&b).into_owned(),
+                ));
+                ([(header::CONTENT_TYPE, "application/json")], "{}")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let agy = serde_json::json!({ "contents": [
+            {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {}}}]},
+            {"role": "model", "parts": [{"functionResponse": {"name": "f", "response": {"output": "zebra"}}}]}
+        ]})
+        .to_string();
+        let roles = |body: &str| -> Vec<String> {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            v["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["role"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for (folds, path) in [
+            (true, "v1beta/models/m:streamGenerateContent"),
+            (true, "v1beta/models/m:generateContent"),
+            (false, "v1/chat/completions"),
+        ] {
+            for asks in [true, false] {
+                let dest = Destination::forward(format!("http://{addr}"), Auth::PassThrough);
+                let dest = if asks {
+                    dest.with_function_responses_in_user_turns()
+                } else {
+                    dest
+                };
+                let (_d, e) = fixture(Some(("anthropic", dest))).await;
+                let r = e
+                    .router()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/anthropic/{path}"))
+                            .method("POST")
+                            .header("content-type", "application/json")
+                            .body(Body::from(agy.clone()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::OK, "{path}");
+                let (_, body) = seen.lock().await.pop().unwrap();
+                let want = if folds && asks {
+                    ["model", "user"]
+                } else {
+                    ["model", "model"]
+                };
+                assert_eq!(roles(&body), want, "{path}, asked: {asks}");
+            }
+        }
     }
 
     #[tokio::test]

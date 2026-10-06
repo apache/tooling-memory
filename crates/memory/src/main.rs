@@ -2715,8 +2715,9 @@ impl Session {
             return Ok(Vec::new());
         };
         let mut args = self.harness.headless(&mine::prompt_for(&excerpt));
-        let model = &model_for(self.harness, self.auth, &self.p.provider, model);
-        args.extend(self.harness.model_flag(model));
+        // the harness's name for the model on this route; a mined entry names it plainly
+        let named = model_for(self.harness, self.auth, &self.p.provider, model);
+        args.extend(self.harness.model_flag(&named));
         let (code, output) = self.run(&args, true).await?;
         // the mining run is not a session anyone continues: its own hook notes go
         let _ = std::fs::remove_dir_all(self.outbox());
@@ -3349,6 +3350,24 @@ mod backend_tests {
     }
 
     #[test]
+    fn a_gateway_route_reshapes_what_its_translation_drops() {
+        let gateway = with_env(&[("LLMAO_KEY", "pat")], || {
+            route_for(Harness::Antigravity, AuthMode::Gateway, None)
+        })
+        .unwrap();
+        assert!(gateway.destination.fold_function_responses);
+        assert!(gateway.destination.fold_system_messages);
+        let google = with_env(&[("GEMINI_API_KEY", "k")], || {
+            route_for(Harness::Antigravity, AuthMode::Key, None)
+        })
+        .unwrap();
+        assert!(
+            !google.destination.fold_function_responses,
+            "Google's own API takes a tool result as agy sends it"
+        );
+    }
+
+    #[test]
     fn the_server_s_own_calls_follow_the_harness_unless_given_a_route() {
         // the harness on a personal login: its route is pass-through, named for the provider
         let harness = route_for(Harness::Claude, AuthMode::Subscription, None).unwrap();
@@ -3511,6 +3530,7 @@ mod backend_tests {
             "named in full already"
         );
         assert_eq!(at(Harness::OpenCode, AuthMode::Gateway), "llmao/gemma4-26b");
+        assert_eq!(at(Harness::Pi, AuthMode::Gateway), "llmao/gemma4-26b");
         assert_eq!(at(Harness::Gemini, AuthMode::Gateway), "gemma4-26b");
     }
 
