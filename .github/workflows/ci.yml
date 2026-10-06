@@ -13,10 +13,37 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # Whether this push or pull request changes only Markdown, which cannot change what
+  # builds (scripts/docs-only.sh). The jobs below skip on a yes; a job skipped by its
+  # condition reports success, so a required check does not sit waiting for it. Anything
+  # the diff cannot answer, a first push or a rewritten base, runs everything.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.diff.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if files=$(git diff --name-only --no-renames "$BASE" "$GITHUB_SHA") &&
+              printf '%s\n' "$files" | sh scripts/docs-only.sh; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "only Markdown changed; the build and test jobs skip"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # The pre-commit gate, as `make check` runs it locally, plus the two checks that need
   # cargo extensions. Actions are pinned by commit; the comment says which release.
   check:
     name: check (linux)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,6 +63,8 @@ jobs:
   # that passes on one and not the other does not merge.
   windows:
     name: test (windows)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,6 +79,8 @@ jobs:
 
   macos:
     name: test (macos)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -63,6 +94,8 @@ jobs:
   # dm-core must build for the browser, or the reader and the plugins cannot.
   wasm:
     name: build (wasm32)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,6 +109,8 @@ jobs:
   # Advisories, licences, duplicate versions, sources. Configured in deny.toml.
   deny:
     name: dependencies
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,6 +120,8 @@ jobs:
   # report is attached to the run for anyone who wants to look at the lines.
   coverage:
     name: coverage
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

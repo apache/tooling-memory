@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: init check verify fmt fmt-check clippy test guard-test deny machete coverage wasm-check run build \
+.PHONY: init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build \
 	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
@@ -122,7 +122,7 @@ local-memory:
 	else target/release/memory --root "$$MEMORY_ROOT" init --domain dom-me; fi
 
 # `make check` is the pre-commit gate: fast, and what every commit must pass.
-check: wasip2-target fmt-check clippy test guard-test taps-check
+check: wasip2-target fmt-check clippy test guard-test docs-only-test taps-check
 
 # `make verify` is what CI runs: the gate plus dependencies, coverage, and the wasm build.
 verify: check deny machete coverage wasm-check
@@ -144,6 +144,8 @@ test:
 	$(TEST_CMD)
 guard-test:
 	sh .claude/hooks/guard-bash.test.sh
+docs-only-test:
+	sh scripts/docs-only.test.sh
 
 # Advisories, licences, duplicate versions, sources. Configured in deny.toml.
 deny:
