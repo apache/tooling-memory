@@ -788,6 +788,7 @@ impl Memory {
         }
         self.store.put_receipt(&receipt).await?;
         self.refresh_projection_after_erasure().await;
+        self.erase_from_projections(&domain, id);
         Ok(receipt)
     }
 
@@ -1483,6 +1484,54 @@ mod tests {
                 !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
                 "{} still holds the erased body",
                 path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn erasure_reaches_every_session_s_projection_not_only_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, ids, _bundle) = vault(dir.path()).await;
+        let [a, b, c, _d, _e] = ids;
+        // two sessions' renders under the root, a live one and one a kill left behind,
+        // and a recall page one of them landed
+        let base = dir.path().join(projection::PROJECTIONS);
+        let peers = [base.join("claude/sess-live"), base.join("codex/run-41")];
+        for p in &peers {
+            m.project_into(p).await.unwrap();
+        }
+        let page = peers[0].join(projection::RECALLS).join("sess-live");
+        std::fs::create_dir_all(&page).unwrap();
+        std::fs::write(page.join("p.md"), format!("served: {MARKER}\n")).unwrap();
+        // the CLI's memory erases, and renders no projection of its own: the vault entry,
+        // superseded and so never rendered but quoted on a recall page, and one listed
+        m.erase(&a, Reason::Requested).await.unwrap();
+        m.erase(&c, Reason::Requested).await.unwrap();
+        drop(m);
+        for (path, bytes) in files_under(dir.path()) {
+            assert!(
+                !bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+                "{} still holds the erased body",
+                path.display()
+            );
+        }
+        for p in &peers {
+            let summaries = std::fs::read_to_string(p.join("dom-me/README.md")).unwrap();
+            assert!(
+                !p.join(format!("dom-me/{c}.md")).exists(),
+                "{}",
+                p.display()
+            );
+            assert!(!summaries.contains(&format!("]({c}.md)")), "{summaries}");
+            assert!(
+                summaries.contains(&format!("]({b}.md)"))
+                    && p.join(format!("dom-me/{b}.md")).exists(),
+                "what was not erased stays: {summaries}"
+            );
+            let listed = summaries.lines().filter(|l| l.starts_with("- [")).count();
+            assert!(
+                summaries.starts_with(&format!("# dom-me: {listed} entries\n")),
+                "{summaries}"
             );
         }
     }

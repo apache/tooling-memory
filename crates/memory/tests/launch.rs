@@ -275,6 +275,40 @@ fn a_session_s_projection_holds_its_own_render_and_nothing_another_left() {
     assert_eq!(left, vec!["dom-other".to_string()], "{left:?}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launch_that_fails_after_rendering_leaves_no_render_behind() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    // no claude anywhere: the render is made, then the plan cannot find the harness
+    let empty = dir.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let mut cmd = memory();
+    cmd.args([
+        "--root",
+        root.to_str().unwrap(),
+        "launch",
+        "--harness",
+        "claude",
+    ])
+    .args(["--auth", "key", "--workdir", work.to_str().unwrap()])
+    .env("PATH", &empty)
+    .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+    .stdin(Stdio::null());
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success());
+    let left: Vec<_> = std::fs::read_dir(root.join("state/projection/claude"))
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "a render outlived its session: {left:?}");
+}
+
 // ---- non-interactive: a prompt, and a task from the ledger ----
 
 /// A fake harness from a shell body. It receives the launcher's arguments; `$*` holds

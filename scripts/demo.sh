@@ -50,13 +50,6 @@ echo "== task $id filed and admitted; a ${HARNESS:-claude} session claims and wo
 work=$(mktemp -d)
 ( cd "$work" && "$memory" --root "$root" work --harness "${HARNESS:-claude}" --auth "${AUTH:-subscription}" --lease-seconds 300 ) || true
 echo
-view="$root/state/projection/${HARNESS:-claude}/dom-demo"
-if [ -f "$view/README.md" ]; then
-  echo "== the projection that session saw at /memory: the record as read-only files, each open a get"
-  sed -n '1,6p' "$view/README.md"
-  echo "... $(ls "$view" | wc -l | tr -d ' ') files"
-  echo
-fi
 echo "== erasure: a throwaway entry, erased by the owner; the stub and the receipt remain"
 gone=$(echo "A note that should never have been written: the demo passphrase is kestrel-91." \
   | "$memory" --root "$root" write --title "Written in error" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')

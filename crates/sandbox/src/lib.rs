@@ -394,8 +394,8 @@ pub const INSIDE_RELAY: &str = "127.0.0.1:4100";
 /// the launcher rendered one.
 pub const INSIDE_PROJECTION: &str = "/memory";
 /// Where the launcher renders the projection on the host, relative to the record root,
-/// one directory per harness: the launcher's own, never under the private home the
-/// harness can write.
+/// one directory per session as `<harness>/<session>/`: the launcher's own, never under
+/// the private home the harness can write.
 pub const PROJECTION: &str = "state/projection";
 /// Where hooks leave notes for the launcher, under the private home.
 pub const OUTBOX: &str = ".memory-outbox";
@@ -690,11 +690,13 @@ fn provider_of(req: &Request<'_>) -> Result<String, Error> {
     })
 }
 
-/// The sandbox's own mounts go on top of the working tree, and would hide it or a part
-/// of it; the home is mounted before the tree, so a tree under it stays.
+/// The working tree and the sandbox's own mounts must not overlap. One mounted after the
+/// tree, under it or at it, hides that part of the tree; a tree at or above one of them
+/// hides the sandbox's own, the home among them. A tree under the home stays: the home
+/// is mounted first.
 fn refuse_a_hidden_workdir(req: &Request<'_>) -> Result<(), Error> {
     let inside = req.workdir_inside();
-    let own = [
+    let after_the_tree = [
         Path::new(INSIDE_PROJECTION),
         Path::new(INSIDE_MEMORY)
             .parent()
@@ -703,7 +705,17 @@ fn refuse_a_hidden_workdir(req: &Request<'_>) -> Result<(), Error> {
             .parent()
             .unwrap_or(Path::new(INSIDE_SOCKET)),
     ];
-    match own.into_iter().find(|own| inside.starts_with(own)) {
+    let own = [
+        Path::new(INSIDE_HOME),
+        Path::new(INSIDE_PROJECTION),
+        Path::new(INSIDE_MEMORY),
+        Path::new(INSIDE_SOCKET),
+    ];
+    let hidden = after_the_tree
+        .into_iter()
+        .find(|own| inside.starts_with(own))
+        .or_else(|| own.into_iter().find(|own| own.starts_with(inside)));
+    match hidden {
         Some(own) => Err(Error::Unsupported(format!(
             "the working tree {} would sit under the sandbox's own {}; run from another directory",
             inside.display(),
@@ -1980,15 +1992,30 @@ mod tests {
                 projection: None,
             })
         };
-        for under in ["/memory", "/memory/w", "/opt/memory/w", "/run/memory/w"] {
+        for under in [
+            "/memory",
+            "/memory/w",
+            "/opt/memory/w",
+            "/run/memory/w",
+            "/home/user",
+            "/home",
+            "/opt",
+            "/run",
+            "/",
+        ] {
             assert!(
                 matches!(plan_at(under), Err(Error::Unsupported(ref m)) if m.contains("sandbox's own")),
-                "{under} would be hidden by a mount the sandbox makes after it"
+                "{under} and the sandbox's own mounts overlap"
             );
         }
         // the home is mounted before the tree, so a tree under it stays; and a sibling
         // whose name only starts the same is not under it
-        for fine in ["/home/user/proj", "/memoryless/w", "/opt/memory-tools"] {
+        for fine in [
+            "/home/user/proj",
+            "/home/someone",
+            "/memoryless/w",
+            "/opt/memory-tools",
+        ] {
             assert!(
                 !matches!(plan_at(fine), Err(Error::Unsupported(ref m)) if m.contains("sandbox's own")),
                 "{fine}"

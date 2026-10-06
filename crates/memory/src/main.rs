@@ -1323,6 +1323,8 @@ struct Prepared {
     home: PathBuf,
     /// Where the record is projected as files for the session, the launcher's own.
     projection: PathBuf,
+    /// Removes the render with the session, on the error paths `finish` never reaches.
+    _render: RemoveOnDrop,
     ceiling: Label,
     ceiling_of: String,
     provider: String,
@@ -1334,6 +1336,18 @@ struct Prepared {
     /// Whether the egress meters this route. A tunnel is pinned without metering, so
     /// the launcher reads what the harness reports about itself afterwards instead.
     metered: bool,
+}
+
+/// A directory removed when this is dropped. A session's render is its own and goes with
+/// it, whichever way the session ends short of the process being killed.
+struct RemoveOnDrop(Option<PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
 }
 
 /// Whether a launch renders the projection, and under what name. A tool run on the host,
@@ -1433,6 +1447,7 @@ async fn prepare_launch(
             .unwrap_or_else(|| run_dir.join(format!("egress-{}.sock", std::process::id()))),
         root: root.to_path_buf(),
         home,
+        _render: RemoveOnDrop((projected != Projected::No).then(|| projection.clone())),
         projection,
         ceiling,
         ceiling_of,
@@ -2309,9 +2324,6 @@ struct RunOptions {
     projection: Option<String>,
 }
 
-/// The environment the run options add: the board for subagents, and for Claude Code
-/// the model as every role's default, since it picks a model per role and a gateway
-/// that serves one model answers only for that one.
 impl RunOptions {
     fn new(
         model: Option<String>,
@@ -2328,6 +2340,9 @@ impl RunOptions {
     }
 }
 
+/// The environment the run options add: the board for subagents, and for Claude Code
+/// the model as every role's default, since it picks a model per role and a gateway
+/// that serves one model answers only for that one.
 fn apply_run_options(p: &mut Prepared, harness: Harness, auth: AuthMode, options: &RunOptions) {
     p.model.clone_from(&options.model);
     if harness == Harness::Claude && auth == AuthMode::Gateway {
@@ -2848,7 +2863,8 @@ impl Session {
             record_reported_usage(&self.p);
         }
         report_usage(&self.p.egress);
-        // the render was this session's alone, and goes with it
+        // the render was this session's alone, and goes with it; here as well as in the
+        // guard, since a launch ends in process::exit, which runs no destructors
         std::fs::remove_dir_all(&self.p.projection).ok();
         if let Runner::Requests(r) = &self.runner {
             std::fs::write(r.dir.join(requests::DONE), code.to_string()).ok();
@@ -3222,6 +3238,30 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn each_session_renders_under_a_name_of_its_own() {
+        assert_eq!(dm_sandbox::PROJECTION, dm_server::projection::PROJECTIONS);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("m");
+        dm_server::Memory::init(&root, "human:test:me", "dom-me").unwrap();
+        let creds = || Credentials {
+            auth: AuthMode::Subscription,
+            provider: None,
+            server_auth: None,
+            server_provider: None,
+        };
+        let at = |projected| prepare_launch(&root, Harness::Claude, creds(), None, None, projected);
+        let base = root.join(dm_sandbox::PROJECTION).join("claude");
+        let a = at(Projected::AsSession).await.unwrap();
+        let b = at(Projected::AsSession).await.unwrap();
+        assert_eq!(a.projection, base.join(a.memory.session_id()));
+        assert_ne!(a.projection, b.projection, "two sessions, two renders");
+        // the name the launcher outside mounts is the one the inside renders under
+        let named = at(Projected::Named("run-7-1a2b")).await.unwrap();
+        assert_eq!(named.projection, base.join("run-7-1a2b"));
+        assert!(at(Projected::Named("../codex")).await.is_err());
+    }
 
     #[test]
     fn a_projection_name_from_the_command_line_is_one_component() {

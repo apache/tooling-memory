@@ -436,8 +436,13 @@ fn run_cli(l: &Launch) -> Fallible<i32> {
     let home_dir = l.root.join("state/sandbox").join(l.harness.binary());
     std::fs::create_dir_all(&home_dir)?;
     let home_m = mount_path(&home_dir)?;
-    // made here, so the container mounts it before the inside renders into it
-    let projection = format!("run-{pid}");
+    // made here, so the container mounts it before the inside renders into it; the pid
+    // alone could come round again on a root a killed run left a render in
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    let projection = format!("run-{pid}-{nanos:08x}");
     let projection_host = projection_dir(l, &projection);
     std::fs::create_dir_all(&projection_host)?;
     let projection_m = Some(mount_path(&projection_host)?);

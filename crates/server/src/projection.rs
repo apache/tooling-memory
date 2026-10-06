@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 pub const SUMMARIES: &str = "README.md";
 /// The directory, beside the domains, where a session's recalls land as files.
 pub const RECALLS: &str = "recall";
+/// Where the launcher renders each session's projection under the root, one directory
+/// per session as `<harness>/<session>/`. Kept in step with `dm_sandbox::PROJECTION`.
+pub const PROJECTIONS: &str = "state/projection";
 
 /// The file an entry is projected as.
 #[must_use]
@@ -276,6 +279,52 @@ impl Memory {
         }
     }
 
+    /// After an erasure, in every session's projection under the root, not only this
+    /// one's: a live session's, which nothing else would reach before its own next
+    /// write, and one a killed session left behind, which nothing renders again. The
+    /// entry's file goes, its line leaves the domain's summaries, and every recall page
+    /// goes, since a page holds bodies as they were served. Only real directories are
+    /// walked; a link in the tree is left where it is.
+    pub(crate) fn erase_from_projections(&self, domain: &str, id: &str) {
+        let base = self.root.join(PROJECTIONS);
+        for dir in real_subdirs(&base).iter().flat_map(|h| real_subdirs(h)) {
+            if let Err(e) = self.erase_from(&dir, domain, id) {
+                eprintln!("memory: projection at {}: {e}", dir.display());
+            }
+        }
+    }
+
+    fn erase_from(&self, dir: &Path, domain: &str, id: &str) -> Result<(), Error> {
+        let dom = dir.join(domain);
+        if std::fs::symlink_metadata(&dom).is_ok_and(|m| m.is_dir()) {
+            let file = dom.join(entry_file(id));
+            match std::fs::remove_file(&file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(io(&file)(e));
+                }
+                _ => {}
+            }
+            let summaries = dom.join(SUMMARIES);
+            let link = format!("]({})", entry_file(id));
+            if let Some(text) = read_own(&summaries).filter(|t| t.contains(&link)) {
+                let kept: Vec<&str> = text.lines().filter(|line| !line.contains(&link)).collect();
+                // the header counts the lines, as render_summaries wrote it
+                let listed = kept.iter().filter(|line| line.starts_with("- [")).count();
+                let page: String = kept
+                    .iter()
+                    .enumerate()
+                    .map(|(n, line)| match n {
+                        0 if line.starts_with("# ") => format!("# {domain}: {listed} entries\n"),
+                        _ => format!("{line}\n"),
+                    })
+                    .collect();
+                write_atomically(&summaries, &page)?;
+            }
+        }
+        self.sweep_recalls(dir, false)?;
+        Ok(())
+    }
+
     /// After an erasure: every recall page goes, this session's included, and the
     /// domains are rendered again.
     pub(crate) async fn refresh_projection_after_erasure(&self) {
@@ -368,6 +417,20 @@ pub fn render_recall(r: &crate::recall::Recall) -> String {
         }
     }
     out
+}
+
+/// The directories directly under `dir`, links and files left out; none when it is not
+/// a directory.
+fn real_subdirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The text of a projected file, if it is a plain file of the projection's own; a
