@@ -181,7 +181,7 @@ async fn dump(url: String) -> String {
     .unwrap();
     let dom = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        dom.contains("memory reader"),
+        dom.contains("amem reader"),
         "the page did not load:\n{dom}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );

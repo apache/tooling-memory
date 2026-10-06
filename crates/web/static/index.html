@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>memory</title>
+<title>amem</title>
 <style>
   :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; --muted: #6b6b6b; --line: #ddd; --accent: #0a62c9; --card: #ffffff; --mono: ui-monospace, Menlo, Consolas, monospace; }
   @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #16181d; --muted: #9a9a9a; --line: #333; --accent: #6fb2ff; --card: #1c1f26; } }
@@ -29,7 +29,7 @@
 </style>
 </head>
 <body>
-<h1>memory</h1>
+<h1>amem</h1>
 <form id="new">
   <label>Harness
     <select name="harness" id="harness" required><option value="">choose…</option></select>
@@ -131,7 +131,7 @@ function body() {
 function preview() {
   const b = body();
   const q = (s) => /[\s"']/.test(s) ? `'${s.replace(/'/g, `'\\''`)}'` : s;
-  const parts = ['memory', b.work ? 'work' : 'launch', '--harness', b.harness || '<harness>', '--auth', b.auth];
+  const parts = ['amem', b.work ? 'work' : 'launch', '--harness', b.harness || '<harness>', '--auth', b.auth];
   if (b.provider) parts.push('--provider', b.provider);
   if (b.model) parts.push('--model', q(b.model));
   if (b.subagents && b.subagents !== (b.work ? 'board' : 'harness')) parts.push('--subagents', b.subagents);

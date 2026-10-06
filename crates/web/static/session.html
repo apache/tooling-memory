@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>memory session</title>
+<title>amem session</title>
 <link rel="stylesheet" href="/vendor/xterm.min.css">
 <style>
   :root { color-scheme: dark; --bg: #16181d; --fg: #e8e8e8; --muted: #9a9a9a; --line: #2b2f36; --accent: #6fb2ff; --pane: #1c1f26; }
@@ -26,7 +26,7 @@
 </style>
 </head>
 <body>
-<div class="bar"><a href="/">memory</a><span id="title"></span><span class="status" id="status">connecting</span></div>
+<div class="bar"><a href="/">amem</a><span id="title"></span><span class="status" id="status">connecting</span></div>
 <div class="main">
   <div id="term"></div>
   <aside class="pane">
@@ -122,7 +122,7 @@ async function poll() {
   } catch (e) { /* the server may be busy; try again */ }
 }
 poll(); setInterval(poll, 2000);
-fetch(`/api/sessions/${id}`).then(r => r.json()).then(s => { document.getElementById('title').textContent = s.title; document.title = `memory · ${s.title}`; });
+fetch(`/api/sessions/${id}`).then(r => r.json()).then(s => { document.getElementById('title').textContent = s.title; document.title = `amem · ${s.title}`; });
 </script>
 </body>
 </html>
