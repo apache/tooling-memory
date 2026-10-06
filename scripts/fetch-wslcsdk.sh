@@ -23,19 +23,30 @@ fi
 dest=$1
 arch=${2:-x64}
 case $arch in
-x64) want=$dll_sha256_x64 ;;
-arm64) want=$dll_sha256_arm64 ;;
+x64) dll_sha256=$dll_sha256_x64 ;;
+arm64) dll_sha256=$dll_sha256_arm64 ;;
 *)
     echo "fetch-wslcsdk: no such architecture: $arch (x64 or arm64)" >&2
     exit 2
     ;;
 esac
 
-sha256() {
+# Stop, writing nothing, unless the file's sha256 is the one pinned for it. Its variables
+# are prefixed, since sh has no locals and a plain name would overwrite the script's.
+require_sum() {
+    rs_file=$1 rs_want=$2 rs_what=$3
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | cut -d' ' -f1
+        rs_got=$(sha256sum "$rs_file" | cut -d' ' -f1)
     else
-        shasum -a 256 "$1" | cut -d' ' -f1
+        rs_got=$(shasum -a 256 "$rs_file" | cut -d' ' -f1)
+    fi
+    if [ -z "$rs_got" ]; then
+        echo "fetch-wslcsdk: could not hash $rs_what ($rs_file); nothing written" >&2
+        exit 1
+    fi
+    if [ "$rs_got" != "$rs_want" ]; then
+        echo "fetch-wslcsdk: $rs_what has sha256 $rs_got, not $rs_want as pinned; nothing written" >&2
+        exit 1
     fi
 }
 
@@ -49,18 +60,9 @@ if [ -z "$pkg" ]; then
         "https://api.nuget.org/v3-flatcontainer/microsoft.wsl.containers/$version/microsoft.wsl.containers.$version.nupkg"
 fi
 
-got=$(sha256 "$pkg")
-if [ "$got" != "$nupkg_sha256" ]; then
-    echo "fetch-wslcsdk: the package's sha256 is $got, not $nupkg_sha256 as pinned for $version; nothing written" >&2
-    exit 1
-fi
-
+require_sum "$pkg" "$nupkg_sha256" "the $version package"
 unzip -p "$pkg" "runtimes/win-$arch/native/wslcsdk.dll" >"$work/wslcsdk.dll"
-got=$(sha256 "$work/wslcsdk.dll")
-if [ "$got" != "$want" ]; then
-    echo "fetch-wslcsdk: the $arch DLL's sha256 is $got, not $want as pinned; nothing written" >&2
-    exit 1
-fi
+require_sum "$work/wslcsdk.dll" "$dll_sha256" "the $arch DLL"
 
 mkdir -p "$dest"
 cp "$work/wslcsdk.dll" "$dest/wslcsdk.dll"

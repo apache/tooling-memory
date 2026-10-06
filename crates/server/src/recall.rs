@@ -1428,11 +1428,8 @@ mod tests {
         assert_eq!(a.queries, ["q1", "q2"]);
     }
 
-    /// A deputy that answers only after a minute, and records when it has.
-    #[derive(Default)]
-    struct Hangs {
-        answered: std::sync::atomic::AtomicBool,
-    }
+    /// A deputy that never answers.
+    struct Hangs;
 
     impl Deputy for Hangs {
         fn model(&self) -> String {
@@ -1444,15 +1441,15 @@ mod tests {
             _prompt: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                self.answered
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 Ok(String::new())
             })
         }
     }
 
-    #[tokio::test]
+    // the clock is paused: tokio's time moves only when everything waits, so the elapsed
+    // time below is what the recall's own timeout allowed, whatever the machine's load
+    #[tokio::test(start_paused = true)]
     async fn the_wall_clock_bounds_the_whole_recall() {
         let dir = tempfile::tempdir().unwrap();
         let m = mem(dir.path());
@@ -1463,9 +1460,9 @@ mod tests {
             vec![],
         )
         .await;
-        let hangs = Arc::new(Hangs::default());
-        let deputy: Arc<dyn Deputy> = hangs.clone();
+        let deputy: Arc<dyn Deputy> = Arc::new(Hangs);
         m.set_deputy(&deputy);
+        let started = tokio::time::Instant::now();
         let err = m
             .recall(
                 "retry",
@@ -1482,10 +1479,10 @@ mod tests {
             matches!(err, Error::Deputy(ref s) if s.contains("within")),
             "{err}"
         );
-        // the recall was over before the deputy answered: cut off, not waited out
         assert!(
-            !hangs.answered.load(std::sync::atomic::Ordering::SeqCst),
-            "the recall waited for the deputy"
+            started.elapsed() <= Duration::from_millis(50),
+            "the recall ran {:?} on a 50 ms wall",
+            started.elapsed()
         );
     }
 
@@ -1679,7 +1676,9 @@ mod tests {
         .await;
         // each call is well under the wall and the two together well over it, with
         // seconds of slack either side, so load on the machine moves neither: a second
-        // hop given a wall of its own would answer, and one sharing the first's cannot
+        // hop given a wall of its own would answer, and one sharing the first's cannot.
+        // Real time, not a paused clock: the deadline is a std Instant, which a paused
+        // tokio clock does not move, so the second hop would see the whole wall left
         let deputy = Scripted::paced(
             &[
                 &format!("{{\"brief\": \"first [{retry}]\", \"missing\": [\"attempts\"]}}"),
