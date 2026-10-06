@@ -84,6 +84,8 @@ pub enum Harness {
     Grok,
     /// Meta's Muse Code, `muse`.
     Muse,
+    /// The pi coding agent, `pi`: four tools and extensions.
+    Pi,
     /// GitHub Copilot CLI.
     Copilot,
     /// OpenCode.
@@ -106,6 +108,7 @@ impl Harness {
             Harness::Qwen => "qwen",
             Harness::Grok => "grok",
             Harness::Muse => "muse",
+            Harness::Pi => "pi",
             Harness::Copilot => "copilot",
             Harness::OpenCode => "opencode",
             Harness::Command => "command",
@@ -117,7 +120,7 @@ impl Harness {
     pub fn provider(self) -> &'static str {
         match self {
             Harness::Claude | Harness::OpenCode => "anthropic",
-            Harness::Codex | Harness::Command => "openai",
+            Harness::Codex | Harness::Pi | Harness::Command => "openai",
             Harness::Gemini | Harness::Antigravity => "gemini",
             Harness::Qwen => "dashscope",
             Harness::Grok => "xai",
@@ -183,6 +186,10 @@ impl Harness {
                 "--disable-reminders".into(),
                 p,
             ],
+            // pi has no permission system of its own, so nothing to turn off; project-local
+            // extensions are ignored, so only the launcher's runs; stdin is closed by the
+            // sandbox, which pi otherwise waits on
+            Harness::Pi => vec!["-p".into(), "-na".into(), p],
             Harness::Copilot => vec!["-p".into(), p, "--allow-all-tools".into()],
             Harness::OpenCode => vec!["run".into(), p],
             // a program has no headless form of its own; the prompt is its first argument
@@ -194,7 +201,11 @@ impl Harness {
     #[must_use]
     pub fn model_flag(self, model: &str) -> Vec<String> {
         match self {
-            Harness::Claude | Harness::Copilot | Harness::Antigravity | Harness::Muse => {
+            Harness::Claude
+            | Harness::Copilot
+            | Harness::Antigravity
+            | Harness::Muse
+            | Harness::Pi => {
                 vec!["--model".into(), model.into()]
             }
             Harness::Codex
@@ -213,7 +224,7 @@ impl Harness {
     pub fn accepts_provider(self) -> bool {
         matches!(
             self,
-            Harness::Codex | Harness::Qwen | Harness::OpenCode | Harness::Command
+            Harness::Codex | Harness::Qwen | Harness::OpenCode | Harness::Pi | Harness::Command
         )
     }
 }
@@ -718,6 +729,7 @@ fn setup_harness(
         Harness::Qwen => setup_qwen(req, relay, provider, env),
         Harness::Grok => setup_grok(req, relay, provider, env),
         Harness::Muse => setup_muse(req, relay, provider, env, tail),
+        Harness::Pi => setup_pi(req, relay, provider, env),
         Harness::Copilot => setup_copilot(req, relay, env),
         Harness::OpenCode => setup_opencode(req, relay, provider, env),
         Harness::Command => {
@@ -1202,6 +1214,100 @@ fn setup_muse(
     )
 }
 
+/// The pi coding agent keeps its configuration under `~/.pi/agent`: `models.json` for
+/// providers of one's own, `mcp.json` for MCP servers, `extensions/` for TypeScript it
+/// loads directly. A destination is a provider in `models.json`, named after it, with
+/// the egress as `baseUrl`, OpenAI's chat completions as the API and the model named,
+/// since pi picks a model from the providers' lists and a provider with no models
+/// offers none: a pi run wants `--model`. pi has no hooks; an extension of the
+/// launcher's runs the hook binary instead, on `tool_call`, where it may block with a
+/// reason the model sees, and on `session_shutdown`; there is no event before
+/// compaction. Its sessions are JSON Lines under the agent directory. pi's logins are
+/// its own built-in provider's and Anthropic's, which Anthropic prohibits for third-party
+/// clients, so a login mode is refused.
+fn setup_pi(
+    req: &Request<'_>,
+    relay: &str,
+    provider: &str,
+    env: &mut BTreeMap<String, String>,
+) -> Result<(), Error> {
+    if req.auth == AuthMode::Subscription {
+        return Err(Error::Unsupported(
+            "pi has no login the launcher can carry: its Anthropic login is something Anthropic prohibits for third-party clients; use --auth key or --auth gateway with --model".into(),
+        ));
+    }
+    let Some(model) = req.model.filter(|m| !m.trim().is_empty()) else {
+        return Err(Error::Unsupported(
+            "pi picks a model from its providers' lists, so a run needs --model".into(),
+        ));
+    };
+    let agent = req.home.join(".pi/agent");
+    let models = serde_json::json!({
+        "providers": {
+            provider: {
+                "baseUrl": format!("{relay}/{provider}/v1"),
+                "api": "openai-completions",
+                "apiKey": "egress",
+                "models": [{ "id": model.trim(), "name": model.trim() }]
+            }
+        }
+    });
+    write(
+        &agent.join("models.json"),
+        &serde_json::to_string_pretty(&models).unwrap_or_default(),
+    )?;
+    let mcp = serde_json::json!({
+        "mcpServers": { "memory": { "url": format!("{relay}/mcp") } }
+    });
+    write(
+        &agent.join("mcp.json"),
+        &serde_json::to_string_pretty(&mcp).unwrap_or_default(),
+    )?;
+    let extension = format!(
+        r#"// written by memory launch; edits are overwritten. The launcher's hooks, as a pi
+// extension: pi has none of its own, so the hook binary is run from here.
+import {{ spawnSync }} from "node:child_process";
+
+function hook(event: string, payload: Record<string, unknown>): any {{
+  const r = spawnSync("{INSIDE_MEMORY}", ["hook", "pi"], {{
+    input: JSON.stringify({{ hook_event_name: event, ...payload }}),
+    encoding: "utf8",
+    timeout: 30000,
+  }});
+  if (!r.stdout) return null;
+  try {{ return JSON.parse(r.stdout); }} catch {{ return null; }}
+}}
+
+function sessionOf(ctx: any): {{ session_id: string; transcript_path: string | null }} {{
+  const m = ctx?.sessionManager;
+  return {{
+    session_id: typeof m?.getSessionId === "function" ? m.getSessionId() ?? "" : "",
+    transcript_path: typeof m?.getSessionFile === "function" ? m.getSessionFile() ?? null : null,
+  }};
+}}
+
+export default function (pi: any) {{
+  pi.on("tool_call", async (e: any, ctx: any) => {{
+    const out = hook("PreToolUse", {{ ...sessionOf(ctx), tool_name: e.toolName, tool_input: e.input }});
+    const d = out?.hookSpecificOutput;
+    if (d && d.permissionDecision === "deny") {{
+      return {{ block: true, reason: d.permissionDecisionReason || "refused" }};
+    }}
+  }});
+  pi.on("session_shutdown", async (_e: any, ctx: any) => {{
+    hook("SessionEnd", {{ ...sessionOf(ctx), reason: "exit" }});
+  }});
+}}
+"#
+    );
+    write(&agent.join("extensions/memory.ts"), &extension)?;
+    // the egress injects the real key; this one only has to exist
+    env.insert("OPENAI_API_KEY".into(), "egress".into());
+    env.insert("PI_SKIP_VERSION_CHECK".into(), "1".into());
+    env.insert("PI_OFFLINE".into(), "1".into());
+    Ok(())
+}
+
 fn setup_copilot(
     req: &Request<'_>,
     relay: &str,
@@ -1446,7 +1552,7 @@ mod tests {
         let bins = dir.path().join("bins");
         std::fs::create_dir_all(&bins).unwrap();
         for b in [
-            "claude", "codex", "gemini", "agy", "qwen", "grok", "muse", "copilot", "opencode",
+            "claude", "codex", "gemini", "agy", "qwen", "grok", "muse", "pi", "copilot", "opencode",
         ] {
             fake_bin(&bins, b);
         }
@@ -2449,6 +2555,55 @@ mod tests {
             .argv
             .iter()
             .any(|a| a == "http://127.0.0.1:4100/meta/v1"));
+    }
+
+    #[test]
+    fn pi_refuses_a_run_without_a_model_and_a_login() {
+        let f = fixture();
+        // no model, no provider list to pick from
+        assert!(matches!(
+            f.plan(Harness::Pi, AuthMode::Key, "p0", &[], false),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            f.plan(Harness::Pi, AuthMode::Subscription, "p0", &[], false),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(Harness::Pi.headless("hi"), vec!["-p", "-na", "hi"]);
+        assert_eq!(Harness::Pi.model_flag("m"), vec!["--model", "m"]);
+        assert_eq!(Harness::Pi.provider(), "openai");
+        assert!(Harness::Pi.accepts_provider());
+    }
+
+    #[test]
+    fn pi_plan_declares_the_destination_as_a_provider_with_the_model_named() {
+        let f = fixture();
+        let (home, plan) = f
+            .plan_model(Harness::Pi, AuthMode::Key, "p1", "gpt-5-mini")
+            .unwrap();
+        let models = json_file(&home.join(".pi/agent/models.json"));
+        assert_eq!(
+            models["providers"]["openai"]["baseUrl"],
+            "http://127.0.0.1:4100/openai/v1"
+        );
+        assert_eq!(models["providers"]["openai"]["api"], "openai-completions");
+        assert_eq!(
+            models["providers"]["openai"]["models"][0]["id"],
+            "gpt-5-mini"
+        );
+        let mcp = json_file(&home.join(".pi/agent/mcp.json"));
+        assert_eq!(
+            mcp["mcpServers"]["memory"]["url"],
+            "http://127.0.0.1:4100/mcp"
+        );
+        let ext = std::fs::read_to_string(home.join(".pi/agent/extensions/memory.ts")).unwrap();
+        assert!(
+            ext.contains("\"/opt/memory/memory\", [\"hook\", \"pi\"]"),
+            "{ext}"
+        );
+        assert!(ext.contains("tool_call") && ext.contains("session_shutdown"));
+        assert_eq!(plan.env["OPENAI_API_KEY"], "egress");
+        assert_eq!(plan.env["PI_OFFLINE"], "1");
     }
 
     #[test]

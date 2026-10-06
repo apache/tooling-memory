@@ -14,6 +14,7 @@ ARG COPILOT=1.0.91
 ARG OPENCODE=1.18.34
 ARG QWEN_CODE=0.24.7
 ARG GROK=1.0.46
+ARG PI=1.0.4
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -37,6 +38,10 @@ RUN npm install -g --no-fund --no-audit \
  && npm cache clean --force \
  && claude --version && codex --version && gemini --version && copilot --version && opencode --version \
  && qwen --version && grok --version
+
+# pi, installed as its own docs say, without its install scripts, which only phone home.
+RUN npm install -g --no-fund --no-audit --ignore-scripts "@earendil-works/pi-coding-agent@${PI}" \
+ && npm cache clean --force && pi --version
 
 # Muse Code is a launcher script that fetches a statically linked binary from Meta's
 # release channel; the channel, not a version, is what pins it, so the version the

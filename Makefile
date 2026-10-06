@@ -50,7 +50,7 @@ PROMPT ?=
 LOOP ?=
 BACKEND ?= auto
 launch: build
-	@test -n "$(HARNESS)" || { echo "HARNESS= is required: claude, codex, gemini, antigravity, qwen, grok, muse, copilot, opencode or command" >&2; exit 2; }
+	@test -n "$(HARNESS)" || { echo "HARNESS= is required: claude, codex, gemini, antigravity, qwen, grok, muse, pi, copilot, opencode or command" >&2; exit 2; }
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
@@ -83,7 +83,7 @@ web: build
 
 # Claim the next task from the ledger and run the harness on it. LOOP=1 keeps claiming.
 work: build
-	@test -n "$(HARNESS)" || { echo "HARNESS= is required: claude, codex, gemini, antigravity, qwen, grok, muse, copilot, opencode or command" >&2; exit 2; }
+	@test -n "$(HARNESS)" || { echo "HARNESS= is required: claude, codex, gemini, antigravity, qwen, grok, muse, pi, copilot, opencode or command" >&2; exit 2; }
 	@set -a; . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \

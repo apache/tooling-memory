@@ -150,6 +150,8 @@ enum HarnessArg {
     Grok,
     /// Meta's Muse Code, `muse`.
     Muse,
+    /// The pi coding agent, `pi`.
+    Pi,
     Copilot,
     Opencode,
     /// A program: the first argument after `--` is run as given, with the egress and
@@ -167,6 +169,7 @@ impl From<HarnessArg> for Harness {
             HarnessArg::Qwen => Harness::Qwen,
             HarnessArg::Grok => Harness::Grok,
             HarnessArg::Muse => Harness::Muse,
+            HarnessArg::Pi => Harness::Pi,
             HarnessArg::Copilot => Harness::Copilot,
             HarnessArg::Opencode => Harness::OpenCode,
             HarnessArg::Command => Harness::Command,
@@ -2432,8 +2435,8 @@ impl Session {
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
         let mut full: Vec<String> = [self.program.as_slice(), args].concat();
         if let Some(m) = &self.model {
-            // OpenCode names a model by its provider, which here is the destination
-            let m = if self.harness == Harness::OpenCode && !m.contains('/') {
+            // OpenCode and pi name a model by its provider, which here is the destination
+            let m = if matches!(self.harness, Harness::OpenCode | Harness::Pi) && !m.contains('/') {
                 format!("{}/{m}", self.p.provider)
             } else {
                 m.clone()
@@ -2617,6 +2620,7 @@ fn run_unconfined(
         | Harness::Qwen
         | Harness::Grok
         | Harness::Muse
+        | Harness::Pi
         | Harness::Copilot
         | Harness::OpenCode
         | Harness::Command => {

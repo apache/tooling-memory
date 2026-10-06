@@ -225,7 +225,7 @@ fn title_for(req: &NewSession, config: &Config) -> String {
 /// the page and the launcher agree.
 fn options(config: &Config) -> Value {
     json!({
-        "harnesses": ["claude", "codex", "gemini", "antigravity", "qwen", "grok", "muse", "copilot", "opencode"],
+        "harnesses": ["claude", "codex", "gemini", "antigravity", "qwen", "grok", "muse", "pi", "copilot", "opencode"],
         "auth": ["subscription", "key", "gateway"],
         "destinations": {
             "subscription": [],

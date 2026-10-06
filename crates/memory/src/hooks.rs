@@ -210,7 +210,7 @@ fn normalise(path: &Path) -> PathBuf {
 fn reads_one(tool: &str) -> bool {
     matches!(
         tool,
-        "Read" | "read_file" | "view" | "view_file" | "NotebookRead" | "read_resource"
+        "Read" | "read" | "read_file" | "view" | "view_file" | "NotebookRead" | "read_resource"
     )
 }
 
@@ -574,6 +574,17 @@ fn text_of(content: &Value) -> String {
 /// Antigravity CLI: `{"type":"USER_INPUT"|"PLANNER_RESPONSE","content":"…"}`, one a line.
 /// Muse Code: the JSONL its headless run prints, records with a `payload_type`; the
 /// prompt is `turn.input.user` and the answer is `run.terminal.completed`.
+/// pi: `{"type":"message","message":{"role":…,"content":[{"type":"text","text":…}]}}`.
+/// A Muse Code record's turn, when it is one: the prompt or the final text.
+fn muse_turn(v: &Value) -> Option<(&'static str, String)> {
+    let payload = v.get("payload")?;
+    match v.get("payload_type").and_then(Value::as_str)? {
+        "turn.input.user" => Some(("user", payload.get("prompt")?.as_str()?.to_string())),
+        "run.terminal.completed" => Some(("assistant", payload.get("text")?.as_str()?.to_string())),
+        _ => None,
+    }
+}
+
 fn turns_in(v: &Value) -> Vec<Turn> {
     let keep = |role: &str, text: String| {
         let text = text.trim().to_string();
@@ -582,20 +593,11 @@ fn turns_in(v: &Value) -> Vec<Turn> {
             text,
         })
     };
-    if let Some(kind) = v.get("payload_type").and_then(Value::as_str) {
-        let payload = v.get("payload").unwrap_or(&Value::Null);
-        let turn = match kind {
-            "turn.input.user" => payload
-                .get("prompt")
-                .and_then(Value::as_str)
-                .and_then(|t| keep("user", t.to_string())),
-            "run.terminal.completed" => payload
-                .get("text")
-                .and_then(Value::as_str)
-                .and_then(|t| keep("assistant", t.to_string())),
-            _ => None,
-        };
-        return turn.into_iter().collect();
+    if v.get("payload_type").is_some() {
+        return muse_turn(v)
+            .and_then(|(who, text)| keep(who, text))
+            .into_iter()
+            .collect();
     }
     if let Some(role) = v.get("type").and_then(Value::as_str) {
         let planner = match role {
@@ -610,6 +612,18 @@ fn turns_in(v: &Value) -> Vec<Turn> {
                 .replace("<USER_REQUEST>", "")
                 .replace("</USER_REQUEST>", "");
             return keep(who, text).into_iter().collect();
+        }
+        // pi wraps a message, with the role inside it
+        if role == "message" {
+            if let Some(m) = v.get("message") {
+                let who = m.get("role").and_then(Value::as_str).unwrap_or_default();
+                if who == "user" || who == "assistant" {
+                    return keep(who, text_of(m.get("content").unwrap_or(&Value::Null)))
+                        .into_iter()
+                        .collect();
+                }
+            }
+            return Vec::new();
         }
         // Claude Code's message has content; Qwen Code's is the Gemini API's, with
         // parts; Grok Build's item carries its content at the top
@@ -866,6 +880,29 @@ not json
             "{capped}"
         );
         assert_eq!(transcript_tail("", 10, 100), "");
+    }
+
+    #[test]
+    fn pi_s_session_file_is_read() {
+        let t = concat!(
+            r#"{"type":"session","version":3,"id":"s1"}"#,
+            "\n",
+            r#"{"type":"model_change","provider":"llmao","modelId":"qwen3.8-27b"}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"system","content":"","sections":{}}}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"what is T0?"}]}}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"The first page."}],"usage":{"input":120,"output":4}}}"#,
+            "\n",
+        );
+        let tail = transcript_tail(t, 10, 10_000);
+        assert!(
+            tail.contains("what is T0?") && tail.contains("The first page."),
+            "{tail}"
+        );
+        assert!(!tail.contains("system"), "{tail}");
+        assert!(reads_one("read"), "pi's read tool");
     }
 
     #[test]
