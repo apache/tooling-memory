@@ -294,8 +294,9 @@ and wrong for the Foundation, where the front desk mints a virtual key per princ
 ## The WSL containers C API
 
 `wslcsdk.dll` is what Microsoft supports for production, and it does not ship with WSL: it
-comes in the `Microsoft.WSL.Containers` NuGet package, as
-`runtimes/win-x64/native/wslcsdk.dll`, and goes beside `memory.exe`. The binding is
+comes in the `Microsoft.WSL.Containers` NuGet package, version 3.0.1, and goes beside
+`memory.exe`. `make wslcsdk DEST=<that directory>` fetches it, checking the package and the
+DLL against pinned sums and writing nothing when either differs. The binding is
 `crates/wslc-api`, Windows only and loaded at run time; the backend over it is
 `crates/memory/src/wslc_api.rs`. On Windows, `--backend wslc` uses it wherever it can
 serve, the same two containers as over the command line, and `--wslc-via cli` or `api`

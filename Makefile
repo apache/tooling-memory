@@ -123,7 +123,7 @@ local-memory:
 	else target/release/amem --root "$$MEMORY_ROOT" init --domain dom-me; fi
 
 # `make check` is the pre-commit gate: fast, and what every commit must pass.
-check: wasip2-target fmt-check clippy test guard-test docs-only-test taps-check
+check: wasip2-target fmt-check clippy test guard-test docs-only-test wslcsdk-test taps-check
 
 # `make verify` is what CI runs: the gate plus dependencies, coverage, and the wasm build.
 verify: check deny machete coverage wasm-check
@@ -147,6 +147,12 @@ guard-test:
 	sh .claude/hooks/guard-bash.test.sh
 docs-only-test:
 	sh scripts/docs-only.test.sh
+wslcsdk-test:
+	sh scripts/fetch-wslcsdk.test.sh
+
+# wslcsdk.dll, the WSL containers C API, beside the Windows memory.exe: pinned and checked.
+wslcsdk:
+	sh scripts/fetch-wslcsdk.sh "$(or $(DEST),target/release)"
 
 # Advisories, licences, duplicate versions, sources. Configured in deny.toml.
 deny:
