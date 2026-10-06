@@ -311,8 +311,9 @@ takes about two. Ctrl-C ends the session and everything in it. A session disk ca
 a `\\wsl.localhost` share, so a record root there needs `--wslc-storage` (or
 `MEMORY_WSLC_STORAGE`) naming a local directory; otherwise the disks go under the root's
 `state/wslc-api`. One session holds a disk at a time, so concurrent launches take numbered
-slots, each provisioned once, and a slot whose launcher was killed is ended and taken back
-by the next launch.
+slots, each provisioned once. A slot whose launcher was killed is ended and taken back by
+the next launch, which also removes the containers and the run volume the killed one left
+on the slot's disk.
 
 ## In the harness image, on Linux: `make unpack`
 

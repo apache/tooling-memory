@@ -236,6 +236,55 @@ pub(crate) fn creator_of(listing: &str, name: &str) -> Option<u32> {
     })
 }
 
+/// `ERROR_ALREADY_EXISTS`: another process holds a session by that name.
+const ALREADY_EXISTS: u32 = 0x8007_00b7;
+/// `ERROR_SHARING_VIOLATION`: another session holds that disk.
+const SHARING_VIOLATION: u32 = 0x8007_0020;
+
+/// Take the first free slot: `create` makes slot `n`'s session, and a slot whose name is
+/// taken is offered to `reclaim`, which ends the session if its creator is gone. A slot
+/// still busy is passed over. The session and its slot number, or `None` when every slot
+/// is in use.
+///
+/// # Errors
+///
+/// A failure other than the slot being busy.
+pub(crate) fn take_slot<S>(
+    slots: usize,
+    mut create: impl FnMut(usize) -> Result<S, dm_wslc_api::Error>,
+    mut reclaim: impl FnMut(usize) -> bool,
+) -> Result<Option<(S, usize)>, dm_wslc_api::Error> {
+    let busy = |e: &dm_wslc_api::Error| e.hr == ALREADY_EXISTS || e.hr == SHARING_VIOLATION;
+    for n in 0..slots {
+        match create(n) {
+            Ok(s) => return Ok(Some((s, n))),
+            // a reclaimed session's disk may still be releasing; then it is busy too
+            Err(e) if e.hr == ALREADY_EXISTS && reclaim(n) => match create(n) {
+                Ok(s) => return Ok(Some((s, n))),
+                Err(e) if busy(&e) => continue,
+                Err(e) => return Err(e),
+            },
+            Err(e) if busy(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+/// The run volumes in a slot's `volumes` directory that are not this run's: a slot is
+/// held by one launch at a time, so any other is left by a launch that was killed.
+pub(crate) fn stale_volumes(files: impl IntoIterator<Item = String>, own: &str) -> Vec<String> {
+    files
+        .into_iter()
+        .filter_map(|f| f.strip_suffix(".vhdx").map(str::to_string))
+        .filter(|v| {
+            v.strip_prefix("memory-run-")
+                .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+                && v != own
+        })
+        .collect()
+}
+
 /// Slot `n`'s session name.
 pub(crate) fn slot_name(n: usize) -> String {
     format!("{SESSION_PREFIX}-{n}")
@@ -255,33 +304,63 @@ mod on_windows {
 
     type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 
-    /// `ERROR_ALREADY_EXISTS`: another process holds a session by that name.
-    const ALREADY_EXISTS: u32 = 0x8007_00b7;
-    /// `ERROR_SHARING_VIOLATION`: another session holds that disk.
-    const SHARING_VIOLATION: u32 = 0x8007_0020;
-
     /// Open the first free slot's session. A slot whose session outlives the process that
     /// made it, killed before it could end it, is taken back rather than passed over:
     /// the API ends such a session by itself only a minute or so later.
     fn open_slot(api: &Arc<Api>, storage: &Path) -> Fallible<(Session, PathBuf)> {
-        for n in 0..SLOTS {
-            let dir = storage.join(n.to_string());
-            std::fs::create_dir_all(&dir)?;
-            let name = slot_name(n);
-            match Session::create(api, &name, &dir) {
-                Ok(s) => return Ok((s, dir)),
-                Err(e) if e.hr == ALREADY_EXISTS && reclaim(&name) => {
-                    return Ok((Session::create(api, &name, &dir)?, dir));
-                }
-                Err(e) if e.hr == ALREADY_EXISTS || e.hr == SHARING_VIOLATION => continue,
-                Err(e) => return Err(e.into()),
+        let dir = |n: usize| storage.join(n.to_string());
+        let taken = take_slot(
+            SLOTS,
+            |n| {
+                std::fs::create_dir_all(dir(n))
+                    .map_err(|e| dm_wslc_api::Error::other("slot directory", e.to_string()))?;
+                Session::create(api, &slot_name(n), &dir(n))
+            },
+            |n| reclaim(&slot_name(n)),
+        )?;
+        let (session, n) = taken.ok_or_else(|| {
+            format!(
+                "all {SLOTS} session slots under {} are in use",
+                storage.display()
+            )
+        })?;
+        Ok((session, dir(n)))
+    }
+
+    /// Delete what killed launches left in this slot. The session's disk keeps their
+    /// containers, which hold their run volumes, and the volumes; a launch killed before
+    /// its harness exited leaves a container auto-removal never reached. A stale volume is
+    /// the sign: it is made before any container. The API lists no containers, so the
+    /// command line lists this session's, all of them stale while this launch, which has
+    /// started none yet, holds the slot.
+    fn sweep(session: &Session, slot: &Path, own: &str) {
+        let dir = slot.join("volumes");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let files = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned());
+        let stale = stale_volumes(files, own);
+        if stale.is_empty() {
+            return;
+        }
+        let name = format!(
+            "{SESSION_PREFIX}-{}",
+            slot.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let args = ["--session", &name, "list", "-a", "-q"].map(String::from);
+        for id in wslc::run_ok(&args).unwrap_or_default().lines() {
+            if let Ok(c) = session.open_container(id.trim()) {
+                c.delete().ok();
             }
         }
-        Err(format!(
-            "all {SLOTS} session slots under {} are in use",
-            storage.display()
-        )
-        .into())
+        for v in stale {
+            match session.delete_volume(&v) {
+                Ok(()) => eprintln!("memory: removed {v}, left by a launch that was killed"),
+                Err(e) => eprintln!("memory: {v}, left by a launch that was killed, stays: {e}"),
+            }
+        }
     }
 
     /// End the session `name` if the process that created it is gone. Whether it ended.
@@ -414,10 +493,11 @@ mod on_windows {
         let (session, slot) = open_slot(api, storage)?;
         let session = Arc::new(session);
         let interrupt = end_on_interrupt(&session);
+        let volume = format!("memory-run-{}", std::process::id());
+        sweep(&session, &slot, &volume);
         ensure_image(&session, &l.image, false, &slot)?;
         let m = mounts(l)?;
         let pid = std::process::id();
-        let volume = format!("memory-run-{pid}");
         session.create_volume(&volume, VOLUME_BYTES)?;
         let result = (|| -> Fallible<i32> {
             let spec = egress_spec(l, &format!("memory-egress-{pid}"), &volume, &m, &[]);
@@ -801,6 +881,78 @@ mod tests {
             Path::new(r"D:\vm")
         );
         assert_eq!(slot_name(3), "durable-memory-3");
+    }
+
+    fn err(hr: u32) -> dm_wslc_api::Error {
+        dm_wslc_api::Error {
+            call: "WslcCreateSession",
+            hr,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_busy_slot_is_passed_over_even_after_a_reclaim_and_any_other_failure_stops() {
+        // slot 0: taken by a dead launcher, reclaimed, but its disk is still releasing
+        let mut calls = Vec::new();
+        let got = take_slot(
+            3,
+            |n| {
+                calls.push(n);
+                match (n, calls.iter().filter(|c| **c == n).count()) {
+                    (0, 1) => Err(err(ALREADY_EXISTS)),
+                    (0, _) => Err(err(SHARING_VIOLATION)),
+                    _ => Ok(format!("session {n}")),
+                }
+            },
+            |n| n == 0,
+        );
+        assert_eq!(
+            got,
+            Ok(Some(("session 1".to_string(), 1))),
+            "the next slot, not a failed launch"
+        );
+        assert_eq!(calls, [0, 0, 1]);
+        // a reclaimed slot is taken when it comes free
+        let mut first = true;
+        let got = take_slot(
+            2,
+            |_| {
+                if std::mem::take(&mut first) {
+                    Err(err(ALREADY_EXISTS))
+                } else {
+                    Ok("s")
+                }
+            },
+            |_| true,
+        );
+        assert_eq!(got, Ok(Some(("s", 0))));
+        // every slot busy, and nothing to reclaim
+        assert_eq!(
+            take_slot(2, |_| Err::<(), _>(err(ALREADY_EXISTS)), |_| false),
+            Ok(None)
+        );
+        // anything else is the launch's failure
+        assert_eq!(
+            take_slot(2, |_| Err::<(), _>(err(0x8007_0005)), |_| false),
+            Err(err(0x8007_0005))
+        );
+    }
+
+    #[test]
+    fn a_killed_launchs_run_volume_is_swept_and_nothing_else() {
+        let files = [
+            "memory-run-33700.vhdx",
+            "memory-run-41.vhdx",
+            "memory-run-41.vhdx.lock",
+            "memory-run-99.vhdx",
+            "other.vhdx",
+            "memory-run-.vhdx",
+        ]
+        .map(String::from);
+        let mut stale = stale_volumes(files, "memory-run-41");
+        stale.sort();
+        assert_eq!(stale, ["memory-run-33700", "memory-run-99"]);
     }
 
     #[test]
