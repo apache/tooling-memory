@@ -174,7 +174,15 @@ impl Harness {
             // Muse's own approval and bubblewrap sandbox are off, since ours is the
             // boundary; --json makes its run a readable record, since its session store
             // is binary journals, and the launcher keeps that stream as the transcript
-            Harness::Muse => vec!["exec".into(), "--yolo".into(), "--json".into(), p],
+            // and its reminder observers, background agents of its own that spend
+            // model calls at Muse's default effort, are off: nobody is there to remind
+            Harness::Muse => vec![
+                "exec".into(),
+                "--yolo".into(),
+                "--json".into(),
+                "--disable-reminders".into(),
+                p,
+            ],
             Harness::Copilot => vec!["-p".into(), p, "--allow-all-tools".into()],
             Harness::OpenCode => vec!["run".into(), p],
             // a program has no headless form of its own; the prompt is its first argument
@@ -1057,6 +1065,9 @@ fn setup_qwen(
 /// removes one left in the home by an earlier login run. MCP servers and hooks live in
 /// the same file; a hook group takes no matcher, since an absent one selects every
 /// tool, and its timeout is in seconds with a default of five, too short for a `get`.
+/// Grok checks a model id against its catalog, so a model of the destination's own,
+/// a gateway's say, is declared as a `[model.<id>]` block of the config with its base,
+/// key and chat-completions backend, and `-m <id>` then selects it.
 fn setup_grok(
     req: &Request<'_>,
     relay: &str,
@@ -1088,6 +1099,24 @@ hooks = [{{ type = "command", command = "{INSIDE_MEMORY} hook grok", timeout = 3
 "#
         )
     };
+    // a model Grok's catalog does not know, declared as the destination's own
+    let custom = match (req.auth, req.model) {
+        (AuthMode::Subscription, _) | (_, None) => String::new(),
+        (_, Some(m)) => {
+            let id = m.replace(['"', '\\'], "");
+            format!(
+                r#"[model."{id}"]
+name = "{id}"
+model = "{id}"
+base_url = "{relay}/{provider}/v1"
+api_key = "egress"
+api_backend = "chat_completions"
+context_window = 131072
+
+"#
+            )
+        }
+    };
     let config = format!(
         r#"# written by memory launch; edits are overwritten
 [cli]
@@ -1098,7 +1127,7 @@ telemetry = false
 feedback = false
 remote_fetch = false
 
-[mcp_servers.memory]
+{custom}[mcp_servers.memory]
 url = "{relay}/mcp"
 
 {}{}{}"#,
@@ -1140,6 +1169,11 @@ fn setup_muse(
     env.insert("MUSE_NO_AUTO_UPDATE".into(), "1".into());
     env.insert("MUSE_LOGIN".into(), "0".into());
     tail.extend(["--base-url".to_string(), format!("{relay}/{provider}/v1")]);
+    if req.auth == AuthMode::Gateway {
+        // Muse asks for `high` effort by default, which a gateway's open models refuse
+        // (vLLM takes low, medium and xhigh); medium, as Claude Code gets there
+        tail.extend(["--reasoning-effort".to_string(), "medium".to_string()]);
+    }
     let path = req.home.join(".config/muse/settings.json");
     let mut settings: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
@@ -1472,6 +1506,27 @@ mod tests {
                 creds,
                 harness_env,
                 None,
+                None,
+            )
+        }
+
+        fn plan_model(
+            &self,
+            harness: Harness,
+            auth: AuthMode,
+            home: &str,
+            model: &str,
+        ) -> Result<(PathBuf, Plan), Error> {
+            self.plan_full(
+                harness,
+                auth,
+                None,
+                home,
+                &[],
+                false,
+                &[],
+                None,
+                Some(model),
             )
         }
 
@@ -1486,6 +1541,7 @@ mod tests {
             creds: bool,
             harness_env: &[(String, String)],
             projection: Option<&Path>,
+            model: Option<&str>,
         ) -> Result<(PathBuf, Plan), Error> {
             let home = self.root.join(home);
             let _path = path_lock();
@@ -1509,7 +1565,7 @@ mod tests {
                 harness_args: args,
                 host_home: creds.then_some(self.host_home.as_path()),
                 harness_env,
-                model: None,
+                model,
                 image: false,
                 workdir_inside: None,
                 rootfs: None,
@@ -1668,6 +1724,7 @@ mod tests {
                 true,
                 &[],
                 Some(&rendered),
+                None,
             )
             .unwrap();
         let m = plan
@@ -2271,6 +2328,7 @@ mod tests {
                     false,
                     &[],
                     Some(&rendered),
+                    None,
                 )
                 .unwrap();
             assert_eq!(plan.env["MEMORY_PROJECTION"], INSIDE_PROJECTION);
@@ -2304,9 +2362,30 @@ mod tests {
         assert!(exec < base, "{argv:?}");
         assert_eq!(argv[base + 1], "http://127.0.0.1:4100/meta/v1");
         assert!(argv[exec..base].iter().any(|a| a == "hi"), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--reasoning-effort"),
+            "Meta's own models take Muse's default effort"
+        );
+        let (_, gw) = f
+            .plan_with(
+                Harness::Muse,
+                AuthMode::Gateway,
+                Some("llmao"),
+                "k1g",
+                &args,
+                false,
+                &[],
+            )
+            .unwrap();
+        let at = gw
+            .argv
+            .iter()
+            .position(|a| a == "--reasoning-effort")
+            .unwrap();
+        assert_eq!(gw.argv[at + 1], "medium");
         assert_eq!(
             Harness::Muse.headless("hi"),
-            vec!["exec", "--yolo", "--json", "hi"]
+            vec!["exec", "--yolo", "--json", "--disable-reminders", "hi"]
         );
         assert_eq!(Harness::Muse.model_flag("m"), vec!["--model", "m"]);
         assert_eq!(Harness::Muse.provider(), "meta");
@@ -2421,6 +2500,23 @@ mod tests {
         assert_eq!(Harness::Grok.provider(), "xai");
         assert_eq!(Harness::Grok.subscription_provider(), "grok");
         assert!(!Harness::Grok.accepts_provider());
+    }
+
+    #[test]
+    fn grok_plan_declares_a_model_of_the_destination_s_own() {
+        let f = fixture();
+        let (home, _) = f
+            .plan_model(Harness::Grok, AuthMode::Key, "k4", "qwen3.8-27b")
+            .unwrap();
+        let cfg = std::fs::read_to_string(home.join(".grok/config.toml")).unwrap();
+        for line in [
+            "[model.\"qwen3.8-27b\"]",
+            "model = \"qwen3.8-27b\"",
+            "base_url = \"http://127.0.0.1:4100/xai/v1\"",
+            "api_backend = \"chat_completions\"",
+        ] {
+            assert!(cfg.contains(line), "{line} in\n{cfg}");
+        }
     }
 
     #[test]

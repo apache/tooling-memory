@@ -135,6 +135,7 @@ pub async fn prompted(
     let mut argv = session.harness().headless(prompt);
     argv.extend(args.iter().cloned());
     let (code, output) = session.run(&argv, true).await?;
+    let output = output.map(|o| answer_of(session, o));
     if let Some(out) = &output {
         print!("{out}");
         if !out.ends_with('\n') {
@@ -157,6 +158,48 @@ pub async fn prompted(
     }
     client.close().await.ok();
     Ok(code)
+}
+
+/// What a headless run printed, as the answer. Muse Code's `exec --json` prints its
+/// record stream, one JSON object a line: that stream is kept under the private home
+/// as the run's transcript, since Muse's own session store is binary, and the answer is
+/// the text of its `run.terminal.completed` record. Every other harness prints the
+/// answer itself.
+fn answer_of(session: &Session, output: String) -> String {
+    if session.harness() != Harness::Muse {
+        return output;
+    }
+    let dir = session.home().join(".local/share/muse/exec");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let stamp = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+        std::fs::write(dir.join(format!("{stamp}.jsonl")), &output).ok();
+    }
+    muse_answer(&output).unwrap_or(output)
+}
+
+/// The final text of a Muse Code record stream, when it holds one: what the run said
+/// when it completed, or why it failed.
+fn muse_answer(jsonl: &str) -> Option<String> {
+    jsonl
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| {
+            let text = match v.get("payload_type").and_then(serde_json::Value::as_str)? {
+                "run.terminal.completed" => v.pointer("/payload/text")?.as_str()?.to_string(),
+                "run.terminal.failed" => {
+                    let reason = v
+                        .pointer("/payload/reason")
+                        .and_then(serde_json::Value::as_str);
+                    format!(
+                        "muse: the run failed: {}",
+                        reason.unwrap_or("no reason given")
+                    )
+                }
+                _ => return None,
+            };
+            Some(text)
+        })
+        .next_back()
 }
 
 /// Claim and run tasks.
@@ -232,6 +275,7 @@ async fn one(
         .await;
     heartbeat.abort();
     let (code, output) = run?;
+    let output = output.map(|o| answer_of(session, o));
     let now = client.get_task(&task.id).await?;
     file_outbox(session, client, now.status == "completed").await?;
     let output = output.unwrap_or_default();
@@ -377,5 +421,25 @@ mod tests {
         let t = tail_of("abcdefghij", 4);
         assert!(t.ends_with("ghij"), "{t}");
         assert!(t.starts_with('…'));
+    }
+
+    #[test]
+    fn muse_s_answer_is_the_terminal_record_s_text() {
+        let stream = concat!(
+            r#"{"payload_type":"turn.input.user","payload":{"prompt":"hi"}}"#,
+            "\n",
+            r#"{"payload_type":"run.output.delta","payload":{"text":"gate"}}"#,
+            "\n",
+            r#"{"payload_type":"run.terminal.completed","payload":{"text":"gateway"}}"#,
+            "\n",
+        );
+        assert_eq!(muse_answer(stream).as_deref(), Some("gateway"));
+        assert!(muse_answer("plain text\n").is_none());
+        let failed =
+            r#"{"payload_type":"run.terminal.failed","payload":{"reason":"API error 400"}}"#;
+        assert_eq!(
+            muse_answer(failed).as_deref(),
+            Some("muse: the run failed: API error 400")
+        );
     }
 }

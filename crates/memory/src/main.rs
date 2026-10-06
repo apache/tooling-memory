@@ -1138,7 +1138,16 @@ fn route_for(
         AuthMode::Gateway => {
             let key = need("LLMAO_KEY", "--auth gateway")?;
             let url = std::env::var("LLMAO_URL").unwrap_or_else(|_| "http://127.0.0.1:4000".into());
-            (Destination::forward(url, bearer(key)), "llmao".to_string())
+            // a gateway translates Anthropic's shape for other models, whose chat
+            // templates refuse Claude Code's trailing system-role message
+            // and Muse Code asks for 128k output tokens whatever the model's window,
+            // so a cap that leaves a 131k-context model room for the prompt
+            (
+                Destination::forward(url, bearer(key))
+                    .with_folded_system_messages()
+                    .with_max_output_tokens(32_768),
+                "llmao".to_string(),
+            )
         }
     };
     Ok(Route {
@@ -1362,6 +1371,9 @@ async fn run_confined(
     // the hook frees a recall page of this session only
     plan.env
         .insert("MEMORY_SESSION".into(), p.memory.session_id().to_string());
+    if std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
+        eprintln!("launch debug: argv {:?}", plan.argv);
+    }
     Ok(tokio::task::spawn_blocking(move || {
         if capture {
             dm_sandbox::run_captured(&plan)
@@ -1867,6 +1879,12 @@ fn apply_run_options(p: &mut Prepared, harness: Harness, auth: AuthMode, options
         // the environment, and `-- --effort <level>` still overrides it
         p.harness_env
             .push(("CLAUDE_CODE_EFFORT_LEVEL".to_string(), "medium".to_string()));
+        // Claude Code assumes a 200k window and compacts too late for the open models
+        // behind a gateway; llmao's own notes say 120k against a 131k window
+        p.harness_env.push((
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
+            "120000".to_string(),
+        ));
     }
     if options.subagents == SubagentsArg::Board {
         // the pre-tool hook files a subagent call on the board and refuses it

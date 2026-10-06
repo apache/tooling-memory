@@ -11,13 +11,14 @@
 //!   response on the way back;
 //! - nothing else. A path that names no destination is a 404, unless the session's only
 //!   destination says its harness addresses calls at the origin, as Muse Code does its
-//!   model catalog: then the whole path goes there.
+//!   model catalog: then the whole path goes there. At any other single destination,
+//!   Muse's catalog is that destination's OpenAI model list, which Muse reads as one.
 //!
 //! Credentials for a destination live here, injected on the way out, unless the mode is
 //! pass-through, in which case the harness holds its own (a subscription login) and the
 //! egress forwards what it sends.
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -73,6 +74,16 @@ pub struct Destination {
     /// no destination then goes here whole, when this is the session's only
     /// destination; otherwise such a path is a 404.
     pub origin_paths: bool,
+    /// Whether a Messages request's `system`-role messages are folded into its `system`
+    /// field on the way out. Claude Code puts its environment block in `messages` as a
+    /// `system` role after the user turn, which Anthropic's API takes and a gateway
+    /// translating to another model's chat template refuses (`System message must be at
+    /// the beginning`); folding it is what the template wants and loses nothing.
+    pub fold_system_messages: bool,
+    /// A cap on the output tokens a request asks for, on the way out. Muse Code asks
+    /// for 128k whatever the catalog says, which a 131k-context model refuses once the
+    /// prompt is counted; a gateway's models are better served by a cap.
+    pub max_output_tokens: Option<u64>,
 }
 
 impl Destination {
@@ -84,6 +95,8 @@ impl Destination {
             auth,
             tunnel_hosts: Vec::new(),
             origin_paths: false,
+            fold_system_messages: false,
+            max_output_tokens: None,
         }
     }
 
@@ -95,6 +108,8 @@ impl Destination {
             auth: Auth::PassThrough,
             tunnel_hosts: hosts.into_iter().map(Into::into).collect(),
             origin_paths: false,
+            fold_system_messages: false,
+            max_output_tokens: None,
         }
     }
 
@@ -113,6 +128,21 @@ impl Destination {
     #[must_use]
     pub fn with_origin_paths(mut self) -> Destination {
         self.origin_paths = true;
+        self
+    }
+
+    /// Fold `system`-role messages into `system`; see
+    /// [`Destination::fold_system_messages`].
+    #[must_use]
+    pub fn with_folded_system_messages(mut self) -> Destination {
+        self.fold_system_messages = true;
+        self
+    }
+
+    /// Cap the output tokens a request asks for; see [`Destination::max_output_tokens`].
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, cap: u64) -> Destination {
+        self.max_output_tokens = Some(cap);
         self
     }
 }
@@ -226,7 +256,7 @@ impl Egress {
             .body(Body::from(body.to_string()))
             .map_err(|e| Error::Upstream(e.to_string()))?;
         let rest = path.trim_start_matches('/').to_string();
-        let resp = upstream_request(inner, &dest, &rest, req)
+        let resp = upstream_request(inner, &dest, &rest, req, None)
             .send()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
@@ -396,6 +426,11 @@ fn only_destination(inner: &Inner, destination: String, rest: String) -> (String
     let Some((only, d)) = inner.destinations.iter().next() else {
         return (destination, rest);
     };
+    // Muse Code's catalog at any other destination: the OpenAI model list, which Muse
+    // reads as its catalog, so a gateway's models are Muse's models
+    if destination == "muse-code" && rest == "models" && !d.origin_paths {
+        return (only.clone(), "v1/models".to_string());
+    }
     if !d.origin_paths {
         return (destination, rest);
     }
@@ -530,6 +565,7 @@ fn upstream_request(
     dest: &Destination,
     rest: &str,
     req: Request,
+    replaced: Option<Bytes>,
 ) -> reqwest::RequestBuilder {
     let (parts, body) = req.into_parts();
     let inject = matches!(dest.auth, Auth::Inject { .. });
@@ -543,13 +579,131 @@ fn upstream_request(
         }
     }
     let mut builder = inner.client.request(method.clone(), &url).headers(headers);
-    if method != Method::GET && method != Method::HEAD {
+    if let Some(bytes) = replaced {
+        builder = builder.body(bytes);
+    } else if method != Method::GET && method != Method::HEAD {
         let stream = body
             .into_data_stream()
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
         builder = builder.body(reqwest::Body::wrap_stream(stream));
     }
     builder
+}
+
+/// A Messages body with its `system`-role messages folded into `system`, when there are
+/// any; `None` when there is nothing to fold or the body is not a JSON object.
+#[must_use]
+pub fn fold_system_messages(body: &[u8]) -> Option<Vec<u8>> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let messages = v.get_mut("messages")?.as_array_mut()?;
+    let stray: Vec<serde_json::Value> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .cloned()
+        .collect();
+    if stray.is_empty() {
+        return None;
+    }
+    messages.retain(|m| m.get("role").and_then(serde_json::Value::as_str) != Some("system"));
+    let mut system: Vec<serde_json::Value> = match v.get("system") {
+        Some(serde_json::Value::String(t)) => {
+            vec![serde_json::json!({ "type": "text", "text": t })]
+        }
+        Some(serde_json::Value::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    };
+    for m in stray {
+        match m.get("content") {
+            Some(serde_json::Value::String(t)) => {
+                system.push(serde_json::json!({ "type": "text", "text": t }));
+            }
+            Some(serde_json::Value::Array(blocks)) => {
+                system.extend(
+                    blocks
+                        .iter()
+                        .filter(|b| {
+                            b.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        })
+                        .cloned(),
+                );
+            }
+            _ => {}
+        }
+    }
+    v["system"] = serde_json::Value::Array(system);
+    serde_json::to_vec(&v).ok()
+}
+
+/// A request the destination wants shaped is read whole and rewritten: a Messages
+/// request with its system role folded, a request asking for more output tokens than
+/// the cap. Everything else streams through untouched.
+async fn shaped(
+    dest: &Destination,
+    rest: &str,
+    req: Request,
+) -> Result<(Request, Option<Bytes>), Box<Response>> {
+    let path = rest.trim_end_matches('/');
+    let fold = dest.fold_system_messages && path.ends_with("messages");
+    let cap = dest.max_output_tokens.filter(|_| {
+        path.ends_with("messages") || path.ends_with("responses") || path.ends_with("completions")
+    });
+    if req.method() != Method::POST || (!fold && cap.is_none()) {
+        return Ok((req, None));
+    }
+    let (parts, body) = req.into_parts();
+    let bytes = to_bytes(body, 64 << 20).await.map_err(|e| {
+        Box::new(error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("request body: {e}"),
+        ))
+    })?;
+    let mut out = bytes.clone();
+    if fold {
+        if let Some(folded) = fold_system_messages(&out) {
+            out = Bytes::from(folded);
+        }
+    }
+    if let Some(cap) = cap {
+        if let Some(capped) = cap_output_tokens(&out, cap) {
+            out = Bytes::from(capped);
+        }
+    }
+    if std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
+        // the request as it leaves, for an adapter whose harness says one thing
+        // on a laptop and another in the sandbox
+        // the parameters, not the prompt: the big fields are dropped from the print
+        let shown = serde_json::from_slice::<serde_json::Value>(&out)
+            .ok()
+            .and_then(|mut v| {
+                let o = v.as_object_mut()?;
+                for k in ["input", "messages", "tools", "instructions", "system"] {
+                    o.remove(k);
+                }
+                Some(v.to_string())
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&out).chars().take(300).collect());
+        eprintln!("egress debug: {path} as shaped, parameters: {shown}");
+    }
+    Ok((Request::from_parts(parts, Body::empty()), Some(out)))
+}
+
+/// The body with its output-token request capped at `cap`, under whichever name the
+/// API spells it; `None` when nothing is over the cap or the body is not a JSON object.
+#[must_use]
+pub fn cap_output_tokens(body: &[u8], cap: u64) -> Option<Vec<u8>> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = v.as_object_mut()?;
+    let mut changed = false;
+    for key in ["max_output_tokens", "max_tokens", "max_completion_tokens"] {
+        if let Some(n) = obj.get(key).and_then(serde_json::Value::as_u64) {
+            if n > cap {
+                obj.insert(key.to_string(), serde_json::json!(cap));
+                changed = true;
+            }
+        }
+    }
+    changed.then(|| serde_json::to_vec(&v).ok()).flatten()
 }
 
 async fn proxy(egress: Egress, destination: String, rest: String, req: Request) -> Response {
@@ -559,7 +713,11 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
         Ok(d) => d,
         Err(refusal) => return *refusal,
     };
-    let builder = upstream_request(inner, &dest, &rest, req);
+    let (req, replaced) = match shaped(&dest, &rest, req).await {
+        Ok(pair) => pair,
+        Err(refusal) => return *refusal,
+    };
+    let builder = upstream_request(inner, &dest, &rest, req, replaced);
     let upstream = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
@@ -700,7 +858,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
     use tower::ServiceExt;
 
     async fn fixture(dest: Option<(&str, Destination)>) -> (tempfile::TempDir, Egress) {
@@ -818,6 +975,88 @@ mod tests {
             e.call("nowhere", "v1/x", &serde_json::json!({})).await,
             Err(Error::Refused(_))
         ));
+    }
+
+    #[test]
+    fn claude_code_s_trailing_system_message_is_folded_into_system() {
+        let body = serde_json::json!({
+            "model": "m",
+            "system": [{"type": "text", "text": "a"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "system", "content": [{"type": "text", "text": "# Environment"}]}
+            ]
+        });
+        let out = fold_system_messages(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(v["system"][1]["text"], "# Environment");
+        // a string system and a string content both become blocks
+        let body = serde_json::json!({
+            "system": "s",
+            "messages": [{"role": "system", "content": "e"}, {"role": "user", "content": "u"}]
+        });
+        let v: serde_json::Value = serde_json::from_slice(
+            &fold_system_messages(&serde_json::to_vec(&body).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["system"][0]["text"], "s");
+        assert_eq!(v["system"][1]["text"], "e");
+        // nothing to fold, nothing changed
+        let plain = serde_json::json!({ "messages": [{"role": "user", "content": "u"}] });
+        assert!(fold_system_messages(&serde_json::to_vec(&plain).unwrap()).is_none());
+        assert!(fold_system_messages(b"not json").is_none());
+    }
+
+    #[test]
+    fn an_output_token_request_over_the_cap_is_capped() {
+        let body = serde_json::json!({ "model": "m", "max_output_tokens": 128_000, "input": "hi" });
+        let out = cap_output_tokens(&serde_json::to_vec(&body).unwrap(), 32_768).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["max_output_tokens"], 32_768);
+        let under = serde_json::json!({ "max_tokens": 100 });
+        assert!(cap_output_tokens(&serde_json::to_vec(&under).unwrap(), 32_768).is_none());
+        assert!(cap_output_tokens(b"[]", 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn muse_s_catalog_at_another_destination_is_its_model_list() {
+        let seen = Arc::new(tokio::sync::Mutex::new(None::<String>));
+        let seen2 = seen.clone();
+        let fake = Router::new().route(
+            "/v1/models",
+            any(move |req: Request| {
+                let seen = seen2.clone();
+                async move {
+                    *seen.lock().await = Some(req.uri().to_string());
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"object":"list","data":[{"id":"qwen3.8-27b"}]}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let (_d, e) = fixture(Some((
+            "llmao",
+            Destination::forward(format!("http://{addr}"), Auth::PassThrough),
+        )))
+        .await;
+        let r = e
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/muse-code/models")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(seen.lock().await.clone().unwrap(), "/v1/models");
     }
 
     #[tokio::test]
