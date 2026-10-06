@@ -2014,7 +2014,7 @@ fn wslc_for_launch(
     else {
         return Ok(None);
     };
-    if backend_of(*backend, *unconfined, root) != Backend::Wslc {
+    if backend_of(*backend, *unconfined, root, (*harness).into()) != Backend::Wslc {
         return Ok(None);
     }
     let mut inside_args = run_options_args(model.as_deref(), *subagents);
@@ -2069,7 +2069,7 @@ fn wslc_for_work(
     else {
         return Ok(None);
     };
-    if backend_of(*backend, *unconfined, root) != Backend::Wslc {
+    if backend_of(*backend, *unconfined, root, (*harness).into()) != Backend::Wslc {
         return Ok(None);
     }
     Ok(Some(wslc::Launch {
@@ -2140,11 +2140,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         },
         workdir,
         runner_for(backend_of(backend, unconfined, root, harness.into()), root)?,
-        RunOptions {
-            model,
-            subagents,
-            program,
-        },
+        RunOptions::new(model, subagents, program, None),
     )
     .await?;
     let code = match prompt {
@@ -2217,11 +2213,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         },
         workdir,
         runner_for(backend_of(backend, unconfined, root, harness.into()), root)?,
-        RunOptions {
-            model,
-            subagents,
-            program: Vec::new(),
-        },
+        RunOptions::new(model, subagents, Vec::new(), None),
     )
     .await?;
     let options = work::Options {
@@ -2445,13 +2437,13 @@ fn resolve_workdir(
     Ok(w)
 }
 
-/// The model as the harness names it on this route. OpenCode names a model by its
+/// The model as the harness names it on this route. OpenCode and pi name a model by its
 /// provider, which here is the destination. Antigravity CLI takes a model outside
 /// Google's catalog only as `gemini-api://<model>`, sent to its base URL as
 /// `v1beta/models/<model>`, and a gateway's models are never in that catalog.
 fn model_for(harness: Harness, auth: AuthMode, provider: &str, model: &str) -> String {
     match harness {
-        Harness::OpenCode if !model.contains('/') => format!("{provider}/{model}"),
+        Harness::OpenCode | Harness::Pi if !model.contains('/') => format!("{provider}/{model}"),
         Harness::Antigravity if auth == AuthMode::Gateway && !model.contains("://") => {
             format!("gemini-api://{model}")
         }
@@ -2748,12 +2740,7 @@ impl Session {
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
         let mut full: Vec<String> = [self.program.as_slice(), args].concat();
         if let Some(m) = &self.model {
-            // OpenCode and pi name a model by its provider, which here is the destination
-            let m = if matches!(self.harness, Harness::OpenCode | Harness::Pi) && !m.contains('/') {
-                format!("{}/{m}", self.p.provider)
-            } else {
-                m.clone()
-            };
+            let m = model_for(self.harness, self.auth, &self.p.provider, m);
             full.extend(self.harness.model_flag(&m));
         }
         let args = full.as_slice();
