@@ -930,10 +930,7 @@ fn server_route(
                 .into(),
         );
     }
-    let mut route = route_for(Harness::Command, mode, server_provider)?;
-    if mode == AuthMode::Gateway {
-        route.name = "llmao".into();
-    }
+    let route = route_for(Harness::Command, mode, server_provider)?;
     let server = ServerRoute {
         auth: mode,
         provider: route.name.clone(),
@@ -1661,6 +1658,26 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     std::process::exit(code);
 }
 
+/// The `memory inside` flags for a task run, after the run options.
+fn work_inside_args(
+    mut args: Vec<String>,
+    domain: Option<&str>,
+    lease_seconds: i64,
+    keep_going: bool,
+    idle_seconds: u64,
+) -> Vec<String> {
+    args.push("--work".to_string());
+    if let Some(d) = domain {
+        args.extend(["--domain".to_string(), d.to_string()]);
+    }
+    args.extend(["--lease-seconds".to_string(), lease_seconds.to_string()]);
+    if keep_going {
+        args.push("--loop".into());
+    }
+    args.extend(["--idle-seconds".to_string(), idle_seconds.to_string()]);
+    args
+}
+
 async fn cmd_work(root: &Path, command: Command) -> Fallible {
     let Command::Work {
         harness,
@@ -1687,16 +1704,13 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
     };
     let workdir = resolve_workdir(root, workdir)?;
     if backend_of(backend, unconfined, root) == Backend::Wslc {
-        let mut inside_args = run_options_args(model.as_deref(), subagents);
-        inside_args.push("--work".to_string());
-        if let Some(d) = &domain {
-            inside_args.extend(["--domain".to_string(), d.clone()]);
-        }
-        inside_args.extend(["--lease-seconds".to_string(), lease_seconds.to_string()]);
-        if keep_going {
-            inside_args.push("--loop".into());
-        }
-        inside_args.extend(["--idle-seconds".to_string(), idle_seconds.to_string()]);
+        let inside_args = work_inside_args(
+            run_options_args(model.as_deref(), subagents),
+            domain.as_deref(),
+            lease_seconds,
+            keep_going,
+            idle_seconds,
+        );
         let code = wslc::run(&wslc::Launch {
             root: root.to_path_buf(),
             harness: harness.into(),
@@ -2037,7 +2051,8 @@ impl Session {
             _ => None,
         };
         let auth = creds.auth;
-        let p = prepare_launch(root, harness, creds, socket, None, true).await?;
+        let mut p = prepare_launch(root, harness, creds, socket, None, true).await?;
+        apply_run_options(&mut p, harness, auth, &options);
 
         #[cfg(unix)]
         let serve_unix = {

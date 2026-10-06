@@ -55,7 +55,8 @@ launch: build
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
 	target/release/memory --root "$$MEMORY_ROOT" launch --harness $(HARNESS) --auth $(AUTH) \
-		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(SERVER_FLAGS) $(if $(PROMPT),--prompt '$(PROMPT)',) -- $(ARGS)
+		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(SERVER_FLAGS) $(if $(MODEL),--model $(MODEL),) \
+		$(if $(SUBAGENTS),--subagents $(SUBAGENTS),) $(if $(PROMPT),--prompt '$(PROMPT)',) -- $(ARGS)
 
 # The harness image, for the wslc backend (and any OCI runtime): the release binary is
 # copied in beside the Dockerfile, then built with wslc on Windows/WSL or podman elsewhere.
@@ -87,7 +88,8 @@ work: build
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
 	target/release/memory --root "$$MEMORY_ROOT" work --harness $(HARNESS) --auth $(AUTH) \
-		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(SERVER_FLAGS) $(if $(LOOP),--loop,)
+		--backend $(BACKEND) $(if $(PROVIDER),--provider $(PROVIDER),) $(SERVER_FLAGS) $(if $(MODEL),--model $(MODEL),) \
+		$(if $(SUBAGENTS),--subagents $(SUBAGENTS),) $(if $(LOOP),--loop,)
 
 # The weekend demo in a record of its own: DEMO_ROOT (default ~/memory-demo) seeded from
 # DEMO_FROM (Markdown directories), one task worked by the harness, the savings measured.
