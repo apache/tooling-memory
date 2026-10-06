@@ -433,8 +433,8 @@ async fn gateway(
         checks.push(check(
             "gateway",
             "llmao",
-            Status::Pass,
-            format!("LLMAO_KEY set for {url}; not asked"),
+            Status::Warn,
+            format!("LLMAO_KEY set for {url}; not asked whether it answers"),
         ));
         return;
     }
@@ -484,7 +484,7 @@ async fn web(root: &Path, checks: &mut Vec<Check>) {
             "web",
             "launcher",
             Status::Pass,
-            format!("running at {}, sessions in {}", r.url, r.workdir),
+            format!("running at {}", r.url),
         ),
         None => check("web", "launcher", Status::Absent, "not running").fix("amem"),
     });
@@ -512,10 +512,12 @@ fn ready(h: Harness, auth: AuthMode, f: &Found) -> Ready {
         (_, AuthMode::Gateway) => {
             if !f.set.iter().any(|n| n == "LLMAO_KEY") {
                 Some("LLMAO_KEY".to_string())
-            } else if f.gateway == Some(false) {
-                Some("gateway not answering".to_string())
             } else {
-                None
+                match f.gateway {
+                    Some(true) => None,
+                    Some(false) => Some("gateway not answering".to_string()),
+                    None => Some("gateway not asked".to_string()),
+                }
             }
         }
     };
@@ -667,6 +669,17 @@ mod tests {
                 .missing
                 .as_deref(),
             Some("gateway not answering")
+        );
+        // offline, the gateway was not asked: not a yes
+        let unasked = Found {
+            gateway: None,
+            ..down
+        };
+        assert_eq!(
+            ready(Harness::Claude, AuthMode::Gateway, &unasked)
+                .missing
+                .as_deref(),
+            Some("gateway not asked")
         );
     }
 }

@@ -1,7 +1,7 @@
 //! What a web launcher over a root leaves in `state/web.json`: the token that is its
-//! master key, where the last one listened and where its sessions start, and the keys of
-//! the browsers paired with it. Owner-only, enforced on every write; a file found readable
-//! by others is not trusted, and its token and browser keys are replaced.
+//! master key, and where the running one listens and its sessions start. Owner-only,
+//! enforced on every write; a file found readable by others is not trusted, and its token
+//! is replaced. Paired browsers are not here: their keys live as long as the server.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -20,9 +20,6 @@ pub struct WebState {
     /// Where its sessions start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
-    /// Keys handed to paired browsers, each a bearer of its own.
-    #[serde(default)]
-    pub browsers: Vec<String>,
 }
 
 fn path(root: &Path) -> PathBuf {
@@ -40,12 +37,13 @@ fn too_open(_: &Path) -> bool {
     false
 }
 
-/// The state, or a fresh one: with a new token when there is no file, it does not read,
+/// The state, or a fresh one: with a new token when there is no file, it does not parse,
 /// or others could read it. The second value says why it is fresh, for the operator.
 ///
 /// # Errors
 ///
-/// When there is no randomness for a token.
+/// When the file is there and cannot be read, which is not the same as not there, or
+/// when there is no randomness for a token.
 pub fn load(root: &Path) -> Result<(WebState, Option<String>), std::io::Error> {
     let p = path(root);
     let fresh = |why: Option<String>| -> Result<(WebState, Option<String>), std::io::Error> {
@@ -57,12 +55,19 @@ pub fn load(root: &Path) -> Result<(WebState, Option<String>), std::io::Error> {
             why,
         ))
     };
-    let Ok(text) = std::fs::read_to_string(&p) else {
-        return fresh(None);
+    let text = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return fresh(None),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", p.display()),
+            ))
+        }
     };
     if too_open(&p) {
         return fresh(Some(format!(
-            "{} was readable by others; its token and paired browsers are replaced",
+            "{} was readable by others; its token is replaced",
             p.display()
         )));
     }
@@ -115,7 +120,7 @@ mod tests {
         assert_eq!(s.token.len(), 64);
         let s = WebState {
             url: Some("http://127.0.0.1:4200".into()),
-            browsers: vec!["b".repeat(64)],
+            workdir: Some("/w".into()),
             ..s
         };
         save(dir.path(), &s).unwrap();
@@ -146,5 +151,33 @@ mod tests {
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_temporary_file_others_could_read_does_not_carry_its_mode_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let leftover = state_dir.join(format!(".web.json.{}", std::process::id()));
+        std::fs::write(&leftover, "old").unwrap();
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (s, _) = load(dir.path()).unwrap();
+        save(dir.path(), &s).unwrap();
+        let mode = std::fs::metadata(dir.path().join(FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_is_an_error_not_a_fresh_token() {
+        let dir = tempfile::tempdir().unwrap();
+        // a directory where the file should be: there, and unreadable as a file
+        std::fs::create_dir_all(dir.path().join(FILE)).unwrap();
+        assert!(load(dir.path()).is_err());
     }
 }

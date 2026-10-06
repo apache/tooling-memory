@@ -82,15 +82,28 @@ pub fn parse(text: &str) -> Read {
             ));
             continue;
         }
-        let value = value.trim();
-        // a quoted value is taken whole; an unquoted one ends at a ` #` comment
-        let value = ['"', '\'']
-            .iter()
-            .find_map(|q| value.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
-            .unwrap_or_else(|| value.split(" #").next().unwrap_or(value).trim_end());
-        r.pairs.push((name.to_string(), value.to_string()));
+        match value_of(value.trim()) {
+            Ok(v) => r.pairs.push((name.to_string(), v.to_string())),
+            Err(why) => r.problems.push(format!("line {}: {name}: {why}", n + 1)),
+        }
     }
     r
+}
+
+/// A value as written: a quoted one runs to its closing quote, and only a comment may
+/// follow it; an unquoted one ends at a ` #` comment.
+fn value_of(value: &str) -> Result<&str, &'static str> {
+    let Some(q) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return Ok(value.split(" #").next().unwrap_or(value).trim_end());
+    };
+    let rest = &value[1..];
+    let end = rest.find(q).ok_or("no closing quote")?;
+    let after = rest[end + 1..].trim_start();
+    if after.is_empty() || after.starts_with('#') {
+        Ok(&rest[..end])
+    } else {
+        Err("something after the closing quote")
+    }
 }
 
 /// Whether this platform's check can say who may read the file.
@@ -210,6 +223,23 @@ mod tests {
         assert_eq!(r.problems.len(), 3, "{:?}", r.problems);
         assert!(r.problems[0].contains("LD_PRELOAD"), "{:?}", r.problems);
         assert!(r.problems[2].contains("line 8"), "{:?}", r.problems);
+    }
+
+    #[test]
+    fn quotes_and_comments_are_read_as_a_shell_would() {
+        assert_eq!(value_of("sk-x"), Ok("sk-x"));
+        assert_eq!(value_of("sk-x # mine"), Ok("sk-x"));
+        assert_eq!(value_of("'sk-x' # mine"), Ok("sk-x"));
+        assert_eq!(value_of("\"sk # x\""), Ok("sk # x"));
+        assert_eq!(value_of("'sk-x"), Err("no closing quote"));
+        assert_eq!(value_of("'sk'x"), Err("something after the closing quote"));
+        let r = parse("OPENAI_API_KEY='sk-x' # mine\nXAI_API_KEY='open\n");
+        assert_eq!(r.pairs, vec![("OPENAI_API_KEY".into(), "sk-x".into())]);
+        assert!(
+            r.problems[0].contains("no closing quote"),
+            "{:?}",
+            r.problems
+        );
     }
 
     #[cfg(unix)]

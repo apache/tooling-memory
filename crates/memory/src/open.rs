@@ -1,7 +1,7 @@
 //! `amem` with no command: find the web launcher running over this root, or start one,
 //! and open the browser on a link that pairs it. What a running server is lives in
-//! `state/web.json` (see `dm_web::state`): its address, where its sessions start, its
-//! token, and the browsers paired with it.
+//! `state/web.json` (see `dm_web::state`): its address, where its sessions start, and its
+//! token.
 //!
 //! The token never leaves this process for a server that has not proved it holds it:
 //! the address in the file can outlive the server and be taken by anything, so the first
@@ -9,6 +9,7 @@
 //! a command line: an opener gets a pairing code, single use and two minutes long.
 
 use dm_web::state::WebState;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,36 +17,45 @@ use std::time::Duration;
 const PORT: u16 = 4200;
 const PORTS: u16 = 10;
 
-/// A running server, as it answered.
+/// A running server that proved it holds the token, at the address it was asked at.
 #[derive(Debug)]
 pub struct Running {
     /// Where it listens.
     pub url: String,
-    /// Where its sessions start.
+    addr: SocketAddr,
+}
+
+/// What a pairing gives: the code for the browser, and where sessions start.
+#[derive(Debug)]
+pub struct Pairing {
+    /// Good once, for two minutes.
+    pub code: String,
+    /// The running server's working tree.
     pub workdir: String,
+}
+
+/// The address an `http://` URL names, if it is a loopback one: the file names the
+/// address, and nothing off this host is asked anything.
+fn loopback(url: &str) -> Option<SocketAddr> {
+    let addr: SocketAddr = url.strip_prefix("http://")?.parse().ok()?;
+    addr.ip().is_loopback().then_some(addr)
 }
 
 /// One HTTP/1.1 exchange with a loopback server; the status and the body.
 async fn exchange(
-    url: &str,
+    addr: SocketAddr,
     method: &str,
     path: &str,
     auth: Option<&str>,
 ) -> Option<(u16, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let authority = url.strip_prefix("http://")?;
-    // the file names the address; only a loopback one is asked anything
-    let addr: std::net::SocketAddr = authority.parse().ok()?;
-    if !addr.ip().is_loopback() {
-        return None;
-    }
     let auth = auth
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
     let go = async {
         let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
         let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {authority}\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
         );
         s.write_all(req.as_bytes()).await.ok()?;
         let mut out = Vec::new();
@@ -60,30 +70,34 @@ async fn exchange(
         .ok()?
 }
 
-/// The server over this root at `url`, if one is there and proves it holds `token`.
+/// The server over this root at `url`, if one is there and proves it holds `token`, at
+/// the address dialled and over this root, so an answer relayed from elsewhere fails.
 pub async fn running(url: &str, token: &str, root: &Path) -> Option<Running> {
+    let addr = loopback(url)?;
     let nonce = dm_web::access::new_token().ok()?;
-    let (status, body) = exchange(url, "GET", &format!("/api/hello?nonce={nonce}"), None).await?;
+    let (status, body) = exchange(addr, "GET", &format!("/api/hello?nonce={nonce}"), None).await?;
     if status != 200 {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let proved = v["proof"] == dm_web::access::proof(token, &nonce).as_str();
-    let ours = v["server"] == "amem" && v["root"] == root.display().to_string().as_str();
-    (proved && ours).then(|| Running {
+    let expected = dm_web::access::proof(token, addr, root, &nonce);
+    (v["server"] == "amem" && v["proof"] == expected.as_str()).then(|| Running {
         url: url.to_string(),
-        workdir: v["workdir"].as_str().unwrap_or_default().to_string(),
+        addr,
     })
 }
 
 /// A pairing code from a server that has proved it holds the token.
-pub async fn pairing_code(running: &Running, token: &str) -> Option<String> {
-    let (status, body) = exchange(&running.url, "POST", "/api/pair", Some(token)).await?;
+pub async fn pair(running: &Running, token: &str) -> Option<Pairing> {
+    let (status, body) = exchange(running.addr, "POST", "/api/pair", Some(token)).await?;
     if status != 200 {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-    v["code"].as_str().map(str::to_string)
+    Some(Pairing {
+        code: v["code"].as_str()?.to_string(),
+        workdir: v["workdir"].as_str().unwrap_or_default().to_string(),
+    })
 }
 
 /// The state, saying so when it had to be replaced.
@@ -216,12 +230,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_server_that_proves_the_token_over_another_root_is_not_ours() {
-        let token = "t".repeat(64);
+    /// A listener that answers every hello with a proof made under `token` for the
+    /// address `claims` and the root `root`, as a relay of another server would.
+    async fn prover(token: String, claims: Option<SocketAddr>, root: &'static str) -> String {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", l.local_addr().unwrap());
-        let t = token.clone();
+        let own = l.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut s, _)) = l.accept().await {
                 let mut buf = vec![0u8; 4096];
@@ -233,9 +246,10 @@ mod tests {
                     .and_then(|r| r.split(' ').next())
                     .unwrap_or_default()
                     .to_string();
+                let at = claims.unwrap_or(own);
                 let body = serde_json::json!({
-                    "server": "amem", "root": "/other", "workdir": "/w",
-                    "proof": dm_web::access::proof(&t, &nonce),
+                    "server": "amem",
+                    "proof": dm_web::access::proof(&token, at, Path::new(root), &nonce),
                 })
                 .to_string();
                 let reply = format!(
@@ -245,22 +259,42 @@ mod tests {
                 let _ = s.write_all(reply.as_bytes()).await;
             }
         });
-        assert!(running(&url, &token, Path::new("/r")).await.is_none());
-        let r = running(&url, &token, Path::new("/other")).await.unwrap();
-        assert_eq!(r.workdir, "/w");
+        format!("http://{own}")
     }
 
     #[tokio::test]
-    async fn nothing_listening_and_an_address_off_this_host_are_not_servers() {
+    async fn a_proof_for_another_root_or_relayed_from_another_port_is_not_ours() {
+        let token = "t".repeat(64);
+        let right = prover(token.clone(), None, "/r").await;
+        assert!(running(&right, &token, Path::new("/r")).await.is_some());
+        let other_root = prover(token.clone(), None, "/other").await;
+        assert!(running(&other_root, &token, Path::new("/r"))
+            .await
+            .is_none());
+        // what a squatter relaying another server's hello would hand back
+        let elsewhere: SocketAddr = "127.0.0.1:4200".parse().unwrap();
+        let relayed = prover(token.clone(), Some(elsewhere), "/r").await;
+        assert!(running(&relayed, &token, Path::new("/r")).await.is_none());
+    }
+
+    #[test]
+    fn only_a_loopback_address_is_asked_anything() {
+        assert!(loopback("http://127.0.0.1:4200").is_some());
+        assert!(loopback("http://[::1]:4200").is_some());
+        assert!(loopback("http://192.0.2.1:4200").is_none());
+        assert!(loopback("http://10.0.0.1:4200").is_none());
+        assert!(loopback("https://127.0.0.1:4200").is_none());
+        assert!(
+            loopback("http://localhost:4200").is_none(),
+            "a name, which could resolve anywhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_listening_is_not_a_server() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         drop(l);
         assert!(running(&url, "t", Path::new("/r")).await.is_none());
-        assert!(exchange("http://192.0.2.1:4200", "GET", "/", None)
-            .await
-            .is_none());
-        assert!(exchange("https://example.org", "GET", "/", None)
-            .await
-            .is_none());
     }
 }

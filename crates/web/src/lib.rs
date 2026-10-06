@@ -458,20 +458,25 @@ async fn hello(
     if q.nonce.len() < 16 || q.nonce.len() > 128 {
         return (StatusCode::BAD_REQUEST, "a nonce of 16 to 128 characters").into_response();
     }
-    Json(json!({
-        "server": "amem",
-        "version": env!("CARGO_PKG_VERSION"),
-        "proof": app.config.access.proof(&q.nonce),
-        "root": app.config.root.display().to_string(),
-        "workdir": app.config.workdir.display().to_string(),
-    }))
-    .into_response()
+    match app.config.access.proof(&q.nonce) {
+        Some(proof) => Json(json!({
+            "server": "amem",
+            "version": env!("CARGO_PKG_VERSION"),
+            "proof": proof,
+        }))
+        .into_response(),
+        None => (StatusCode::SERVICE_UNAVAILABLE, "not bound yet").into_response(),
+    }
 }
 
-/// A pairing code for a browser, for the token's holder.
+/// A pairing code for a browser, for the token's holder, with where sessions start.
 async fn pair(State(app): State<App>) -> Response {
     match app.config.access.pairing_code() {
-        Ok(code) => Json(json!({ "code": code })).into_response(),
+        Ok(code) => Json(json!({
+            "code": code,
+            "workdir": app.config.workdir.display().to_string(),
+        }))
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -871,6 +876,7 @@ pub async fn bind(listen: &str) -> Result<tokio::net::TcpListener, Error> {
 ///
 /// When the record cannot be opened or the listener fails.
 pub async fn serve(config: Config, listener: tokio::net::TcpListener) -> Result<(), Error> {
+    config.access.bound(listener.local_addr()?);
     let app = router(config)?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -889,7 +895,7 @@ mod tests {
             auth: "subscription".into(),
             backend: "auto".into(),
             command_override: Some(command.iter().map(|s| (*s).to_string()).collect()),
-            access: Access::with_token(TOKEN),
+            access: Access::with_token(&dir.join("memory"), TOKEN),
         }
     }
 
@@ -997,11 +1003,11 @@ mod tests {
         command: &[&str],
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         Memory::init(&dir.join("memory"), "human:test:me", "dom-me").unwrap();
-        let app = router(config(dir, command)).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let config = config(dir, command);
         let h = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            serve(config, listener).await.unwrap();
         });
         (addr, h)
     }
@@ -1167,9 +1173,10 @@ mod tests {
         assert_eq!(status, 200, "{reply}");
         assert!(!reply.contains(TOKEN));
         let v = json_body(&reply);
-        assert_eq!(v["proof"], access::proof(TOKEN, nonce));
+        let root = dir.path().join("memory");
+        assert_eq!(v["proof"], access::proof(TOKEN, addr, &root, nonce));
+        assert!(v.get("root").is_none() && v.get("workdir").is_none(), "{v}");
         assert_eq!(v["server"], "amem");
-        assert!(v["workdir"].is_string());
         let short =
             format!("GET /api/hello?nonce=x HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
         assert_eq!(raw(addr, &short).await.0, 400);

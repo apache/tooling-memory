@@ -114,8 +114,14 @@ async function poll() {
     const r = await amem.fetch('/api/entries');
     const list = await r.json();
     const recent = document.getElementById('recent');
-    recent.innerHTML = list.slice(0, 8).map(e => `<a href="#" data-id="${e.id}">${e.type}: ${e.title}</a>`).join('');
-    recent.querySelectorAll('a').forEach(a => a.onclick = (ev) => { ev.preventDefault(); open(a.dataset.id); });
+    // titles are anyone's text, an agent's or a bundle's: set as text, never as markup
+    recent.replaceChildren(...list.slice(0, 8).map((e) => {
+      const a = document.createElement('a');
+      a.href = '#';
+      a.textContent = `${e.type}: ${e.title}`;
+      a.onclick = (ev) => { ev.preventDefault(); open(e.id); };
+      return a;
+    }));
     const fresh = list.filter(e => !seen.has(e.id));
     list.forEach(e => seen.add(e.id));
     if (!first && fresh.length) open(fresh[0].id);

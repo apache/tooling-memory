@@ -197,13 +197,13 @@ record of its own (`DEMO_ROOT`, seeded from `DEMO_FROM`), measuring before and a
 hand it is:
 
 ```sh
-memory --root ~/memory-demo init --owner human:asf:you --domain dom-demo
+amem --root ~/memory-demo init --owner human:asf:you --domain dom-demo
 scripts/seed-corpus.py --root ~/memory-demo --memory target/release/amem docs
-memory --root ~/memory-demo task create "Answer: what did DR-19 decide, and why?" \
+amem --root ~/memory-demo task create "Answer: what did DR-19 decide, and why?" \
   --body "Search the record, open only what you need, answer in a handoff with the entry ids you cite, then complete." --priority 5
-memory --root ~/memory-demo task admit task-demo-xxxxxxxx
-memory --root ~/memory-demo work --harness claude
-memory --root ~/memory-demo savings --query "what did DR-19 decide about MoinMoin"
+amem --root ~/memory-demo task admit task-demo-xxxxxxxx
+amem --root ~/memory-demo work --harness claude
+amem --root ~/memory-demo savings --query "what did DR-19 decide about MoinMoin"
 ```
 
 On 243 entries and 76k tokens here: T0 was 2.6% of the corpus, 194 of 200 known items
@@ -220,10 +220,12 @@ and opens that. `make web` does the same with `local/.env` and the virtual key i
 environment. The server answers loopback names only, refuses requests and websockets from
 pages on other origins, and wants a key past its static pages. The command line holds
 the server's token, in `state/web.json`, owner-only, and never sends it to a server that
-has not first answered a nonce under it, since the address in that file can outlive the
-server. A browser holds a key of its own: the link `amem` opens carries a pairing code,
+has not first answered a nonce under it, over the address it was dialled at and the
+root, since the address in that file can outlive the server and an answer could be
+relayed from another port. A browser holds a key of its own: the link `amem` opens carries a pairing code,
 good once for two minutes, which the page trades for a key kept in its origin's storage
-and sent as a bearer, and by the terminal's websocket as a subprotocol. No cookie: a
+and sent as a bearer, and by the terminal's websocket as a subprotocol; it lives as long
+as the server, so a restart is a new pairing, which `amem` opens. No cookie: a
 cookie for 127.0.0.1 goes to every port on it. The front page lists sessions and
 starts one from a form: the harness, named, since there is no default; the auth mode; the
 destination, where the mode names one; the model, picked from what the destination lists

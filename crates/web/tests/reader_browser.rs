@@ -108,6 +108,7 @@ const TOKEN: &str = "reader-test-token";
 
 /// `amem web` over `root`, on a loopback port.
 async fn web(dir: &Path, root: PathBuf) -> SocketAddr {
+    let access = dm_web::Access::with_token(&root, TOKEN);
     let app = dm_web::router(dm_web::Config {
         root,
         memory_binary: "memory".into(),
@@ -116,7 +117,7 @@ async fn web(dir: &Path, root: PathBuf) -> SocketAddr {
         auth: "subscription".into(),
         backend: "auto".into(),
         command_override: Some(vec!["true".into()]),
-        access: dm_web::Access::with_token(TOKEN),
+        access,
     })
     .unwrap();
     serve(app).await

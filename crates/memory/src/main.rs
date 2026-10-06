@@ -1524,26 +1524,35 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     }
     let wanted = resolve_workdir(root, workdir);
     let mut state = open::state(root)?;
-    // one server per root: when it is already up and proves it, the browser goes to it
-    if listen.is_none() {
-        if let Some(url) = state.url.clone() {
-            if let Some(running) = open::running(&url, &state.token, root).await {
-                if let Ok(w) = &wanted {
-                    if running.workdir != w.display().to_string() {
-                        eprintln!(
-                            "amem: already running over this root, with sessions starting in {}, not {}; \
-                             stop it (ctrl-c where it runs) to start them here",
-                            running.workdir,
-                            w.display()
-                        );
-                    }
-                }
-                let code = open::pairing_code(&running, &state.token)
-                    .await
-                    .ok_or("the running launcher gave no pairing code")?;
-                open::show(&running.url, &code, !no_open);
-                return Ok(());
+    // one server per root: when it is already up and proves it, the browser goes to it,
+    // and a second one is not started beside it, whatever address was asked for
+    if let Some(url) = state.url.clone() {
+        if let Some(running) = open::running(&url, &state.token, root).await {
+            if listen
+                .as_deref()
+                .is_some_and(|l| format!("http://{l}") != running.url)
+            {
+                return Err(format!(
+                    "a launcher over this root is already running at {}; one per root",
+                    running.url
+                )
+                .into());
             }
+            let pairing = open::pair(&running, &state.token)
+                .await
+                .ok_or("the running launcher gave no pairing code")?;
+            if let Ok(w) = &wanted {
+                if pairing.workdir != w.display().to_string() {
+                    eprintln!(
+                        "amem: already running over this root, with sessions starting in {}, not {}; \
+                         stop it (ctrl-c where it runs) to start them here",
+                        pairing.workdir,
+                        w.display()
+                    );
+                }
+            }
+            open::show(&running.url, &pairing.code, !no_open);
+            return Ok(());
         }
     }
     let workdir = wanted?;
@@ -1552,7 +1561,7 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     state.url = Some(url.clone());
     state.workdir = Some(workdir.display().to_string());
     dm_web::state::save(root, &state)?;
-    let access = dm_web::Access::new(Some(root.to_path_buf()), &state, Vec::new());
+    let access = dm_web::Access::new(root, &state, Vec::new());
     let code = access.pairing_code()?;
     let config = web_config(root, workdir, harness, auth, backend, access)?;
     eprintln!(
@@ -1565,9 +1574,10 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         r = dm_web::serve(config, listener) => r?,
         _ = tokio::signal::ctrl_c() => {}
     }
-    // the address goes with the process; the token and the paired browsers stay
+    // the address goes with the process, and only this process's address: the token
+    // stays for the next server, and no browser key survives it
     let (mut after, _) = dm_web::state::load(root)?;
-    if after.token == state.token {
+    if after.token == state.token && after.url.as_deref() == Some(url.as_str()) {
         after.url = None;
         after.workdir = None;
         dm_web::state::save(root, &after)?;

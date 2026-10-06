@@ -10,19 +10,24 @@
 //! minutes, minted by the token's holder, so what passes through an opener's command line
 //! is worth one pairing and soon nothing. The page keeps its key in its origin's storage,
 //! which, unlike a cookie, is not shared with other ports on the same host. A websocket,
-//! which cannot carry a header from a browser, offers its key as a subprotocol.
+//! which cannot carry a header from a browser, offers its key as a subprotocol. Browser
+//! keys live as long as the server that issued them: a tab left open on a stopped server
+//! keeps offering its key to whatever takes the port next, so the next server must not
+//! know it.
 //!
 //! A command line asks whether a server holds the token without sending it: the server
-//! answers a nonce with an HMAC under the token, which only the holder can make.
+//! answers a nonce with an HMAC under the token over the address it is bound to and the
+//! root it serves, so the answer cannot be relayed from another server's port.
 
-use crate::state::{self, WebState};
+use crate::state::WebState;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,43 +45,48 @@ pub struct Access {
     /// Origins besides the server's own whose pages may call it, exactly as a browser
     /// sends them: `https://example.org`.
     origins: Vec<String>,
-    /// Where paired browsers are remembered; `None` keeps them in memory only.
-    root: Option<PathBuf>,
+    /// The root the server serves, which the proof covers.
+    root: PathBuf,
     inner: Arc<Mutex<Inner>>,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
+    /// Where the server is bound, once it is; the proof covers it.
+    address: Option<SocketAddr>,
     browsers: Vec<String>,
     codes: HashMap<String, Instant>,
 }
 
 impl Access {
-    /// The gate for a server over `root`, with the token and paired browsers in `state`.
+    /// The gate for a server over `root` with the token in `state`, and no browser paired.
     #[must_use]
-    pub fn new(root: Option<PathBuf>, state: &WebState, origins: Vec<String>) -> Access {
+    pub fn new(root: &Path, state: &WebState, origins: Vec<String>) -> Access {
         Access {
             token: state.token.clone(),
             origins,
-            root,
-            inner: Arc::new(Mutex::new(Inner {
-                browsers: state.browsers.clone(),
-                codes: HashMap::new(),
-            })),
+            root: root.to_path_buf(),
+            inner: Arc::new(Mutex::new(Inner::default())),
         }
     }
 
-    /// A gate on one token, nothing remembered: for tests.
+    /// A gate on one token over `root`: for tests.
     #[must_use]
-    pub fn with_token(token: &str) -> Access {
+    pub fn with_token(root: &Path, token: &str) -> Access {
         Access::new(
-            None,
+            root,
             &WebState {
                 token: token.to_string(),
                 ..WebState::default()
             },
             Vec::new(),
         )
+    }
+
+    /// The address the server is bound to, which the proof covers. [`crate::serve`] sets
+    /// it from its listener; until then the server proves nothing.
+    pub fn bound(&self, address: SocketAddr) {
+        self.inner().address = Some(address);
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -100,7 +110,7 @@ impl Access {
         Ok(code)
     }
 
-    /// Trade a code for a browser key, once; the key is remembered in the state file.
+    /// Trade a code for a browser key, once; the key lives as long as this server.
     fn redeem(&self, code: &str) -> Result<Option<String>, std::io::Error> {
         let mut i = self.inner();
         let Some(born) = i.codes.remove(code) else {
@@ -111,13 +121,6 @@ impl Access {
         }
         let key = random_hex::<32>()?;
         i.browsers.push(key.clone());
-        if let Some(root) = &self.root {
-            let (mut s, _) = state::load(root)?;
-            if same(&s.token, &self.token) {
-                s.browsers.clone_from(&i.browsers);
-                state::save(root, &s)?;
-            }
-        }
         Ok(Some(key))
     }
 
@@ -129,17 +132,22 @@ impl Access {
         self.is_token(key) || self.inner().browsers.iter().any(|b| same(b, key))
     }
 
-    /// The answer to a nonce: proof of holding the token that does not reveal it.
+    /// The answer to a nonce: proof of holding the token, at this address, over this
+    /// root, that does not reveal the token. `None` until the server is bound.
     #[must_use]
-    pub fn proof(&self, nonce: &str) -> String {
-        proof(&self.token, nonce)
+    pub fn proof(&self, nonce: &str) -> Option<String> {
+        let address = self.inner().address?;
+        Some(proof(&self.token, address, &self.root, nonce))
     }
 }
 
-/// HMAC-SHA256 of `amem-hello:<nonce>` under the token, hex.
+/// HMAC-SHA256 under the token of the address the server is bound to, the root it
+/// serves and the nonce, hex. A caller checks it against the address it dialled and the
+/// root it means, so another server's answer, relayed, does not match.
 #[must_use]
-pub fn proof(token: &str, nonce: &str) -> String {
-    hmac_sha256(token.as_bytes(), format!("amem-hello:{nonce}").as_bytes())
+pub fn proof(token: &str, address: SocketAddr, root: &Path, nonce: &str) -> String {
+    let message = format!("amem-hello\n{address}\n{}\n{nonce}", root.display());
+    hmac_sha256(token.as_bytes(), message.as_bytes())
         .iter()
         .map(|x| format!("{x:02x}"))
         .collect()
@@ -333,7 +341,7 @@ mod tests {
 
     #[test]
     fn an_origin_is_the_servers_own_or_named() {
-        let mut a = Access::with_token("t");
+        let mut a = Access::with_token(Path::new("/r"), "t");
         a.origins = vec!["https://amem.example".into()];
         assert!(origin_allowed(
             &a,
@@ -357,7 +365,7 @@ mod tests {
 
     #[test]
     fn a_code_pairs_one_browser_once() {
-        let a = Access::with_token(&"t".repeat(64));
+        let a = Access::with_token(Path::new("/r"), &"t".repeat(64));
         let code = a.pairing_code().unwrap();
         let key = a.redeem(&code).unwrap().unwrap();
         assert!(
@@ -366,38 +374,51 @@ mod tests {
         );
         assert_eq!(a.redeem(&code).unwrap(), None, "a code is single use");
         assert_eq!(a.redeem("not-a-code").unwrap(), None);
-        let other = a.pairing_code().unwrap();
-        assert_ne!(other, code);
-        // a stale code is refused
+        assert_ne!(a.pairing_code().unwrap(), code);
         a.inner()
             .codes
             .insert("stale".into(), Instant::now() - CODE_LIFETIME);
-        assert_eq!(a.redeem("stale").unwrap(), None);
+        assert_eq!(a.redeem("stale").unwrap(), None, "a stale code is refused");
     }
 
     #[test]
-    fn a_paired_browser_is_remembered_in_the_state_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let (s, _) = state::load(dir.path()).unwrap();
-        state::save(dir.path(), &s).unwrap();
-        let a = Access::new(Some(dir.path().to_path_buf()), &s, vec![]);
+    fn a_browser_key_does_not_outlive_its_server() {
+        let s = WebState {
+            token: "t".repeat(64),
+            ..WebState::default()
+        };
+        let a = Access::new(Path::new("/r"), &s, vec![]);
         let key = a.redeem(&a.pairing_code().unwrap()).unwrap().unwrap();
-        let (again, _) = state::load(dir.path()).unwrap();
-        assert_eq!(again.browsers, vec![key.clone()]);
+        assert!(a.admits(&key));
+        let next = Access::new(Path::new("/r"), &s, vec![]);
         assert!(
-            Access::new(None, &again, vec![]).admits(&key),
-            "a restart keeps it"
+            !next.admits(&key),
+            "the next server over the same token knows no browser"
         );
+        assert!(next.admits(&s.token));
     }
 
     #[test]
-    fn the_proof_needs_the_token_and_the_nonce() {
-        let p = proof("token-a", "n1");
+    fn the_proof_covers_the_token_the_address_the_root_and_the_nonce() {
+        let at: SocketAddr = "127.0.0.1:4200".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:4201".parse().unwrap();
+        let r = Path::new("/r");
+        let p = proof("token-a", at, r, "n1");
         assert_eq!(p.len(), 64);
-        assert_eq!(p, proof("token-a", "n1"));
-        assert_ne!(p, proof("token-b", "n1"));
-        assert_ne!(p, proof("token-a", "n2"));
+        assert_eq!(p, proof("token-a", at, r, "n1"));
+        assert_ne!(p, proof("token-b", at, r, "n1"));
+        assert_ne!(
+            p,
+            proof("token-a", other, r, "n1"),
+            "a relayed answer names its own port"
+        );
+        assert_ne!(p, proof("token-a", at, Path::new("/s"), "n1"));
+        assert_ne!(p, proof("token-a", at, r, "n2"));
         assert!(!p.contains("token-a"));
+        let a = Access::with_token(r, "token-a");
+        assert_eq!(a.proof("n1"), None, "an unbound server proves nothing");
+        a.bound(at);
+        assert_eq!(a.proof("n1").as_deref(), Some(p.as_str()));
         // RFC 4231, test cases 2 and 6: a short key, and one longer than the block
         let hex = |b: [u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         assert_eq!(
