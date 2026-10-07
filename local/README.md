@@ -266,6 +266,28 @@ opens as it lands, a `mem-…` id in the terminal is a link, and the recent entr
 listed under it. Loopback only; reach it over SSH when remote. xterm.js, marked and
 mermaid are served from the binary, so the browser needs no internet either.
 
+### The status strip
+
+A session started from the browser is told its id, and the launcher writes what it knows
+about itself to `state/web/<id>.json` every two seconds and once more when it ends: where
+its model calls go and whether the egress meters them or only pins them, the ceiling and
+the label the session has reached, calls and tokens so far, and the entries and handoffs it
+wrote. The session page shows it in the strip on the frame's top edge, so what the paper
+measures is on screen while the harness runs.
+
+### A hosted page
+
+The pages are plain files, so a static host can serve them: `make hosted` puts them in
+`target/hosted`, and the `Hosted pages` workflow publishes them to GitHub Pages when it is
+run by hand. `amem --hosted <url>` (or `AMEM_HOSTED=<url>` in the environment) then lets
+that page's origin through and opens it instead of the server's own, with the server's
+address and a pairing code in the fragment: `<url>#server=http%3A%2F%2F127.0.0.1%3A4200&pair=<code>`.
+A browser does not send a fragment to the host, so the host never learns the server or the
+code; the page stores the server, trades the code for a key as the server's own pages do,
+and talks to `127.0.0.1` directly. The server answers that origin's preflights, including
+the private-network grant Chrome asks of a public page calling loopback, which may show a
+prompt the first time. The process stays on this machine; the hosted page is a bookmark.
+
 ## Handoffs the harness did not write
 
 The launcher installs three hooks in each harness's settings in the private home: before

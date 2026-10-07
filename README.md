@@ -36,6 +36,21 @@ gateway, `GH_TOKEN` for Copilot, go in `~/memory/credentials.env` as `NAME=value
 600; the environment wins over the file, and a `gh auth login` stands in for `GH_TOKEN`.
 `amem doctor` names which are found where, never their values.
 
+A profile names the flags of a launch, so the name is the whole command. Every harness
+is one, `amem claude`, and `~/memory/profiles.toml` adds more:
+
+```toml
+[nightly]
+harness = "codex"
+auth = "gateway"
+model = "qwen3.8-27b"
+subagents = "board"
+```
+
+`amem nightly` launches it, `amem work nightly` works the ledger with it, and a flag
+typed after the name wins over the file; `amem profiles` lists them, and the web form
+offers them first.
+
 To run a harness confined, with the memory server attached and every model call metered,
 interactively, on a prompt, or on the next task from the ledger,
 see [local/README.md](local/README.md): `make launch` runs Claude Code, Codex, Gemini CLI,
@@ -70,6 +85,7 @@ amem tap install github-issues taps/target/wasm32-wasip2/release/tap_github_issu
 amem tap run github-issues --config '{"repo":"owner/name"}'
 amem                # the web launcher and the browser reader, opened in the browser
 amem doctor         # logins, keys, harnesses, backend and gateway, checked
+amem claude         # a profile: every harness is one, profiles.toml adds more
 amem reindex
 amem savings        # the paper's read-path claims, measured on this record
 amem golden golden/docs.toml   # recall scored on a question suite

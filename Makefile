@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: e2e install init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
+.PHONY: e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
 	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
@@ -227,6 +227,11 @@ build:
 # `check` or `verify`; run it for a change to the pages. FILTER= narrows to a spec or -g.
 e2e:
 	sh scripts/e2e.sh $(FILTER)
+
+# The pages as plain files in target/hosted, for a static host; see "A hosted page" in
+# local/README.md. `amem --hosted <url>` opens that copy paired with this machine's server.
+hosted:
+	sh scripts/hosted.sh
 
 # `amem` on the PATH, from this checkout.
 install:
