@@ -3,60 +3,161 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>memory board</title>
+<title>Board · amem</title>
+<!-- the reader's theme and contrast, set before the first paint; storage is a convenience -->
+<script>try { const s = localStorage, r = document.documentElement; if (s.getItem('amem-theme')) r.dataset.theme = s.getItem('amem-theme'); if (s.getItem('amem-contrast')) r.dataset.contrast = s.getItem('amem-contrast'); } catch (_) { /* private window */ }</script>
+<link rel="stylesheet" href="tokens.css">
 <style>
-  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; --muted: #6b6b6b; --line: #ddd; --accent: #0a62c9; --card: #fff; --human: #b35c00; --mono: ui-monospace, Menlo, Consolas, monospace; }
-  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #16181d; --muted: #9a9a9a; --line: #333; --accent: #6fb2ff; --card: #1c1f26; --human: #ffb45c; } }
-  body { margin: 0; padding: 24px 16px; font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 1000px; margin-inline: auto; }
-  h1 { font-size: 20px; margin: 0 0 4px; } h1 a { color: var(--accent); text-decoration: none; font-weight: 400; font-size: 14px; margin-left: 10px; }
-  h2 { font-size: 14px; margin: 22px 0 6px; color: var(--muted); font-weight: 600; text-transform: lowercase; }
-  .sub { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
-  .task { border-top: 1px solid var(--line); padding: 8px 0; display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: start; }
-  .task .title { font-weight: 600; } .task .title .id { font: 12px var(--mono); color: var(--muted); margin-left: 6px; }
-  .task .meta { grid-column: 1; font-size: 12px; color: var(--muted); }
-  .task .meta code { font-family: var(--mono); font-size: 12px; }
-  .task .acts { grid-column: 2; grid-row: 1 / span 2; display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-  .task.depth-1 { margin-left: 22px; } .task.depth-2 { margin-left: 44px; } .task.depth-3 { margin-left: 66px; } .task.depth-4 { margin-left: 88px; } .task.deep { margin-left: 110px; }
-  .task.human .title::before { content: "for a person · "; color: var(--human); font-weight: 600; font-size: 12px; }
-  button, input, textarea { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--fg); }
-  button { cursor: pointer; } button.primary { background: var(--accent); color: white; border: 0; }
-  details.body { grid-column: 1 / -1; font-size: 13px; } details.body pre { white-space: pre-wrap; font-family: inherit; margin: 6px 0 0; color: var(--fg); }
-  form.file { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin: 8px 0 16px; }
-  form.file textarea { grid-column: 1 / -1; min-height: 44px; resize: vertical; }
-  .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
-  .hint { font-size: 12px; color: var(--muted); min-height: 1.2em; }
-  dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--fg); max-width: 560px; width: 90vw; }
-  dialog textarea { width: 100%; min-height: 120px; box-sizing: border-box; }
-  dialog .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
+  .file fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+  .file-grid { display: grid; gap: var(--am-space-4); grid-template-columns: minmax(0, 1fr); }
+  .file-foot { display: flex; align-items: center; gap: var(--am-space-3); flex-wrap: wrap; }
+  .groups { display: grid; gap: var(--am-space-8); }
+  .group { display: grid; gap: var(--am-space-2); }
+  .group > .am-hint { padding: var(--am-space-3) var(--am-space-4); border: var(--am-line) dashed var(--am-rule); border-radius: var(--am-radius); }
+  #handoff-text { min-height: 8rem; }
+  @media (min-width: 720px) {
+    .file-grid { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
+    .file-grid .wide { grid-column: 1 / -1; }
+  }
 </style>
 </head>
-<body>
-<h1>board <a href="/">sessions</a><a href="/reader">reader</a></h1>
-<p class="sub">Tasks on the ledger by status, each under the task it was filed from. A task addressed to a person is marked; claim it, do it, and complete it with a handoff. <span id="domain"></span></p>
-<form class="file" id="file">
-  <input name="title" placeholder="A task to file, one line" required>
-  <input name="requirements" placeholder="requirements, comma separated: human, tool:github">
-  <button class="primary" type="submit">File</button>
-  <textarea name="body" placeholder="What is to be done, in Markdown"></textarea>
-  <span class="hint" id="file-hint"></span>
-</form>
-<div id="lists"></div>
-<dialog id="handoff">
+<body class="am-body">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<symbol id="i-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 3.5H3.5v17h4M16.5 3.5h4v17h-4"/><path d="M8 8.5h8M8 12h8M8 15.5h5"/></symbol>
+<symbol id="i-running" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2"/><circle cx="8" cy="8" r="3" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-connecting" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2" stroke-dasharray="2.7 2.2"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-done" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M5.3 8.2l1.9 1.9 3.6-3.9"/></symbol>
+<symbol id="i-ok" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 8.6l3.3 3.2L13.2 4.6"/></symbol>
+<symbol id="i-fail" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></symbol>
+<symbol id="i-warn" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2l6.3 11.2H1.7Z"/><path d="M8 6.6v3M8 11.6v.05"/></symbol>
+<symbol id="i-absent" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2" stroke-dasharray="0.1 2.6"/></symbol>
+<symbol id="i-refused" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M3.7 12.3l8.6-8.6"/></symbol>
+<symbol id="i-ceiling" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.8h11"/><path d="M8 13.6V5.8M5.2 8.5L8 5.7l2.8 2.8"/></symbol>
+<symbol id="i-admit" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 13.8V2.4h7.2v11.4"/><path d="M1.6 8.1h6.6M6 5.9l2.2 2.2L6 10.3"/></symbol>
+<symbol id="i-handoff" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.6h3.2l1 1.7h3.6l1-1.7H14v3a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1Z"/><path d="M8 2v5.6M5.7 5.4L8 7.7l2.3-2.3"/></symbol>
+<symbol id="i-lease" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M8 4.6V8l2.4 1.5"/></symbol>
+<symbol id="i-queued" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 4.6h10M3 8h10M3 11.4h6"/></symbol>
+<symbol id="i-invalid" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M5 8h6"/></symbol>
+<symbol id="i-superseded" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.4 8h8.4M8 5l3 3-3 3"/><path d="M13.6 3.2v9.6"/></symbol>
+<symbol id="i-demoted" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2v8.2M4.9 7.4L8 10.5l3.1-3.1"/><path d="M3 13.6h10"/></symbol>
+<symbol id="i-erased" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="2.4" y="2.4" width="11.2" height="11.2" rx="1.6" stroke-dasharray="2.2 2.2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><rect x="5.6" y="5.6" width="8" height="8" rx="1.4"/><path d="M10.4 5.6V3.8a1.3 1.3 0 0 0-1.3-1.3H3.8a1.3 1.3 0 0 0-1.3 1.3v5.3a1.3 1.3 0 0 0 1.3 1.3h1.8"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.6" width="12.4" height="10.8" rx="1.6"/><path d="M4.6 6.2l2 1.8-2 1.8M8.4 10h3"/></symbol>
+<symbol id="i-search" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="4.4"/><path d="M10.3 10.3l3.5 3.5"/></symbol>
+<symbol id="i-entry" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.8" y="1.8" width="10.4" height="12.4" rx="1.4"/><path d="M5.4 5.4h5.2M5.4 8h5.2M5.4 10.6h3"/></symbol>
+<symbol id="i-start" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M4.6 2.9v10.2L12.8 8Z"/></symbol>
+<symbol id="i-label-0" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="none"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="none"/></symbol>
+<symbol id="i-label-1" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="currentColor"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="none"/></symbol>
+<symbol id="i-label-2" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="currentColor"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="currentColor"/></symbol>
+<symbol id="i-trust-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/></symbol>
+<symbol id="i-trust-1" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/><path d="M8 2.4a5.6 5.6 0 0 0 0 11.2Z" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-trust-2" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6" fill="currentColor"/></symbol>
+<symbol id="i-pair" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.8" cy="8" r="2.8"/><path d="M7.6 8h6.6M11.2 8v2.4M13.6 8v1.8"/></symbol>
+<symbol id="i-busy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 1.8a6.2 6.2 0 1 0 6.2 6.2"/></symbol>
+</defs></svg>
+<a class="am-skip" href="#main">Skip to the page</a>
+<header class="am-top">
+  <a class="am-mark" href="index.html"><svg class="am-glyph" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-mark"/></svg>amem</a>
+  <nav class="am-nav" aria-label="Pages">
+    <a href="index.html">Sessions</a>
+    <a href="board.html" aria-current="page">Board</a>
+    <a href="reader.html">Reader</a>
+  </nav>
+  <div class="am-top-end" id="pairing"></div>
+</header>
+
+<main class="am-main" id="main">
+  <div class="am-head">
+    <h1 class="am-title">Board</h1>
+    <p class="am-lead">The tasks on the ledger by status, each under the task it was filed from. A task addressed to a person is marked: claim it, do it, and complete it with a handoff. <span id="domain"></span></p>
+  </div>
+
+  <div id="unpaired" class="am-alert am-alert--await" role="status" hidden>
+    <svg class="am-glyph" aria-hidden="true"><use href="#i-pair"/></svg>
+    <p><b>Not paired.</b> <span id="unpaired-why"></span></p>
+    <div class="am-alert-act"><div class="am-cmd"><code><span class="p">$ </span>amem</code></div></div>
+  </div>
+  <div id="error" class="am-alert" role="alert" hidden>
+    <svg class="am-glyph" aria-hidden="true"><use href="#i-fail"/></svg>
+    <p><b id="error-what"></b> <span id="error-why"></span></p>
+    <div class="am-alert-act"><button class="am-btn am-btn--secondary" type="button" id="error-close">Dismiss</button></div>
+  </div>
+
+  <section class="am-panel file" aria-labelledby="file-h">
+    <h2 class="am-section-title" id="file-h">File a task</h2>
+    <form id="file">
+      <fieldset id="file-fields" class="file-grid">
+        <div class="am-field"><label for="f-title">Title</label>
+          <input class="am-ctrl" id="f-title" name="title" required autocomplete="off" placeholder="One line: what is to be done">
+        </div>
+        <div class="am-field"><label for="f-req">Requirements</label>
+          <input class="am-ctrl is-mono" id="f-req" name="requirements" autocomplete="off" spellcheck="false" placeholder="human, tool:github">
+          <span class="am-hint">Comma separated. <span class="am-mono">human</span> addresses it to a person.</span>
+        </div>
+        <div class="am-field wide"><label for="f-body">Body</label>
+          <textarea class="am-ctrl" id="f-body" name="body" placeholder="What is to be done, in Markdown"></textarea>
+        </div>
+        <div class="file-foot wide">
+          <button class="am-btn am-btn--primary" type="submit" id="file-go">File task</button>
+          <span class="am-hint" id="file-hint" aria-live="polite">It lands as proposed, waiting for admission.</span>
+        </div>
+      </fieldset>
+    </form>
+  </section>
+
+  <div class="groups" id="lists" aria-busy="true"></div>
+</main>
+
+<dialog class="am-dialog" id="handoff" aria-labelledby="handoff-h">
   <form method="dialog" id="handoff-form">
+    <h2 class="am-section-title" id="handoff-h">Complete with a handoff</h2>
     <p>Complete <b id="handoff-title"></b> with a handoff: what was done, what remains, what the next one should know.</p>
-    <textarea id="handoff-text" required></textarea>
-    <div class="row"><button value="cancel">Cancel</button><button class="primary" value="ok" id="handoff-ok">Complete</button></div>
+    <div class="am-field"><label for="handoff-text">Handoff</label>
+      <textarea class="am-ctrl" id="handoff-text" required></textarea></div>
+    <div class="am-dialog-foot">
+      <button class="am-btn am-btn--secondary" value="cancel" formnovalidate>Cancel</button>
+      <button class="am-btn am-btn--primary" value="ok" id="handoff-ok">Complete</button>
+    </div>
   </form>
 </dialog>
+
+<script src="amem.js"></script>
 <script>
+// ---- small DOM helpers: task text is anyone's, so it is only ever set as text ----
 const $ = (id) => document.getElementById(id);
-const esc = (t) => String(t ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const NS = 'http://www.w3.org/2000/svg';
+function el(tag, cls, ...kids) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  for (const k of kids) if (k !== null && k !== undefined && k !== false) e.append(k);
+  return e;
+}
+function glyph(name, label) {
+  const s = document.createElementNS(NS, 'svg');
+  s.setAttribute('class', 'am-glyph');
+  if (label) { s.setAttribute('role', 'img'); s.setAttribute('aria-label', label); } else s.setAttribute('aria-hidden', 'true');
+  const u = document.createElementNS(NS, 'use');
+  u.setAttribute('href', `#i-${name}`);
+  s.append(u);
+  return s;
+}
+const state = (tone, name, label) => el('span', `am-state am-state--${tone}`, glyph(name, label));
+const id = (t) => el('span', 'am-id', t);
+
+// ---- the ledger's states, in its own words, each with its gutter glyph ----
 const ORDER = ['claimed', 'admitted', 'proposed', 'completed', 'invalidated'];
-const WORDS = { claimed: 'claimed, under a lease', admitted: 'admitted, claimable', proposed: 'proposed, waiting for admission', completed: 'completed, with a handoff', invalidated: 'invalidated' };
+const WORDS = { claimed: 'Claimed, under a lease', admitted: 'Admitted, claimable', proposed: 'Proposed, waiting for admission', completed: 'Completed, with a handoff', invalidated: 'Invalidated' };
+const GUTTER = { claimed: ['live', 'lease'], admitted: ['ink', 'queued'], proposed: ['await', 'admit'], completed: ['ok', 'done'], invalidated: ['ink', 'invalid'] };
+const EMPTY = {
+  claimed: ['Nothing claimed. A session claims an admitted task with ', el('code', null, 'amem work'), '; Claim here takes one for a person.'],
+  admitted: 'Nothing claimable. Admit a proposal, or file a task above.',
+  proposed: 'No proposals waiting.',
+  completed: 'Nothing completed yet.',
+  invalidated: 'Nothing invalidated.',
+};
 
 function parentOf(t) {
-  const o = t.origin || '';
-  const m = /^(task|continues|retries):(.+)$/.exec(o);
+  const m = /^(task|continues|retries):(.+)$/.exec(t.origin || '');
   return m ? m[2] : null;
 }
 function relation(t) {
@@ -64,65 +165,122 @@ function relation(t) {
   if (o.startsWith('task:')) return 'subagent of';
   if (o.startsWith('continues:')) return 'continues';
   if (o.startsWith('retries:')) return 'retries';
-  return o ? `from ${o}` : '';
+  return o ? 'from' : '';
 }
 
+// every call goes to the server through the page's key
 async function api(method, path, body) {
-  const r = await fetch(path, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  const r = await amem.fetch(path, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
   const text = await r.text();
+  if (r.status === 401) { paired = false; showPairing(); }
   if (!r.ok) throw new Error(text || r.statusText);
   return text ? JSON.parse(text) : null;
+}
+function fail(what, why) {
+  $('error-what').textContent = what;
+  $('error-why').textContent = why;
+  $('error').hidden = false;
+}
+$('error-close').addEventListener('click', () => { $('error').hidden = true; });
+
+// what a page says when it has no key; a hosted copy also says where amem has to run
+const unpairedWhy = () => { const w = amem.unpaired(); return amem.hosted && !/own machine/.test(w) ? `${w} This copy of the pages runs in your browser and talks to amem on your own machine: run amem there, and it opens this page paired.` : w; };
+let paired = false;
+function showPairing() {
+  const end = $('pairing');
+  if (paired) {
+    let host = amem.server() || location.origin;
+    try { host = new URL(host).host; } catch (_) { /* as it is */ }
+    end.replaceChildren('Paired with ', id(host));
+    $('unpaired').hidden = true;
+    return;
+  }
+  end.replaceChildren(state('await', 'pair'), 'Not paired');
+  $('unpaired-why').textContent = unpairedWhy();
+  $('unpaired').hidden = false;
+  $('file-fields').disabled = true;
+  $('file-hint').textContent = 'Pair this browser first, as the note above says.';
+  $('lists').removeAttribute('aria-busy');
+  $('lists').replaceChildren(el('div', 'am-empty', el('b', null, 'Tasks show here once this browser is paired'), el('p', null, 'Nothing on this page reaches amem until then.')));
 }
 
 let all = [];
 async function refresh() {
-  const data = await api('GET', '/api/tasks');
+  if (!paired) return;
+  let data;
+  try { data = await api('GET', '/api/tasks'); } catch (e) { if (paired) fail('The board did not load.', e.message); return; }
   $('domain').textContent = data.domain ? `Domain ${data.domain}.` : '';
   all = data.tasks;
-  const byId = new Map(all.map(t => [t.id, t]));
+  const byId = new Map(all.map((t) => [t.id, t]));
   const depth = (t) => { let d = 0, p = parentOf(t); const seen = new Set(); while (p && byId.has(p) && !seen.has(p)) { seen.add(p); d++; p = parentOf(byId.get(p)); } return d; };
-  const lists = $('lists'); lists.innerHTML = '';
+  // a refresh keeps a body that was open open
+  const open = new Set([...document.querySelectorAll('.am-task-body[open]')].map((d) => d.dataset.id));
+  const lists = $('lists');
+  lists.removeAttribute('aria-busy');
+  lists.replaceChildren();
   for (const status of ORDER) {
-    const h = document.createElement('h2'); h.textContent = WORDS[status]; lists.appendChild(h);
-    const tasks = all.filter(t => t.status === status);
-    if (!tasks.length) { const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'none'; lists.appendChild(e); continue; }
+    const tasks = all.filter((t) => t.status === status);
+    const h = el('h2', 'am-sub-title', WORDS[status], el('small', null, String(tasks.length)));
+    h.id = `g-${status}`;
+    const group = el('section', 'group', h);
+    group.setAttribute('aria-labelledby', h.id);
+    lists.append(group);
+    if (!tasks.length) { group.append(el('p', 'am-hint', ...[].concat(EMPTY[status]))); continue; }
+    const list = el('div', 'am-list');
+    group.append(list);
     // parents before children, each child right after its parent where both share a status
-    const roots = tasks.filter(t => !parentOf(t) || !tasks.some(x => x.id === parentOf(t)));
-    const place = (t) => { lists.appendChild(render(t, depth(t))); tasks.filter(c => parentOf(c) === t.id).forEach(place); };
+    const roots = tasks.filter((t) => !parentOf(t) || !tasks.some((x) => x.id === parentOf(t)));
+    const place = (t) => { list.append(render(t, depth(t), open)); tasks.filter((c) => parentOf(c) === t.id).forEach(place); };
     roots.forEach(place);
   }
 }
 
-function render(t, d) {
-  const el = document.createElement('div');
+function render(t, d, open) {
   const human = (t.requirements || []).includes('human');
-  el.className = `task depth-${Math.min(d, 4)}${d > 4 ? ' deep' : ''}${human ? ' human' : ''}`;
-  const rel = relation(t); const parent = parentOf(t);
-  const meta = [];
-  if (rel) meta.push(`${rel} <code>${esc(parent || t.origin)}</code>`);
-  if ((t.depends_on || []).length) meta.push(`after ${t.depends_on.map(x => `<code>${esc(x)}</code>`).join(', ')}`);
-  if ((t.requirements || []).length) meta.push(`needs ${t.requirements.map(esc).join(', ')}`);
-  if (t.holder) meta.push(`held by ${esc(t.holder)}`);
-  if (t.handoff) meta.push(`handoff <a href="/reader#${esc(t.handoff)}"><code>${esc(t.handoff)}</code></a>`);
-  if (t.reason) meta.push(esc(t.reason));
-  meta.push(`filed by ${esc(t.created_by)} · ${esc((t.created || '').slice(0, 16).replace('T', ' '))}`);
+  const row = el('div', `am-task${d ? ' is-child' : ''}`);
+  row.style.setProperty('--depth', String(Math.min(d, 5)));
+  const [tone, g] = GUTTER[t.status] || ['ink', 'queued'];
+  const rel = relation(t);
+  const parent = parentOf(t);
+  const meta = el('span', 'am-task-meta');
+  if (human) meta.append(el('b', null, 'For a person'));
+  if (rel) meta.append(el('span', null, `${rel} `, id(parent || t.origin)));
+  if ((t.depends_on || []).length) meta.append(el('span', null, 'after ', ...t.depends_on.flatMap((x, i) => (i ? [', ', id(x)] : [id(x)]))));
+  if ((t.requirements || []).length) meta.append(el('span', null, `needs ${t.requirements.join(', ')}`));
+  if (t.holder) meta.append(el('span', null, `held by ${t.holder}`));
+  if (t.handoff) {
+    const a = el('a', null, id(t.handoff));
+    a.href = `reader.html#${encodeURIComponent(t.handoff)}`;
+    meta.append(el('span', null, 'handoff ', a));
+  }
+  if (t.reason) meta.append(el('span', null, t.reason));
+  const when = el('span', 'am-time', `${(t.created || '').slice(0, 16).replace('T', ' ')}Z`);
+  meta.append(el('span', null, `filed by ${t.created_by}, `, when));
+
   const acts = [];
-  if (t.status === 'proposed') acts.push(['Admit', () => act('admit', t)]);
-  if (t.status === 'admitted') acts.push(['Claim', () => act('claim', t)]);
-  if (t.status === 'claimed') acts.push(['Complete…', () => completeWith(t)]);
-  if (t.status !== 'completed' && t.status !== 'invalidated') acts.push(['Invalidate', () => act('invalidate', t, { reason: 'closed from the board' })]);
-  if (t.status === 'invalidated' || t.status === 'completed') acts.push(['Retry', () => act('retry', t)]);
-  el.innerHTML = `<div class="title">${esc(t.title)}<span class="id">${esc(t.id)}</span></div>
-    <div class="meta">${meta.join(' · ')}</div>
-    <div class="acts">${acts.map((a, i) => `<button data-i="${i}">${a[0]}</button>`).join('')}</div>
-    <details class="body"><summary>body</summary><pre>${esc(t.body)}</pre></details>`;
-  el.querySelectorAll('button').forEach(b => b.addEventListener('click', () => acts[+b.dataset.i][1]()));
-  return el;
+  if (t.status === 'proposed') acts.push(['Admit', 'secondary', () => act('admit', t)]);
+  if (t.status === 'admitted') acts.push(['Claim', 'secondary', () => act('claim', t)]);
+  if (t.status === 'claimed') acts.push(['Complete', 'secondary', () => completeWith(t)]);
+  if (t.status !== 'completed' && t.status !== 'invalidated') acts.push(['Invalidate', 'danger', () => act('invalidate', t, { reason: 'closed from the board' })]);
+  if (t.status === 'invalidated' || t.status === 'completed') acts.push(['Retry', 'secondary', () => act('retry', t)]);
+  const buttons = el('span', 'am-task-acts', ...acts.map(([word, role, fn]) => {
+    const b = el('button', `am-btn am-btn--${role}`, word);
+    b.type = 'button';
+    b.setAttribute('aria-label', `${word}: ${t.title}`);
+    b.addEventListener('click', fn);
+    return b;
+  }));
+
+  const body = el('details', 'am-task-body', el('summary', null, 'Body'), el('pre', null, t.body || ''));
+  body.dataset.id = t.id;
+  if (open.has(t.id)) body.open = true;
+  row.append(state(tone, g, t.status), el('span', 'am-task-title', el('span', null, t.title), id(t.id)), buttons, meta, body);
+  return row;
 }
 
 async function act(what, t, body) {
-  try { await api('POST', `/api/tasks/${encodeURIComponent(t.id)}/${what}`, body); await refresh(); }
-  catch (e) { alert(e.message); }
+  try { await api('POST', `/api/tasks/${encodeURIComponent(t.id)}/${what}`, body); $('error').hidden = true; await refresh(); }
+  catch (e) { fail(`Could not ${what} ${t.id}.`, e.message); }
 }
 
 function completeWith(t) {
@@ -140,14 +298,28 @@ function completeWith(t) {
 $('file').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = new FormData($('file'));
-  const requirements = String(f.get('requirements') || '').split(',').map(s => s.trim()).filter(Boolean);
+  const requirements = String(f.get('requirements') || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const hint = $('file-hint');
   try {
-    await api('POST', '/api/tasks', { title: f.get('title'), body: f.get('body') || '', requirements });
-    $('file').reset(); $('file-hint').textContent = 'filed'; await refresh();
-  } catch (err) { $('file-hint').textContent = err.message; }
+    const r = await api('POST', '/api/tasks', { title: f.get('title'), body: f.get('body') || '', requirements });
+    $('file').reset();
+    hint.className = 'am-hint';
+    hint.replaceChildren(r && r.deduplicated ? 'Already on the ledger: ' : 'Filed: ', id(r && r.task ? r.task.id : ''), r && r.deduplicated ? '.' : ', proposed and waiting for admission.');
+    await refresh();
+  } catch (err) {
+    hint.className = 'am-err';
+    hint.replaceChildren(glyph('fail'), `Not filed: ${err.message}`);
+  }
 });
 
-refresh(); setInterval(refresh, 5000);
+(async () => {
+  await amem.ready;
+  paired = amem.paired();
+  showPairing();
+  if (!paired) return;
+  await refresh();
+  setInterval(refresh, 5000);
+})();
 </script>
 </body>
 </html>

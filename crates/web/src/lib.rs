@@ -2186,7 +2186,7 @@ mod tests {
             .unwrap();
         let (status, page) = http(addr, "GET", "/reader", None).await;
         assert_eq!(status, 200);
-        assert!(page.contains("amem reader") && page.contains("reader/dm_reader.js"));
+        assert!(page.contains("Reader · amem") && page.contains("reader/dm_reader.js"));
         let (status, glue) = http(addr, "GET", "/reader/dm_reader.js", None).await;
         assert_eq!(status, 200);
         assert!(glue.contains("parse_entry"));

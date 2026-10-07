@@ -3,61 +3,197 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>amem reader</title>
+<title>Reader · amem</title>
+<!-- the reader's theme and contrast, set before the first paint; storage is a convenience -->
+<script>try { const s = localStorage, r = document.documentElement; if (s.getItem('amem-theme')) r.dataset.theme = s.getItem('amem-theme'); if (s.getItem('amem-contrast')) r.dataset.contrast = s.getItem('amem-contrast'); } catch (_) { /* private window */ }</script>
+<link rel="stylesheet" href="tokens.css">
 <style>
-  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; --muted: #6b6b6b; --line: #ddd; --accent: #0a62c9; --pane: #fff; }
-  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #16181d; --muted: #9a9a9a; --line: #333; --accent: #6fb2ff; --pane: #1d2027; } }
-  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
-  header { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
-  header h1 { font-size: 16px; margin: 0 12px 0 0; }
-  input, select, button { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--fg); }
-  input[type=search] { flex: 1 1 240px; min-width: 160px; }
-  button { background: var(--accent); color: white; border: 0; cursor: pointer; }
-  main { display: grid; grid-template-columns: minmax(280px, 2fr) 3fr; height: calc(100vh - 57px); }
-  @media (max-width: 760px) { main { grid-template-columns: 1fr; height: auto; } #entry { border-left: 0; border-top: 1px solid var(--line); } }
-  #hits { overflow: auto; margin: 0; padding: 0; list-style: none; }
-  #hits li { padding: 10px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
-  #hits li:hover, #hits li.open { background: var(--pane); }
-  #hits .t { font-weight: 600; }
-  #hits .s { color: var(--muted); font-size: 13px; }
-  .chip { display: inline-block; font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; margin-right: 4px; vertical-align: middle; }
-  #entry { overflow: auto; padding: 16px 24px; border-left: 1px solid var(--line); background: var(--pane); }
-  #entry pre { overflow: auto; padding: 8px; background: var(--bg); border-radius: 6px; }
-  #entry .meta { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
-  .status { color: var(--muted); font-size: 13px; padding: 10px 16px; }
-  .status.bad { color: #c0392b; }
+  .load { display: grid; gap: var(--am-space-4); grid-template-columns: minmax(0, 1fr); }
+  .url-row { display: flex; gap: var(--am-space-2); align-items: stretch; }
+  .url-row .am-ctrl { flex: 1; }
+  .domains { display: flex; flex-wrap: wrap; gap: var(--am-space-2); align-items: center; }
+  .search { position: relative; }
+  .search .am-glyph { position: absolute; left: 0.7rem; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; color: var(--am-muted); pointer-events: none; }
+  .search .am-ctrl { padding-left: 2.1rem; min-height: 2.75rem; font-size: var(--am-text-body); }
+  .results { display: grid; gap: var(--am-space-4); grid-template-columns: minmax(0, 1fr); align-items: start; }
+  .am-hit { cursor: pointer; }
+  .am-hit:hover { background: var(--am-plate); }
+  .am-hit.is-open:hover { background: var(--am-accent-tint); }
+  .hit-open { all: unset; cursor: pointer; overflow-wrap: anywhere; }
+  .hit-open:focus-visible { outline: var(--am-focus-width) solid var(--am-accent); outline-offset: 2px; border-radius: 2px; }
+  .reading { padding: var(--am-space-4); }
+  .reading .am-entry-title { font-size: var(--am-text-title); line-height: var(--am-leading-tight); }
+  .reading .am-prose pre { max-width: 100%; }
+  .back { display: none; justify-self: start; }
+  #status:empty { display: none; }
+  @media (min-width: 720px) {
+    .load { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+    .load .wide { grid-column: 1 / -1; }
+    .results { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+    .reading { position: sticky; top: var(--am-space-4); max-height: calc(100vh - 2 * var(--am-space-4)); overflow: auto; padding: var(--am-space-6); }
+  }
+  @media (max-width: 720px) {
+    .back { display: inline-flex; }
+  }
 </style>
 </head>
-<body>
-<header>
-  <h1>amem reader</h1>
-  <input id="bundle" type="url" placeholder="bundle URL, the directory with manifest.yaml" size="36">
-  <button id="load" type="button">Load</button>
-  <label style="font-size:13px;color:var(--muted)">or pick a folder <input id="folder" type="file" webkitdirectory multiple style="font-size:12px"></label>
-  <select id="handling" title="the highest classification to show">
-    <option value="2">restricted</option><option value="1">internal</option><option value="0">public</option>
-  </select>
-  <input id="q" type="search" placeholder="search, summaries first" autocomplete="off">
-  <span id="domains"></span>
+<body class="am-body">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<symbol id="i-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 3.5H3.5v17h4M16.5 3.5h4v17h-4"/><path d="M8 8.5h8M8 12h8M8 15.5h5"/></symbol>
+<symbol id="i-running" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2"/><circle cx="8" cy="8" r="3" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-connecting" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2" stroke-dasharray="2.7 2.2"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-done" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M5.3 8.2l1.9 1.9 3.6-3.9"/></symbol>
+<symbol id="i-ok" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 8.6l3.3 3.2L13.2 4.6"/></symbol>
+<symbol id="i-fail" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></symbol>
+<symbol id="i-warn" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2l6.3 11.2H1.7Z"/><path d="M8 6.6v3M8 11.6v.05"/></symbol>
+<symbol id="i-absent" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2" stroke-dasharray="0.1 2.6"/></symbol>
+<symbol id="i-refused" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M3.7 12.3l8.6-8.6"/></symbol>
+<symbol id="i-ceiling" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.8h11"/><path d="M8 13.6V5.8M5.2 8.5L8 5.7l2.8 2.8"/></symbol>
+<symbol id="i-admit" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 13.8V2.4h7.2v11.4"/><path d="M1.6 8.1h6.6M6 5.9l2.2 2.2L6 10.3"/></symbol>
+<symbol id="i-handoff" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.6h3.2l1 1.7h3.6l1-1.7H14v3a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1Z"/><path d="M8 2v5.6M5.7 5.4L8 7.7l2.3-2.3"/></symbol>
+<symbol id="i-lease" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M8 4.6V8l2.4 1.5"/></symbol>
+<symbol id="i-queued" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 4.6h10M3 8h10M3 11.4h6"/></symbol>
+<symbol id="i-invalid" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M5 8h6"/></symbol>
+<symbol id="i-superseded" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.4 8h8.4M8 5l3 3-3 3"/><path d="M13.6 3.2v9.6"/></symbol>
+<symbol id="i-demoted" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2v8.2M4.9 7.4L8 10.5l3.1-3.1"/><path d="M3 13.6h10"/></symbol>
+<symbol id="i-erased" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="2.4" y="2.4" width="11.2" height="11.2" rx="1.6" stroke-dasharray="2.2 2.2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><rect x="5.6" y="5.6" width="8" height="8" rx="1.4"/><path d="M10.4 5.6V3.8a1.3 1.3 0 0 0-1.3-1.3H3.8a1.3 1.3 0 0 0-1.3 1.3v5.3a1.3 1.3 0 0 0 1.3 1.3h1.8"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.6" width="12.4" height="10.8" rx="1.6"/><path d="M4.6 6.2l2 1.8-2 1.8M8.4 10h3"/></symbol>
+<symbol id="i-search" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="4.4"/><path d="M10.3 10.3l3.5 3.5"/></symbol>
+<symbol id="i-entry" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.8" y="1.8" width="10.4" height="12.4" rx="1.4"/><path d="M5.4 5.4h5.2M5.4 8h5.2M5.4 10.6h3"/></symbol>
+<symbol id="i-start" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M4.6 2.9v10.2L12.8 8Z"/></symbol>
+<symbol id="i-label-0" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="none"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="none"/></symbol>
+<symbol id="i-label-1" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="currentColor"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="none"/></symbol>
+<symbol id="i-label-2" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="currentColor"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="currentColor"/></symbol>
+<symbol id="i-trust-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/></symbol>
+<symbol id="i-trust-1" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/><path d="M8 2.4a5.6 5.6 0 0 0 0 11.2Z" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-trust-2" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6" fill="currentColor"/></symbol>
+<symbol id="i-pair" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.8" cy="8" r="2.8"/><path d="M7.6 8h6.6M11.2 8v2.4M13.6 8v1.8"/></symbol>
+<symbol id="i-busy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 1.8a6.2 6.2 0 1 0 6.2 6.2"/></symbol>
+</defs></svg>
+<a class="am-skip" href="#q">Skip to the search</a>
+<header class="am-top">
+  <a class="am-mark" href="index.html"><svg class="am-glyph" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-mark"/></svg>amem</a>
+  <nav class="am-nav" aria-label="Pages">
+    <a href="index.html">Sessions</a>
+    <a href="board.html">Board</a>
+    <a href="reader.html" aria-current="page">Reader</a>
+  </nav>
+  <div class="am-top-end" id="pairing"></div>
 </header>
-<main>
-  <div>
-    <div id="status" class="status">no bundle loaded</div>
-    <ul id="hits"></ul>
+
+<main class="am-main" id="main">
+  <div class="am-head">
+    <h1 class="am-title">Reader</h1>
+    <p class="am-lead">Read and search an exported bundle in this browser, no session needed. Every entry is checked against the manifest's digest before it is indexed, and nothing above the handling you choose is shown.</p>
   </div>
-  <article id="entry"><p class="status">open a hit to read it</p></article>
+
+  <section class="am-panel" aria-labelledby="load-h">
+    <h2 class="am-section-title" id="load-h">Load a bundle</h2>
+    <div class="load">
+      <div class="am-field"><label for="bundle">Bundle URL</label>
+        <div class="url-row">
+          <input class="am-ctrl is-mono" id="bundle" type="url" placeholder="https://example.org/bundles/dm/" autocomplete="off" spellcheck="false">
+          <button class="am-btn am-btn--primary" id="load" type="button">Load</button>
+        </div>
+        <span class="am-hint">The directory that holds <span class="am-mono">manifest.yaml</span>.</span></div>
+      <div class="am-field"><label for="folder">Or a folder</label>
+        <input class="am-ctrl" id="folder" type="file" webkitdirectory multiple>
+        <span class="am-hint">An export on this machine; nothing leaves the browser.</span></div>
+      <div class="am-field"><label for="handling">Handling</label>
+        <select class="am-ctrl" id="handling">
+          <option value="2">restricted</option><option value="1">internal</option><option value="0">public</option>
+        </select>
+        <span class="am-hint">The highest label the reader shows.</span></div>
+      <div class="am-field wide" id="domains-field" hidden><span class="am-legend" id="domains-l">The record's domains</span>
+        <div class="domains" id="domains" role="group" aria-labelledby="domains-l"></div>
+        <span class="am-hint" id="domains-hint">Exported at the handling above and read here.</span></div>
+    </div>
+  </section>
+
+  <section class="am-section" aria-labelledby="search-h">
+    <h2 class="am-vh" id="search-h">Search</h2>
+    <div class="search">
+      <svg class="am-glyph" aria-hidden="true"><use href="#i-search"/></svg>
+      <input class="am-ctrl" id="q" type="search" placeholder="Search, summaries first" autocomplete="off" aria-label="Search the bundle">
+    </div>
+    <div id="status" class="am-hint" role="status"></div>
+    <div class="results">
+      <div id="results-col">
+        <ul class="am-hits" id="hits" hidden></ul>
+        <div class="am-empty" id="empty"><b>No bundle loaded</b><p>Load an export by its URL or its folder, or one of the record's domains when amem serves this page. The results list here, summaries first.</p></div>
+      </div>
+      <article class="am-panel reading am-entry" id="entry" aria-label="The open entry" tabindex="-1">
+        <p class="am-hint">Open a result to read it.</p>
+      </article>
+    </div>
+  </section>
+
+  <footer class="am-foot">
+    <div class="am-prefs" role="group" aria-label="Show these pages in">
+      <div class="am-field"><span class="am-legend" id="lg-theme">Theme</span>
+        <div class="am-seg" role="radiogroup" aria-labelledby="lg-theme">
+          <label><input type="radio" name="am-theme" value="system" checked><span>System</span></label>
+          <label><input type="radio" name="am-theme" value="light"><span>Light</span></label>
+          <label><input type="radio" name="am-theme" value="dark"><span>Dark</span></label>
+        </div></div>
+      <div class="am-field"><span class="am-legend" id="lg-contrast">Contrast</span>
+        <div class="am-seg" role="radiogroup" aria-labelledby="lg-contrast">
+          <label><input type="radio" name="am-contrast" value="system" checked><span>System</span></label>
+          <label><input type="radio" name="am-contrast" value="normal"><span>Normal</span></label>
+          <label><input type="radio" name="am-contrast" value="more"><span>More</span></label>
+        </div></div>
+    </div>
+    <span>The index is the server's own: FTS5, title, summary and body.</span>
+  </footer>
 </main>
 <script src="vendor/marked.min.js"></script>
 <script src="vendor/purify.min.js"></script>
 <!-- served by amem, the page carries this browser's key to it; a static copy has no amem.js and needs none -->
 <script src="amem.js"></script>
 <script type="module">
+// `/api/...` and `/bundle/...` are the server's, through the page's key; a static copy has
+// no amem.js, and fetches what it is given as written
 const get = (u) => (window.amem ? window.amem.fetch(u) : fetch(u));
 import initReader, { parse_entry, parse_manifest, digest } from './reader/dm_reader.js';
 import sqlite3InitModule from './vendor/sqlite3.mjs';
 
 const $ = (id) => document.getElementById(id);
-const status = (text, bad = false) => { const s = $('status'); s.textContent = text; s.className = 'status' + (bad ? ' bad' : ''); };
+const NS = 'http://www.w3.org/2000/svg';
+function el(tag, cls, ...kids) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  for (const k of kids) if (k !== null && k !== undefined && k !== false) e.append(k);
+  return e;
+}
+function glyph(name) {
+  const s = document.createElementNS(NS, 'svg');
+  s.setAttribute('class', 'am-glyph');
+  s.setAttribute('aria-hidden', 'true');
+  const u = document.createElementNS(NS, 'use');
+  u.setAttribute('href', `#i-${name}`);
+  s.append(u);
+  return s;
+}
+// what the reader is doing: busy, done, or failed with the reason
+function status(text, bad = false, busy = false) {
+  const s = $('status');
+  s.className = bad ? 'am-err' : busy ? 'am-busy' : 'am-hint';
+  s.replaceChildren(...(bad ? [glyph('fail')] : busy ? [glyph('busy')] : []), text);
+}
+
+// ---- theme and contrast: system unless the reader says otherwise, kept per browser ----
+for (const name of ['theme', 'contrast']) {
+  const now = document.documentElement.dataset[name] || 'system';
+  for (const r of document.querySelectorAll(`input[name="am-${name}"]`)) {
+    r.checked = r.value === now;
+    r.addEventListener('change', () => {
+      if (r.value === 'system') delete document.documentElement.dataset[name];
+      else document.documentElement.dataset[name] = r.value;
+      try { if (r.value === 'system') localStorage.removeItem(`amem-${name}`); else localStorage.setItem(`amem-${name}`, r.value); } catch (_) { /* private window */ }
+    });
+  }
+}
 
 // The same index the server keeps: FTS5 over title, summary and body, porter unicode61,
 // bm25 weighted 10, 5, 1, phrases ANDed and any-word as the fallback for a question.
@@ -65,16 +201,20 @@ let db = null;
 let entries = new Map();
 let manifest = null;
 const LABELS = ['public', 'internal', 'restricted'];
+const TIERS = ['raw', 'curated', 'verified'];
 // a manifest path is a plain file name: no separators, no leading dot
 const PLAIN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 const handling = () => Number($('handling').value);
+const fact = (kind, order, word) => el('span', 'am-fact', glyph(`${kind}-${Math.max(0, order.indexOf(word))}`), word);
 
 async function boot() {
+  status('Starting the reader', false, true);
   await initReader();
   const sqlite3 = await sqlite3InitModule();
   db = new sqlite3.oo1.DB(':memory:');
   db.exec(`CREATE TABLE entries (id TEXT PRIMARY KEY, domain TEXT, type TEXT, tier TEXT, label_rank INTEGER, status TEXT, title TEXT, summary TEXT, created TEXT);
            CREATE VIRTUAL TABLE entries_fts USING fts5(id UNINDEXED, title, summary, body, tokenize = 'porter unicode61');`);
+  status('');
   const params = new URLSearchParams(location.search);
   // ?handling= names a label or its rank, ?bundle= a directory, ?q= a query, ?open= an id
   const h = params.get('handling');
@@ -82,18 +222,38 @@ async function boot() {
   if (params.get('bundle')) { $('bundle').value = params.get('bundle'); await loadUrl(params.get('bundle')); }
   if (params.get('q')) { $('q').value = params.get('q'); search(); }
   if (params.get('open')) open(params.get('open'));
-  // served by `amem`, the record's own domains are one click away; a static copy
-  // has no such endpoint and shows nothing here
+  await domains();
+}
+
+// served by `amem`, the record's own domains are one click away; a static copy has no
+// such endpoint and shows nothing here
+async function domains() {
+  if (!window.amem) return;
+  await window.amem.ready;
+  const end = $('pairing');
+  if (!window.amem.paired()) {
+    end.replaceChildren(el('span', 'am-state am-state--await', glyph('pair')), 'Not paired');
+    $('domains-field').hidden = false;
+    const why = window.amem.hosted && !/own machine/.test(window.amem.unpaired()) ? `${window.amem.unpaired()} This copy talks to amem on your own machine: run amem there, and it opens this page paired.` : window.amem.unpaired();
+    $('domains-hint').textContent = `${why} A bundle URL or a folder works without it.`;
+    return;
+  }
+  let host = window.amem.server() || location.origin;
+  try { host = new URL(host).host; } catch (_) { /* as it is */ }
+  end.replaceChildren('Paired with ', el('span', 'am-id', host));
   try {
-    const r = await get('api/domains');
-    if (r.ok) {
-      for (const d of await r.json()) {
-        const b = document.createElement('button'); b.type = 'button'; b.textContent = d;
-        b.title = `export ${d} at the chosen label and read it here`;
-        b.addEventListener('click', () => { const url = `bundle/${d}/${LABELS[handling()]}`; $('bundle').value = url; loadUrl(url); });
-        $('domains').append(b, ' ');
-      }
-    }
+    const r = await get('/api/domains');
+    if (!r.ok) return;
+    const names = await r.json();
+    $('domains').replaceChildren(...names.map((d) => {
+      const b = el('button', 'am-btn am-btn--secondary', d);
+      b.type = 'button';
+      b.classList.add('am-mono');
+      b.title = `export ${d} at the chosen handling and read it here`;
+      b.addEventListener('click', () => { const url = `/bundle/${d}/${LABELS[handling()]}`; $('bundle').value = url; loadUrl(url); });
+      return b;
+    }));
+    $('domains-field').hidden = !names.length;
   } catch (_) { /* a static copy */ }
 }
 
@@ -121,7 +281,7 @@ function admit(text, name, expected) {
 async function loadUrl(base) {
   reset();
   base = base.replace(/\/+$/, '');
-  status(`loading ${base}…`);
+  status(`Loading ${base}`, false, true);
   try {
     const m = JSON.parse(parse_manifest(await (await get(`${base}/manifest.yaml`)).text()));
     if (m.error) throw new Error(m.error);
@@ -131,7 +291,7 @@ async function loadUrl(base) {
     // fetched a few at a time: a bundle of thousands loads in seconds, not in minutes
     for (let i = 0; i < listed.length; i += 16) {
       const chunk = listed.slice(i, i + 16);
-      status(`loading ${base}… ${i} of ${listed.length}`);
+      status(`Loading ${base}: ${i} of ${listed.length}`, false, true);
       const texts = await Promise.all(chunk.map(async (e) => {
         const r = await get(`${base}/${encodeURIComponent(e.path)}`);
         return r.ok ? r.text() : null;
@@ -142,14 +302,14 @@ async function loadUrl(base) {
       });
     }
     done(m, refused);
-  } catch (err) { status(`could not load: ${err.message}`, true); }
+  } catch (err) { status(`The bundle did not load: ${err.message}`, true); }
 }
 
 async function loadFolder(files) {
   reset();
   const byName = new Map([...files].map((f) => [f.name, f]));
   const mf = byName.get('manifest.yaml');
-  if (!mf) { status('that folder has no manifest.yaml', true); return; }
+  if (!mf) { status('That folder has no manifest.yaml; pick the export directory.', true); return; }
   const m = JSON.parse(parse_manifest(await mf.text()));
   if (m.error) { status(m.error, true); return; }
   manifest = m;
@@ -165,7 +325,7 @@ async function loadFolder(files) {
 
 function done(m, refused) {
   const note = refused ? `, ${refused} refused (digest, path or missing)` : '';
-  status(`${m.domain}: ${entries.size} entries, highest label ${m.highest_label}, exported ${m.exported_at.slice(0, 10)} by ${m.exported_by}${note}`);
+  status(`${m.domain}: ${entries.size} entries, highest label ${m.highest_label}, exported ${m.exported_at.slice(0, 10)} by ${m.exported_by}${note}`, refused > 0 && entries.size === 0);
   search();
 }
 
@@ -175,48 +335,69 @@ function ftsQuery(text, anyWord) {
   return words.length ? words.join(anyWord ? ' OR ' : ' ') : null;
 }
 
-function run(match, handling, limit) {
+function run(match, h, limit) {
   const rows = [];
   db.exec({
     sql: `SELECT e.id, e.type, e.tier, e.label_rank, e.title, e.summary, bm25(entries_fts, 0.0, 10.0, 5.0, 1.0) AS score
           FROM entries_fts f JOIN entries e ON e.id = f.id
           WHERE entries_fts MATCH ? AND e.label_rank <= ? AND e.status IS NULL
           ORDER BY score, e.created DESC LIMIT ?`,
-    bind: [match, handling, limit], rowMode: 'object', callback: (r) => rows.push(r) });
+    bind: [match, h, limit], rowMode: 'object', callback: (r) => rows.push(r) });
   return rows;
 }
 
-function list(handling, limit) {
+function list(h, limit) {
   const rows = [];
   db.exec({ sql: `SELECT id, type, tier, label_rank, title, summary FROM entries WHERE label_rank <= ? AND status IS NULL ORDER BY created DESC LIMIT ?`,
-    bind: [handling, limit], rowMode: 'object', callback: (r) => rows.push(r) });
+    bind: [h, limit], rowMode: 'object', callback: (r) => rows.push(r) });
   return rows;
+}
+
+// the query's words, marked where they appear: built as text and <mark>, never as markup
+function marked_(text, words) {
+  if (!words.length) return [text];
+  const re = new RegExp(`(${words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi');
+  return String(text || '').split(re).map((part, i) => (i % 2 ? el('mark', null, part) : part));
 }
 
 function search() {
   if (!db) return;
   const h = handling();
   const text = $('q').value.trim();
+  const words = text.split(/\s+/).filter((w) => w.length > 1);
   let rows;
+  let match = null;
   if (!text) rows = list(h, 50);
   else {
-    const all = ftsQuery(text, false);
-    rows = all ? run(all, h, 25) : [];
-    if (rows.length === 0 && text.split(/\s+/).length > 1) rows = run(ftsQuery(text, true), h, 25);
+    match = ftsQuery(text, false);
+    rows = match ? run(match, h, 25) : [];
+    if (rows.length === 0 && text.split(/\s+/).length > 1) { match = ftsQuery(text, true); rows = run(match, h, 25); }
   }
+  const openId = $('entry').dataset.id;
   $('hits').replaceChildren(...rows.map((r) => {
-    const li = document.createElement('li');
+    const li = el('li', `am-hit${r.id === openId ? ' is-open' : ''}`);
     li.dataset.id = r.id;
-    li.innerHTML = `<div class="t"></div><div class="s"></div><div><span class="chip"></span><span class="chip"></span><span class="chip"></span></div>`;
-    li.querySelector('.t').textContent = r.title;
-    li.querySelector('.s').textContent = r.summary;
-    const chips = li.querySelectorAll('.chip');
-    chips[0].textContent = r.type; chips[1].textContent = r.tier; chips[2].textContent = LABELS[r.label_rank];
+    const b = el('button', 'hit-open', ...marked_(r.title, words));
+    b.type = 'button';
+    li.append(
+      el('span', 'am-hit-title', b),
+      el('span', 'am-hit-sum', ...marked_(r.summary, words)),
+      el('span', 'am-hit-meta', el('span', null, r.type), fact('label', LABELS, LABELS[r.label_rank]), fact('trust', TIERS, r.tier), el('span', 'am-id', r.id)),
+    );
     li.addEventListener('click', () => open(r.id));
     return li;
   }));
-  if (rows.length === 0 && entries.size) {
-    const li = document.createElement('li'); li.className = 'status'; li.textContent = 'nothing matches'; $('hits').append(li);
+  const loaded = entries.size > 0;
+  $('hits').hidden = rows.length === 0;
+  const empty = $('empty');
+  empty.hidden = rows.length > 0;
+  if (rows.length === 0 && loaded) {
+    // nothing at this handling: say whether anything above it matches
+    const above = match && h < 2 ? run(match, 2, 25).length : !text && h < 2 ? list(2, 50).length : 0;
+    const p = el('p', null, text ? `Nothing matches ${text} at ${LABELS[h]} or below.` : `Nothing at ${LABELS[h]} or below.`);
+    if (above) p.append(` ${above} entr${above === 1 ? 'y' : 'ies'} above it match${above === 1 ? 'es' : ''}; raise the handling to see ${above === 1 ? 'it' : 'them'}.`);
+    else if (text) p.append(' Try fewer words, or other words for the same thing.');
+    empty.replaceChildren(el('b', null, 'Nothing matching'), p);
   }
 }
 
@@ -224,13 +405,17 @@ function open(id) {
   const e = entries.get(id);
   // the handling picker bounds what opens as well as what lists
   if (!e || e.label_rank > handling()) return;
-  for (const li of $('hits').children) li.classList.toggle('open', li.dataset.id === id);
+  for (const li of $('hits').children) li.classList.toggle('is-open', li.dataset.id === id);
   const art = $('entry');
-  art.replaceChildren();
-  const meta = document.createElement('div'); meta.className = 'meta';
-  meta.textContent = `${e.id} · ${e.type} · ${e.trust_tier} · ${e.classification} · ${e.author} · ${e.created.slice(0, 10)}` + (e.supersedes ? ` · supersedes ${e.supersedes}` : '');
-  const h = document.createElement('h2'); h.textContent = e.title;
-  const body = document.createElement('div');
+  art.dataset.id = id;
+  const back = el('button', 'am-btn am-btn--quiet back', 'Back to the results');
+  back.type = 'button';
+  back.addEventListener('click', () => { const li = $('hits').querySelector('.is-open'); (li || $('hits')).scrollIntoView({ block: 'center' }); const b = li && li.querySelector('button'); if (b) b.focus(); });
+  const meta = el('div', 'am-entry-meta',
+    fact('label', LABELS, e.classification), fact('trust', TIERS, e.trust_tier), el('span', 'am-id', e.id),
+    el('span', null, e.author), el('span', 'am-time', e.created.slice(0, 10)),
+    e.supersedes ? el('span', null, 'supersedes ', el('span', 'am-id', e.supersedes)) : null);
+  const body = el('div', 'am-prose');
   // an entry is somebody's Markdown: rendered, then stripped of scripts and handlers
   body.innerHTML = DOMPurify.sanitize(marked.parse(e.body));
   // a link to another entry opens it here
@@ -238,10 +423,9 @@ function open(id) {
     const m = /^(mem-[a-z0-9-]+)$/.exec(a.getAttribute('href') || '');
     if (m) a.addEventListener('click', (ev) => { ev.preventDefault(); open(m[1]); });
   }
-  art.append(h, meta, body);
-  if (e.source && e.source.length) {
-    const src = document.createElement('p'); src.className = 'meta'; src.textContent = `source: ${e.source.join(', ')}`; art.append(src);
-  }
+  art.replaceChildren(back, el('div', 'am-entry-type', e.type), el('h2', 'am-entry-title', e.title), meta, body);
+  if (e.source && e.source.length) art.append(el('p', 'am-hint', `Source: ${e.source.join(', ')}`));
+  if (matchMedia('(max-width: 720px)').matches) { art.scrollIntoView({ block: 'start' }); art.focus({ preventScroll: true }); }
 }
 
 $('load').addEventListener('click', () => loadUrl($('bundle').value.trim()));
@@ -249,7 +433,7 @@ $('bundle').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') loadUr
 $('folder').addEventListener('change', (ev) => loadFolder(ev.target.files));
 $('q').addEventListener('input', search);
 $('handling').addEventListener('change', search);
-boot().catch((err) => status(`the reader could not start: ${err.message}`, true));
+boot().catch((err) => status(`The reader could not start: ${err.message}`, true));
 </script>
 </body>
 </html>

@@ -67,3 +67,67 @@ pub fn vendor(name: &str) -> Option<(&'static str, &'static [u8])> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAGES: [(&str, &str); 4] = [
+        ("index.html", INDEX),
+        ("session.html", SESSION),
+        ("board.html", BOARD),
+        ("reader.html", READER),
+    ];
+
+    #[test]
+    fn the_book_inlines_the_tokens_and_components_whole() {
+        let book = include_str!("../../../docs/design-book.html");
+        assert!(
+            book.contains(TOKENS),
+            "docs/design-book.html must carry crates/web/static/tokens.css whole, as it is"
+        );
+    }
+
+    #[test]
+    fn every_path_a_page_names_is_relative() {
+        // the same files are served by amem and as a hosted copy on another origin, so a
+        // leading slash would reach the host and not the page's own directory
+        for (name, page) in PAGES {
+            for attr in ["href=\"/", "src=\"/", "href='/", "src='/"] {
+                assert!(
+                    !page.contains(attr),
+                    "{name} names a path from the root: {attr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pages_take_every_colour_from_the_tokens() {
+        let hex = |s: &str| {
+            s.as_bytes().windows(5).any(|w| {
+                w[0] == b'#'
+                    && w[1..4].iter().all(u8::is_ascii_hexdigit)
+                    && !w[4].is_ascii_alphanumeric()
+            }) || s.as_bytes().windows(8).any(|w| {
+                w[0] == b'#'
+                    && w[1..7].iter().all(u8::is_ascii_hexdigit)
+                    && !w[7].is_ascii_alphanumeric()
+            })
+        };
+        for (name, page) in PAGES {
+            assert!(!hex(page), "{name} has a colour of its own");
+            // a colour by name, in the page's own styles; the terminal's ANSI names are
+            // keys of the theme read from the tokens, not colours
+            let styles = page
+                .split("<style>")
+                .skip(1)
+                .filter_map(|s| s.split("</style>").next());
+            for css in styles {
+                for f in ["rgb(", "hsl(", "white", "black", "gray", "grey"] {
+                    assert!(!css.contains(f), "{name} names a colour: {f}");
+                }
+            }
+        }
+    }
+}

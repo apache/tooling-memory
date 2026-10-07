@@ -202,7 +202,7 @@ async fn dump(url: String) -> String {
     .unwrap();
     let dom = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        dom.contains("amem reader"),
+        dom.contains("Reader · amem"),
         "the page did not load:\n{dom}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -210,9 +210,10 @@ async fn dump(url: String) -> String {
 }
 
 fn hit_ids(dom: &str) -> Vec<&str> {
-    dom.match_indices("<li data-id=\"")
-        .map(|(i, m)| {
-            let rest = &dom[i + m.len()..];
+    dom.match_indices("<li class=\"am-hit")
+        .map(|(i, _)| {
+            let rest = &dom[i..];
+            let rest = &rest[rest.find("data-id=\"").unwrap() + 9..];
             &rest[..rest.find('"').unwrap()]
         })
         .collect()
@@ -232,9 +233,10 @@ async fn the_reader_loads_a_domain_verifies_it_and_ranks_like_the_server() {
         dom.contains("dom-me: 3 entries, highest label restricted"),
         "the bundle did not load:\n{dom}"
     );
+    let open = r#"class="hit-open" type="button">"#;
     let first_hit = dom
-        .find(r#"class="t">"#)
-        .map(|i| &dom[i + 10..i + 40])
+        .find(open)
+        .map(|i| &dom[i + open.len()..i + open.len() + 30])
         .unwrap_or_default();
     assert!(
         first_hit.starts_with("Retry policy"),
@@ -317,7 +319,8 @@ async fn an_entry_opened_from_the_url_is_rendered_without_its_scripts() {
     ))
     .await;
     assert!(
-        dom.contains("<h2>Commit convention</h2>") && dom.contains("body says why"),
+        dom.contains(r#"<h2 class="am-entry-title">Commit convention</h2>"#)
+            && dom.contains("body says why"),
         "the entry named in the URL did not open:\n{dom}"
     );
     assert!(

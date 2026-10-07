@@ -3,167 +3,636 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>amem</title>
+<title>Sessions · amem</title>
+<!-- the reader's theme and contrast, set before the first paint; storage is a convenience -->
+<script>try { const s = localStorage, r = document.documentElement; if (s.getItem('amem-theme')) r.dataset.theme = s.getItem('amem-theme'); if (s.getItem('amem-contrast')) r.dataset.contrast = s.getItem('amem-contrast'); } catch (_) { /* private window */ }</script>
+<link rel="stylesheet" href="tokens.css">
 <style>
-  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; --muted: #6b6b6b; --line: #ddd; --accent: #0a62c9; --card: #ffffff; --mono: ui-monospace, Menlo, Consolas, monospace; }
-  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #16181d; --muted: #9a9a9a; --line: #333; --accent: #6fb2ff; --card: #1c1f26; } }
-  body { margin: 0; padding: 24px 16px; font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 860px; margin-inline: auto; }
-  h1 { font-size: 20px; margin: 0 0 16px; }
-  h2 { font-size: 15px; margin: 24px 0 8px; color: var(--muted); font-weight: 600; }
-  form { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px 12px; align-items: end; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
-  label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); min-width: 0; }
-  input, select, textarea, button { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--fg); min-width: 0; }
-  textarea { resize: vertical; min-height: 44px; font-family: inherit; }
-  .wide { grid-column: 1 / -1; }
-  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-  .row label { display: flex; align-items: center; gap: 6px; }
-  button { background: var(--accent); color: white; border: 0; cursor: pointer; }
-  button:disabled { opacity: .5; cursor: default; }
-  .hint { font-size: 12px; color: var(--muted); min-height: 1.2em; }
-  .cmd { font: 12px/1.5 var(--mono); color: var(--muted); background: transparent; border: 1px dashed var(--line); border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; word-break: break-all; }
-  ul { list-style: none; padding: 0; margin: 0; }
-  li { display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
-  li a { color: var(--accent); text-decoration: none; }
-  .status { color: var(--muted); font-size: 13px; }
-  @media (max-width: 640px) { form { grid-template-columns: 1fr 1fr; } }
+  .launch { display: grid; gap: var(--am-space-8); grid-template-columns: minmax(0, 1fr); align-items: start; }
+  .launch-form fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+  .launch-foot { margin-top: var(--am-space-4); }
+  .more { justify-self: start; }
+  .auth-ready { display: flex; gap: var(--am-space-1); align-items: center; }
+  .auth-ready .am-state { width: 16px; height: 16px; }
+  .sub-field { grid-auto-flow: column; align-items: center; gap: var(--am-space-2); }
+  #unpaired .am-alert-act { display: grid; }
+  @media (min-width: 1100px) {
+    .launch { grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); }
+  }
 </style>
 </head>
-<body>
-<h1>amem</h1>
-<form id="new">
-  <label>Harness
-    <select name="harness" id="harness" required><option value="">choose…</option></select>
-  </label>
-  <label>Auth
-    <select name="auth" id="auth"></select>
-  </label>
-  <label>Destination
-    <select name="provider" id="provider"><option value="">the harness's own</option></select>
-  </label>
-  <label class="wide">Model
-    <input name="model" id="model" list="models" placeholder="the harness's default" autocomplete="off">
-    <datalist id="models"></datalist>
-    <span class="hint" id="models-hint"></span>
-  </label>
-  <label class="wide">Prompt, or leave empty for an interactive session
-    <textarea name="prompt" id="prompt" placeholder="load T0 and summarise it"></textarea>
-  </label>
-  <div class="wide row">
-    <label><input type="checkbox" name="work" id="work" style="width:auto"> Work the next task from the ledger</label>
-    <label>Subagents
-      <select name="subagents" id="subagents"></select>
-    </label>
-  </div>
-  <div class="wide cmd" id="cmd"></div>
-  <div class="wide row"><button type="submit" id="start">Start</button><span class="hint" id="form-hint"></span></div>
-</form>
-<h2>Board and reader</h2>
-<p class="status">The tasks on the ledger, by status, each under the task it was filed from: <a href="/board">open the board</a>. Read and search a domain in the browser, no session needed: <a href="/reader">open the reader</a>.</p>
-<h2>Sessions</h2>
-<ul id="sessions"><li class="status">none yet</li></ul>
-<script src="/amem.js"></script>
-<script>
-const $ = (id) => document.getElementById(id);
-const form = $('new');
-let options = null;
+<body class="am-body">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<symbol id="i-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 3.5H3.5v17h4M16.5 3.5h4v17h-4"/><path d="M8 8.5h8M8 12h8M8 15.5h5"/></symbol>
+<symbol id="i-running" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2"/><circle cx="8" cy="8" r="3" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-connecting" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2" stroke-dasharray="2.7 2.2"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-done" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M5.3 8.2l1.9 1.9 3.6-3.9"/></symbol>
+<symbol id="i-ok" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 8.6l3.3 3.2L13.2 4.6"/></symbol>
+<symbol id="i-fail" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></symbol>
+<symbol id="i-warn" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2l6.3 11.2H1.7Z"/><path d="M8 6.6v3M8 11.6v.05"/></symbol>
+<symbol id="i-absent" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2" stroke-dasharray="0.1 2.6"/></symbol>
+<symbol id="i-refused" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M3.7 12.3l8.6-8.6"/></symbol>
+<symbol id="i-ceiling" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.8h11"/><path d="M8 13.6V5.8M5.2 8.5L8 5.7l2.8 2.8"/></symbol>
+<symbol id="i-admit" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 13.8V2.4h7.2v11.4"/><path d="M1.6 8.1h6.6M6 5.9l2.2 2.2L6 10.3"/></symbol>
+<symbol id="i-handoff" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.6h3.2l1 1.7h3.6l1-1.7H14v3a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1Z"/><path d="M8 2v5.6M5.7 5.4L8 7.7l2.3-2.3"/></symbol>
+<symbol id="i-lease" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M8 4.6V8l2.4 1.5"/></symbol>
+<symbol id="i-queued" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 4.6h10M3 8h10M3 11.4h6"/></symbol>
+<symbol id="i-invalid" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M5 8h6"/></symbol>
+<symbol id="i-superseded" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.4 8h8.4M8 5l3 3-3 3"/><path d="M13.6 3.2v9.6"/></symbol>
+<symbol id="i-demoted" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2v8.2M4.9 7.4L8 10.5l3.1-3.1"/><path d="M3 13.6h10"/></symbol>
+<symbol id="i-erased" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="2.4" y="2.4" width="11.2" height="11.2" rx="1.6" stroke-dasharray="2.2 2.2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><rect x="5.6" y="5.6" width="8" height="8" rx="1.4"/><path d="M10.4 5.6V3.8a1.3 1.3 0 0 0-1.3-1.3H3.8a1.3 1.3 0 0 0-1.3 1.3v5.3a1.3 1.3 0 0 0 1.3 1.3h1.8"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.6" width="12.4" height="10.8" rx="1.6"/><path d="M4.6 6.2l2 1.8-2 1.8M8.4 10h3"/></symbol>
+<symbol id="i-search" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="4.4"/><path d="M10.3 10.3l3.5 3.5"/></symbol>
+<symbol id="i-entry" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.8" y="1.8" width="10.4" height="12.4" rx="1.4"/><path d="M5.4 5.4h5.2M5.4 8h5.2M5.4 10.6h3"/></symbol>
+<symbol id="i-start" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M4.6 2.9v10.2L12.8 8Z"/></symbol>
+<symbol id="i-label-0" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="none"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="none"/></symbol>
+<symbol id="i-label-1" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="currentColor"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="none"/></symbol>
+<symbol id="i-label-2" viewBox="0 0 16 16" stroke="currentColor" stroke-width="1.2"><rect x="1.6" y="9.6" width="3" height="4.6" rx=".5" fill="currentColor"/><rect x="6.5" y="6.4" width="3" height="7.8" rx=".5" fill="currentColor"/><rect x="11.4" y="2.6" width="3" height="11.6" rx=".5" fill="currentColor"/></symbol>
+<symbol id="i-trust-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/></symbol>
+<symbol id="i-trust-1" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/><path d="M8 2.4a5.6 5.6 0 0 0 0 11.2Z" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-trust-2" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6" fill="currentColor"/></symbol>
+<symbol id="i-pair" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.8" cy="8" r="2.8"/><path d="M7.6 8h6.6M11.2 8v2.4M13.6 8v1.8"/></symbol>
+<symbol id="i-busy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 1.8a6.2 6.2 0 1 0 6.2 6.2"/></symbol>
+</defs></svg>
+<a class="am-skip" href="#main">Skip to the page</a>
+<header class="am-top">
+  <a class="am-mark" href="index.html"><svg class="am-glyph" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-mark"/></svg>amem</a>
+  <nav class="am-nav" aria-label="Pages">
+    <a href="index.html" aria-current="page">Sessions</a>
+    <a href="board.html">Board</a>
+    <a href="reader.html">Reader</a>
+  </nav>
+  <div class="am-top-end" id="pairing"></div>
+</header>
 
-function fill(select, values, keep, placeholder) {
+<main class="am-main" id="main">
+  <div class="am-head">
+    <h1 class="am-title">Sessions</h1>
+    <p class="am-lead">A session is a coding harness in a box with no network. Its model calls cross one metered line, and what it learns lands on the record.</p>
+  </div>
+
+  <div id="unpaired" class="am-alert am-alert--await" role="status" hidden>
+    <svg class="am-glyph" aria-hidden="true"><use href="#i-pair"/></svg>
+    <p><b>Not paired.</b> <span id="unpaired-why"></span></p>
+    <div class="am-alert-act">
+      <div class="am-cmd"><code><span class="p">$ </span>amem</code><button class="am-btn am-btn--secondary" type="button" data-copy><svg class="am-glyph" aria-hidden="true"><use href="#i-copy"/></svg><span>Copy command</span></button></div>
+    </div>
+  </div>
+
+  <section class="am-section" aria-labelledby="list-h">
+    <div class="am-section-head">
+      <h2 class="am-section-title" id="list-h">Running and recent</h2>
+      <span class="am-hint">Newest first. A session keeps running when its page is closed.</span>
+    </div>
+    <div id="sessions" aria-busy="true"></div>
+    <button class="am-btn am-btn--quiet more" type="button" id="more" hidden></button>
+  </section>
+
+  <div class="launch">
+    <section class="am-panel launch-form" aria-labelledby="start-h">
+      <h2 class="am-section-title" id="start-h">Start a session</h2>
+      <form id="new" novalidate>
+        <fieldset id="fields" class="am-launch">
+          <div class="am-field c3"><label for="profile">Profile</label>
+            <select class="am-ctrl" id="profile" name="profile"><option value="">None, set it up here</option></select>
+            <span class="am-hint" id="profile-hint">From <span class="am-mono">profiles.toml</span>, and every harness by its own name. Choosing one fills the form; what you change is a flag on top.</span></div>
+          <div class="am-field c3"><label for="harness">Harness</label>
+            <select class="am-ctrl" id="harness" name="harness"><option value="">Choose a harness</option></select>
+            <span class="am-hint auth-ready" id="auth-ready"></span></div>
+
+          <div class="am-field c3"><span class="am-legend" id="auth-l">Auth</span>
+            <div class="am-seg" role="radiogroup" aria-labelledby="auth-l" id="auth"></div>
+            <span class="am-hint">The glyph on each says what this host has for the harness.</span></div>
+          <div class="am-field c3"><label for="provider">Destination</label>
+            <select class="am-ctrl" id="provider" name="provider"></select>
+            <span class="am-hint" id="provider-hint"></span></div>
+
+          <div class="am-field c3"><label for="model">Model</label>
+            <input class="am-ctrl is-mono" id="model" name="model" list="models" placeholder="the harness's default" autocomplete="off" spellcheck="false">
+            <datalist id="models"></datalist>
+            <span class="am-hint" id="models-hint"></span></div>
+          <div class="am-field c3"><label for="backend">Backend</label>
+            <select class="am-ctrl is-mono" id="backend" name="backend"></select>
+            <span class="am-hint">Where the harness runs; <span class="am-mono">auto</span> picks for each harness.</span></div>
+
+          <div class="am-field"><label for="prompt">Prompt</label>
+            <textarea class="am-ctrl" id="prompt" name="prompt" placeholder="Load T0 and summarise it"></textarea>
+            <span class="am-hint" id="prompt-hint">Leave it empty for an interactive session.</span></div>
+
+          <div class="am-launch-foot">
+            <label class="am-check"><input type="checkbox" id="work" name="work"> Work the next task from the ledger</label>
+            <span class="am-field sub-field"><span class="am-legend" id="sub-l">Subagents</span>
+              <span class="am-seg" role="radiogroup" aria-labelledby="sub-l" id="subagents"></span></span>
+          </div>
+        </fieldset>
+
+        <div class="am-launch launch-foot">
+          <div class="am-cmd">
+            <code><span class="p">$ </span><span id="cmd"></span></code>
+            <button class="am-btn am-btn--secondary" type="button" data-copy><svg class="am-glyph" aria-hidden="true"><use href="#i-copy"/></svg><span>Copy command</span></button>
+          </div>
+          <div class="am-launch-foot">
+            <button class="am-btn am-btn--primary" type="submit" id="start" disabled><svg class="am-glyph" aria-hidden="true"><use href="#i-start"/></svg><span>Start session</span></button>
+            <span class="am-hint" id="form-hint" aria-live="polite">Opens the session's page. It keeps running if you close it.</span>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <section class="am-section" aria-labelledby="host-h">
+      <div class="am-section-head">
+        <h2 class="am-section-title" id="host-h">This host</h2>
+        <button class="am-btn am-btn--secondary" type="button" id="online" disabled>Ask the gateway</button>
+      </div>
+      <p class="am-hint" id="host-hint">What <span class="am-mono">amem doctor</span> finds each harness has, for each way to sign in. It reads files and the environment; the gateway is asked only when you ask.</p>
+      <ul class="am-ready" id="ready" aria-label="Harnesses, and what each has to launch"></ul>
+    </section>
+  </div>
+
+  <footer class="am-foot">
+    <div class="am-prefs" role="group" aria-label="Show these pages in">
+      <div class="am-field"><span class="am-legend" id="lg-theme">Theme</span>
+        <div class="am-seg" role="radiogroup" aria-labelledby="lg-theme">
+          <label><input type="radio" name="am-theme" value="system" checked><span>System</span></label>
+          <label><input type="radio" name="am-theme" value="light"><span>Light</span></label>
+          <label><input type="radio" name="am-theme" value="dark"><span>Dark</span></label>
+        </div></div>
+      <div class="am-field"><span class="am-legend" id="lg-contrast">Contrast</span>
+        <div class="am-seg" role="radiogroup" aria-labelledby="lg-contrast">
+          <label><input type="radio" name="am-contrast" value="system" checked><span>System</span></label>
+          <label><input type="radio" name="am-contrast" value="normal"><span>Normal</span></label>
+          <label><input type="radio" name="am-contrast" value="more"><span>More</span></label>
+        </div></div>
+    </div>
+    <span><span class="am-mono">amem doctor</span>, in a terminal, says all of what this page summarises.</span>
+  </footer>
+</main>
+
+<script src="amem.js"></script>
+<script>
+// ---- small DOM helpers: what the API says is only ever set as text ----
+const $ = (id) => document.getElementById(id);
+const NS = 'http://www.w3.org/2000/svg';
+function el(tag, cls, ...kids) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  for (const k of kids) if (k !== null && k !== undefined && k !== false) e.append(k);
+  return e;
+}
+function glyph(name, label) {
+  const s = document.createElementNS(NS, 'svg');
+  s.setAttribute('class', 'am-glyph');
+  if (label) { s.setAttribute('role', 'img'); s.setAttribute('aria-label', label); } else s.setAttribute('aria-hidden', 'true');
+  const u = document.createElementNS(NS, 'use');
+  u.setAttribute('href', `#i-${name}`);
+  s.append(u);
+  return s;
+}
+const state = (tone, name, label) => el('span', `am-state am-state--${tone}`, glyph(name, label));
+function chip(tone, name, word, count) {
+  const c = el('span', `am-chip am-chip--${tone}`, glyph(name));
+  if (count !== undefined) c.append(el('span', 'am-chip-count', String(count)));
+  c.append(el('span', 'am-chip-word', word));
+  c.title = count !== undefined ? `${count} ${word}` : word;
+  return c;
+}
+const mono = (t) => el('span', 'am-mono', t);
+const clock = (iso) => `${String(iso || '').slice(11, 19)}Z`;
+function since(iso) {
+  const m = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60000));
+  return m < 1 ? 'under a minute' : m < 120 ? `${m} min` : `${Math.round(m / 60)} h`;
+}
+
+// ---- theme and contrast: system unless the reader says otherwise, kept per browser ----
+for (const name of ['theme', 'contrast']) {
+  const now = document.documentElement.dataset[name] || 'system';
+  for (const r of document.querySelectorAll(`input[name="am-${name}"]`)) {
+    r.checked = r.value === now;
+    r.addEventListener('change', () => {
+      if (r.value === 'system') delete document.documentElement.dataset[name];
+      else document.documentElement.dataset[name] = r.value;
+      try { if (r.value === 'system') localStorage.removeItem(`amem-${name}`); else localStorage.setItem(`amem-${name}`, r.value); } catch (_) { /* private window */ }
+    });
+  }
+}
+
+// ---- copy: the button says what happened, in the same word, then goes back ----
+for (const b of document.querySelectorAll('[data-copy]')) {
+  b.addEventListener('click', async () => {
+    const text = b.closest('.am-cmd').querySelector('code').textContent.replace(/^\$\s*/, '');
+    const label = b.querySelector('span');
+    try { await navigator.clipboard.writeText(text); label.textContent = 'Copied'; } catch (_) { label.textContent = 'Select it to copy'; }
+    setTimeout(() => { label.textContent = 'Copy command'; }, 1600);
+  });
+}
+
+// what a page says when it has no key; a hosted copy also says where amem has to run
+const unpairedWhy = () => { const w = amem.unpaired(); return amem.hosted && !/own machine/.test(w) ? `${w} This copy of the pages runs in your browser and talks to amem on your own machine: run amem there, and it opens this page paired.` : w; };
+// ---- pairing ----
+let paired = false;
+function showPairing() {
+  const end = $('pairing');
+  if (paired) {
+    let host = amem.server() || location.origin;
+    try { host = new URL(host).host; } catch (_) { /* as it is */ }
+    const id = el('span', 'am-id', host);
+    end.replaceChildren('Paired with ', id);
+    $('unpaired').hidden = true;
+    return;
+  }
+  end.replaceChildren(state('await', 'pair'), 'Not paired');
+  $('unpaired-why').textContent = unpairedWhy();
+  $('unpaired').hidden = false;
+  $('fields').disabled = true;
+  $('start').disabled = true;
+  $('online').disabled = true;
+  $('form-hint').textContent = 'Pair this browser first, as the note above says.';
+  $('auth-ready').textContent = '';
+  $('sessions').removeAttribute('aria-busy');
+  $('sessions').replaceChildren(el('div', 'am-empty', el('b', null, 'Sessions show here once this browser is paired'),
+    el('p', null, 'Nothing on this page reaches amem until then.')));
+  $('ready').replaceChildren();
+}
+
+// ---- the form ----
+let options = null;
+let profiles = {};
+let doctor = null;
+let base = null; // what the chosen profile fills in, so a change from it is an override
+let subTouched = false;
+const ALIAS = { antigravity: 'agy' };
+const MODES = [['subscription', 'Subscription'], ['key', 'Key'], ['gateway', 'Gateway']];
+const MODE_NAME = Object.fromEntries(MODES);
+
+function fill(select, values, keep, first) {
   const before = keep ? select.value : '';
-  select.innerHTML = placeholder ? `<option value="">${placeholder}</option>` : '';
-  for (const v of values) { const o = document.createElement('option'); o.value = v; o.textContent = v; select.appendChild(o); }
+  select.replaceChildren();
+  if (first) select.append(new Option(first, ''));
+  for (const v of values) select.append(new Option(v, v));
   if (before && values.includes(before)) select.value = before;
 }
+function seg(box, name, values, labels) {
+  box.replaceChildren(...values.map((v) => {
+    const input = el('input');
+    input.type = 'radio'; input.name = name; input.value = v;
+    return el('label', null, input, el('span', null, labels[v] || v));
+  }));
+}
+const radio = (name) => (document.querySelector(`input[name="${name}"]:checked`) || {}).value || '';
+function setRadio(name, value) { for (const r of document.querySelectorAll(`input[name="${name}"]`)) r.checked = r.value === value; }
 
-async function loadOptions() {
-  const r = await amem.fetch('/api/options');
-  if (r.status === 401) { $('form-hint').textContent = amem.unpaired(); $('start').disabled = true; return; }
-  options = await r.json();
-  fill($('harness'), options.harnesses, false, 'choose…');
+async function load() {
+  await amem.ready;
+  paired = amem.paired();
+  if (paired) {
+    const r = await amem.fetch('/api/options').catch(() => null);
+    if (!r || !r.ok) paired = false;
+    else options = await r.json();
+  }
+  showPairing();
+  if (!paired) return;
+  $('online').disabled = false;
+  fill($('harness'), options.harnesses, false, 'Choose a harness');
   if (options.defaults.harness) $('harness').value = options.defaults.harness;
-  fill($('auth'), options.auth, false);
-  $('auth').value = options.defaults.auth;
-  fill($('subagents'), options.subagents, false);
+  seg($('auth'), 'auth', options.auth, MODE_NAME);
+  setRadio('auth', options.defaults.auth);
+  seg($('subagents'), 'subagents', options.subagents, { harness: 'Harness', board: 'Board' });
+  setRadio('subagents', 'harness');
+  fill($('backend'), options.backends, false);
+  $('backend').value = options.defaults.backend || options.backends[0];
   onAuth();
+  loadProfiles();
+  loadDoctor(false);
+  refresh();
+  setInterval(refresh, 3000);
 }
 
-function onAuth() {
-  const auth = $('auth').value;
+async function loadProfiles() {
+  const r = await amem.fetch('/api/profiles').catch(() => null);
+  if (!r || !r.ok) { $('profile-hint').textContent = 'No profiles: the launcher did not list them.'; return; }
+  profiles = await r.json();
+  fill($('profile'), Object.keys(profiles).sort(), true, 'None, set it up here');
+}
+
+function onProfile() {
+  // a profile's name is typed, so it is mono; the choice of none is not
+  $('profile').classList.toggle('is-mono', !!$('profile').value);
+  const p = profiles[$('profile').value];
+  if (!p) { base = null; preview(); return; }
+  base = {
+    harness: p.harness || '',
+    auth: p.auth || options.defaults.auth,
+    provider: p.provider || '',
+    model: p.model || '',
+    backend: p.backend || options.defaults.backend,
+    subagents: p.subagents || '',
+  };
+  $('harness').value = options.harnesses.includes(base.harness) ? base.harness : '';
+  setRadio('auth', base.auth);
+  $('model').value = base.model;
+  $('backend').value = base.backend;
+  subTouched = !!base.subagents;
+  setRadio('subagents', base.subagents || ($('work').checked ? 'board' : 'harness'));
+  onAuth(base.provider);
+  // a profile that names no destination gets the one the auth mode picks, as the launcher does
+  if (!base.provider && !$('provider').disabled) { base.provider = $('provider').value; preview(); }
+}
+
+function onAuth(provider) {
+  const auth = radio('auth');
   const dests = options.destinations[auth] || [];
   const p = $('provider');
-  fill(p, dests, true, auth === 'subscription' ? "the harness's own" : (auth === 'gateway' ? '' : "the harness's own"));
-  if (auth === 'gateway' && dests.length) p.value = dests[0];
-  p.disabled = auth === 'subscription';
+  if (auth === 'subscription') {
+    fill(p, [], false, "The harness's own login");
+    p.disabled = true;
+  } else {
+    fill(p, dests, true, auth === 'gateway' ? null : "The harness's own provider");
+    if (auth === 'gateway' && dests.length && !p.value) p.value = dests[0];
+    p.disabled = false;
+  }
+  if (typeof provider === 'string' && dests.includes(provider)) p.value = provider;
+  destinationHint();
+  readiness();
   loadModels();
   preview();
+}
+
+// the ceiling grants.toml gives a destination, as the doctor read it
+const LABELS = ['public', 'internal', 'restricted'];
+function ceilings() {
+  const g = doctor && (doctor.checks || []).find((c) => c.area === 'record' && c.subject === 'grants');
+  const m = g && /ceilings (.*)$/.exec(g.detail || '');
+  const out = {};
+  if (m) for (const pair of m[1].split(/,\s*/)) { const [d, l] = pair.split(/\s+/); if (d && l) out[d] = l; }
+  return out;
+}
+function destinationHint() {
+  const h = $('provider-hint');
+  if (radio('auth') === 'subscription') { h.textContent = 'A subscription login goes where the harness sends it.'; return; }
+  const d = $('provider').value;
+  if (!d) { h.textContent = 'The provider the harness is made for.'; return; }
+  const c = ceilings()[d];
+  if (!LABELS.includes(c)) { h.replaceChildren(el('span', 'am-mono', d), ': its ceiling is in ', mono('grants.toml'), '.'); return; }
+  const fact = el('span', 'am-fact', glyph(`label-${LABELS.indexOf(c)}`), c);
+  fact.style.fontSize = 'inherit';
+  h.replaceChildren('Ceiling ', fact, ' in ', mono('grants.toml'), '. The session reads nothing above it.');
 }
 
 let modelsSeq = 0;
 async function loadModels() {
   const seq = ++modelsSeq;
-  const auth = $('auth').value, provider = $('provider').value;
+  const auth = radio('auth'), provider = $('provider').value;
   const list = $('models'), hint = $('models-hint');
-  list.innerHTML = '';
-  if (auth === 'subscription') { hint.textContent = "a login is the harness's own: leave the model to it, or name one"; return; }
-  hint.textContent = 'asking the destination for its models…';
+  list.replaceChildren();
+  if (auth === 'subscription') { hint.textContent = "A login is the harness's own: leave the model to it, or name one."; return; }
+  hint.replaceChildren(el('span', 'am-busy', glyph('busy'), `Asking ${provider || 'the provider'} for its models`));
   try {
     const r = await amem.fetch(`/api/models?auth=${encodeURIComponent(auth)}&provider=${encodeURIComponent(provider)}`);
     if (seq !== modelsSeq) return;
-    if (!r.ok) { hint.textContent = `no list: ${(await r.text()).slice(0, 160)}`; return; }
+    if (!r.ok) { hint.textContent = `No model list: ${(await r.text()).slice(0, 160)}. Type a name, or leave it to the harness.`; return; }
     const v = await r.json();
-    for (const m of v.models || []) { const o = document.createElement('option'); o.value = m; list.appendChild(o); }
-    hint.textContent = v.models && v.models.length ? `${v.models.length} model${v.models.length === 1 ? '' : 's'} at ${v.destination || provider}; pick one or type` : (v.note || 'the destination lists no models');
-    if (v.models && v.models.length === 1 && !$('model').value) $('model').value = v.models[0];
+    for (const m of v.models || []) list.append(new Option(m, m));
+    const n = (v.models || []).length;
+    hint.textContent = n ? `${n} model${n === 1 ? '' : 's'} at ${v.destination || provider}; pick one or type a name` : (v.note || 'The destination lists no models; type a name.');
+    if (n === 1 && !$('model').value && !base) $('model').value = v.models[0];
     preview();
-  } catch (e) { if (seq === modelsSeq) hint.textContent = `no list: ${e}`; }
+  } catch (e) { if (seq === modelsSeq) hint.textContent = `No model list: ${e.message}`; }
 }
 
+// ---- readiness, in the doctor's words: ready, or what is missing ----
+function verdict(r) {
+  if (!r) return { tone: 'ink', glyph: 'absent', words: ['not checked'] };
+  if (r.ok) return { tone: 'ok', glyph: 'ok', words: ['ready'] };
+  const m = r.missing || '';
+  if (m === 'n/a') return { tone: 'ink', glyph: 'absent', words: ['not offered'] };
+  if (/ not installed$/.test(m)) return { tone: 'ink', glyph: 'absent', words: ['not installed'] };
+  if (m === 'gateway not answering') return { tone: 'fail', glyph: 'fail', words: ['gateway not answering'] };
+  if (m === 'gateway not asked') return { tone: 'ink', glyph: 'absent', words: ['gateway not asked'] };
+  if (m === 'login') return { tone: 'ink', glyph: 'absent', words: ['no login'] };
+  return { tone: 'ink', glyph: 'absent', words: ['no ', mono(m)] };
+}
+const readyOf = (h) => (doctor && doctor.ready ? doctor.ready[h] || doctor.ready[ALIAS[h]] : null);
+const say = (v) => v.words.map((w) => (typeof w === 'string' ? w : w.cloneNode(true)));
+
+function readiness() {
+  const h = $('harness').value;
+  const modes = readyOf(h);
+  // each auth segment carries the chosen harness's verdict, in its glyph and its name
+  for (const label of $('auth').querySelectorAll('label')) {
+    const input = label.querySelector('input');
+    const span = label.querySelector('span');
+    for (const old of span.querySelectorAll('.am-state')) old.remove();
+    input.removeAttribute('aria-label');
+    if (!h || !modes) continue;
+    const v = verdict(modes[input.value]);
+    span.prepend(state(v.tone, v.glyph));
+    input.setAttribute('aria-label', `${MODE_NAME[input.value] || input.value}, ${v.words.map((w) => (typeof w === 'string' ? w : w.textContent)).join('')}`);
+  }
+  const out = $('auth-ready');
+  const auth = radio('auth');
+  if (!h) out.textContent = 'Choose one to see what this host has for it.';
+  else if (!modes) out.textContent = doctor ? `amem doctor says nothing of ${h}.` : 'Asking amem doctor.';
+  else {
+    const v = verdict(modes[auth]);
+    out.replaceChildren(state(v.tone, v.glyph), el('span', null, `With ${(MODE_NAME[auth] || auth).toLowerCase()}: `, ...say(v)));
+  }
+  for (const row of $('ready').children) row.classList.toggle('is-open', row.dataset.harness === h);
+  startState();
+}
+
+async function loadDoctor(online) {
+  const b = $('online');
+  if (online) { b.setAttribute('aria-busy', 'true'); b.replaceChildren(el('span', 'am-busy', glyph('busy'), 'Asking the gateway')); }
+  else if (!doctor) $('ready').replaceChildren(el('li', 'am-ready-row', el('span', 'am-busy', glyph('busy'), 'Asking amem doctor')));
+  try {
+    const r = await amem.fetch(online ? '/api/doctor?online=1' : '/api/doctor');
+    if (!r.ok) throw new Error((await r.text()).slice(0, 200) || r.statusText);
+    doctor = await r.json();
+    renderReady();
+    if (online) $('host-hint').textContent = `Asked the gateway at ${clock(new Date().toISOString())}.`;
+  } catch (e) {
+    $('ready').replaceChildren(el('li', 'am-ready-row', el('span', 'am-err', glyph('fail'), `amem doctor did not answer: ${e.message}. Run amem doctor in a terminal.`)));
+  } finally {
+    b.removeAttribute('aria-busy');
+    b.replaceChildren('Ask the gateway');
+  }
+  destinationHint();
+  readiness();
+}
+
+function renderReady() {
+  $('ready').replaceChildren(...options.harnesses.map((h) => {
+    const modes = readyOf(h) || {};
+    const box = el('span', 'am-ready-modes');
+    const missing = MODES.map(([m]) => (modes[m] && modes[m].missing) || '');
+    if (missing.every((m) => / not installed$/.test(m))) {
+      box.append(el('span', 'am-ready-mode', state('ink', 'absent'), 'not installed'));
+    } else {
+      for (const [m, name] of MODES) {
+        const v = verdict(modes[m]);
+        box.append(el('span', 'am-ready-mode', state(v.tone, v.glyph), el('b', null, name), ' ', ...say(v)));
+      }
+    }
+    const row = el('li', 'am-ready-row', el('span', 'am-ready-h', h), box);
+    row.dataset.harness = h;
+    return row;
+  }));
+}
+
+// ---- what is sent, and the command it is ----
+const FIELDS = ['harness', 'auth', 'provider', 'model', 'backend', 'subagents'];
 function body() {
-  const f = new FormData(form);
-  const b = { harness: f.get('harness'), auth: f.get('auth'), work: !!f.get('work'), subagents: f.get('subagents') };
-  if (f.get('provider')) b.provider = f.get('provider');
-  if ((f.get('model') || '').trim()) b.model = f.get('model').trim();
-  if (!b.work && (f.get('prompt') || '').trim()) b.prompt = f.get('prompt').trim();
+  const work = $('work').checked;
+  const v = {
+    harness: $('harness').value, auth: radio('auth'), provider: $('provider').disabled ? '' : $('provider').value,
+    model: $('model').value.trim(), backend: $('backend').value, subagents: radio('subagents'),
+  };
+  const b = { work };
+  const prompt = $('prompt').value.trim();
+  if (!work && prompt) b.prompt = prompt;
+  if (base) {
+    // with a profile, only what differs from it is sent, and said as a flag
+    b.profile = $('profile').value;
+    const from = { ...base, subagents: base.subagents || (work ? 'board' : 'harness') };
+    for (const k of FIELDS) if (v[k] && v[k] !== from[k]) b[k] = v[k];
+  } else {
+    for (const k of FIELDS) if (v[k]) b[k] = v[k];
+  }
   return b;
 }
 
+const quote = (s) => (/^[A-Za-z0-9_./:=@%+<>-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
 function preview() {
+  if (!options) return;
   const b = body();
-  const q = (s) => /[\s"']/.test(s) ? `'${s.replace(/'/g, `'\\''`)}'` : s;
-  const parts = ['amem', b.work ? 'work' : 'launch', '--harness', b.harness || '<harness>', '--auth', b.auth];
-  if (b.provider) parts.push('--provider', b.provider);
-  if (b.model) parts.push('--model', q(b.model));
-  if (b.subagents && b.subagents !== (b.work ? 'board' : 'harness')) parts.push('--subagents', b.subagents);
-  if (b.prompt) parts.push('--prompt', q(b.prompt));
-  $('cmd').textContent = parts.join(' ');
+  const words = [];
+  const flags = [];
+  const flag = (f, value) => flags.push([f, quote(value)]);
+  if (b.profile) {
+    words.push('amem', ...(b.work ? ['work'] : []), b.profile);
+    for (const k of FIELDS) if (b[k]) flag(`--${k}`, b[k]);
+  } else {
+    words.push('amem', b.work ? 'work' : 'launch');
+    flag('--harness', b.harness || '<harness>');
+    flag('--auth', b.auth);
+    if (b.provider) flag('--provider', b.provider);
+    if (b.model) flag('--model', b.model);
+    if (b.backend && b.backend !== options.defaults.backend) flag('--backend', b.backend);
+    if (b.subagents && b.subagents !== (b.work ? 'board' : 'harness')) flag('--subagents', b.subagents);
+  }
+  if (b.prompt) flag('--prompt', b.prompt);
+  const out = [words.join(' ')];
+  for (const [f, v] of flags) out.push(' ', el('span', 'f', f), ` ${v}`);
+  $('cmd').replaceChildren(...out);
   $('prompt').disabled = b.work;
-  $('start').disabled = !b.harness;
-  $('form-hint').textContent = b.harness ? '' : 'there is no default harness';
+  $('prompt-hint').textContent = b.work ? 'Not used while working the next task: the task is the prompt.' : 'Leave it empty for an interactive session.';
+  startState();
 }
 
-$('auth').addEventListener('change', onAuth);
-$('provider').addEventListener('change', () => { loadModels(); preview(); });
-form.addEventListener('input', preview);
-form.addEventListener('change', preview);
-form.addEventListener('submit', async (e) => {
+function startState() {
+  if (!paired || !options) return;
+  const start = $('start');
+  if (start.getAttribute('aria-busy') === 'true') return;
+  const can = !!($('profile').value || $('harness').value);
+  start.disabled = !can;
+  const hint = $('form-hint');
+  if (hint.classList.contains('am-err')) return;
+  if (!can) { hint.textContent = 'Choose a profile or a harness first.'; return; }
+  const h = $('harness').value;
+  const modes = readyOf(h);
+  const r = modes && modes[radio('auth')];
+  if (r && !r.ok && r.missing !== 'gateway not asked') {
+    hint.replaceChildren(`amem doctor finds ${h} has `, ...say(verdict(r)), ' here, so the session may stop at once.');
+  } else hint.textContent = "Opens the session's page. It keeps running if you close it.";
+}
+
+function formError(text) {
+  const hint = $('form-hint');
+  hint.className = 'am-err';
+  hint.replaceChildren(glyph('fail'), text);
+}
+function clearError() {
+  const hint = $('form-hint');
+  if (hint.classList.contains('am-err')) { hint.className = 'am-hint'; startState(); }
+}
+
+$('profile').addEventListener('change', () => { clearError(); onProfile(); });
+$('harness').addEventListener('change', () => { readiness(); preview(); });
+$('auth').addEventListener('change', () => onAuth());
+$('provider').addEventListener('change', () => { destinationHint(); loadModels(); preview(); });
+$('subagents').addEventListener('change', () => { subTouched = true; });
+$('work').addEventListener('change', () => { if (!subTouched) setRadio('subagents', $('work').checked ? 'board' : 'harness'); });
+$('new').addEventListener('input', () => { clearError(); preview(); });
+$('new').addEventListener('change', preview);
+$('online').addEventListener('click', () => loadDoctor(true));
+$('new').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const r = await amem.fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body()) });
-  if (!r.ok) { $('form-hint').textContent = await r.text(); return; }
-  const s = await r.json();
-  location.href = `/s/${s.id}`;
+  const start = $('start');
+  if (start.disabled) return;
+  start.setAttribute('aria-busy', 'true');
+  start.disabled = true;
+  start.querySelector('span').textContent = 'Starting';
+  try {
+    const r = await amem.fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body()) });
+    if (!r.ok) throw new Error((await r.text()) || r.statusText);
+    const s = await r.json();
+    location.href = `session.html?id=${encodeURIComponent(s.id)}`;
+  } catch (err) {
+    start.removeAttribute('aria-busy');
+    start.querySelector('span').textContent = 'Start session';
+    start.disabled = false;
+    formError(`The session did not start: ${err.message}`);
+  }
 });
 
-async function refresh() {
-  const r = await amem.fetch('/api/sessions');
-  if (!r.ok) return;
-  const list = await r.json();
-  const ul = $('sessions');
-  if (!list.length) { ul.innerHTML = '<li class="status">none yet</li>'; return; }
-  ul.innerHTML = list.reverse().map(s =>
-    `<li><a href="/s/${s.id}">${esc(s.title)}</a><span class="status">${s.alive ? 'running' : 'exited ' + (s.exit ?? '?')} · ${s.started.slice(11,19)}Z</span></li>`).join('');
+// ---- the session list ----
+let showAll = false;
+const SHOWN = 6;
+function row(s) {
+  const a = el('a', 'am-srow');
+  a.href = `session.html?id=${encodeURIComponent(s.id)}`;
+  const l = s.launch || {};
+  const chips = el('span', 'am-srow-chips');
+  let gutter, words;
+  if (s.alive) { gutter = state('live', 'running', 'running'); words = `running for ${since(s.started)}`; }
+  else if (s.exit === 0) { gutter = state('ok', 'done', 'exited 0'); words = 'exited 0'; }
+  else {
+    const said = s.exit === null || s.exit === undefined ? 'stopped' : `exited ${s.exit}`;
+    gutter = state('fail', 'fail', said);
+    words = said;
+    chips.append(chip('fail', 'fail', said));
+  }
+  const where = l.provider || l.auth || (l.profile ? `profile ${l.profile}` : '');
+  const time = el('span', 'am-time', clock(s.started));
+  time.title = s.started;
+  a.append(gutter, el('span', 'am-srow-title', s.title), chips,
+    el('span', 'am-srow-meta', where ? `${where}, ` : '', `${words}, started `, time));
+  return a;
 }
-const esc = (t) => t.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-loadOptions().then(() => { if (options) preview(); });
-refresh(); setInterval(refresh, 3000);
+async function refresh() {
+  const r = await amem.fetch('/api/sessions').catch(() => null);
+  const box = $('sessions');
+  box.removeAttribute('aria-busy');
+  if (!r) return;
+  if (r.status === 401) { paired = false; showPairing(); return; }
+  if (!r.ok) return;
+  const list = (await r.json()).reverse();
+  if (!list.length) {
+    box.replaceChildren(el('div', 'am-empty', el('b', null, 'No sessions yet'),
+      el('p', null, 'A session is a harness in the box. Start one with the form below, or run ', el('code', null, 'amem launch'), ' in a terminal; it appears here either way.')));
+    $('more').hidden = true;
+    return;
+  }
+  const shown = showAll ? list : list.slice(0, SHOWN);
+  box.replaceChildren(el('div', 'am-list', ...shown.map(row)));
+  const more = $('more');
+  more.hidden = list.length <= SHOWN;
+  more.textContent = showAll ? 'Show the newest only' : `Show ${list.length - SHOWN} more`;
+}
+$('more').addEventListener('click', () => { showAll = !showAll; refresh(); });
+
+load();
 </script>
 </body>
 </html>
