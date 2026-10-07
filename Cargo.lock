@@ -934,6 +934,7 @@ dependencies = [
  "axum",
  "bytes",
  "dm-core",
+ "dm-ledger",
  "dm-server",
  "futures-util",
  "getrandom 0.4.3",
