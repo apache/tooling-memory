@@ -547,3 +547,48 @@ fn an_unconfined_harness_gets_none_of_the_launchers_credentials() {
         assert!(!env.contains(secret), "the harness saw {secret}:\n{env}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_profile_is_the_whole_command_and_what_is_typed_wins() {
+    let h = Host::new();
+    h.init();
+    h.file(
+        "home/memory/profiles.toml",
+        "[nightly]\nharness = \"codex\"\nauth = \"subscription\"\nmodel = \"m1\"\n",
+    );
+    let out = h.run(&["profiles", "--json"], &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["nightly"]["model"], "m1");
+    assert_eq!(
+        v["claude"]["harness"], "claude",
+        "every harness is a profile"
+    );
+
+    let out = h.run(&["nope"], &[]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no command or profile named `nope`") && err.contains("nightly"),
+        "{err}"
+    );
+
+    // the profile reaches the launcher as its flags, the typed one winning: a codex
+    // that says what it was given, run unconfined on a login it finds
+    h.file("home/.codex/auth.json", "{}");
+    let seen = h.path("seen-args");
+    h.script("codex", &format!("echo \"$@\" > '{}'", seen.display()));
+    let out = h.run(&["nightly", "--unconfined", "--model", "m2"], &[]);
+    let args = std::fs::read_to_string(&seen).unwrap_or_else(|_| {
+        panic!(
+            "codex did not run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert!(args.contains("m2") && !args.contains("m1"), "{args}");
+}

@@ -11,6 +11,8 @@ pub const READER: &str = include_str!("../static/reader.html");
 pub const AMEM_JS: &str = include_str!("../static/amem.js");
 /// The board: tasks by status, each under the task it was filed from.
 pub const BOARD: &str = include_str!("../static/board.html");
+/// The design tokens every page links: docs/design-book.html holds the same values.
+pub const TOKENS: &str = include_str!("../static/tokens.css");
 
 /// The reader's core, built from `crates/reader` by `make reader`: the JavaScript glue
 /// and the WebAssembly it loads.

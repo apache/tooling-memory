@@ -146,12 +146,72 @@ pub async fn bind(listen: Option<&str>) -> Result<tokio::net::TcpListener, dm_we
     Err(last.unwrap_or_else(|| dm_web::Error::Request("no port to listen on".into())))
 }
 
+/// A hosted copy of the pages: where it is, and the origin the server lets through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hosted {
+    page: String,
+    origin: String,
+}
+
+impl Hosted {
+    /// A hosted page's address: https, or http on this machine for trying it out.
+    ///
+    /// # Errors
+    ///
+    /// When it is neither.
+    pub fn parse(url: &str) -> Result<Hosted, String> {
+        let page = url.split('#').next().unwrap_or_default().trim();
+        let (scheme, rest) = page
+            .split_once("://")
+            .ok_or_else(|| format!("{url} is not a web address"))?;
+        let authority = rest.split('/').next().unwrap_or_default();
+        let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+        let local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+        if authority.is_empty() || !(scheme == "https" || (scheme == "http" && local)) {
+            return Err(format!(
+                "{url}: a hosted page is https, or http on this machine"
+            ));
+        }
+        Ok(Hosted {
+            page: page.to_string(),
+            origin: format!("{scheme}://{authority}"),
+        })
+    }
+
+    /// The origin the server lets through.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// The page, told its server and the code in the fragment, which a browser does not
+    /// send to the host.
+    #[must_use]
+    pub fn link(&self, server: &str, code: &str) -> String {
+        let server = server.replace(':', "%3A").replace('/', "%2F");
+        format!("{}#server={server}&pair={code}", self.page)
+    }
+}
+
+/// How the pairing link is opened: in a browser or only printed, and on the server's own
+/// pages or a hosted copy.
+#[derive(Clone, Debug)]
+pub struct Opening {
+    /// Whether to start a browser on it.
+    pub browser: bool,
+    /// The hosted copy, when there is one.
+    pub hosted: Option<Hosted>,
+}
+
 /// Open the pairing link in the browser, or say where it is. The link is good once, for
 /// two minutes.
-pub fn show(url: &str, code: &str, open: bool) {
-    let link = format!("{url}/?pair={code}");
+pub fn show(url: &str, code: &str, how: &Opening) {
+    let link = match &how.hosted {
+        Some(h) => h.link(url, code),
+        None => format!("{url}/?pair={code}"),
+    };
     eprintln!("amem: {link}  (pairs one browser, once, within two minutes)");
-    if open && !browser(&link) {
+    if how.browser && !browser(&link) {
         eprintln!("amem: no browser to open; open the link above");
     }
 }
@@ -294,6 +354,28 @@ mod tests {
         let elsewhere: SocketAddr = "127.0.0.1:4200".parse().unwrap();
         let relayed = prover(token.clone(), Some(elsewhere), "/r").await;
         assert!(running(&relayed, &token, Path::new("/r")).await.is_none());
+    }
+
+    #[test]
+    fn a_hosted_page_is_https_and_its_link_carries_the_server_in_the_fragment() {
+        let h = Hosted::parse("https://sstriker.github.io/durable-memory/#old").unwrap();
+        assert_eq!(h.origin(), "https://sstriker.github.io");
+        assert_eq!(
+            h.link("http://127.0.0.1:4200", "c0de"),
+            "https://sstriker.github.io/durable-memory/#server=http%3A%2F%2F127.0.0.1%3A4200&pair=c0de"
+        );
+        assert_eq!(
+            Hosted::parse("http://localhost:8000/").unwrap().origin(),
+            "http://localhost:8000"
+        );
+        for bad in [
+            "http://example.org/",
+            "ftp://x/",
+            "sstriker.github.io",
+            "https://",
+        ] {
+            assert!(Hosted::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

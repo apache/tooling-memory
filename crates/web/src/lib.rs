@@ -100,6 +100,26 @@ pub struct NewSession {
     /// Arguments for the harness.
     #[serde(default)]
     pub args: Vec<String>,
+    /// A profile from `profiles.toml`, or a harness's own name; what the request sets
+    /// itself wins over it.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Where the harness runs: auto, namespaces, image, wslc or none.
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
+/// The backends a request may name.
+pub const BACKENDS: &[&str] = &["auto", "namespaces", "image", "wslc", "none"];
+
+/// Whether `name` may name a profile: lowercase letters, digits, `-` and `_`, starting
+/// with a letter, as the launcher's own check has it.
+fn profile_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// One session as the API shows it.
@@ -115,6 +135,51 @@ pub struct SessionInfo {
     pub exit: Option<i32>,
     /// When it started, RFC 3339.
     pub started: String,
+    /// What it was started with, for the session's bar: the harness, or the profile
+    /// that names one, and whatever the request set itself.
+    #[serde(default)]
+    pub launch: Launched,
+}
+
+/// What a session was started with, as the request said it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Launched {
+    /// The profile, when one was named.
+    pub profile: Option<String>,
+    /// The harness, when the request named one.
+    pub harness: Option<String>,
+    /// The auth mode, when the request named one.
+    pub auth: Option<String>,
+    /// The destination, when the request named one.
+    pub provider: Option<String>,
+    /// The model, when the request named one.
+    pub model: Option<String>,
+    /// The backend, when the request named one.
+    pub backend: Option<String>,
+    /// interactive, prompt or work.
+    pub mode: String,
+}
+
+impl Launched {
+    fn of(req: &NewSession) -> Launched {
+        let some = |v: &Option<String>| v.clone().filter(|v| !v.trim().is_empty());
+        Launched {
+            profile: some(&req.profile),
+            harness: some(&req.harness),
+            auth: some(&req.auth),
+            provider: some(&req.provider),
+            model: some(&req.model),
+            backend: some(&req.backend),
+            mode: if req.work {
+                "work"
+            } else if req.prompt.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+                "prompt"
+            } else {
+                "interactive"
+            }
+            .into(),
+        }
+    }
 }
 
 struct Session {
@@ -173,32 +238,63 @@ fn harness_of(config: &Config, req: &NewSession) -> Result<String, String> {
         .ok_or_else(|| "say which harness: there is no default".to_string())
 }
 
-/// The launcher's command line for a request.
+/// The launcher's command line for a request. With a profile, the request's own fields
+/// are passed only where it sets them, so the profile's stand where it does not.
 fn launch_argv(config: &Config, req: &NewSession) -> Result<Vec<String>, String> {
     if let Some(c) = &config.command_override {
         return Ok(c.clone());
+    }
+    let set = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let profile = set(&req.profile);
+    if let Some(p) = &profile {
+        if !profile_name(p) {
+            return Err(format!("`{p}` is not a profile name"));
+        }
+    }
+    let backend = set(&req.backend);
+    if let Some(b) = &backend {
+        if !BACKENDS.contains(&b.as_str()) {
+            return Err(format!("no backend named {b}: {}", BACKENDS.join(", ")));
+        }
     }
     let mut a = vec![
         config.memory_binary.display().to_string(),
         "--root".into(),
         config.root.display().to_string(),
         if req.work { "work" } else { "launch" }.into(),
-        "--harness".into(),
-        harness_of(config, req)?,
-        "--auth".into(),
-        req.auth.clone().unwrap_or_else(|| config.auth.clone()),
-        "--backend".into(),
-        config.backend.clone(),
     ];
-    if let Some(p) = req.provider.as_deref().filter(|p| !p.is_empty()) {
-        a.extend(["--provider".to_string(), p.to_string()]);
+    let mut flag = |name: &str, value: Option<String>| {
+        if let Some(v) = value {
+            a.extend([name.to_string(), v]);
+        }
+    };
+    match profile {
+        Some(p) => {
+            flag("--profile", Some(p));
+            flag("--harness", set(&req.harness));
+            flag("--auth", set(&req.auth));
+            flag("--backend", backend);
+        }
+        None => {
+            flag("--harness", Some(harness_of(config, req)?));
+            flag(
+                "--auth",
+                Some(set(&req.auth).unwrap_or_else(|| config.auth.clone())),
+            );
+            flag(
+                "--backend",
+                Some(backend.unwrap_or_else(|| config.backend.clone())),
+            );
+        }
     }
-    if let Some(m) = req.model.as_deref().filter(|m| !m.trim().is_empty()) {
-        a.extend(["--model".to_string(), m.trim().to_string()]);
-    }
-    if let Some(sa) = req.subagents.as_deref().filter(|s| !s.is_empty()) {
-        a.extend(["--subagents".to_string(), sa.to_string()]);
-    }
+    flag("--provider", set(&req.provider));
+    flag("--model", set(&req.model));
+    flag("--subagents", set(&req.subagents));
     if !req.work {
         if let Some(p) = &req.prompt {
             a.extend(["--prompt".to_string(), p.clone()]);
@@ -212,7 +308,12 @@ fn launch_argv(config: &Config, req: &NewSession) -> Result<Vec<String>, String>
 }
 
 fn title_for(req: &NewSession, config: &Config) -> String {
-    let mut h = harness_of(config, req).unwrap_or_else(|_| "?".into());
+    let named = req.profile.clone().filter(|p| !p.trim().is_empty());
+    let mut h = harness_of(config, req)
+        .ok()
+        .filter(|_| req.harness.is_some() || named.is_none())
+        .or(named)
+        .unwrap_or_else(|| "?".into());
     if let Some(m) = req.model.as_deref().filter(|m| !m.trim().is_empty()) {
         h = format!("{h} on {}", m.trim());
     }
@@ -236,6 +337,7 @@ fn options(config: &Config) -> Value {
             "gateway": ["llmao"]
         },
         "subagents": ["harness", "board"],
+        "backends": BACKENDS,
         "defaults": { "harness": config.harness, "auth": config.auth, "backend": config.backend }
     })
 }
@@ -272,6 +374,74 @@ async fn models_via_launcher(
     serde_json::from_slice(&out.stdout).map_err(|e| format!("not a model list: {e}"))
 }
 
+/// What the launcher prints as JSON for `args`, asked of it as `models` is: the same
+/// binary over the same root, within `secs`.
+async fn launcher_json(config: &Config, args: &[&str], secs: u64) -> Result<Value, String> {
+    let mut cmd = tokio::process::Command::new(&config.memory_binary);
+    cmd.arg("--root")
+        .arg(&config.root)
+        .args(args)
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(secs), cmd.output())
+        .await
+        .map_err(|_| format!("`{}` did not answer in time", args.join(" ")))?
+        .map_err(|e| format!("could not run the launcher: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("not JSON: {e}"))
+}
+
+/// `?online=1` asks the gateway too.
+#[derive(Debug, Default, Deserialize)]
+struct DoctorQuery {
+    #[serde(default)]
+    online: Option<String>,
+}
+
+/// What `amem doctor` says: per harness and auth mode, whether a launch has what it
+/// needs. Offline unless asked, since asking the gateway can take seconds.
+async fn doctor_api(
+    State(app): State<App>,
+    axum::extract::Query(q): axum::extract::Query<DoctorQuery>,
+) -> Response {
+    let online = q.online.as_deref().is_some_and(|v| v == "1" || v == "true");
+    let args: &[&str] = if online {
+        &["doctor", "--json"]
+    } else {
+        &["doctor", "--json", "--offline"]
+    };
+    match launcher_json(&app.config, args, 30).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// The profiles, from `profiles.toml` and the harnesses' own names.
+async fn profiles_api(State(app): State<App>) -> Response {
+    match launcher_json(&app.config, &["profiles", "--json"], 10).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// What the session's launcher says about itself, for its strip: an empty object until
+/// it has said anything, which a session started outside the launcher never does.
+async fn session_status(State(app): State<App>, Path(id): Path<String>) -> Response {
+    if app.get(&id).is_none() {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    }
+    // the id is one this server made, 32 hex digits, before it is a file name
+    let path = app.config.root.join("state/web").join(format!("{id}.json"));
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(v) => Json(v).into_response(),
+            Err(_) => Json(json!({})).into_response(),
+        },
+        Err(_) => Json(json!({})).into_response(),
+    }
+}
+
 impl App {
     fn start(&self, req: &NewSession) -> Result<Arc<Session>, Error> {
         let argv = launch_argv(&self.config, req).map_err(Error::Request)?;
@@ -290,6 +460,8 @@ impl App {
         cmd.cwd(&self.config.workdir);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // the launcher writes its status under this id, which the strip reads
+        cmd.env("AMEM_WEB_SESSION", &id);
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -311,6 +483,7 @@ impl App {
                 alive: true,
                 exit: None,
                 started: now(),
+                launch: Launched::of(req),
             }),
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
@@ -521,6 +694,22 @@ async fn vendor(Path(name): Path<String>) -> Response {
             .into_response(),
         None => (StatusCode::NOT_FOUND, "no such file").into_response(),
     }
+}
+
+/// The session page by file name; the session is `?id=` in its address.
+async fn session_file() -> Html<&'static str> {
+    Html(pages::SESSION)
+}
+
+async fn tokens_css() -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/css"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        pages::TOKENS,
+    )
+        .into_response()
 }
 
 async fn session_page(State(app): State<App>, Path(id): Path<String>) -> Response {
@@ -996,6 +1185,13 @@ pub fn router(config: Config) -> Result<Router, Error> {
     Ok(Router::new()
         .route("/", get(index))
         .route("/amem.js", get(amem_js))
+        .route("/tokens.css", get(tokens_css))
+        // the pages by file name too: a hosted copy has only files, and the pages link
+        // each other relatively so the same links work from both
+        .route("/index.html", get(index))
+        .route("/session.html", get(session_file))
+        .route("/board.html", get(board))
+        .route("/reader.html", get(reader))
         .route("/api/hello", get(hello))
         .route("/api/pair", axum::routing::post(pair))
         .route("/api/pair/redeem", axum::routing::post(redeem))
@@ -1007,6 +1203,9 @@ pub fn router(config: Config) -> Result<Router, Error> {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}", get(session_info).delete(kill_session))
         .route("/api/sessions/{id}/scrollback", get(scrollback))
+        .route("/api/sessions/{id}/status", get(session_status))
+        .route("/api/profiles", get(profiles_api))
+        .route("/api/doctor", get(doctor_api))
         .route("/api/entries", get(entries))
         .route("/api/entry/{id}", get(entry))
         .route("/api/domains", get(domains))
@@ -1071,6 +1270,66 @@ mod tests {
     }
 
     const TOKEN: &str = "test-token";
+
+    #[test]
+    fn a_profile_passes_only_what_the_request_sets_and_names_are_checked() {
+        let mut c = config(std::path::Path::new("/tmp/x"), &[]);
+        c.command_override = None;
+        let argv = |r: NewSession| launch_argv(&c, &r).map(|a| a[3..].join(" "));
+        assert_eq!(
+            argv(NewSession {
+                profile: Some("nightly".into()),
+                ..NewSession::default()
+            })
+            .unwrap(),
+            "launch --profile nightly"
+        );
+        assert_eq!(
+            argv(NewSession {
+                profile: Some("nightly".into()),
+                auth: Some("key".into()),
+                backend: Some("none".into()),
+                model: Some(" m2 ".into()),
+                work: true,
+                ..NewSession::default()
+            })
+            .unwrap(),
+            "work --profile nightly --auth key --backend none --model m2"
+        );
+        let plain = argv(NewSession {
+            harness: Some("codex".into()),
+            backend: Some("image".into()),
+            ..NewSession::default()
+        })
+        .unwrap();
+        assert!(
+            plain.contains("--harness codex") && plain.contains("--backend image"),
+            "{plain}"
+        );
+        for bad in ["../x", "Nightly", "-p", ""] {
+            let r = argv(NewSession {
+                profile: Some(bad.into()),
+                ..NewSession::default()
+            });
+            assert!(bad.is_empty() || r.is_err(), "{bad}: {r:?}");
+        }
+        assert!(argv(NewSession {
+            harness: Some("codex".into()),
+            backend: Some("chroot".into()),
+            ..NewSession::default()
+        })
+        .unwrap_err()
+        .contains("no backend named chroot"));
+        let l = Launched::of(&NewSession {
+            profile: Some("nightly".into()),
+            prompt: Some("go".into()),
+            ..NewSession::default()
+        });
+        assert_eq!(
+            (l.profile.as_deref(), l.mode.as_str()),
+            (Some("nightly"), "prompt")
+        );
+    }
 
     #[test]
     fn the_launcher_command_line_follows_the_request() {
@@ -1298,6 +1557,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hosted_page_the_operator_allowed_is_answered_across_origins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("memory");
+        Memory::init(&root, "human:test:me", "dom-me").unwrap();
+        let mut c = config(dir.path(), &["true"]);
+        c.access = Access::new(
+            &root,
+            &crate::state::WebState {
+                token: TOKEN.into(),
+                ..crate::state::WebState::default()
+            },
+            vec!["https://amem.example".into()],
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { serve(c, listener).await.unwrap() });
+        let req = |method: &str, path: &str, extra: &str| {
+            format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Connection: close\r\n\r\n")
+        };
+        let hosted = "Origin: https://amem.example\r\n";
+        let preflight = format!(
+            "{hosted}Access-Control-Request-Method: GET\r\nAccess-Control-Request-Headers: authorization\r\nAccess-Control-Request-Private-Network: true\r\n"
+        );
+        let (status, head) = raw(addr, &req("OPTIONS", "/api/sessions", &preflight)).await;
+        assert_eq!(status, 204, "a preflight carries no key: {head}");
+        let head = head.to_ascii_lowercase();
+        assert!(
+            head.contains("access-control-allow-origin: https://amem.example"),
+            "{head}"
+        );
+        assert!(
+            head.contains("access-control-allow-private-network: true"),
+            "{head}"
+        );
+        assert!(
+            head.contains("access-control-allow-headers: authorization, content-type"),
+            "{head}"
+        );
+
+        let keyed = format!("{hosted}Authorization: Bearer {TOKEN}\r\n");
+        let (status, head) = raw(addr, &req("GET", "/api/sessions", &keyed)).await;
+        assert_eq!(status, 200);
+        assert!(head
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin: https://amem.example"));
+        let (status, head) = raw(addr, &req("GET", "/api/sessions", hosted)).await;
+        assert_eq!(status, 401, "the call itself still wants a key");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "so the page can read why"
+        );
+
+        let other = "Origin: https://attacker.example\r\nAccess-Control-Request-Method: GET\r\n";
+        assert_eq!(
+            raw(addr, &req("OPTIONS", "/api/sessions", other)).await.0,
+            403
+        );
+        // the server's own pages get no cross-origin headers
+        let (_, head) = raw(
+            addr,
+            &req(
+                "GET",
+                "/api/sessions",
+                &format!("Authorization: Bearer {TOKEN}\r\nOrigin: http://{addr}\r\n"),
+            ),
+        )
+        .await;
+        assert!(
+            !head
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "{head}"
+        );
+        // the pages load with no key, by path and by file name
+        for page in [
+            "/board",
+            "/board.html",
+            "/session.html",
+            "/index.html",
+            "/tokens.css",
+        ] {
+            assert_eq!(raw(addr, &req("GET", page, "")).await.0, 200, "{page}");
+        }
+    }
+
+    #[tokio::test]
     async fn the_token_mints_a_code_a_browser_trades_once_for_a_key_of_its_own() {
         let dir = tempfile::tempdir().unwrap();
         let (addr, _h) = start(dir.path(), &["true"]).await;
@@ -1459,6 +1805,61 @@ mod tests {
         assert_eq!(tree["children"].as_array().unwrap().len(), 0);
         let (status, _) = http(addr, "POST", "/api/tasks/task-me-none/retry", None).await;
         assert!(status == 404 || status == 409, "{status}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_is_told_its_id_and_its_status_is_what_its_launcher_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(
+            dir.path(),
+            &["sh", "-c", "echo id=$AMEM_WEB_SESSION; sleep 5"],
+        )
+        .await;
+        let (status, body) = http(
+            addr,
+            "POST",
+            "/api/sessions",
+            Some(r#"{"profile":"nightly"}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(v["launch"]["profile"], "nightly");
+        assert_eq!(v["title"], "nightly");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (_, text) =
+                http(addr, "GET", &format!("/api/sessions/{id}/scrollback"), None).await;
+            if text.contains(&format!("id={id}")) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session was not told its id: {text}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, v) = get_json(addr, &format!("/api/sessions/{id}/status")).await;
+        assert_eq!((status, v), (200, json!({})), "nothing written yet");
+        let file = dir
+            .path()
+            .join("memory/state/web")
+            .join(format!("{id}.json"));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, r#"{"destination":"llmao","usage":{"calls":3}}"#).unwrap();
+        let (_, v) = get_json(addr, &format!("/api/sessions/{id}/status")).await;
+        assert_eq!(v["destination"], "llmao");
+        assert_eq!(v["usage"]["calls"], 3);
+        let (status, _) = get_json(
+            addr,
+            "/api/sessions/0123456789abcdef0123456789abcdef/status",
+        )
+        .await;
+        assert_eq!(status, 404, "only a session this server started");
+        let (_, o) = get_json(addr, "/api/options").await;
+        assert_eq!(o["backends"][0], "auto");
     }
 
     #[cfg(unix)]

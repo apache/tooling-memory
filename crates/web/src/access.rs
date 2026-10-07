@@ -21,7 +21,7 @@
 
 use crate::state::WebState;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
@@ -248,10 +248,22 @@ enum Needs {
     Key,
 }
 
+/// The pages and what they load: the same files a hosted copy serves, nothing of the
+/// record's in any of them.
+const STATIC: &[&str] = &[
+    "/",
+    "/index.html",
+    "/session.html",
+    "/board",
+    "/board.html",
+    "/reader",
+    "/reader.html",
+    "/amem.js",
+    "/tokens.css",
+];
+
 fn needs(path: &str) -> Needs {
-    if path == "/"
-        || path == "/reader"
-        || path == "/amem.js"
+    if STATIC.contains(&path)
         || path == "/api/hello"
         || path == "/api/pair/redeem"
         || path.starts_with("/s/")
@@ -270,6 +282,21 @@ fn refuse(status: StatusCode, why: &'static str) -> Response {
     (status, why).into_response()
 }
 
+/// The cross-origin answer for a hosted page the operator allowed: its origin, the
+/// headers its calls carry, and, for a page on the public internet calling loopback,
+/// the private-network grant Chrome asks for.
+fn cors(r: &mut Response, origin: &HeaderValue, private_network: bool) {
+    let h = r.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+    h.insert(header::VARY, HeaderValue::from_static("Origin"));
+    if private_network {
+        h.insert(
+            "access-control-allow-private-network",
+            HeaderValue::from_static("true"),
+        );
+    }
+}
+
 /// The gate, in front of every route.
 pub async fn gate(State(access): State<Access>, req: Request, next: Next) -> Response {
     let headers = req.headers();
@@ -282,12 +309,42 @@ pub async fn gate(State(access): State<Access>, req: Request, next: Next) -> Res
             "this server answers to loopback names only",
         );
     }
+    // a hosted page the operator allowed: its calls are cross-origin
+    let mut foreign = None;
     if let Some(origin) = headers.get(header::ORIGIN) {
         let ok = origin
             .to_str()
             .is_ok_and(|o| origin_allowed(&access, o, host));
         if !ok {
             return refuse(StatusCode::FORBIDDEN, "a page from another origin");
+        }
+        if origin.to_str().is_ok_and(|o| o != format!("http://{host}")) {
+            foreign = Some(origin.clone());
+        }
+    }
+    if let Some(origin) = &foreign {
+        // a preflight carries no key; it is answered here, and the call it precedes
+        // is gated like any other
+        if req.method() == axum::http::Method::OPTIONS {
+            let pna = headers
+                .get("access-control-request-private-network")
+                .is_some_and(|v| v == "true");
+            let mut r = StatusCode::NO_CONTENT.into_response();
+            cors(&mut r, origin, pna);
+            let h = r.headers_mut();
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("GET, POST, DELETE"),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("authorization, content-type"),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_MAX_AGE,
+                HeaderValue::from_static("600"),
+            );
+            return r;
         }
     }
     let key = bearer(headers).or_else(|| protocol_key(headers));
@@ -296,13 +353,19 @@ pub async fn gate(State(access): State<Access>, req: Request, next: Next) -> Res
         Needs::Token => key.is_some_and(|k| access.is_token(k)),
         Needs::Key => key.is_some_and(|k| access.admits(k)),
     };
-    if !ok {
-        return refuse(
+    let mut r = if ok {
+        next.run(req).await
+    } else {
+        refuse(
             StatusCode::UNAUTHORIZED,
             "not paired: run amem, which opens a link that pairs this browser",
-        );
+        )
+    };
+    // the page reads the answer, a refusal included, so it can say what to do
+    if let Some(origin) = &foreign {
+        cors(&mut r, origin, false);
     }
-    next.run(req).await
+    r
 }
 
 /// `POST /api/pair/redeem` with `{"code": ...}`: a browser key, or 401 for a code that

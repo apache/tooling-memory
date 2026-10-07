@@ -22,6 +22,7 @@ use dm_store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
@@ -160,6 +161,8 @@ pub struct Memory {
     /// Where the record is projected as files for this session, when it is; refreshed
     /// after every write, import and erasure made through this service.
     projection: Option<PathBuf>,
+    /// Entries this session wrote, and how many of them were handoffs.
+    written: (AtomicUsize, AtomicUsize),
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -265,6 +268,7 @@ impl Memory {
             fan_out: Mutex::new(recall::FanOut::default()),
             cache: Mutex::new(recall::Cache::default()),
             projection: None,
+            written: (AtomicUsize::new(0), AtomicUsize::new(0)),
         })
     }
 
@@ -316,6 +320,15 @@ impl Memory {
             self.session = Mutex::new(self.grants.session());
         }
         self
+    }
+
+    /// How many entries this session wrote, and how many of those were handoffs.
+    #[must_use]
+    pub fn written(&self) -> (usize, usize) {
+        (
+            self.written.0.load(Ordering::Relaxed),
+            self.written.1.load(Ordering::Relaxed),
+        )
     }
 
     /// A short identifier for this session, for telemetry.
@@ -510,6 +523,10 @@ impl Memory {
             }
         }
         self.refresh_projection().await;
+        self.written.0.fetch_add(1, Ordering::Relaxed);
+        if entry.front.entry_type == EntryType::Handoff {
+            self.written.1.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(Written {
             id: entry.front.id,
             classification,
@@ -1274,6 +1291,22 @@ mod tests {
         m.disable_read_log();
         m.search("retries", None, 10).await.unwrap();
         assert!(reads::all(dir.path()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_session_counts_what_it_wrote_and_its_handoffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        assert_eq!(m.written(), (0, 0));
+        m.write(req("A fact.\n")).await.unwrap();
+        m.write(WriteRequest {
+            entry_type: EntryType::Handoff,
+            ..req("Stopped at step 3.\n")
+        })
+        .await
+        .unwrap();
+        assert!(m.write(req("   ")).await.is_err(), "a refused write");
+        assert_eq!(m.written(), (2, 1), "a refused write is not counted");
     }
 
     #[tokio::test]

@@ -20,14 +20,16 @@ mod mcp_http;
 mod mine;
 mod model;
 mod open;
+mod profiles;
 mod requests;
 mod savings;
+mod status;
 mod taps;
 mod work;
 mod wslc;
 mod wslc_api;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dm_core::{EntryType, Label};
 use dm_egress::{Auth, Destination, Egress, Telemetry};
 use dm_ledger::{Status, TaskSpec};
@@ -69,6 +71,10 @@ struct OpenArgs {
     /// not hold the root.
     #[arg(long)]
     workdir: Option<PathBuf>,
+    /// A hosted copy of the pages to open instead of the server's own, its origin let
+    /// through: `https://<host>/<path>/`.
+    #[arg(long, env = "AMEM_HOSTED")]
+    hosted: Option<String>,
 }
 
 /// How much of each hit a search or a recall carries.
@@ -579,6 +585,10 @@ enum Command {
         /// place of the launcher, so the pages are driven without a harness or a sandbox.
         #[arg(long, hide = true)]
         session_command: Option<String>,
+        /// A hosted copy of the pages to open instead of the server's own, its origin let
+        /// through: `https://<host>/<path>/`.
+        #[arg(long, env = "AMEM_HOSTED")]
+        hosted: Option<String>,
         /// The harness the form preselects; each session names its own.
         #[arg(long, value_enum)]
         harness: Option<HarnessArg>,
@@ -593,6 +603,13 @@ enum Command {
     /// What this host can run: the root and its grants, the credentials and logins
     /// found, the harnesses on the PATH and in the image, the backend, and whether the
     /// gateway answers. Names credentials, never their values.
+    /// The profiles: `profiles.toml` under the root, and every harness by its own name.
+    /// `amem <profile>` launches one; `launch` and `work` take `--profile <name>`.
+    Profiles {
+        /// As JSON, for the web launcher.
+        #[arg(long)]
+        json: bool,
+    },
     Doctor {
         /// The report as JSON, for the web launcher.
         #[arg(long)]
@@ -848,6 +865,37 @@ fn body_or_stdin(body: Option<String>) -> std::io::Result<String> {
     }
 }
 
+/// The command line, with any profile it names spelled out as flags, parsed. The root is
+/// found as `Cli` finds it: `--root`, `MEMORY_ROOT`, then `~/memory`.
+fn parse_with_profiles(args: Vec<OsString>) -> Result<Cli, String> {
+    let commands: Vec<String> = Cli::command()
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect();
+    let root = profiles_root(&args);
+    let argv = profiles::expand(args, &commands, || match &root {
+        Some(r) => profiles::load(r),
+        None => Ok(profiles::builtin()),
+    })?;
+    Ok(Cli::parse_from(argv))
+}
+
+/// The root a command line names, before it is parsed.
+fn profiles_root(args: &[OsString]) -> Option<PathBuf> {
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--root" {
+            return it.next().map(PathBuf::from);
+        }
+        if let Some(r) = a.to_str().and_then(|s| s.strip_prefix("--root=")) {
+            return Some(PathBuf::from(r));
+        }
+    }
+    std::env::var_os("MEMORY_ROOT")
+        .map(PathBuf::from)
+        .or_else(credentials::default_root)
+}
+
 fn main() {
     // The relay unshares a pid namespace, which only a single-threaded process may do,
     // so it runs before any runtime starts.
@@ -885,7 +933,13 @@ fn main() {
         }
         std::process::exit(0);
     }
-    let cli = Cli::parse();
+    let cli = match parse_with_profiles(args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
     let Some(root) = cli.root.clone().or_else(credentials::default_root) else {
         eprintln!("error: give --root, or set MEMORY_ROOT; there is no home for ~/memory");
         std::process::exit(1);
@@ -956,6 +1010,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
                 listen: None,
                 no_open: cli.open.no_open,
                 session_command: None,
+                hosted: cli.open.hosted,
                 harness: None,
                 auth: AuthArg::Subscription,
                 backend: BackendArg::Auto,
@@ -988,6 +1043,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Hook { .. } => unreachable!("handled in main before the root is needed"),
         cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
         Command::Doctor { json, offline } => doctor::run(&root, &at_start, json, offline).await,
+        Command::Profiles { json: as_json } => profiles::show(&profiles::load(&root)?, as_json),
         cmd @ (Command::Mine { .. }
         | Command::Models { .. }
         | Command::WslcApiCheck { .. }
@@ -1606,6 +1662,7 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         listen,
         no_open,
         session_command,
+        hosted,
         harness,
         auth,
         backend,
@@ -1622,13 +1679,17 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         .into());
     }
     let wanted = resolve_workdir(root, workdir);
+    let opening = open::Opening {
+        browser: !no_open,
+        hosted: hosted.as_deref().map(open::Hosted::parse).transpose()?,
+    };
     let mut state = open::state(root).await?;
     if open_running(
         root,
         &state,
         listen.as_deref(),
         wanted.as_ref().ok(),
-        no_open,
+        &opening,
     )
     .await?
     {
@@ -1640,7 +1701,12 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
     state.url = Some(url.clone());
     state.workdir = Some(workdir.display().to_string());
     dm_web::state::save(root, &state)?;
-    let access = dm_web::Access::new(root, &state, Vec::new());
+    let origins = opening
+        .hosted
+        .iter()
+        .map(|h| h.origin().to_string())
+        .collect();
+    let access = dm_web::Access::new(root, &state, origins);
     let code = access.pairing_code()?;
     let config = web_config(
         root,
@@ -1654,7 +1720,7 @@ async fn web_cmd(root: &Path, command: Command) -> Fallible {
         root.display(),
         config.workdir.display()
     );
-    open::show(&url, &code, !no_open);
+    open::show(&url, &code, &opening);
     tokio::select! {
         r = dm_web::serve(config, listener) => r?,
         _ = tokio::signal::ctrl_c() => {}
@@ -1677,7 +1743,7 @@ async fn open_running(
     state: &dm_web::state::WebState,
     listen: Option<&str>,
     wanted: Option<&PathBuf>,
-    no_open: bool,
+    opening: &open::Opening,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let Some(url) = &state.url else {
         return Ok(false);
@@ -1705,7 +1771,7 @@ async fn open_running(
             );
         }
     }
-    open::show(&running.url, &pairing.code, !no_open);
+    open::show(&running.url, &pairing.code, opening);
     Ok(true)
 }
 
@@ -2508,6 +2574,53 @@ fn runner_for(backend: Backend, root: &Path) -> Result<Runner, Box<dyn std::erro
     })
 }
 
+/// The line a session starts with: where the harness runs, where its calls go, and the
+/// memory session it is.
+fn announce(runner: &Runner, p: &Prepared, harness: Harness, workdir: &Path) {
+    let how = match runner {
+        Runner::Namespaces => "confined to",
+        Runner::Image(_) => "confined, in the harness image, to",
+        Runner::Unconfined(_) => "unconfined in",
+        Runner::Requests(_) => "in the harness image, working tree at",
+    };
+    let shown = match runner {
+        Runner::Requests(r) => r.workdir_inside.clone(),
+        _ => workdir.to_path_buf(),
+    };
+    eprintln!(
+        "memory: {} {how} {} · model calls via {} at ceiling {} · session {}",
+        harness.binary(),
+        shown.display(),
+        p.ceiling_of,
+        p.ceiling,
+        p.memory.session_id()
+    );
+}
+
+/// The status a session started from the web launcher writes for it.
+fn start_status(
+    root: &Path,
+    p: &Prepared,
+    harness: Harness,
+    auth: AuthMode,
+    model: Option<String>,
+) -> Option<status::Writer> {
+    status::Writer::start(
+        root,
+        status::Fixed {
+            memory_session: p.memory.session_id().to_string(),
+            harness: harness.binary().to_string(),
+            auth: wslc::auth_name(auth).to_string(),
+            destination: p.provider.clone(),
+            ceiling_of: p.ceiling_of.clone(),
+            ceiling: p.ceiling,
+            metered: p.metered,
+            model,
+        },
+        p.memory.clone(),
+    )
+}
+
 /// A started session: the memory opened, the egress serving, the harness not yet run.
 /// `launch` runs it once; `work` runs it once per task.
 pub struct Session {
@@ -2524,6 +2637,9 @@ pub struct Session {
     model: Option<String>,
     #[cfg(unix)]
     serve_unix: tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
+    /// What the session says about itself to the web launcher that started it.
+    #[allow(dead_code)] // kept for its drop, which writes the last word
+    status: Option<status::Writer>,
 }
 
 /// How a session runs the harness.
@@ -2616,24 +2732,8 @@ impl Session {
                 tokio::spawn(async move { egress.serve_tcp(addr).await }),
             ));
         }
-        let how = match &runner {
-            Runner::Namespaces => "confined to",
-            Runner::Image(_) => "confined, in the harness image, to",
-            Runner::Unconfined(_) => "unconfined in",
-            Runner::Requests(_) => "in the harness image, working tree at",
-        };
-        let shown = match &runner {
-            Runner::Requests(r) => r.workdir_inside.clone(),
-            _ => workdir.clone(),
-        };
-        eprintln!(
-            "memory: {} {how} {} · model calls via {} at ceiling {} · session {}",
-            harness.binary(),
-            shown.display(),
-            p.ceiling_of,
-            p.ceiling,
-            p.memory.session_id()
-        );
+        announce(&runner, &p, harness, &workdir);
+        let status = start_status(root, &p, harness, auth, options.model.clone());
         Ok(Session {
             p,
             harness,
@@ -2644,6 +2744,7 @@ impl Session {
             model: options.model,
             #[cfg(unix)]
             serve_unix,
+            status,
         })
     }
 
@@ -3204,6 +3305,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Golden { .. }
         | Command::Hook { .. }
         | Command::Doctor { .. }
+        | Command::Profiles { .. }
         | Command::Relay { .. }
         | Command::Usage
         | Command::Task { .. }

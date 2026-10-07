@@ -40,6 +40,8 @@ const PASS_ENV: &[&str] = &[
     "LLMAO_URL",
     "GH_TOKEN",
     "GOOGLE_CLOUD_PROJECT",
+    // the web launcher's id for the session, for the status it reads; an id, not a path
+    "AMEM_WEB_SESSION",
 ];
 
 /// Login directories copied from, never written.
@@ -284,7 +286,7 @@ fn wants_gateway(l: &Launch) -> bool {
     l.auth == AuthMode::Gateway || l.server_auth == Some(AuthMode::Gateway)
 }
 
-fn auth_name(a: AuthMode) -> &'static str {
+pub(crate) fn auth_name(a: AuthMode) -> &'static str {
     match a {
         AuthMode::Subscription => "subscription",
         AuthMode::Key => "key",
