@@ -57,6 +57,11 @@ pub struct DomainGrant {
     /// What a write gets when the entry states no classification.
     #[serde(default)]
     pub default_classification: Label,
+    /// Whether a task a session files from a task it holds, a subagent's work or the
+    /// continuation of its own, is admitted as it is filed. Tasks from outside, a tap's
+    /// say, stay proposed until the owner admits them either way.
+    #[serde(default)]
+    pub admit_own: bool,
 }
 
 /// One destination's settings.
@@ -118,6 +123,7 @@ impl Grants {
             domain.to_string(),
             DomainGrant {
                 default_classification: Label::Internal,
+                admit_own: true,
             },
         );
         let mut destinations = BTreeMap::new();

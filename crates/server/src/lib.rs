@@ -166,6 +166,54 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What a fan-out filed: the subagent tasks, the ones it did not file because the same
+/// spawn already exists in the chain, and the continuation that waits on the new ones.
+#[derive(Clone, Debug, Serialize)]
+pub struct FanOut {
+    /// Newly filed, one per item that was new.
+    pub children: Vec<Task>,
+    /// Items the chain already holds, filed by an earlier run of the same work: done,
+    /// with a handoff, or still open. A resumed run asks for what it asked for before;
+    /// the answer is the earlier task, not another.
+    pub existing: Vec<Task>,
+    /// Resumes the parent when the new children are done; none when nothing was new.
+    pub continuation: Option<Task>,
+}
+
+/// A task with everything filed from it, recursively.
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskTree {
+    /// The task.
+    #[serde(flatten)]
+    pub task: Task,
+    /// Its subagent tasks, continuations and retries, each with theirs.
+    pub children: Vec<TaskTree>,
+}
+
+impl TaskTree {
+    /// Every task in the tree, this one first.
+    pub fn flatten(&self, out: &mut Vec<Task>) {
+        out.push(self.task.clone());
+        for c in &self.children {
+            c.flatten(out);
+        }
+    }
+
+    /// Every handoff in the tree, as `(task id, title, handoff entry id)`, this task first.
+    pub fn handoffs(&self, out: &mut Vec<(String, String, String)>) {
+        if let Some(h) = &self.task.handoff {
+            out.push((
+                self.task.id.clone(),
+                self.task.spec.title.clone(),
+                h.clone(),
+            ));
+        }
+        for c in &self.children {
+            c.handoffs(out);
+        }
+    }
+}
+
 impl Memory {
     /// Create a root: the grants file for one owner and one domain, the record, the
     /// state directory, an empty index and ledger. Refuses a root that already has a
@@ -552,6 +600,196 @@ impl Memory {
         Ok(l.admit(id)?)
     }
 
+    /// Whether tasks a session files from a task it holds are admitted as they are
+    /// filed in this domain; see `admit_own` in the grants.
+    fn admits_own(&self, domain: &str) -> bool {
+        self.grants.domains.get(domain).is_some_and(|g| g.admit_own)
+    }
+
+    /// Admit `task` where the domain's grant says so and it is still proposed.
+    fn admit_own_in(&self, l: &mut Ledger, task: Task) -> Result<Task, Error> {
+        if task.status == dm_ledger::Status::Proposed && self.admits_own(&task.spec.domain) {
+            Ok(l.admit(&task.id)?)
+        } else {
+            Ok(task)
+        }
+    }
+
+    /// Fan a held task out: file the subagent tasks its run asked for, one per item,
+    /// and the continuation that resumes the parent once they are done. A child carries
+    /// `origin: task:<parent>` and a hash of its body, so the same spawn asked twice is
+    /// one task; the continuation carries `origin: continues:<parent>`, depends on the
+    /// children, inherits the parent's requirements and priority, and its prompt will
+    /// hold every child's handoff and the parent's own, which is what resuming is. Where
+    /// the domain admits a session's own filings, everything filed here is admitted.
+    ///
+    /// # Errors
+    ///
+    /// A parent outside the grants, or a ledger error.
+    pub async fn fan_out(&self, parent: &str, items: &[(String, String)]) -> Result<FanOut, Error> {
+        let mut l = self.ledger.lock().await;
+        let parent = l.get(parent)?;
+        self.task_in_grants(&parent)?;
+        // the chain this parent belongs to: a continuation or a retry resumes a root,
+        // and what an earlier run of the chain already asked for is not asked again
+        let root = Memory::root_of(&l, &parent);
+        let mut done = Vec::new();
+        Memory::tree_in(&l, root)?.flatten(&mut done);
+        let mut children = Vec::new();
+        let mut existing = Vec::new();
+        for (title, body) in items {
+            let hash = dm_core::digest(body)[..16].to_string();
+            if let Some(earlier) = done.iter().find(|t| {
+                t.spec.upstream_event.as_deref() == Some(hash.as_str())
+                    && t.spec
+                        .origin
+                        .as_deref()
+                        .is_some_and(|o| o.starts_with("task:"))
+            }) {
+                existing.push(earlier.clone());
+                continue;
+            }
+            let created = l.create(TaskSpec {
+                domain: parent.spec.domain.clone(),
+                title: title.clone(),
+                body: body.clone(),
+                requirements: Vec::new(),
+                depends_on: Vec::new(),
+                origin: Some(format!("task:{}", parent.id)),
+                upstream_event: Some(hash),
+                created_by: self.author.clone(),
+                classification: parent.spec.classification.max(self.label()),
+                priority: parent.spec.priority,
+            })?;
+            children.push(self.admit_own_in(&mut l, created.task)?);
+        }
+        if children.is_empty() {
+            return Ok(FanOut {
+                children,
+                existing,
+                continuation: None,
+            });
+        }
+        let ids: Vec<String> = children.iter().map(|c| c.id.clone()).collect();
+        let created = l.create(TaskSpec {
+            domain: parent.spec.domain.clone(),
+            title: format!(
+                "Resume: {}",
+                parent.spec.title.trim_start_matches("Resume: ")
+            ),
+            body: format!(
+                "{}\n\n## Continuation\n\nThis resumes `{}`. The subagents its run asked for have run; their handoffs, and the run's own, are in the prompt above. Do not ask for them again: finish the task from what they found, and leave a handoff.",
+                parent.spec.body.trim_end(),
+                parent.id
+            ),
+            requirements: parent.spec.requirements.clone(),
+            depends_on: ids.clone(),
+            origin: Some(format!("continues:{}", parent.id)),
+            upstream_event: Some(dm_core::digest(&ids.join(","))[..16].to_string()),
+            created_by: self.author.clone(),
+            classification: parent.spec.classification.max(self.label()),
+            priority: parent.spec.priority,
+        })?;
+        let continuation = self.admit_own_in(&mut l, created.task)?;
+        Ok(FanOut {
+            children,
+            existing,
+            continuation: Some(continuation),
+        })
+    }
+
+    /// The root of a task's chain: what a continuation or a retry ultimately resumes.
+    fn root_of(l: &Ledger, task: &Task) -> Task {
+        let mut current = task.clone();
+        let mut seen = HashSet::new();
+        while let Some(up) = current
+            .spec
+            .origin
+            .as_deref()
+            .and_then(|o| {
+                o.strip_prefix("continues:")
+                    .or_else(|| o.strip_prefix("retries:"))
+            })
+            .map(str::to_string)
+        {
+            if !seen.insert(up.clone()) {
+                break;
+            }
+            match l.get(&up) {
+                Ok(t) => current = t,
+                Err(_) => break,
+            }
+        }
+        current
+    }
+
+    /// A task with everything filed from it, recursively: its subagent tasks, its
+    /// continuations and its retries, each with theirs.
+    ///
+    /// # Errors
+    ///
+    /// A task outside the grants, or a ledger error.
+    pub async fn task_tree(&self, id: &str) -> Result<TaskTree, Error> {
+        let l = self.ledger.lock().await;
+        let task = l.get(id)?;
+        self.task_in_grants(&task)?;
+        Ok(Memory::tree_in(&l, task)?)
+    }
+
+    fn tree_in(l: &Ledger, task: Task) -> Result<TaskTree, dm_ledger::Error> {
+        let mut children = Vec::new();
+        for t in l.filed_from(&task.id)? {
+            children.push(Memory::tree_in(l, t)?);
+        }
+        Ok(TaskTree { task, children })
+    }
+
+    /// File a task again from one that dead-ended: the same spec, with the chain's
+    /// handoffs attached as lessons, so the next claimant starts from what was learned
+    /// rather than from zero. The original's intent is untouched; the new task carries
+    /// `origin: retries:<id>`.
+    ///
+    /// # Errors
+    ///
+    /// A task outside the grants, or a ledger error.
+    pub async fn retry_task(&self, id: &str) -> Result<Task, Error> {
+        let mut l = self.ledger.lock().await;
+        let root = l.get(id)?;
+        self.task_in_grants(&root)?;
+        let tree = Memory::tree_in(&l, root.clone())?;
+        let mut lessons = Vec::new();
+        tree.handoffs(&mut lessons);
+        let mut body = root.spec.body.trim_end().to_string();
+        if !lessons.is_empty() {
+            body.push_str(
+                "
+
+## Lessons from the attempts so far
+
+",
+            );
+            for (task, title, handoff) in &lessons {
+                body.push_str(&format!(
+                    "- `{task}` {title}: handoff `{handoff}`
+"
+                ));
+            }
+        }
+        let created = l.create(TaskSpec {
+            domain: root.spec.domain.clone(),
+            title: root.spec.title.clone(),
+            body,
+            requirements: root.spec.requirements.clone(),
+            depends_on: Vec::new(),
+            origin: Some(format!("retries:{}", root.id)),
+            upstream_event: None,
+            created_by: self.author.clone(),
+            classification: root.spec.classification.max(self.label()),
+            priority: root.spec.priority,
+        })?;
+        self.admit_own_in(&mut l, created.task)
+    }
+
     /// Claim the highest-ranked claimable task in a domain that this session's manifest
     /// can take.
     ///
@@ -633,7 +871,9 @@ impl Memory {
         Ok(l.release(id, &self.author, handoff)?)
     }
 
-    /// Close a task without doing it.
+    /// Close a task without doing it, and everything still open that was filed from it:
+    /// its subagent tasks, their continuations, and theirs, since a promise withdrawn
+    /// withdraws the promises made to keep it.
     ///
     /// # Errors
     ///
@@ -646,7 +886,19 @@ impl Memory {
     ) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
         self.task_in_grants(&l.get(id)?)?;
-        Ok(l.invalidate(id, reason, superseded_by)?)
+        let task = l.invalidate(id, reason, superseded_by)?;
+        let mut pending = l.filed_from(id)?;
+        while let Some(t) = pending.pop() {
+            pending.extend(l.filed_from(&t.id)?);
+            if !t.status.is_terminal() {
+                l.invalidate(
+                    &t.id,
+                    &format!("filed from {id}, which was invalidated: {reason}"),
+                    superseded_by,
+                )?;
+            }
+        }
+        Ok(task)
     }
 
     /// One task.
@@ -1105,6 +1357,192 @@ mod tests {
         assert_eq!(handoffs.len(), 1);
         let h = fresh.get(&handoffs[0].id).await.unwrap();
         assert!(h.body.contains("Next: digests"));
+    }
+
+    #[tokio::test]
+    async fn a_fan_out_files_children_and_a_continuation_that_waits_on_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path()).with_manifest(vec!["tool:fs".into()]);
+        let parent = m
+            .create_task(TaskSpec {
+                requirements: vec!["tool:fs".into()],
+                priority: 3,
+                ..spec("Ship the import")
+            })
+            .await
+            .unwrap()
+            .task;
+        m.admit(&parent.id).await.unwrap();
+        let f = m
+            .fan_out(
+                &parent.id,
+                &[
+                    (
+                        "Count crates".into(),
+                        "List the crates and count them.".into(),
+                    ),
+                    ("Read the plan".into(), "Summarise PLAN.md.".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(f.children.len(), 2);
+        // the starter grants admit a session's own filings
+        assert!(f.children.iter().all(|c| c.status == Status::Admitted));
+        assert_eq!(
+            f.children[0].spec.origin.as_deref(),
+            Some(format!("task:{}", parent.id).as_str())
+        );
+        let continuation = f.continuation.clone().unwrap();
+        assert_eq!(continuation.status, Status::Admitted);
+        assert_eq!(continuation.spec.title, "Resume: Ship the import");
+        assert_eq!(continuation.spec.requirements, vec!["tool:fs".to_string()]);
+        assert_eq!(continuation.spec.priority, 3);
+        assert_eq!(
+            continuation.spec.depends_on,
+            f.children.iter().map(|c| c.id.clone()).collect::<Vec<_>>()
+        );
+        // the same spawn asked twice is the same task, and so is the continuation
+        let again = m
+            .fan_out(
+                &parent.id,
+                &[
+                    (
+                        "Count crates".into(),
+                        "List the crates and count them.".into(),
+                    ),
+                    ("Read the plan".into(), "Summarise PLAN.md.".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(again.children.is_empty(), "nothing new");
+        assert_eq!(again.existing.len(), 2);
+        assert_eq!(again.existing[0].id, f.children[0].id);
+        assert!(
+            again.continuation.is_none(),
+            "no continuation for nothing new"
+        );
+        // the continuation is not claimable until the children are complete
+        let claimed = m
+            .claim_next(None, Duration::minutes(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            claimed.task.id, continuation.id,
+            "a child or the parent first"
+        );
+        // the tree shows it all under the parent
+        let tree = m.task_tree(&parent.id).await.unwrap();
+        assert_eq!(tree.children.len(), 3, "two children and the continuation");
+        assert!(tree.children.iter().any(|c| c.task.id == continuation.id));
+    }
+
+    #[tokio::test]
+    async fn a_resumed_run_asks_for_a_spawn_once_per_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let parent = m.create_task(spec("Ship the import")).await.unwrap().task;
+        let f = m
+            .fan_out(
+                &parent.id,
+                &[(
+                    "Count crates".into(),
+                    "List the crates and count them.".into(),
+                )],
+            )
+            .await
+            .unwrap();
+        let continuation = f.continuation.clone().unwrap();
+        // the same spawn under the continuation gets the earlier child, not another:
+        // the chain is one
+        let resumed = m
+            .fan_out(
+                &continuation.id,
+                &[(
+                    "Count crates".into(),
+                    "List the crates and count them.".into(),
+                )],
+            )
+            .await
+            .unwrap();
+        assert!(resumed.children.is_empty());
+        assert_eq!(resumed.existing[0].id, f.children[0].id);
+        assert!(resumed.continuation.is_none());
+        // something new under the continuation is filed, with its own continuation,
+        // titled after the root rather than stacking "Resume:"
+        let more = m
+            .fan_out(&continuation.id, &[("Lint".into(), "Run clippy.".into())])
+            .await
+            .unwrap();
+        assert_eq!(more.children.len(), 1);
+        assert_eq!(
+            more.continuation.unwrap().spec.title,
+            "Resume: Ship the import"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidation_is_recursive_and_a_retry_carries_the_lessons() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let parent = m.create_task(spec("Root")).await.unwrap().task;
+        let f = m
+            .fan_out(&parent.id, &[("Child".into(), "Do the child.".into())])
+            .await
+            .unwrap();
+        let child = &f.children[0];
+        // the child completes with a handoff, which the retry will carry as a lesson
+        m.claim(&child.id, Duration::minutes(30)).await.unwrap();
+        let h = m
+            .write(WriteRequest {
+                entry_type: EntryType::Handoff,
+                ..req("The child found the crates.\n")
+            })
+            .await
+            .unwrap();
+        m.complete(&child.id, &h.id).await.unwrap();
+        // a grandchild under the continuation, still open
+        let g = m
+            .fan_out(
+                &f.continuation.clone().unwrap().id,
+                &[("Grandchild".into(), "Deeper.".into())],
+            )
+            .await
+            .unwrap();
+        m.invalidate(&parent.id, "obsolete", None).await.unwrap();
+        assert_eq!(
+            m.get_task(&f.continuation.unwrap().id)
+                .await
+                .unwrap()
+                .status,
+            Status::Invalidated
+        );
+        assert_eq!(
+            m.get_task(&g.children[0].id).await.unwrap().status,
+            Status::Invalidated,
+            "the grandchild goes with the tree"
+        );
+        assert_eq!(
+            m.get_task(&child.id).await.unwrap().status,
+            Status::Completed,
+            "what was done stays done"
+        );
+        let retry = m.retry_task(&parent.id).await.unwrap();
+        assert_eq!(retry.spec.title, "Root");
+        assert_eq!(
+            retry.spec.origin.as_deref(),
+            Some(format!("retries:{}", parent.id).as_str())
+        );
+        assert!(
+            retry.spec.body.contains("## Lessons"),
+            "{}",
+            retry.spec.body
+        );
+        assert!(retry.spec.body.contains(&h.id), "{}", retry.spec.body);
+        assert_eq!(retry.status, Status::Admitted);
+        assert_eq!(m.task_tree(&parent.id).await.unwrap().children.len(), 3);
     }
 
     #[tokio::test]

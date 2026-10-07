@@ -671,6 +671,28 @@ impl Ledger {
         Ledger::get_in(&self.conn, id)
     }
 
+    /// The tasks filed from `parent`: the subagent tasks a run of it asked for
+    /// (`origin` `task:<parent>`), its continuations (`continues:<parent>`) and its
+    /// retries (`retries:<parent>`), oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the ledger did not write.
+    pub fn filed_from(&self, parent: &str) -> Result<Vec<Task>, Error> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE origin IN (?1, ?2, ?3) ORDER BY created"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                format!("task:{parent}"),
+                format!("continues:{parent}"),
+                format!("retries:{parent}")
+            ],
+            |r| Ok(task_from_row(r)),
+        )?;
+        rows.map(|r| r?).collect()
+    }
+
     /// Tasks in a domain with the given status, ranked as the queue ranks them.
     ///
     /// # Errors
@@ -1210,6 +1232,32 @@ mod tests {
         assert_eq!(theirs.task.spec.domain, "dom-b");
         assert!(l.create(elsewhere).unwrap().deduplicated);
         assert_eq!(l.event_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn what_was_filed_from_a_task_is_found_by_its_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = Ledger::open(&dir.path().join("l.db")).unwrap();
+        let parent = l.create(spec("parent")).unwrap().task;
+        let mut child = spec("child");
+        child.origin = Some(format!("task:{}", parent.id));
+        child.upstream_event = Some("h1".into());
+        let child = l.create(child).unwrap().task;
+        let mut cont = spec("resume");
+        cont.origin = Some(format!("continues:{}", parent.id));
+        cont.upstream_event = Some("h2".into());
+        cont.depends_on = vec![child.id.clone()];
+        let cont = l.create(cont).unwrap().task;
+        let mut other = spec("other");
+        other.origin = Some("task:elsewhere".into());
+        other.upstream_event = Some("h3".into());
+        l.create(other).unwrap();
+        let filed = l.filed_from(&parent.id).unwrap();
+        assert_eq!(
+            filed.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec![child.id.as_str(), cont.id.as_str()]
+        );
+        assert!(l.filed_from(&child.id).unwrap().is_empty());
     }
 
     #[test]

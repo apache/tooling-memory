@@ -467,6 +467,12 @@ async fn delegate(
             "subagents go to the task board here, and the memory server's address is not set, so nothing can be filed; do this part yourself".into(),
         );
     };
+    // under a task, the spawn is a fan-out of that task: children and a continuation
+    if let Ok(parent) = std::env::var("MEMORY_TASK") {
+        if !parent.is_empty() {
+            return fan_out(url, &parent, tool, &units, wait).await;
+        }
+    }
     let mut ids = Vec::new();
     for u in units {
         let body = format!(
@@ -506,6 +512,83 @@ async fn delegate(
         }
     }
     Decision::Deny(crate::board::refusal(&ids))
+}
+
+/// File the units as the subagent tasks of `parent`, with a continuation that resumes
+/// it when they are done, and refuse the call with what was filed.
+async fn fan_out(
+    url: &str,
+    parent: &str,
+    tool: &str,
+    units: &[crate::board::Unit],
+    wait: std::time::Duration,
+) -> Decision {
+    let items: Vec<Value> = units
+        .iter()
+        .map(|u| serde_json::json!({ "title": u.title, "body": u.body }))
+        .collect();
+    let call = crate::mcp_http::call_tool(
+        url,
+        "fan_out",
+        serde_json::json!({ "parent": parent, "items": items }),
+    );
+    let answer = match tokio::time::timeout(wait, call).await {
+        Ok(Ok(v)) => {
+            let text = v
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            serde_json::from_str::<Value>(text).unwrap_or(Value::Null)
+        }
+        Ok(Err(why)) => {
+            return Decision::Deny(format!(
+                "subagents go to the task board here, and filing failed: {why}; do this part yourself"
+            ))
+        }
+        Err(_) => {
+            return Decision::Deny(format!(
+                "subagents go to the task board here, and the memory server did not answer within {wait:?}; do this part yourself"
+            ))
+        }
+    };
+    let ids: Vec<String> = answer["children"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    // what an earlier run of this chain already asked for: done, with a handoff to
+    // read, or still open on the board
+    let mut earlier = Vec::new();
+    for e in answer["existing"].as_array().into_iter().flatten() {
+        let id = e["id"].as_str().unwrap_or("?");
+        match e["handoff"].as_str() {
+            Some(h) => earlier.push(format!(
+                "`{id}` was already done; its handoff is `{h}`, read it with the memory server's `get`"
+            )),
+            None => earlier.push(format!(
+                "`{id}` is already on the board ({}); do not ask again",
+                e["status"].as_str().unwrap_or("open")
+            )),
+        }
+    }
+    let mut text = String::new();
+    if !ids.is_empty() {
+        let continuation = answer["continuation"]["id"].as_str().unwrap_or("?");
+        text.push_str(&format!(
+            "{} The board will resume `{parent}` as `{continuation}` once they are done, with their handoffs in its prompt (`{tool}` filed them). ",
+            crate::board::refusal(&ids)
+        ));
+    }
+    if !earlier.is_empty() {
+        text.push_str("This was asked for before in this chain: ");
+        text.push_str(&earlier.join("; "));
+        text.push_str(". ");
+    }
+    text.push_str("Finish what you can from what is already known, then leave a handoff.");
+    Decision::Deny(text)
 }
 
 /// Why a note was left; part of its filename so the launcher can tell them apart.

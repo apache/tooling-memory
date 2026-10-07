@@ -11,7 +11,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use dm_server::Memory;
@@ -649,6 +649,167 @@ async fn reader() -> Html<&'static str> {
     Html(pages::READER)
 }
 
+/// The board: tasks by status, each under the task it was filed from.
+async fn board() -> Html<&'static str> {
+    Html(pages::BOARD)
+}
+
+fn task_error(e: &dm_server::Error) -> Response {
+    let status = match e {
+        dm_server::Error::NotFound(_) => StatusCode::NOT_FOUND,
+        dm_server::Error::Denied(_) => StatusCode::FORBIDDEN,
+        dm_server::Error::Ledger(_) => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string()).into_response()
+}
+
+/// Every task of the domain, whatever its status, newest first within a status, with
+/// the domain named: what the board lists and nests by origin.
+async fn tasks(State(app): State<App>) -> Response {
+    use dm_ledger::Status;
+    let domain = match app.memory.resolve_domain(None) {
+        Ok(d) => d,
+        Err(e) => return task_error(&e),
+    };
+    let mut all = Vec::new();
+    for status in [
+        Status::Claimed,
+        Status::Admitted,
+        Status::Proposed,
+        Status::Completed,
+        Status::Invalidated,
+    ] {
+        match app.memory.tasks(Some(&domain), status).await {
+            Ok(mut t) => all.append(&mut t),
+            Err(e) => return task_error(&e),
+        }
+    }
+    Json(json!({ "domain": domain, "tasks": all })).into_response()
+}
+
+/// A task filed from the board, by the person.
+#[derive(Debug, Default, Deserialize)]
+struct FileTask {
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    requirements: Vec<String>,
+    #[serde(default)]
+    priority: Option<i64>,
+}
+
+async fn file_task(State(app): State<App>, Json(req): Json<FileTask>) -> Response {
+    if req.title.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "a task needs a title").into_response();
+    }
+    let spec = dm_ledger::TaskSpec {
+        domain: String::new(),
+        title: req.title.trim().to_string(),
+        body: req.body,
+        requirements: req.requirements,
+        depends_on: Vec::new(),
+        origin: None,
+        upstream_event: None,
+        created_by: String::new(),
+        classification: dm_core::Label::Public,
+        priority: req.priority.unwrap_or(0),
+    };
+    match app.memory.create_task(spec).await {
+        Ok(c) => Json(json!({ "task": c.task, "deduplicated": c.deduplicated })).into_response(),
+        Err(e) => task_error(&e),
+    }
+}
+
+async fn task_tree(State(app): State<App>, Path(id): Path<String>) -> Response {
+    match app.memory.task_tree(&id).await {
+        Ok(t) => Json(json!(t)).into_response(),
+        Err(e) => task_error(&e),
+    }
+}
+
+async fn admit_task(State(app): State<App>, Path(id): Path<String>) -> Response {
+    match app.memory.admit(&id).await {
+        Ok(t) => Json(json!({ "task": t })).into_response(),
+        Err(e) => task_error(&e),
+    }
+}
+
+/// The person claims a task, for half an hour at a time; the board's own heartbeat is
+/// the person coming back to complete it.
+async fn claim_task(State(app): State<App>, Path(id): Path<String>) -> Response {
+    match app.memory.claim(&id, time::Duration::minutes(30)).await {
+        Ok(c) => Json(json!({ "task": c.task })).into_response(),
+        Err(e) => task_error(&e),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Handoff {
+    #[serde(default)]
+    handoff: String,
+}
+
+/// Complete a task the person holds: the handoff text becomes a handoff entry, and the
+/// task completes with it, as a harness's run would.
+async fn complete_task(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(h): Json<Handoff>,
+) -> Response {
+    if h.handoff.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "a handoff needs a body").into_response();
+    }
+    let task = match app.memory.get_task(&id).await {
+        Ok(t) => t,
+        Err(e) => return task_error(&e),
+    };
+    let written = app
+        .memory
+        .write(dm_server::WriteRequest {
+            domain: Some(task.spec.domain.clone()),
+            entry_type: dm_core::EntryType::Handoff,
+            title: Some(format!("Handoff: {}", task.spec.title)),
+            body: h.handoff,
+            ..dm_server::WriteRequest::default()
+        })
+        .await;
+    let written = match written {
+        Ok(w) => w,
+        Err(e) => return task_error(&e),
+    };
+    match app.memory.complete(&id, &written.id).await {
+        Ok(t) => Json(json!({ "task": t, "handoff": written.id })).into_response(),
+        Err(e) => task_error(&e),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Reason {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn invalidate_task(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(r): Json<Reason>,
+) -> Response {
+    let reason = r.reason.unwrap_or_else(|| "closed from the board".into());
+    match app.memory.invalidate(&id, &reason, None).await {
+        Ok(t) => Json(json!({ "task": t })).into_response(),
+        Err(e) => task_error(&e),
+    }
+}
+
+async fn retry_task(State(app): State<App>, Path(id): Path<String>) -> Response {
+    match app.memory.retry_task(&id).await {
+        Ok(t) => Json(json!({ "task": t })).into_response(),
+        Err(e) => task_error(&e),
+    }
+}
+
 /// The reader's wasm and glue. They change with the binary, under the same names, so
 /// the browser revalidates them rather than keeping a copy.
 async fn reader_asset(Path(name): Path<String>) -> Response {
@@ -847,6 +1008,14 @@ pub fn router(config: Config) -> Result<Router, Error> {
         .route("/api/entries", get(entries))
         .route("/api/entry/{id}", get(entry))
         .route("/api/domains", get(domains))
+        .route("/board", get(board))
+        .route("/api/tasks", get(tasks).post(file_task))
+        .route("/api/tasks/{id}/tree", get(task_tree))
+        .route("/api/tasks/{id}/admit", post(admit_task))
+        .route("/api/tasks/{id}/claim", post(claim_task))
+        .route("/api/tasks/{id}/complete", post(complete_task))
+        .route("/api/tasks/{id}/invalidate", post(invalidate_task))
+        .route("/api/tasks/{id}/retry", post(retry_task))
         .route("/reader", get(reader))
         .route("/reader/{name}", get(reader_asset))
         .route("/bundle/{domain}/{label}/{file}", get(bundle_file))
@@ -1235,6 +1404,59 @@ mod tests {
     async fn get_json(addr: std::net::SocketAddr, path: &str) -> (u16, Value) {
         let (status, body) = http(addr, "GET", path, None).await;
         (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn the_board_files_admits_claims_and_completes_a_person_s_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let (status, body) = http(
+            addr,
+            "POST",
+            "/api/tasks",
+            Some(r#"{"title":"Sign off the release","body":"Check the notes.","requirements":["human"]}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let id = serde_json::from_str::<Value>(&body).unwrap()["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, _) = http(addr, "POST", "/api/tasks", Some(r#"{"title":"  "}"#)).await;
+        assert_eq!(status, 400);
+        let (_, all) = get_json(addr, "/api/tasks").await;
+        assert_eq!(all["domain"], "dom-me");
+        assert_eq!(all["tasks"][0]["status"], "proposed");
+        let (status, _) = http(addr, "POST", &format!("/api/tasks/{id}/admit"), None).await;
+        assert_eq!(status, 200);
+        // the board is a person, so a task that requires one is claimable from it
+        let (status, body) = http(addr, "POST", &format!("/api/tasks/{id}/claim"), None).await;
+        assert_eq!(status, 200, "{body}");
+        let (status, _) = http(
+            addr,
+            "POST",
+            &format!("/api/tasks/{id}/complete"),
+            Some(r#"{"handoff":"  "}"#),
+        )
+        .await;
+        assert_eq!(status, 400, "a handoff needs a body");
+        let (status, body) = http(
+            addr,
+            "POST",
+            &format!("/api/tasks/{id}/complete"),
+            Some(r#"{"handoff":"Signed off; ship it."}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let done: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(done["task"]["status"], "completed");
+        assert!(done["handoff"].as_str().unwrap().starts_with("mem-"));
+        let (status, tree) = get_json(addr, &format!("/api/tasks/{id}/tree")).await;
+        assert_eq!(status, 200);
+        assert_eq!(tree["id"], id);
+        assert_eq!(tree["children"].as_array().unwrap().len(), 0);
+        let (status, _) = http(addr, "POST", "/api/tasks/task-me-none/retry", None).await;
+        assert!(status == 404 || status == 409, "{status}");
     }
 
     #[cfg(unix)]

@@ -213,6 +213,24 @@ pub struct TaskIdParams {
     pub id: String,
 }
 
+/// One subagent task to file in a fan-out.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct FanOutItem {
+    /// One line.
+    pub title: String,
+    /// The prompt the subagent would have been given, in Markdown.
+    pub body: String,
+}
+
+/// Parameters of `fan_out`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct FanOutParams {
+    /// The task the run asking for subagents holds.
+    pub parent: String,
+    /// The subagent tasks, one per prompt.
+    pub items: Vec<FanOutItem>,
+}
+
 /// Parameters of `claim_next`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct ClaimNextParams {
@@ -483,6 +501,36 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Fan a held task out: file one task per item as its subagents' work, and a continuation that resumes the parent when they are done, with their handoffs in its prompt. Filing the same prompt twice is one task."
+    )]
+    async fn fan_out(&self, p: Parameters<FanOutParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let items: Vec<(String, String)> = p.items.into_iter().map(|i| (i.title, i.body)).collect();
+        let f = self
+            .memory
+            .fan_out(&p.parent, &items)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "children": f.children, "continuation": f.continuation }))
+    }
+
+    #[tool(
+        description = "A task with everything filed from it, recursively: its subagent tasks, continuations and retries."
+    )]
+    async fn task_tree(&self, p: Parameters<TaskIdParams>) -> Result<CallToolResult, McpError> {
+        let t = self.memory.task_tree(&p.0.id).await.map_err(mcp_err)?;
+        ok(json!(t))
+    }
+
+    #[tool(
+        description = "File a task again from one that dead-ended, with the handoffs of its chain attached as lessons."
+    )]
+    async fn retry_task(&self, p: Parameters<TaskIdParams>) -> Result<CallToolResult, McpError> {
+        let t = self.memory.retry_task(&p.0.id).await.map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
         description = "Admit a proposed task so it can be claimed. On a laptop the owner is the triage."
     )]
     async fn admit_task(&self, p: Parameters<TaskIdParams>) -> Result<CallToolResult, McpError> {
@@ -703,6 +751,9 @@ mod tests {
             "invalidate_task",
             "get_task",
             "list_tasks",
+            "fan_out",
+            "task_tree",
+            "retry_task",
         ] {
             assert!(
                 names.contains(&expected),

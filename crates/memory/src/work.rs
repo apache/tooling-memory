@@ -271,7 +271,7 @@ async fn one(
         })
     };
     let run = session
-        .run(&session.harness().headless(&prompt), true)
+        .run_task(&session.harness().headless(&prompt), true, Some(&task.id))
         .await;
     heartbeat.abort();
     let (code, output) = run?;

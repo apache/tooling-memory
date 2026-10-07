@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory board</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafaf7; --muted: #6b6b6b; --line: #ddd; --accent: #0a62c9; --card: #fff; --human: #b35c00; --mono: ui-monospace, Menlo, Consolas, monospace; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e8e8e8; --bg: #16181d; --muted: #9a9a9a; --line: #333; --accent: #6fb2ff; --card: #1c1f26; --human: #ffb45c; } }
+  body { margin: 0; padding: 24px 16px; font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 1000px; margin-inline: auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; } h1 a { color: var(--accent); text-decoration: none; font-weight: 400; font-size: 14px; margin-left: 10px; }
+  h2 { font-size: 14px; margin: 22px 0 6px; color: var(--muted); font-weight: 600; text-transform: lowercase; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+  .task { border-top: 1px solid var(--line); padding: 8px 0; display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: start; }
+  .task .title { font-weight: 600; } .task .title .id { font: 12px var(--mono); color: var(--muted); margin-left: 6px; }
+  .task .meta { grid-column: 1; font-size: 12px; color: var(--muted); }
+  .task .meta code { font-family: var(--mono); font-size: 12px; }
+  .task .acts { grid-column: 2; grid-row: 1 / span 2; display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  .task.depth-1 { margin-left: 22px; } .task.depth-2 { margin-left: 44px; } .task.depth-3 { margin-left: 66px; } .task.depth-4 { margin-left: 88px; } .task.deep { margin-left: 110px; }
+  .task.human .title::before { content: "for a person · "; color: var(--human); font-weight: 600; font-size: 12px; }
+  button, input, textarea { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--fg); }
+  button { cursor: pointer; } button.primary { background: var(--accent); color: white; border: 0; }
+  details.body { grid-column: 1 / -1; font-size: 13px; } details.body pre { white-space: pre-wrap; font-family: inherit; margin: 6px 0 0; color: var(--fg); }
+  form.file { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin: 8px 0 16px; }
+  form.file textarea { grid-column: 1 / -1; min-height: 44px; resize: vertical; }
+  .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
+  .hint { font-size: 12px; color: var(--muted); min-height: 1.2em; }
+  dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--fg); max-width: 560px; width: 90vw; }
+  dialog textarea { width: 100%; min-height: 120px; box-sizing: border-box; }
+  dialog .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>board <a href="/">sessions</a><a href="/reader">reader</a></h1>
+<p class="sub">Tasks on the ledger by status, each under the task it was filed from. A task addressed to a person is marked; claim it, do it, and complete it with a handoff. <span id="domain"></span></p>
+<form class="file" id="file">
+  <input name="title" placeholder="A task to file, one line" required>
+  <input name="requirements" placeholder="requirements, comma separated: human, tool:github">
+  <button class="primary" type="submit">File</button>
+  <textarea name="body" placeholder="What is to be done, in Markdown"></textarea>
+  <span class="hint" id="file-hint"></span>
+</form>
+<div id="lists"></div>
+<dialog id="handoff">
+  <form method="dialog" id="handoff-form">
+    <p>Complete <b id="handoff-title"></b> with a handoff: what was done, what remains, what the next one should know.</p>
+    <textarea id="handoff-text" required></textarea>
+    <div class="row"><button value="cancel">Cancel</button><button class="primary" value="ok" id="handoff-ok">Complete</button></div>
+  </form>
+</dialog>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (t) => String(t ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ORDER = ['claimed', 'admitted', 'proposed', 'completed', 'invalidated'];
+const WORDS = { claimed: 'claimed, under a lease', admitted: 'admitted, claimable', proposed: 'proposed, waiting for admission', completed: 'completed, with a handoff', invalidated: 'invalidated' };
+
+function parentOf(t) {
+  const o = t.origin || '';
+  const m = /^(task|continues|retries):(.+)$/.exec(o);
+  return m ? m[2] : null;
+}
+function relation(t) {
+  const o = t.origin || '';
+  if (o.startsWith('task:')) return 'subagent of';
+  if (o.startsWith('continues:')) return 'continues';
+  if (o.startsWith('retries:')) return 'retries';
+  return o ? `from ${o}` : '';
+}
+
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  const text = await r.text();
+  if (!r.ok) throw new Error(text || r.statusText);
+  return text ? JSON.parse(text) : null;
+}
+
+let all = [];
+async function refresh() {
+  const data = await api('GET', '/api/tasks');
+  $('domain').textContent = data.domain ? `Domain ${data.domain}.` : '';
+  all = data.tasks;
+  const byId = new Map(all.map(t => [t.id, t]));
+  const depth = (t) => { let d = 0, p = parentOf(t); const seen = new Set(); while (p && byId.has(p) && !seen.has(p)) { seen.add(p); d++; p = parentOf(byId.get(p)); } return d; };
+  const lists = $('lists'); lists.innerHTML = '';
+  for (const status of ORDER) {
+    const h = document.createElement('h2'); h.textContent = WORDS[status]; lists.appendChild(h);
+    const tasks = all.filter(t => t.status === status);
+    if (!tasks.length) { const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'none'; lists.appendChild(e); continue; }
+    // parents before children, each child right after its parent where both share a status
+    const roots = tasks.filter(t => !parentOf(t) || !tasks.some(x => x.id === parentOf(t)));
+    const place = (t) => { lists.appendChild(render(t, depth(t))); tasks.filter(c => parentOf(c) === t.id).forEach(place); };
+    roots.forEach(place);
+  }
+}
+
+function render(t, d) {
+  const el = document.createElement('div');
+  const human = (t.requirements || []).includes('human');
+  el.className = `task depth-${Math.min(d, 4)}${d > 4 ? ' deep' : ''}${human ? ' human' : ''}`;
+  const rel = relation(t); const parent = parentOf(t);
+  const meta = [];
+  if (rel) meta.push(`${rel} <code>${esc(parent || t.origin)}</code>`);
+  if ((t.depends_on || []).length) meta.push(`after ${t.depends_on.map(x => `<code>${esc(x)}</code>`).join(', ')}`);
+  if ((t.requirements || []).length) meta.push(`needs ${t.requirements.map(esc).join(', ')}`);
+  if (t.holder) meta.push(`held by ${esc(t.holder)}`);
+  if (t.handoff) meta.push(`handoff <a href="/reader#${esc(t.handoff)}"><code>${esc(t.handoff)}</code></a>`);
+  if (t.reason) meta.push(esc(t.reason));
+  meta.push(`filed by ${esc(t.created_by)} · ${esc((t.created || '').slice(0, 16).replace('T', ' '))}`);
+  const acts = [];
+  if (t.status === 'proposed') acts.push(['Admit', () => act('admit', t)]);
+  if (t.status === 'admitted') acts.push(['Claim', () => act('claim', t)]);
+  if (t.status === 'claimed') acts.push(['Complete…', () => completeWith(t)]);
+  if (t.status !== 'completed' && t.status !== 'invalidated') acts.push(['Invalidate', () => act('invalidate', t, { reason: 'closed from the board' })]);
+  if (t.status === 'invalidated' || t.status === 'completed') acts.push(['Retry', () => act('retry', t)]);
+  el.innerHTML = `<div class="title">${esc(t.title)}<span class="id">${esc(t.id)}</span></div>
+    <div class="meta">${meta.join(' · ')}</div>
+    <div class="acts">${acts.map((a, i) => `<button data-i="${i}">${a[0]}</button>`).join('')}</div>
+    <details class="body"><summary>body</summary><pre>${esc(t.body)}</pre></details>`;
+  el.querySelectorAll('button').forEach(b => b.addEventListener('click', () => acts[+b.dataset.i][1]()));
+  return el;
+}
+
+async function act(what, t, body) {
+  try { await api('POST', `/api/tasks/${encodeURIComponent(t.id)}/${what}`, body); await refresh(); }
+  catch (e) { alert(e.message); }
+}
+
+function completeWith(t) {
+  $('handoff-title').textContent = `${t.title} (${t.id})`;
+  $('handoff-text').value = '';
+  const dlg = $('handoff');
+  dlg.returnValue = '';
+  dlg.showModal();
+  dlg.onclose = async () => {
+    if (dlg.returnValue !== 'ok') return;
+    await act('complete', t, { handoff: $('handoff-text').value });
+  };
+}
+
+$('file').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = new FormData($('file'));
+  const requirements = String(f.get('requirements') || '').split(',').map(s => s.trim()).filter(Boolean);
+  try {
+    await api('POST', '/api/tasks', { title: f.get('title'), body: f.get('body') || '', requirements });
+    $('file').reset(); $('file-hint').textContent = 'filed'; await refresh();
+  } catch (err) { $('file-hint').textContent = err.message; }
+});
+
+refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>

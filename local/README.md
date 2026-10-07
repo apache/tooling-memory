@@ -115,6 +115,25 @@ carries on with its own part and the board runs the rest. A `Workflow` script is
 per `agent()` call whose prompt is a literal, titled by its `label`; a script the hook
 cannot read is one task holding the script. The fan-out, the waits and the merges the
 script would have done are the board's: a task's result comes back as a handoff.
+
+Under `work`, where the run holds a task, the spawn is a fan-out of that task (the M5d
+decision in PLAN.md): each prompt is filed as a child with `origin: task:<parent>` and a
+hash of its body, so the same spawn asked twice anywhere in the chain is one task, and a
+resumed run that asks again is told where the earlier handoff is; and a continuation,
+"Resume: <parent>", is filed with `origin: continues:<parent>`, depending on the children
+and inheriting the parent's requirements and priority. The parent's run ends with its
+handoff as any run does; the continuation becomes claimable when the last child
+completes, and its prompt carries every child's handoff and the parent's own, which is
+what resuming is. Where the domain's grant says `admit_own = true`, as the starter grants
+do, everything a session files from a task it holds is admitted as it is filed; tasks from
+outside, a tap's say, stay proposed for the owner. `memory task tree <id>` shows a task
+with everything filed from it; `memory task invalidate <id>` closes the tree with it, every
+open child and continuation, and `memory task retry <id>` files the task again with the
+chain's handoffs attached as lessons, so a dead end costs the attempts, not the intent.
+There is no depth cap, and a task that only a person can take, one whose requirements
+include `human`, is a node like any other: the board page in the web terminal lists tasks
+by status under what filed them, marks the ones for a person, and lets the person admit,
+claim, complete with a handoff, invalidate or retry them.
 Grok is not a harness but a destination: any OpenAI-shaped harness reaches it with
 `--provider xai` and `XAI_API_KEY`. `command` is not a harness either but a program: the
 first argument after `--` runs as given, confined, with the egress and the memory server in

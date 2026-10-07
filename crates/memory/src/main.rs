@@ -796,7 +796,7 @@ enum TaskOp {
         #[arg(long)]
         handoff: Option<String>,
     },
-    /// Close a task without doing it.
+    /// Close a task without doing it, and everything still open that was filed from it.
     Invalidate {
         id: String,
         #[arg(long, default_value = "obsolete")]
@@ -804,6 +804,10 @@ enum TaskOp {
     },
     /// One task.
     Get { id: String },
+    /// A task with everything filed from it: subagent tasks, continuations, retries.
+    Tree { id: String },
+    /// File a task again from one that dead-ended, with its chain's handoffs as lessons.
+    Retry { id: String },
 }
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
@@ -1544,12 +1548,14 @@ fn report_usage(egress: &Egress) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one argument per thing a run is given
 async fn run_confined(
     p: &Prepared,
     harness: Harness,
     auth: AuthMode,
     workdir: &Path,
     args: &[String],
+    env: &[(String, String)],
     capture: bool,
     rootfs: Option<&Path>,
 ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
@@ -1566,7 +1572,7 @@ async fn run_confined(
         destination_ceiling: p.ceiling,
         harness_args: args,
         host_home: host_home.as_deref(),
-        harness_env: &p.harness_env,
+        harness_env: env,
         model: p.model.as_deref(),
         image: false,
         workdir_inside: None,
@@ -2739,6 +2745,25 @@ impl Session {
         args: &[String],
         capture: bool,
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
+        self.run_task(args, capture, None).await
+    }
+
+    /// Run the harness for a task it holds: the task's id goes into the environment as
+    /// `MEMORY_TASK`, so the hooks know which task a subagent is filed from.
+    ///
+    /// # Errors
+    ///
+    /// When the sandbox cannot be built or the harness cannot be started.
+    pub async fn run_task(
+        &self,
+        args: &[String],
+        capture: bool,
+        task: Option<&str>,
+    ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
+        let mut env = self.p.harness_env.clone();
+        if let Some(t) = task {
+            env.push(("MEMORY_TASK".to_string(), t.to_string()));
+        }
         let mut full: Vec<String> = [self.program.as_slice(), args].concat();
         if let Some(m) = &self.model {
             let m = model_for(self.harness, self.auth, &self.p.provider, m);
@@ -2763,6 +2788,7 @@ impl Session {
                     self.auth,
                     &self.workdir,
                     args,
+                    &env,
                     capture,
                     None,
                 )
@@ -2775,12 +2801,13 @@ impl Session {
                     self.auth,
                     &self.workdir,
                     args,
+                    &env,
                     capture,
                     Some(rootfs),
                 )
                 .await
             }
-            Runner::Requests(r) => self.run_requested(r, args, capture).await,
+            Runner::Requests(r) => self.run_requested(r, args, &env, capture).await,
         }
     }
 
@@ -2789,6 +2816,7 @@ impl Session {
         &self,
         r: &RequestsRunner,
         args: &[String],
+        env: &[(String, String)],
         capture: bool,
     ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
         self.p.memory.project_into(&self.p.projection).await?;
@@ -2803,7 +2831,7 @@ impl Session {
             destination_ceiling: self.p.ceiling,
             harness_args: args,
             host_home: r.host_home.as_deref(),
-            harness_env: &self.p.harness_env,
+            harness_env: env,
             model: self.p.model.as_deref(),
             image: true,
             workdir_inside: Some(&r.workdir_inside),
@@ -3232,6 +3260,8 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         TaskOp::Complete { id, handoff } => json(&m.complete(&id, &handoff).await?),
         TaskOp::Release { id, handoff } => json(&m.release(&id, handoff.as_deref()).await?),
         TaskOp::Invalidate { id, reason } => json(&m.invalidate(&id, &reason, None).await?),
+        TaskOp::Tree { id } => json(&m.task_tree(&id).await?),
+        TaskOp::Retry { id } => json(&m.retry_task(&id).await?),
         TaskOp::Get { id } => json(&m.get_task(&id).await?),
     }
 }
