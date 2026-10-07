@@ -126,9 +126,9 @@ handoff as any run does; the continuation becomes claimable when the last child
 completes, and its prompt carries every child's handoff and the parent's own, which is
 what resuming is. Where the domain's grant says `admit_own = true`, as the starter grants
 do, everything a session files from a task it holds is admitted as it is filed; tasks from
-outside, a tap's say, stay proposed for the owner. `memory task tree <id>` shows a task
-with everything filed from it; `memory task invalidate <id>` closes the tree with it, every
-open child and continuation, and `memory task retry <id>` files the task again with the
+outside, a tap's say, stay proposed for the owner. `amem task tree <id>` shows a task
+with everything filed from it; `amem task invalidate <id>` closes the tree with it, every
+open child and continuation, and `amem task retry <id>` files the task again with the
 chain's handoffs attached as lessons, so a dead end costs the attempts, not the intent.
 There is no depth cap, and a task that only a person can take, one whose requirements
 include `human`, is a node like any other: the board page in the web terminal lists tasks
@@ -245,7 +245,10 @@ relayed from another port. A browser holds a key of its own: the link `amem` ope
 good once for two minutes, which the page trades for a key kept in its origin's storage
 and sent as a bearer, and by the terminal's websocket as a subprotocol; it lives as long
 as the server, so a restart is a new pairing, which `amem` opens. No cookie: a
-cookie for 127.0.0.1 goes to every port on it. The front page lists sessions and
+cookie for 127.0.0.1 goes to every port on it.
+At `/board` it serves the task ledger: every task by status, nested under the task it was
+filed from, the ones addressed to a person marked, with admit, claim, complete with a
+handoff, invalidate and retry, and a form to file one. The front page lists sessions and
 starts one from a form: the harness, named, since there is no default; the auth mode; the
 destination, where the mode names one; the model, picked from what the destination lists
 or typed, the list fetched through `amem models`, which routes as a launch would with

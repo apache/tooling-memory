@@ -49,9 +49,12 @@ with an explicit request from the user, ask before overriding it.
   says what each colour means and how a page is composed; `crates/web/static/tokens.css`
   holds the same values. A new token, hue, chip, glyph or type role changes the book in
   the same commit as the code, and its Decisions chapter says why.
-- **`unsafe` lives in one crate.** `crates/sandbox` is the only crate that may use it,
-  because namespaces and mounts have to happen between fork and exec. Every block has a
-  SAFETY comment. Anywhere else the workspace forbids it; do not relax that.
+- **`unsafe` lives in two crates.** `crates/sandbox` may use it, because namespaces and
+  mounts have to happen between fork and exec, and `crates/wslc-api` may, because it binds
+  a C API by hand. Every block has a SAFETY comment. Anywhere else the workspace forbids
+  it; do not relax that, and give a crate that needs foreign calls its own binding crate
+  rather than a third exception. `make check` holds both halves (`scripts/unsafe-crates.sh`,
+  and clippy for the binding's Windows target).
 - **Nothing reaches outside its root.** The wrapper is a confined process: it touches the
   record, its own state, and its grants file, each behind a rooted operator, and nothing
   else on the host. A name is validated before it becomes a path. Code that opens a file

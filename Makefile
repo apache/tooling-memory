@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: e2e install init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build \
+.PHONY: e2e install init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
 	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.

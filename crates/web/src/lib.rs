@@ -983,7 +983,9 @@ async fn bundle_file(
 ///
 /// When the record cannot be opened.
 pub fn router(config: Config) -> Result<Router, Error> {
-    let memory = Arc::new(Memory::open(&config.root)?);
+    // the browser is the owner, a person: a task addressed to a person, one that
+    // requires `human`, is one the board may claim
+    let memory = Arc::new(Memory::open(&config.root)?.with_manifest(vec!["human".into()]));
     let access = config.access.clone();
     let app = App {
         config,
