@@ -1220,6 +1220,10 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
         "google" => Destination::forward("https://cloudcode-pa.googleapis.com", Auth::PassThrough)
             .with_tunnels([
                 "oauth2.googleapis.com",
+                // Antigravity's eligibility check, before anything else, on a login:
+                // the account's profile, then its picture
+                "www.googleapis.com",
+                ".googleusercontent.com",
                 "accounts.google.com",
                 "cloudcode-pa.googleapis.com",
                 "daily-cloudcode-pa.googleapis.com",
