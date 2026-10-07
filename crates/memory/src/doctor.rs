@@ -330,7 +330,9 @@ fn on_path(binary: &str) -> bool {
 }
 
 async fn harnesses(root: &Path, checks: &mut Vec<Check>, found: &mut Found) {
-    let backend = backend_of(BackendArg::Auto, false, root);
+    // the backend auto picks depends on the harness, since an unpacked image may lack
+    // one; the summary line speaks for Claude Code, the loop below asks per harness
+    let backend = backend_of(BackendArg::Auto, false, root, Harness::Claude);
     let rootfs = image::present(root);
     let in_image = |b: &str| {
         rootfs
@@ -360,7 +362,7 @@ async fn harnesses(root: &Path, checks: &mut Vec<Check>, found: &mut Found) {
         let b = h.binary();
         let host = on_path(b);
         let image = in_image(b);
-        let runnable = match backend {
+        let runnable = match backend_of(BackendArg::Auto, false, root, h) {
             Backend::Image | Backend::Wslc => image,
             _ => host,
         };
