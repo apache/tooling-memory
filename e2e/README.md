@@ -1,10 +1,11 @@
 # The browser tests
 
-The web pages driven by a real browser: the launch form and the command line it previews,
-a session's terminal streaming and taking input, the reading pane opening what a session
-writes, the reader loading a domain, the key in front of the server and how a browser
-pairs, and every page at 360, 768 and 1280 pixels in light and dark with an accessibility
-scan. After the Board Agenda Tool's suite (apache/tooling-agenda, `e2e/`).
+The web pages driven by a real browser: the launch form, its profiles and the command
+line it previews, what this host has for each harness, a session's terminal streaming and
+taking input, its bar and status strip, the reading pane opening what a session writes,
+the board, the reader loading a domain, the key in front of the server and how a browser
+pairs, a hosted copy of the pages on another origin, and every page at 360, 768 and 1280
+pixels in light and dark, and in more contrast, with an accessibility scan. After the Board Agenda Tool's suite (apache/tooling-agenda, `e2e/`).
 
 ```sh
 make e2e                                              # the whole suite
@@ -22,7 +23,10 @@ on the host first and mounts the checkout. The image's Playwright and the one in
 `amem web` over it with `--session-command`, a hidden flag that runs `session.sh` in each
 session's terminal in place of the launcher: a banner naming an entry, then whatever is
 typed, echoed. So the pages, the API, the key and the websocket are the real ones, and no
-harness, sandbox or credential is needed; the launcher's own confinement is tested in
+harness, sandbox or credential is needed; session.sh also writes the status file the
+launcher would, so the strip has something to show. `tests/support/static.mjs` serves
+`crates/web/static` as plain files on a second origin, `http://localhost:4311`, which the
+server lets through with `--hosted`; the launcher's own confinement is tested in
 Rust (`crates/memory/tests/launch.rs`, `crates/sandbox`).
 
 ## Writing a spec

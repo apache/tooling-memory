@@ -12,6 +12,7 @@ test('a pairing link gives the page a key of its own and leaves no trace in the 
   expect(await storedKey(page)).not.toBe(token());
   expect(await context.cookies(), 'a cookie would go to every port on the host').toEqual([]);
   await expect(page.locator('#harness')).toContainText('claude');
+  await expect(page.locator('#pairing')).toContainText('Paired with');
   // a reload, or a return later, needs no link
   await page.reload();
   await expect(page.locator('#harness')).toContainText('claude');
@@ -24,16 +25,28 @@ test('a pairing link is good once', async ({ browser, request }) => {
   await expect.poll(() => storedKey(first)).not.toBeNull();
   const second = await browser.newPage();
   await second.goto(`/?pair=${code}`);
-  await expect(second.locator('#form-hint')).toContainText('used already');
+  await expect(second.locator('#unpaired')).toContainText('used already');
   expect(await storedKey(second)).toBeNull();
   await first.close();
   await second.close();
 });
 
-test('a page that is not paired says how to pair it', async ({ page }) => {
-  await page.goto('/');
+for (const [name, path, disabled] of [
+  ['the launch page', '/', 'Start session'],
+  ['the board', '/board', 'File task'],
+] as const) {
+  test(`${name}, not paired, says how to pair it and disables what cannot work`, async ({ page }) => {
+    await page.goto(path);
+    await expect(page.getByText('This browser is not paired with this server')).toBeVisible();
+    await expect(page.locator('#pairing')).toContainText('Not paired');
+    await expect(page.getByRole('button', { name: disabled })).toBeDisabled();
+  });
+}
+
+test('a session page, not paired, says so in its bar and shows nothing of the session', async ({ page }) => {
+  await page.goto('/session.html?id=0123456789abcdef0123456789abcdef');
+  await expect(page.locator('#status')).toHaveText('not paired');
   await expect(page.getByText('This browser is not paired with this server')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Start' })).toBeDisabled();
 });
 
 test('the API wants a key, and a page from another origin is refused even with one', async ({ request }) => {

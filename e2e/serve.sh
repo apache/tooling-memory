@@ -2,7 +2,8 @@
 # The server under test: a fresh record with a few entries, and `amem web` over it with
 # every session running session.sh in place of the launcher, so the pages are driven
 # without a harness or a sandbox. Playwright starts it (playwright.config.ts) and the
-# tests read the token from .state/home/memory/state/web.json.
+# tests read the token from .state/home/memory/state/web.json. A hosted copy of the
+# pages, served by support/static.mjs, is let through from its origin.
 set -eu
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 amem=${AMEM:-$here/../target/debug/amem}
@@ -28,4 +29,5 @@ write convention "Commit subjects carry a prefix" \
 
 cd "$state/work"
 exec "$amem" --root "$root" web --listen "127.0.0.1:${PORT:-4310}" --no-open --backend none \
-    --session-command "sh $here/session.sh $state/ids"
+    --hosted "http://localhost:${HOSTED_PORT:-4311}/" \
+    --session-command "sh $here/session.sh $state/ids $root"
