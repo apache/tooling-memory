@@ -202,7 +202,7 @@ impl Telemetry {
         let mut stmt = conn.prepare(
             "SELECT session, COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read),
                     SUM(cache_write), MIN(at), MAX(source = 'harness')
-             FROM usage WHERE model NOT LIKE 'http %' AND model != 'tunnel'
+             FROM usage WHERE COALESCE(model, '') NOT LIKE 'http %' AND COALESCE(model, '') != 'tunnel'
              GROUP BY session ORDER BY MIN(at)",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -221,6 +221,38 @@ impl Telemetry {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// One session's totals, asked of that session's rows only; `None` before its first
+    /// call.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn session(&self, session: &str) -> Result<Option<SessionTotals>, Error> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read),
+                    SUM(cache_write), MIN(at), MAX(source = 'harness')
+             FROM usage WHERE session = ?1 AND COALESCE(model, '') NOT LIKE 'http %'
+               AND COALESCE(model, '') != 'tunnel'",
+        )?;
+        let totals = stmt.query_row([session], |r| {
+            let u = |i: usize| -> rusqlite::Result<u64> {
+                Ok(u64::try_from(r.get::<_, Option<i64>>(i)?.unwrap_or(0)).unwrap_or(0))
+            };
+            Ok(SessionTotals {
+                session: session.to_string(),
+                calls: u(0)?,
+                input_tokens: u(1)?,
+                output_tokens: u(2)?,
+                cache_read_tokens: u(3)?,
+                cache_write_tokens: u(4)?,
+                started: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                reported: r.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+            })
+        })?;
+        Ok((totals.calls > 0).then_some(totals))
     }
 
     /// Totals by destination and model, most tokens first.
@@ -294,5 +326,14 @@ mod tests {
             (2, 20, 10, 4)
         );
         assert_eq!(s[1].model, "?");
+        let one = t.session("s1").unwrap().unwrap();
+        assert_eq!(
+            (one.calls, one.input_tokens, one.output_tokens),
+            (2, 20, 10)
+        );
+        assert_eq!(t.session("s2").unwrap().unwrap().calls, 1);
+        assert_eq!(t.session("s3").unwrap(), None, "no calls yet");
+        let all = t.by_session().unwrap();
+        assert_eq!(all.iter().find(|x| x.session == "s1"), Some(&one));
     }
 }

@@ -74,7 +74,7 @@ pub struct Config {
 }
 
 /// A request to start a session.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct NewSession {
     /// claude, codex, gemini, copilot, opencode.
     #[serde(default)]
@@ -261,6 +261,15 @@ fn launch_argv(config: &Config, req: &NewSession) -> Result<Vec<String>, String>
         if !BACKENDS.contains(&b.as_str()) {
             return Err(format!("no backend named {b}: {}", BACKENDS.join(", ")));
         }
+        // a browser may pick among confinements, not leave confinement off: that is the
+        // operator's to allow, by starting the server with --backend none
+        if b == "none" && config.backend != "none" {
+            return Err(
+                "a session from the browser runs confined; `amem web --backend none` \
+                        is how the operator allows otherwise"
+                    .into(),
+            );
+        }
     }
     let mut a = vec![
         config.memory_binary.display().to_string(),
@@ -278,7 +287,9 @@ fn launch_argv(config: &Config, req: &NewSession) -> Result<Vec<String>, String>
             flag("--profile", Some(p));
             flag("--harness", set(&req.harness));
             flag("--auth", set(&req.auth));
-            flag("--backend", backend);
+            // the operator's own backend stands over the profile's; auto leaves it be
+            let operator = (config.backend != "auto").then(|| config.backend.clone());
+            flag("--backend", backend.or(operator));
         }
         None => {
             flag("--harness", Some(harness_of(config, req)?));
@@ -337,7 +348,10 @@ fn options(config: &Config) -> Value {
             "gateway": ["llmao"]
         },
         "subagents": ["harness", "board"],
-        "backends": BACKENDS,
+        "backends": BACKENDS
+            .iter()
+            .filter(|b| **b != "none" || config.backend == "none")
+            .collect::<Vec<_>>(),
         "defaults": { "harness": config.harness, "auth": config.auth, "backend": config.backend }
     })
 }
@@ -431,8 +445,9 @@ async fn session_status(State(app): State<App>, Path(id): Path<String>) -> Respo
     if app.get(&id).is_none() {
         return (StatusCode::NOT_FOUND, "no such session").into_response();
     }
-    // the id is one this server made, 32 hex digits, before it is a file name
-    let path = app.config.root.join("state/web").join(format!("{id}.json"));
+    let Some(path) = state::status_file(&app.config.root, &id) else {
+        return Json(json!({})).into_response();
+    };
     match tokio::fs::read_to_string(&path).await {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
             Ok(v) => Json(v).into_response(),
@@ -462,6 +477,14 @@ impl App {
         cmd.env("COLORTERM", "truecolor");
         // the launcher writes its status under this id, which the strip reads
         cmd.env("AMEM_WEB_SESSION", &id);
+        // and refuses to run unconfined unless the operator allowed it here; set either
+        // way, so nothing in the server's own environment speaks for the operator
+        let allowed = if self.config.backend == "none" {
+            "1"
+        } else {
+            "0"
+        };
+        cmd.env("AMEM_WEB_ALLOW_UNCONFINED", allowed);
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -648,6 +671,7 @@ async fn pair(State(app): State<App>) -> Response {
         Ok(code) => Json(json!({
             "code": code,
             "workdir": app.config.workdir.display().to_string(),
+            "origins": app.config.access.origins(),
         }))
         .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1288,13 +1312,13 @@ mod tests {
             argv(NewSession {
                 profile: Some("nightly".into()),
                 auth: Some("key".into()),
-                backend: Some("none".into()),
+                backend: Some("image".into()),
                 model: Some(" m2 ".into()),
                 work: true,
                 ..NewSession::default()
             })
             .unwrap(),
-            "work --profile nightly --auth key --backend none --model m2"
+            "work --profile nightly --auth key --backend image --model m2"
         );
         let plain = argv(NewSession {
             harness: Some("codex".into()),
@@ -1328,6 +1352,49 @@ mod tests {
         assert_eq!(
             (l.profile.as_deref(), l.mode.as_str()),
             (Some("nightly"), "prompt")
+        );
+    }
+
+    #[test]
+    fn no_confinement_is_the_operators_to_allow_and_the_operators_backend_stands() {
+        let mut c = config(std::path::Path::new("/tmp/x"), &[]);
+        c.command_override = None;
+        let argv = |r: NewSession| launch_argv(&c, &r).map(|a| a[3..].join(" "));
+        // no confinement is the operator's to allow, not a browser's to pick
+        let none = NewSession {
+            harness: Some("codex".into()),
+            backend: Some("none".into()),
+            ..NewSession::default()
+        };
+        assert!(argv(none.clone()).unwrap_err().contains("runs confined"));
+        assert!(!options(&c)["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "none"));
+        let mut open = c.clone();
+        open.backend = "none".into();
+        assert!(launch_argv(&open, &none).is_ok());
+        assert!(options(&open)["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "none"));
+        // the operator's own backend stands over a profile's
+        let mut strict = c.clone();
+        strict.backend = "namespaces".into();
+        let a = launch_argv(
+            &strict,
+            &NewSession {
+                profile: Some("nightly".into()),
+                ..NewSession::default()
+            },
+        )
+        .unwrap()
+        .join(" ");
+        assert!(
+            a.ends_with("launch --profile nightly --backend namespaces"),
+            "{a}"
         );
     }
 

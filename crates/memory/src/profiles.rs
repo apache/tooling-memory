@@ -173,19 +173,41 @@ pub fn show(
     Ok(())
 }
 
-/// Whether `args` gives `flag`, as `--flag value` or `--flag=value`.
-fn gives(args: &[OsString], flag: &str) -> bool {
+/// Whether a flag of a command takes the next word as its value; `--flag=value` and a
+/// flag that takes none consume no word.
+pub type TakesValue<'a> = &'a dyn Fn(&str) -> bool;
+
+/// Whether `args` gives `flag`, as `--flag value` or `--flag=value`, among the command's
+/// own flags: up to `--`, or the first word that is not a flag, after which everything
+/// is the harness's.
+fn gives(args: &[OsString], flag: &str, takes_value: TakesValue<'_>) -> bool {
     let eq = format!("{flag}=");
-    args.iter()
-        .take_while(|a| *a != "--")
-        .any(|a| a == flag || a.to_str().is_some_and(|s| s.starts_with(&eq)))
+    let mut i = 0;
+    while let Some(a) = args.get(i).and_then(|a| a.to_str()) {
+        if a == "--" || !a.starts_with('-') {
+            return false;
+        }
+        if a == flag || a.starts_with(&eq) {
+            return true;
+        }
+        i += if !a.contains('=') && takes_value(a) {
+            2
+        } else {
+            1
+        };
+    }
+    false
 }
 
 /// Put `profile`'s flags in front of `rest`, skipping those `rest` gives itself.
-fn with_profile(profile: &Profile, rest: &[OsString]) -> Vec<OsString> {
+fn with_profile(
+    profile: &Profile,
+    rest: &[OsString],
+    takes_value: TakesValue<'_>,
+) -> Vec<OsString> {
     let mut out = Vec::new();
     for (flag, value) in profile.flags() {
-        if !gives(rest, flag) {
+        if !gives(rest, flag, takes_value) {
             out.push(OsString::from(flag));
             out.push(OsString::from(value));
         }
@@ -246,6 +268,7 @@ fn command_at(argv: &[OsString]) -> usize {
 pub fn expand(
     argv: Vec<OsString>,
     commands: &[String],
+    takes_value: &dyn Fn(&str, &str) -> bool,
     profiles: impl FnOnce() -> Result<BTreeMap<String, Profile>, String>,
 ) -> Result<Vec<OsString>, String> {
     let at = command_at(&argv);
@@ -263,7 +286,7 @@ pub fn expand(
         let p = find(&all, &word)?;
         let mut out = head[..at].to_vec();
         out.push("launch".into());
-        out.extend(with_profile(p, &rest));
+        out.extend(with_profile(p, &rest, &|f| takes_value("launch", f)));
         return Ok(out);
     }
     if word != "launch" && word != "work" {
@@ -283,7 +306,7 @@ pub fn expand(
     let all = profiles()?;
     let p = find(&all, &name)?;
     let mut out = head.to_vec();
-    out.extend(with_profile(p, &rest));
+    out.extend(with_profile(p, &rest, &|f| takes_value(&word, f)));
     Ok(out)
 }
 
@@ -297,6 +320,14 @@ mod tests {
 
     fn strs(v: &[OsString]) -> Vec<String> {
         v.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    /// As clap has it for launch and work: these take no value.
+    fn takes(_: &str, flag: &str) -> bool {
+        !matches!(
+            flag,
+            "--unconfined" | "--loop" | "--no-handoff" | "--mine" | "-h" | "--help"
+        )
     }
 
     fn commands() -> Vec<String> {
@@ -330,6 +361,7 @@ mod tests {
         let out = expand(
             os(&["amem", "nightly", "--model", "m2", "--", "--resume"]),
             &commands(),
+            &takes,
             || Ok(sample()),
         )
         .unwrap();
@@ -350,9 +382,12 @@ mod tests {
                 "--resume"
             ]
         );
-        let out = expand(os(&["amem", "--root", "/r", "claude"]), &commands(), || {
-            Ok(sample())
-        })
+        let out = expand(
+            os(&["amem", "--root", "/r", "claude"]),
+            &commands(),
+            &takes,
+            || Ok(sample()),
+        )
         .unwrap();
         assert_eq!(
             strs(&out),
@@ -361,10 +396,30 @@ mod tests {
     }
 
     #[test]
+    fn the_typed_flag_is_found_as_written_and_the_harness_words_are_not_flags() {
+        let run =
+            |argv: &[&str]| strs(&expand(os(argv), &commands(), &takes, || Ok(sample())).unwrap());
+        // `--model=m2` is the flag too
+        assert!(!run(&["amem", "nightly", "--model=m2"]).contains(&"m1".to_string()));
+        // after `--`, or the first word that is not a flag, the words are the harness's
+        for argv in [
+            &["amem", "nightly", "--", "--model", "x"][..],
+            &["amem", "nightly", "--unconfined", "fix", "--model", "x"],
+        ] {
+            let out = run(argv);
+            assert!(out.windows(2).any(|w| w == ["--model", "m1"]), "{out:?}");
+        }
+        // a flag that takes a value consumes it: `--prompt --model` is a prompt
+        let out = run(&["amem", "nightly", "--prompt", "--model"]);
+        assert!(out.windows(2).any(|w| w == ["--model", "m1"]), "{out:?}");
+    }
+
+    #[test]
     fn launch_and_work_take_a_profile_and_work_takes_it_as_a_word() {
         let out = expand(
             os(&["amem", "work", "nightly", "--loop"]),
             &commands(),
+            &takes,
             || Ok(sample()),
         )
         .unwrap();
@@ -387,6 +442,7 @@ mod tests {
         let out = expand(
             os(&["amem", "launch", "--profile=nightly", "--auth", "key"]),
             &commands(),
+            &takes,
             || Ok(sample()),
         )
         .unwrap();
@@ -415,14 +471,14 @@ mod tests {
             &["amem", "--no-open"],
             &["amem", "launch", "--harness", "claude"],
         ] {
-            let out = expand(os(argv), &commands(), || Err("read".into())).unwrap();
+            let out = expand(os(argv), &commands(), &takes, || Err("read".into())).unwrap();
             assert_eq!(strs(&out), argv);
         }
     }
 
     #[test]
     fn an_unknown_name_says_what_there_is() {
-        let e = expand(os(&["amem", "nope"]), &commands(), || Ok(sample())).unwrap_err();
+        let e = expand(os(&["amem", "nope"]), &commands(), &takes, || Ok(sample())).unwrap_err();
         assert!(
             e.contains("no command or profile named `nope`") && e.contains("nightly"),
             "{e}"

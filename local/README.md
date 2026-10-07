@@ -279,7 +279,16 @@ measures is on screen while the harness runs.
 
 The pages are plain files, so a static host can serve them: `make hosted` puts them in
 `target/hosted`, and the `Hosted pages` workflow publishes them to GitHub Pages when it is
-run by hand. `amem --hosted <url>` (or `AMEM_HOSTED=<url>` in the environment) then lets
+run by hand. It has not been run: Pages on this private repository needs a paid plan and
+Actions running, and enabling it with "GitHub Actions" as the source. The copy needs an
+origin of its own, served at its root, because every page on an origin reads what the
+browser keeps for it, the paired key included: a project site at
+`sstriker.github.io/durable-memory/` shares `sstriker.github.io` with every other site of
+the account, so the site gets a custom domain, and `amem --hosted` refuses an address
+with a path. To try it on this machine, serve `target/hosted`
+(`python3 -m http.server -d target/hosted 8000`) and run
+`amem --hosted http://localhost:8000/`. A server already running over the root keeps
+the origins it started with; `amem --hosted` against one started without it says so. `amem --hosted <url>` (or `AMEM_HOSTED=<url>` in the environment) then lets
 that page's origin through and opens it instead of the server's own, with the server's
 address and a pairing code in the fragment: `<url>#server=http%3A%2F%2F127.0.0.1%3A4200&pair=<code>`.
 A browser does not send a fragment to the host, so the host never learns the server or the

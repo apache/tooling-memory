@@ -37,6 +37,17 @@ fn too_open(_: &Path) -> bool {
     false
 }
 
+/// Where a session's launcher writes its status, relative to the root.
+pub const STATUS_DIR: &str = "state/web";
+
+/// The status file for a web session id; `None` for anything that is not one of the
+/// ids this server makes, 32 hex digits, so no id becomes a path anywhere else.
+#[must_use]
+pub fn status_file(root: &Path, id: &str) -> Option<std::path::PathBuf> {
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| root.join(STATUS_DIR).join(format!("{id}.json")))
+}
+
 /// What [`load`] found.
 #[derive(Debug)]
 pub struct Loaded {

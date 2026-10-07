@@ -600,9 +600,6 @@ enum Command {
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
-    /// What this host can run: the root and its grants, the credentials and logins
-    /// found, the harnesses on the PATH and in the image, the backend, and whether the
-    /// gateway answers. Names credentials, never their values.
     /// The profiles: `profiles.toml` under the root, and every harness by its own name.
     /// `amem <profile>` launches one; `launch` and `work` take `--profile <name>`.
     Profiles {
@@ -610,6 +607,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// What this host can run: the root and its grants, the credentials and logins
+    /// found, the harnesses on the PATH and in the image, the backend, and whether the
+    /// gateway answers. Names credentials, never their values.
     Doctor {
         /// The report as JSON, for the web launcher.
         #[arg(long)]
@@ -868,12 +868,22 @@ fn body_or_stdin(body: Option<String>) -> std::io::Result<String> {
 /// The command line, with any profile it names spelled out as flags, parsed. The root is
 /// found as `Cli` finds it: `--root`, `MEMORY_ROOT`, then `~/memory`.
 fn parse_with_profiles(args: Vec<OsString>) -> Result<Cli, String> {
+    // clap's own `help` is a command too, though it is not listed until the parser is built
     let commands: Vec<String> = Cli::command()
         .get_subcommands()
         .map(|c| c.get_name().to_string())
+        .chain(std::iter::once("help".to_string()))
         .collect();
     let root = profiles_root(&args);
-    let argv = profiles::expand(args, &commands, || match &root {
+    let cli = Cli::command();
+    // which of a command's flags take a value, as its definition says
+    let takes_value = |command: &str, flag: &str| {
+        let long = flag.trim_start_matches('-');
+        cli.find_subcommand(command)
+            .and_then(|c| c.get_arguments().find(|a| a.get_long() == Some(long)))
+            .is_some_and(|a| a.get_action().takes_values())
+    };
+    let argv = profiles::expand(args, &commands, &takes_value, || match &root {
         Some(r) => profiles::load(r),
         None => Ok(profiles::builtin()),
     })?;
@@ -1761,6 +1771,17 @@ async fn open_running(
     let pairing = open::pair(&running, &state.token)
         .await
         .ok_or("the running launcher gave no pairing code")?;
+    if let Some(h) = &opening.hosted {
+        if !pairing.origins.iter().any(|o| o == h.origin()) {
+            return Err(format!(
+                "the launcher running at {} was not started with --hosted {}, so that page \
+                 cannot reach it: stop it (ctrl-c where it runs) and run amem again",
+                running.url,
+                h.origin()
+            )
+            .into());
+        }
+    }
     if let Some(w) = wanted {
         if pairing.workdir != w.display().to_string() {
             eprintln!(
@@ -2171,6 +2192,22 @@ fn wslc_for_work(
     }))
 }
 
+/// A session the web launcher started runs confined unless the operator allowed
+/// otherwise: a browser, or a profile it picked, asking for no confinement is refused.
+/// `auto` on a platform with no backend is what the command line gets too, and stands.
+fn refuse_browser_unconfined(unconfined: bool, backend: BackendArg) -> Fallible {
+    let asked = unconfined || matches!(backend, BackendArg::None);
+    let allowed = std::env::var("AMEM_WEB_ALLOW_UNCONFINED").is_ok_and(|v| v == "1");
+    if asked && status::web_session().is_some() && !allowed {
+        return Err(
+            "a session started from the browser runs confined; the operator allows \
+                    otherwise with `amem web --backend none`"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     if let Some(l) = wslc_for_launch(root, &command)? {
         std::process::exit(wslc::run(&l)?);
@@ -2199,6 +2236,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         unreachable!("routed by launch_cmd")
     };
     let workdir = resolve_workdir(root, workdir)?;
+    refuse_browser_unconfined(unconfined, backend)?;
     let prompt = match (prompt, prompt_file) {
         (Some(p), _) => Some(p),
         (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
@@ -2278,6 +2316,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         unreachable!("routed by launch_cmd")
     };
     let workdir = resolve_workdir(root, workdir)?;
+    refuse_browser_unconfined(unconfined, backend)?;
     let session = Session::start(
         root,
         harness.into(),

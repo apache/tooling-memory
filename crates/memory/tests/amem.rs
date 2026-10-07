@@ -592,3 +592,60 @@ fn a_profile_is_the_whole_command_and_what_is_typed_wins() {
     });
     assert!(args.contains("m2") && !args.contains("m1"), "{args}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_session_from_the_browser_says_what_it_did_and_runs_confined_unless_allowed() {
+    let h = Host::new();
+    h.init();
+    h.file("home/.codex/auth.json", "{}");
+    h.script("codex", "exit 0");
+    let id = "0123456789abcdef0123456789abcdef";
+    let launch = [
+        "launch",
+        "--harness",
+        "codex",
+        "--auth",
+        "subscription",
+        "--unconfined",
+    ];
+
+    // the operator did not allow it: refused before anything runs
+    let out = h.run(
+        &launch,
+        &[("AMEM_WEB_SESSION", id), ("AMEM_WEB_ALLOW_UNCONFINED", "0")],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("runs confined"));
+
+    let out = h.run(
+        &launch,
+        &[("AMEM_WEB_SESSION", id), ("AMEM_WEB_ALLOW_UNCONFINED", "1")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let file = h.root().join("state/web").join(format!("{id}.json"));
+    let v: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&file).expect("the launcher wrote its status"),
+    )
+    .unwrap();
+    assert_eq!(v["harness"], "codex");
+    assert_eq!(v["auth"], "subscription");
+    assert_eq!(v["destination"], "chatgpt");
+    assert_eq!(v["running"], false, "the last word says it stopped");
+    assert!(v["memory_session"].as_str().unwrap().starts_with("sess-"));
+    assert_eq!(v["usage"]["calls"], 0);
+
+    // a launch the web launcher did not start writes nothing
+    std::fs::remove_file(&file).unwrap();
+    let out = h.run(&launch, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!file.exists());
+}

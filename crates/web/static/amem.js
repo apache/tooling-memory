@@ -25,21 +25,24 @@
     } catch (_) { return null; }
   }
 
-  // served from this machine, the page's origin is its server; anywhere else, a copy
-  amem.hosted = !LOOPBACK.includes(location.hostname);
+  // a copy is a page that has been told a server other than its own origin, by the link
+  // it was opened on or one before it; served by amem, the page's origin is its server
+  const opened = new URLSearchParams(location.hash.slice(1));
+  const told = opened.get('server');
+  const named = told ? loopback(told) : null;
+  const stored = get(SERVER);
+  amem.hosted = !!((named && named !== location.origin) || (stored && stored !== location.origin));
   amem.server = () => (amem.hosted ? get(SERVER) : location.origin);
 
   async function pairFromAddress() {
     const u = new URL(location.href);
     const fragment = new URLSearchParams(u.hash.slice(1));
     const code = u.searchParams.get('pair') || fragment.get('pair');
-    const named = fragment.get('server');
-    if (named && amem.hosted) {
-      const server = loopback(named);
-      if (!server) amem.pairError = 'That link names a server that is not on this machine.';
-      else if (server !== get(SERVER)) { set(SERVER, server); drop(STORE); }
-    }
-    if (!code && !named) return;
+    if (told && !named) amem.pairError = 'That link names a server that is not on this machine.';
+    // only a link that pairs moves the page to another server: one that only names a
+    // server would otherwise unpair the page for anyone who can send it a link
+    if (named && code && amem.hosted && named !== get(SERVER)) { set(SERVER, named); drop(STORE); }
+    if (!code && !told) return;
     // off the address bar and out of history before anything else
     u.searchParams.delete('pair');
     fragment.delete('pair');

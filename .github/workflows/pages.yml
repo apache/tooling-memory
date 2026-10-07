@@ -2,7 +2,9 @@ name: Hosted pages
 
 # The pages as plain files on GitHub Pages, for `amem --hosted <url>`. Run by hand only:
 # publishing is a decision, not a side effect of a merge. Needs Pages enabled with
-# "GitHub Actions" as the source in the repository's settings.
+# "GitHub Actions" as the source in the repository's settings, and a custom domain: the
+# copy needs an origin of its own, and user.github.io is shared by every site of the
+# account (local/README.md, "A hosted page").
 on:
   workflow_dispatch:
 

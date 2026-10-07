@@ -32,6 +32,8 @@ pub struct Pairing {
     pub code: String,
     /// The running server's working tree.
     pub workdir: String,
+    /// The hosted origins it lets through.
+    pub origins: Vec<String>,
 }
 
 /// The address an `http://` URL names, if it is a loopback one: the file names the
@@ -97,6 +99,14 @@ pub async fn pair(running: &Running, token: &str) -> Option<Pairing> {
     Some(Pairing {
         code: v["code"].as_str()?.to_string(),
         workdir: v["workdir"].as_str().unwrap_or_default().to_string(),
+        origins: v["origins"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| o.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -154,27 +164,41 @@ pub struct Hosted {
 }
 
 impl Hosted {
-    /// A hosted page's address: https, or http on this machine for trying it out.
+    /// A hosted page's address: https, or http on this machine for trying it out, and
+    /// the root of its origin. Every page on an origin shares what the browser keeps for
+    /// it, the key included, so the copy needs an origin of its own: a project site at
+    /// `user.github.io/repo/` shares one with every other site of that account.
     ///
     /// # Errors
     ///
-    /// When it is neither.
+    /// When it is none of that.
     pub fn parse(url: &str) -> Result<Hosted, String> {
-        let page = url.split('#').next().unwrap_or_default().trim();
-        let (scheme, rest) = page
-            .split_once("://")
-            .ok_or_else(|| format!("{url} is not a web address"))?;
-        let authority = rest.split('/').next().unwrap_or_default();
-        let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
-        let local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
-        if authority.is_empty() || !(scheme == "https" || (scheme == "http" && local)) {
+        let u = url::Url::parse(url).map_err(|e| format!("{url}: {e}"))?;
+        let local = matches!(
+            u.host(),
+            Some(url::Host::Domain("localhost"))
+                | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+                | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+        );
+        if !(u.scheme() == "https" || (u.scheme() == "http" && local)) {
             return Err(format!(
                 "{url}: a hosted page is https, or http on this machine"
             ));
         }
+        if !u.username().is_empty() || u.password().is_some() {
+            return Err(format!("{url}: a hosted page's address names no user"));
+        }
+        if u.path() != "/" {
+            return Err(format!(
+                "{url}: the hosted copy needs an origin of its own, at its root: every page \
+                 on an origin can read what the browser keeps for it, the key included \
+                 (for GitHub Pages, a custom domain on the site)"
+            ));
+        }
+        let origin = u.origin().ascii_serialization();
         Ok(Hosted {
-            page: page.to_string(),
-            origin: format!("{scheme}://{authority}"),
+            page: format!("{origin}/"),
+            origin,
         })
     }
 
@@ -357,27 +381,34 @@ mod tests {
     }
 
     #[test]
-    fn a_hosted_page_is_https_and_its_link_carries_the_server_in_the_fragment() {
-        let h = Hosted::parse("https://sstriker.github.io/durable-memory/#old").unwrap();
-        assert_eq!(h.origin(), "https://sstriker.github.io");
+    fn a_hosted_page_has_an_origin_of_its_own_and_its_link_carries_the_server_in_the_fragment() {
+        let h = Hosted::parse("https://Amem.Example:443/#old").unwrap();
+        assert_eq!(h.origin(), "https://amem.example", "as a browser sends it");
         assert_eq!(
             h.link("http://127.0.0.1:4200", "c0de"),
-            "https://sstriker.github.io/durable-memory/#server=http%3A%2F%2F127.0.0.1%3A4200&pair=c0de"
+            "https://amem.example/#server=http%3A%2F%2F127.0.0.1%3A4200&pair=c0de"
         );
         assert_eq!(
             Hosted::parse("http://localhost:8000/").unwrap().origin(),
             "http://localhost:8000"
+        );
+        assert_eq!(
+            Hosted::parse("http://127.0.0.1:8000").unwrap().origin(),
+            "http://127.0.0.1:8000"
         );
         for bad in [
             "http://example.org/",
             "ftp://x/",
             "sstriker.github.io",
             "https://",
+            "https://sstriker.github.io/durable-memory/",
+            "http://127.0.0.1:1@evil.example/",
+            "http://localhost:8000\\@evil.example/",
+            "https://user:pw@amem.example/",
         ] {
             assert!(Hosted::parse(bad).is_err(), "{bad}");
         }
     }
-
     #[test]
     fn only_a_loopback_address_is_asked_anything() {
         assert!(loopback("http://127.0.0.1:4200").is_some());

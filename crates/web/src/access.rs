@@ -83,6 +83,12 @@ impl Access {
         )
     }
 
+    /// The hosted origins this server lets through.
+    #[must_use]
+    pub fn origins(&self) -> &[String] {
+        &self.origins
+    }
+
     /// The address the server is bound to, which the proof covers. [`crate::serve`] sets
     /// it from its listener; until then the server proves nothing.
     pub fn bound(&self, address: SocketAddr) {
