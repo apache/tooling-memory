@@ -212,7 +212,10 @@ pub async fn import(
     // before anything lands: a line or a highest that understates is refused whole
     manifest.check(&inside)?;
 
-    // Pass two: land what is new.
+    // Pass two: land what is new. An entry is already here when a previous import landed
+    // it, known by its origin, or when it is this domain's own, come back in a bundle it
+    // left in: its origin names this record and this domain, and the id it names is here.
+    let home = format!("bundle:{owner}/{into_domain}/");
     for mut entry in checked {
         let origin = entry.front.origin.clone().unwrap_or_else(|| {
             format!(
@@ -220,7 +223,11 @@ pub async fn import(
                 manifest.exported_by, manifest.domain, entry.front.id
             )
         });
-        if index.by_origin(into_domain, &origin)?.is_some() {
+        let own = match origin.strip_prefix(&home) {
+            Some(id) => store.get(into_domain, id).await?.is_some(),
+            None => false,
+        };
+        if own || index.by_origin(into_domain, &origin)?.is_some() {
             out.skipped.push(entry.front.id.clone());
             continue;
         }
@@ -228,7 +235,10 @@ pub async fn import(
         if entry.front.domain != into_domain {
             entry.front.domain = into_domain.to_string();
         }
-        if store.get(into_domain, &entry.front.id).await?.is_some() {
+        // an id names one entry across the record, whichever domain holds it: a bundle's
+        // id that is in use here, in this domain or another, lands under a new one
+        if index.holds(&entry.front.id)? || store.get(into_domain, &entry.front.id).await?.is_some()
+        {
             entry.front.id = dm_core::id::new_entry_id(into_domain);
         }
         if !same_owner {

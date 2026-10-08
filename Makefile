@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
+.PHONY: e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test conformance-test conformance deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
 	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
@@ -123,7 +123,7 @@ local-memory:
 	else target/release/amem --root "$$MEMORY_ROOT" init --domain dom-me; fi
 
 # `make check` is the pre-commit gate: fast, and what every commit must pass.
-check: wasip2-target fmt-check clippy test guard-test docs-only-test wslcsdk-test unsafe-check taps-check
+check: wasip2-target fmt-check clippy test guard-test docs-only-test wslcsdk-test conformance-test unsafe-check taps-check
 
 # `make verify` is what CI runs: the gate plus dependencies, coverage, and the wasm build.
 verify: check deny machete coverage wasm-check
@@ -149,6 +149,23 @@ docs-only-test:
 	sh scripts/docs-only.test.sh
 wslcsdk-test:
 	sh scripts/fetch-wslcsdk.test.sh
+conformance-test:
+	sh scripts/conformance.test.sh
+
+# The seven M0 steps against a server exposing the surface: a fresh record served by this
+# build, or URL=<mcp endpoint> for another server, with OPERATOR=<command> taking
+# `export <dir>`, `import <dir>` and `reindex` for steps 6 and 7. The default run names
+# this build's own index file so step 7 shows the rebuild from a lost one.
+conformance: build
+	@if [ -n "$(URL)" ]; then \
+		python3 scripts/conformance.py --url "$(URL)" $(if $(OPERATOR),--operator '$(OPERATOR)',); \
+	else \
+		root="$$(mktemp -d)/memory"; \
+		target/release/amem --root "$$root" init --domain dom-conf >/dev/null; \
+		python3 scripts/conformance.py --stdio "target/release/amem --root $$root serve" \
+			--operator "target/release/amem --root $$root" \
+			--drop-index "python3 -c \"import os; os.remove('$$root/state/index.db')\""; \
+	fi
 
 # `unsafe` only where AGENTS.md allows it, and every block there documented: the C API
 # binding is Windows only, so its clippy runs for the Windows target, which needs no

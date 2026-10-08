@@ -114,7 +114,7 @@ Each is a crate or a backend with a clear seam, and each can be done without tou
 - A second `ledger` backend: Postgres with `SKIP LOCKED`.
 - A second inbound tap beside GitHub issues (`taps/github-issues` is the pattern, `taps/github-comments` the outbound one): a tracker or a mailing list.
 - The browser reader's next step: the page keeping a loaded bundle between visits, and admitting or refusing proposals from it.
-- Conformance tests: a harness-neutral script that runs the seven M0 steps against any server exposing the surface.
+- Conformance beyond the laptop: `scripts/conformance.py`, landed 8 October, runs the seven M0 steps over MCP against any server exposing the surface, on stdio or streamable HTTP, with the operator's export, import and reindex behind a command of the operator's; `make conformance` runs it against this build, `scripts/conformance.test.sh` holds that each of its assertions catches the defect it is for, against a second implementation of the surface in memory. Its first run against this build found two: a record's own export, imported back, landed a copy of every entry under a new id, and a bundle imported into a second domain of the same record kept its ids and took the first domain's place in the index. Both fixed in `import`. What is left is running it against a serving layer that is not this binary, when there is one.
 
 ## Working agreements
 

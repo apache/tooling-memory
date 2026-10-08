@@ -9,6 +9,8 @@
 - A C toolchain for the bundled SQLite (`build-essential` on Debian and Ubuntu, the Visual
   Studio Build Tools on Windows).
 - `make`. On Windows, run the targets from Git Bash or WSL.
+- `python3`, for `scripts/conformance.py` and its test, which `make check` and the
+  binary's tests run; the script uses the standard library alone.
 - For the browser reader's tests, a Chrome or Chromium, or Podman or Docker: with no
   Chrome installed they run the one in the Playwright image through
   `scripts/chrome-container.sh`, which pulls the image on first use
@@ -21,14 +23,15 @@
 git clone git@github.com:sstriker/durable-memory.git
 cd durable-memory
 make init        # installs the pre-commit hook
-make check       # format, clippy, tests, guard and docs-only tests
+make check       # format, clippy, tests, guard, docs-only and conformance tests
 ```
 
 ## Day to day
 
 | Command | What it runs |
 | ------- | ------------ |
-| `make check` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the guard and docs-only tests. The pre-commit gate; a commit of Markdown alone, outside `crates/` and `taps/`, runs the guard tests instead |
+| `make check` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the guard, docs-only and conformance tests. The pre-commit gate; a commit of Markdown alone, outside `crates/` and `taps/`, runs the guard tests instead |
+| `make conformance` | `scripts/conformance.py`, the seven M0 steps over MCP, against a fresh record served by this build; `URL=<mcp endpoint>` points it at another server, `OPERATOR=<command>` gives it that server's export, import and reindex for the last two steps |
 | `make test` | `cargo test` alone |
 | `make fmt` | `cargo fmt`, rewriting in place |
 | `make run ARGS='...'` | the `memory` binary, for example `ARGS='init /tmp/m --domain dom-me'` |

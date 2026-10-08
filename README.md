@@ -92,7 +92,9 @@ amem golden golden/docs.toml   # recall scored on a question suite
 ```
 
 `crates/memory/tests/cli.rs` runs the seven steps PLAN.md calls M0, end to end, against the
-built binary.
+built binary. `scripts/conformance.py` runs the same seven over MCP against any server
+exposing the surface, this one included (`make conformance`); a serving layer that passes
+it serves the harnesses this one serves.
 
 ## Layout
 

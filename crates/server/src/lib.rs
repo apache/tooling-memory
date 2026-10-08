@@ -2467,6 +2467,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_record_s_own_export_comes_back_as_nothing_new() {
+        // the entries are already here under their own ids: an import of the bundle
+        // they left in skips them, rather than landing a copy of each under a new id
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let m = mem(&root);
+        let w = m.write(req("Known here.\n")).await.unwrap();
+        let out = dir.path().join("out");
+        m.export(Some("dom-me"), Label::Internal, &out)
+            .await
+            .unwrap();
+        let back = m.import(&out, Some("dom-me")).await.unwrap();
+        assert_eq!(
+            (back.written.len(), back.skipped.as_slice()),
+            (0, std::slice::from_ref(&w.id)),
+            "{back:?}"
+        );
+        let all = m.list(Some("dom-me"), None, 10).await.unwrap();
+        assert_eq!(all.len(), 1, "no copy: {all:?}");
+        // and a copy that went round through another record, carrying its origin
+        // here, is the same entry too
+        grant_domain(&root, "dom-x");
+        let m = Memory::open(&root).unwrap();
+        let x = m.import(&out, Some("dom-x")).await.unwrap();
+        assert_ne!(
+            x.written,
+            std::slice::from_ref(&w.id),
+            "another domain's copy has an id of its own"
+        );
+        assert_eq!(
+            m.list(Some("dom-me"), None, 10).await.unwrap().len(),
+            1,
+            "the copy in dom-x did not take dom-me's place in the index"
+        );
+        let round = dir.path().join("round");
+        m.export(Some("dom-x"), Label::Internal, &round)
+            .await
+            .unwrap();
+        let back = m.import(&round, Some("dom-me")).await.unwrap();
+        assert_eq!((back.written.len(), back.skipped.len()), (0, 1), "{back:?}");
+        assert_eq!(m.list(Some("dom-me"), None, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn the_same_bundle_lands_in_each_domain_that_imports_it() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
