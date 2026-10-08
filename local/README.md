@@ -303,7 +303,8 @@ The launcher installs three hooks in each harness's settings in the private home
 context is compacted, at session end, and before a tool runs. Claude Code and Codex call
 the first PreCompact and Gemini CLI calls it PreCompress; Codex allows a session-end hook
 three seconds, which is plenty for one file read and one file write; the third is
-PreToolUse in Claude Code, Codex, Qwen Code and Grok Build and BeforeTool in Gemini CLI, and guards
+PreToolUse in Claude Code, Codex, Qwen Code, Grok Build and Copilot CLI, BeforeTool in
+Gemini CLI, and OpenCode's `tool.execute.before` through a plugin the launcher writes, and guards
 the projection, the record's read-only files at `/memory`: a read of an entry file
 becomes a `get`, and a search over the projection is refused (PLAN.md, M4b). Gemini CLI
 and Qwen Code refuse their file tools a path outside the workspace, so the launcher

@@ -109,15 +109,28 @@ pub enum Decision {
 
 impl Decision {
     /// The hook's standard output in the harness's shape. Claude Code, Codex and Qwen
-    /// Code read a `hookSpecificOutput` and take silence as allowed; Gemini CLI reads a
-    /// top-level `decision` and takes silence as allowed; Antigravity CLI and Grok
-    /// Build want a `decision` either way, since an empty answer is refused or logged
-    /// as a broken hook.
+    /// Code read a `hookSpecificOutput` and take silence as allowed; Gemini CLI and
+    /// OpenCode's plugin read a top-level `decision` and take silence as allowed;
+    /// Copilot CLI reads a top-level `permissionDecision` and takes silence as its
+    /// default; Antigravity CLI and Grok Build want a `decision` either way, since an
+    /// empty answer is refused or logged as a broken hook.
     #[must_use]
     pub fn output(&self, harness: &str) -> Option<String> {
-        if matches!(harness, "antigravity" | "gemini" | "grok") {
+        if harness == "copilot" {
             return match self {
-                Decision::Allow if harness == "gemini" => None,
+                Decision::Allow => None,
+                Decision::Deny(reason) => Some(
+                    serde_json::json!({
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason,
+                    })
+                    .to_string(),
+                ),
+            };
+        }
+        if matches!(harness, "antigravity" | "gemini" | "grok" | "opencode") {
+            return match self {
+                Decision::Allow if matches!(harness, "gemini" | "opencode") => None,
                 Decision::Allow => Some(serde_json::json!({ "decision": "allow" }).to_string()),
                 Decision::Deny(reason) => {
                     Some(serde_json::json!({ "decision": "deny", "reason": reason }).to_string())
@@ -141,10 +154,18 @@ impl Decision {
 }
 
 /// The name of the event before a tool runs: `PreToolUse` in Claude Code, Codex, Qwen
-/// Code and Antigravity CLI, `BeforeTool` in Gemini CLI.
+/// Code, Antigravity CLI, Copilot CLI and OpenCode's plugin, `BeforeTool` in Gemini CLI.
 #[must_use]
 pub fn pre_tool_event(name: &str) -> bool {
     matches!(name, "PreToolUse" | "BeforeTool")
+}
+
+/// Whether this harness's session-end event fires at the end of every turn rather than
+/// once a session, agy's `Stop` and OpenCode's `session.idle`: its note is one a
+/// session, named by the session and rewritten, so the outbox holds the last.
+#[must_use]
+pub fn per_session_note(harness: &str) -> bool {
+    matches!(harness, "antigravity" | "opencode")
 }
 
 /// The path a tool call is about, for the tools that touch files: `file_path` for a
@@ -156,6 +177,7 @@ fn path_of(input: &Value) -> Option<PathBuf> {
     // `target_directory`, then Antigravity CLI's, which are PascalCase
     [
         "file_path",
+        "filePath",
         "absolute_path",
         "notebook_path",
         "target_file",
@@ -256,6 +278,7 @@ fn searches(tool: &str) -> bool {
             | "search_files"
             | "search_file_content"
             | "list_directory"
+            | "list"
             | "grep_search"
             | "grep_files"
             | "find_by_name"
@@ -861,10 +884,19 @@ pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
     let (_, body) = note(&input, event, &tail);
     std::fs::create_dir_all(outbox)?;
     let stamp = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
-    // agy's Stop fires at the end of every turn, not once a session: its note is
-    // named by the conversation and rewritten, so the outbox holds the last one
-    let name = if harness == "antigravity" && event == Event::SessionEnd {
-        format!("agy-{}-{}.md", short(&input.session_id), event.suffix())
+    // agy's Stop and OpenCode's idle fire at the end of every turn, not once a session:
+    // the note is named by the session and rewritten, so the outbox holds the last one
+    let name = if per_session_note(harness) && event == Event::SessionEnd {
+        let prefix = if harness == "antigravity" {
+            "agy"
+        } else {
+            harness
+        };
+        format!(
+            "{prefix}-{}-{}.md",
+            short(&input.session_id),
+            event.suffix()
+        )
     } else {
         format!("{stamp}-{}.md", event.suffix())
     };
@@ -1424,6 +1456,72 @@ not json
 
     // the hook runs inside the Linux sandbox; these are unix paths
     #[cfg(unix)]
+    #[test]
+    fn copilot_and_opencode_are_answered_in_their_own_shapes_and_known_by_their_tools() {
+        // Copilot CLI, configured with the PascalCase events, sends Claude's payload and
+        // reads a top-level permission decision; silence is the default behaviour
+        let v: Value =
+            serde_json::from_str(&Decision::Deny("why".into()).output("copilot").unwrap()).unwrap();
+        assert_eq!(
+            (
+                v["permissionDecision"].as_str(),
+                v["permissionDecisionReason"].as_str()
+            ),
+            (Some("deny"), Some("why"))
+        );
+        assert_eq!(Decision::Allow.output("copilot"), None);
+        // OpenCode's plugin reads a decision and throws the reason to refuse the call
+        let v: Value =
+            serde_json::from_str(&Decision::Deny("why".into()).output("opencode").unwrap())
+                .unwrap();
+        assert_eq!(
+            (v["decision"].as_str(), v["reason"].as_str()),
+            (Some("deny"), Some("why"))
+        );
+        assert_eq!(Decision::Allow.output("opencode"), None);
+        // OpenCode's idle event fires at the end of every turn, as agy's Stop does: one
+        // note a session, rewritten
+        assert!(per_session_note("opencode") && per_session_note("antigravity"));
+        assert!(!per_session_note("claude") && !per_session_note("copilot"));
+        // OpenCode's tools: read takes filePath, list a path, glob and grep a pattern
+        let view = Path::new("/memory");
+        let mut asked = Vec::new();
+        let d = decide(
+            "read",
+            &serde_json::json!({ "filePath": "/memory/dom-me/mem-me-abc1.md" }),
+            view,
+            SID,
+            |id| {
+                asked.push(id.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            (d, asked),
+            (Decision::Allow, vec!["mem-me-abc1".to_string()])
+        );
+        assert!(matches!(
+            decide(
+                "list",
+                &serde_json::json!({ "path": "/memory/dom-me" }),
+                view,
+                SID,
+                |_| panic!("a list is not a get")
+            ),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            decide(
+                "glob",
+                &serde_json::json!({ "pattern": "/memory/**/*.md" }),
+                view,
+                SID,
+                |_| panic!("a glob is not a get")
+            ),
+            Decision::Deny(_)
+        ));
+    }
+
     #[test]
     fn antigravity_s_hook_shape_is_read_and_answered() {
         // agy wants a decision either way: an empty answer is refused as invalid

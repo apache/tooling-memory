@@ -1422,6 +1422,22 @@ fn setup_copilot(
         "mcpServers": { "memory": { "type": "http", "url": format!("{relay}/mcp") } }
     });
     write(&req.home.join(".copilot/mcp-config.json"), &mcp.to_string())?;
+    // hooks in Copilot's own file under COPILOT_HOME, with the PascalCase event names
+    // so the payload is Claude's, hook_event_name, tool_name and tool_input in Claude's
+    // spellings; the timeout is in seconds, and a command hook that errors denies
+    let hook = serde_json::json!([{
+        "type": "command",
+        "bash": format!("{INSIDE_MEMORY} hook copilot"),
+        "timeoutSec": 30
+    }]);
+    let hooks = serde_json::json!({
+        "version": 1,
+        "hooks": { "PreToolUse": hook, "SessionEnd": hook }
+    });
+    write(
+        &req.home.join(".copilot/hooks/memory.json"),
+        &serde_json::to_string_pretty(&hooks).unwrap_or_default(),
+    )?;
     env.insert("COPILOT_HOME".into(), format!("{INSIDE_HOME}/.copilot"));
     env.insert("COPILOT_AUTO_UPDATE".into(), "false".into());
     // no base-url override exists, so its HTTPS goes through the egress as a CONNECT
@@ -1498,12 +1514,85 @@ fn setup_opencode_copilot(
     Ok(())
 }
 
+/// OpenCode's hooks are a plugin, a module OpenCode loads from its plugin directory,
+/// so the launcher writes one that hands the three events to the memory's hook as the
+/// other harnesses' hook files do: a tool call before it runs, with the decision's
+/// reason thrown to refuse it; compaction before it starts; and the end of a turn,
+/// which is OpenCode's nearest thing to a session's end. The transcript is written
+/// from the session's messages, one turn a line in the shape the tail reader knows,
+/// since OpenCode keeps its own as one file per part.
+const OPENCODE_PLUGIN: &str = r#"// written by amem launch; edits are overwritten
+import { spawnSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const MEMORY = "__MEMORY__";
+
+// one event to the memory's hook: JSON in, a decision or nothing out; a hook that
+// cannot run is a refusal, as a server that does not answer is
+function hook(payload) {
+  const run = spawnSync(MEMORY, ["hook", "opencode"], {
+    input: JSON.stringify(payload),
+    encoding: "utf8",
+    env: process.env,
+    timeout: 30000,
+  });
+  if (run.error) return { decision: "deny", reason: `the memory's hook could not run: ${run.error.message}` };
+  const out = (run.stdout || "").trim();
+  if (!out) return null;
+  try { return JSON.parse(out); } catch { return null; }
+}
+
+// the session's turns, one JSON line each, in the shape the hook's tail reader knows
+async function transcript(client, sessionID) {
+  const dir = join(process.env.HOME || "/home/user", ".local", "share", "opencode", "transcripts");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${sessionID}.jsonl`);
+  const res = await client.session.messages({ path: { id: sessionID } });
+  const lines = (res.data || []).map((m) => {
+    const parts = m.parts || [];
+    const text = parts.filter((p) => p.type === "text").map((p) => p.text).join("\n");
+    const tools = parts.filter((p) => p.type === "tool").map((p) => `[used tool ${p.tool}]`).join("\n");
+    return JSON.stringify({ type: m.info.role, message: { content: [text, tools].filter(Boolean).join("\n") } });
+  });
+  writeFileSync(file, lines.join("\n") + "\n");
+  return file;
+}
+
+async function note(client, event, sessionID, extra) {
+  try {
+    const transcript_path = await transcript(client, sessionID);
+    hook({ hook_event_name: event, session_id: sessionID, transcript_path, ...extra });
+  } catch (err) {
+    console.warn(`memory: ${event} note not left: ${err.message}`);
+  }
+}
+
+export const MemoryPlugin = async ({ client }) => ({
+  "tool.execute.before": async (input, output) => {
+    const d = hook({ hook_event_name: "PreToolUse", session_id: input.sessionID, tool_name: input.tool, tool_input: output.args });
+    if (d && d.decision === "deny") throw new Error(d.reason || "refused by the memory's hook");
+  },
+  "experimental.session.compacting": async (input) => {
+    await note(client, "PreCompact", input.sessionID, { trigger: "auto" });
+  },
+  event: async ({ event }) => {
+    if (event.type !== "session.idle") return;
+    await note(client, "SessionEnd", event.properties.sessionID, { reason: "idle" });
+  },
+});
+"#;
+
 fn setup_opencode(
     req: &Request<'_>,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
+    write(
+        &req.home.join(".config/opencode/plugins/memory.js"),
+        &OPENCODE_PLUGIN.replace("__MEMORY__", INSIDE_MEMORY),
+    )?;
     if req.auth == AuthMode::Subscription && provider == "github-copilot" {
         return setup_opencode_copilot(req, relay, env);
     }
@@ -2384,6 +2473,52 @@ mod tests {
         ));
     }
 
+    /// Hooks in Copilot's own file under COPILOT_HOME, with the PascalCase events so the
+    /// payload is Claude's; a command hook that errors denies the call, and the timeout
+    /// is in seconds.
+    fn assert_copilot_hooks(home: &Path) {
+        let hooks = json_file(&home.join(".copilot/hooks/memory.json"));
+        assert_eq!(hooks["version"], 1);
+        for event in ["PreToolUse", "SessionEnd"] {
+            let h = &hooks["hooks"][event][0];
+            assert_eq!(h["type"], "command", "{event}");
+            assert_eq!(h["bash"], "/opt/memory/memory hook copilot", "{event}");
+            assert_eq!(h["timeoutSec"], 30, "{event}");
+        }
+    }
+
+    /// OpenCode has no hook files: a plugin in the global plugin directory under the
+    /// private home runs the memory's hook for the three events, and parses as a module
+    /// where a node is on the PATH to say so.
+    fn assert_opencode_plugin(home: &Path) {
+        let path = home.join(".config/opencode/plugins/memory.js");
+        let plugin = std::fs::read_to_string(&path).unwrap();
+        for needle in [
+            "\"/opt/memory/memory\"",
+            "\"opencode\"",
+            "\"tool.execute.before\"",
+            "\"experimental.session.compacting\"",
+            "\"session.idle\"",
+            "PreToolUse",
+            "PreCompact",
+            "SessionEnd",
+        ] {
+            assert!(plugin.contains(needle), "{needle} in\n{plugin}");
+        }
+        if let Ok(node) = find_on_path("node") {
+            let out = std::process::Command::new(node)
+                .arg("--check")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     #[test]
     fn copilot_tunnels_through_the_egress_with_its_github_login() {
         let f = fixture();
@@ -2402,6 +2537,8 @@ mod tests {
         let mcp = json_file(&home.join(".copilot/mcp-config.json"));
         assert_eq!(mcp["mcpServers"]["memory"]["type"], "http");
         assert_eq!(plan.env["COPILOT_HOME"], "/home/user/.copilot");
+        assert_copilot_hooks(&home);
+        assert_eq!(plan.env["MEMORY_MCP_URL"], "http://127.0.0.1:4100/mcp");
         assert_eq!(plan.env["HTTPS_PROXY"], "http://127.0.0.1:4100");
         assert_eq!(plan.env["NO_PROXY"], "127.0.0.1,localhost");
         assert_eq!(
@@ -2446,6 +2583,7 @@ mod tests {
         assert_eq!(c["autoupdate"], false);
         assert_eq!(plan.env["XDG_CONFIG_HOME"], "/home/user/.config");
         assert_eq!(plan.env["ANTHROPIC_API_KEY"], "egress");
+        assert_opencode_plugin(&home);
         let (home, plan) = f
             .plan_with(
                 Harness::OpenCode,

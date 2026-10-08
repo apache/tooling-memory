@@ -567,7 +567,7 @@ enum Command {
     /// input and leave a note in the outbox for the launcher to file as a handoff.
     #[command(hide = true)]
     Hook {
-        /// Which harness's hook format: claude, codex, gemini, antigravity, qwen or grok.
+        /// Which harness's hook format: claude, codex, gemini, antigravity, qwen, grok, copilot or opencode.
         harness: String,
     },
     /// A web terminal on the launcher: sessions in pseudo-terminals streamed to the
