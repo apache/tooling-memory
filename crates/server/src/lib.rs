@@ -1641,6 +1641,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_manifest_that_misstates_its_labels_is_refused_whole() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Memory::init(a_dir.path(), "human:test:alice", "dom-a").unwrap();
+        let open = a
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("Open.\n")
+            })
+            .await
+            .unwrap();
+        let held = a
+            .write(WriteRequest {
+                classification: Some(Label::Internal),
+                ..req("Held.\n")
+            })
+            .await
+            .unwrap();
+        let export = |tamper: fn(&mut dm_core::manifest::Manifest)| {
+            let dir = tempfile::tempdir().unwrap();
+            let a = &a;
+            async move {
+                a.export(None, Label::Internal, dir.path()).await.unwrap();
+                let mpath = dir.path().join("manifest.yaml");
+                let mut m = dm_core::manifest::Manifest::from_yaml(
+                    &std::fs::read_to_string(&mpath).unwrap(),
+                )
+                .unwrap();
+                tamper(&mut m);
+                std::fs::write(&mpath, m.to_yaml()).unwrap();
+                dir
+            }
+        };
+        // the highest understated: the bundle holds internal and says public
+        let understated = export(|m| m.highest_label = Label::Public).await;
+        // one line understated, the highest left as it was
+        let lowered = export(|m| {
+            let line = m
+                .entries
+                .iter_mut()
+                .find(|e| e.classification == Label::Internal)
+                .expect("the held entry is listed");
+            line.classification = Label::Public;
+        })
+        .await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Memory::init(b_dir.path(), "human:test:bob", "dom-b").unwrap();
+        let e = b
+            .import(understated.path(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("highest_label"), "{e}");
+        let e = b
+            .import(lowered.path(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&held.id) && e.contains("internal"), "{e}");
+        // refused whole: nothing landed, not even the entry whose line was right
+        for id in [&open.id, &held.id] {
+            assert!(
+                b.get(id).await.is_err(),
+                "{id} landed from a refused bundle"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn export_then_import_elsewhere_lands_raw_and_dedups() {
         let a_dir = tempfile::tempdir().unwrap();
         let a = Memory::init(a_dir.path(), "human:test:alice", "dom-a").unwrap();

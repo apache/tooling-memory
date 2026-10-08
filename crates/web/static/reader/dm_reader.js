@@ -52,7 +52,9 @@ export function parse_entry(text) {
 }
 
 /**
- * Parse a bundle's `manifest.yaml`. JSON of the manifest, or an object with an `error`.
+ * Parse a bundle's `manifest.yaml`. JSON of the manifest, or an object with an `error`:
+ * a foreign format, or a manifest that does not agree with itself about the labels
+ * inside it, which a reader would otherwise report on the manifest's word.
  * @param {string} yaml
  * @returns {string}
  */

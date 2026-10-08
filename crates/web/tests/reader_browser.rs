@@ -286,6 +286,68 @@ async fn a_tampered_entry_is_refused_even_when_the_manifest_blanks_its_digest() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_line_that_understates_its_entry_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("memory");
+    let ids = seed(&root).await;
+    let published = dir.path().join("published");
+    Memory::open(&root)
+        .unwrap()
+        .export(Some("dom-me"), Label::Internal, &published)
+        .await
+        .unwrap();
+    // the manifest's line for an internal entry says public; the entry's own
+    // frontmatter still says internal, and the digest is untouched
+    let mpath = published.join("manifest.yaml");
+    let mut manifest =
+        dm_core::manifest::Manifest::from_yaml(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+    let line = manifest
+        .entries
+        .iter_mut()
+        .find(|e| e.id == ids[0])
+        .unwrap();
+    line.classification = Label::Public;
+    std::fs::write(&mpath, manifest.to_yaml()).unwrap();
+    let host = static_host(published).await;
+    let addr = web(dir.path(), root).await;
+    let dom = dump(format!("http://{addr}/reader?bundle=http://{host}")).await;
+    assert!(
+        dom.contains("dom-me: 1 entries, highest label internal") && dom.contains("1 refused"),
+        "the understated entry was admitted:\n{dom}"
+    );
+    assert!(!hit_ids(&dom).contains(&ids[0].as_str()), "{dom}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_that_understates_its_highest_label_does_not_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("memory");
+    seed(&root).await;
+    let published = dir.path().join("published");
+    Memory::open(&root)
+        .unwrap()
+        .export(Some("dom-me"), Label::Internal, &published)
+        .await
+        .unwrap();
+    let mpath = published.join("manifest.yaml");
+    let text = std::fs::read_to_string(&mpath).unwrap();
+    assert!(text.contains("highest_label: internal"), "{text}");
+    std::fs::write(
+        &mpath,
+        text.replace("highest_label: internal", "highest_label: public"),
+    )
+    .unwrap();
+    let host = static_host(published).await;
+    let addr = web(dir.path(), root).await;
+    let dom = dump(format!("http://{addr}/reader?bundle=http://{host}")).await;
+    assert!(
+        dom.contains("The bundle did not load") && dom.contains("highest_label"),
+        "an understated manifest loaded:\n{dom}"
+    );
+    assert!(hit_ids(&dom).is_empty(), "{dom}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_handling_in_the_url_hides_what_is_above_it() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("memory");

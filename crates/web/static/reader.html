@@ -270,13 +270,15 @@ function reset() {
   $('hits').replaceChildren();
 }
 
-function admit(text, name, expected) {
-  // the manifest's digest is the bundle's word for what the entry is; a mismatch, or a
+function admit(text, name, expected, classification) {
+  // the manifest's digest is the bundle's word for what the entry is, and its line's
+  // classification the bundle's word for the entry's label; a mismatch on either, or a
   // manifest with no word, is refused before it is indexed, as import refuses it before
   // it is written
   if (digest(text) !== expected) return { error: `${name}: digest does not match the manifest` };
   const parsed = JSON.parse(parse_entry(text));
   if (parsed.error) return { error: `${name}: ${parsed.error}` };
+  if (parsed.classification !== classification) return { error: `${name}: ${parsed.classification} in its frontmatter but ${classification} in the manifest` };
   entries.set(parsed.id, parsed);
   db.exec({ sql: 'INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?)',
     bind: [parsed.id, parsed.domain, parsed.type, parsed.trust_tier, parsed.label_rank, parsed.status, parsed.title, parsed.summary, parsed.created] });
@@ -304,7 +306,7 @@ async function loadUrl(base) {
         return r.ok ? r.text() : null;
       }));
       chunk.forEach((e, j) => {
-        const r = texts[j] === null ? { error: `${e.path}: not in the bundle` } : admit(texts[j], e.path, e.digest);
+        const r = texts[j] === null ? { error: `${e.path}: not in the bundle` } : admit(texts[j], e.path, e.digest, e.classification);
         if (r.error) { refused++; console.warn(r.error); }
       });
     }
@@ -324,14 +326,14 @@ async function loadFolder(files) {
   for (const e of m.entries) {
     const f = PLAIN.test(e.path) ? byName.get(e.path) : undefined;
     if (!f) { refused++; continue; }
-    const r = admit(await f.text(), e.path, e.digest);
+    const r = admit(await f.text(), e.path, e.digest, e.classification);
     if (r.error) { refused++; console.warn(r.error); }
   }
   done(m, refused);
 }
 
 function done(m, refused) {
-  const note = refused ? `, ${refused} refused (digest, path or missing)` : '';
+  const note = refused ? `, ${refused} refused (digest, label, path or missing)` : '';
   status(`${m.domain}: ${entries.size} entries, highest label ${m.highest_label}, exported ${m.exported_at.slice(0, 10)} by ${m.exported_by}${note}`, refused > 0 && entries.size === 0);
   search();
 }

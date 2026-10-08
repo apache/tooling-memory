@@ -76,6 +76,65 @@ impl Manifest {
         Ok(())
     }
 
+    /// Whether the manifest agrees with itself: `highest_label` is the highest of its
+    /// lines, public when there are none, and within `max_label`. A manifest that
+    /// understates its highest would pass a bundle holding more than it says through a
+    /// destination's check on the manifest's word, so a receiver refuses one before it
+    /// opens an entry.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Invalid`] naming the field that disagrees.
+    pub fn consistent(&self) -> Result<(), crate::Error> {
+        let inside = self
+            .entries
+            .iter()
+            .map(|e| e.classification)
+            .max()
+            .unwrap_or(Label::Public);
+        if self.highest_label != inside {
+            return Err(crate::Error::Invalid(format!(
+                "highest_label is {} but the entries listed reach {}",
+                self.highest_label, inside
+            )));
+        }
+        if self.highest_label > self.max_label {
+            return Err(crate::Error::Invalid(format!(
+                "highest_label {} exceeds the export bound max_label {}",
+                self.highest_label, self.max_label
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the manifest says what is inside the bundle: every line names an entry
+    /// the bundle's text carries under that id, with the classification the text's
+    /// frontmatter carries, and the manifest is [`Manifest::consistent`]. `inside` is
+    /// each entry's id and frontmatter classification as read from the bundle. A line
+    /// that disagrees refuses the bundle whole, so a receiver filtering on the
+    /// manifest's word never admits more than the record would have served.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Invalid`] naming the first entry that disagrees, or the field.
+    pub fn check(&self, inside: &[(String, Label)]) -> Result<(), crate::Error> {
+        for line in &self.entries {
+            let Some((_, front)) = inside.iter().find(|(id, _)| *id == line.id) else {
+                return Err(crate::Error::Invalid(format!(
+                    "{} is listed in the manifest but no entry in the bundle carries that id",
+                    line.id
+                )));
+            };
+            if *front != line.classification {
+                return Err(crate::Error::Invalid(format!(
+                    "{} is {} in its frontmatter but the manifest lists it as {}",
+                    line.id, front, line.classification
+                )));
+            }
+        }
+        self.consistent()
+    }
+
     /// Render as YAML.
     ///
     /// # Panics
@@ -129,5 +188,70 @@ mod tests {
         let back = Manifest::from_yaml(&m.to_yaml()).unwrap();
         assert_eq!(back.entries.len(), 2);
         assert_eq!(back.highest_label, Label::Internal);
+    }
+
+    fn two() -> Manifest {
+        let mut m = Manifest::new("dom-a", "memory:local:me", Label::Internal);
+        for (n, label) in [("1", Label::Public), ("2", Label::Internal)] {
+            m.push(ManifestEntry {
+                id: format!("mem-a-{n}"),
+                path: format!("mem-a-{n}.md"),
+                digest: "00".into(),
+                classification: label,
+            })
+            .unwrap();
+        }
+        m
+    }
+
+    #[test]
+    fn a_manifest_says_what_is_inside_it() {
+        let inside =
+            |a: Label, b: Label| vec![("mem-a-1".to_string(), a), ("mem-a-2".to_string(), b)];
+        // as exported: every line is its frontmatter, and the highest is the highest
+        two()
+            .check(&inside(Label::Public, Label::Internal))
+            .unwrap();
+        assert!(two().consistent().is_ok());
+        // the highest understated: a destination checking the manifest's word would
+        // admit a bundle holding more than it says
+        let mut m = two();
+        m.highest_label = Label::Public;
+        let e = m.consistent().unwrap_err().to_string();
+        assert!(e.contains("highest_label") && e.contains("internal"), "{e}");
+        assert!(m.check(&inside(Label::Public, Label::Internal)).is_err());
+        // overstated is not what is inside it either
+        let mut m = two();
+        m.highest_label = Label::Restricted;
+        assert!(m.consistent().is_err());
+        // above the bound the export was asked for
+        let mut m = two();
+        m.max_label = Label::Public;
+        assert!(m.consistent().is_err());
+        // a line that understates its entry: the frontmatter says more than the manifest
+        let e = two()
+            .check(&inside(Label::Public, Label::Restricted))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("mem-a-2") && e.contains("restricted"), "{e}");
+        // a line that overstates it is a mismatch too
+        assert!(two()
+            .check(&inside(Label::Internal, Label::Internal))
+            .is_err());
+        // an entry the manifest lists but the bundle's text names otherwise
+        let e = two()
+            .check(&[
+                ("mem-a-1".to_string(), Label::Public),
+                ("mem-a-9".to_string(), Label::Internal),
+            ])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("mem-a-2"), "{e}");
+        // nothing inside: public, and nothing else
+        let empty = Manifest::new("dom-a", "memory:local:me", Label::Internal);
+        empty.check(&[]).unwrap();
+        let mut empty = Manifest::new("dom-a", "memory:local:me", Label::Internal);
+        empty.highest_label = Label::Internal;
+        assert!(empty.consistent().is_err());
     }
 }

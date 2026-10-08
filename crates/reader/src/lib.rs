@@ -71,14 +71,17 @@ pub fn parse_entry(text: &str) -> String {
     }
 }
 
-/// Parse a bundle's `manifest.yaml`. JSON of the manifest, or an object with an `error`.
+/// Parse a bundle's `manifest.yaml`. JSON of the manifest, or an object with an `error`:
+/// a foreign format, or a manifest that does not agree with itself about the labels
+/// inside it, which a reader would otherwise report on the manifest's word.
 #[wasm_bindgen]
 #[must_use]
 pub fn parse_manifest(yaml: &str) -> String {
     match serde_yaml::from_str::<Manifest>(yaml) {
-        Ok(m) if m.format == dm_core::manifest::FORMAT => {
-            serde_json::to_string(&m).unwrap_or_else(|err| error(&err.to_string()))
-        }
+        Ok(m) if m.format == dm_core::manifest::FORMAT => match m.consistent() {
+            Ok(()) => serde_json::to_string(&m).unwrap_or_else(|err| error(&err.to_string())),
+            Err(e) => error(&e.to_string()),
+        },
         Ok(m) => error(&format!(
             "bundle format {:?} is not {}",
             m.format,
@@ -128,6 +131,30 @@ mod tests {
         assert_eq!(digest(&Entry::parse(ENTRY).unwrap().render()), d);
         let bad: serde_json::Value = serde_json::from_str(&parse_entry("no fence")).unwrap();
         assert!(bad["error"].as_str().unwrap().contains("frontmatter"));
+    }
+
+    #[test]
+    fn a_manifest_that_understates_what_is_inside_it_is_refused() {
+        let mut m = Manifest::new("dom-me", "memory test", Label::Internal);
+        m.push(dm_core::manifest::ManifestEntry {
+            id: "mem-me-00000001".into(),
+            path: "mem-me-00000001.md".into(),
+            digest: "00".into(),
+            classification: Label::Internal,
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&parse_manifest(&m.to_yaml())).unwrap();
+        assert_eq!(v["highest_label"], "internal");
+        let understated = m
+            .to_yaml()
+            .replace("highest_label: internal", "highest_label: public");
+        let v: serde_json::Value = serde_json::from_str(&parse_manifest(&understated)).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("highest_label")),
+            "{v}"
+        );
     }
 
     #[test]

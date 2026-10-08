@@ -152,7 +152,8 @@ pub async fn export(
 /// # Errors
 ///
 /// A bad or missing manifest, a path that is not a plain file name, a digest that does
-/// not match, an entry that does not parse, or a store or index error.
+/// not match, a manifest whose labels are not the entries' own, an entry that does not
+/// parse, or a store or index error.
 pub async fn import(
     store: &Store,
     index: &mut Index,
@@ -179,6 +180,7 @@ pub async fn import(
     // is known by its digest and is not an error: the bundle is older than the erasure.
     let mut out = Imported::default();
     let mut checked: Vec<Entry> = Vec::with_capacity(manifest.entries.len());
+    let mut inside: Vec<(String, Label)> = Vec::with_capacity(manifest.entries.len());
     for m in &manifest.entries {
         if m.path.contains(['/', '\\']) || m.path.starts_with('.') || m.path.is_empty() {
             return Err(Error::Invalid(format!(
@@ -195,12 +197,16 @@ pub async fn import(
             )));
         }
         let entry = Entry::parse(&text)?;
+        inside.push((entry.front.id.clone(), entry.front.classification));
         if erased.contains(&m.digest) || erased.contains(&body_digest(&entry.body)) {
             out.erased.push(m.id.clone());
             continue;
         }
         checked.push(entry);
     }
+    // the manifest's word on the labels must be the entries' own, erased ones included,
+    // before anything lands: a line or a highest that understates is refused whole
+    manifest.check(&inside)?;
 
     // Pass two: land what is new.
     for mut entry in checked {
