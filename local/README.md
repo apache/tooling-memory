@@ -101,7 +101,8 @@ and `LLMAO_URL` pointing at it: through the gateway every harness has one destin
 | Grok Build | works, metered: Grok checks a model id against its own catalog, so the launcher declares the model as a `[model.<id>]` block in its config with the egress as `base_url` and `chat_completions` as the backend, and `-m <id>` selects it | custom model block |
 | pi | works, metered: the destination is a provider in its `models.json` with the model named | chat completions |
 | Muse Code | works, metered, after three things: its first call is its own model catalog, `GET /muse-code/models`, which it addresses at the base URL's origin and reads in the OpenAI model-list shape, so at a destination that is not Meta's the egress answers it from that destination's `/v1/models`; it asks for `high` effort by default, so the launcher passes `--reasoning-effort medium` on this route; and it asks for 128k output tokens whatever the catalog says, which a 131k-context model refuses once the prompt is counted, so the egress caps the output tokens a request asks for at 32k on this route. Inference is then the Responses API, streamed. Its reminder observers, background agents of its own, are off in headless runs | catalog, then Responses |
-| Gemini CLI, Antigravity | no: the gateway has no `generateContent` route | API shape |
+| Antigravity | works, metered, since 7 October: the egress folds a `functionResponse` the way LiteLLM's Gemini translation wants it, and `auto` runs agy from this host when the image lacks it; proven on 9 October with a one-word answer on Qwen | Gemini shape, translated by the gateway |
+| Gemini CLI | works, metered, through the same fold, proven 9 October on Qwen; it prints `MCP issues detected` on the way, which its own `/mcp list` would explain, while the memory server's hooks fire and leave handoffs | Gemini shape, translated |
 | Copilot CLI | no: no base-URL override | GitHub only |
 
 `--model` passes a model in the harness's own flag, after the prompt, where every harness,
@@ -134,6 +135,41 @@ There is no depth cap, and a task that only a person can take, one whose require
 include `human`, is a node like any other: the board page in the web terminal lists tasks
 by status under what filed them, marks the ones for a person, and lets the person admit,
 claim, complete with a handoff, invalidate or retry them.
+
+## The librarian: `amem librarian`
+
+The paper's librarian is a permanent fleet of cheap-model agents that verifies stale
+facts, merges duplicates, writes the summaries the index serves, splits oversized files
+and acts on telemetry. Its first rung here is a survey that writes nothing: `amem
+librarian` reads a domain and the read log and proposes, as JSON, what needs curation.
+Summaries the index should not serve, a table or a heading or a clipped first paragraph
+instead of a sentence; two live entries with the same title, merge candidates; raw entries
+past their review date or older than thirty days without one, due for a check; bodies over
+twelve thousand characters, due for a split; and questions searched for more than once
+that found nothing, which are authoring tasks. With `--file`, each proposal becomes a task
+on the ledger, at low priority, with `origin: librarian:<kind>` and a hash of what it
+concerns, so a survey run twice files each once; `amem work` on a cheap model then does
+the curation with the memory server's own tools. Every task body says what to do and how
+it stays reversible: the new entry `supersedes` the old and changes no facts; a verify
+proposes and never promotes to `verified`, which stays a human's or a senior agent's gate.
+Not yet: the checker that samples summaries against bodies on a different model, canary
+entries, and the telemetry of the librarian's own behaviour.
+
+## Evaluation: `scripts/eval.py`
+
+Memory against no memory, and harness against harness, on a set of tasks. A set is a
+TOML file of prompts and the regular expression each answer must match (`evals/demo.toml`
+asks four things only the demo record knows). Each task runs under each condition:
+`memory`, the harness through `amem launch --prompt` with the record attached; `none`,
+the same harness bare in an empty directory, the harness as people use it today. Both
+report the tokens the harness itself counted, read from the transcript it left, so the
+two are measured the same way. Results go to `evals/out/` as JSON with a table on stdout:
+passes per condition, input, cached and output tokens, seconds.
+
+```sh
+scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
+scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex,claude --auth gateway --model qwen3.8-27b
+```
 Grok is not a harness but a destination: any OpenAI-shaped harness reaches it with
 `--provider xai` and `XAI_API_KEY`. `command` is not a harness either but a program: the
 first argument after `--` runs as given, confined, with the egress and the memory server in

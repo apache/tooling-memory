@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Memory against no memory, and harness against harness, on a set of tasks.
+
+Each task in the set is a prompt and a regular expression its answer must match. Each
+run is one prompted launch; the conditions are:
+
+  memory   the harness through `amem launch --prompt`, with the record attached, so T0,
+           search, recall and the hooks are there as in any session;
+  none     the same harness, bare, in an empty working directory, with nothing attached:
+           the harness as people use it today.
+
+Both conditions report the tokens the harness itself counted, read from the transcript
+it left, so the two are measured the same way; `amem usage` holds the egress's count
+for the memory condition as well. The answer is what the harness printed; the grade is
+whether it matches `expect`.
+
+  scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
+  scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex,claude --auth gateway --model qwen3.8-27b
+  scripts/eval.py evals/demo.toml --root ~/memory-demo2 --conditions memory
+
+Results go to evals/out/<set>-<stamp>.json and a table to stdout. Bare runs are known
+for claude and codex; the memory condition takes every harness the launcher does.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+AMEM = HERE / "target" / "release" / "amem"
+
+BARE = {
+    "claude": lambda prompt, model: ["claude", "-p", prompt, "--dangerously-skip-permissions"] + (["--model", model] if model else []),
+    "codex": lambda prompt, model: ["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", prompt] + (["-m", model] if model else []),
+}
+
+
+def newest(patterns, since):
+    files = []
+    for pat in patterns:
+        # the harnesses keep their transcripts under dot-directories, which glob skips
+        # unless told otherwise
+        files += [p for p in glob.glob(pat, recursive=True, include_hidden=True) if os.path.getmtime(p) >= since]
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def usage_of(path):
+    """What the harness counted, from its transcript: Claude Code's per-call usage summed
+    once per message id, or Codex's last running total."""
+    if not path:
+        return None
+    seen = set()
+    total = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    codex = None
+    model = None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                v = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if v.get("type") == "assistant":
+                m = v.get("message", {})
+                mid = m.get("id")
+                if mid and mid in seen:
+                    continue
+                if mid:
+                    seen.add(mid)
+                u = m.get("usage")
+                if u:
+                    model = m.get("model", model)
+                    total["input"] += u.get("input_tokens", 0)
+                    total["output"] += u.get("output_tokens", 0)
+                    total["cache_read"] += u.get("cache_read_input_tokens", 0)
+                    total["cache_write"] += u.get("cache_creation_input_tokens", 0)
+            elif v.get("type") == "turn_context":
+                model = v.get("payload", {}).get("model", model)
+            elif v.get("type") == "event_msg" and v.get("payload", {}).get("type") == "token_count":
+                t = v["payload"].get("info", {}).get("total_token_usage")
+                if t:
+                    cached = t.get("cached_input_tokens", 0)
+                    codex = {
+                        "input": max(t.get("input_tokens", 0) - cached, 0),
+                        "output": t.get("output_tokens", 0),
+                        "cache_read": cached,
+                        "cache_write": t.get("cache_write_input_tokens", 0),
+                    }
+    u = codex or total
+    u["model"] = model
+    return u
+
+
+KEYS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY", "META_API_KEY"]
+
+
+def bare_env(env, harness, auth):
+    """The environment a bare harness runs in, matching the auth mode the memory
+    condition uses: a login means no key in sight, since a harness prefers a key it is
+    given over its login; a key means that key; the gateway means the harness's own
+    base-URL override pointed at it with the PAT as the key."""
+    e = dict(env)
+    if auth == "subscription":
+        for k in KEYS:
+            e.pop(k, None)
+    elif auth == "gateway":
+        url = e.get("LLMAO_URL", "http://127.0.0.1:4000")
+        key = e.get("LLMAO_KEY", "")
+        for k in KEYS:
+            e.pop(k, None)
+        if harness == "claude":
+            e["ANTHROPIC_BASE_URL"] = url
+            e["ANTHROPIC_AUTH_TOKEN"] = key
+            e["CLAUDE_CODE_EFFORT_LEVEL"] = e.get("CLAUDE_CODE_EFFORT_LEVEL", "medium")
+        elif harness == "codex":
+            e["OPENAI_BASE_URL"] = url.rstrip("/") + "/v1"
+            e["OPENAI_API_KEY"] = key
+    return e
+
+
+def run(cmd, cwd, env, timeout):
+    started = time.time()
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        out, err, code = p.stdout, p.stderr, p.returncode
+    except subprocess.TimeoutExpired as e:
+        out, err, code = (e.stdout or ""), (e.stderr or "") + "\n[timed out]", 124
+    return out, err, code, time.time() - started
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("set", help="the TOML task set")
+    ap.add_argument("--root", required=True, help="the record the memory condition attaches")
+    ap.add_argument("--harness", default="claude", help="comma-separated: claude, codex, ...")
+    ap.add_argument("--auth", default="subscription")
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--provider", default=None)
+    ap.add_argument("--conditions", default="memory,none")
+    ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--only", default=None, help="comma-separated task ids")
+    args = ap.parse_args()
+
+    with open(args.set, "rb") as f:
+        tasks = tomllib.load(f)["task"]
+    if args.only:
+        keep = set(args.only.split(","))
+        tasks = [t for t in tasks if t["id"] in keep]
+    harnesses = [h.strip() for h in args.harness.split(",") if h.strip()]
+    conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
+    root = Path(os.path.expanduser(args.root))
+    if "memory" in conditions and not AMEM.exists():
+        sys.exit("build first: make build")
+    env = dict(os.environ)
+    cred = root / "credentials.env"
+    if cred.exists():
+        for line in cred.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env.setdefault(k.strip(), v.strip().strip("'\""))
+
+    results = []
+    for harness in harnesses:
+        for cond in conditions:
+            if cond == "none" and harness not in BARE:
+                print(f"skip: no bare form known for {harness}", file=sys.stderr)
+                continue
+            for t in tasks:
+                since = time.time() - 1
+                if cond == "memory":
+                    cmd = [str(AMEM), "--root", str(root), "launch", "--harness", harness, "--auth", args.auth, "--no-handoff", "--prompt", t["prompt"]]
+                    if args.model:
+                        cmd += ["--model", args.model]
+                    if args.provider:
+                        cmd += ["--provider", args.provider]
+                    cwd = tempfile.mkdtemp(prefix="eval-mem-")
+                    out, err, code, secs = run(cmd, cwd, env, args.timeout)
+                    transcript = newest([str(root / "state" / "sandbox" / harness / "**" / "*.jsonl")], since)
+                    session = None
+                    m = re.search(r"session (sess-[a-z0-9]+)", err)
+                    if m:
+                        session = m.group(1)
+                else:
+                    cwd = tempfile.mkdtemp(prefix="eval-none-")
+                    cmd = BARE[harness](t["prompt"], args.model)
+                    out, err, code, secs = run(cmd, cwd, bare_env(env, harness, args.auth), args.timeout)
+                    home = Path.home()
+                    transcript = newest([str(home / ".claude" / "projects" / "**" / "*.jsonl"), str(home / ".codex" / "sessions" / "**" / "*.jsonl")], since)
+                    session = None
+                shutil.rmtree(cwd, ignore_errors=True)
+                answer = out.strip()
+                passed = re.search(t["expect"], answer, re.I | re.S) is not None
+                usage = usage_of(transcript)
+                r = {
+                    "task": t["id"], "harness": harness, "condition": cond, "model": args.model,
+                    "pass": passed, "exit": code, "seconds": round(secs, 1), "session": session,
+                    "usage": usage, "answer": answer[-600:], "transcript": transcript,
+                }
+                results.append(r)
+                tok = f"{usage['input']}+{usage['cache_read']}c in, {usage['output']} out" if usage else "no transcript"
+                print(f"{harness:<10} {cond:<7} {t['id']:<18} {'PASS' if passed else 'FAIL'}  {secs:5.0f}s  {tok}", flush=True)
+
+    out_dir = HERE / "evals" / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    name = Path(args.set).stem
+    out_path = out_dir / f"{name}-{stamp}.json"
+    out_path.write_text(json.dumps({"set": args.set, "root": str(root), "args": vars(args), "results": results}, indent=1))
+
+    print()
+    print("| harness | condition | passed | input tokens | cached | output | seconds |")
+    print("|---|---|---|---|---|---|---|")
+    for harness in harnesses:
+        for cond in conditions:
+            rs = [r for r in results if r["harness"] == harness and r["condition"] == cond]
+            if not rs:
+                continue
+            ok = sum(1 for r in rs if r["pass"])
+            us = [r["usage"] for r in rs if r["usage"]]
+            tin = sum(u["input"] for u in us)
+            tc = sum(u["cache_read"] for u in us)
+            tout = sum(u["output"] for u in us)
+            secs = sum(r["seconds"] for r in rs)
+            print(f"| {harness} | {cond} | {ok}/{len(rs)} | {tin} | {tc} | {tout} | {secs:.0f} |")
+    print(f"\nwritten {out_path.relative_to(HERE)}")
+
+
+if __name__ == "__main__":
+    main()

@@ -352,6 +352,21 @@ fn options(config: &Config) -> Value {
             .iter()
             .filter(|b| **b != "none" || config.backend == "none")
             .collect::<Vec<_>>(),
+        // what each choice means, for the form's hints: one sentence each, in the words
+        // the launcher's own help uses
+        "descriptions": {
+            "backends": {
+                "auto": "Picks for each harness: the unpacked image when it carries the harness, this host's namespaces otherwise; WSL containers on Windows.",
+                "namespaces": "Linux namespaces over this host's own binaries: the harness you installed, confined, with only the working tree, a private home and the egress reachable.",
+                "image": "The harness image, unpacked by `make unpack`, pivoted into: the same pinned harnesses and Node on every machine, confined the same way.",
+                "wslc": "WSL containers on Windows: an egress container and a harness container with no network, from the same image.",
+                "none": "No confinement at all. The egress still proxies and meters, but nothing is sandboxed; for platforms without a backend, and for debugging."
+            },
+            "subagents": {
+                "harness": "A subagent the harness would spawn runs inside the harness, as it would without the launcher.",
+                "board": "A subagent the harness would spawn becomes a task on the board instead, under the task this run holds, and the run resumes as a continuation once it is done; the call is refused with the task ids."
+            }
+        },
         "defaults": { "harness": config.harness, "auth": config.auth, "backend": config.backend }
     })
 }
@@ -1499,6 +1514,19 @@ mod tests {
         assert!(err.contains("no default"), "{err}");
         let o = options(&c);
         assert_eq!(o["destinations"]["gateway"][0], "llmao");
+        // every choice the form offers is described
+        for b in o["backends"].as_array().unwrap() {
+            assert!(
+                o["descriptions"]["backends"][b.as_str().unwrap()].is_string(),
+                "{b}"
+            );
+        }
+        for sa in o["subagents"].as_array().unwrap() {
+            assert!(
+                o["descriptions"]["subagents"][sa.as_str().unwrap()].is_string(),
+                "{sa}"
+            );
+        }
         assert!(o["harnesses"]
             .as_array()
             .unwrap()

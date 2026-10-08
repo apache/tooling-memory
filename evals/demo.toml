@@ -1,0 +1,29 @@
+# An evaluation set over the demo record: questions whose answers live in the record and
+# nowhere else, so a harness without memory can only guess. `scripts/eval.py` runs each
+# task under each condition and grades the answer against `expect`, a case-insensitive
+# regular expression that the answer must match.
+#
+#   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
+#   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex --auth gateway --model qwen3.8-27b
+#
+# Seed the record first: scripts/demo.sh ~/memory-demo2 <markdown-dir>...
+
+[[task]]
+id = "dr19-decision"
+prompt = "What did DR-19 decide about the wiki staying on MoinMoin? Answer in one or two sentences from what you know; do not browse the web."
+expect = "(not taken a decision|no decision|stays on MoinMoin|proposed)"
+
+[[task]]
+id = "dr19-spike"
+prompt = "Which spike in the work plan would settle DR-19, the question of whether the wiki stays on MoinMoin? Name it. Do not browse the web."
+expect = "S2"
+
+[[task]]
+id = "asf-pressures"
+prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What ASF stresses that the paper had to answer' list? Give the number."
+expect = "\\b(five|5)\\b"
+
+[[task]]
+id = "committers-gate"
+prompt = "In the 'Seeding a Foundation' notes on trust and review, who is the promotion gate? One sentence."
+expect = "committer"

@@ -114,7 +114,7 @@
             <span class="am-hint" id="models-hint"></span></div>
           <div class="am-field c3"><label for="backend">Backend</label>
             <select class="am-ctrl is-mono" id="backend" name="backend"></select>
-            <span class="am-hint">Where the harness runs; <span class="am-mono">auto</span> picks for each harness.</span></div>
+            <span class="am-hint" id="backend-hint">Where the harness runs; <span class="am-mono">auto</span> picks for each harness.</span></div>
 
           <div class="am-field"><label for="prompt">Prompt</label>
             <textarea class="am-ctrl" id="prompt" name="prompt" placeholder="Load T0 and summarise it"></textarea>
@@ -123,7 +123,8 @@
           <div class="am-launch-foot">
             <label class="am-check"><input type="checkbox" id="work" name="work"> Work the next task from the ledger</label>
             <span class="am-field sub-field"><span class="am-legend" id="sub-l">Subagents</span>
-              <span class="am-seg" role="radiogroup" aria-labelledby="sub-l" id="subagents"></span></span>
+              <span class="am-seg" role="radiogroup" aria-labelledby="sub-l" id="subagents"></span>
+              <span class="am-hint" id="sub-hint"></span></span>
           </div>
         </fieldset>
 
@@ -308,6 +309,7 @@ async function load() {
   setRadio('subagents', 'harness');
   fill($('backend'), options.backends, false);
   $('backend').value = options.defaults.backend || options.backends[0];
+  describe();
   onAuth();
   loadProfiles();
   loadDoctor(false);
@@ -568,8 +570,17 @@ $('profile').addEventListener('change', () => { clearError(); onProfile(); });
 $('harness').addEventListener('change', () => { readiness(); preview(); });
 $('auth').addEventListener('change', () => onAuth());
 $('provider').addEventListener('change', () => { destinationHint(); loadModels(); preview(); });
-$('subagents').addEventListener('change', () => { subTouched = true; });
-$('work').addEventListener('change', () => { if (!subTouched) setRadio('subagents', $('work').checked ? 'board' : 'harness'); });
+// what the chosen backend and subagent setting mean, in the server's words
+function describe() {
+  const d = (options && options.descriptions) || {};
+  const b = $('backend').value;
+  if (d.backends && d.backends[b]) $('backend-hint').textContent = d.backends[b];
+  const s = radio('subagents');
+  if (d.subagents && d.subagents[s]) $('sub-hint').textContent = d.subagents[s];
+}
+$('backend').addEventListener('change', describe);
+$('subagents').addEventListener('change', () => { subTouched = true; describe(); });
+$('work').addEventListener('change', () => { if (!subTouched) setRadio('subagents', $('work').checked ? 'board' : 'harness'); describe(); });
 $('new').addEventListener('input', () => { clearError(); preview(); });
 $('new').addEventListener('change', preview);
 $('online').addEventListener('click', () => loadDoctor(true));

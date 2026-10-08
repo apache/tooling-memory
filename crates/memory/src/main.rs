@@ -16,6 +16,7 @@ mod golden;
 mod harness_usage;
 mod hooks;
 mod image;
+mod librarian;
 mod mcp_http;
 mod mine;
 mod model;
@@ -428,6 +429,22 @@ enum Command {
         mine_model: Option<String>,
         #[arg(long, value_enum, default_value = "auto")]
         mine_via: MineVia,
+    },
+    /// The librarian's survey: what in a domain needs curation, from the record and
+    /// the read log, as proposals; with --file, each becomes a task for a run to do with
+    /// the memory server's own tools, born proposed unless the domain admits its own.
+    Librarian {
+        #[arg(long)]
+        domain: Option<String>,
+        /// File each proposal as a task on the ledger.
+        #[arg(long)]
+        file: bool,
+        /// Days after which a raw entry with no review date is due for a look.
+        #[arg(long, default_value_t = 30)]
+        stale_days: i64,
+        /// Characters of body above which an entry is proposed for a split.
+        #[arg(long, default_value_t = 12_000)]
+        split_chars: usize,
     },
     /// The models a destination lists, as JSON: what the web form offers to pick from.
     /// Routed as a launch would be, with the destination's credential; a login mode has
@@ -3304,6 +3321,34 @@ async fn retrieve(m: &Memory, command: Command) -> Fallible {
     }
 }
 
+/// `amem librarian`: the survey, or the survey filed as tasks.
+async fn librarian_cmd(
+    m: &Memory,
+    domain: Option<&str>,
+    file: bool,
+    stale_days: i64,
+    split_chars: usize,
+) -> Fallible {
+    let options = librarian::Options {
+        stale_days,
+        split_chars,
+        ..librarian::Options::default()
+    };
+    let survey = librarian::survey(m, m.root(), domain, &options).await?;
+    if file {
+        let (ids, already) = librarian::file(m, &survey).await?;
+        json(&serde_json::json!({
+            "domain": survey.domain,
+            "entries": survey.entries,
+            "proposals": survey.proposals.len(),
+            "filed": ids,
+            "already_filed": already,
+        }))
+    } else {
+        json(&survey)
+    }
+}
+
 async fn maintain(m: &Memory, command: Command) -> Fallible {
     match command {
         Command::Export {
@@ -3337,6 +3382,12 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
             Ok(())
         }
         Command::Erase { id, reason } => json(&m.erase(&id, reason.into()).await?),
+        Command::Librarian {
+            domain,
+            file,
+            stale_days,
+            split_chars,
+        } => librarian_cmd(m, domain.as_deref(), file, stale_days, split_chars).await,
         Command::Init { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
