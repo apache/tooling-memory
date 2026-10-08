@@ -29,7 +29,7 @@ Agents doing real, sustained work fail in four predictable ways:
 
 # 2. Principles
 
-Ten rules govern every component. When a question isn't answered below, reason from these.
+Eleven rules govern every component. When a question isn't answered below, reason from these.
 
 1. **Data outlives tooling.** The record is versioned plain text, under whatever engine keeps the guarantees of §4. Search indexes, embeddings, and dashboards are derived: rebuildable from source, never authoritative.
 2. **Agents are stateless and disposable.** A sandbox starts empty and dies without ceremony. Anything worth keeping is written to shared memory first.
@@ -41,6 +41,7 @@ Ten rules govern every component. When a question isn't answered below, reason f
 8. **Curation is permanent work.** A librarian function continuously verifies, merges, summarizes, and archives, fed by the system's own telemetry. Knowledge decays gracefully or catastrophically; there is no third option.
 9. **Deterministic perimeter, reasoned interior.** Access control, spend limits, data boundaries, and irreversibility gates are enforced by a policy engine. Judgment is informed by policy and exercised by agents, with a trail. Self-improvement can change the harness but never widen the perimeter; only humans grant power.
 10. **Keep everything human-legible.** Every layer readable and editable with standard tools. Humans are the only continuity at decade scale.
+11. **Evaluation is built in, not bolted on.** What a replay needs is recorded when the task runs: the snapshot it saw, the context it decided from, the outcome it produced. Every layer, memory included, can be switched off for a comparison run, and keeps its place only while it beats the system without it.
 
 ---
 
@@ -807,9 +808,21 @@ The invariant: self-evolution is permission-monotonic. It makes agents better wi
 
 # 11. Evaluating Change
 
-Two kinds of change need measuring: changes the operator makes (a new base model, a new sandbox bootstrap) and changes the vendor makes silently. Both use the same machinery, replay against memory, because memory holds three things benchmarks lack.
+Three kinds of change need measuring: adopting the system at all, changes the operator makes (a new base model, a new sandbox bootstrap), and changes the vendor makes silently. All use the same machinery, replay against memory, because memory holds three things benchmarks lack.
 
 First, **the knowledge state is reproducible**, up to erasure: "the corpus as the agent saw it" is the record at the version current when the task ran, including the policy version and T0 contents, and a replay that reaches an erased entry sees its stub (§4). Second, **outcomes are real**: the task graph records completion, handoff acceptance, whether dependent tasks later got reverted, human PR approval. The dependency edges add downstream consequences, the strongest kind of ground truth. Third, **scoring uses the system's own cost numbers**: tokens per task and retrieval depth, not pass/fail alone.
+
+## Built in, not bolted on
+
+None of this can be added later. A replay needs data that exists only at the moment the task runs, so the provisions ship with the first task, and a component that cannot support them is not finished:
+
+- **Decision contexts are logged** at every step the funnel sees (§9), with the HEAD commit, policy version, and T0 the agent held. Without them there is nothing to replay.
+- **Outcomes land on the task graph.** Completion, handoff acceptance, later reverts, and human approval are recorded where a scorer can join them to the task, not left in a tracker comment.
+- **Every layer has an off switch.** Memory access, disclosure depth, prefetch, and T0 contents are session configuration, set at spawn and compiled into the session filter (§8), so an evaluation arm differs from production in configuration only, never in code. The perimeter is not among them: no arm runs with wider permissions than production.
+- **Evaluation is work like any other.** Runs are tasks in dom-platform with their own resource class and budget, sandboxed, writing only to a scratch branch of their snapshot. Their cost is visible, their results are scorecards with provenance, and they never touch production memory or inflate production cost-per-task.
+- **Results travel in a standard carrier.** Traces and scores leave the system in the OpenTelemetry generative-AI conventions, today's binding, so an outside harness can read them; the scorecard in dom-platform remains the durable record.
+
+A system built this way produces the evidence external assurance asks for as a by-product (§15).
 
 ## Replaying your own history
 
@@ -830,6 +843,7 @@ flowchart TD
     subgraph SUT["Vary exactly one"]
         MODEL["New model"]
         BOOT["New bootstrap"]
+        MEM["Memory arm"]
     end
     FIX --> RP{"Replay mode"}
     SUT --> RP
@@ -850,6 +864,21 @@ For a **model swap**, freeze bootstrap and corpus to get a clean model delta, an
 Every evaluation writes a permanent scorecard to dom-platform: which model or bootstrap, against which snapshot, what moved, and the verdict. Over years this answers which model was running when, why each switch was made, and what it cost.
 
 Four traps make a naive version of this lie, so they are named: **survivorship bias**: mined tasks are what the old system could do, so a failure-recovery stratum replays archived failures and zero-result queries to test new capability. **Leakage**: snapshot at the parent of the task's own writes and exclude its artifacts, so the candidate never sees the outcome it is being scored on. **Noise**: single runs mislead, so use multi-seed confidence intervals and a paired noise-floor protocol, never a point estimate. **Judge drift**: for open-ended tasks, hold the judge model fixed across the comparison, anchor it to human-approved outcomes, and never let a model judge itself. Against distribution shift, run two suites: a rolling set resampled from recent memory, and a frozen anchor set comparable across years, whose changes pass human review.
+
+## Does memory earn its keep
+
+The first change to evaluate is the system itself. The case in §1 is a claim about cost and about correctness, and both are testable with the machinery above: hold model, harness, task set, and snapshot fixed, and vary only what the agent may read.
+
+| Arm | What the agent gets | What it stands for |
+|---|---|---|
+| **No memory** | The task spec, plus the repositories and trackers it would have without this system | The floor: what memory adds |
+| **Transcript replay** | No memory, plus prior sessions' transcripts | Today's recovery (§1), the status quo memory replaces |
+| **T0 only** | Cached index and policy digest, no retrieval | What the cheap layer alone buys |
+| **Full** | T0, retrieval, and handoffs | The system as built |
+
+Every arm is scored on the same real outcomes as any replay, task success from the task graph, and on cost per task, time to first action, and retrieval depth, paired by task across seeds under the noise-floor protocol above. The verdict needs both axes. Memory earns its keep in a domain when task success is no worse than the no-memory arm, within a margin fixed before the run, and cost per task is lower; or when success is higher at a cost the domain's budget accepts. Cheaper and worse is a failure, not a trade.
+
+Three cautions apply to this comparison in particular. **The baseline must be honest:** the no-memory arm keeps everything an agent would have without this system, including tracker history, so taps that mirror handoffs into trackers (§7) stay in place; stripping them would compare memory against an agent poorer than any real one. **Leakage applies to memory too:** entries written after the task's snapshot are excluded from the full arm, as the leakage rule above requires. **The answer is per domain, and it moves:** memory may pay where decisions are long-lived and not where tasks are throwaway, and larger context windows or cheaper reads can erode its margin. So the comparison is stratified by domain and task type. Before live re-execution exists it runs on a fixed pilot task set (§14, M1); once it exists it becomes a standing holdout, a small sample of completed tasks re-executed in the no-memory arm on a published cadence, so the case for memory is re-proven as models change rather than asserted once.
 
 ## Detecting unadvertised vendor change
 
@@ -998,7 +1027,7 @@ This architecture assembles ideas with two distinct lineages: a recent body of a
 
 **Self-improvement (§10).** SEAGym (arXiv:2606.17546) locates self-evolution in the harness, the same artifact set as dom-platform. EvolveR (arXiv:2510.16079) formalizes distill-offline/retrieve-online. The Darwin Gödel Machine (arXiv:2505.22954) supplies archive-plus-gated-admission; the Red Queen Gödel Machine (arXiv:2606.26294) shows evaluators must co-evolve with agents to resist gaming, which is why eval-suite curation stays human-reviewed. The failure the safety gate exists for is specification gaming (Amodei et al., arXiv:1606.06565; Krakovna et al., 2020), amplified here by a shared substrate that can propagate a gamed strategy fleet-wide. Authoring agents as code that a meta-agent writes and an archive admits is Automated Design of Agentic Systems (Hu, Lu & Clune, arXiv:2408.08435); §10 differs in requiring human review and a manifest check before admission.
 
-**Evaluating change and vendor drift (§11).** Replay-based evaluation adapts record-and-replay testing and shadow deployment from service engineering to agent trajectories; the paired noise-floor protocol (arXiv:2606.20695) supplies the statistics. Silent vendor change is empirically documented: Chen, Zaharia & Zou (arXiv:2307.09009) measured large behavioral drift in GPT-3.5/4 behind stable model names. The detection battery draws on model-monitoring and change-point detection practice from ML operations.
+**Evaluating change and vendor drift (§11).** Replay-based evaluation adapts record-and-replay testing and shadow deployment from service engineering to agent trajectories; the paired noise-floor protocol (arXiv:2606.20695) supplies the statistics. Silent vendor change is empirically documented: Chen, Zaharia & Zou (arXiv:2307.09009) measured large behavioral drift in GPT-3.5/4 behind stable model names. The detection battery draws on model-monitoring and change-point detection practice from ML operations. The memory ablation moves the with-and-without comparisons of the Mem0/LoCoMo line from a public benchmark onto the system's own tasks. Building evaluation in follows test-and-evaluation practice in AI risk management: the NIST AI RMF's Measure function (NIST AI 100-1, 2023) asks for testing before deployment and regularly in operation, documented test sets and metrics, and evaluation of the metrics themselves, the co-evolving suites of §10; ISO/IEC 42001 (2023, clause 9) makes monitoring, measurement, and evaluation a management-system requirement with stated criteria. For carrying the evidence, OpenTelemetry's generative-AI semantic conventions define spans for model and agent operations and an evaluation-result event, which records a score without prescribing how it was produced and was still experimental in 2026; Inspect, from the UK AI Security Institute, is a widely used open harness with a published log schema. Both are present bindings, not foundations.
 
 **Serving (§5).** Tool-protocol standardization for agent access is currently led by the Model Context Protocol (2024), which the serving bindings treat as the present binding around a durable operation surface; its skills extension (2026) serves instruction bundles with per-file digest manifests, the delivery path Appendix B uses for method-type entries. Delegated recall applies the retrieve-then-synthesize pattern of reader-model RAG inside the service boundary, traded for turn economy.
 
@@ -1016,7 +1045,7 @@ Trackers for ongoing coverage: github.com/Shichun-Liu/Agent-Memory-Paper-List ·
 
 Two constraints drive everything here: agents pay for what they read, and the system must outlive every component it is built from. The response to the first is a read path that discloses progressively (index, summary, section, document) with coordination flowing through shared state instead of conversation. The response to the second is a strict separation between what is durable and what is disposable: everything of value is text with provenance in a versioned record; indexes, services, models, and the agents themselves are rebuildable or replaceable without loss.
 
-The remaining sections are consequences. Governance is text agents read and a perimeter they cannot cross, and classified content leaves its boundary only through a guard. Curation is a permanent, telemetry-directed function with its own containment. Self-improvement is real but permission-monotonic, gated by evals that co-evolve under human review. Change, whether self-initiated or vendor-inflicted, is measured by replaying the system's own history. And when any of it fails, the failure is a diff: inspectable, attributable, reversible.
+The remaining sections are consequences. Governance is text agents read and a perimeter they cannot cross, and classified content leaves its boundary only through a guard. Curation is a permanent, telemetry-directed function with its own containment. Self-improvement is real but permission-monotonic, gated by evals that co-evolve under human review. Change, whether self-initiated or vendor-inflicted, is measured by replaying the system's own history, and so is the system itself: memory keeps its place only while it beats running without it. And when any of it fails, the failure is a diff: inspectable, attributable, reversible.
 
 Everything durable is version-controlled text. Everything serving is rebuildable. Every agent is disposable. Every decision leaves a trail.
 
@@ -1087,6 +1116,8 @@ Hu, S., Lu, C., & Clune, J. (2024). Automated Design of Agentic Systems. arXiv:2
 
 Hu, Y., Liu, S., Yue, Y., Zhang, G., et al. (2025). Memory in the Age of AI Agents. arXiv:2512.13564. https://arxiv.org/abs/2512.13564
 
+ISO/IEC 42001:2023. *Information Technology, Artificial Intelligence, Management System*. International Organization for Standardization. https://www.iso.org/standard/81230.html
+
 Kelley, J. E., & Walker, M. R. (1959). Critical-Path Planning and Scheduling. *Eastern Joint Computer Conference*.
 
 Kleppmann, M. (2017). *Designing Data-Intensive Applications*. O'Reilly. https://dataintensive.net
@@ -1105,9 +1136,13 @@ Model Context Protocol (2026). Skills over MCP extension. https://modelcontextpr
 
 *Multi-Agent Memory as a Computer Architecture Problem* (2026). arXiv:2603.10062. https://arxiv.org/abs/2603.10062
 
+National Institute of Standards and Technology (2023). *Artificial Intelligence Risk Management Framework (AI RMF 1.0)*. NIST AI 100-1. https://doi.org/10.6028/NIST.AI.100-1
+
 Nygard, M. (2011). Documenting Architecture Decisions. https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions
 
 Open Policy Agent (2024). Documentation. https://www.openpolicyagent.org
+
+OpenTelemetry (2026). Semantic Conventions for Generative AI Systems. https://opentelemetry.io/docs/specs/semconv/gen-ai/
 
 Packer, C., et al. (2023). MemGPT: Towards LLMs as Operating Systems. arXiv:2310.08560. https://arxiv.org/abs/2310.08560
 
@@ -1126,6 +1161,8 @@ Saltzer, J. H., & Schroeder, M. D. (1975). The Protection of Information in Comp
 Śliwerski, J., Zimmermann, T., & Zeller, A. (2005). When Do Changes Induce Fixes? *MSR 2005*.
 
 Smith, R. G. (1980). The Contract Net Protocol: High-Level Communication and Control in a Distributed Problem Solver. *IEEE Transactions on Computers*, C-29(12).
+
+UK AI Security Institute (2024). Inspect: An Open-Source Framework for Large Language Model Evaluations. https://inspect.aisi.org.uk
 
 van der Aalst, W. M. P., ter Hofstede, A. H. M., Kiepuszewski, B., & Barros, A. P. (2003). Workflow Patterns. *Distributed and Parallel Databases*, 14(1).
 
