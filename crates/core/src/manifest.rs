@@ -107,24 +107,40 @@ impl Manifest {
         Ok(())
     }
 
-    /// Whether the manifest says what is inside the bundle: every line names an entry
-    /// the bundle's text carries under that id, with the classification the text's
-    /// frontmatter carries, and the manifest is [`Manifest::consistent`]. `inside` is
-    /// each entry's id and frontmatter classification as read from the bundle. A line
-    /// that disagrees refuses the bundle whole, so a receiver filtering on the
-    /// manifest's word never admits more than the record would have served.
+    /// Whether the manifest says what is inside the bundle: each line's file carries
+    /// the line's id and, in its frontmatter, the line's classification; no id is listed
+    /// twice; and the manifest is [`Manifest::consistent`]. `inside` is one pair per
+    /// line, in the manifest's order, each the id and frontmatter classification read
+    /// from the file that line names: a line is held to its own file, never to whichever
+    /// entry carries the id it claims. A disagreement refuses the bundle whole, so a
+    /// receiver filtering on the manifest's word never admits more than the record
+    /// would have served.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Invalid`] naming the first entry that disagrees, or the field.
+    /// [`crate::Error::Invalid`] naming the first line that disagrees, or the field.
     pub fn check(&self, inside: &[(String, Label)]) -> Result<(), crate::Error> {
-        for line in &self.entries {
-            let Some((_, front)) = inside.iter().find(|(id, _)| *id == line.id) else {
+        if inside.len() != self.entries.len() {
+            return Err(crate::Error::Invalid(format!(
+                "the manifest lists {} entries and the bundle carries {}",
+                self.entries.len(),
+                inside.len()
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (line, (id, front)) in self.entries.iter().zip(inside) {
+            if !seen.insert(line.id.as_str()) {
                 return Err(crate::Error::Invalid(format!(
-                    "{} is listed in the manifest but no entry in the bundle carries that id",
+                    "{} is listed twice in the manifest",
                     line.id
                 )));
-            };
+            }
+            if *id != line.id {
+                return Err(crate::Error::Invalid(format!(
+                    "{} is listed as {} but the file carries the id {}",
+                    line.path, line.id, id
+                )));
+            }
             if *front != line.classification {
                 return Err(crate::Error::Invalid(format!(
                     "{} is {} in its frontmatter but the manifest lists it as {}",
@@ -247,6 +263,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("mem-a-2"), "{e}");
+        // `inside` is one per line, in the manifest's order: a line that borrows another
+        // entry's id and label, while its path names a file carrying more, is held to
+        // the file it names, not to whichever entry carries the id it claims
+        let mut borrowed = two();
+        borrowed.entries[1].id = "mem-a-1".into();
+        borrowed.entries[1].classification = Label::Public;
+        borrowed.highest_label = Label::Public;
+        assert!(borrowed.consistent().is_ok(), "to itself it agrees");
+        let e = borrowed
+            .check(&[
+                ("mem-a-1".to_string(), Label::Public),
+                ("mem-a-2".to_string(), Label::Internal),
+            ])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("mem-a-2") || e.contains("mem-a-1"), "{e}");
+        // the same id listed twice is two words for one entry
+        let mut twice = two();
+        twice.entries[1].id = "mem-a-1".into();
+        twice.entries[1].classification = Label::Public;
+        twice.highest_label = Label::Public;
+        assert!(twice
+            .check(&[
+                ("mem-a-1".to_string(), Label::Public),
+                ("mem-a-1".to_string(), Label::Public),
+            ])
+            .is_err());
+        // more or fewer entries than lines is not the bundle the manifest describes
+        assert!(two()
+            .check(&[("mem-a-1".to_string(), Label::Public)])
+            .is_err());
         // nothing inside: public, and nothing else
         let empty = Manifest::new("dom-a", "memory:local:me", Label::Internal);
         empty.check(&[]).unwrap();

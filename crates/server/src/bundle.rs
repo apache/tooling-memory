@@ -106,7 +106,10 @@ pub fn export_scope(
 
 /// Export `hits`, the entries [`export_scope`] listed for `domain`, into `dest`. The
 /// index is consulted before this is called and never held across the record reads,
-/// so the export can run on any executor thread.
+/// so the export can run on any executor thread. The manifest's word on each entry's
+/// label is the record's, read from the text written, not the index's, which can lag
+/// it: every receiver checks the manifest against the text, so an exporter must say
+/// what the text says.
 ///
 /// # Errors
 ///
@@ -125,6 +128,7 @@ pub async fn export(
         let Some(text) = store.get_text(domain, &hit.id).await? else {
             continue;
         };
+        let classification = Entry::parse(&text)?.front.classification;
         let file = format!("{}.md", hit.id);
         let path = dest.join(&file);
         tokio::fs::write(&path, &text).await.map_err(io(&path))?;
@@ -132,7 +136,7 @@ pub async fn export(
             id: hit.id.clone(),
             path: file,
             digest: digest(&text),
-            classification: hit.classification,
+            classification,
         })?;
     }
     let mpath = dest.join("manifest.yaml");
@@ -236,4 +240,52 @@ pub async fn import(
         out.written.push(entry.front.id.clone());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HELD: &str = "---\nid: mem-a-held0001\ntype: fact\ndomain: dom-a\nauthor: human:test:me\ncreated: 2026-10-01T09:00:00Z\ntrust_tier: curated\nclassification: restricted\n---\n# Held\n\nHeld.\n";
+
+    #[tokio::test]
+    async fn an_export_s_manifest_speaks_for_the_record_not_the_index() {
+        // the index can lag the record, which is what reindex exists for; the manifest
+        // every receiver now checks against the text must be written from the text, or
+        // an exporter hands out a bundle every receiver refuses
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_dir(dir.path()).unwrap();
+        let entry = Entry::parse(HELD).unwrap();
+        store.put(&entry).await.unwrap();
+        let stale = Hit {
+            id: entry.front.id.clone(),
+            domain: "dom-a".into(),
+            entry_type: entry.front.entry_type,
+            trust_tier: entry.front.trust_tier,
+            classification: Label::Public,
+            title: "Held".into(),
+            summary: "Held.".into(),
+            score: 0.0,
+        };
+        let dest = tempfile::tempdir().unwrap();
+        let ex = export(
+            &store,
+            vec![stale],
+            "dom-a",
+            Label::Restricted,
+            "memory:test:me",
+            dest.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ex.manifest.entries[0].classification, Label::Restricted);
+        assert_eq!(ex.manifest.highest_label, Label::Restricted);
+        let written = Manifest::from_yaml(
+            &std::fs::read_to_string(dest.path().join("manifest.yaml")).unwrap(),
+        )
+        .unwrap();
+        written
+            .check(&[(entry.front.id.clone(), Label::Restricted)])
+            .unwrap();
+    }
 }
