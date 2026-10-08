@@ -34,7 +34,7 @@ nothing past its static pages without a key, and keeps its token in
 Credentials the launcher needs, the API keys, `LLMAO_KEY` for the
 gateway, `GH_TOKEN` for Copilot, go in `~/memory/credentials.env` as `NAME=value`, mode
 600; the environment wins over the file, and a `gh auth login` stands in for `GH_TOKEN`.
-`amem doctor` names which are found where, never their values.
+`amem doctor` names which are found where, never their values. `LLMAO_KEY` alone points at the local LiteLLM on port 4000; a PAT for the Foundation's gateway wants `LLMAO_URL=https://llm.apache.org` beside it, which `amem doctor` says when the local one does not answer.
 
 A profile names the flags of a launch, so the name is the whole command. Every harness
 is one, `amem claude`, and `~/memory/profiles.toml` adds more:

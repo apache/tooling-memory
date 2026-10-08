@@ -458,7 +458,14 @@ async fn gateway(
         }
         Ok(Err(e)) => {
             found.gateway = Some(false);
-            check("gateway", "llmao", Status::Fail, format!("{url}: {e}"))
+            let c = check("gateway", "llmao", Status::Fail, format!("{url}: {e}"));
+            if std::env::var_os("LLMAO_URL").is_none() {
+                // the commonest cause: a PAT for the Foundation's gateway, with the
+                // address left to its default, the local LiteLLM
+                c.fix("LLMAO_URL is not set, so the key goes to the local LiteLLM; for the Foundation's gateway put LLMAO_URL=https://llm.apache.org in credentials.env")
+            } else {
+                c
+            }
         }
         Err(_) => {
             found.gateway = Some(false);

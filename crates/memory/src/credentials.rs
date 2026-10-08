@@ -22,7 +22,7 @@ pub const KNOWN: &[(&str, &str)] = &[
     ("LLMAO_KEY", "--auth gateway"),
     (
         "LLMAO_URL",
-        "the gateway's address, when it is not the local one",
+        "the gateway's address: the local LiteLLM when unset, https://llm.apache.org for the Foundation's",
     ),
     ("GH_TOKEN", "copilot, on your GitHub login"),
     (
