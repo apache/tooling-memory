@@ -171,7 +171,9 @@ fn survey_entry(
     out: &mut Vec<Proposal>,
 ) {
     let id = &e.front.id;
-    if let Some(why) = poor_summary(summary) {
+    // a handoff is a report for the next session, not a fact the index should curate
+    let handoff = e.front.entry_type == EntryType::Handoff;
+    if let (false, Some(why)) = (handoff, poor_summary(summary)) {
         out.push(Proposal {
             kind: Kind::Resummarise,
             entries: vec![id.clone()],
@@ -199,7 +201,7 @@ fn survey_entry(
                 && (today - e.front.created.date()).whole_days() > options.stale_days
         }
     };
-    if stale && e.front.entry_type != EntryType::Handoff {
+    if stale && !handoff {
         let why = match e.front.review_by {
             Some(d) => format!("`{id}` was due for review on {d}"),
             None => format!(
