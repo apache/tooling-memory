@@ -14,6 +14,10 @@ could have, so the test can show which step of conformance.py catches it:
     search-bodies       search at summary depth carries bodies
     second-claim        claim_next hands out a task somebody holds
     lease-forever       a lapsed lease is still renewed, and the task not returned
+    heartbeat-noop      heartbeat answers but does not extend the lease
+    release-lies        release answers admitted and leaves the task claimed
+    complete-anyone     complete works on a task nobody holds
+    no-holder           a claim records no holder
     import-trusts       import does not check digests
     highest-wrong       the manifest's highest_label is below its lines
     reindex-forgets     reindex drops the ledger
@@ -26,10 +30,11 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 
 FLAW = os.environ.get("FLAW", "")
-STATE = os.environ.get("FAKE_STATE") or os.path.join(os.getcwd(), "fake-state.json")
+STATE = os.environ.get("FAKE_STATE") or os.path.join(tempfile.gettempdir(), "conformance-fake-state.json")
 DOMAIN = "dom-fake"
 LABELS = ["public", "internal", "restricted"]
 
@@ -193,7 +198,7 @@ class Fake:
 
     def take(self, t, lease, now):
         t["status"] = "claimed"
-        t["holder"] = "human:fake:owner"
+        t["holder"] = None if FLAW == "no-holder" else "human:fake:owner"
         t["lease_until"] = now + lease
         t["attempts"] += 1
         return {"task": t, "lease_until": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t["lease_until"]))}
@@ -254,13 +259,15 @@ class Fake:
             t = self.task(a["id"])
             if t["status"] != "claimed" or (t["lease_until"] < now and FLAW != "lease-forever"):
                 raise Refused("the lease is not held: it expired or was never yours")
-            t["lease_until"] = now + (a.get("lease_seconds") or 1800)
+            if FLAW != "heartbeat-noop":
+                t["lease_until"] = now + (a.get("lease_seconds") or 1800)
             return {"task": t}
         if name == "complete":
             t = self.task(a["id"])
             self.get(a["handoff"])
-            if t["status"] != "claimed":
-                raise Refused(f"task is {t['status']}")
+            held = t["status"] == "claimed" and t["lease_until"] >= now
+            if not held and FLAW != "complete-anyone":
+                raise Refused(f"task is {t['status']} and the lease is not held")
             t["status"] = "completed"
             t["handoff"] = a["handoff"]
             return {"task": t}
@@ -268,6 +275,9 @@ class Fake:
             t = self.task(a["id"])
             if a.get("handoff"):
                 self.get(a["handoff"])
+                t["handoff"] = a["handoff"]
+            if FLAW == "release-lies":
+                return {"task": dict(t, status="admitted")}
             t["status"] = "admitted"
             t["holder"] = None
             t["lease_until"] = None
@@ -346,14 +356,14 @@ class Fake:
 
     # ---- the operator's verbs
     def export(self, dest):
-        os.makedirs(os.path.join(dest, "entries"), exist_ok=True)
+        os.makedirs(dest, exist_ok=True)
         lines = []
         highest = "public"
         for e in self.state["entries"]:
             if e["classification"] != "public":
                 continue
             text = render(e)
-            path = f"entries/{e['id']}.md"
+            path = f"{e['id']}.md"
             with open(os.path.join(dest, path), "w", encoding="utf-8") as f:
                 f.write(text)
             lines.append((e["id"], path, digest(text), e["classification"]))

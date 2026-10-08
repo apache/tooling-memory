@@ -146,6 +146,20 @@ pub async fn export(
     Ok(Exported { manifest })
 }
 
+/// Whether an origin that names this record and `domain` names an entry that is here:
+/// `id` is what followed the record's own prefix, written by whoever made the bundle, so
+/// one that is not a name is not ours rather than a refusal of the whole bundle.
+async fn is_own(store: &Store, domain: &str, id: Option<&str>) -> Result<bool, Error> {
+    let Some(id) = id else {
+        return Ok(false);
+    };
+    match store.get(domain, id).await {
+        Ok(found) => Ok(found.is_some()),
+        Err(dm_store::Error::BadName(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Import a bundle from `src` into `into_domain`. `owner` is this record's owner; a bundle
 /// the same owner exported keeps its trust tiers, every other bundle lands at raw. An
 /// entry whose text's digest, or whose trimmed body's, is in `erased`, what this
@@ -215,6 +229,9 @@ pub async fn import(
     // Pass two: land what is new. An entry is already here when a previous import landed
     // it, known by its origin, or when it is this domain's own, come back in a bundle it
     // left in: its origin names this record and this domain, and the id it names is here.
+    // Presence is all that is compared: a bundle carrying another version of an entry
+    // this domain holds is skipped, not landed as a version, since the record's versions
+    // are written here and a bundle is a copy.
     let home = format!("bundle:{owner}/{into_domain}/");
     for mut entry in checked {
         let origin = entry.front.origin.clone().unwrap_or_else(|| {
@@ -223,11 +240,9 @@ pub async fn import(
                 manifest.exported_by, manifest.domain, entry.front.id
             )
         });
-        let own = match origin.strip_prefix(&home) {
-            Some(id) => store.get(into_domain, id).await?.is_some(),
-            None => false,
-        };
-        if own || index.by_origin(into_domain, &origin)?.is_some() {
+        if is_own(store, into_domain, origin.strip_prefix(&home)).await?
+            || index.by_origin(into_domain, &origin)?.is_some()
+        {
             out.skipped.push(entry.front.id.clone());
             continue;
         }
@@ -236,9 +251,9 @@ pub async fn import(
             entry.front.domain = into_domain.to_string();
         }
         // an id names one entry across the record, whichever domain holds it: a bundle's
-        // id that is in use here, in this domain or another, lands under a new one
-        if index.holds(&entry.front.id)? || store.get(into_domain, &entry.front.id).await?.is_some()
-        {
+        // id that is in use here, in this domain or another, lands under a new one. The
+        // record is asked, since the index can lag it and is what a reindex rebuilds.
+        if store.holds(&entry.front.id).await? {
             entry.front.id = dm_core::id::new_entry_id(into_domain);
         }
         if !same_owner {

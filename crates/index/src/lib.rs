@@ -576,24 +576,6 @@ impl Index {
             )
             .optional()?)
     }
-
-    /// Whether `id` is indexed, in any domain. An id names one entry across the record,
-    /// since `get` takes an id alone and this index is keyed by it, so an import that
-    /// would land a second entry under an id in use gives it another. Unfiltered, as
-    /// `by_origin` is, and for the same path.
-    ///
-    /// # Errors
-    ///
-    /// A database error.
-    pub fn holds(&self, id: &str) -> Result<bool, Error> {
-        Ok(self
-            .conn
-            .query_row("SELECT 1 FROM entries WHERE id = ?1", params![id], |_| {
-                Ok(())
-            })
-            .optional()?
-            .is_some())
-    }
 }
 
 #[cfg(test)]

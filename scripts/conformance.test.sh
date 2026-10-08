@@ -27,7 +27,7 @@ run() {
     (
         status=0
         FLAW="$flaw" FAKE_STATE="$work/$name.json" \
-            python3 "$script" --stdio "python3 $fake" --lease 1 --timeout 5 "$@" \
+            python3 "$script" --stdio "python3 $fake" --lease 2 --timeout 5 "$@" \
             >"$work/$name.out" 2>&1 || status=$?
         echo "$status" >"$work/$name.status"
     ) &
@@ -42,6 +42,10 @@ run search-everything search-everything --operator "python3 $fake operator"
 run search-bodies search-bodies --operator "python3 $fake operator"
 run second-claim second-claim
 run lease-forever lease-forever
+run heartbeat-noop heartbeat-noop
+run release-lies release-lies
+run complete-anyone complete-anyone
+run no-holder no-holder
 run import-trusts import-trusts --operator "python3 $fake operator"
 run highest-wrong highest-wrong --operator "python3 $fake operator"
 run reindex-forgets reindex-forgets --operator "python3 $fake operator" --drop-index "python3 $fake operator drop-index"
@@ -50,16 +54,19 @@ wait
 
 failures=0
 
-# expect <name> <exit status> <last line>: what the run must have ended with
+# expect <name> <exit status> <last line> [<words>]: what the run must have ended with,
+# and words its report must hold, so a failure at the right step is the right failure
 expect() {
     name=$1
     want_status=$2
     want_tail=$3
+    want_words=${4:-}
     got_status=$(cat "$work/$name.status")
     got_tail=$(tail -n 1 "$work/$name.out" | sed 's/, [0-9]* checks//')
-    if [ "$got_status" != "$want_status" ] || [ "$got_tail" != "$want_tail" ]; then
-        printf '%s: exit %s ending %s; wanted exit %s ending %s\n' \
-            "$name" "$got_status" "$got_tail" "$want_status" "$want_tail" >&2
+    if [ "$got_status" != "$want_status" ] || [ "$got_tail" != "$want_tail" ] ||
+        { [ -n "$want_words" ] && ! grep -qF -- "$want_words" "$work/$name.out"; }; then
+        printf '%s: exit %s ending %s; wanted exit %s ending %s holding %s\n' \
+            "$name" "$got_status" "$got_tail" "$want_status" "$want_tail" "${want_words:-anything}" >&2
         sed 's/^/    /' "$work/$name.out" >&2
         failures=$((failures + 1))
     fi
@@ -69,18 +76,22 @@ expect() {
 expect whole 0 '7 of 7 steps passed'
 expect surface 0 '5 of 7 steps passed; not run: 6, 7'
 # and each defect is reported at the step whose claim it breaks, the rest still running
-expect missing-tool 1 '6 of 7 steps passed; FAILED: 1'
-expect write-ignores-label 1 '1 of 7 steps passed; not run: 6, 7; could not run: 3, 4, 5; FAILED: 2'
-expect t0-forgets 1 '5 of 7 steps passed; FAILED: 3, 7'
-expect search-everything 1 '5 of 7 steps passed; FAILED: 4, 7'
-expect search-bodies 1 '6 of 7 steps passed; FAILED: 4'
-expect second-claim 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5'
-expect lease-forever 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5'
-expect import-trusts 1 '6 of 7 steps passed; FAILED: 6'
-expect highest-wrong 1 '6 of 7 steps passed; FAILED: 6'
-expect reindex-forgets 1 '6 of 7 steps passed; FAILED: 7'
+expect missing-tool 1 '6 of 7 steps passed; FAILED: 1' 'tools/list lacks heartbeat'
+expect write-ignores-label 1 '1 of 7 steps passed; not run: 6, 7; could not run: 3, 4, 5; FAILED: 2' "write at public came back 'internal'"
+expect t0-forgets 1 '5 of 7 steps passed; FAILED: 3, 7' 'T0 does not name the handoff'
+expect search-everything 1 '5 of 7 steps passed; FAILED: 4, 7' 'search for a word only the handoff carries found'
+expect search-bodies 1 '6 of 7 steps passed; FAILED: 4' 'search at summary depth returned a body'
+expect second-claim 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'a second claim_next while the lease holds returned a task'
+expect lease-forever 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat {"id": "task-fake-0004", "lease_seconds": 2} was answered, not refused'
+expect heartbeat-noop 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat did not renew it'
+expect release-lies 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'expecting the released task back from the pool'
+expect complete-anyone 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'complete {"id": "task-fake-0004", "handoff": "mem-fake-0002"} was answered, not refused'
+expect no-holder 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'the claimed task names no holder'
+expect import-trusts 1 '6 of 7 steps passed; FAILED: 6' 'import accepted an entry that does not match its digest'
+expect highest-wrong 1 '6 of 7 steps passed; FAILED: 6' 'the lines say'
+expect reindex-forgets 1 '6 of 7 steps passed; FAILED: 7' 'after reindex the ledger lost the completed task'
 # a server that never answers is reported, not waited on
-expect silent 1 '0 of 7 steps passed; not run: 6, 7; could not run: 2, 3, 4, 5; FAILED: 1'
+expect silent 1 '0 of 7 steps passed; not run: 6, 7; could not run: 2, 3, 4, 5; FAILED: 1' 'no reply within'
 
 # a command that cannot start is a report, not a traceback
 status=0

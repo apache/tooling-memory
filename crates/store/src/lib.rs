@@ -384,6 +384,23 @@ impl Store {
         Ok(ids)
     }
 
+    /// Whether `id` names a current entry in any domain of the record. An id names one
+    /// entry across the record, since a reader asks for one by id alone, so a copy that
+    /// would land under an id in use is given another; the record answers, not an index
+    /// that can lag it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadName`] for an id that cannot be a path, or a backend error.
+    pub async fn holds(&self, id: &str) -> Result<bool, Error> {
+        for domain in self.domains().await? {
+            if self.read_text(&current_path(&domain, id)?).await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Every domain with a directory in the record, sorted.
     ///
     /// # Errors

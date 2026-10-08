@@ -228,9 +228,10 @@ class Stdio(Session):
                 reply = json.loads(line)
             except ValueError:
                 raise Fail(f"not JSON on the server's output: {line.rstrip()!r}") from None
-            if reply.get("id") == message["id"]:
+            # a request or notification of the server's own carries a method, and may
+            # carry an id of its own numbering; only a reply to what was asked is one
+            if isinstance(reply, dict) and "method" not in reply and reply.get("id") == message["id"]:
                 return reply
-            # a notification or a request of the server's own: not what was asked
 
     def close(self):
         try:
@@ -277,10 +278,11 @@ class Http(Session):
             return None
         if "text/event-stream" in ctype:
             replies = []
-            for line in text.splitlines():
-                if line.startswith("data:"):
+            for event in text.replace("\r\n", "\n").split("\n\n"):
+                data = "\n".join(l[5:].strip() for l in event.split("\n") if l.startswith("data:"))
+                if data:
                     try:
-                        replies.append(json.loads(line[5:].strip()))
+                        replies.append(json.loads(data))
                     except ValueError:
                         pass
         else:
@@ -289,7 +291,7 @@ class Http(Session):
             except ValueError:
                 raise Fail(f"{message['method']}: not JSON: {text[:200]!r}") from None
         for reply in replies:
-            if isinstance(reply, dict) and reply.get("id") == message["id"]:
+            if isinstance(reply, dict) and "method" not in reply and reply.get("id") == message["id"]:
                 return reply
         return None
 
@@ -349,12 +351,37 @@ def parse_manifest(text):
     return top, entries
 
 
-def run_operator(prefix, args, what):
+def plain_name(path):
+    """A file name and nothing more: no separator, not hidden, as import reads one."""
+    return bool(path) and "/" not in path and "\\" not in path and not path.startswith(".")
+
+
+def frontmatter(text):
+    """The frontmatter block of an entry, between its two `---` lines."""
+    if not text.startswith("---\n"):
+        return ""
+    end = text.find("\n---", 4)
+    return text[4:end] if end != -1 else ""
+
+
+def when(stamp):
+    """An RFC 3339 time as seconds since the epoch, fractions and offsets allowed."""
+    import datetime
+
+    try:
+        return datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def run_operator(prefix, args, what, timeout):
     argv = shlex.split(prefix) + args
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, check=False)
+        done = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout)
     except OSError as e:
         raise NotRun(f"cannot run {prefix!r}: {e}") from None
+    except subprocess.TimeoutExpired:
+        raise Fail(f"{what}: {' '.join(argv)} did not finish within {timeout:g}s") from None
     return done
 
 
@@ -561,11 +588,29 @@ class Run:
         finally:
             s.close()
 
+    def claimed(self, payload, what, lease, expecting="a task"):
+        """The task a claim returned, held by someone, under a lease of about `lease`."""
+        t = task_of(payload, what)
+        self.check(t is not None, f"{what} found nothing claimable, expecting {expecting}")
+        self.check(t.get("status") == "claimed", f"{what}: a claimed task is {t.get('status')!r}")
+        self.check(t.get("holder"), f"{what}: the claimed task names no holder: {short(t)}")
+        until = when(str(payload.get("lease_until", "")))
+        self.check(until is not None, f"{what}: lease_until {payload.get('lease_until')!r} is not a time")
+        if until is not None:
+            ahead = until - time.time()
+            self.check(
+                0 < ahead <= lease + 5,
+                f"{what}: lease_until is {ahead:.0f}s ahead, for a lease of {lease}s",
+            )
+        return t
+
     # 5
     def step_tasks(self):
         self.need("domain", "handoff")
         d, h = self.state["domain"], self.state["handoff"]
         lease = self.opts.lease
+        if lease < 10:
+            print(f"   note: --lease {lease} is below the surface's floor of 10; a server holding the floor fails here")
         s = self.session()
         try:
             c = s.call("create_task", title=f"Finish the import {self.only}", body="The rest of it.", domain=d, priority=5)
@@ -577,15 +622,11 @@ class Run:
             s.refused("claim", id=tid, lease_seconds=lease)  # proposed: not yet claimable
             t = task_of(s.call("admit_task", id=tid), "admit_task")
             self.check(t.get("status") == "admitted", f"admit_task left it {t.get('status')!r}")
-            c = s.call("claim_next", domain=d, lease_seconds=lease)
-            t = task_of(c, "claim_next")
-            self.check(t is not None, "claim_next found nothing claimable after admit")
+            t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease, "the admitted task")
             self.check(
                 t.get("id") == tid,
                 f"claim_next returned {t.get('id')!r}, not the task filed; run against a record with no other admitted tasks",
             )
-            self.check(t.get("status") == "claimed", f"a claimed task is {t.get('status')!r}")
-            self.check(c.get("lease_until"), f"claim_next gives no lease_until: {short(c)}")
             self.check(
                 task_of(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next") is None,
                 "a second claim_next while the lease holds returned a task",
@@ -604,23 +645,35 @@ class Run:
             self.check(isinstance(tasks, list), f"list_tasks: no list in {short(done)}")
             self.check(tid in ids(tasks), "list_tasks completed lacks the task")
             self.state["task"] = tid
-            # a lease nobody renews is lost at expiry, and the task comes back
+            # a second task: its lease renewed past where it would have lapsed, then
+            # left to lapse, lost, returned to the pool, and given back with its handoff
             t2 = task_of(s.call("create_task", title=f"Left behind {self.only}", body="Claimed, then abandoned.", domain=d), "create_task")
             tid2 = t2["id"]
             s.call("admit_task", id=tid2)
-            c = s.call("claim_next", domain=d, lease_seconds=lease)
-            self.check(task_of(c, "claim_next").get("id") == tid2, "the second task was not claimed")
-            print(f"   waiting {lease + 2}s for the lease to lapse")
+            t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease)
+            self.check(t.get("id") == tid2, "the second task was not claimed")
+            print(f"   holding the lease across {lease}s with one heartbeat, then letting it lapse")
+            time.sleep(lease * 0.5)
+            s.call("heartbeat", id=tid2, lease_seconds=lease)
+            time.sleep(lease * 0.7)
+            self.check(
+                task_of(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next") is None,
+                "a renewed lease lapsed where the first one would have: heartbeat did not renew it",
+            )
             time.sleep(lease + 2)
             s.refused("heartbeat", id=tid2, lease_seconds=lease)
-            c = s.call("claim_next", domain=d, lease_seconds=lease)
-            t = task_of(c, "claim_next")
+            s.refused("complete", id=tid2, handoff=h)
+            t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease, "the task whose lease lapsed")
             self.check(
-                t is not None and t.get("id") == tid2,
-                f"an expired lease did not return the task to the pool: {short(c)}",
+                t.get("id") == tid2,
+                f"an expired lease did not return the task to the pool: {short(t)}",
             )
             t = task_of(s.call("release", id=tid2, handoff=h), "release")
             self.check(t.get("status") == "admitted", f"release left it {t.get('status')!r}")
+            t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease, "the released task back from the pool")
+            self.check(t.get("id") == tid2, "a released task did not come back from the pool")
+            self.check(t.get("handoff") == h, f"the released task came back with handoff {t.get('handoff')!r}, not the one left")
+            s.call("release", id=tid2)
             t = task_of(s.call("invalidate_task", id=tid2, reason="obsolete: conformance run"), "invalidate_task")
             self.check(t.get("status") == "invalidated", f"invalidate_task left it {t.get('status')!r}")
             self.check(
@@ -639,7 +692,7 @@ class Run:
         work = tempfile.mkdtemp(prefix="conformance-")
         try:
             bundle = os.path.join(work, "bundle")
-            done = run_operator(self.opts.operator, ["export", bundle], "export")
+            done = run_operator(self.opts.operator, ["export", bundle], "export", self.opts.timeout * 10)
             self.check(done.returncode == 0, f"export failed ({done.returncode}): {done.stderr.strip()[-300:]}")
             mpath = os.path.join(bundle, "manifest.yaml")
             self.check(os.path.isfile(mpath), "export wrote no manifest.yaml")
@@ -657,6 +710,10 @@ class Run:
                     self.check(m.get(key), f"a manifest line without {key}: {m}")
                 self.check(m["id"] not in seen, f"manifest lists {m['id']} twice")
                 seen.add(m["id"])
+                self.check(
+                    plain_name(m["path"]),
+                    f"manifest path {m['path']!r} is not a plain file name inside the bundle",
+                )
                 path = os.path.join(bundle, m["path"])
                 self.check(os.path.isfile(path), f"manifest names {m['path']}, which the bundle lacks")
                 with open(path, "rb") as f:
@@ -671,7 +728,7 @@ class Run:
                     f"{m['id']} is {m['classification']}, above max_label {top['max_label']}",
                 )
                 self.check(
-                    f"classification: {m['classification']}" in text.decode("utf-8", "replace"),
+                    f"classification: {m['classification']}" in frontmatter(text.decode("utf-8", "replace")),
                     f"{m['id']}: the manifest's classification is not the entry's",
                 )
                 if LABELS.index(m["classification"]) > LABELS.index(highest):
@@ -689,7 +746,7 @@ class Run:
             finally:
                 s.close()
             for n in (1, 2):
-                done = run_operator(self.opts.operator, ["import", bundle], "import")
+                done = run_operator(self.opts.operator, ["import", bundle], "import", self.opts.timeout * 10)
                 self.check(done.returncode == 0, f"import {n} failed ({done.returncode}): {done.stderr.strip()[-300:]}")
             # a tampered entry: the bundle is refused whole and the record is untouched
             forged = os.path.join(work, "forged")
@@ -697,7 +754,7 @@ class Run:
             victim = next(m for m in lines if m["id"] == h)
             with open(os.path.join(forged, victim["path"]), "a", encoding="utf-8") as f:
                 f.write("\nAn addition the manifest does not know.\n")
-            done = run_operator(self.opts.operator, ["import", forged], "import")
+            done = run_operator(self.opts.operator, ["import", forged], "import", self.opts.timeout * 10)
             self.check(done.returncode != 0, "import accepted an entry that does not match its digest")
             s = self.session()
             try:
@@ -717,7 +774,7 @@ class Run:
         self.need("domain", "handoff", "task")
         d, h, tid = self.state["domain"], self.state["handoff"], self.state["task"]
         if self.opts.drop_index:
-            done = run_operator(self.opts.drop_index, [], "drop-index")
+            done = run_operator(self.opts.drop_index, [], "drop-index", self.opts.timeout * 10)
             self.check(done.returncode == 0, f"--drop-index failed ({done.returncode}): {done.stderr.strip()[-300:]}")
             s = self.session()
             try:
@@ -725,7 +782,7 @@ class Run:
                 self.check(h not in found, "after --drop-index the handoff is still found; the index was not lost")
             finally:
                 s.close()
-        done = run_operator(self.opts.operator, ["reindex"], "reindex")
+        done = run_operator(self.opts.operator, ["reindex"], "reindex", self.opts.timeout * 10)
         self.check(done.returncode == 0, f"reindex failed ({done.returncode}): {done.stderr.strip()[-300:]}")
         s = self.session()
         try:
@@ -733,14 +790,20 @@ class Run:
             self.check(found == [h], f"after reindex, search finds {found}")
             t0 = s.call("t0", domain=d)
             self.check(h in t0, "after reindex, T0 lost the handoff")
-            t = task_of(s.call("get_task", id=tid), "get_task")
+            try:
+                t = task_of(s.call("get_task", id=tid), "get_task")
+            except ToolError as e:
+                raise Fail(f"after reindex the ledger lost the completed task: {e}") from None
             self.check(t.get("status") == "completed", f"after reindex the task is {t.get('status')!r}")
             done_tasks = s.call("list_tasks", domain=d, status="completed")
             tasks = done_tasks.get("tasks") if isinstance(done_tasks, dict) else done_tasks
             self.check(tid in ids(tasks or []), "after reindex the ledger lost the completed task")
         finally:
             s.close()
-        print("   rebuilt from the record" + ("" if self.opts.drop_index else " (no --drop-index: the loss was not shown)"))
+        print(
+            "   the index rebuilt from the record, the ledger replayed"
+            + ("" if self.opts.drop_index else " (no --drop-index: the loss was not shown)")
+        )
 
 
 STEPS = [
@@ -761,7 +824,7 @@ def main(argv):
     how.add_argument("--url", metavar="URL", help="an MCP endpoint over streamable HTTP")
     p.add_argument("--operator", metavar="CMD", help="a command run with `export <dir>`, `import <dir>` and `reindex` appended")
     p.add_argument("--drop-index", metavar="CMD", help="a command that loses the server's derived state, for step 7")
-    p.add_argument("--domain", help="the domain to run in; default: the first with a T0 resource")
+    p.add_argument("--domain", help="the domain to run in; default: the first with a T0 resource. The operator's verbs act on the server's default domain, so steps 6 and 7 want that one")
     p.add_argument("--lease", type=int, default=10, help="lease seconds for step 5; the surface's floor is 10 (default)")
     p.add_argument("--timeout", type=float, default=30, help="seconds to wait for any one answer (default 30)")
     opts = p.parse_args(argv)
@@ -784,6 +847,10 @@ def main(argv):
             continue
         except ToolError as e:
             print(f"   FAIL: the server refused: {e}")
+            failed.append(n)
+            continue
+        except Exception as e:  # noqa: BLE001  an answer of a shape no check expected
+            print(f"   FAIL: an answer of an unexpected shape: {type(e).__name__}: {e}")
             failed.append(n)
             continue
         passed += 1

@@ -2491,9 +2491,9 @@ mod tests {
         grant_domain(&root, "dom-x");
         let m = Memory::open(&root).unwrap();
         let x = m.import(&out, Some("dom-x")).await.unwrap();
+        assert_eq!(x.written.len(), 1, "{x:?}");
         assert_ne!(
-            x.written,
-            std::slice::from_ref(&w.id),
+            x.written[0], w.id,
             "another domain's copy has an id of its own"
         );
         assert_eq!(
@@ -2508,6 +2508,50 @@ mod tests {
         let back = m.import(&round, Some("dom-me")).await.unwrap();
         assert_eq!((back.written.len(), back.skipped.len()), (0, 1), "{back:?}");
         assert_eq!(m.list(Some("dom-me"), None, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_import_learns_which_ids_are_in_use_from_the_record_not_the_index() {
+        // the index can lag the record, which is what reindex is for; an import in that
+        // window must still give a copy its own id, or the record ends with two entries
+        // under one id and the index, keyed by id, can show only one of them
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let m = mem(&root);
+        let w = m.write(req("Known here.\n")).await.unwrap();
+        let out = dir.path().join("out");
+        m.export(Some("dom-me"), Label::Internal, &out)
+            .await
+            .unwrap();
+        grant_domain(&root, "dom-x");
+        drop(m);
+        std::fs::remove_file(root.join("state/index.db")).unwrap();
+        let m = Memory::open(&root).unwrap();
+        let x = m.import(&out, Some("dom-x")).await.unwrap();
+        assert_eq!(x.written.len(), 1, "{x:?}");
+        assert_ne!(x.written[0], w.id, "the copy has an id of its own");
+        m.reindex().await.unwrap();
+        assert_eq!(m.list(Some("dom-me"), None, 10).await.unwrap().len(), 1);
+        assert_eq!(m.list(Some("dom-x"), None, 10).await.unwrap().len(), 1);
+        // a foreign bundle whose origin claims an id of ours that is not a name is not
+        // ours, and not a refusal of the whole bundle either
+        let forged = dir.path().join("forged");
+        std::fs::create_dir_all(&forged).unwrap();
+        let text = "---\nid: mem-f-forged01\ntype: fact\ndomain: dom-f\nauthor: human:test:eve\ncreated: 2026-10-01T09:00:00Z\ntrust_tier: raw\nclassification: internal\norigin: \"bundle:human:test:me/dom-x/../../etc\"\n---\n# Forged\n\nForged.\n";
+        std::fs::write(forged.join("mem-f-forged01.md"), text).unwrap();
+        let mut manifest =
+            dm_core::manifest::Manifest::new("dom-f", "human:test:eve", Label::Internal);
+        manifest
+            .push(dm_core::manifest::ManifestEntry {
+                id: "mem-f-forged01".into(),
+                path: "mem-f-forged01.md".into(),
+                digest: dm_core::digest(text),
+                classification: Label::Internal,
+            })
+            .unwrap();
+        std::fs::write(forged.join("manifest.yaml"), manifest.to_yaml()).unwrap();
+        let f = m.import(&forged, Some("dom-x")).await.unwrap();
+        assert_eq!((f.written.len(), f.skipped.len()), (1, 0), "{f:?}");
     }
 
     #[tokio::test]
