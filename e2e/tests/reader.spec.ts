@@ -20,4 +20,5 @@ test('nothing matching says so, and how to see more', async ({ signedIn: page })
   await page.locator('#handling').selectOption('public');
   await page.locator('#q').fill('horizon');
   await expect(page.locator('#empty')).toContainText('Nothing matches horizon at public or below');
+  await expect(page.locator('#empty')).toContainText('raise the handling');
 });

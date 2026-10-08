@@ -11,7 +11,9 @@ test('the bar names the harness, the model and the profile', async ({ signedIn: 
   const facts = page.getByRole('definition');
   await expect(page.locator('#facts')).toContainText('Harness');
   await expect(facts.filter({ hasText: 'claude' }).first()).toBeVisible();
-  await expect(facts.filter({ hasText: 'qwen3.8-27b' })).toHaveCount(1);
+  // what the launcher reports wins over what was asked for, which it has resolved
+  await expect(facts.filter({ hasText: 'model-the-launcher-reports' })).toHaveCount(1);
+  await expect(facts.filter({ hasText: 'qwen3.8-27b' })).toHaveCount(0);
   await expect(page.locator('#facts')).toContainText('Profile');
   const info = await sessionInfo(page);
   expect(info.launch.profile).toBe('claude');

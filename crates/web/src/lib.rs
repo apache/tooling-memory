@@ -978,6 +978,18 @@ async fn complete_task(
         Ok(t) => t,
         Err(e) => return task_error(&e),
     };
+    // a task that cannot be completed gets no handoff written for it: the entry would
+    // stay in the record, citing nothing
+    if task.status != dm_ledger::Status::Claimed {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "{id} is {:?}; only a claimed task is completed",
+                task.status
+            ),
+        )
+            .into_response();
+    }
     let written = app
         .memory
         .write(dm_server::WriteRequest {
@@ -1844,6 +1856,20 @@ mod tests {
         assert_eq!(all["tasks"][0]["status"], "proposed");
         let (status, _) = http(addr, "POST", &format!("/api/tasks/{id}/admit"), None).await;
         assert_eq!(status, 200);
+        // a task that is not claimed is not completed, and no handoff is left behind
+        let (status, _) = http(
+            addr,
+            "POST",
+            &format!("/api/tasks/{id}/complete"),
+            Some(r#"{"handoff":"too early"}"#),
+        )
+        .await;
+        assert_eq!(status, 409);
+        let (_, listed) = get_json(addr, "/api/entries").await;
+        assert!(
+            !listed.to_string().contains("Handoff:"),
+            "a refused completion wrote a handoff: {listed}"
+        );
         // the board is a person, so a task that requires one is claimable from it
         let (status, body) = http(addr, "POST", &format!("/api/tasks/{id}/claim"), None).await;
         assert_eq!(status, 200, "{body}");

@@ -121,6 +121,13 @@ try { const s = localStorage, r = document.documentElement; if (s.getItem('amem-
 <script src="vendor/purify.min.js"></script>
 <script src="amem.js"></script>
 <script>
+// an entry's body is anyone's text, an agent's or a bundle's: Markdown, with no styles,
+// no forms and no remote images, so it can neither restyle the page around it nor call
+// out from it
+const SANITIZE = { FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select', 'option'], FORBID_ATTR: ['style'] };
+DOMPurify.addHook('afterSanitizeAttributes', (n) => {
+  if (n.tagName === 'IMG' && !/^data:image\//i.test(n.getAttribute('src') || '')) n.removeAttribute('src');
+});
 // ---- small DOM helpers: what the API says is only ever set as text ----
 const $ = (id) => document.getElementById(id);
 const NS = 'http://www.w3.org/2000/svg';
@@ -372,7 +379,7 @@ async function open(entryId, why) {
   meta.hidden = false;
   const body = $('body');
   // an entry is somebody's Markdown: rendered, then stripped of scripts and handlers
-  body.innerHTML = DOMPurify.sanitize(marked.parse(e.body));
+  body.innerHTML = DOMPurify.sanitize(marked.parse(e.body), SANITIZE);
   const blocks = body.querySelectorAll('pre code.language-mermaid');
   for (const b of blocks) { const d = el('div', 'mermaid'); d.textContent = b.textContent; b.parentElement.replaceWith(d); }
   if (blocks.length) { try { await mermaid.run({ nodes: body.querySelectorAll('.mermaid') }); } catch (err) { console.warn(err); } }

@@ -120,12 +120,12 @@ pub fn builtin() -> BTreeMap<String, Profile> {
 }
 
 /// The profiles under `root`: the file's, and the harnesses' own where the file does not
-/// name them.
+/// name them. A profile may not take a command's name, which would always win over it.
 ///
 /// # Errors
 ///
 /// When the file is there and does not parse, or names a profile badly.
-pub fn load(root: &Path) -> Result<BTreeMap<String, Profile>, String> {
+pub fn load(root: &Path, commands: &[String]) -> Result<BTreeMap<String, Profile>, String> {
     let mut all = builtin();
     let path = root.join(FILE);
     let text = match std::fs::read_to_string(&path) {
@@ -136,6 +136,13 @@ pub fn load(root: &Path) -> Result<BTreeMap<String, Profile>, String> {
     let named: BTreeMap<String, Profile> =
         toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     for (name, p) in named {
+        if commands.contains(&name) {
+            return Err(format!(
+                "{}: `{name}` is a command, so `amem {name}` would never reach the profile; \
+                 give it another name",
+                path.display()
+            ));
+        }
         if !valid_name(&name) {
             return Err(format!(
                 "{}: `{name}` is not a profile name: lowercase letters, digits, - and _, \
@@ -344,7 +351,7 @@ mod tests {
             "[nightly]\nharness = \"codex\"\nauth = \"gateway\"\nmodel = \"m1\"\nsubagents = \"board\"\n",
         )
         .unwrap();
-        load(dir.path()).unwrap()
+        load(dir.path(), &commands()).unwrap()
     }
 
     #[test]
@@ -489,13 +496,17 @@ mod tests {
     fn a_bad_file_or_name_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FILE), "[Bad]\nharness = \"codex\"\n").unwrap();
-        assert!(load(dir.path()).unwrap_err().contains("not a profile name"));
+        assert!(load(dir.path(), &commands())
+            .unwrap_err()
+            .contains("not a profile name"));
         std::fs::write(
             dir.path().join(FILE),
             "[ok]\nharness = \"codex\"\ncolour = \"red\"\n",
         )
         .unwrap();
-        assert!(load(dir.path()).unwrap_err().contains("colour"));
+        assert!(load(dir.path(), &commands())
+            .unwrap_err()
+            .contains("colour"));
         assert!(
             valid_name("night-1") && !valid_name("../x") && !valid_name("1x") && !valid_name("")
         );

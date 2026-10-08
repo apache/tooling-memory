@@ -7,8 +7,9 @@ set -eu
 here=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 out=${1:-$here/target/hosted}
 static=$here/crates/web/static
-# only a directory this script made is replaced: it leaves .nojekyll in each one
-if [ -e "$out" ] && [ ! -e "$out/.nojekyll" ] && [ -n "$(ls -A "$out")" ]; then
+# only a directory this script made is replaced: it leaves a marker of its own in each
+# one (.nojekyll would not do: every hand-made Pages site has one)
+if [ -e "$out" ] && [ ! -e "$out/.amem-hosted" ] && [ -n "$(ls -A "$out")" ]; then
     echo "$out is there and was not made by this script; give an empty or new directory" >&2
     exit 2
 fi
@@ -21,4 +22,5 @@ cp "$static"/vendor/* "$out/vendor/"
 cp "$static"/reader/* "$out/reader/"
 # a host that runs Jekyll would drop the files it does not know
 : > "$out/.nojekyll"
+: > "$out/.amem-hosted"
 echo "hosted pages in $out"

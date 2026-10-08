@@ -152,6 +152,13 @@
 <!-- served by amem, the page carries this browser's key to it; a static copy has no amem.js and needs none -->
 <script src="amem.js"></script>
 <script type="module">
+// an entry's body is anyone's text, an agent's or a bundle's: Markdown, with no styles,
+// no forms and no remote images, so it can neither restyle the page around it nor call
+// out from it
+const SANITIZE = { FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select', 'option'], FORBID_ATTR: ['style'] };
+DOMPurify.addHook('afterSanitizeAttributes', (n) => {
+  if (n.tagName === 'IMG' && !/^data:image\//i.test(n.getAttribute('src') || '')) n.removeAttribute('src');
+});
 // `/api/...` and `/bundle/...` are the server's, through the page's key; a static copy has
 // no amem.js, and fetches what it is given as written
 const get = (u) => (window.amem ? window.amem.fetch(u) : fetch(u));
@@ -417,7 +424,7 @@ function open(id) {
     e.supersedes ? el('span', null, 'supersedes ', el('span', 'am-id', e.supersedes)) : null);
   const body = el('div', 'am-prose');
   // an entry is somebody's Markdown: rendered, then stripped of scripts and handlers
-  body.innerHTML = DOMPurify.sanitize(marked.parse(e.body));
+  body.innerHTML = DOMPurify.sanitize(marked.parse(e.body), SANITIZE);
   // a link to another entry opens it here
   for (const a of body.querySelectorAll('a')) {
     const m = /^(mem-[a-z0-9-]+)$/.exec(a.getAttribute('href') || '');

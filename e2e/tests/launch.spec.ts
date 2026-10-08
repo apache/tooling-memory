@@ -133,3 +133,9 @@ test('a killed session says it exited', async ({ signedIn: page }) => {
   await page.goto('/');
   await expect(page.locator(`a[href="session.html?id=${id}"]`)).toContainText('exited');
 });
+
+test('the preview quotes what a shell would read as a redirect', async ({ signedIn: page }) => {
+  await page.locator('#harness').selectOption('claude');
+  await page.locator('#prompt').fill('fix>notes.md');
+  await expect(page.locator('#cmd')).toContainText("--prompt 'fix>notes.md'");
+});

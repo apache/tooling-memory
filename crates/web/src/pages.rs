@@ -102,31 +102,97 @@ mod tests {
         }
     }
 
+    /// Whether `s` holds a hex colour: `#` and 3, 4, 6 or 8 hex digits, ending there,
+    /// and not an anchor in an address.
+    fn hex_colour(s: &str) -> bool {
+        let b = s.as_bytes();
+        (0..b.len()).any(|i| {
+            if b[i] != b'#' || s[..i].ends_with("href=\"") || s[..i].ends_with("href='") {
+                return false;
+            }
+            let n = b[i + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .count();
+            matches!(n, 3 | 4 | 6 | 8) && b[i + 1..=i + n].iter().all(u8::is_ascii_hexdigit)
+        })
+    }
+
+    /// A colour function or a colour by name, in CSS: a page's styles, or a style attribute.
+    fn named_colour(css: &str) -> Option<&'static str> {
+        const FUNCTIONS: [&str; 10] = [
+            "rgb(",
+            "rgba(",
+            "hsl(",
+            "hsla(",
+            "hwb(",
+            "lab(",
+            "lch(",
+            "oklab(",
+            "oklch(",
+            "color-mix(",
+        ];
+        const NAMES: [&str; 7] = ["white", "black", "gray", "grey", "red", "blue", "green"];
+        // a name is a whole word of the CSS, not part of `border` or `required`
+        FUNCTIONS.into_iter().find(|f| css.contains(f)).or_else(|| {
+            css.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .find_map(|w| NAMES.into_iter().find(|n| *n == w))
+        })
+    }
+
+    #[test]
+    fn the_colour_check_sees_colours_and_not_anchors() {
+        for colour in ["#abc;", "#abcd ", "#a0b1c2;", "#aabbccdd)", "color: #FFF;"] {
+            assert!(hex_colour(colour), "{colour}");
+        }
+        for not in [
+            "href=\"#bad\"",
+            "#abcde;",
+            "#ghi;",
+            "issue #12",
+            "#main-nav",
+        ] {
+            assert!(!hex_colour(not), "{not}");
+        }
+        for f in [
+            "rgba(0,0,0,.5)",
+            "hsla(1,2%,3%,.1)",
+            "oklch(50% 0.1 20)",
+            "color: red",
+        ] {
+            assert!(named_colour(f).is_some(), "{f}");
+        }
+        assert_eq!(named_colour("color: var(--am-ink)"), None);
+        assert_eq!(
+            named_colour("border: 1px solid var(--am-rule); required"),
+            None
+        );
+    }
+
     #[test]
     fn the_pages_take_every_colour_from_the_tokens() {
-        let hex = |s: &str| {
-            s.as_bytes().windows(5).any(|w| {
-                w[0] == b'#'
-                    && w[1..4].iter().all(u8::is_ascii_hexdigit)
-                    && !w[4].is_ascii_alphanumeric()
-            }) || s.as_bytes().windows(8).any(|w| {
-                w[0] == b'#'
-                    && w[1..7].iter().all(u8::is_ascii_hexdigit)
-                    && !w[7].is_ascii_alphanumeric()
-            })
-        };
         for (name, page) in PAGES {
-            assert!(!hex(page), "{name} has a colour of its own");
-            // a colour by name, in the page's own styles; the terminal's ANSI names are
-            // keys of the theme read from the tokens, not colours
+            assert!(!hex_colour(page), "{name} has a colour of its own");
+            // the page's own styles and every style attribute; the terminal's ANSI names
+            // in its script are keys of the theme read from the tokens, not colours
             let styles = page
                 .split("<style>")
                 .skip(1)
                 .filter_map(|s| s.split("</style>").next());
-            for css in styles {
-                for f in ["rgb(", "hsl(", "white", "black", "gray", "grey"] {
-                    assert!(!css.contains(f), "{name} names a colour: {f}");
+            let attributes = page
+                .split("style=\"")
+                .skip(1)
+                .filter_map(|s| s.split('"').next());
+            for css in styles.chain(attributes) {
+                if let Some(f) = named_colour(css) {
+                    panic!("{name} names a colour: {f}");
                 }
+            }
+            for f in ["rgb(", "rgba(", "hsl(", "hsla(", "oklch(", "color-mix("] {
+                assert!(
+                    !page.contains(f),
+                    "{name} builds a colour in its script: {f}"
+                );
             }
         }
     }

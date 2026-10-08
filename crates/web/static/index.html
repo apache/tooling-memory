@@ -228,7 +228,8 @@ for (const b of document.querySelectorAll('[data-copy]')) {
 }
 
 // what a page says when it has no key; a hosted copy also says where amem has to run
-const unpairedWhy = () => { const w = amem.unpaired(); return amem.hosted && !/own machine/.test(w) ? `${w} This copy of the pages runs in your browser and talks to amem on your own machine: run amem there, and it opens this page paired.` : w; };
+let unreach = '';
+const unpairedWhy = () => { if (unreach) return unreach; const w = amem.unpaired(); return amem.hosted && !/own machine/.test(w) ? `${w} This copy of the pages runs in your browser and talks to amem on your own machine: run amem there, and it opens this page paired.` : w; };
 // ---- pairing ----
 let paired = false;
 function showPairing() {
@@ -287,8 +288,14 @@ async function load() {
   paired = amem.paired();
   if (paired) {
     const r = await amem.fetch('/api/options').catch(() => null);
-    if (!r || !r.ok) paired = false;
-    else options = await r.json();
+    if (!r || !r.ok) {
+      paired = false;
+      // not reaching the server, or being refused by it, is not the same as not being paired
+      let where = amem.server() || location.origin;
+      try { where = new URL(where).host; } catch (_) { /* as it is */ }
+      if (!r) unreach = `amem is not answering at ${where}. Is it running? Run amem, and it opens this page paired.`;
+      else if (r.status === 403) unreach = `amem at ${where} refuses this page: start it with amem --hosted ${location.origin}/ to let this copy in.`;
+    } else options = await r.json();
   }
   showPairing();
   if (!paired) return;
@@ -502,7 +509,7 @@ function body() {
   return b;
 }
 
-const quote = (s) => (/^[A-Za-z0-9_./:=@%+<>-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+const quote = (s) => (/^[A-Za-z0-9_./:=@%+-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
 function preview() {
   if (!options) return;
   const b = body();

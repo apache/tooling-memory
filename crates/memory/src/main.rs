@@ -868,12 +868,7 @@ fn body_or_stdin(body: Option<String>) -> std::io::Result<String> {
 /// The command line, with any profile it names spelled out as flags, parsed. The root is
 /// found as `Cli` finds it: `--root`, `MEMORY_ROOT`, then `~/memory`.
 fn parse_with_profiles(args: Vec<OsString>) -> Result<Cli, String> {
-    // clap's own `help` is a command too, though it is not listed until the parser is built
-    let commands: Vec<String> = Cli::command()
-        .get_subcommands()
-        .map(|c| c.get_name().to_string())
-        .chain(std::iter::once("help".to_string()))
-        .collect();
+    let commands = command_words();
     let root = profiles_root(&args);
     let cli = Cli::command();
     // which of a command's flags take a value, as its definition says
@@ -884,10 +879,20 @@ fn parse_with_profiles(args: Vec<OsString>) -> Result<Cli, String> {
             .is_some_and(|a| a.get_action().takes_values())
     };
     let argv = profiles::expand(args, &commands, &takes_value, || match &root {
-        Some(r) => profiles::load(r),
+        Some(r) => profiles::load(r, &commands),
         None => Ok(profiles::builtin()),
     })?;
     Ok(Cli::parse_from(argv))
+}
+
+/// The words that are commands, which no profile may take: clap's own `help` too, though
+/// it is not listed until the parser is built.
+fn command_words() -> Vec<String> {
+    Cli::command()
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .chain(std::iter::once("help".to_string()))
+        .collect()
 }
 
 /// The root a command line names, before it is parsed.
@@ -1053,7 +1058,9 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Hook { .. } => unreachable!("handled in main before the root is needed"),
         cmd @ Command::Web { .. } => web_cmd(&root, cmd).await,
         Command::Doctor { json, offline } => doctor::run(&root, &at_start, json, offline).await,
-        Command::Profiles { json: as_json } => profiles::show(&profiles::load(&root)?, as_json),
+        Command::Profiles { json: as_json } => {
+            profiles::show(&profiles::load(&root, &command_words())?, as_json)
+        }
         cmd @ (Command::Mine { .. }
         | Command::Models { .. }
         | Command::WslcApiCheck { .. }

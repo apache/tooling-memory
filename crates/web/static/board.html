@@ -186,6 +186,7 @@ $('error-close').addEventListener('click', () => { $('error').hidden = true; });
 // what a page says when it has no key; a hosted copy also says where amem has to run
 const unpairedWhy = () => { const w = amem.unpaired(); return amem.hosted && !/own machine/.test(w) ? `${w} This copy of the pages runs in your browser and talks to amem on your own machine: run amem there, and it opens this page paired.` : w; };
 let paired = false;
+let boardDomain = '';
 function showPairing() {
   const end = $('pairing');
   if (paired) {
@@ -210,6 +211,7 @@ async function refresh() {
   let data;
   try { data = await api('GET', '/api/tasks'); } catch (e) { if (paired) fail('The board did not load.', e.message); return; }
   $('domain').textContent = data.domain ? `Domain ${data.domain}.` : '';
+  boardDomain = data.domain || '';
   all = data.tasks;
   const byId = new Map(all.map((t) => [t.id, t]));
   const depth = (t) => { let d = 0, p = parentOf(t); const seen = new Set(); while (p && byId.has(p) && !seen.has(p)) { seen.add(p); d++; p = parentOf(byId.get(p)); } return d; };
@@ -250,7 +252,9 @@ function render(t, d, open) {
   if (t.holder) meta.append(el('span', null, `held by ${t.holder}`));
   if (t.handoff) {
     const a = el('a', null, id(t.handoff));
-    a.href = `reader.html#${encodeURIComponent(t.handoff)}`;
+    // the reader, on this domain's bundle at the owner's handling, opened at the handoff
+    const q = new URLSearchParams({ handling: 'restricted', bundle: `/bundle/${boardDomain}/restricted`, open: t.handoff });
+    a.href = `reader.html?${q}`;
     meta.append(el('span', null, 'handoff ', a));
   }
   if (t.reason) meta.append(el('span', null, t.reason));

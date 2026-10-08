@@ -30,6 +30,12 @@ test('a task for a person is filed, admitted, claimed and completed with a hando
   const done = page.getByRole('region', { name: /^Completed/ }).locator('.am-task', { hasText: 'Read the pane test handoff' });
   await expect(done).toContainText('handoff mem-');
   await expect(done.getByRole('img', { name: 'completed' })).toBeVisible();
+  // the handoff opens in the reader, on this domain's bundle, at the entry
+  const link = done.getByRole('link', { name: /^mem-/ });
+  const href = await link.getAttribute('href');
+  expect(href).toMatch(/^reader\.html\?/);
+  await link.click();
+  await expect(page.locator('#entry')).toContainText('Read it; nothing remains');
 });
 
 test('a task title is shown as text, never run as markup', async ({ signedIn: page }) => {
