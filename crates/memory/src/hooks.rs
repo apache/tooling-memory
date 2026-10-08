@@ -90,10 +90,12 @@ impl HookInput {
                 .unwrap_or(Value::Null);
             return (name, input);
         }
-        (
-            self.tool_name.clone().unwrap_or_default(),
-            self.tool_input.clone(),
-        )
+        // Copilot may hand the arguments as a JSON string; the object inside is the input
+        let input = match &self.tool_input {
+            Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
+            other => other.clone(),
+        };
+        (self.tool_name.clone().unwrap_or_default(), input)
     }
 }
 
@@ -278,7 +280,6 @@ fn searches(tool: &str) -> bool {
             | "search_files"
             | "search_file_content"
             | "list_directory"
-            | "list"
             | "grep_search"
             | "grep_files"
             | "find_by_name"
@@ -326,6 +327,14 @@ where
     let Some(path) = path_of(input) else {
         if reads_many_into(tool, input, &projection) {
             return Decision::Deny(whole_of(&projection));
+        }
+        // a tool the hook watches whose input it cannot read is refused, not waved
+        // through for want of a path it could not see
+        if !input.is_object() && (reads_one(tool) || searches(tool) || globs(tool)) {
+            return Decision::Deny(format!(
+                "the memory's hook could not read {tool}'s input as an object, so the call \
+                 is refused; a smaller call, or the memory's `search` and `get` tools, will do"
+            ));
         }
         return Decision::Allow;
     };
@@ -829,6 +838,34 @@ fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+/// The note's file name in the outbox. A harness whose end fires once a session keeps
+/// every note, named by the time; one whose end fires every turn, agy's and OpenCode's,
+/// has one note a session, named by the whole session id, since OpenCode's ids share
+/// their first characters for minutes at a time, with anything that is not a file name
+/// character made one.
+#[must_use]
+pub fn note_name(harness: &str, session_id: &str, event: Event, stamp: i128) -> String {
+    if per_session_note(harness) && event == Event::SessionEnd {
+        let prefix = if harness == "antigravity" {
+            "agy"
+        } else {
+            harness
+        };
+        let id: String = session_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        return format!("{prefix}-{id}-{}.md", event.suffix());
+    }
+    format!("{stamp}-{}.md", event.suffix())
+}
+
 /// Run as the hook: read the event from standard input; before a tool, decide and say
 /// so on standard output; otherwise leave a note in the outbox. Exit 0 whatever
 /// happens, so a hook never blocks the harness.
@@ -884,22 +921,7 @@ pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
     let (_, body) = note(&input, event, &tail);
     std::fs::create_dir_all(outbox)?;
     let stamp = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
-    // agy's Stop and OpenCode's idle fire at the end of every turn, not once a session:
-    // the note is named by the session and rewritten, so the outbox holds the last one
-    let name = if per_session_note(harness) && event == Event::SessionEnd {
-        let prefix = if harness == "antigravity" {
-            "agy"
-        } else {
-            harness
-        };
-        format!(
-            "{prefix}-{}-{}.md",
-            short(&input.session_id),
-            event.suffix()
-        )
-    } else {
-        format!("{stamp}-{}.md", event.suffix())
-    };
+    let name = note_name(harness, &input.session_id, event, stamp);
     let tmp = outbox.join(format!("{name}.tmp"));
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, outbox.join(name))?;
@@ -1457,7 +1479,7 @@ not json
     // the hook runs inside the Linux sandbox; these are unix paths
     #[cfg(unix)]
     #[test]
-    fn copilot_and_opencode_are_answered_in_their_own_shapes_and_known_by_their_tools() {
+    fn copilot_and_opencode_are_answered_in_their_own_shapes() {
         // Copilot CLI, configured with the PascalCase events, sends Claude's payload and
         // reads a top-level permission decision; silence is the default behaviour
         let v: Value =
@@ -1479,11 +1501,18 @@ not json
             (Some("deny"), Some("why"))
         );
         assert_eq!(Decision::Allow.output("opencode"), None);
-        // OpenCode's idle event fires at the end of every turn, as agy's Stop does: one
-        // note a session, rewritten
-        assert!(per_session_note("opencode") && per_session_note("antigravity"));
-        assert!(!per_session_note("claude") && !per_session_note("copilot"));
-        // OpenCode's tools: read takes filePath, list a path, glob and grep a pattern
+        // Copilot may hand the arguments as a JSON string; the hook reads it as the object
+        let input = HookInput::parse(
+            r#"{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Read","tool_input":"{\"path\":\"/memory/dom-me/mem-me-abc1.md\"}"}"#,
+        )
+        .unwrap();
+        let (_, args) = input.tool();
+        assert_eq!(args["path"], "/memory/dom-me/mem-me-abc1.md");
+    }
+
+    #[test]
+    fn opencode_s_tools_are_known_and_an_unreadable_input_is_refused() {
+        // OpenCode's read takes filePath; a directory read is its listing
         let view = Path::new("/memory");
         let mut asked = Vec::new();
         let d = decide(
@@ -1502,11 +1531,11 @@ not json
         );
         assert!(matches!(
             decide(
-                "list",
-                &serde_json::json!({ "path": "/memory/dom-me" }),
+                "read",
+                &serde_json::json!({ "filePath": "/memory/dom-me" }),
                 view,
                 SID,
-                |_| panic!("a list is not a get")
+                |_| panic!("a directory is not a get")
             ),
             Decision::Deny(_)
         ));
@@ -1520,6 +1549,60 @@ not json
             ),
             Decision::Deny(_)
         ));
+        // a file tool whose input the hook cannot read as an object is refused, not
+        // waved through for want of a path
+        assert!(matches!(
+            decide(
+                "Read",
+                &serde_json::json!("not an object"),
+                view,
+                SID,
+                |_| panic!()
+            ),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            decide("Bash", &serde_json::json!("ls"), view, SID, |_| panic!()),
+            Decision::Allow,
+            "a tool the hook does not watch is not its business"
+        );
+    }
+
+    #[test]
+    fn a_note_is_one_a_session_where_the_end_fires_every_turn() {
+        // OpenCode's idle event fires at the end of every turn, as agy's Stop does
+        assert!(per_session_note("opencode") && per_session_note("antigravity"));
+        assert!(!per_session_note("claude") && !per_session_note("copilot"));
+        // one note a session means one per session id, not per its first characters:
+        // OpenCode's ids share their first eight for minutes at a time
+        let a = note_name(
+            "opencode",
+            "ses_7f3a1b2c3d4e5fABCDEFGHIJKL",
+            Event::SessionEnd,
+            1,
+        );
+        let b = note_name(
+            "opencode",
+            "ses_7f3a1b2c3d4e5fMNOPQRSTUVWX",
+            Event::SessionEnd,
+            2,
+        );
+        assert_ne!(a, b);
+        assert!(
+            a.ends_with("-sessionend.md") && a.starts_with("opencode-"),
+            "{a}"
+        );
+        assert_eq!(
+            note_name("opencode", "ses_x", Event::SessionEnd, 3),
+            note_name("opencode", "ses_x", Event::SessionEnd, 4),
+            "the same session rewrites its note"
+        );
+        assert_ne!(
+            note_name("claude", "s", Event::SessionEnd, 3),
+            note_name("claude", "s", Event::SessionEnd, 4),
+            "a harness whose end fires once keeps every note"
+        );
+        assert!(!note_name("opencode", "../x/y", Event::SessionEnd, 1).contains('/'));
     }
 
     #[test]

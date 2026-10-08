@@ -1424,7 +1424,8 @@ fn setup_copilot(
     write(&req.home.join(".copilot/mcp-config.json"), &mcp.to_string())?;
     // hooks in Copilot's own file under COPILOT_HOME, with the PascalCase event names
     // so the payload is Claude's, hook_event_name, tool_name and tool_input in Claude's
-    // spellings; the timeout is in seconds, and a command hook that errors denies
+    // spellings, and PreCompact's carries the transcript's path; the timeout is in
+    // seconds, and a command hook that errors denies
     let hook = serde_json::json!([{
         "type": "command",
         "bash": format!("{INSIDE_MEMORY} hook copilot"),
@@ -1432,7 +1433,7 @@ fn setup_copilot(
     }]);
     let hooks = serde_json::json!({
         "version": 1,
-        "hooks": { "PreToolUse": hook, "SessionEnd": hook }
+        "hooks": { "PreToolUse": hook, "PreCompact": hook, "SessionEnd": hook }
     });
     write(
         &req.home.join(".copilot/hooks/memory.json"),
@@ -1518,9 +1519,10 @@ fn setup_opencode_copilot(
 /// so the launcher writes one that hands the three events to the memory's hook as the
 /// other harnesses' hook files do: a tool call before it runs, with the decision's
 /// reason thrown to refuse it; compaction before it starts; and the end of a turn,
-/// which is OpenCode's nearest thing to a session's end. The transcript is written
-/// from the session's messages, one turn a line in the shape the tail reader knows,
-/// since OpenCode keeps its own as one file per part.
+/// which is OpenCode's nearest thing to a session's end. The transcript is kept from
+/// the message events as they stream and written when the turn ends, one turn a line
+/// in the shape the tail reader knows, with no call to OpenCode's server on that path:
+/// a headless run exits on idle and would not wait for one.
 const OPENCODE_PLUGIN: &str = r#"// written by amem launch; edits are overwritten
 import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -1543,42 +1545,73 @@ function hook(payload) {
   try { return JSON.parse(out); } catch { return null; }
 }
 
+// what each session has said so far, from the events as they stream: a message's role
+// from message.updated, each part's text, or the tool it used, from message.part.updated,
+// which carries the whole part each time
+const sessions = new Map();
+function session(id) {
+  let s = sessions.get(id);
+  if (!s) { s = { order: [], messages: new Map() }; sessions.set(id, s); }
+  return s;
+}
+function message(sessionID, messageID) {
+  const s = session(sessionID);
+  let m = s.messages.get(messageID);
+  if (!m) { m = { role: null, parts: new Map() }; s.messages.set(messageID, m); s.order.push(messageID); }
+  return m;
+}
+function remember(event) {
+  if (event.type === "message.updated") {
+    const info = event.properties.info;
+    message(info.sessionID, info.id).role = info.role;
+  } else if (event.type === "message.part.updated") {
+    const p = event.properties.part;
+    const m = message(p.sessionID, p.messageID);
+    if (p.type === "text") m.parts.set(p.id, p.text || "");
+    else if (p.type === "tool") m.parts.set(p.id, `[used tool ${p.tool}]`);
+  }
+}
+
+// a session id as a file name: OpenCode's are letters, digits and underscores, and
+// anything else becomes one rather than a path
+function fileName(sessionID) {
+  return String(sessionID).replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
 // the session's turns, one JSON line each, in the shape the hook's tail reader knows
-async function transcript(client, sessionID) {
+function transcript(sessionID) {
   const dir = join(process.env.HOME || "/home/user", ".local", "share", "opencode", "transcripts");
   mkdirSync(dir, { recursive: true });
-  const file = join(dir, `${sessionID}.jsonl`);
-  const res = await client.session.messages({ path: { id: sessionID } });
-  const lines = (res.data || []).map((m) => {
-    const parts = m.parts || [];
-    const text = parts.filter((p) => p.type === "text").map((p) => p.text).join("\n");
-    const tools = parts.filter((p) => p.type === "tool").map((p) => `[used tool ${p.tool}]`).join("\n");
-    return JSON.stringify({ type: m.info.role, message: { content: [text, tools].filter(Boolean).join("\n") } });
+  const file = join(dir, `${fileName(sessionID)}.jsonl`);
+  const s = session(sessionID);
+  const lines = s.order.map((id) => {
+    const m = s.messages.get(id);
+    const content = [...m.parts.values()].filter(Boolean).join("\n");
+    return JSON.stringify({ type: m.role || "assistant", message: { content } });
   });
-  writeFileSync(file, lines.join("\n") + "\n");
+  writeFileSync(file, lines.length ? lines.join("\n") + "\n" : "");
   return file;
 }
 
-async function note(client, event, sessionID, extra) {
+function note(event, sessionID, extra) {
   try {
-    const transcript_path = await transcript(client, sessionID);
-    hook({ hook_event_name: event, session_id: sessionID, transcript_path, ...extra });
+    hook({ hook_event_name: event, session_id: sessionID, transcript_path: transcript(sessionID), ...extra });
   } catch (err) {
     console.warn(`memory: ${event} note not left: ${err.message}`);
   }
 }
 
-export const MemoryPlugin = async ({ client }) => ({
+export const MemoryPlugin = async () => ({
   "tool.execute.before": async (input, output) => {
     const d = hook({ hook_event_name: "PreToolUse", session_id: input.sessionID, tool_name: input.tool, tool_input: output.args });
     if (d && d.decision === "deny") throw new Error(d.reason || "refused by the memory's hook");
   },
   "experimental.session.compacting": async (input) => {
-    await note(client, "PreCompact", input.sessionID, { trigger: "auto" });
+    note("PreCompact", input.sessionID, { trigger: "auto" });
   },
   event: async ({ event }) => {
-    if (event.type !== "session.idle") return;
-    await note(client, "SessionEnd", event.properties.sessionID, { reason: "idle" });
+    remember(event);
+    if (event.type === "session.idle") note("SessionEnd", event.properties.sessionID, { reason: "idle" });
   },
 });
 "#;
@@ -2479,7 +2512,7 @@ mod tests {
     fn assert_copilot_hooks(home: &Path) {
         let hooks = json_file(&home.join(".copilot/hooks/memory.json"));
         assert_eq!(hooks["version"], 1);
-        for event in ["PreToolUse", "SessionEnd"] {
+        for event in ["PreToolUse", "PreCompact", "SessionEnd"] {
             let h = &hooks["hooks"][event][0];
             assert_eq!(h["type"], "command", "{event}");
             assert_eq!(h["bash"], "/opt/memory/memory hook copilot", "{event}");
@@ -2506,18 +2539,106 @@ mod tests {
             assert!(plugin.contains(needle), "{needle} in\n{plugin}");
         }
         if let Ok(node) = find_on_path("node") {
-            let out = std::process::Command::new(node)
-                .arg("--check")
-                .arg(&path)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            drive_opencode_plugin(&node, &plugin);
         }
     }
+
+    /// The plugin under a node, against a fake memory binary that records what it is
+    /// sent and refuses a tool call: a denial throws its reason; the turns arrive as
+    /// events and the idle event writes the transcript and leaves the session-end note
+    /// without awaiting anything, since OpenCode's run exits on idle; a session id is a
+    /// file name, not a path.
+    #[cfg(unix)]
+    fn drive_opencode_plugin(node: &Path, plugin: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("memory");
+        let record = dir.path().join("record");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nin=$(cat)\nprintf '%s\\n---\\n' \"$in\" >> {}\ncase \"$in\" in *PreToolUse*) printf '%s' '{{\"decision\":\"deny\",\"reason\":\"no: projection\"}}';; esac\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let module = dir.path().join("memory.mjs");
+        std::fs::write(
+            &module,
+            plugin.replace(INSIDE_MEMORY, &fake.display().to_string()),
+        )
+        .unwrap();
+        let harness = dir.path().join("drive.mjs");
+        std::fs::write(&harness, OPENCODE_HARNESS).unwrap();
+        let out = std::process::Command::new(node)
+            .arg(&harness)
+            .arg(&module)
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let transcript = std::fs::read_to_string(
+            dir.path()
+                .join(".local/share/opencode/transcripts/ses_abc.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript,
+            "{\"type\":\"user\",\"message\":{\"content\":\"Load T0.\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":\"Loading.\\n[used tool mcp__memory__t0]\"}}\n"
+        );
+        let sent = std::fs::read_to_string(&record).unwrap();
+        assert!(
+            sent.contains("\"hook_event_name\":\"PreToolUse\"")
+                && sent.contains("\"tool_input\":{\"filePath\":\"/memory/x\"}"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("\"hook_event_name\":\"SessionEnd\"")
+                && sent.contains("\"session_id\":\"ses_abc\"")
+                && sent.contains("transcripts/ses_abc.jsonl"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("\"hook_event_name\":\"PreCompact\""),
+            "{sent}"
+        );
+        assert!(
+            !dir.path().join(".local/share/evil.jsonl").exists()
+                && !dir.path().join(".local/share/opencode/evil.jsonl").exists(),
+            "a session id walked out of the transcripts directory"
+        );
+    }
+
+    /// Drives the plugin: a denied tool call, the events of one turn, a compaction and
+    /// an idle, with a client whose messages call must never be awaited.
+    const OPENCODE_HARNESS: &str = r#"
+const [plugin] = process.argv.slice(2);
+const mod = await import(plugin);
+const client = { session: { messages: async () => { throw new Error("awaited the client on the idle path"); } } };
+const hooks = await mod.MemoryPlugin({ client });
+let threw = null;
+try {
+  await hooks["tool.execute.before"]({ tool: "read", sessionID: "ses_abc", callID: "c1" }, { args: { filePath: "/memory/x" } });
+} catch (e) { threw = e.message; }
+if (threw !== "no: projection") { console.error(`deny not thrown: ${threw}`); process.exit(1); }
+const ev = (type, properties) => hooks.event({ event: { type, properties } });
+await ev("message.updated", { info: { id: "m1", sessionID: "ses_abc", role: "user" } });
+await ev("message.part.updated", { part: { id: "p1", messageID: "m1", sessionID: "ses_abc", type: "text", text: "Load" } });
+await ev("message.part.updated", { part: { id: "p1", messageID: "m1", sessionID: "ses_abc", type: "text", text: "Load T0." } });
+await ev("message.updated", { info: { id: "m2", sessionID: "ses_abc", role: "assistant" } });
+await ev("message.part.updated", { part: { id: "p2", messageID: "m2", sessionID: "ses_abc", type: "text", text: "Loading." } });
+await ev("message.part.updated", { part: { id: "p3", messageID: "m2", sessionID: "ses_abc", type: "tool", tool: "mcp__memory__t0" } });
+await hooks["experimental.session.compacting"]({ sessionID: "ses_abc" }, { context: [] });
+await ev("session.idle", { sessionID: "ses_abc" });
+await ev("session.idle", { sessionID: "../../evil" });
+"#;
 
     #[test]
     fn copilot_tunnels_through_the_egress_with_its_github_login() {
