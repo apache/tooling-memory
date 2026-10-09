@@ -199,9 +199,11 @@ the answers rediscovered by fetching the source document from GitHub; isolated, 
 On the Foundation gateway with Qwen: Codex with memory 4 of 4 in 74 seconds on 18k input
 and 157k cached, over an empty record 0 of 4 in 140 seconds on 21k and 296k; Claude Code
 with memory 4 of 4 in 97 seconds on 229k, over an empty record 0 of 4 in 214 seconds on
-741k. A bare harness does not reach that gateway at all: it is the launcher's egress that
-folds Claude Code's system message and, for Codex, a login-free home that makes it use the
-key. That is the paper's claim in one table: with the record, every answer, in a third of
+741k; bare Codex, once given a home without its ChatGPT login and a provider in its
+config pointing at the gateway, 3 of 4 in 25 minutes, the answers rediscovered from the
+source files on this machine's disk, at hundreds of millions of cached tokens by its own
+count; bare Claude Code does not reach that gateway at all, since it is the launcher's
+egress that folds its system message. That is the paper's claim in one table: with the record, every answer, in a third of
 the time and tokens of searching for it; without, either nothing, or rediscovery at a
 cost, where a public source exists at all.
 
