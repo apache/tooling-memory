@@ -119,7 +119,10 @@ script would have done are the board's: a task's result comes back as a handoff.
 hands its hooks the subagent's message encrypted, so the hook cannot file it; the call is
 refused all the same, with an instruction to call the server's `fan_out` itself with the
 prompt in the clear, which Codex then does: proven on its ChatGPT login, the child and the
-continuation on the board and the parent completed with a handoff.
+continuation on the board and the parent completed with a handoff. The board is the relay
+between harnesses: in that same chain Claude Code claimed the child Codex had filed and
+completed it, and Codex then claimed the continuation with Claude's handoff in its prompt;
+`amem task tree` shows each task's holder.
 
 Under `work`, where the run holds a task, the spawn is a fan-out of that task (the M5d
 decision in PLAN.md): each prompt is filed as a child with `origin: task:<parent>` and a
@@ -214,7 +217,11 @@ the answers rediscovered by fetching the source document from GitHub; isolated, 
 On the Foundation gateway with Qwen: Codex with memory 4 of 4 in 74 seconds on 18k input
 and 157k cached, over an empty record 0 of 4 in 140 seconds on 21k and 296k; Claude Code
 with memory 4 of 4 in 97 seconds on 229k, over an empty record 0 of 4 in 214 seconds on
-741k; bare Codex, once given a home without its ChatGPT login and a provider in its
+741k. Codex on its own ChatGPT login, with the set's preamble telling a harness to ask its
+memory first: with memory 3 of 4 in 31 seconds by the grader and 4 of 4 on reading, the
+fourth answer right in words the pattern did not list, over an empty record 0 of 4 in 44
+seconds; without the preamble that model never asked the memory at all and answered from
+"this conversation", which is why the preamble exists. Bare Codex on the gateway, once given a home without its ChatGPT login and a provider in its
 config pointing at the gateway, 3 of 4 in 25 minutes, the answers rediscovered from the
 source files on this machine's disk, at hundreds of millions of cached tokens by its own
 count; bare Claude Code does not reach that gateway at all, since it is the launcher's

@@ -16,7 +16,7 @@ preamble = "If a memory server is attached to this session, search it and read i
 [[task]]
 id = "dr19-decision"
 prompt = "What did DR-19 decide about the wiki staying on MoinMoin? Answer in one or two sentences from what you know; do not browse the web."
-expect = "(not taken a decision|no (final )?decision|hasn't (made|taken) a (final )?decision|stays on MoinMoin|proposed)"
+expect = "(not taken a decision|no (final )?decision|hasn't (made|taken) a (final )?decision|did not decide|still open|stays on MoinMoin|proposed)"
 
 [[task]]
 id = "dr19-spike"
