@@ -4,10 +4,18 @@
 Each task in the set is a prompt and a regular expression its answer must match. Each
 run is one prompted launch; the conditions are:
 
-  memory   the harness through `amem launch --prompt`, with the record attached, so T0,
-           search, recall and the hooks are there as in any session;
-  none     the same harness, bare, in an empty working directory, with nothing attached:
-           the harness as people use it today.
+  memory    the harness through `amem launch --prompt`, with the record attached, so T0,
+            search, recall and the hooks are there as in any session;
+  empty     the same launch over an empty record (`--empty-memory`): the same sandbox,
+            egress and tools, and nothing in memory, so the only difference from
+            `memory` is what the record holds;
+  bare      the harness as installed, in an empty working directory, nothing attached:
+            as people use it today, its web and shell tools included, so it may
+            rediscover an answer from sources at the cost of doing so. On a gateway a
+            bare harness may not even connect, where the launcher's egress fixes the
+            gateway's shape for it;
+  isolated  the bare harness with its web, shell and subagent tools off: what it knows
+            without memory and without rediscovery. Claude Code only, so far.
 
 Both conditions report the tokens the harness itself counted, read from the transcript
 it left, so the two are measured the same way; `amem usage` holds the egress's count
@@ -16,7 +24,7 @@ whether it matches `expect`.
 
   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex,claude --auth gateway --model qwen3.8-27b
-  scripts/eval.py evals/demo.toml --root ~/memory-demo2 --conditions memory
+  scripts/eval.py evals/demo.toml --root ~/memory-demo2 --conditions memory,empty
 
 Results go to evals/out/<set>-<stamp>.json and a table to stdout. Bare runs are known
 for claude and codex; the memory condition takes every harness the launcher does.
@@ -40,6 +48,12 @@ AMEM = HERE / "target" / "release" / "amem"
 BARE = {
     "claude": lambda prompt, model: ["claude", "-p", prompt, "--dangerously-skip-permissions"] + (["--model", model] if model else []),
     "codex": lambda prompt, model: ["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", prompt] + (["-m", model] if model else []),
+}
+
+# the bare harness with no way to rediscover: no web, no shell, no subagents, and no
+# files either, since the sources may well be on the same machine
+ISOLATED = {
+    "claude": lambda prompt, model: BARE["claude"](prompt, model) + ["--disallowedTools", "WebFetch,WebSearch,Bash,Agent,Task,Workflow,Read,Glob,Grep,Edit,Write,NotebookEdit,Skill"],
 }
 
 
@@ -122,6 +136,10 @@ def bare_env(env, harness, auth):
         elif harness == "codex":
             e["OPENAI_BASE_URL"] = url.rstrip("/") + "/v1"
             e["OPENAI_API_KEY"] = key
+    if harness == "codex" and auth != "subscription":
+        # a bare codex prefers its ChatGPT login to a key, and a gateway's model is
+        # not one that login serves; a home with no login makes it use the key
+        e["CODEX_HOME"] = tempfile.mkdtemp(prefix="eval-codex-home-")
     return e
 
 
@@ -143,7 +161,7 @@ def main():
     ap.add_argument("--auth", default="subscription")
     ap.add_argument("--model", default=None)
     ap.add_argument("--provider", default=None)
-    ap.add_argument("--conditions", default="memory,none")
+    ap.add_argument("--conditions", default="memory,empty,bare")
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--only", default=None, help="comma-separated task ids")
     args = ap.parse_args()
@@ -170,27 +188,39 @@ def main():
     results = []
     for harness in harnesses:
         for cond in conditions:
-            if cond == "none" and harness not in BARE:
+            if cond == "bare" and harness not in BARE:
                 print(f"skip: no bare form known for {harness}", file=sys.stderr)
+                continue
+            if cond == "isolated" and harness not in ISOLATED:
+                print(f"skip: no isolated form known for {harness}", file=sys.stderr)
                 continue
             for t in tasks:
                 since = time.time() - 1
-                if cond == "memory":
+                if cond in ("memory", "empty"):
                     cmd = [str(AMEM), "--root", str(root), "launch", "--harness", harness, "--auth", args.auth, "--no-handoff", "--prompt", t["prompt"]]
+                    if cond == "empty":
+                        cmd.append("--empty-memory")
                     if args.model:
                         cmd += ["--model", args.model]
                     if args.provider:
                         cmd += ["--provider", args.provider]
                     cwd = tempfile.mkdtemp(prefix="eval-mem-")
                     out, err, code, secs = run(cmd, cwd, env, args.timeout)
-                    transcript = newest([str(root / "state" / "sandbox" / harness / "**" / "*.jsonl")], since)
+                    homes = [str(root / "state" / "sandbox" / harness / "**" / "*.jsonl")]
+                    m = re.search(r"empty memory at (\S+)", err)
+                    if m:
+                        homes.append(str(Path(m.group(1)) / "state" / "sandbox" / harness / "**" / "*.jsonl"))
+                    transcript = newest(homes, since)
                     session = None
                     m = re.search(r"session (sess-[a-z0-9]+)", err)
                     if m:
                         session = m.group(1)
                 else:
-                    cwd = tempfile.mkdtemp(prefix="eval-none-")
-                    cmd = BARE[harness](t["prompt"], args.model)
+                    cwd = tempfile.mkdtemp(prefix=f"eval-{cond}-")
+                    cmd = (ISOLATED if cond == "isolated" else BARE)[harness](t["prompt"], args.model)
+                    # a bare codex speaks to the gateway through its openai provider, which
+                    # reads OPENAI_BASE_URL; it still wants the model on its catalog, which a
+                    # gateway's is not, so the warning is expected
                     out, err, code, secs = run(cmd, cwd, bare_env(env, harness, args.auth), args.timeout)
                     home = Path.home()
                     transcript = newest([str(home / ".claude" / "projects" / "**" / "*.jsonl"), str(home / ".codex" / "sessions" / "**" / "*.jsonl")], since)
@@ -203,6 +233,7 @@ def main():
                     "task": t["id"], "harness": harness, "condition": cond, "model": args.model,
                     "pass": passed, "exit": code, "seconds": round(secs, 1), "session": session,
                     "usage": usage, "answer": answer[-600:], "transcript": transcript,
+                    "stderr": err.strip()[-600:] if code != 0 else "",
                 }
                 results.append(r)
                 tok = f"{usage['input']}+{usage['cache_read']}c in, {usage['output']} out" if usage else "no transcript"

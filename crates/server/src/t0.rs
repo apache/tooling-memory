@@ -35,7 +35,12 @@ fn line(h: &Hit) -> String {
     } else {
         format!(": {}", h.summary)
     };
-    format!("- `{}` {}{} ({})\n", h.id, h.title, summary, h.trust_tier)
+    // the decay clock, where the reader sees it
+    let due = if h.review_due { ", review due" } else { "" };
+    format!(
+        "- `{}` {}{} ({}{due})\n",
+        h.id, h.title, summary, h.trust_tier
+    )
 }
 
 /// Render a T0 under [`BUDGET_TOKENS`]. Sections are trimmed from the bottom, oldest
@@ -148,6 +153,7 @@ mod tests {
             title: title.into(),
             summary: summary.into(),
             score: 0.0,
+            review_due: false,
         }
     }
 

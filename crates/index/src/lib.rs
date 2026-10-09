@@ -59,6 +59,9 @@ pub struct Hit {
     pub summary: String,
     /// BM25 rank. Lower is better; zero for keyed lookups that have no query.
     pub score: f64,
+    /// Whether the entry's `review_by` has passed: the decay clock the paper gives facts,
+    /// shown with the hit so a reader sees it before leaning on it.
+    pub review_due: bool,
 }
 
 /// An entry's indexed metadata, without its body.
@@ -115,7 +118,7 @@ INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
 ";
 
 const HIT_COLUMNS: &str =
-    "e.id, e.domain, e.entry_type, e.tier_rank, e.label_rank, e.title, e.summary";
+    "e.id, e.domain, e.entry_type, e.tier_rank, e.label_rank, e.title, e.summary, e.review_by";
 
 fn tier_from_rank(id: &str, rank: i64) -> Result<TrustTier, Error> {
     match rank {
@@ -169,6 +172,14 @@ fn hit_from_row(row: &Row<'_>, score: f64) -> Result<Hit, Error> {
         id: id.clone(),
         what: format!("entry type {entry_type:?}"),
     })?;
+    // the decay clock, read at query time: an entry past its review date is served
+    // with that said, so the reader sees it before leaning on it
+    let review_by: Option<String> = row.get(7)?;
+    let today = OffsetDateTime::now_utc().date();
+    let review_due = review_by
+        .as_deref()
+        .and_then(|d| Date::parse(d, &time::format_description::well_known::Iso8601::DATE).ok())
+        .is_some_and(|d| d <= today);
     Ok(Hit {
         trust_tier: tier_from_rank(&id, row.get(3)?)?,
         classification: label_from_rank(&id, row.get(4)?)?,
@@ -178,6 +189,7 @@ fn hit_from_row(row: &Row<'_>, score: f64) -> Result<Hit, Error> {
         title: row.get(5)?,
         summary: row.get(6)?,
         score,
+        review_due,
     })
 }
 
@@ -418,7 +430,7 @@ impl Index {
         values.insert(0, q.to_string().into());
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
-            let score: f64 = row.get(7)?;
+            let score: f64 = row.get(8)?;
             Ok(hit_from_row(row, score))
         })?;
         rows.map(|r| r?).collect()
@@ -509,19 +521,20 @@ impl Index {
         let mut stmt = self.conn.prepare(&sql)?;
         let row = stmt
             .query_row(params_from_iter(values), |row| {
+                // the hit's own columns come first, review_by among them now
                 let hit = hit_from_row(row, 0.0);
-                let created: String = row.get(8)?;
-                let review_by: Option<String> = row.get(9)?;
-                let status: Option<String> = row.get(10)?;
+                let created: String = row.get(9)?;
+                let review_by: Option<String> = row.get(10)?;
+                let status: Option<String> = row.get(11)?;
                 Ok((
                     hit,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                     created,
                     review_by,
                     status,
-                    row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
-                    row.get::<_, String>(13)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, String>(14)?,
                 ))
             })
             .optional()?;

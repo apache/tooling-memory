@@ -491,17 +491,23 @@ impl Memory {
                 .classification_for_write(&domain, req.classification, &s)
                 .ok_or_else(|| Error::Denied(format!("domain {domain} is not granted")))?
         };
+        let now = OffsetDateTime::now_utc();
+        // facts decay fast and carry mandatory review dates (the paper, §4): one written
+        // without a date gets one ninety days out, which the librarian enforces
+        let review_by = req.review_by.or_else(|| {
+            (req.entry_type == EntryType::Fact).then(|| now.date() + Duration::days(90))
+        });
         let entry = Entry {
             front: Frontmatter {
                 id: dm_core::id::new_entry_id(&domain),
                 entry_type: req.entry_type,
                 domain: domain.clone(),
                 author: self.author.clone(),
-                created: OffsetDateTime::now_utc(),
+                created: now,
                 source: req.source,
                 confidence: req.confidence,
                 trust_tier: TrustTier::Raw,
-                review_by: req.review_by,
+                review_by,
                 supersedes: req.supersedes,
                 policy_context: Vec::new(),
                 classification,
@@ -1579,6 +1585,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fact_without_a_review_date_gets_one_and_a_decision_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let fact = m
+            .write(WriteRequest {
+                entry_type: EntryType::Fact,
+                ..req("The build takes three minutes.\n")
+            })
+            .await
+            .unwrap();
+        let due = m.get(&fact.id).await.unwrap().front.review_by.unwrap();
+        let days = (due - OffsetDateTime::now_utc().date()).whole_days();
+        assert!((89..=90).contains(&days), "{days}");
+        let decision = m
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("We keep MoinMoin.\n")
+            })
+            .await
+            .unwrap();
+        assert!(m.get(&decision.id).await.unwrap().front.review_by.is_none());
+    }
+
+    #[tokio::test]
     async fn tasks_end_to_end_and_complete_needs_a_real_handoff() {
         let dir = tempfile::tempdir().unwrap();
         let m = mem(dir.path()).with_manifest(vec!["tool:fs".into()]);
@@ -2054,7 +2084,13 @@ mod tests {
             Some(OffsetDateTime::now_utc().date()),
             "review today"
         );
-        assert!(m.get(&c).await.unwrap().front.review_by.is_none());
+        // c read nothing erased, so it was not flagged for review today; as a fact it
+        // carries its own review date ninety days out
+        assert_ne!(
+            m.get(&c).await.unwrap().front.review_by,
+            Some(OffsetDateTime::now_utc().date()),
+            "not flagged"
+        );
         assert!(!bundle.exists(), "the served bundle held a copy");
         let kept = m.receipt(&a).await.unwrap().unwrap();
         assert_eq!(

@@ -155,16 +155,48 @@ proposes and never promotes to `verified`, which stays a human's or a senior age
 Not yet: the checker that samples summaries against bodies on a different model, canary
 entries, and the telemetry of the librarian's own behaviour.
 
+## Is it still true? Validity and decay
+
+The paper's answer is structural rather than a check at read time: content ages by type,
+and the system carries the clocks. Decisions are superseded, never expired, since the why
+outlives the what; facts decay fast and carry mandatory review dates; conventions need a
+named owner. Here that is: a fact written without `review_by` gets one ninety days out;
+every entry's `review_by` is in the index, and the librarian proposes a verify for any
+whose date has passed, and for any raw entry older than thirty days without a date; a
+search hit and a T0 line mark an entry whose review is due, so the reading agent sees it
+before it leans on it; a curation write never edits in place, it writes an entry that
+`supersedes` the old, which is then superseded and out of the active set, and demotion
+leaves a tombstone. When a task's dependencies clear, its prompt tells the claimant that
+its first act is to verify their handoffs and the entries they cite against what the task
+assumes, and that a mismatch goes back to the board in a handoff rather than being
+absorbed. Not yet: the checker on a different model that samples summaries against
+bodies and hunts contradictions, canary entries, and a source-change trigger, which wants
+entries to name the files they were drawn from so a change to the file can call for a
+re-check.
+
 ## Evaluation: `scripts/eval.py`
 
 Memory against no memory, and harness against harness, on a set of tasks. A set is a
 TOML file of prompts and the regular expression each answer must match (`evals/demo.toml`
 asks four things only the demo record knows). Each task runs under each condition:
-`memory`, the harness through `amem launch --prompt` with the record attached; `none`,
-the same harness bare in an empty directory, the harness as people use it today. Both
-report the tokens the harness itself counted, read from the transcript it left, so the
-two are measured the same way. Results go to `evals/out/` as JSON with a table on stdout:
-passes per condition, input, cached and output tokens, seconds.
+`memory`, the harness through `amem launch --prompt` with the record attached; `empty`,
+the same launch over an empty record (`amem launch --empty-memory`), the same sandbox,
+egress and tools with nothing in memory, so the only difference from `memory` is what the
+record holds; `bare`, the harness as installed in an empty directory, as people use it
+today, web and shell included, so it may rediscover an answer from sources at the cost of
+doing so, and on a gateway it may not even connect, since it is the launcher's egress that
+fixes the gateway's shape for it; `isolated`, the bare harness with its web, shell and
+subagent tools off, what it knows with neither memory nor rediscovery. All report the
+tokens the harness itself counted,
+read from the transcript it left, so the conditions are measured the same way. Results
+go to `evals/out/` as JSON with a table on stdout: passes per condition, input, cached
+and output tokens, seconds.
+
+The first run, Claude Code on a Max login over the demo record, 9 October: with memory
+4 of 4 in 34 seconds on 294k cached tokens; bare 3 of 4 in 391 seconds on 978k, the
+answers rediscovered by fetching the source document from GitHub, the fourth not
+findable there. That is the paper's claim in one table: memory is not the only way to
+the answer, it is the cheap one, and the one that holds what no public source does.
 
 ```sh
 scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription

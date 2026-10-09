@@ -345,6 +345,12 @@ enum Command {
         /// With --prompt: a run that leaves no handoff is fine.
         #[arg(long)]
         no_handoff: bool,
+        /// Run over an empty record of the same owner and domain, made for this run under
+        /// the system's temporary directory: the same sandbox, egress and tools, and
+        /// nothing in memory. For an evaluation's baseline. Its calls are metered in that
+        /// record's telemetry, not this one's.
+        #[arg(long)]
+        empty_memory: bool,
         /// After the run, mine the session's transcript for entries with a small model
         /// through the same destination; they land raw, low confidence, with the
         /// transcript as source.
@@ -2250,6 +2256,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         model,
         subagents,
         no_handoff,
+        empty_memory,
         mine: mine_after,
         mine_model,
         mine_via,
@@ -2278,7 +2285,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         },
         workdir,
         runner_for(backend_of(backend, unconfined, root, harness.into()), root)?,
-        RunOptions::new(model, subagents, program, None),
+        RunOptions::new(model, subagents, program, None).empty_memory(empty_memory),
     )
     .await?;
     let code = match prompt {
@@ -2466,6 +2473,8 @@ struct RunOptions {
     program: Vec<String>,
     /// The projection's directory name, when the launcher outside chose it.
     projection: Option<String>,
+    /// Run over an empty record made for this run, for an evaluation's baseline.
+    empty_memory: bool,
 }
 
 impl RunOptions {
@@ -2480,8 +2489,35 @@ impl RunOptions {
             subagents,
             program,
             projection,
+            empty_memory: false,
         }
     }
+
+    fn empty_memory(mut self, yes: bool) -> RunOptions {
+        self.empty_memory = yes;
+        self
+    }
+}
+
+/// An empty record of the same owner and domain as `root`, under the system's temporary
+/// directory, for a run that should have everything but memory.
+fn empty_record(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let grants = Memory::open(root)?.grants().clone();
+    let domain = grants
+        .domains
+        .keys()
+        .next()
+        .cloned()
+        .ok_or("the record grants no domain to copy")?;
+    let dir = std::env::temp_dir().join(format!(
+        "amem-empty-{}-{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    Memory::init(&dir, &grants.owner, &domain)?;
+    eprintln!("memory: empty memory at {}", dir.display());
+    Ok(dir)
 }
 
 /// The environment the run options add: the board for subagents, and for Claude Code
@@ -2753,6 +2789,13 @@ impl Session {
             .projection
             .as_deref()
             .map_or(Projected::AsSession, Projected::Named);
+        let empty;
+        let root = if options.empty_memory {
+            empty = empty_record(root)?;
+            empty.as_path()
+        } else {
+            root
+        };
         let mut p = prepare_launch(root, harness, creds, socket, None, projected).await?;
         apply_run_options(&mut p, harness, auth, &options);
 

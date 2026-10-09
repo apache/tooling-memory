@@ -815,6 +815,7 @@ mod tests {
             title: id.into(),
             summary: String::new(),
             score: 0.0,
+            review_due: false,
         }
     }
 

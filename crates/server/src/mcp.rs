@@ -58,6 +58,7 @@ fn hit_json(h: &Hit) -> Value {
         "classification": h.classification.to_string(),
         "title": h.title,
         "summary": h.summary,
+        "review_due": h.review_due,
     })
 }
 

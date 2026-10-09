@@ -291,6 +291,7 @@ mod tests {
             title: "Held".into(),
             summary: "Held.".into(),
             score: 0.0,
+            review_due: false,
         };
         let dest = tempfile::tempdir().unwrap();
         let ex = export(

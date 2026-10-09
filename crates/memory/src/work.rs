@@ -378,6 +378,9 @@ async fn prompt_for(client: &MemoryClient, task: &Task) -> Fallible<String> {
     }
     if !task.depends_on.is_empty() {
         p.push_str("\n# What the tasks this one depends on left behind\n");
+        p.push_str(
+            "\nYour first act is to verify these against what this task assumes: an entry's `review_by` may have passed, a decision may have been superseded, a handoff may describe a world that has moved on. Check what matters with `get` and `search`. A mismatch is not absorbed silently: say so in your handoff and release the task, so the board can re-decompose it.\n",
+        );
         for dep in &task.depends_on {
             let Ok(d) = client.get_task(dep).await else {
                 continue;
