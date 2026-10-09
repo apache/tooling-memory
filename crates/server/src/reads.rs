@@ -30,6 +30,10 @@ pub struct Read {
     /// Whether the body came from the session cache: pushed by a pack, then asked for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cached: bool,
+    /// The entries served: a page's hit ids, or the one a get opened. What the
+    /// librarian's signals are computed from, co-retrieval and opened bodies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<String>,
     /// How a recall was served: `brief`, or `pack:sections` and `pack:summaries`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
@@ -93,6 +97,21 @@ impl ReadLog {
         cached: bool,
         via: Option<&str>,
     ) {
+        self.served_ids(tool, query, hits, tokens, cached, via, &[]);
+    }
+
+    /// As [`ReadLog::served_via`], naming the entries served.
+    #[allow(clippy::too_many_arguments)] // one per thing a read is
+    pub fn served_ids(
+        &self,
+        tool: &str,
+        query: Option<&str>,
+        hits: usize,
+        tokens: usize,
+        cached: bool,
+        via: Option<&str>,
+        ids: &[String],
+    ) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -106,6 +125,7 @@ impl ReadLog {
             hits,
             tokens,
             cached,
+            ids: ids.to_vec(),
             via: via.map(str::to_string),
         };
         let _g = self
@@ -128,12 +148,34 @@ impl ReadLog {
 
     /// A list or search answered with these hits.
     pub fn hits(&self, tool: &str, query: Option<&str>, hits: &[Hit]) {
-        self.append(tool, query, hits.len(), hits_tokens(hits));
+        let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        self.served_ids(
+            tool,
+            query,
+            hits.len(),
+            hits_tokens(hits),
+            false,
+            None,
+            &ids,
+        );
     }
 
     /// Text served whole: a T0, or an entry's body.
     pub fn text(&self, tool: &str, text: &str) {
         self.append(tool, None, 1, approx_tokens(text));
+    }
+
+    /// An entry's body served whole, by id; `cached` says a pack had already pushed it.
+    pub fn opened(&self, id: &str, text: &str, cached: bool) {
+        self.served_ids(
+            "get",
+            None,
+            1,
+            approx_tokens(text),
+            cached,
+            None,
+            &[id.to_string()],
+        );
     }
 }
 

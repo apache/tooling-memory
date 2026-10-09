@@ -439,6 +439,48 @@ impl Memory {
         Ok(hits)
     }
 
+    /// An entry from the archive, for audit: a superseded, demoted or erased version the
+    /// active set no longer serves, with its stub if erased. The session's handling still
+    /// applies and the label still rises; what the archive holds is read, never served
+    /// into retrieval.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when absent or above the session's handling, or a store error.
+    pub async fn archived(&self, id: &str) -> Result<Entry, Error> {
+        let mut f = self.grants.read_filter();
+        f.include_inactive = true;
+        let meta = self.index.lock().await.meta(id, &f)?;
+        let Some(meta) = meta else {
+            return Err(Error::NotFound(id.to_string()));
+        };
+        let entry = self
+            .store
+            .get(&meta.hit.domain, id)
+            .await?
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        if !lock(&self.session).observe(entry.front.classification) {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        Ok(entry)
+    }
+
+    /// Every entry of a domain the archive holds, active or not, newest first: the
+    /// audit's view, for the librarian's own telemetry.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or an index error.
+    pub async fn list_archive(
+        &self,
+        domain: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Hit>, Error> {
+        let mut f = self.filter_for(domain)?;
+        f.include_inactive = true;
+        Ok(self.index.lock().await.list(&f, None, limit)?)
+    }
+
     /// One entry, body included, if the filter admits it. Raises the session label.
     /// The index decides admission and the record serves the body, always; a current
     /// version the record has moved above the session's handling, or out of the active
@@ -469,8 +511,7 @@ impl Memory {
             return Err(Error::NotFound(id.to_string()));
         }
         let pushed = self.was_pushed(&entry);
-        self.reads
-            .served("get", None, 1, dm_core::approx_tokens(&entry.body), pushed);
+        self.reads.opened(id, &entry.body, pushed);
         Ok(entry)
     }
 
@@ -610,6 +651,23 @@ impl Memory {
         spec.created_by = self.author.clone();
         spec.classification = spec.classification.max(self.label());
         Ok(self.ledger.lock().await.create(spec)?)
+    }
+
+    /// File a task the system files on the owner's behalf, as the librarian's survey,
+    /// the checker and the canaries do; admitted at once where the domain's grant
+    /// admits its own filings, else born proposed for the owner to admit.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::create_task`].
+    pub async fn file_own(&self, spec: TaskSpec) -> Result<Created, Error> {
+        let created = self.create_task(spec).await?;
+        let mut l = self.ledger.lock().await;
+        let task = self.admit_own_in(&mut l, created.task)?;
+        Ok(Created {
+            task,
+            deduplicated: created.deduplicated,
+        })
     }
 
     /// Admit a proposed task. On a laptop the owner is the triage.

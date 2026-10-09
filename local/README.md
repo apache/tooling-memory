@@ -170,8 +170,58 @@ and exits 3 when one has been altered, superseded, demoted or erased, and with `
 files a task for the owner, requiring `human`, naming what changed. The source-change
 trigger: an entry whose `source` names a file, as `file:<path>` under `--workdir` or an
 absolute path, is proposed for a verify when that file changed after the entry was
-written. Not yet: the telemetry of the librarian's own behaviour, and co-retrieval and
-wasted reads as signals.
+written.
+
+The paper's retrieval signals are in the survey too, from the read log, which now names
+the entries each read served. Two live entries that searches returned together three
+times or more are a merge candidate; an entry whose body was opened three times or more
+after its summary was served is one whose summary did not say enough, and is proposed for
+a re-summarise that says what the readers were looking for. The checker hunts
+contradictions as well, `amem check --contradictions`: for each sampled entry it takes the
+two others a search for its title puts beside it and asks its model whether the pair can
+both be true, each pair once; a contradiction becomes a task to reconcile them, at a
+priority above the survey's, whose body says to write one entry that says which holds and
+why with `supersedes` naming the one that no longer does, or to demote the stale one
+with a tombstone, and never to edit either in place.
+
+The librarian's own telemetry is the paper's watch on the watchers, and it is computed
+from the record and the ledger rather than written by any librarian, so a librarian
+cannot suppress it: `amem librarian --telemetry` counts, per author, the active entries
+that supersede another, how many of those left the body as it was against how many
+changed it and by how much (one minus the word overlap), the demotions, and the curation
+tasks completed from the ledger. It alarms on a rewrite that changed the summary and
+more than thirty percent of the body (`body-drift`), an author whose curations mostly
+change bodies (`body-heavy`), and a demotion rate out of line with the curation done
+(`demotion-rate`); `--file` makes each alarm an owner's task, requiring `human`, with
+`origin: telemetry:<kind>`.
+
+The schedule and the budget are `amem curate`, and `make curate`: one cycle runs the
+survey and files its proposals up to the gap under `--budget-tasks` open curation tasks,
+runs the checker on `--sample` entries and, with `--contradictions`, the hunt, each model
+call counted by the egress against `--budget-tokens`, at which the checker stops; checks
+the canaries; computes the telemetry and files its alarms; and appends a line to
+`state/curation.jsonl` with what it found, filed and spent. `--every <seconds>` runs the
+cycle at that interval until stopped. The librarian's reads during a cycle are not
+logged, so curation does not count as retrieval. The tasks a cycle files are worked by
+`amem work` on a cheap model; `file_own` admits them where the domain's grant says
+`admit_own`, and leaves them proposed for the owner otherwise.
+
+Proven end to end on 10 October, on a seeded record: six entries, two of them the same
+method under different titles, two at odds about whether a harness is the default, one
+citing `file:Makefile`, and two canaries; three searches that returned the pair together
+and three opens of one body. The survey proposed the merge from co-retrieval, the
+re-summarise from the opened body, and the verify from the touched Makefile. A cycle with
+the gateway's gemma as checker filed eight tasks, found the contradiction, rejected two
+summaries, and spent 2.4k tokens over ten calls. Codex on the gateway's Qwen claimed the
+contradiction first, read both entries, found the commit that removed the default
+harness, wrote the corrected entry superseding the stale one with the receipts, and
+completed the task with a handoff; a second run rewrote a summary without touching its
+body. The telemetry then counted two curations for `agent:codex`, one summary-only and
+one that changed the body, two tasks completed, no alarms; both canaries intact. A
+second cycle under a budget of six open tasks filed nothing more, and under a budget of
+1,500 tokens the checker stopped after five entries, as the log line shows. The one
+aside the librarian left in its handoff, that the Makefile's usage examples still implied
+a default harness, was right, and is fixed.
 
 ## Is it still true? Validity and decay
 
@@ -189,8 +239,9 @@ its first act is to verify their handoffs and the entries they cite against what
 assumes, and that a mismatch goes back to the board in a handoff rather than being
 absorbed. The checker samples summaries against bodies on a model of its own; canaries catch a
 curation pass that alters what it should not; and an entry that names the file it was
-drawn from, as `file:<path>`, is proposed for a verify when that file changes. Not yet:
-contradiction hunting across entries.
+drawn from, as `file:<path>`, is proposed for a verify when that file changes; and the
+checker's contradiction hunt puts entries a search places side by side in front of a
+model and files a reconcile when they cannot both hold.
 
 ## Evaluation: `scripts/eval.py`
 

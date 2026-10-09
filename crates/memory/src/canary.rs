@@ -156,7 +156,7 @@ pub async fn file(
     let mut ids = Vec::new();
     for (id, what) in &report.tripped {
         let created = memory
-            .create_task(dm_ledger::TaskSpec {
+            .file_own(dm_ledger::TaskSpec {
                 domain: domain.to_string(),
                 title: format!("Canary tripped: {id}"),
                 body: format!(

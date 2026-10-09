@@ -199,7 +199,69 @@ pub async fn survey(
     }
     merges(by_title, &mut survey.proposals);
     authoring(root, &mut survey.proposals);
+    let live: std::collections::BTreeSet<String> = hits.iter().map(|h| h.id.clone()).collect();
+    signals(root, &live, &mut survey.proposals);
     Ok(survey)
+}
+
+/// The paper's retrieval signals, from the read log: entries a search keeps returning
+/// together are merge candidates, and an entry whose body keeps being opened after its
+/// summary was served is one whose summary did not say enough.
+fn signals(root: &Path, live: &std::collections::BTreeSet<String>, out: &mut Vec<Proposal>) {
+    let mut together: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut opened: BTreeMap<String, usize> = BTreeMap::new();
+    for r in reads::all(root).unwrap_or_default() {
+        match r.tool.as_str() {
+            "search" => {
+                let ids: Vec<&String> =
+                    r.ids.iter().filter(|i| live.contains(*i)).take(5).collect();
+                for (i, a) in ids.iter().enumerate() {
+                    for b in &ids[i + 1..] {
+                        let key = if a < b {
+                            ((*a).clone(), (*b).clone())
+                        } else {
+                            ((*b).clone(), (*a).clone())
+                        };
+                        *together.entry(key).or_default() += 1;
+                    }
+                }
+            }
+            "get" => {
+                for id in r.ids.iter().filter(|i| live.contains(*i)) {
+                    *opened.entry(id.clone()).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let already: std::collections::BTreeSet<Vec<String>> =
+        out.iter().map(|p| p.entries.clone()).collect();
+    for ((a, b), n) in together.into_iter().filter(|(_, n)| *n >= 3) {
+        if already.contains(&vec![a.clone(), b.clone()]) {
+            continue;
+        }
+        out.push(Proposal {
+            kind: Kind::Merge,
+            entries: vec![a.clone(), b.clone()],
+            why: format!("`{a}` and `{b}` were retrieved together {n} times"),
+            body: format!(
+                "Read `{a}` and `{b}` with `get`. Searches keep returning them together, which is how a split topic looks. If they say the same thing, `write` one entry that holds what both say, with `supersedes` naming the older one; if they differ, give each a title that says how. Change no facts. Leave a handoff."
+            ),
+        });
+    }
+    for (id, n) in opened.into_iter().filter(|(_, n)| *n >= 3) {
+        if already.contains(&vec![id.clone()]) {
+            continue;
+        }
+        out.push(Proposal {
+            kind: Kind::Resummarise,
+            entries: vec![id.clone()],
+            why: format!("`{id}` was opened {n} times after its summary was served, so the summary did not say enough"),
+            body: format!(
+                "Read `{id}` with `get`. Sessions keep opening its body after seeing its summary: write a one- or two-sentence summary that says what they were looking for, the kind a search hit should show. Then `write` the entry again with the same body and type, your summary as `summary`, and `supersedes: {id}`. Do not change the body. Leave a handoff."
+            ),
+        });
+    }
 }
 
 /// The proposals one entry gives rise to: its summary, its size, its age.
@@ -342,7 +404,7 @@ pub async fn file(
             format!("{} {}", p.kind.title(), p.entries.join(", "))
         };
         let created = memory
-            .create_task(dm_ledger::TaskSpec {
+            .file_own(dm_ledger::TaskSpec {
                 domain: survey.domain.clone(),
                 title,
                 body: format!("{}\n\n_{}_", p.body, p.why),

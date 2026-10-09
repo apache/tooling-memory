@@ -12,6 +12,7 @@ mod board;
 mod canary;
 mod checker;
 mod credentials;
+mod curation;
 mod deputy;
 mod doctor;
 mod golden;
@@ -457,6 +458,43 @@ enum Command {
         /// entry was written calls for a verify. Defaults to the current directory.
         #[arg(long)]
         workdir: Option<PathBuf>,
+        /// The librarian's own telemetry instead of a survey: curation per author from
+        /// the record and the ledger, and the alarms it raises; --file files them.
+        #[arg(long)]
+        telemetry: bool,
+    },
+    /// One curation cycle under a budget: the survey filed, the checker on a sample,
+    /// contradictions hunted, the canaries checked, the telemetry's alarms filed, and a
+    /// line in state/curation.jsonl; with --every, again at that interval. The tasks it
+    /// files are worked by `amem work` on a cheap model.
+    Curate {
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long, value_enum, default_value = "gateway")]
+        auth: AuthArg,
+        #[arg(long)]
+        provider: Option<String>,
+        /// The checker's model, a different one than the librarian runs on.
+        #[arg(long)]
+        model: Option<String>,
+        /// Entries the checker samples each cycle.
+        #[arg(long, default_value_t = 8)]
+        sample: usize,
+        /// Hunt contradictions too, on the same sample.
+        #[arg(long)]
+        contradictions: bool,
+        /// Curation tasks that may be open at once; the survey files up to the gap.
+        #[arg(long, default_value_t = 20)]
+        budget_tasks: usize,
+        /// Tokens a cycle's model calls may take in all; the checker stops at it.
+        #[arg(long, default_value_t = 200_000)]
+        budget_tokens: u64,
+        /// Where `file:` sources are resolved.
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Run a cycle every so many seconds, until stopped.
+        #[arg(long)]
+        every: Option<u64>,
     },
     /// The checker: a model of its own, not the librarian's, judges whether each
     /// summary the index serves entails its body, on a sample of a domain; it writes
@@ -477,6 +515,9 @@ enum Command {
         sample: usize,
         #[arg(long)]
         file: bool,
+        /// Hunt contradictions too: pairs a search puts side by side, judged by the model.
+        #[arg(long)]
+        contradictions: bool,
     },
     /// Canary entries: planted with known content, checked for alteration.
     Canary {
@@ -1134,6 +1175,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         }
         cmd @ (Command::Mine { .. }
         | Command::Check { .. }
+        | Command::Curate { .. }
         | Command::Models { .. }
         | Command::WslcApiCheck { .. }
         | Command::Savings { .. }
@@ -2071,14 +2113,7 @@ fn model_ids(v: &serde_json::Value) -> Vec<String> {
 async fn tools_cmd(root: &Path, command: Command) -> Fallible {
     match command {
         Command::Models { auth, provider } => models_cmd(root, auth, provider).await,
-        Command::Check {
-            auth,
-            provider,
-            model,
-            domain,
-            sample,
-            file,
-        } => check_cmd(root, auth, provider, model, domain, sample, file).await,
+        cmd @ (Command::Check { .. } | Command::Curate { .. }) => curation_cmd(root, cmd).await,
         Command::Mine {
             transcript,
             auth,
@@ -2139,6 +2174,59 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
             Ok(())
         }
         _ => unreachable!("routed by run_cli"),
+    }
+}
+
+/// The curation commands: the checker, and the cycle.
+async fn curation_cmd(root: &Path, command: Command) -> Fallible {
+    match command {
+        Command::Check {
+            auth,
+            provider,
+            model,
+            domain,
+            sample,
+            file,
+            contradictions,
+        } => {
+            check_cmd(
+                root,
+                auth,
+                provider,
+                model,
+                domain,
+                sample,
+                file,
+                contradictions,
+            )
+            .await
+        }
+        Command::Curate {
+            domain,
+            auth,
+            provider,
+            model,
+            sample,
+            contradictions,
+            budget_tasks,
+            budget_tokens,
+            workdir,
+            every,
+        } => {
+            let plan = CuratePlan {
+                domain,
+                auth,
+                provider,
+                model,
+                sample,
+                contradictions,
+                budget_tasks,
+                budget_tokens,
+                workdir: workdir.or_else(|| std::env::current_dir().ok()),
+            };
+            curate_loop(root, &plan, every).await
+        }
+        _ => unreachable!("routed by tools_cmd"),
     }
 }
 
@@ -3454,23 +3542,167 @@ async fn canary_cmd(m: &Memory, op: CanaryOp) -> Fallible {
 }
 
 /// `amem check`: the checker over a sample of a domain, through a destination of its own.
-async fn check_cmd(
-    root: &Path,
+/// A curation cycle's settings.
+struct CuratePlan {
+    domain: Option<String>,
     auth: AuthArg,
     provider: Option<String>,
     model: Option<String>,
-    domain: Option<String>,
     sample: usize,
-    file: bool,
-) -> Fallible {
-    let auth = AuthMode::from(auth);
-    let provider = provider.unwrap_or_else(|| {
+    contradictions: bool,
+    budget_tasks: usize,
+    budget_tokens: u64,
+    workdir: Option<PathBuf>,
+}
+
+/// The destination a checker or a cycle speaks to, from the auth mode and provider given.
+fn checker_destination(auth: AuthMode, provider: Option<String>) -> String {
+    provider.unwrap_or_else(|| {
         if auth == AuthMode::Gateway {
             "llmao".to_string()
         } else {
             "openai".to_string()
         }
-    });
+    })
+}
+
+/// How many curation tasks are open: proposed or admitted, filed by the survey, the
+/// checker or the telemetry.
+async fn open_curation_tasks(
+    m: &Memory,
+    domain: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut n = 0;
+    for status in [dm_ledger::Status::Proposed, dm_ledger::Status::Admitted] {
+        n += m
+            .tasks(Some(domain), status)
+            .await?
+            .iter()
+            .filter(|t| {
+                t.spec.origin.as_deref().is_some_and(|o| {
+                    o.starts_with("librarian:")
+                        || o.starts_with("checker:")
+                        || o.starts_with("telemetry:")
+                })
+            })
+            .count();
+    }
+    Ok(n)
+}
+
+/// The summaries of a domain's newest entries, for the checker's tasks.
+async fn summaries_of(
+    m: &Memory,
+    domain: &str,
+    n: usize,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    Ok(checker::sample_of(m, domain, n)
+        .await?
+        .iter()
+        .map(|h| (h.id.clone(), h.summary.clone()))
+        .collect())
+}
+
+/// `amem librarian --telemetry`: the librarian's own telemetry, its alarms filed with --file.
+async fn telemetry_cmd(m: &Memory, domain: Option<&str>, file: bool) -> Fallible {
+    let t = curation::telemetry(m, domain).await?;
+    let filed = if file {
+        curation::file_alarms(m, &t).await?
+    } else {
+        Vec::new()
+    };
+    json(&serde_json::json!({
+        "domain": t.domain,
+        "by_author": t.by_author,
+        "alarms": t.alarms,
+        "filed": filed,
+    }))
+}
+
+/// `amem curate`: a cycle, and with `every`, a cycle at that interval until stopped.
+async fn curate_loop(root: &Path, plan: &CuratePlan, every: Option<u64>) -> Fallible {
+    loop {
+        curate_cmd(root, plan).await?;
+        let Some(secs) = every else {
+            return Ok(());
+        };
+        eprintln!("amem: next curation cycle in {secs}s");
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    }
+}
+
+/// The checker's part of a cycle: the sample judged, contradictions hunted, both filed.
+async fn checker_pass(
+    p: &Prepared,
+    plan: &CuratePlan,
+    domain: &str,
+    model: &str,
+    cycle: &mut curation::Cycle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let m = &p.memory;
+    let spend = checker::Spend {
+        egress: &p.egress,
+        session: m.session_id(),
+        limit: plan.budget_tokens,
+    };
+    let report = checker::check(
+        &p.egress,
+        m,
+        &p.provider,
+        model,
+        Some(domain),
+        plan.sample,
+        Some(&spend),
+    )
+    .await?;
+    cycle.checked = report.checked.len();
+    cycle.rejected = report.checked.iter().filter(|v| !v.entails).count();
+    let summaries = summaries_of(m, domain, plan.sample).await?;
+    checker::file(m, &report, &summaries).await?;
+    if plan.contradictions {
+        let found = checker::hunt(
+            &p.egress,
+            m,
+            &p.provider,
+            model,
+            Some(domain),
+            plan.sample,
+            Some(&spend),
+        )
+        .await?;
+        cycle.contradictions = found.len();
+        checker::file_contradictions(m, domain, model, &found).await?;
+    }
+    if let Some(t) = p.egress.telemetry().session(m.session_id())? {
+        cycle.calls = t.calls;
+        cycle.tokens_in = t.input_tokens;
+        cycle.tokens_out = t.output_tokens;
+    }
+    Ok(())
+}
+
+/// The owner's part of a cycle: the canaries checked and the telemetry's alarms, filed.
+async fn owner_pass(
+    m: &Memory,
+    root: &Path,
+    domain: &str,
+    cycle: &mut curation::Cycle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let canaries = canary::check(m, root).await?;
+    cycle.canaries_tripped = canaries.tripped.len();
+    if !canaries.tripped.is_empty() {
+        canary::file(m, &canaries, domain).await?;
+    }
+    let t = curation::telemetry(m, Some(domain)).await?;
+    cycle.alarms = t.alarms.len();
+    curation::file_alarms(m, &t).await?;
+    Ok(())
+}
+
+/// `amem curate`: one cycle, logged.
+async fn curate_cmd(root: &Path, plan: &CuratePlan) -> Fallible {
+    let auth = AuthMode::from(plan.auth);
+    let provider = checker_destination(auth, plan.provider.clone());
     let p = prepare_launch(
         root,
         Harness::Command,
@@ -3480,6 +3712,65 @@ async fn check_cmd(
         Projected::No,
     )
     .await?;
+    let m = &p.memory;
+    m.disable_read_log();
+    let domain = m.resolve_domain(plan.domain.as_deref())?;
+    let model = plan
+        .model
+        .clone()
+        .unwrap_or_else(|| mine::default_model(&p.provider).to_string());
+    let mut cycle = curation::Cycle {
+        at: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        domain: domain.clone(),
+        budget_tasks: plan.budget_tasks,
+        budget_tokens: plan.budget_tokens,
+        checker_model: model.clone(),
+        ..curation::Cycle::default()
+    };
+    // the survey, filed up to the budget's gap
+    cycle.open_before = open_curation_tasks(m, &domain).await?;
+    let options = librarian::Options {
+        source_root: plan.workdir.clone(),
+        ..librarian::Options::default()
+    };
+    let mut survey = librarian::survey(m, root, Some(&domain), &options).await?;
+    cycle.proposals = survey.proposals.len();
+    let room = plan.budget_tasks.saturating_sub(cycle.open_before);
+    survey.proposals.truncate(room);
+    let (filed, already) = librarian::file(m, &survey).await?;
+    cycle.filed = filed.len();
+    cycle.already_filed = already;
+    checker_pass(&p, plan, &domain, &model, &mut cycle).await?;
+    owner_pass(m, root, &domain, &mut cycle).await?;
+    curation::log_cycle(root, &cycle)?;
+    json(&cycle)
+}
+
+#[allow(clippy::too_many_arguments)] // the checker's flags
+async fn check_cmd(
+    root: &Path,
+    auth: AuthArg,
+    provider: Option<String>,
+    model: Option<String>,
+    domain: Option<String>,
+    sample: usize,
+    file: bool,
+    contradictions: bool,
+) -> Fallible {
+    let auth = AuthMode::from(auth);
+    let provider = checker_destination(auth, provider);
+    let p = prepare_launch(
+        root,
+        Harness::Command,
+        Credentials::keyed(auth, &provider),
+        None,
+        None,
+        Projected::No,
+    )
+    .await?;
+    p.memory.disable_read_log();
     let model = model.unwrap_or_else(|| mine::default_model(&p.provider).to_string());
     let report = checker::check(
         &p.egress,
@@ -3488,25 +3779,36 @@ async fn check_cmd(
         &model,
         domain.as_deref(),
         sample,
+        None,
     )
     .await?;
+    let found = if contradictions {
+        checker::hunt(
+            &p.egress,
+            &p.memory,
+            &p.provider,
+            &model,
+            domain.as_deref(),
+            sample,
+            None,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
     let mut filed = Vec::new();
     if file {
-        let mut summaries = Vec::new();
-        for v in &report.checked {
-            if let Ok(hits) = p.memory.list(Some(&report.domain), None, sample).await {
-                if let Some(h) = hits.iter().find(|h| h.id == v.id) {
-                    summaries.push((h.id.clone(), h.summary.clone()));
-                }
-            }
-        }
+        let summaries = summaries_of(&p.memory, &report.domain, sample).await?;
         filed = checker::file(&p.memory, &report, &summaries).await?;
+        filed
+            .extend(checker::file_contradictions(&p.memory, &report.domain, &model, &found).await?);
     }
     json(&serde_json::json!({
         "domain": report.domain,
         "model": report.model,
         "checked": report.checked,
         "rejected": report.checked.iter().filter(|v| !v.entails).count(),
+        "contradictions": found,
         "filed": filed,
     }))
 }
@@ -3580,7 +3882,13 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
             stale_days,
             split_chars,
             workdir,
+            telemetry,
         } => {
+            // the survey's reads are the librarian's, not a session's
+            m.disable_read_log();
+            if telemetry {
+                return telemetry_cmd(m, domain.as_deref(), file).await;
+            }
             let workdir = workdir.or_else(|| std::env::current_dir().ok());
             librarian_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
         }
@@ -3594,6 +3902,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Web { .. }
         | Command::Mine { .. }
         | Command::Check { .. }
+        | Command::Curate { .. }
         | Command::Models { .. }
         | Command::WslcApiCheck { .. }
         | Command::Savings { .. }
