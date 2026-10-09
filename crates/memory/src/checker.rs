@@ -83,7 +83,7 @@ pub async fn check(
         }
         let body: String = e.body.chars().take(8000).collect();
         let (path, req) =
-            crate::mine::request(destination, model, &question(&h.title, &h.summary, &body));
+            crate::mine::request_with(destination, model, &question(&h.title, &h.summary, &body));
         let answer = egress.call(destination, &path, &req).await?;
         let (entails, why) = verdict_of(&crate::mine::answer_text(destination, &answer));
         report.checked.push(Verdict {

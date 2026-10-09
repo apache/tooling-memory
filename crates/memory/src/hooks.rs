@@ -492,7 +492,18 @@ async fn delegate(
 ) -> Decision {
     let units = crate::board::units_of(tool, tool_input);
     if units.is_empty() {
-        return Decision::Allow;
+        // a spawn the hook cannot read, Codex's encrypted message say, is refused all
+        // the same: the harness files it itself, in the clear, through the server
+        let parent = std::env::var("MEMORY_TASK").unwrap_or_default();
+        let how = if parent.is_empty() {
+            "call the memory server's `create_task` tool with the subagent's prompt as the body"
+                .to_string()
+        } else {
+            format!("call the memory server's `fan_out` tool with parent `{parent}` and one item per subagent, title and prompt in the clear; the board runs them and resumes `{parent}` with their handoffs")
+        };
+        return Decision::Deny(format!(
+            "Subagents are not run from here, and this call's message cannot be read by the board. Instead, {how}. Then finish what you can without their answers and leave a handoff."
+        ));
     }
     let Some(url) = url else {
         return Decision::Deny(

@@ -177,7 +177,11 @@ def main():
     args = ap.parse_args()
 
     with open(args.set, "rb") as f:
-        tasks = tomllib.load(f)["task"]
+        spec = tomllib.load(f)
+    tasks = spec["task"]
+    preamble = spec.get("preamble", "")
+    for t in tasks:
+        t["prompt"] = preamble + t["prompt"]
     if args.only:
         keep = set(args.only.split(","))
         tasks = [t for t in tasks if t["id"] in keep]

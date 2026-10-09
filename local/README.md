@@ -110,12 +110,16 @@ subcommand or not, accepts one; for Claude Code it also sets every role's defaul
 Claude Code picks a model per role and a gateway that serves one model answers for that
 one only. `--subagents board`, the default in `work`, turns a call that would spawn or
 orchestrate subagents into tasks: Claude Code's `Agent` and `Workflow` tools and Codex's
-`spawn_agent` are caught by the pre-tool hook, each prompt is filed on the ledger as a
+`spawn_agent`, which its hooks name `collaborationspawn_agent`, are caught by the pre-tool hook, each prompt is filed on the ledger as a
 task of its own, born proposed, and the call is refused with the task ids, so the harness
 carries on with its own part and the board runs the rest. A `Workflow` script is one task
 per `agent()` call whose prompt is a literal, titled by its `label`; a script the hook
 cannot read is one task holding the script. The fan-out, the waits and the merges the
-script would have done are the board's: a task's result comes back as a handoff.
+script would have done are the board's: a task's result comes back as a handoff. Codex
+hands its hooks the subagent's message encrypted, so the hook cannot file it; the call is
+refused all the same, with an instruction to call the server's `fan_out` itself with the
+prompt in the clear, which Codex then does: proven on its ChatGPT login, the child and the
+continuation on the board and the parent completed with a handoff.
 
 Under `work`, where the run holds a task, the spawn is a fan-out of that task (the M5d
 decision in PLAN.md): each prompt is filed as a child with `origin: task:<parent>` and a

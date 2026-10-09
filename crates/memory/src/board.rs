@@ -17,10 +17,20 @@ pub struct Unit {
     pub body: String,
 }
 
-/// Whether this tool is a harness spawning or orchestrating subagents.
+/// Whether this tool is a harness spawning or orchestrating subagents: Claude Code's
+/// `Agent`, `Task` and `Workflow`, Codex's `spawn_agent`, which its hooks name with
+/// the `collaboration` prefix of its tool family.
 #[must_use]
 pub fn delegates(tool: &str) -> bool {
-    matches!(tool, "Agent" | "Task" | "Workflow" | "spawn_agent")
+    matches!(tool, "Agent" | "Task" | "Workflow") || tool.ends_with("spawn_agent")
+}
+
+/// Whether a prompt is one the hook cannot read: Codex hands its hooks the subagent's
+/// message encrypted, a token with no spaces where a prompt would have them.
+#[must_use]
+pub fn opaque(text: &str) -> bool {
+    let t = text.trim();
+    t.len() > 60 && !t.contains(char::is_whitespace)
 }
 
 /// The first line of a prompt, cut to a title's length.
@@ -74,7 +84,10 @@ pub fn units_of(tool: &str, input: &Value) -> Vec<Unit> {
             ) else {
                 return Vec::new();
             };
-            let title = text_in(input, &["description", "label", "title"])
+            if opaque(prompt) {
+                return Vec::new();
+            }
+            let title = text_in(input, &["description", "label", "title", "task_name"])
                 .map_or_else(|| title_of(prompt), str::to_string);
             vec![Unit {
                 title,
@@ -198,6 +211,18 @@ mod tests {
         assert!(u[0].body.starts_with("Read crates/egress"));
         assert!(units_of("Agent", &serde_json::json!({"description": "x"})).is_empty());
         assert!(delegates("Workflow") && delegates("spawn_agent") && !delegates("Read"));
+        assert!(
+            delegates("collaborationspawn_agent"),
+            "Codex's hooks name it so"
+        );
+        assert!(!delegates("collaborationwait_agent"));
+        // Codex's hook payload carries the message encrypted: nothing to file from it
+        assert!(units_of(
+            "collaborationspawn_agent",
+            &serde_json::json!({"task_name": "count", "message": "gAAAAABqyWPr0akHx_T6lZyV61yB0ak14LVbK2jYfWPjcPcrgzxsFr987qcjZQjoqOawv0vPYnVdseTnPfT7Dk6R8YYiJDtCrM"})
+        )
+        .is_empty());
+        assert!(!opaque("List the crates and count them."));
     }
 
     #[test]
@@ -237,7 +262,7 @@ return results"#;
 
     #[test]
     fn a_long_first_line_is_cut_to_a_title() {
-        let long = "x".repeat(100);
+        let long = "word ".repeat(30);
         let u = units_of("spawn_agent", &serde_json::json!({"message": long}));
         assert_eq!(u[0].title.chars().count(), 80);
         assert!(u[0].title.ends_with("..."));

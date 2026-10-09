@@ -83,10 +83,16 @@ pub async fn write_proposals(
     Ok(ids)
 }
 
-/// The mining request for a destination's API shape.
+/// The request for any prompt at a destination, in the shape the destination speaks.
+#[must_use]
+pub fn request_with(destination: &str, model: &str, prompt: &str) -> (String, Value) {
+    crate::model::request(destination, model, prompt)
+}
+
+/// The mining request: the instructions and the excerpt.
 #[must_use]
 pub fn request(destination: &str, model: &str, excerpt: &str) -> (String, Value) {
-    crate::model::request(destination, model, &prompt_for(excerpt))
+    request_with(destination, model, &prompt_for(excerpt))
 }
 
 /// Proposals out of the model's text, tolerant of a code fence around the JSON.

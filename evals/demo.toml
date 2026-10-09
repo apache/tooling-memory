@@ -8,6 +8,11 @@
 #
 # Seed the record first: scripts/demo.sh ~/memory-demo2 <markdown-dir>...
 
+# Put in front of every prompt, under every condition alike. A harness given a memory
+# server does not always think to ask it; a task run says so in its prompt, and so does
+# this. The bare harness reads the same sentence and has nothing to ask.
+preamble = "If a memory server is attached to this session, search it and read its T0 before answering; it holds what you need. "
+
 [[task]]
 id = "dr19-decision"
 prompt = "What did DR-19 decide about the wiki staying on MoinMoin? Answer in one or two sentences from what you know; do not browse the web."
