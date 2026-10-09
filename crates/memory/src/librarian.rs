@@ -81,6 +81,9 @@ pub struct Options {
     pub split_chars: usize,
     /// How many entries to read.
     pub limit: usize,
+    /// Where an entry's `file:` sources are resolved: a source whose file changed after
+    /// the entry was written is the trigger for a verify.
+    pub source_root: Option<std::path::PathBuf>,
 }
 
 impl Default for Options {
@@ -89,8 +92,45 @@ impl Default for Options {
             stale_days: 30,
             split_chars: 12_000,
             limit: 2000,
+            source_root: None,
         }
     }
+}
+
+/// A source that names a file: `file:<path>`, or a path that exists under the root.
+fn source_file(source: &str, root: &Path) -> Option<std::path::PathBuf> {
+    let rel = source.strip_prefix("file:").unwrap_or(source);
+    if rel.contains("://")
+        || rel.starts_with("transcript:")
+        || rel.starts_with("task-")
+        || rel.starts_with("mem-")
+    {
+        return None;
+    }
+    let p = Path::new(rel);
+    let full = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    };
+    full.is_file().then_some(full)
+}
+
+/// Whether a source file changed after the entry was written: the source-change trigger.
+fn source_changed(e: &Entry, root: &Path) -> Option<(String, time::OffsetDateTime)> {
+    for s in &e.front.source {
+        let Some(path) = source_file(s, root) else {
+            continue;
+        };
+        let Ok(modified) = path.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        let modified = time::OffsetDateTime::from(modified);
+        if modified > e.front.created {
+            return Some((s.clone(), modified));
+        }
+    }
+    None
 }
 
 fn normalise(title: &str) -> String {
@@ -194,17 +234,30 @@ fn survey_entry(
             ),
         });
     }
-    let stale = match e.front.review_by {
-        Some(d) => d < today,
-        None => {
-            e.front.trust_tier == TrustTier::Raw
-                && (today - e.front.created.date()).whole_days() > options.stale_days
-        }
-    };
+    // a canary is planted to be left alone
+    if e.front.source.iter().any(|s| s == "canary") {
+        return;
+    }
+    let changed = options
+        .source_root
+        .as_deref()
+        .and_then(|r| source_changed(e, r));
+    let stale = changed.is_some()
+        || match e.front.review_by {
+            Some(d) => d < today,
+            None => {
+                e.front.trust_tier == TrustTier::Raw
+                    && (today - e.front.created.date()).whole_days() > options.stale_days
+            }
+        };
     if stale && !handoff {
-        let why = match e.front.review_by {
-            Some(d) => format!("`{id}` was due for review on {d}"),
-            None => format!(
+        let why = match (&changed, e.front.review_by) {
+            (Some((source, at)), _) => format!(
+                "`{id}` cites `{source}`, which changed on {} after the entry was written",
+                at.date()
+            ),
+            (None, Some(d)) => format!("`{id}` was due for review on {d}"),
+            (None, None) => format!(
                 "`{id}` is raw and older than {} days with no review date",
                 options.stale_days
             ),
@@ -340,5 +393,42 @@ mod tests {
             "dr19 does the wiki stay on moinmoin"
         );
         assert_eq!(Kind::Resummarise.name(), "resummarise");
+    }
+
+    #[test]
+    fn a_source_file_that_changed_after_the_entry_is_the_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, "v1").unwrap();
+        let mut e = dm_core::Entry {
+            front: dm_core::Frontmatter {
+                id: "mem-t-1".into(),
+                entry_type: EntryType::Fact,
+                domain: "dom-t".into(),
+                author: "a".into(),
+                created: time::OffsetDateTime::now_utc() + time::Duration::seconds(5),
+                source: vec!["file:notes.md".into(), "transcript:/x.jsonl".into()],
+                confidence: None,
+                trust_tier: TrustTier::Raw,
+                review_by: None,
+                supersedes: None,
+                policy_context: Vec::new(),
+                classification: dm_core::Label::Public,
+                status: None,
+                origin: None,
+                summary: None,
+                title: None,
+            },
+            body: "b".into(),
+        };
+        assert!(
+            source_changed(&e, dir.path()).is_none(),
+            "written after the file"
+        );
+        e.front.created = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        let (source, _) = source_changed(&e, dir.path()).unwrap();
+        assert_eq!(source, "file:notes.md");
+        assert!(source_file("https://x/y", dir.path()).is_none());
+        assert!(source_file("mem-t-2", dir.path()).is_none());
     }
 }

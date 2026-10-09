@@ -152,8 +152,19 @@ concerns, so a survey run twice files each once; `amem work` on a cheap model th
 the curation with the memory server's own tools. Every task body says what to do and how
 it stays reversible: the new entry `supersedes` the old and changes no facts; a verify
 proposes and never promotes to `verified`, which stays a human's or a senior agent's gate.
-Not yet: the checker that samples summaries against bodies on a different model, canary
-entries, and the telemetry of the librarian's own behaviour.
+Three of the paper's containments are in. The checker, `amem check`, is the librarian's
+independent counterpart: through a destination and model of its own, which should not be
+the one that wrote the summaries, it samples a domain's entries and asks whether each
+summary entails its body, and writes nothing; with `--file` a rejected summary becomes a
+task for a librarian run, with the checker's model and reason on it. Canaries, `amem
+canary plant`, are entries with known content and summaries planted in a domain and
+recorded with their digests under the record's state; `amem canary check` reads each back
+and exits 3 when one has been altered, superseded, demoted or erased, and with `--file`
+files a task for the owner, requiring `human`, naming what changed. The source-change
+trigger: an entry whose `source` names a file, as `file:<path>` under `--workdir` or an
+absolute path, is proposed for a verify when that file changed after the entry was
+written. Not yet: the telemetry of the librarian's own behaviour, and co-retrieval and
+wasted reads as signals.
 
 ## Is it still true? Validity and decay
 
@@ -169,10 +180,10 @@ before it leans on it; a curation write never edits in place, it writes an entry
 leaves a tombstone. When a task's dependencies clear, its prompt tells the claimant that
 its first act is to verify their handoffs and the entries they cite against what the task
 assumes, and that a mismatch goes back to the board in a handoff rather than being
-absorbed. Not yet: the checker on a different model that samples summaries against
-bodies and hunts contradictions, canary entries, and a source-change trigger, which wants
-entries to name the files they were drawn from so a change to the file can call for a
-re-check.
+absorbed. The checker samples summaries against bodies on a model of its own; canaries catch a
+curation pass that alters what it should not; and an entry that names the file it was
+drawn from, as `file:<path>`, is proposed for a verify when that file changes. Not yet:
+contradiction hunting across entries.
 
 ## Evaluation: `scripts/eval.py`
 

@@ -9,6 +9,8 @@
 //! passes them inside.
 
 mod board;
+mod canary;
+mod checker;
 mod credentials;
 mod deputy;
 mod doctor;
@@ -451,6 +453,35 @@ enum Command {
         /// Characters of body above which an entry is proposed for a split.
         #[arg(long, default_value_t = 12_000)]
         split_chars: usize,
+        /// Where an entry's `file:` sources are resolved; a source changed after the
+        /// entry was written calls for a verify. Defaults to the current directory.
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
+    /// The checker: a model of its own, not the librarian's, judges whether each
+    /// summary the index serves entails its body, on a sample of a domain; it writes
+    /// nothing, and with --file a rejected summary becomes a task for a librarian run.
+    Check {
+        #[arg(long, value_enum, default_value = "key")]
+        auth: AuthArg,
+        /// The destination; openai by default, llmao with --auth gateway.
+        #[arg(long)]
+        provider: Option<String>,
+        /// The checker's model. Make it a different one than wrote the summaries.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+        /// How many entries to sample, newest first.
+        #[arg(long, default_value_t = 20)]
+        sample: usize,
+        #[arg(long)]
+        file: bool,
+    },
+    /// Canary entries: planted with known content, checked for alteration.
+    Canary {
+        #[command(subcommand)]
+        op: CanaryOp,
     },
     /// The models a destination lists, as JSON: what the web form offers to pick from.
     /// Routed as a launch would be, with the destination's credential; a login mode has
@@ -791,6 +822,23 @@ enum TapOp {
 }
 
 #[derive(Subcommand)]
+enum CanaryOp {
+    /// Plant canaries in a domain and record them under the record's state.
+    Plant {
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long, default_value_t = 3)]
+        count: usize,
+    },
+    /// Read every planted canary back; exit 3 when one has been altered, and with
+    /// --file, a task for the owner per tripped canary.
+    Check {
+        #[arg(long)]
+        file: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TaskOp {
     /// File a task. It is born proposed.
     Create {
@@ -1085,6 +1133,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
             profiles::show(&profiles::load(&root, &command_words())?, as_json)
         }
         cmd @ (Command::Mine { .. }
+        | Command::Check { .. }
         | Command::Models { .. }
         | Command::WslcApiCheck { .. }
         | Command::Savings { .. }
@@ -2022,6 +2071,14 @@ fn model_ids(v: &serde_json::Value) -> Vec<String> {
 async fn tools_cmd(root: &Path, command: Command) -> Fallible {
     match command {
         Command::Models { auth, provider } => models_cmd(root, auth, provider).await,
+        Command::Check {
+            auth,
+            provider,
+            model,
+            domain,
+            sample,
+            file,
+        } => check_cmd(root, auth, provider, model, domain, sample, file).await,
         Command::Mine {
             transcript,
             auth,
@@ -3364,6 +3421,96 @@ async fn retrieve(m: &Memory, command: Command) -> Fallible {
     }
 }
 
+/// `amem canary`: plant, or check and alarm.
+async fn canary_cmd(m: &Memory, op: CanaryOp) -> Fallible {
+    match op {
+        CanaryOp::Plant { domain, count } => {
+            let new = canary::plant(m, m.root(), domain.as_deref(), count).await?;
+            json(&new)
+        }
+        CanaryOp::Check { file } => {
+            let report = canary::check(m, m.root()).await?;
+            let filed = if file && !report.tripped.is_empty() {
+                let domain = canary::planted(m.root())?
+                    .first()
+                    .map(|c| c.domain.clone())
+                    .unwrap_or_default();
+                canary::file(m, &report, &domain).await?
+            } else {
+                Vec::new()
+            };
+            json(&serde_json::json!({
+                "planted": report.planted,
+                "intact": report.intact,
+                "tripped": report.tripped,
+                "filed": filed,
+            }))?;
+            if !report.tripped.is_empty() {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `amem check`: the checker over a sample of a domain, through a destination of its own.
+async fn check_cmd(
+    root: &Path,
+    auth: AuthArg,
+    provider: Option<String>,
+    model: Option<String>,
+    domain: Option<String>,
+    sample: usize,
+    file: bool,
+) -> Fallible {
+    let auth = AuthMode::from(auth);
+    let provider = provider.unwrap_or_else(|| {
+        if auth == AuthMode::Gateway {
+            "llmao".to_string()
+        } else {
+            "openai".to_string()
+        }
+    });
+    let p = prepare_launch(
+        root,
+        Harness::Command,
+        Credentials::keyed(auth, &provider),
+        None,
+        None,
+        Projected::No,
+    )
+    .await?;
+    let model = model.unwrap_or_else(|| mine::default_model(&p.provider).to_string());
+    let report = checker::check(
+        &p.egress,
+        &p.memory,
+        &p.provider,
+        &model,
+        domain.as_deref(),
+        sample,
+    )
+    .await?;
+    let mut filed = Vec::new();
+    if file {
+        let mut summaries = Vec::new();
+        for v in &report.checked {
+            if let Ok(hits) = p.memory.list(Some(&report.domain), None, sample).await {
+                if let Some(h) = hits.iter().find(|h| h.id == v.id) {
+                    summaries.push((h.id.clone(), h.summary.clone()));
+                }
+            }
+        }
+        filed = checker::file(&p.memory, &report, &summaries).await?;
+    }
+    json(&serde_json::json!({
+        "domain": report.domain,
+        "model": report.model,
+        "checked": report.checked,
+        "rejected": report.checked.iter().filter(|v| !v.entails).count(),
+        "filed": filed,
+    }))
+}
+
 /// `amem librarian`: the survey, or the survey filed as tasks.
 async fn librarian_cmd(
     m: &Memory,
@@ -3371,10 +3518,12 @@ async fn librarian_cmd(
     file: bool,
     stale_days: i64,
     split_chars: usize,
+    workdir: Option<PathBuf>,
 ) -> Fallible {
     let options = librarian::Options {
         stale_days,
         split_chars,
+        source_root: workdir,
         ..librarian::Options::default()
     };
     let survey = librarian::survey(m, m.root(), domain, &options).await?;
@@ -3430,7 +3579,12 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
             file,
             stale_days,
             split_chars,
-        } => librarian_cmd(m, domain.as_deref(), file, stale_days, split_chars).await,
+            workdir,
+        } => {
+            let workdir = workdir.or_else(|| std::env::current_dir().ok());
+            librarian_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
+        }
+        Command::Canary { op } => canary_cmd(m, op).await,
         Command::Init { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
@@ -3439,6 +3593,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Image { .. }
         | Command::Web { .. }
         | Command::Mine { .. }
+        | Command::Check { .. }
         | Command::Models { .. }
         | Command::WslcApiCheck { .. }
         | Command::Savings { .. }
