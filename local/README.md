@@ -192,11 +192,18 @@ read from the transcript it left, so the conditions are measured the same way. R
 go to `evals/out/` as JSON with a table on stdout: passes per condition, input, cached
 and output tokens, seconds.
 
-The first run, Claude Code on a Max login over the demo record, 9 October: with memory
-4 of 4 in 34 seconds on 294k cached tokens; bare 3 of 4 in 391 seconds on 978k, the
-answers rediscovered by fetching the source document from GitHub, the fourth not
-findable there. That is the paper's claim in one table: memory is not the only way to
-the answer, it is the cheap one, and the one that holds what no public source does.
+Measured 9 October over the demo record, four questions each. Claude Code on a Max login:
+with memory 4 of 4 in 34 seconds on 294k cached tokens; over an empty record, the same
+sandbox and tools, 0 of 4 in 55 seconds on 357k; bare, 3 of 4 in 391 seconds on 978k,
+the answers rediscovered by fetching the source document from GitHub; isolated, 0 of 4.
+On the Foundation gateway with Qwen: Codex with memory 4 of 4 in 74 seconds on 18k input
+and 157k cached, over an empty record 0 of 4 in 140 seconds on 21k and 296k; Claude Code
+with memory 4 of 4 in 97 seconds on 229k, over an empty record 0 of 4 in 214 seconds on
+741k. A bare harness does not reach that gateway at all: it is the launcher's egress that
+folds Claude Code's system message and, for Codex, a login-free home that makes it use the
+key. That is the paper's claim in one table: with the record, every answer, in a third of
+the time and tokens of searching for it; without, either nothing, or rediscovery at a
+cost, where a public source exists at all.
 
 ```sh
 scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription

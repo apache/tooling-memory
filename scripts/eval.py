@@ -138,8 +138,16 @@ def bare_env(env, harness, auth):
             e["OPENAI_API_KEY"] = key
     if harness == "codex" and auth != "subscription":
         # a bare codex prefers its ChatGPT login to a key, and a gateway's model is
-        # not one that login serves; a home with no login makes it use the key
-        e["CODEX_HOME"] = tempfile.mkdtemp(prefix="eval-codex-home-")
+        # not one that login serves; a home with no login makes it use the key, and
+        # a provider in its config is how it is pointed at a base other than OpenAI's
+        home = tempfile.mkdtemp(prefix="eval-codex-home-")
+        e["CODEX_HOME"] = home
+        if auth == "gateway":
+            base = e.get("LLMAO_URL", "http://127.0.0.1:4000").rstrip("/") + "/v1"
+            Path(home, "config.toml").write_text(
+                'model_provider = "gateway"\n\n[model_providers.gateway]\nname = "gateway"\n'
+                f'base_url = "{base}"\nenv_key = "OPENAI_API_KEY"\nwire_api = "responses"\n'
+            )
     return e
 
 
@@ -149,7 +157,9 @@ def run(cmd, cwd, env, timeout):
         p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         out, err, code = p.stdout, p.stderr, p.returncode
     except subprocess.TimeoutExpired as e:
-        out, err, code = (e.stdout or ""), (e.stderr or "") + "\n[timed out]", 124
+        # a timed-out run hands its output back as bytes, whatever `text` said
+        text = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
+        out, err, code = text(e.stdout), text(e.stderr) + "\n[timed out]", 124
     return out, err, code, time.time() - started
 
 
@@ -215,7 +225,9 @@ def main():
                     m = re.search(r"session (sess-[a-z0-9]+)", err)
                     if m:
                         session = m.group(1)
+                    empty_root = re.search(r"empty memory at (\S+)", err)
                 else:
+                    empty_root = None
                     cwd = tempfile.mkdtemp(prefix=f"eval-{cond}-")
                     cmd = (ISOLATED if cond == "isolated" else BARE)[harness](t["prompt"], args.model)
                     # a bare codex speaks to the gateway through its openai provider, which
@@ -229,6 +241,9 @@ def main():
                 answer = out.strip()
                 passed = re.search(t["expect"], answer, re.I | re.S) is not None
                 usage = usage_of(transcript)
+                # an empty record made for one run has served its purpose once read
+                if cond == "empty" and empty_root and empty_root.group(1).startswith(tempfile.gettempdir()):
+                    shutil.rmtree(empty_root.group(1), ignore_errors=True)
                 r = {
                     "task": t["id"], "harness": harness, "condition": cond, "model": args.model,
                     "pass": passed, "exit": code, "seconds": round(secs, 1), "session": session,
