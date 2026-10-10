@@ -15,6 +15,7 @@ mod credentials;
 mod curation;
 mod deputy;
 mod doctor;
+mod drift;
 mod golden;
 mod harness_usage;
 mod hooks;
@@ -695,6 +696,13 @@ enum Command {
         #[arg(long, requires = "provider")]
         model: Option<String>,
     },
+    /// Vendor drift: run a pinned probe set against one destination and model, and
+    /// compare the latest run with a baseline, detector by detector, once nothing on
+    /// our side is found to have changed.
+    Drift {
+        #[command(subcommand)]
+        op: drift::DriftOp,
+    },
     /// Inside the sandbox, run by the harness's hooks: read the event from standard
     /// input and leave a note in the outbox for the launcher to file as a handoff.
     #[command(hide = true)]
@@ -1299,6 +1307,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         }
         Command::Task { op } => task(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
+        Command::Drift { op } => drift::run(&root, op).await,
         other => entries(&Memory::open(&root)?, other).await,
     }
 }
@@ -4168,6 +4177,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::WslcApiCheck { .. }
         | Command::Savings { .. }
         | Command::Golden { .. }
+        | Command::Drift { .. }
         | Command::Hook { .. }
         | Command::Doctor { .. }
         | Command::Profiles { .. }

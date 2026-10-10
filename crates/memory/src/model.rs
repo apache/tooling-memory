@@ -94,6 +94,37 @@ pub fn request(destination: &str, model: &str, prompt: &str) -> (String, Value) 
     }
 }
 
+/// As [`request`], with the sampling pinned in the destination's own names: what the
+/// drift probes send, so a prompt is asked the same way on every run. Mining, the
+/// checker and the deputy keep the destination's defaults through [`request`].
+#[must_use]
+pub fn request_sampled(
+    destination: &str,
+    model: &str,
+    prompt: &str,
+    temperature: f64,
+    max_tokens: u32,
+) -> (String, Value) {
+    let (path, mut body) = request(destination, model, prompt);
+    match destination {
+        "gemini" | "google" => {
+            body["generationConfig"] =
+                json!({ "temperature": temperature, "maxOutputTokens": max_tokens });
+        }
+        // OpenAI's own API counts output in max_completion_tokens; the gateways and the
+        // other chat-completions destinations still take max_tokens
+        "openai" => {
+            body["temperature"] = json!(temperature);
+            body["max_completion_tokens"] = json!(max_tokens);
+        }
+        _ => {
+            body["temperature"] = json!(temperature);
+            body["max_tokens"] = json!(max_tokens);
+        }
+    }
+    (path, body)
+}
+
 /// The model's text out of a response in any of the three shapes.
 #[must_use]
 pub fn answer_text(destination: &str, v: &Value) -> String {

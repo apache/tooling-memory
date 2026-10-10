@@ -8,7 +8,7 @@ NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
 .PHONY: e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test conformance-test conformance deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
-	local-up local-down local-logs local-key local-memory launch usage golden taps-check taps-build wasip2-target reader
+	local-up local-down local-logs local-key local-memory launch usage golden drift taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
 # Reads local/.env. See local/README.md.
@@ -89,6 +89,21 @@ curate: build
 	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
 	target/release/amem --root "$$MEMORY_ROOT" curate --auth $(AUTH) $(if $(MODEL),--model $(MODEL),) \
 		--contradictions $(if $(EVERY),--every $(EVERY),)
+
+# Vendor drift: the probe set (SET, default probes/drift.toml) run against MODEL through
+# the gateway (or AUTH=key with PROVIDER), appended under state/drift, then the latest
+# run checked against the first. FILE=1 files confirmed drift as a task for the owner.
+#   make drift MODEL=qwen3.8-27b
+DRIFT_AUTH = $(if $(filter subscription,$(AUTH)),gateway,$(AUTH))
+DRIFT_PROVIDER = $(or $(PROVIDER),$(if $(filter gateway,$(DRIFT_AUTH)),llmao,openai))
+drift: build
+	@test -n "$(MODEL)" || { echo "MODEL= is required: the model whose drift is watched; amem models --auth gateway lists them" >&2; exit 2; }
+	@set -a; . ./$(LOCAL_ENV); set +a; \
+	LLMAO_KEY="$$(cat local/.virtual-key 2>/dev/null)" \
+	target/release/amem --root "$$MEMORY_ROOT" drift probe --auth $(DRIFT_AUTH) --provider $(DRIFT_PROVIDER) \
+		--model $(MODEL) $(if $(SET),--set $(SET),) $(if $(REPEAT),--repeat $(REPEAT),) >/dev/null && \
+	target/release/amem --root "$$MEMORY_ROOT" drift check --provider $(DRIFT_PROVIDER) --model $(MODEL) \
+		$(if $(BASELINE),--baseline $(BASELINE),) $(if $(FILE),--file,)
 
 # Claim the next task from the ledger and run the harness on it. LOOP=1 keeps claiming.
 work: build
