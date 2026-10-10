@@ -256,6 +256,17 @@ impl Db {
         )
     }
 
+    pub(crate) fn created_payload(&self, id: &str) -> Result<String, Error> {
+        self.conn()
+            .query_row(
+                "SELECT payload FROM events WHERE task_id = ?1 AND kind = 'created' ORDER BY seq LIMIT 1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(id.to_string()))
+    }
+
     pub(crate) fn event_count(&self) -> Result<u64, Error> {
         let n: i64 = self
             .conn()
@@ -405,6 +416,12 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
             conn.execute(
                 "UPDATE tasks SET posted_to = ?2 WHERE id = ?1",
                 params![id, to],
+            )?;
+        }
+        Event::Rescored { priority, .. } => {
+            conn.execute(
+                "UPDATE tasks SET priority = ?2 WHERE id = ?1",
+                params![id, priority],
             )?;
         }
     }

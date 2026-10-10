@@ -35,6 +35,7 @@ use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
 pub mod bundle;
+pub mod fabric;
 pub mod mcp;
 pub mod projection;
 pub mod reads;
@@ -2675,6 +2676,141 @@ mod tests {
                 .is_err(),
             "outside the task the rule holds"
         );
+    }
+
+    fn tspec(
+        title: &str,
+        priority: i64,
+        origin: Option<&str>,
+        after: &[&str],
+        reqs: &[&str],
+    ) -> TaskSpec {
+        TaskSpec {
+            domain: "dom-me".into(),
+            title: title.into(),
+            body: "b".into(),
+            requirements: reqs.iter().map(|s| (*s).to_string()).collect(),
+            depends_on: after.iter().map(|s| (*s).to_string()).collect(),
+            origin: origin.map(str::to_string),
+            upstream_event: origin.map(|_| title.to_string()),
+            created_by: String::new(),
+            classification: Label::Public,
+            priority,
+        }
+    }
+
+    async fn filed(m: &Memory, s: TaskSpec) -> Task {
+        m.file_own(s).await.unwrap().task
+    }
+
+    async fn done(m: &Memory, s: TaskSpec) {
+        let t = filed(m, s).await;
+        let mut l = m.ledger.lock().await;
+        l.claim(&t.id, "w", Duration::minutes(5), &t.spec.requirements)
+            .await
+            .unwrap();
+        l.complete(&t.id, "w", "mem-x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_rubric_raises_blockers_and_children_and_keeps_curations_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        done(&m, tspec("Shipped", 0, None, &[], &["deploy"])).await;
+        let blocker = filed(&m, tspec("Blocker", 0, None, &[], &[])).await;
+        let ranked = filed(&m, tspec("Ranked", 9, None, &[&blocker.id], &[])).await;
+        let child = filed(
+            &m,
+            tspec("Child", 0, Some(&format!("task:{}", ranked.id)), &[], &[]),
+        )
+        .await;
+        let curation = filed(
+            &m,
+            tspec("Resummarise", -1, Some("librarian:resummarise"), &[], &[]),
+        )
+        .await;
+        let r = m.rescore(None).await.unwrap();
+        assert_eq!(r.rubric, "default");
+        let rank = |id: &str| {
+            r.changed
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| (c.to, c.why.clone()))
+        };
+        let (b, why) = rank(&blocker.id).unwrap();
+        assert_eq!(b, 10, "a blocker rises above what it blocks");
+        assert!(why.contains(&ranked.id), "{why}");
+        assert_eq!(rank(&child.id).unwrap().0, 9, "a child rises to its parent");
+        let (c, why) = rank(&curation.id).unwrap();
+        assert_eq!(
+            c, 11,
+            "curation's floor puts it at the head: nothing completed was curation"
+        );
+        assert!(why.contains("floor"), "{why}");
+        assert!(r.maintenance_share < r.floor);
+        let again = m.rescore(None).await.unwrap();
+        assert!(
+            again.changed.is_empty(),
+            "a second cycle moves nothing: {:?}",
+            again.changed
+        );
+        let next = m
+            .ledger
+            .lock()
+            .await
+            .claim_next("dom-me", "w2", Duration::minutes(5), &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.task.id, curation.id);
+    }
+
+    #[tokio::test]
+    async fn a_verified_l1_strategy_compiles_into_the_rubric() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Policy,
+                ..req("# This period\n\n```policy\nid = \"pol-L1-007\"\nlayer = 1\nrule = \"Prioritise subagent work over curation.\"\nintent = \"Delivery this period.\"\n\n[rubric]\nmaintenance_floor = 0.0\n\n[rubric.origin_weights]\n\"task:\" = 3\n\"librarian:\" = -2\n```\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(owner.rubric().1, "default", "inert until verified");
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        verify(&owner, &agent, &id).await;
+        let (rubric, from) = owner.rubric();
+        assert_eq!(from, "pol-L1-007");
+        assert_eq!(rubric.origin_weight(Some("task:task-x")), 3);
+        let sub = filed(&owner, tspec("Sub", 0, Some("task:task-parent"), &[], &[])).await;
+        let lib = filed(&owner, tspec("Lib", 0, Some("librarian:merge"), &[], &[])).await;
+        let r = owner.rescore(None).await.unwrap();
+        assert_eq!(r.rubric, "pol-L1-007");
+        let to = |id: &str| r.changed.iter().find(|c| c.id == id).map(|c| c.to);
+        assert_eq!(to(&sub.id), Some(3));
+        assert_eq!(to(&lib.id), Some(-2));
+    }
+
+    #[tokio::test]
+    async fn task_stats_count_flow_and_name_capability_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        done(&m, tspec("Shipped", 0, None, &[], &["deploy"])).await;
+        filed(&m, tspec("Needs GPU", 0, None, &[], &["gpu"])).await;
+        let dead = filed(&m, tspec("Stale", 0, Some("librarian:verify"), &[], &[])).await;
+        m.ledger
+            .lock()
+            .await
+            .invalidate(&dead.id, "obsolete", None)
+            .await
+            .unwrap();
+        let st = m.task_stats(None).await.unwrap();
+        assert_eq!(st["by_family"]["filed"]["completed"], 1);
+        assert_eq!(st["by_family"]["librarian"]["invalidated"], 1);
+        assert_eq!(st["invalidated_because"]["obsolete"], 1);
+        assert_eq!(st["unmatched_requirements"]["gpu"], 1, "{st}");
+        assert!(st["unmatched_requirements"].get("deploy").is_none());
     }
 
     #[tokio::test]

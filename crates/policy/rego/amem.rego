@@ -47,20 +47,31 @@ inflated if {
 	not r in input.parent.requirements
 }
 
+# Irreversible action escalates regardless of score: a task that asks for it is never
+# admitted as filed, whoever files it.
+irreversible if "irreversible" in input.task.requirements
+
 auto_admit if {
 	input.filing == "own"
 	admits_own
+	not irreversible
 }
 
 auto_admit if {
 	input.filing == "held"
 	admits_own
 	not inflated
+	not irreversible
 }
 
 review_of := "human" if needs_human
 
-review_of := "none" if not needs_human
+review_of := "human" if irreversible
+
+review_of := "none" if {
+	not needs_human
+	not irreversible
+}
 
 file_decision := {"allow": false, "admit": false, "review": "none", "reason": sprintf("domain %v is not granted", [input.domain])} if {
 	not domain_granted

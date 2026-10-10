@@ -94,7 +94,9 @@ pub enum Status {
 }
 
 impl Status {
-    fn as_str(self) -> &'static str {
+    /// The status as the ledger stores it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Status::Proposed => "proposed",
             Status::Admitted => "admitted",
@@ -245,6 +247,12 @@ enum Event {
     Posted {
         to: String,
     },
+    /// The rubric ranked an open task again: its place in the queue, and why. The
+    /// priority it was filed with stays in its `Created` event.
+    Rescored {
+        priority: i64,
+        why: String,
+    },
 }
 
 impl Event {
@@ -260,6 +268,7 @@ impl Event {
             Event::Completed { .. } => "completed",
             Event::Invalidated { .. } => "invalidated",
             Event::Posted { .. } => "posted",
+            Event::Rescored { .. } => "rescored",
         }
     }
 
@@ -786,6 +795,52 @@ impl Ledger {
         self.get(id).await
     }
 
+    /// Rank an open task again: its place in the queue changes, the priority it was filed
+    /// with does not, and a claimed task keeps its lease whatever the rubric says. No
+    /// event when the rank is what it was.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`], or [`Error::WrongState`] when it is terminal.
+    pub async fn rescore(&mut self, id: &str, priority: i64, why: &str) -> Result<Task, Error> {
+        let task = self.get(id).await?;
+        if task.status.is_terminal() {
+            return Err(Error::WrongState {
+                id: id.to_string(),
+                status: task.status,
+                op: "rescore",
+            });
+        }
+        if task.spec.priority == priority {
+            return Ok(task);
+        }
+        self.append(
+            id,
+            &Event::Rescored {
+                priority,
+                why: why.to_string(),
+            },
+        )
+        .await?;
+        self.get(id).await
+    }
+
+    /// The priority a task was filed with, before any rescore: from its `Created` event.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`], or a payload the ledger did not write.
+    pub async fn filed_priority(&self, id: &str) -> Result<i64, Error> {
+        let payload = on_backend!(&self.backend, db => db.created_payload(id))?;
+        match Event::parse(id, &payload)? {
+            Event::Created { spec, .. } => Ok(spec.priority),
+            _ => Err(Error::BadRow {
+                id: id.to_string(),
+                what: "first event is not its creation".into(),
+            }),
+        }
+    }
+
     /// Completed tasks in a domain that came from upstream and whose handoff has not
     /// been posted back, oldest first.
     ///
@@ -949,6 +1004,7 @@ mod tests {
         a_completed_task_from_upstream_is_posted_back_once,
         two_claimers_on_two_connections_get_two_tasks,
         a_domain_claims_only_its_own_queue,
+        a_rescore_moves_the_queue_and_keeps_the_filed_priority,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1586,5 +1642,47 @@ mod tests {
         assert_eq!(attr(2, "task.attempts"), Some(Value::I64(1)));
         assert_eq!(attr(3, "task.status"), Some(Value::from("completed")));
         assert_eq!(attr(3, "memory.domain"), Some(Value::from("dom-a")));
+    }
+
+    async fn a_rescore_moves_the_queue_and_keeps_the_filed_priority(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let first = admitted(&mut l, spec("First")).await;
+        let second = admitted(&mut l, spec("Second")).await;
+        let moved = l
+            .rescore(&second.id, 7, "unblocks a ranked task")
+            .await
+            .unwrap();
+        assert_eq!(moved.spec.priority, 7);
+        assert_eq!(
+            l.filed_priority(&second.id).await.unwrap(),
+            0,
+            "the filer's say is kept"
+        );
+        let events = l.event_count().await.unwrap();
+        l.rescore(&second.id, 7, "same").await.unwrap();
+        assert_eq!(
+            l.event_count().await.unwrap(),
+            events,
+            "no event for no change"
+        );
+        a_rescored_task_is_claimed_first_and_replayed(&mut l, &first, &second).await;
+    }
+
+    async fn a_rescored_task_is_claimed_first_and_replayed(
+        l: &mut Ledger,
+        first: &Task,
+        second: &Task,
+    ) {
+        let c = next(l, "s", mins(5)).await.unwrap();
+        assert_eq!(c.task.id, second.id, "the rescored task is claimed first");
+        l.rebuild().await.unwrap();
+        assert_eq!(
+            l.get(&second.id).await.unwrap().spec.priority,
+            7,
+            "replay keeps it"
+        );
+        l.complete(&second.id, "s", "h").await.unwrap();
+        assert!(is_wrong_state(&l.rescore(&second.id, 1, "late").await));
+        assert_eq!(l.get(&first.id).await.unwrap().spec.priority, 0);
     }
 }

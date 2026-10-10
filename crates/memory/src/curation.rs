@@ -316,6 +316,8 @@ pub struct Cycle {
     /// called malicious.
     pub reviewed: usize,
     pub malicious: usize,
+    /// Open tasks the rubric moved this cycle.
+    pub rescored: usize,
 }
 
 /// Append a cycle's record.

@@ -186,6 +186,22 @@ impl Db {
         get_in(&self.client, &s, id).await
     }
 
+    pub(crate) async fn created_payload(&self, id: &str) -> Result<String, Error> {
+        let s = self.schema_of_task(id).await?;
+        let row = self
+            .client
+            .query_opt(
+                &format!(
+                    "SELECT payload FROM {s}.events WHERE task_id = $1 AND kind = 'created'
+                     ORDER BY seq LIMIT 1"
+                ),
+                &[&id],
+            )
+            .await?
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        Ok(row.try_get(0)?)
+    }
+
     pub(crate) async fn find_origin(
         &self,
         domain: &str,
@@ -682,6 +698,9 @@ async fn project<C: GenericClient>(
             vec![&id, reason, superseded_by],
         ),
         Event::Posted { to } => ("SET posted_to = $2 WHERE id = $1", vec![&id, to]),
+        Event::Rescored { priority, .. } => {
+            ("SET priority = $2 WHERE id = $1", vec![&id, priority])
+        }
     };
     conn.execute(&format!("UPDATE {s}.tasks {sql}"), &args)
         .await?;

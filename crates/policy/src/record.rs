@@ -56,9 +56,74 @@ pub struct Meta {
     /// For an exception: when it lapses, RFC 3339.
     #[serde(default)]
     pub expires: Option<String>,
+    /// For an L1 strategy: the rubric it compiles into, the task-scoring weights.
+    #[serde(default)]
+    pub rubric: Option<Rubric>,
+}
+
+/// The task-scoring weights an L1 strategy compiles into: the paper's rubric. A task's
+/// rank starts from the priority it was filed with, plus the weight of the longest
+/// origin prefix that matches it, plus its age in days times the age weight; a task
+/// that blocks a ranked one rises to that rank plus the unblock weight, and a child to
+/// its parent's. Curation has a protected floor: when its share of the completed work
+/// falls under it, the best curation task waiting goes to the head of the queue.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rubric {
+    /// Weight by origin prefix, e.g. `"librarian:" = -1`, `"task:" = 1`.
+    #[serde(default)]
+    pub origin_weights: std::collections::BTreeMap<String, i64>,
+    /// What a blocker gains above the task it blocks.
+    #[serde(default = "one")]
+    pub unblock_weight: i64,
+    /// Rank per day of waiting.
+    #[serde(default)]
+    pub age_weight_per_day: i64,
+    /// The share of completed work that curation is guaranteed, 0 to 1.
+    #[serde(default = "floor")]
+    pub maintenance_floor: f64,
+}
+
+fn one() -> i64 {
+    1
+}
+
+fn floor() -> f64 {
+    0.2
+}
+
+impl Eq for Rubric {}
+
+impl Default for Rubric {
+    fn default() -> Rubric {
+        Rubric {
+            origin_weights: std::collections::BTreeMap::new(),
+            unblock_weight: one(),
+            age_weight_per_day: 0,
+            maintenance_floor: floor(),
+        }
+    }
+}
+
+impl Rubric {
+    /// The weight of the longest origin prefix that matches.
+    #[must_use]
+    pub fn origin_weight(&self, origin: Option<&str>) -> i64 {
+        let Some(o) = origin else { return 0 };
+        self.origin_weights
+            .iter()
+            .filter(|(prefix, _)| o.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map_or(0, |(_, w)| *w)
+    }
 }
 
 impl Meta {
+    /// Whether it is an L1 strategy that compiles into a rubric.
+    #[must_use]
+    pub fn has_rubric(&self) -> bool {
+        self.layer == 1 && self.rubric.is_some()
+    }
+
     /// Whether this is an exception rather than a rule.
     #[must_use]
     pub fn is_exception(&self) -> bool {

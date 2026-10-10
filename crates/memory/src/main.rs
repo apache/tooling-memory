@@ -1011,6 +1011,19 @@ enum TaskOp {
     Tree { id: String },
     /// File a task again from one that dead-ended, with its chain's handoffs as lessons.
     Retry { id: String },
+    /// Rank a domain's open tasks by the rubric in force, once: the paper's cycle.
+    /// Blockers rise above what they block, children to their parents, and curation
+    /// keeps its floor; each move is a `rescored` event with its reason.
+    Rescore {
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// How tasks flow: by family and status, why they were invalidated, and the
+    /// requirements waiting that no completed task ever carried.
+    Stats {
+        #[arg(long)]
+        domain: Option<String>,
+    },
 }
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
@@ -3749,6 +3762,7 @@ async fn owner_pass(
     if !canaries.tripped.is_empty() {
         canary::file(m, &canaries, domain).await?;
     }
+    cycle.rescored = m.rescore(Some(domain)).await?.changed.len();
     let t = curation::telemetry(m, Some(domain)).await?;
     cycle.alarms = t.alarms.len();
     curation::file_alarms(m, &t).await?;
@@ -4165,6 +4179,15 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
     }
 }
 
+/// `amem task rescore` and `amem task stats`: the fabric's ranking and its telemetry.
+async fn fabric_cmd(m: &Memory, op: TaskOp) -> Fallible {
+    match op {
+        TaskOp::Rescore { domain } => json(&m.rescore(domain.as_deref()).await?),
+        TaskOp::Stats { domain } => json(&m.task_stats(domain.as_deref()).await?),
+        _ => unreachable!("routed by task"),
+    }
+}
+
 async fn task(m: &Memory, op: TaskOp) -> Fallible {
     match op {
         TaskOp::Create {
@@ -4214,6 +4237,7 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         TaskOp::Invalidate { id, reason } => json(&m.invalidate(&id, &reason, None).await?),
         TaskOp::Tree { id } => json(&m.task_tree(&id).await?),
         TaskOp::Retry { id } => json(&m.retry_task(&id).await?),
+        op @ (TaskOp::Rescore { .. } | TaskOp::Stats { .. }) => fabric_cmd(m, op).await,
         TaskOp::Get { id } => json(&m.get_task(&id).await?),
     }
 }

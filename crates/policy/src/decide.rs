@@ -534,6 +534,19 @@ mod tests {
     }
 
     #[test]
+    fn irreversible_work_is_never_admitted_as_filed() {
+        let d = file(Class::System, Filing::Own, &["irreversible"], None);
+        assert!(d.allow && !d.admit && d.review == Review::Human, "{d:?}");
+        let d = file(
+            Class::Agent,
+            Filing::Held,
+            &["irreversible"],
+            Some(&["irreversible"]),
+        );
+        assert!(!d.admit, "even within what the filer holds: {d:?}");
+    }
+
+    #[test]
     fn a_session_on_its_own_account_is_born_proposed() {
         let d = file(Class::Agent, Filing::Session, &[], None);
         assert!(d.allow && !d.admit, "{d:?}");
