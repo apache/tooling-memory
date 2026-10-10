@@ -208,30 +208,12 @@ pub async fn survey(
 /// together are merge candidates, and an entry whose body keeps being opened after its
 /// summary was served is one whose summary did not say enough.
 fn signals(root: &Path, live: &std::collections::BTreeSet<String>, out: &mut Vec<Proposal>) {
-    let mut together: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let all = reads::all(root).unwrap_or_default();
+    let together = reads::co_retrieved(&all, |i| live.contains(i));
     let mut opened: BTreeMap<String, usize> = BTreeMap::new();
-    for r in reads::all(root).unwrap_or_default() {
-        match r.tool.as_str() {
-            "search" => {
-                let ids: Vec<&String> =
-                    r.ids.iter().filter(|i| live.contains(*i)).take(5).collect();
-                for (i, a) in ids.iter().enumerate() {
-                    for b in &ids[i + 1..] {
-                        let key = if a < b {
-                            ((*a).clone(), (*b).clone())
-                        } else {
-                            ((*b).clone(), (*a).clone())
-                        };
-                        *together.entry(key).or_default() += 1;
-                    }
-                }
-            }
-            "get" => {
-                for id in r.ids.iter().filter(|i| live.contains(*i)) {
-                    *opened.entry(id.clone()).or_default() += 1;
-                }
-            }
-            _ => {}
+    for r in all.iter().filter(|r| r.tool == "get") {
+        for id in r.ids.iter().filter(|i| live.contains(*i)) {
+            *opened.entry(id.clone()).or_default() += 1;
         }
     }
     let already: std::collections::BTreeSet<Vec<String>> =

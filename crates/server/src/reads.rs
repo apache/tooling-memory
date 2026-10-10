@@ -6,6 +6,7 @@
 use dm_core::approx_tokens;
 use dm_index::Hit;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -307,6 +308,31 @@ pub fn all(root: &Path) -> std::io::Result<Vec<Read>> {
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect())
+}
+
+/// How many times each pair of entries came back from one search, over a read log: the
+/// first five hits of every search that `keep` admits, as a pair in id order. The
+/// librarian's merge signal and the prefetch's association are this one count.
+#[must_use]
+pub fn co_retrieved(
+    reads: &[Read],
+    keep: impl Fn(&str) -> bool,
+) -> BTreeMap<(String, String), usize> {
+    let mut together: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for r in reads.iter().filter(|r| r.tool == "search") {
+        let ids: Vec<&String> = r.ids.iter().filter(|i| keep(i)).take(5).collect();
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                let key = if a < b {
+                    ((*a).clone(), (*b).clone())
+                } else {
+                    ((*b).clone(), (*a).clone())
+                };
+                *together.entry(key).or_default() += 1;
+            }
+        }
+    }
+    together
 }
 
 #[cfg(test)]

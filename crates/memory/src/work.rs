@@ -8,7 +8,7 @@ use crate::hooks::{self, Event};
 use crate::Session;
 use dm_client::{MemoryClient, Task};
 use dm_sandbox::Harness;
-use dm_server::{mcp, Memory};
+use dm_server::{mcp, prefetch, Memory};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +32,9 @@ pub struct Options {
     pub idle: Duration,
     /// Mine the transcript after each task, when set.
     pub mine: Option<MinePlan>,
+    /// Put the summaries of the entries a task likely needs in its prompt; off for the
+    /// no-memory comparisons.
+    pub prefetch: bool,
 }
 
 /// How to mine after a task.
@@ -226,7 +229,7 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
             tokio::time::sleep(options.idle).await;
             continue;
         };
-        last = one(session, &client, &task, options.lease_seconds).await?;
+        last = one(session, &client, &task, options).await?;
         if let Some(plan) = &options.mine {
             let via = if plan.via_harness {
                 crate::MineVia::Harness
@@ -247,10 +250,12 @@ async fn one(
     session: &Session,
     client: &Arc<MemoryClient>,
     task: &Task,
-    lease_seconds: i64,
+    options: &Options,
 ) -> Fallible<i32> {
+    let lease_seconds = options.lease_seconds;
     eprintln!("memory: claimed {}: {}", task.id, task.title);
-    let prompt = prompt_for(client, task).await?;
+    let memory = session.memory();
+    let prompt = prompt_for(client, task, options.prefetch.then_some(&*memory)).await?;
     // the reads above were the launcher's: neither the fan-out rule nor the pushed set
     // should carry them into the harness's session
     session.memory().harness_starts();
@@ -351,9 +356,14 @@ fn tail_of(s: &str, chars: usize) -> String {
     format!("…\n{}", s.chars().skip(skip).collect::<String>())
 }
 
-/// The prompt: the task, what the tasks it depends on left behind, T0 for its domain,
-/// and how to stop.
-async fn prompt_for(client: &MemoryClient, task: &Task) -> Fallible<String> {
+/// The prompt: the task, what the tasks it depends on left behind, the summaries of what
+/// it likely needs when `prefetch_from` gives the session's memory, T0 for its domain, and how
+/// to stop.
+async fn prompt_for(
+    client: &MemoryClient,
+    task: &Task,
+    prefetch_from: Option<&Memory>,
+) -> Fallible<String> {
     let mut p = String::new();
     p.push_str(
         "You are working one task from a shared task ledger, reached through the `memory` MCP server. \
@@ -401,6 +411,9 @@ async fn prompt_for(client: &MemoryClient, task: &Task) -> Fallible<String> {
             }
         }
     }
+    if let Some(memory) = prefetch_from {
+        p.push_str(&prefetched(memory, task).await);
+    }
     let t0 = client.t0(Some(&task.domain)).await?;
     p.push_str(&format!("\n# T0 for {}\n\n{}\n", task.domain, t0.trim()));
     p.push_str(&format!(
@@ -413,9 +426,102 @@ async fn prompt_for(client: &MemoryClient, task: &Task) -> Fallible<String> {
     Ok(p)
 }
 
+/// The prefetch for a task, as its prompt section. A prefetch that fails costs the
+/// task nothing but the section: the harness can still search.
+async fn prefetched(memory: &Memory, task: &Task) -> String {
+    let query = prefetch::task_query(&task.title, &task.body);
+    match memory.prefetch(&query, &prefetch::Plan::default()).await {
+        Ok(found) => {
+            eprintln!(
+                "memory: prefetched {} summaries ({} tokens): {}",
+                found.hits.len(),
+                found.tokens,
+                found.ids().join(", ")
+            );
+            prefetch_section(&found)
+        }
+        Err(e) => {
+            eprintln!("memory: no prefetch for {}: {e}", task.id);
+            String::new()
+        }
+    }
+}
+
+/// The prefetched summaries as a prompt section; nothing when nothing was found.
+fn prefetch_section(found: &prefetch::Prefetched) -> String {
+    if found.hits.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\n# Entries this task likely needs: summaries only\n\n\
+         Chosen before you started, by a search on the task and by what earlier sessions \
+         retrieved together. These are summaries, not bodies: open one with `get` when you \
+         need what it says, and leave the rest.\n\n",
+    );
+    for h in &found.hits {
+        let summary = h.summary.trim();
+        s.push_str(&format!(
+            "- `{}` ({}, {}): {}",
+            h.id,
+            h.entry_type,
+            h.domain,
+            h.title.trim()
+        ));
+        if !summary.is_empty() && summary != h.title.trim() {
+            s.push_str(&format!(". {summary}"));
+        }
+        if let Some((anchor, n)) = found.with.get(&h.id) {
+            s.push_str(&format!(" (retrieved with `{anchor}` {n} times)"));
+        }
+        s.push('\n');
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prefetch_section_lists_summaries_and_says_how_to_open_them() {
+        assert!(prefetch_section(&prefetch::Prefetched::default()).is_empty());
+        let hit = |id: &str, title: &str, summary: &str| dm_index::Hit {
+            id: id.into(),
+            domain: "dom-demo".into(),
+            entry_type: dm_core::EntryType::Fact,
+            trust_tier: dm_core::TrustTier::Raw,
+            classification: dm_core::Label::Public,
+            title: title.into(),
+            summary: summary.into(),
+            score: 0.0,
+            review_due: false,
+        };
+        let found = prefetch::Prefetched {
+            query: "retry".into(),
+            hits: vec![
+                hit(
+                    "mem-a-1",
+                    "Retry backoff",
+                    "Backoff doubles, capped at 15 minutes.",
+                ),
+                hit("mem-a-2", "Context header", "Context header"),
+            ],
+            with: [("mem-a-2".to_string(), ("mem-a-1".to_string(), 4))].into(),
+            tokens: 40,
+        };
+        let s = prefetch_section(&found);
+        assert!(s.contains("summaries only") && s.contains("`get`"), "{s}");
+        assert!(
+            s.contains("- `mem-a-1` (fact, dom-demo): Retry backoff. Backoff doubles"),
+            "{s}"
+        );
+        assert!(
+            s.contains(
+                "- `mem-a-2` (fact, dom-demo): Context header (retrieved with `mem-a-1` 4 times)"
+            ),
+            "{s}"
+        );
+    }
 
     #[test]
     fn tail_keeps_the_end() {

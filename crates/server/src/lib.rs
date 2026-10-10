@@ -37,6 +37,7 @@ use tokio::sync::Mutex as AsyncMutex;
 pub mod bundle;
 pub mod fabric;
 pub mod mcp;
+pub mod prefetch;
 pub mod projection;
 pub mod reads;
 pub mod recall;

@@ -5,7 +5,11 @@
 //! sessions that ran here. Retrieval: what a page of hits costs against the bodies it
 //! stands for and the corpus it was chosen from, and whether known items land in the top
 //! three. The funnel: what memory served each session, from the reads log, beside what
-//! the session's model calls ingested, from the egress telemetry.
+//! the session's model calls ingested, from the egress telemetry. Then the paper's
+//! retrieval metrics, per session and in total: fetch-through, retrieval depth per task,
+//! prefetch precision and wasted reads, from the read and write logs.
+
+pub mod metrics;
 
 use dm_core::approx_tokens;
 use dm_egress::Telemetry;
@@ -52,6 +56,8 @@ pub struct Report {
     pub sessions: Vec<SessionRow>,
     /// Recall, by regime: the brief against the pack it would be written from.
     pub recall: RecallRow,
+    /// The paper's retrieval metrics.
+    pub metrics: metrics::Metrics,
 }
 
 /// Recall in the funnel. One turn for the caller either way; what differs is the
@@ -266,6 +272,44 @@ fn funnel(root: &Path, report: &mut Report) -> Fallible<()> {
     Ok(())
 }
 
+/// The handoffs among the entries the write log names, with the text a citation is
+/// looked for in, and the handoffs of the tasks completed in the granted domains.
+async fn metrics_of(memory: &Memory, root: &Path) -> Fallible<metrics::Metrics> {
+    let all = reads::all(root)?;
+    let writes = reads::all_writes(root)?;
+    let mut handoffs = BTreeMap::new();
+    for w in &writes {
+        if handoffs.contains_key(&w.id) {
+            continue;
+        }
+        let entry = match memory.get(&w.id).await {
+            Ok(e) => e,
+            Err(_) => match memory.archived(&w.id).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            },
+        };
+        if entry.front.entry_type == dm_core::EntryType::Handoff {
+            let text = format!("{}\n{}", entry.body, entry.front.source.join("\n"));
+            handoffs.insert(w.id.clone(), text);
+        }
+    }
+    let mut completed = std::collections::BTreeSet::new();
+    for d in memory.domains() {
+        let done = memory
+            .tasks(Some(&d), dm_ledger::Status::Completed)
+            .await
+            .unwrap_or_default();
+        completed.extend(done.into_iter().filter_map(|t| t.handoff));
+    }
+    Ok(metrics::compute(&metrics::Inputs {
+        reads: &all,
+        writes: &writes,
+        handoffs: &handoffs,
+        completed: &completed,
+    }))
+}
+
 /// Measure.
 ///
 /// # Errors
@@ -294,6 +338,7 @@ pub async fn measure(root: &Path, query: Option<&str>) -> Fallible<Report> {
     }
     retrieval(&memory, &mut report, query, &titles).await?;
     funnel(root, &mut report)?;
+    report.metrics = metrics_of(&memory, root).await?;
     Ok(report)
 }
 
@@ -376,6 +421,7 @@ pub fn render(r: &Report) -> String {
         s.push_str("  nothing recorded yet\n");
     }
     s.push_str(&render_recall(&r.recall));
+    s.push_str(&metrics::render(&r.metrics));
     s
 }
 

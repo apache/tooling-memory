@@ -442,6 +442,10 @@ enum Command {
         mine_model: Option<String>,
         #[arg(long, value_enum, default_value = "auto")]
         mine_via: MineVia,
+        /// Leave the prefetch out of the prompt: no summaries of the entries the task
+        /// likely needs, for comparisons against a run without memory's push.
+        #[arg(long)]
+        no_prefetch: bool,
     },
     /// The librarian's survey: what in a domain needs curation, from the record and
     /// the read log, as proposals; with --file, each becomes a task for a run to do with
@@ -647,6 +651,9 @@ enum Command {
         keep_going: bool,
         #[arg(long, default_value_t = 30)]
         idle_seconds: u64,
+        /// Task mode without the prefetch.
+        #[arg(long)]
+        no_prefetch: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -2417,6 +2424,7 @@ fn wslc_for_work(
         idle_seconds,
         model,
         subagents,
+        no_prefetch,
         ..
     } = command
     else {
@@ -2424,6 +2432,16 @@ fn wslc_for_work(
     };
     if backend_of(*backend, *unconfined, root, (*harness).into()) != Backend::Wslc {
         return Ok(None);
+    }
+    let mut inside_args = work_inside_args(
+        run_options_args(model.as_deref(), *subagents),
+        domain.as_deref(),
+        *lease_seconds,
+        *keep_going,
+        *idle_seconds,
+    );
+    if *no_prefetch {
+        inside_args.push("--no-prefetch".into());
     }
     Ok(Some(wslc::Launch {
         projection: wslc::projection_name(),
@@ -2435,13 +2453,7 @@ fn wslc_for_work(
         server_provider: server_provider.clone(),
         workdir: resolve_workdir(root, workdir.clone())?,
         image: image.clone(),
-        inside_args: work_inside_args(
-            run_options_args(model.as_deref(), *subagents),
-            domain.as_deref(),
-            *lease_seconds,
-            *keep_going,
-            *idle_seconds,
-        ),
+        inside_args,
         interactive: false,
         via: *wslc_via,
         storage: wslc_storage.clone(),
@@ -2567,6 +2579,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         mine: mine_after,
         mine_model,
         mine_via,
+        no_prefetch,
         ..
     } = command
     else {
@@ -2597,6 +2610,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
             model: mine_model,
             via_harness: session.mines_via_harness(mine_via),
         }),
+        prefetch: !no_prefetch,
     };
     let code = work::run(&session, &options).await?;
     session.finish(code);
@@ -2624,6 +2638,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
         lease_seconds,
         keep_going,
         idle_seconds,
+        no_prefetch,
         args,
     } = command
     else {
@@ -2659,6 +2674,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
             keep_going,
             idle: std::time::Duration::from_secs(idle_seconds),
             mine: None,
+            prefetch: !no_prefetch,
         };
         work::run(&session, &options).await?
     } else {
