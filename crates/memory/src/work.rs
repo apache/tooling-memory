@@ -248,13 +248,9 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
     loop {
         let claimed = match &options.task {
             Some(id) => client.claim(id, options.lease_seconds).await?,
+            // a worker only claims: rank is the ledger's, moved along dependency edges
+            // at admission and by triage's cycle, never by a worker on its way in
             None => {
-                // rank first, so the claim is the highest-ranked contribution this
-                // session can do: whatever blocks or was filed for the top task has
-                // risen to it, and the manifest decides what is claimable
-                if let Err(e) = session.memory().rescore(options.domain.as_deref()).await {
-                    eprintln!("memory: rescore before claiming: {e}");
-                }
                 client
                     .claim_next(options.domain.as_deref(), options.lease_seconds)
                     .await?

@@ -365,7 +365,15 @@ child rises to its parent, and when curation's share of the completed work is un
 floor, the best curation task an agent can do goes to the head of the queue. Each move
 is a `rescored` event on the ledger with its reason, on either backend, replayed like
 any other; the filed priority stays in the creation event, so rescoring never
-compounds, and a claimed task keeps its lease. Irreversible work escalates: a task that
+compounds, and a claimed task keeps its lease. Who moves rank, as the paper has it: a worker
+only claims, taking the highest-ranked task its capabilities allow, and never ranks
+anything. Rank moves in two places. When a task is admitted, the ledger raises every
+open task it waits on, transitively, to its rank plus the unblock weight, each a
+`rescored` event naming the task it serves: the paper's "automatic re-ranks are the
+ledger's own appends", and a task merely proposed moves nothing. And triage's cycle,
+`amem curate`, runs the rubric-wide rescore once; `amem task rescore` is the owner's
+override and no MCP tool reaches it. A session holding a task files no higher than that
+task, so work it delegates cannot outrank what it serves. Irreversible work escalates: a task that
 requires `irreversible` is never admitted as filed, whoever files it. `amem task stats`
 is the fabric's telemetry: by family and status, why tasks were invalidated, and the
 requirements of waiting tasks that no completed task ever carried, a capability gap.

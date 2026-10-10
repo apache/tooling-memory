@@ -1345,6 +1345,11 @@ impl Memory {
         )?;
         spec.created_by = self.author.clone();
         spec.classification = spec.classification.max(self.label());
+        // a session files no higher than the task it holds: work it delegates serves
+        // that task, and rank is not something a worker can raise
+        if let (Filing::Held, Some(p)) = (filing, parent) {
+            spec.priority = spec.priority.min(p.spec.priority);
+        }
         let created = l.create(spec).await?;
         let task = self
             .admit_per_policy(l, created.task, filing, parent)
@@ -1363,11 +1368,41 @@ impl Memory {
     pub async fn admit(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
         self.task_in_grants(&l.get(id).await?)?;
-        Ok(l.admit(id).await?)
+        let admitted = l.admit(id).await?;
+        self.rank_edges(&mut l, &admitted).await?;
+        Ok(admitted)
     }
 
-    /// Whether tasks a session files from a task it holds are admitted as they are
-    /// filed in this domain; see `admit_own` in the grants.
+    /// Priority propagates along dependency edges, as the ledger's own appends: when a
+    /// task is admitted, every open task it waits on, and what those wait on, rises to
+    /// at least its rank plus the rubric's unblock weight, each move a `rescored` event
+    /// naming the task it serves. Rank moves only here, at admission, and in triage's
+    /// cycle; a worker only claims, and a task merely proposed moves nothing.
+    async fn rank_edges(&self, l: &mut Ledger, task: &Task) -> Result<(), Error> {
+        let w = self.rubric().0.unblock_weight;
+        let mut stack = vec![(task.id.clone(), task.spec.priority)];
+        let mut seen = HashSet::new();
+        while let Some((id, rank)) = stack.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Ok(t) = l.get(&id).await else { continue };
+            for dep in &t.spec.depends_on {
+                let Ok(d) = l.get(dep).await else { continue };
+                if d.status.is_terminal() {
+                    continue;
+                }
+                let to = rank + w;
+                if d.spec.priority < to {
+                    l.rescore(dep, to, &format!("blocks {id}, ranked {rank}"))
+                        .await?;
+                }
+                stack.push((dep.clone(), d.spec.priority.max(to)));
+            }
+        }
+        Ok(())
+    }
+
     /// Admit a task as filed where the policy says so: the system's own filings and a
     /// session's filings from a task it holds, within that task's requirements, where
     /// the domain admits its own; everything else stays proposed for the owner.
@@ -1398,7 +1433,9 @@ impl Memory {
             held_task: None,
         })?;
         if d.admit {
-            Ok(l.admit(&task.id).await?)
+            let admitted = l.admit(&task.id).await?;
+            self.rank_edges(l, &admitted).await?;
+            Ok(admitted)
         } else {
             Ok(task)
         }
@@ -2805,9 +2842,15 @@ mod tests {
                 .find(|c| c.id == id)
                 .map(|c| (c.to, c.why.clone()))
         };
-        let (b, why) = rank(&blocker.id).unwrap();
-        assert_eq!(b, 10, "a blocker rises above what it blocks");
-        assert!(why.contains(&ranked.id), "{why}");
+        let b = m.ledger.lock().await.get(&blocker.id).await.unwrap();
+        assert_eq!(
+            b.spec.priority, 10,
+            "a blocker rose above what it blocks when that was admitted"
+        );
+        assert!(
+            rank(&blocker.id).is_none(),
+            "so the cycle has nothing to move"
+        );
         assert_eq!(rank(&child.id).unwrap().0, 9, "a child rises to its parent");
         let (c, why) = rank(&curation.id).unwrap();
         assert_eq!(
@@ -2944,7 +2987,7 @@ mod tests {
         )
         .await;
         filed(&m, tspec("Unrelated, high", 9, None, &[], &[])).await;
-        m.rescore(None).await.unwrap();
+        // no rescore: admitting the release raised what it waits on
         let c = m
             .claim_next(None, Duration::minutes(5))
             .await
@@ -2964,6 +3007,36 @@ mod tests {
             gpu.spec.priority > 9,
             "but it was ranked above the unrelated work too"
         );
+    }
+
+    #[tokio::test]
+    async fn rank_moves_on_admission_not_on_filing_and_a_worker_cannot_raise_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let blocker = filed(&owner, tspec("Fixtures", 0, None, &[], &[])).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        // a session on its own account files a high task on the blocker: proposed, inert
+        let proposed = agent
+            .create_task(tspec("Mine, urgent", 50, None, &[&blocker.id], &[]))
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(proposed.status, Status::Proposed);
+        let b = owner.ledger.lock().await.get(&blocker.id).await.unwrap();
+        assert_eq!(b.spec.priority, 0, "a proposed task moves nothing");
+        // triage admits it: the edge carries its rank, as the ledger's own append
+        owner.admit(&proposed.id).await.unwrap();
+        let b = owner.ledger.lock().await.get(&blocker.id).await.unwrap();
+        assert_eq!(b.spec.priority, 51);
+        // a session holding a task files no higher than it
+        let held = filed(&owner, tspec("Held", 4, None, &[], &[])).await;
+        agent.set_held_task(&held.id);
+        let child = agent
+            .create_task(tspec("Sub", 99, None, &[], &[]))
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(child.spec.priority, 4, "capped at the held task's rank");
     }
 
     #[tokio::test]
