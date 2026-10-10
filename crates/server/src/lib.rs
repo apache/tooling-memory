@@ -153,6 +153,26 @@ pub enum Promotion {
     },
 }
 
+/// The record's policy entries, active, in every granted domain, at any tier: read
+/// through the index and the files the record keeps, so the policy can be compiled
+/// where no runtime is at hand. Policy is enforced whatever a session may read, so the
+/// owner's view is used. An entry whose body is not a policy is skipped.
+fn policy_entries(ix: &Index, root: &Path, grants: &Grants) -> Vec<dm_policy::record::Entry> {
+    let Ok(hits) = ix.list(&grants.read_filter(), Some(EntryType::Policy), 1000) else {
+        return Vec::new();
+    };
+    hits.into_iter()
+        .filter_map(|h| {
+            let path = root
+                .join("record")
+                .join(&h.domain)
+                .join(format!("{}.md", h.id));
+            let entry = Entry::parse(&std::fs::read_to_string(path).ok()?).ok()?;
+            dm_policy::record::parse(&h.id, h.trust_tier, &entry.body).ok()
+        })
+        .collect()
+}
+
 /// What an entry may have reached, as [`Memory::taint`] computes it.
 #[derive(Clone, Debug, Serialize)]
 pub struct Taint {
@@ -200,7 +220,7 @@ pub struct Memory {
     /// Entries this session wrote, and how many of them were handoffs.
     written: (AtomicUsize, AtomicUsize),
     /// The checkable perimeter: admission and the gates, as Rego over the grants.
-    policy: Policy,
+    policy: std::sync::RwLock<std::sync::Arc<Policy>>,
     /// The task this session holds, when the launcher runs it on one: what it files
     /// from is judged against that task's requirements.
     held: OnceLock<String>,
@@ -294,9 +314,13 @@ impl Memory {
     pub fn open(root: &Path) -> Result<Memory, Error> {
         let grants = Grants::load(&root.join(GRANTS_FILE))?;
         std::fs::create_dir_all(root.join("state")).map_err(io(root))?;
-        let policy = Policy::load(root, &grants)?;
         let store = Store::open_dir(root)?;
         let index = Index::open(&root.join(INDEX_FILE))?;
+        let policy = Policy::load(root, &grants)?.with_record(
+            &grants,
+            policy_entries(&index, root, &grants),
+            OffsetDateTime::now_utc(),
+        )?;
         let ledger = match &grants.ledger {
             Some(settings) => Ledger::connect_blocking(&settings.url)?,
             None => Ledger::open(&root.join(LEDGER_FILE))?,
@@ -319,7 +343,7 @@ impl Memory {
             cache: Mutex::new(recall::Cache::default()),
             projection: None,
             written: (AtomicUsize::new(0), AtomicUsize::new(0)),
-            policy,
+            policy: std::sync::RwLock::new(std::sync::Arc::new(policy)),
             held: OnceLock::new(),
             superseded: AtomicUsize::new(0),
             scope: OnceLock::new(),
@@ -343,9 +367,10 @@ impl Memory {
             parent: None,
             write: None,
             promote: None,
+            held_task: None,
         };
         let f = self
-            .policy
+            .policy()
             .read_scope(&input)?
             .narrow(&self.grants.read_filter());
         {
@@ -364,7 +389,8 @@ impl Memory {
                     f.handling,
                     f.min_tier
                 ),
-                policy: self.policy.version().to_string(),
+                policy: self.policy().version().to_string(),
+                cites: Vec::new(),
             },
         );
         Ok(self.scope.get_or_init(|| f).clone())
@@ -376,10 +402,33 @@ impl Memory {
         let _ = self.held.set(id.to_string());
     }
 
-    /// The policy in force.
+    /// The policy in force: the base, and the record's verified policy entries.
     #[must_use]
-    pub fn policy(&self) -> &Policy {
-        &self.policy
+    pub fn policy(&self) -> std::sync::Arc<Policy> {
+        self.policy
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Compile the policy again from the record: after a policy entry is written,
+    /// promoted, superseded or erased, so what is enforced follows what is verified.
+    ///
+    /// # Errors
+    ///
+    /// When the base policy will not compile.
+    pub async fn reload_policy(&self) -> Result<(), Error> {
+        let entries = {
+            let ix = self.index.lock().await;
+            policy_entries(&ix, &self.root, &self.grants)
+        };
+        let p = Policy::load(&self.root, &self.grants)?.with_record(
+            &self.grants,
+            entries,
+            OffsetDateTime::now_utc(),
+        )?;
+        *self.policy.write().unwrap_or_else(PoisonError::into_inner) = std::sync::Arc::new(p);
+        Ok(())
     }
 
     /// Who this session is to the policy.
@@ -393,8 +442,10 @@ impl Memory {
     /// Ask the policy, and log the decision under the record's state: every allow and
     /// deny, with the policy version that produced it, as the paper has decision logs.
     fn decide(&self, input: &Input) -> Result<Decision, Error> {
-        let d = self.policy.decide(input)?;
-        self.log_decision(input, &d);
+        let mut input = input.clone();
+        input.held_task = self.held.get().cloned();
+        let d = self.policy().decide(&input)?;
+        self.log_decision(&input, &d);
         Ok(d)
     }
 
@@ -413,6 +464,8 @@ impl Memory {
             "review": d.review,
             "reason": d.reason,
             "policy": d.policy,
+            "cites": d.cites,
+            "held_task": input.held_task,
         });
         reads::append_line(&self.root.join("state/decisions.jsonl"), &line.to_string());
         if dm_otel::enabled() {
@@ -752,6 +805,9 @@ impl Memory {
             entry.front.supersedes.as_deref(),
         );
         self.refresh_projection().await;
+        if entry.front.entry_type == EntryType::Policy {
+            self.reload_policy().await?;
+        }
         self.written.0.fetch_add(1, Ordering::Relaxed);
         if entry.front.entry_type == EntryType::Handoff {
             self.written.1.fetch_add(1, Ordering::Relaxed);
@@ -915,6 +971,7 @@ impl Memory {
                 author: entry.front.author.clone(),
                 proposer: proposer.to_string(),
             }),
+            held_task: None,
         })
     }
 
@@ -924,6 +981,9 @@ impl Memory {
         self.store.put(&entry).await?;
         self.index.lock().await.upsert(&entry)?;
         self.refresh_projection().await;
+        if entry.front.entry_type == EntryType::Policy {
+            self.reload_policy().await?;
+        }
         Ok(Promotion::Promoted {
             id: entry.front.id,
             tier,
@@ -956,8 +1016,11 @@ impl Memory {
                 supersedes_author: old.as_ref().map(|e| e.front.author.clone()),
                 session_supersedes: self.superseded.load(Ordering::Relaxed),
                 findings: scan::kinds(&findings),
+                entry_type: entry.front.entry_type.to_string(),
+                supersedes_type: old.as_ref().map(|e| e.front.entry_type.to_string()),
             }),
             promote: None,
+            held_task: None,
         })?;
         if !decision.allow {
             return Err(self.quarantine(entry.clone(), &decision, &findings).await);
@@ -995,6 +1058,7 @@ impl Memory {
             }
         }
         let kind = match decision.review {
+            _ if !decision.cites.is_empty() => "policy",
             dm_policy::decide::Review::Approver => "verified",
             _ if findings.is_empty() => "blast-radius",
             _ => "injection",
@@ -1163,6 +1227,7 @@ impl Memory {
         self.observe(&decisions);
         self.observe(&conventions);
         let generated_by = format!("memory {}", env!("CARGO_PKG_VERSION"));
+        let digest = self.policy_digest();
         let text = t0::render(&t0::Inputs {
             domain: &domain,
             generated_by: &generated_by,
@@ -1172,9 +1237,44 @@ impl Memory {
             total_active: total,
             due_for_review: due,
             tasks_waiting: waiting,
+            policy_digest: &digest,
         });
         self.reads.text("t0", &text);
         Ok(text)
+    }
+
+    /// The policy digest T0 carries: the L0 core in full, rule and intent; the other
+    /// layers' rules that are verified, by id and rule, marked enforced where a module
+    /// checks them; and the exceptions in force, with their scope.
+    fn policy_digest(&self) -> Vec<String> {
+        let p = self.policy();
+        let now = OffsetDateTime::now_utc();
+        let mut out = Vec::new();
+        let mut entries: Vec<_> = p.entries().iter().collect();
+        entries.sort_by_key(|e| (e.meta.layer, e.meta.id.clone()));
+        for e in entries {
+            let m = &e.meta;
+            if m.is_exception() {
+                if e.in_force(now) {
+                    out.push(format!(
+                        "{} excepts {} for {} until {}",
+                        m.id,
+                        m.breaches.as_deref().unwrap_or("?"),
+                        m.scope_task.as_deref().unwrap_or("?"),
+                        m.expires.as_deref().unwrap_or("?")
+                    ));
+                }
+            } else if m.layer == 0 {
+                out.push(format!(
+                    "{} (L0, not overridable): {} Why: {}",
+                    m.id, m.rule, m.intent
+                ));
+            } else if e.tier == TrustTier::Verified {
+                let how = if e.enforced() { ", enforced" } else { "" };
+                out.push(format!("{} (L{}{how}): {}", m.id, m.layer, m.rule));
+            }
+        }
+        out
     }
 
     // ---- tasks ----
@@ -1286,6 +1386,7 @@ impl Memory {
             }),
             write: None,
             promote: None,
+            held_task: None,
         })?;
         if d.admit {
             Ok(l.admit(&task.id).await?)
@@ -1687,6 +1788,7 @@ impl Memory {
             parent: None,
             write: None,
             promote: None,
+            held_task: None,
         })?;
         if !d.allow || self.author != self.grants.owner {
             return Err(Error::Denied(format!(
@@ -1845,6 +1947,8 @@ impl Memory {
                 flagged.push(other);
             }
         }
+        // an erased policy entry takes its rule or exception with it
+        self.reload_policy().await?;
         Ok(flagged)
     }
 
@@ -2434,6 +2538,142 @@ mod tests {
         assert_eq!(
             owner.get(&after).await.unwrap().front.review_by,
             Some(today)
+        );
+    }
+
+    const RULE: &str = "# Decisions are superseded by a person\n\n```policy\nid = \"pol-L2-031\"\nlayer = 2\nrule = \"Decisions are superseded by a person, not an agent.\"\nintent = \"An agent rewrote a standing decision mid-task.\"\n```\n\n```rego\npackage amem.rules\nimport rego.v1\ndeny contains {\"policy\": \"pol-L2-031\", \"reason\": \"an agent superseded a decision\"} if {\n\tinput.principal.class == \"agent\"\n\tinput.write.supersedes_type == \"decision\"\n}\n```\n";
+
+    async fn verify(owner: &Memory, proposer: &Memory, id: &str) {
+        let Promotion::Proposed { task } = proposer
+            .promote(id, TrustTier::Verified, "reviewed")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        owner.approve(&task.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn policy_is_memory_enforced_once_verified_with_exceptions_scoped_to_a_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let decision = |b: &str| WriteRequest {
+            entry_type: EntryType::Decision,
+            ..req(b)
+        };
+        let d1 = owner
+            .write(decision("Use SQLite on a laptop.\n"))
+            .await
+            .unwrap()
+            .id;
+        let rule = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Policy,
+                ..req(RULE)
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        // raw: inert
+        let d2 = agent
+            .write(WriteRequest {
+                supersedes: Some(d1.clone()),
+                ..decision("Use Postgres on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        // verified: a person approves what an agent proposed, and it is enforced
+        verify(&owner, &agent, &rule).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let err = agent
+            .write(WriteRequest {
+                supersedes: Some(d2.clone()),
+                ..decision("Use files on a laptop.\n")
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("pol-L2-031"), "{err}");
+        assert_eq!(gate_tasks(&agent, "gate:policy").await.len(), 1);
+        let t0 = owner.t0(None).await.unwrap();
+        assert!(
+            t0.contains("## Policy digest") && t0.contains("pol-L2-031 (L2, enforced)"),
+            "{t0}"
+        );
+        an_exception_lets_one_task_through(dir.path(), &owner, &agent, &d2).await;
+    }
+
+    async fn an_exception_lets_one_task_through(
+        root: &Path,
+        owner: &Memory,
+        agent: &Memory,
+        d2: &str,
+    ) {
+        let decision = |b: &str| WriteRequest {
+            entry_type: EntryType::Decision,
+            ..req(b)
+        };
+        // an exception scoped to one task, verified, lets that task through and is cited
+        let held = owner
+            .file_own(TaskSpec {
+                domain: "dom-me".into(),
+                title: "Replace the decision".into(),
+                body: "b".into(),
+                requirements: Vec::new(),
+                depends_on: Vec::new(),
+                origin: None,
+                upstream_event: None,
+                created_by: String::new(),
+                classification: Label::Public,
+                priority: 0,
+            })
+            .await
+            .unwrap()
+            .task;
+        let exc = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Policy,
+                ..req(&format!(
+                    "# Exception\n\n```policy\nid = \"exc-2026-001\"\nlayer = 2\nbreaches = \"pol-L2-031\"\nscope_task = \"{}\"\nexpires = \"2099-01-01T00:00:00Z\"\nintent = \"The task is to replace it.\"\n```\n",
+                    held.id
+                ))
+            })
+            .await
+            .unwrap()
+            .id;
+        verify(owner, agent, &exc).await;
+        let inside = Memory::open(root).unwrap().with_author("agent:a");
+        inside.set_held_task(&held.id);
+        inside
+            .write(WriteRequest {
+                supersedes: Some(d2.to_string()),
+                ..decision("Use files on a laptop.\n")
+            })
+            .await
+            .unwrap();
+        let log = std::fs::read_to_string(root.join("state/decisions.jsonl")).unwrap();
+        assert!(
+            log.lines()
+                .any(|l| l.contains("exc-2026-001") && l.contains("\"allow\":true")),
+            "{log}"
+        );
+        let outside = Memory::open(root).unwrap().with_author("agent:a");
+        let d3 = owner
+            .write(decision("Another decision.\n"))
+            .await
+            .unwrap()
+            .id;
+        assert!(
+            outside
+                .write(WriteRequest {
+                    supersedes: Some(d3),
+                    ..decision("Changed.\n")
+                })
+                .await
+                .is_err(),
+            "outside the task the rule holds"
         );
     }
 

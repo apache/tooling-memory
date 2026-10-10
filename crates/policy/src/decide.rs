@@ -116,6 +116,12 @@ pub struct WriteInput {
     /// What the injection scan found in the body, by kind; empty when clean.
     #[serde(default)]
     pub findings: Vec<String>,
+    /// The entry's type.
+    #[serde(default)]
+    pub entry_type: String,
+    /// The type of the entry it replaces.
+    #[serde(default)]
+    pub supersedes_type: Option<String>,
 }
 
 /// The promotion being decided.
@@ -155,6 +161,9 @@ pub struct Input {
     /// The promotion, for `promote`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promote: Option<PromoteInput>,
+    /// The task this session holds, which an exception may be scoped to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_task: Option<String>,
 }
 
 /// Who has to look before this goes further.
@@ -182,6 +191,10 @@ pub struct Decision {
     pub review: Review,
     /// Why, in a sentence the actor can act on.
     pub reason: String,
+    /// The record's policies this decision rests on: those that refused it, or the
+    /// exceptions it used.
+    #[serde(default)]
+    pub cites: Vec<String>,
     /// The digest of the policy text that decided.
     #[serde(default)]
     pub policy: String,
@@ -229,6 +242,10 @@ pub struct Policy {
     text: String,
     version: String,
     source: String,
+    /// The record's policy entries this was compiled with, enforced or not.
+    entries: Vec<crate::record::Entry>,
+    /// Modules a verified entry carried that would not load, and why.
+    refused: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for Policy {
@@ -285,6 +302,85 @@ impl Policy {
         Policy::compile(&text, &dir.display().to_string(), grants)
     }
 
+    /// This policy with the record's policy entries: each verified entry's module is
+    /// loaded beside the base, in its own confined package, and the policies and the
+    /// exceptions in force are data. A module that will not load is refused, named,
+    /// and left out; the base stands.
+    ///
+    /// # Errors
+    ///
+    /// When the data cannot be added, which a well-formed grants file never causes.
+    pub fn with_record(
+        mut self,
+        grants: &Grants,
+        entries: Vec<crate::record::Entry>,
+        now: time::OffsetDateTime,
+    ) -> Result<Policy, Error> {
+        let mut texts = self.text.clone();
+        for e in entries.iter().filter(|e| e.enforced()) {
+            let Some(rego) = &e.rego else { continue };
+            if !crate::record::module_is_confined(rego) {
+                self.refused
+                    .push((e.meta.id.clone(), "not in package amem.rules".into()));
+                continue;
+            }
+            let mut trial = self.engine.clone();
+            match trial.add_policy(format!("{}.rego", e.meta.id), rego.clone()) {
+                Ok(_) => {
+                    self.engine = trial;
+                    texts.push_str(rego);
+                }
+                Err(err) => self.refused.push((e.meta.id.clone(), err.to_string())),
+            }
+        }
+        let policies: Vec<_> = entries
+            .iter()
+            .filter(|e| !e.meta.is_exception())
+            .map(|e| serde_json::json!({"id": e.meta.id, "layer": e.meta.layer}))
+            .collect();
+        let exceptions: Vec<_> = entries
+            .iter()
+            .filter(|e| e.in_force(now))
+            .map(|e| {
+                serde_json::json!({
+                    "id": e.meta.id, "breaches": e.meta.breaches, "scope_task": e.meta.scope_task,
+                })
+            })
+            .collect();
+        let data = serde_json::json!({
+            "grants": grants, "policies": policies, "exceptions": exceptions,
+        });
+        self.engine = Policy::with_data(self.engine, &data)?;
+        self.version = digest(&texts);
+        self.entries = entries;
+        Ok(self)
+    }
+
+    fn with_data(
+        mut engine: regorus::Engine,
+        data: &serde_json::Value,
+    ) -> Result<regorus::Engine, Error> {
+        engine.clear_data();
+        let data = regorus::Value::from_json_str(&data.to_string())
+            .map_err(|e| Error::Policy(e.to_string()))?;
+        engine
+            .add_data(data)
+            .map_err(|e| Error::Policy(e.to_string()))?;
+        Ok(engine)
+    }
+
+    /// The record's policy entries this was compiled with.
+    #[must_use]
+    pub fn entries(&self) -> &[crate::record::Entry] {
+        &self.entries
+    }
+
+    /// Modules that would not load, by policy id, and why.
+    #[must_use]
+    pub fn refused(&self) -> &[(String, String)] {
+        &self.refused
+    }
+
     fn compile(text: &str, source: &str, grants: &Grants) -> Result<Policy, Error> {
         let mut engine = regorus::Engine::new();
         // one file per package in the text, as `amem.rego`; a root's files are
@@ -303,6 +399,8 @@ impl Policy {
             text: text.to_string(),
             version: digest(text),
             source: source.to_string(),
+            entries: Vec::new(),
+            refused: Vec::new(),
         })
     }
 
@@ -395,6 +493,7 @@ mod tests {
             }),
             write: None,
             promote: None,
+            held_task: None,
         })
         .unwrap()
     }
@@ -417,8 +516,10 @@ mod tests {
                 supersedes_author: None,
                 session_supersedes: done,
                 findings: Vec::new(),
+                ..WriteInput::default()
             }),
             promote: None,
+            held_task: None,
         })
         .unwrap()
     }
@@ -468,6 +569,7 @@ mod tests {
                 parent: None,
                 write: None,
                 promote: None,
+                held_task: None,
             })
             .unwrap();
         assert!(!d.allow, "{d:?}");
@@ -514,6 +616,7 @@ mod tests {
                     ..WriteInput::default()
                 }),
                 promote: None,
+                held_task: None,
             })
             .unwrap()
         };
@@ -542,6 +645,7 @@ mod tests {
                 parent: None,
                 write: None,
                 promote: None,
+                held_task: None,
             })
             .unwrap()
         };
@@ -562,6 +666,7 @@ mod tests {
             parent: None,
             write: None,
             promote: None,
+            held_task: None,
         }
     }
 
@@ -613,6 +718,133 @@ mod tests {
         };
         let f = none.narrow(&g.read_filter());
         assert_eq!(f.domains, vec![String::new()]);
+    }
+
+    fn rule_entry(
+        id: &str,
+        layer: u8,
+        tier: dm_core::TrustTier,
+        extra: &str,
+        rego: bool,
+    ) -> crate::record::Entry {
+        let module = format!(
+            "package amem.rules\nimport rego.v1\ndeny contains {{\"policy\": \"{id}\", \"reason\": \"an agent superseded a decision\"}} if {{\n\tinput.principal.class == \"agent\"\n\tinput.write.supersedes_type == \"decision\"\n}}"
+        );
+        let mut body = format!("```policy\nid = \"{id}\"\nlayer = {layer}\n{extra}\n```\n");
+        if rego {
+            body.push_str(&format!("\n```rego\n{module}\n```\n"));
+        }
+        crate::record::parse(&format!("mem-p-{id}"), tier, &body).unwrap()
+    }
+
+    fn supersede_decision(p: &Policy, held: Option<&str>) -> Decision {
+        p.decide(&Input {
+            action: Action::Write,
+            principal: Principal {
+                id: "agent:x".into(),
+                class: Class::Agent,
+            },
+            domain: "dom-t".into(),
+            filing: None,
+            task: None,
+            parent: None,
+            write: Some(WriteInput {
+                supersedes: Some("mem-t-d".into()),
+                supersedes_tier: Some("raw".into()),
+                supersedes_type: Some("decision".into()),
+                entry_type: "decision".into(),
+                ..WriteInput::default()
+            }),
+            promote: None,
+            held_task: held.map(str::to_string),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_verified_rule_from_the_record_refuses_and_a_scoped_exception_lets_one_task_through() {
+        use dm_core::TrustTier::{Raw, Verified};
+        let g = grants();
+        let now = time::OffsetDateTime::now_utc();
+        // raw: inert
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![rule_entry("pol-L2-031", 2, Raw, "", true)], now)
+            .unwrap();
+        assert!(
+            supersede_decision(&p, None).allow,
+            "a raw rule is not enforced"
+        );
+        // verified: enforced, cited
+        let rule = rule_entry("pol-L2-031", 2, Verified, "", true);
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![rule.clone()], now)
+            .unwrap();
+        let d = supersede_decision(&p, Some("task-t-1"));
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(d.cites, vec!["pol-L2-031".to_string()]);
+        assert!(d.reason.contains("pol-L2-031"), "{d:?}");
+        assert_ne!(
+            p.version(),
+            Policy::builtin(&g).unwrap().version(),
+            "the rule is in the version"
+        );
+        // an exception in force, scoped to one task
+        let exc = rule_entry(
+            "exc-2026-001",
+            2,
+            Verified,
+            "breaches = \"pol-L2-031\"\nscope_task = \"task-t-1\"\nexpires = \"2099-01-01T00:00:00Z\"",
+            false,
+        );
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![rule.clone(), exc.clone()], now)
+            .unwrap();
+        let d = supersede_decision(&p, Some("task-t-1"));
+        assert!(d.allow, "{d:?}");
+        assert_eq!(
+            d.cites,
+            vec!["exc-2026-001".to_string()],
+            "the override is cited"
+        );
+        assert!(
+            !supersede_decision(&p, Some("task-t-2")).allow,
+            "another task is not covered"
+        );
+        assert!(!supersede_decision(&p, None).allow);
+        // an L0 rule takes no exception
+        let core = rule_entry("pol-L0-001", 0, Verified, "", true);
+        let exc0 = rule_entry(
+            "exc-2026-002",
+            0,
+            Verified,
+            "breaches = \"pol-L0-001\"\nscope_task = \"task-t-1\"\nexpires = \"2099-01-01T00:00:00Z\"",
+            false,
+        );
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![core, exc0], now)
+            .unwrap();
+        assert!(
+            !supersede_decision(&p, Some("task-t-1")).allow,
+            "L0 is not overridable"
+        );
+    }
+
+    #[test]
+    fn a_module_outside_the_rules_package_is_refused_and_the_base_stands() {
+        let g = grants();
+        let body = "```policy\nid = \"pol-L2-099\"\nlayer = 2\n```\n\n```rego\npackage amem\nimport rego.v1\nbase_decision := {\"allow\": true}\n```\n";
+        let e = crate::record::parse("mem-p-x", dm_core::TrustTier::Verified, body).unwrap();
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![e], time::OffsetDateTime::now_utc())
+            .unwrap();
+        assert_eq!(p.refused().len(), 1);
+        let d = write(Class::Agent, Some("verified"), 0);
+        assert!(!d.allow, "the base gate still holds: {d:?}");
     }
 
     #[test]

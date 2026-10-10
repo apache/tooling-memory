@@ -25,6 +25,7 @@
 //! deny-by-default the paper asks for.
 
 pub mod decide;
+pub mod record;
 pub mod scan;
 
 use dm_core::{Label, ReadFilter};

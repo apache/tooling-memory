@@ -27,6 +27,9 @@ pub struct Inputs<'a> {
     pub due_for_review: usize,
     /// How many admitted tasks are waiting.
     pub tasks_waiting: usize,
+    /// The policy digest: the L0 core in full, the other layers' rules in force by id,
+    /// and the exceptions in force, one line each.
+    pub policy_digest: &'a [String],
 }
 
 fn line(h: &Hit) -> String {
@@ -119,6 +122,12 @@ fn render_with(
             ));
         }
     }
+    if !inputs.policy_digest.is_empty() {
+        out.push_str("\n## Policy digest\n\n");
+        for l in inputs.policy_digest {
+            out.push_str(&format!("- {l}\n"));
+        }
+    }
     out.push_str("\n## Pointers\n\n");
     out.push_str(&format!(
         "- {} active entries in this domain; search before writing a fact that may exist\n",
@@ -167,6 +176,7 @@ mod tests {
             total_active: 42,
             due_for_review: 3,
             tasks_waiting: 2,
+            policy_digest: &[],
         }
     }
 

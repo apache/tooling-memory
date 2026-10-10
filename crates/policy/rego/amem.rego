@@ -216,12 +216,67 @@ promote_decision := {"allow": true, "admit": false, "review": "none", "reason": 
 
 default promote_decision := {"allow": false, "admit": false, "review": "none", "reason": "no promotion rule for this request"}
 
-default decision := {"allow": false, "admit": false, "review": "none", "reason": "no rule for this action"}
+default base_decision := {"allow": false, "admit": false, "review": "none", "reason": "no rule for this action"}
 
-decision := promote_decision if input.action == "promote"
+base_decision := promote_decision if input.action == "promote"
 
-decision := file_decision if input.action == "file_task"
+base_decision := file_decision if input.action == "file_task"
 
-decision := write_decision if input.action == "write"
+base_decision := write_decision if input.action == "write"
 
-decision := erase_decision if input.action == "erase"
+base_decision := erase_decision if input.action == "erase"
+
+# ---- the record's rules: modules from verified policy entries ----
+
+# A verified policy entry's module lives in `package amem.rules` and contributes
+# `deny contains {"policy": <id>, "reason": <why>}` for a request. A denial wins over
+# the decision above unless an exception in force covers it: an exception entry,
+# verified and unexpired, that breaches that policy and is scoped to the task this
+# session holds. An L0 rule takes no exception. Every decision says which policies it
+# cites, the denials or the exceptions used: the paper's citation and override rates.
+core_policy(pid) if {
+	some p in data.policies
+	p.id == pid
+	p.layer == 0
+}
+
+excepted(pid) if {
+	not core_policy(pid)
+	some e in data.exceptions
+	e.breaches == pid
+	e.scope_task == input.held_task
+}
+
+rule_denials contains d if {
+	some d in data.amem.rules.deny
+	not excepted(d.policy)
+}
+
+exceptions_used contains x if {
+	some d in data.amem.rules.deny
+	excepted(d.policy)
+	some ex in data.exceptions
+	ex.breaches == d.policy
+	ex.scope_task == input.held_task
+	x := ex.id
+}
+
+used_list := [x | some x in exceptions_used]
+
+denied_list := [p | some d in rule_denials; p := d.policy]
+
+denied_reasons := [r | some d in rule_denials; r := sprintf("%v: %v", [d.policy, d.reason])]
+
+decision := object.union(base_decision, {"cites": used_list}) if {
+	count(rule_denials) == 0
+}
+
+decision := {
+	"allow": false,
+	"admit": false,
+	"review": "human",
+	"reason": concat("; ", denied_reasons),
+	"cites": denied_list,
+} if {
+	count(rule_denials) > 0
+}

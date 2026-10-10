@@ -107,6 +107,7 @@ enum Kind {
     Convention,
     Method,
     Handoff,
+    Policy,
 }
 
 impl From<Kind> for EntryType {
@@ -117,6 +118,7 @@ impl From<Kind> for EntryType {
             Kind::Convention => EntryType::Convention,
             Kind::Method => EntryType::Method,
             Kind::Handoff => EntryType::Handoff,
+            Kind::Policy => EntryType::Policy,
         }
     }
 }
@@ -905,6 +907,16 @@ enum PolicyOp {
     Eval {
         #[arg(default_value = "-")]
         input: String,
+    },
+    /// The record's policies: each by layer and tier, whether its rule is enforced, and
+    /// the exceptions in force.
+    List,
+    /// The paper's conflict rules over the record's policies, and from the decision log
+    /// each policy's citations and overrides; --file files a bug on the lower layer of
+    /// each conflict, for the owner.
+    Lint {
+        #[arg(long)]
+        file: bool,
     },
 }
 
@@ -3894,6 +3906,10 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
             let input: dm_policy::decide::Input = serde_json::from_str(&text)?;
             json(&m.policy().decide(&input)?)
         }
+        Command::Policy { op: PolicyOp::List } => json(&policy_list(m)),
+        Command::Policy {
+            op: PolicyOp::Lint { file },
+        } => policy_lint(m, file).await,
         Command::Quarantine {
             op: QuarantineOp::List,
         } => json(
@@ -3939,6 +3955,103 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         }
         _ => unreachable!("routed by maintain"),
     }
+}
+
+/// The record's policies, as `amem policy list` shows them.
+fn policy_list(m: &Memory) -> serde_json::Value {
+    let p = m.policy();
+    let now = time::OffsetDateTime::now_utc();
+    let rows: Vec<_> = p
+        .entries()
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.meta.id, "entry": e.entry_id, "layer": e.meta.layer, "tier": e.tier,
+                "rule": e.meta.rule, "exception": e.meta.is_exception(),
+                "enforced": e.enforced(), "in_force": e.in_force(now),
+                "breaches": e.meta.breaches, "scope_task": e.meta.scope_task,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "version": p.version(), "policies": rows,
+        "refused": p.refused().iter().map(|(id, why)| serde_json::json!({"id": id, "why": why})).collect::<Vec<_>>(),
+    })
+}
+
+/// Citations and overrides per policy, from the decision log: how often each rule
+/// refused something, and how often an exception let something through.
+fn policy_rates(root: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(root.join("state/decisions.jsonl")).unwrap_or_default();
+    let mut cited: std::collections::BTreeMap<String, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let allow = v["allow"].as_bool().unwrap_or(false);
+        for id in v["cites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.as_str())
+        {
+            let row = cited.entry(id.to_string()).or_default();
+            if allow {
+                row.1 += 1;
+            } else {
+                row.0 += 1;
+            }
+        }
+    }
+    serde_json::json!(cited
+        .into_iter()
+        .map(|(id, (refused, overridden))| serde_json::json!({"id": id, "refused": refused, "let_through": overridden}))
+        .collect::<Vec<_>>())
+}
+
+/// `amem policy lint`.
+async fn policy_lint(m: &Memory, file: bool) -> Fallible {
+    let p = m.policy();
+    let mut findings = dm_policy::record::lint(p.entries(), time::OffsetDateTime::now_utc());
+    findings.extend(
+        p.refused()
+            .iter()
+            .map(|(id, why)| dm_policy::record::Finding {
+                policy: id.clone(),
+                kind: "module-refused".into(),
+                why: format!("{id}'s module would not load: {why}"),
+            }),
+    );
+    let mut filed = Vec::new();
+    if file {
+        let domain = m.resolve_domain(None)?;
+        for f in findings.iter().filter(|f| f.kind != "inert") {
+            let created = m
+                .file_own(dm_ledger::TaskSpec {
+                    domain: domain.clone(),
+                    title: format!("Policy bug, {}: {}", f.kind, f.policy),
+                    body: format!(
+                        "{}\n\nAcross layers the higher wins and the lower is fixed: amend or supersede {} so it agrees, or file an exception with a scope, an expiry and an approver. Within a layer, resolve from the stated intents and record the trade-off.",
+                        f.why, f.policy
+                    ),
+                    requirements: vec!["human".into()],
+                    depends_on: Vec::new(),
+                    origin: Some(format!("policy:{}", f.kind)),
+                    upstream_event: Some(f.policy.clone()),
+                    created_by: String::new(),
+                    classification: dm_core::Label::Internal,
+                    priority: 4,
+                })
+                .await?;
+            if !created.deduplicated {
+                filed.push(created.task.id);
+            }
+        }
+    }
+    json(&serde_json::json!({
+        "findings": findings, "rates": policy_rates(m.root()), "filed": filed,
+    }))
 }
 
 /// `amem librarian`: the survey, or the survey filed as tasks.

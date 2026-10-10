@@ -105,6 +105,9 @@ pub enum EntryType {
     Method,
     /// What an agent wrote when it stopped, so the next one need not read its transcript.
     Handoff,
+    /// A policy: a rule and its intent at a layer, L0 to L3, with a Rego module where it
+    /// is machine-checkable, or an exception to one. Enforced only once verified.
+    Policy,
 }
 
 impl fmt::Display for EntryType {
@@ -115,6 +118,7 @@ impl fmt::Display for EntryType {
             EntryType::Convention => "convention",
             EntryType::Method => "method",
             EntryType::Handoff => "handoff",
+            EntryType::Policy => "policy",
         })
     }
 }
@@ -128,6 +132,7 @@ impl std::str::FromStr for EntryType {
             "convention" => Ok(EntryType::Convention),
             "method" => Ok(EntryType::Method),
             "handoff" => Ok(EntryType::Handoff),
+            "policy" => Ok(EntryType::Policy),
             other => Err(Error::Invalid(format!("unknown entry type {other:?}"))),
         }
     }
