@@ -1251,6 +1251,11 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
             if let Some(a) = author {
                 m = m.with_author(a);
             }
+            // a harness working a task has it in MEMORY_TASK, as the launcher sets it;
+            // what this session files or writes is judged against that task
+            if let Some(t) = std::env::var("MEMORY_TASK").ok().filter(|t| !t.is_empty()) {
+                m.set_held_task(&t);
+            }
             mcp::serve_stdio(Arc::new(m)).await?;
             Ok(())
         }

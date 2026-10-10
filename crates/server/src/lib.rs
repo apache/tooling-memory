@@ -328,12 +328,14 @@ impl Memory {
         };
         let session = grants.session();
         let session_id = dm_core::id::new_task_id("session").replace("task-session-", "sess-");
+        let reads = reads::ReadLog::new(root, &session_id);
+        reads.set_author(&grants.owner);
         Ok(Memory {
             root: root.to_path_buf(),
             author: grants.owner.clone(),
             grants,
             manifest: Vec::new(),
-            reads: reads::ReadLog::new(root, &session_id),
+            reads,
             session_id,
             store,
             index: AsyncMutex::new(index),
@@ -517,6 +519,7 @@ impl Memory {
     #[must_use]
     pub fn with_author(mut self, author: impl Into<String>) -> Memory {
         self.author = author.into();
+        self.reads.set_author(&self.author);
         // the read scope is the principal's; a new author is asked afresh
         self.scope = OnceLock::new();
         self
@@ -2729,6 +2732,11 @@ mod tests {
             tspec("Resummarise", -1, Some("librarian:resummarise"), &[], &[]),
         )
         .await;
+        let alarm = filed(
+            &m,
+            tspec("Alarm", 5, Some("telemetry:write-rate"), &[], &["human"]),
+        )
+        .await;
         let r = m.rescore(None).await.unwrap();
         assert_eq!(r.rubric, "default");
         let rank = |id: &str| {
@@ -2747,6 +2755,10 @@ mod tests {
             "curation's floor puts it at the head: nothing completed was curation"
         );
         assert!(why.contains("floor"), "{why}");
+        assert!(
+            rank(&alarm.id).is_none(),
+            "an owner's alarm is not what the floor promotes"
+        );
         assert!(r.maintenance_share < r.floor);
         let again = m.rescore(None).await.unwrap();
         assert!(

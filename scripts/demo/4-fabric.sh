@@ -1,0 +1,49 @@
+#!/bin/sh
+# Act 4: the task fabric. A strategy compiles into the rubric; a rescore ranks the
+# queue along its edges and keeps curation's floor; a harness that would spawn
+# subagents has them filed on the board instead; and the flow is counted.
+. "$(dirname "$0")/lib.sh"
+act "Act 4: the task fabric"
+
+say "an L1 strategy that compiles into the rubric, verified by a person"
+strategy=$(a write --kind policy --title "pol-L1-007 This period: subagent work first" <<'POL' | j "d['id']"
+# This period, work filed by a running task comes first
+
+```policy
+id = "pol-L1-007"
+layer = 1
+rule = "Prioritise work a running task filed over new work."
+intent = "Finishing what is started beats starting more; curation keeps a fifth of the work."
+
+[rubric]
+unblock_weight = 1
+maintenance_floor = 0.2
+
+[rubric.origin_weights]
+"task:" = 2
+"continues:" = 3
+"librarian:" = -1
+```
+POL
+)
+a approve "$(agent agent:librarian promote "{\"id\": \"$strategy\", \"to\": \"verified\", \"why\": \"agreed for this period\"}" | j "d['task']['id']")" >/dev/null
+echo "  pol-L1-007 is verified and in force"
+
+say "a small queue: a blocker under a ranked task, and new work"
+blocker=$(a task create "Migrate the fixtures" --domain dom-demo --body "Needed before the release." | j "d['id']")
+ranked=$(a task create "Cut the release" --domain dom-demo --priority 8 --after "$blocker" --body "Blocked on the fixtures." | j "d['id']")
+plain=$(a task create "Tidy the README" --domain dom-demo --priority 1 --body "Small." | j "d['id']")
+for t in "$blocker" "$ranked" "$plain"; do a task admit "$t" >/dev/null; done
+say "the cycle's rescore: every move a ledger event with its reason"
+a task rescore | j "f\"  rubric {d['rubric']}; curation's share of the completed work {d['maintenance_share']:.0%} against a floor of {d['floor']:.0%}\n\" + '\n'.join(f\"  {c['from']:>3} -> {c['to']:<3} {c['title']:<40} {c['why']}\" for c in d['changed'])"
+
+if [ -n "${HARNESS:-}" ]; then
+  say "subagents on the board: a $HARNESS session asked to delegate files each delegation as a task"
+  parent=$(a task create "Compare two decisions" --domain dom-demo --priority 20 --body "Use two subagents, one per decision, to summarise DR-19 and DR-22 from the memory record; then combine their answers into a handoff and complete this task." | j "d['id']")
+  a task admit "$parent" >/dev/null
+  ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" --lease-seconds 900 2>&1 | grep -E '^memory: (claimed|task|board|filed)' ) || true
+  a task tree "$parent" | j "f\"  {d['id']} {d['status']}: \" + ', '.join(f\"{c['id']} ({(c.get('origin') or '').split(':')[0]}) {c['status']}\" for c in d.get('children', []))" || true
+fi
+
+say "the fabric's telemetry: by family and status, why work was dropped, and capability gaps"
+a task stats | j "'\n'.join(f\"  {fam:<12} \" + ', '.join(f'{k} {v}' for k, v in s.items()) for fam, s in d['by_family'].items()) + f\"\n  unmatched requirements: {d['unmatched_requirements'] or 'none'}\""

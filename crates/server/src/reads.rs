@@ -18,6 +18,9 @@ pub struct Read {
     pub at: String,
     /// The session that read.
     pub session: String,
+    /// Who it read as: the owner, or an agent. Empty in lines written before this was kept.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author: String,
     /// t0, search, list or get.
     pub tool: String,
     /// The query, for search.
@@ -49,6 +52,8 @@ pub fn path(root: &Path) -> PathBuf {
 pub struct ReadLog {
     path: PathBuf,
     session: String,
+    /// Who the session reads as: the owner, or the agent it was opened for.
+    author: Mutex<String>,
     lock: Mutex<()>,
     enabled: AtomicBool,
 }
@@ -124,9 +129,18 @@ impl ReadLog {
         ReadLog {
             path: path(root),
             session: session.to_string(),
+            author: Mutex::new(String::new()),
             lock: Mutex::new(()),
             enabled: AtomicBool::new(true),
         }
+    }
+
+    /// Record reads as this author's from now on.
+    pub fn set_author(&self, author: &str) {
+        *self
+            .author
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = author.to_string();
     }
 
     /// Stop recording: for a reader whose reads are not a session's, such as a report.
@@ -184,6 +198,11 @@ impl ReadLog {
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
             session: self.session.clone(),
+            author: self
+                .author
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             tool: tool.to_string(),
             query: query.map(str::to_string),
             hits,

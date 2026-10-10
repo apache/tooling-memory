@@ -132,9 +132,10 @@ fn apply_floor(open: &[Task], completed: &[Task], rubric: &Rubric, ranks: &mut R
         .filter(|t| !maintenance(t))
         .map(|t| rank_of(t, ranks))
         .max();
+    // the floor is for curation an agent can do; an alarm for the owner waits for a person
     let best_curation = open
         .iter()
-        .filter(|t| maintenance(t))
+        .filter(|t| maintenance(t) && !t.spec.requirements.iter().any(|r| r == "human"))
         .max_by_key(|t| rank_of(t, ranks));
     if let (Some(top), Some(c)) = (top_delivery, best_curation) {
         if rank_of(c, ranks) <= top {

@@ -99,8 +99,9 @@ fn channels(root: &Path, t: &mut Telemetry) {
         *per_hour.entry((w.author.clone(), hour)).or_default() += 1;
         t.by_author.entry(w.author.clone()).or_default().writes += 1;
     }
+    // an owner importing or seeding writes in bulk by design; the alarm is for agents
     for ((who, hour), n) in per_hour {
-        if n >= 30 {
+        if n >= 30 && who.starts_with("agent:") {
             t.alarms.push(Alarm {
                 kind: "write-rate".into(),
                 who: who.clone(),
@@ -112,7 +113,10 @@ fn channels(root: &Path, t: &mut Telemetry) {
         let Some(at) = parse(&w.at) else { continue };
         let readers: BTreeSet<&str> = reads
             .iter()
-            .filter(|r| r.session != w.session && r.ids.contains(&w.id))
+            // a broadcast is other agents reading it; the owner reading is not one
+            .filter(|r| {
+                r.session != w.session && r.author.starts_with("agent:") && r.ids.contains(&w.id)
+            })
             .filter(|r| {
                 parse(&r.at).is_some_and(|ra| ra >= at && ra - at <= time::Duration::hours(1))
             })
