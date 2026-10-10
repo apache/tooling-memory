@@ -183,6 +183,9 @@ pub enum Error {
     /// the session's label.
     #[error("destination {0} is not available to this session")]
     Refused(String),
+    /// The call would go over a spend limit; the reason says which.
+    #[error("{0}")]
+    OverBudget(String),
     /// A direct call the upstream did not answer with success.
     #[error("{0}")]
     Upstream(String),
@@ -300,7 +303,7 @@ impl Egress {
         let dest =
             admit(inner, destination).map_err(|_| Error::Refused(destination.to_string()))?;
         if let Some(reason) = over_budget(inner, destination) {
-            return Err(Error::Refused(format!("{destination}: {reason}")));
+            return Err(Error::OverBudget(reason));
         }
         let req = Request::builder()
             .method(Method::POST)
