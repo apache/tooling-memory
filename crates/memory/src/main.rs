@@ -502,6 +502,11 @@ enum Command {
         /// Tokens a cycle's model calls may take in all; the checker stops at it.
         #[arg(long, default_value_t = 200_000)]
         budget_tokens: u64,
+        /// Run the vendor-drift probes on the checker's model each cycle, against its
+        /// baseline, filing confirmed drift for the owner. Uses probes/drift.toml in the
+        /// working directory.
+        #[arg(long)]
+        drift: bool,
         /// Where `file:` sources are resolved.
         #[arg(long)]
         workdir: Option<PathBuf>,
@@ -2370,6 +2375,7 @@ async fn curation_cmd(root: &Path, command: Command) -> Fallible {
             contradictions,
             budget_tasks,
             budget_tokens,
+            drift,
             workdir,
             every,
         } => {
@@ -2382,6 +2388,7 @@ async fn curation_cmd(root: &Path, command: Command) -> Fallible {
                 contradictions,
                 budget_tasks,
                 budget_tokens,
+                drift,
                 workdir: workdir.or_else(|| std::env::current_dir().ok()),
             };
             curate_loop(root, &plan, every).await
@@ -3744,6 +3751,7 @@ struct CuratePlan {
     contradictions: bool,
     budget_tasks: usize,
     budget_tokens: u64,
+    drift: bool,
     workdir: Option<PathBuf>,
 }
 
@@ -3872,6 +3880,18 @@ async fn checker_pass(
             .iter()
             .filter(|r| r.verdict == review::Kind::Malicious)
             .count();
+    }
+    if plan.drift && !spend.exhausted() {
+        let set = plan
+            .workdir
+            .clone()
+            .unwrap_or_default()
+            .join("probes/drift.toml");
+        if set.is_file() {
+            cycle.drift = drift::scheduled(&p.egress, m, &set, &p.provider, model, Some(domain))
+                .await
+                .unwrap_or_else(|e| Some(format!("probe failed: {e}")));
+        }
     }
     if let Some(t) = p.egress.telemetry().session(m.session_id())? {
         cycle.calls = t.calls;

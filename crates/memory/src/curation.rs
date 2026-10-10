@@ -79,6 +79,7 @@ pub async fn telemetry(
     demotions(memory, &domain, &active, &mut t).await?;
     completed(memory, &domain, &mut t).await?;
     rates(&mut t);
+    inflation(memory.root(), &mut t);
     channels(memory.root(), &mut t);
     Ok(t)
 }
@@ -234,6 +235,22 @@ async fn completed(
 
 /// The per-author rates the paper alerts on: rewrites that keep changing bodies, and a
 /// demotion rate out of line with the curation done.
+/// Requirements inflation per creator, from the decision log: a creator whose filings
+/// keep asking for more than it holds is flagged, as the paper has it.
+fn inflation(root: &Path, t: &mut Telemetry) {
+    for (who, n) in dm_server::fabric::inflated_by_creator(root) {
+        if n >= 3 {
+            t.alarms.push(Alarm {
+                kind: "inflation".into(),
+                who: who.clone(),
+                why: format!(
+                    "{who} filed {n} tasks asking for requirements it does not hold; inflated requirements address work to the most capable claimant"
+                ),
+            });
+        }
+    }
+}
+
 fn rates(t: &mut Telemetry) {
     for (who, s) in &t.by_author {
         if s.curations >= 5 && s.body_changed * 2 > s.curations {
@@ -322,6 +339,8 @@ pub struct Cycle {
     pub malicious: usize,
     /// Open tasks the rubric moved this cycle.
     pub rescored: usize,
+    /// The vendor-drift verdict on the checker's model, when the cycle probed it.
+    pub drift: Option<String>,
 }
 
 /// Append a cycle's record.

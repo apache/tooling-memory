@@ -3081,6 +3081,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fetch_carries_the_summaries_usually_read_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let a = m
+            .write(WriteRequest {
+                title: Some("Retry backoff".into()),
+                ..req("Operation R retries with exponential backoff.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let b = m
+            .write(WriteRequest {
+                title: Some("Backoff jitter".into()),
+                ..req("Backoff adds jitter so retries spread out.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        assert!(
+            m.read_with(&a, 2).await.unwrap().is_empty(),
+            "no association yet"
+        );
+        for _ in 0..3 {
+            let reader = Memory::open(dir.path()).unwrap();
+            reader.search("backoff", None, 5).await.unwrap();
+        }
+        let reader = Memory::open(dir.path()).unwrap();
+        let with = reader.read_with(&a, 2).await.unwrap();
+        assert_eq!(with.iter().map(|h| &h.id).collect::<Vec<_>>(), vec![&b]);
+    }
+
+    #[tokio::test]
+    async fn inflated_requirements_are_counted_per_creator() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let held = filed(&owner, tspec("Held", 4, None, &[], &["github"])).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        agent.set_held_task(&held.id);
+        agent
+            .create_task(tspec("Deploy it", 0, None, &[], &["deploy"]))
+            .await
+            .unwrap();
+        agent
+            .create_task(tspec("Within", 0, None, &[], &["github"]))
+            .await
+            .unwrap();
+        let st = owner.task_stats(None).await.unwrap();
+        assert_eq!(st["inflated_by_creator"]["agent:a"], 1, "{st}");
+    }
+
+    #[tokio::test]
     async fn taint_follows_reads_to_what_was_written_after() {
         let dir = tempfile::tempdir().unwrap();
         let a = mem(dir.path());

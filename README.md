@@ -16,7 +16,8 @@ is the statement of them. Beyond the read path, so are the paper's other commitm
 trust tiers that move only by a person's approval, policy as memory with scoped
 exceptions, the write gates and the quarantine, the task fabric's rubric, the
 librarian's curation and its own telemetry, prefetch and the read metrics, vendor-drift
-probes, and transcripts kept as sources. Every store behind those contracts is the simplest thing that
+probes, transcripts kept as sources, spend limits at the egress, and frozen-context
+replay. Every store behind those contracts is the simplest thing that
 could hold them on one laptop: the record as files under one directory, the index, the
 ledger and the metering each a SQLite file, the read log a JSONL file, one process holding
 every lock, one host. That is deliberate. It let the contracts be tried against ten
@@ -24,9 +25,10 @@ harnesses in two weeks, and it is also why none of it is the production shape.
 
 ### What the paper asks for that is not built
 
-- **Replay.** Neither frozen-context replay of a logged decision point nor live
-  re-execution of a task against a point-in-time snapshot. The evaluation harness, memory
-  against none on a fixed question set, is the nearest thing.
+- **Replay, beyond its first mode.** Frozen-context replay is built, `amem replay`, but
+  its decision contexts are the harness's own transcript, a self-report an agent could
+  shape; the egress sees the exact context each model call carried and does not yet keep
+  it. Live re-execution of a task against a point-in-time snapshot is not built.
 - **The platform as a domain.** Harness configuration, agent definitions and their
   authoring, decomposition templates and eval suites are not held in memory, and there is
   no evolution loop that loads only verified configuration into a harness. Policy is the
@@ -37,14 +39,11 @@ harnesses in two weeks, and it is also why none of it is the production shape.
   portfolio orchestration; a cross-domain dependency is seen, nothing more.
 - **The event log.** No log the record, index and ledger are projections of, no single
   materializer per domain, and no freshness fast lane with a published bound.
-- **Spend limits per resource class**, a policy the paper puts in the perimeter.
-- **Drift beyond metadata.** No logprob divergence, change-point detection over many
-  runs, or schedule; the probes run when someone runs them, against fixed thresholds.
-- **Smaller pieces.** Prefetch happens when a task is claimed, not appended to a fetch at
-  serve time; "used" in the wasted-read ratio is "cited in the handoff", not a model's
-  judgement; requirements inflation is refused at admission but not tracked per creator;
-  transcripts have no MCP tool and their excerpts are not restored on import; a harness's
-  own copy of its transcript is left in its private home.
+- **Drift beyond metadata.** No logprob divergence or change-point detection over many
+  runs; the probes run each curation cycle with `--drift`, against fixed thresholds.
+- **Smaller pieces.** "Used" in the wasted-read ratio is "cited in the handoff", not a
+  model's judgement; transcripts' excerpts are not restored on import; a harness's own
+  copy of its transcript is left in its private home.
 - **Platforms and CI.** No confinement on macOS, no bridge to Gofannon, and CI has not
   run since a billing failure; every change is gated locally by `make check`.
 

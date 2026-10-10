@@ -81,6 +81,16 @@ a t0 | sed -n '/## Policy digest/,/## Pointers/p' | sed '$d' | sed 's/^/  /'
 say "the lint: the paper's conflict rules, and each policy's refusals and let-throughs from the decision log"
 a policy lint | j "'\n'.join([f\"  {f['policy']}: {f['kind']}\" for f in d['findings']] + [f\"  {r['id']}: refused {r['refused']}, let through {r['let_through']}\" for r in d['rates']])"
 
+if gateway; then
+  say "spend limits: a destination's budget, checked by the egress before each model call leaves"
+  cp "$root/grants.toml" "$root/grants.toml.before-spend"
+  printf '\n[spend.llmao]\nsession_tokens = 1500\n' >> "$root/grants.toml"
+  echo "  grants.toml: [spend.llmao] session_tokens = 1500; the checker on a sample of eight:"
+  a check --auth gateway --model "$CHECKER_MODEL" --sample 8 2>&1 | grep -o 'spend limit[^"]*' | head -1 | sed 's/^/  refused: /' || true
+  tail -1 "$root/state/decisions.jsonl" | j "f\"  the decision log: {d['action']} {'allowed' if d['allow'] else 'refused'}, {d['reason']}\""
+  mv "$root/grants.toml.before-spend" "$root/grants.toml"
+fi
+
 say "reads are the policy's too: a root's policy narrowing agents to public entries, inside the query"
 mkdir -p "$root/policy"
 sed 's/^read_filter := base_filter$/read_filter := object.union(base_filter, {"handling": "public"}) if class == "agent"\n\nread_filter := base_filter if class != "agent"/' \

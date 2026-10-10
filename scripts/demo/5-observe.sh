@@ -52,5 +52,10 @@ if has transcript; then
       a transcript show "$s" --turn "$turn" | j "'    ' + d['role'] + ': ' + d['text'][:160].replace(chr(10), ' ')"
     fi
     echo "  searching the record for its words finds the entries, never the transcript: $(a search "$s" | j 'len(d)') hits"
+    if gateway; then
+      say "frozen-context replay: the transcript's decision points, presented again to $WORKER_MODEL"
+      a replay "$s" --limit 4 --model "$WORKER_MODEL" | j "f\"  agreement {d['agreement']:.0%} with the recorded steps\n\" + '\n'.join(f\"    turn {p['turn']:>2}: recorded {p['recorded_tool'] or 'a reply'}, replayed {p['replayed_tool'] or 'a reply'}  {'agrees' if p['agrees'] else 'differs'}\" for p in d['points'])" || true
+      echo "  (the recorded side is the harness's own transcript, a self-report; see the README)"
+    fi
   fi
 fi

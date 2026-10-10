@@ -946,6 +946,47 @@ pub fn task_body(destination: &str, model: &str, c: &Comparison) -> String {
 /// # Errors
 ///
 /// A ledger error.
+/// One scheduled round, as the curation cycle runs it: probe the model twice over,
+/// keep the run, compare it with the first run on record, and file confirmed drift for
+/// the owner. The first round only sets the baseline. Returns the verdict, if there
+/// was a baseline to compare with.
+///
+/// # Errors
+///
+/// When the probe set cannot be read or the run cannot be kept.
+pub async fn scheduled(
+    egress: &Egress,
+    memory: &Memory,
+    set_path: &Path,
+    destination: &str,
+    model: &str,
+    domain: Option<&str>,
+) -> Fallible<Option<String>> {
+    let set = ProbeSet::parse(&std::fs::read_to_string(set_path)?)?;
+    let run = probe_run(
+        egress,
+        destination,
+        model,
+        &set,
+        &set_path.display().to_string(),
+        2,
+    )
+    .await;
+    append(memory.root(), &run)?;
+    let runs = load(&runs_path(memory.root(), destination, model))?;
+    let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
+        return Ok(None);
+    };
+    if runs.len() < 2 {
+        return Ok(None);
+    }
+    let c = compare(first, last, &Params::default());
+    if c.drift {
+        file(memory, domain, destination, model, &c).await?;
+    }
+    Ok(Some(c.verdict))
+}
+
 pub async fn file(
     memory: &Memory,
     domain: Option<&str>,

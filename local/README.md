@@ -376,7 +376,9 @@ override and no MCP tool reaches it. A session holding a task files no higher th
 task, so work it delegates cannot outrank what it serves. Irreversible work escalates: a task that
 requires `irreversible` is never admitted as filed, whoever files it. `amem task stats`
 is the fabric's telemetry: by family and status, why tasks were invalidated, and the
-requirements of waiting tasks that no completed task ever carried, a capability gap.
+requirements of waiting tasks that no completed task ever carried, a capability gap,
+and per creator the filings held back for asking more than the creator holds, the
+paper's requirements inflation, which the librarian's telemetry flags at three.
 
 ## Prefetch and the read metrics
 
@@ -391,7 +393,10 @@ from the read and write logs: fetch-through, search hits later opened; retrieval
 pulls per completed task; prefetch precision, prefetched entries later opened or cited;
 and wasted reads, bodies opened that the session's handoff does not cite. "Used" here is
 cited by id in the handoff, where the paper samples a cheap-model judge. The read log
-also records who read, owner or agent, which the librarian's relay alarm uses. A Codex
+also records who read, owner or agent, which the librarian's relay alarm uses. Prefetch
+happens at fetch time too, the paper's rule 4: `get` over MCP carries `read_with`, the
+summaries of at most two entries the read log shows searched up with it at least three
+times, looked up under the session's filter and logged as a read. A Codex
 run on the gateway's Qwen prefetched eight summaries, opened three bodies, one of which
 only co-retrieval had surfaced, and scored fetch-through 2/3, depth 4.0, prefetch
 precision 5/8 and no wasted reads.
@@ -414,8 +419,37 @@ exported with its entry. `amem transcript erase <session> --reason ...` erases o
 the owner's act: a stub and a receipt remain, and the entries that cite it are flagged.
 A live Codex session's handoff cited `#1-3`; with the clock at zero, the sweep kept the
 cited turns as excerpts, dropped the rest and the raw lines, and erasing the handoff
-took its excerpts with it. Not yet: an MCP tool, excerpts on import, and the copy the
-harness keeps in its own home.
+took its excerpts with it. Agents follow a citation with the `transcript_turn` MCP tool,
+under the same rule. Not yet: excerpts on import, and the copy the harness keeps in its
+own home.
+
+## Spend limits: `[spend]` in grants.toml
+
+Spend limits per resource class sit in the perimeter, as the paper has them: in
+`grants.toml`, `[spend.<destination>]` sets `session_tokens`, what one session may spend
+there, and `day_tokens`, what the root may spend there in a day, tokens in and out. A
+`spend` rule in the built-in Rego decides, so a policy entry in the record can add its
+own. The egress asks before every model call, its own and a harness's, with what it has
+metered; over a limit the call does not leave, refused as a permission error with the
+reason, which a harness does not retry, and the refusal is a logged decision. Listing a
+destination's models is not a model call and is not limited.
+
+## Replay: `amem replay`
+
+`amem replay <session>` is the paper's frozen-context replay: each decision point of a
+kept transcript, every assistant turn up to `--limit` or one `--turn`, is presented again
+as the conversation up to that point, to the model given, through the egress, metered
+and under the spend limits; the candidate's next step, a tool or a reply, is scored
+against the one recorded, the same tool or a reply that overlaps by a third. The run is
+logged in `state/replay/<session>.jsonl` with digests of the context and the prompt, so
+two models replayed on the same session compare like for like: a regression between
+models, or the confirmation step for vendor drift. It is the owner's, since it reads a
+transcript whole, and runs while the transcript is live. The recorded side is the
+harness's own transcript, a self-report: the memory server's logs and the egress's
+metering are observed, the transcript is not, and a stronger replay would present what
+the egress saw the model sent, which is not yet kept. Codex's transcripts now record its
+tool calls as turns, as Claude Code's do. On the rehearsal's sessions the gateway's Qwen
+agreed with Claude's recorded steps between a quarter and three quarters of the time.
 
 ## Vendor drift: `amem drift` and `make drift`
 
@@ -435,8 +469,9 @@ escalate. The gateway does not swap a model behind a name, so a repoint is shown
 checking one model's run against another's baseline, `--baseline-model`: qwen3-8b
 against qwen3.8-27b fired input tokens on all eight probes, the reported model and
 fingerprint, and a flip rate of 1.0 over a floor of 0.0. Reasoning models think inside
-`max_tokens`; a probe cut by the limit says so. Not yet: logprob divergence, replay,
-change-point detection over many runs, a schedule.
+`max_tokens`; a probe cut by the limit says so. `amem curate --drift` probes the
+checker's model every cycle against its first run and files confirmed drift. Not yet:
+logprob divergence, change-point detection over many runs.
 
 ## The ledger on PostgreSQL
 

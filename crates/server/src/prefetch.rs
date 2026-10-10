@@ -114,6 +114,37 @@ impl Prefetched {
 }
 
 impl Memory {
+    /// The summaries to append to a fetch of `id`: entries the read log shows searched
+    /// up with it at least `plan.together` times, strongest first, at most `max`, looked
+    /// up under this session's filter, so an association mined from other sessions'
+    /// reads never widens what this one sees. The paper's rule: when B usually follows
+    /// A, B's summary rides on A's fetch, a few tokens in place of a search round.
+    ///
+    /// # Errors
+    ///
+    /// An index error.
+    pub async fn read_with(&self, id: &str, max: usize) -> Result<Vec<Hit>, Error> {
+        let f = self.session_filter()?;
+        let pairs = reads::co_retrieved(&reads::all(&self.root).unwrap_or_default(), |_| true);
+        let mut out = Vec::new();
+        {
+            let index = self.index.lock().await;
+            for (partner, _) in partners(&pairs, id, Plan::default().together) {
+                if out.len() >= max {
+                    break;
+                }
+                if let Some(meta) = index.meta(&partner, &f)? {
+                    out.push(meta.hit);
+                }
+            }
+        }
+        if !out.is_empty() {
+            self.observe(&out);
+            self.reads.hits("read_with", Some(id), &out);
+        }
+        Ok(out)
+    }
+
     /// Summaries likely needed for a task: the top hits of a search on `query`, then
     /// the entries the read log says are co-retrieved with them, inside the plan's cap
     /// and budget. Everything is admitted by the session's read filter, the label rises

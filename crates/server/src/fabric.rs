@@ -155,6 +155,28 @@ fn apply_floor(open: &[Task], completed: &[Task], rubric: &Rubric, ranks: &mut R
     share
 }
 
+/// Filings held back for requirements their filer does not hold, per creator, from the
+/// decision log: the paper's requirements inflation as telemetry, since a task with
+/// inflated requirements is a message addressed to the most capable claimant.
+#[must_use]
+pub fn inflated_by_creator(root: &std::path::Path) -> BTreeMap<String, usize> {
+    let text = std::fs::read_to_string(root.join("state/decisions.jsonl")).unwrap_or_default();
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let inflated = v["action"] == "file_task"
+            && v["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("does not hold"));
+        if let (true, Some(who)) = (inflated, v["principal"].as_str()) {
+            *out.entry(who.to_string()).or_default() += 1;
+        }
+    }
+    out
+}
+
 impl Memory {
     /// The rubric in force: the last verified L1 policy that carries one, by id, or the
     /// default.
@@ -277,6 +299,7 @@ impl Memory {
         Ok(serde_json::json!({
             "domain": domain, "by_family": by_family, "invalidated_because": reasons,
             "unmatched_requirements": unmatched,
+            "inflated_by_creator": inflated_by_creator(&self.root),
         }))
     }
 }

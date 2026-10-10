@@ -131,6 +131,15 @@ pub struct GetParams {
     pub id: String,
 }
 
+/// Parameters of `transcript_turn`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct TurnParams {
+    /// The session, as a citation `transcript:<session>#<turn>` names it.
+    pub session: String,
+    /// The turn, from one.
+    pub turn: usize,
+}
+
 /// Parameters of `promote`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct PromoteParams {
@@ -396,12 +405,13 @@ impl McpServer {
     }
 
     #[tool(
-        description = "One entry in full: its frontmatter and Markdown body. Reading it raises this session's label to the entry's classification."
+        description = "One entry in full: its frontmatter and Markdown body. Reading it raises this session's label to the entry's classification. `read_with`, when present, gives the summaries of entries usually read alongside it."
     )]
     async fn get(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
         let e = self.memory.get(&p.0.id).await.map_err(mcp_err)?;
+        let with = self.memory.read_with(&p.0.id, 2).await.unwrap_or_default();
         let f = &e.front;
-        ok(json!({
+        let mut v = json!({
             "id": f.id,
             "domain": f.domain,
             "type": f.entry_type.to_string(),
@@ -414,7 +424,14 @@ impl McpServer {
             "review_by": f.review_by.map(|d| d.to_string()),
             "title": e.title(),
             "body": e.body,
-        }))
+        });
+        if !with.is_empty() {
+            v["read_with"] = json!(with
+                .iter()
+                .map(|h| json!({ "id": h.id, "title": h.title, "summary": h.summary }))
+                .collect::<Vec<_>>());
+        }
+        ok(v)
     }
 
     #[tool(
@@ -447,6 +464,18 @@ impl McpServer {
             "domain": w.domain,
             "classification": w.classification.to_string(),
         }))
+    }
+
+    #[tool(
+        description = "One turn of a session's transcript, by citation: an entry's source `transcript:<session>#<turn>`. Served only when an entry you may read cites that turn; reading it raises your label as a get does. Recover from handoffs, not transcripts; this is for checking where an entry came from."
+    )]
+    async fn transcript_turn(&self, p: Parameters<TurnParams>) -> Result<CallToolResult, McpError> {
+        let r = self
+            .memory
+            .transcript_turn(&p.0.session, p.0.turn)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(r).unwrap_or_default())
     }
 
     #[tool(
