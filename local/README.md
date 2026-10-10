@@ -281,9 +281,32 @@ author; the owner's task carried the scan's excerpts; and the decision log held 
 with the policy's version. One consequence to know: the session-end handoff the hook
 mined for that run quoted the poison and was quarantined too, so a handoff that reports
 an injection by repeating it does not enter the record either; the owner's task says
-where both are. Not yet: the compiled read filter pushed into the index as OPA's
-partial evaluation would push it, which is the production shape; decision logs as
-OpenTelemetry spans; and a model-based read of quarantined bodies.
+where both are. Every decision is also a `policy.decision` span when a collector is named. Not yet: the
+compiled read filter pushed into the index as OPA's partial evaluation would push it,
+which is the production shape; and a model-based read of quarantined bodies.
+
+## Traces: OpenTelemetry
+
+`amem` sends OpenTelemetry traces beside the usage it records in SQLite, which stays
+as it is until the librarian's signals are computed from the stream. Three spans. A
+`model.call` for every model call the egress meters, from the request's start to its
+last byte: session, destination, the model reported, status, input, output, cache-read
+and cache-write tokens, and whether the egress observed it or the harness reported it.
+A `memory.read` for every read the server answers: tool, query, hits, tokens served,
+the entries served. A `policy.decision` for every decision the perimeter makes: action,
+principal and class, domain, allow, admit, review, reason and the policy's version.
+Nothing is sent, and nothing is installed, unless a collector is named: set
+`OTEL_EXPORTER_OTLP_ENDPOINT` to its OTLP/HTTP base, `http://localhost:4318` for a local
+collector, and `amem` posts protobuf to `/v1/traces` under it;
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` names the traces URL in full instead. The spans
+carry `service.name` `amem` and its version, and the usual `OTEL_*` variables apply:
+`OTEL_EXPORTER_OTLP_HEADERS` for a collector that wants a token,
+`OTEL_RESOURCE_ATTRIBUTES` for more resource attributes, `OTEL_BSP_SCHEDULE_DELAY` for
+how often a batch goes out. A collector that cannot be reached costs under a second at
+exit and never fails a command. The quickest local collector is Jaeger's all-in-one
+image with OTLP on 4318; the reference stack's shape, an OpenTelemetry collector writing
+Parquet queried with DuckDB or DataFusion, takes the same variable. Not yet: task
+transitions from the ledger, which wait on the ledger's move behind two backends.
 
 ## Is it still true? Validity and decay
 

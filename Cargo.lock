@@ -40,6 +40,7 @@ dependencies = [
  "dm-egress",
  "dm-index",
  "dm-ledger",
+ "dm-otel",
  "dm-policy",
  "dm-sandbox",
  "dm-server",
