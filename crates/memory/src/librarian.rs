@@ -329,7 +329,7 @@ fn survey_entry(
             entries: vec![id.clone()],
             why,
             body: format!(
-                "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}` and say in its body what changed and how you know. You propose; you do not promote to verified. Leave a handoff."
+                "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}` and say in its body what changed and how you know. If it holds, also call `promote` with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff."
             ),
         });
     }

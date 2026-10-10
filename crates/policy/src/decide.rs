@@ -61,6 +61,8 @@ pub enum Action {
     Erase,
     /// Read: the session's filter, asked once.
     Read,
+    /// Promote an entry's trust tier.
+    Promote,
 }
 
 /// How a task is being filed.
@@ -116,6 +118,19 @@ pub struct WriteInput {
     pub findings: Vec<String>,
 }
 
+/// The promotion being decided.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PromoteInput {
+    /// `direct`, `propose` or `approve`.
+    pub phase: String,
+    /// The tier asked for: `curated` or `verified`.
+    pub to: String,
+    /// The entry's author.
+    pub author: String,
+    /// Who proposed it; for `approve`, the proposal task's filer.
+    pub proposer: String,
+}
+
 /// One request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Input {
@@ -137,6 +152,9 @@ pub struct Input {
     /// The write, for `write`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write: Option<WriteInput>,
+    /// The promotion, for `promote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promote: Option<PromoteInput>,
 }
 
 /// Who has to look before this goes further.
@@ -376,6 +394,7 @@ mod tests {
                 requirements: r.iter().map(|s| (*s).to_string()).collect(),
             }),
             write: None,
+            promote: None,
         })
         .unwrap()
     }
@@ -399,6 +418,7 @@ mod tests {
                 session_supersedes: done,
                 findings: Vec::new(),
             }),
+            promote: None,
         })
         .unwrap()
     }
@@ -447,6 +467,7 @@ mod tests {
                 task: Some(TaskInput::default()),
                 parent: None,
                 write: None,
+                promote: None,
             })
             .unwrap();
         assert!(!d.allow, "{d:?}");
@@ -492,6 +513,7 @@ mod tests {
                     findings: vec!["instruction".into(), "broadcast".into()],
                     ..WriteInput::default()
                 }),
+                promote: None,
             })
             .unwrap()
         };
@@ -519,6 +541,7 @@ mod tests {
                 task: None,
                 parent: None,
                 write: None,
+                promote: None,
             })
             .unwrap()
         };
@@ -538,6 +561,7 @@ mod tests {
             task: None,
             parent: None,
             write: None,
+            promote: None,
         }
     }
 

@@ -545,6 +545,20 @@ enum Command {
     /// What an entry may have reached: the sessions that read it and the entries they
     /// wrote after; where to look when an entry turns out to be poison.
     Taint { id: String },
+    /// Promote an entry's trust tier. To curated at once, by anyone but its author; to
+    /// verified by proposal only, a task a person who did not propose it approves.
+    Promote {
+        id: String,
+        /// curated or verified.
+        #[arg(long)]
+        to: String,
+        /// What was checked, and against what.
+        #[arg(long, default_value = "")]
+        why: String,
+    },
+    /// Approve a proposal to promote an entry to verified. The approver did not
+    /// propose it, and is a person.
+    Approve { task: String },
     /// The models a destination lists, as JSON: what the web form offers to pick from.
     /// Routed as a launch would be, with the destination's credential; a login mode has
     /// no list, since the login is the harness's own.
@@ -2086,7 +2100,7 @@ async fn mine_cmd(
     )
     .await?;
     let client = work::client(p.memory.clone()).await?;
-    let model = model.unwrap_or_else(|| mine::default_model(&p.provider).to_string());
+    let model = model::resolve(&p.egress, &p.provider, model.as_deref()).await;
     let ids = mine::mine(&p.egress, &client, &p.provider, &model, transcript).await?;
     println!("{}", serde_json::to_string_pretty(&ids)?);
     Ok(())
@@ -2135,30 +2149,7 @@ async fn list_models(
         "v1/models"
     };
     let v = p.egress.get(&p.provider, path).await?;
-    Ok((p.provider.clone(), model_ids(&v)))
-}
-
-/// Model ids out of a listing in OpenAI's shape (`data[].id`), Google's
-/// (`models[].name`, prefixed `models/`) or a plain `models[].id`.
-fn model_ids(v: &serde_json::Value) -> Vec<String> {
-    let items = v
-        .get("data")
-        .or_else(|| v.get("models"))
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut ids: Vec<String> = items
-        .iter()
-        .filter_map(|m| {
-            m.get("id")
-                .or_else(|| m.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .map(|s| s.trim_start_matches("models/").to_string())
-        })
-        .collect();
-    ids.sort();
-    ids.dedup();
-    ids
+    Ok((p.provider.clone(), model::model_ids(&v)))
 }
 
 async fn tools_cmd(root: &Path, command: Command) -> Fallible {
@@ -3099,10 +3090,7 @@ impl Session {
             eprintln!("memory: nothing to mine; no transcript under the private home");
             return Ok(Vec::new());
         };
-        let model = model.map_or_else(
-            || mine::default_model(&self.p.server.provider).to_string(),
-            str::to_string,
-        );
+        let model = model::resolve(&self.p.egress, &self.p.server.provider, model).await;
         let client = work::client(self.p.memory.clone()).await?;
         let ids = if self.mines_via_harness(via) {
             self.mine_via_harness(&client, &model, &t).await?
@@ -3771,10 +3759,7 @@ async fn curate_cmd(root: &Path, plan: &CuratePlan) -> Fallible {
     let m = &p.memory;
     m.disable_read_log();
     let domain = m.resolve_domain(plan.domain.as_deref())?;
-    let model = plan
-        .model
-        .clone()
-        .unwrap_or_else(|| mine::default_model(&p.provider).to_string());
+    let model = model::resolve(&p.egress, &p.provider, plan.model.as_deref()).await;
     let mut cycle = curation::Cycle {
         at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -3835,7 +3820,7 @@ async fn check_cmd(
     )
     .await?;
     p.memory.disable_read_log();
-    let model = model.unwrap_or_else(|| mine::default_model(&p.provider).to_string());
+    let model = model::resolve(&p.egress, &p.provider, model.as_deref()).await;
     let report = checker::check(
         &p.egress,
         &p.memory,
@@ -3943,6 +3928,8 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
             op: QuarantineOp::Drop { id },
         } => json(&m.release_quarantined(&id, false).await?),
         Command::Taint { id } => json(&m.taint(&id)),
+        Command::Promote { id, to, why } => json(&m.promote(&id, to.parse()?, &why).await?),
+        Command::Approve { task } => json(&m.approve(&task).await?),
         Command::Canary { op } => canary_cmd(m, op).await,
         Command::Erase { id, reason } => json(&m.erase(&id, reason.into()).await?),
         Command::Reindex => {
@@ -4029,6 +4016,8 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         }
         cmd @ (Command::Canary { .. }
         | Command::Erase { .. }
+        | Command::Promote { .. }
+        | Command::Approve { .. }
         | Command::Reindex
         | Command::Policy { .. }
         | Command::Quarantine { .. }
@@ -4173,10 +4162,10 @@ mod backend_tests {
     #[test]
     fn model_ids_are_read_from_either_listing_shape() {
         let openai = serde_json::json!({ "object": "list", "data": [{ "id": "b" }, { "id": "a" }, { "id": "a" }] });
-        assert_eq!(model_ids(&openai), vec!["a", "b"]);
+        assert_eq!(model::model_ids(&openai), vec!["a", "b"]);
         let google = serde_json::json!({ "models": [{ "name": "models/gemini-2.5-flash" }] });
-        assert_eq!(model_ids(&google), vec!["gemini-2.5-flash"]);
-        assert!(model_ids(&serde_json::json!({})).is_empty());
+        assert_eq!(model::model_ids(&google), vec!["gemini-2.5-flash"]);
+        assert!(model::model_ids(&serde_json::json!({})).is_empty());
     }
 
     #[test]

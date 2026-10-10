@@ -78,6 +78,18 @@ impl fmt::Display for TrustTier {
     }
 }
 
+impl std::str::FromStr for TrustTier {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Error> {
+        match s {
+            "raw" => Ok(TrustTier::Raw),
+            "curated" => Ok(TrustTier::Curated),
+            "verified" => Ok(TrustTier::Verified),
+            other => Err(Error::Invalid(format!("unknown trust tier {other:?}"))),
+        }
+    }
+}
+
 /// What kind of knowledge an entry holds. The kinds age differently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

@@ -5,7 +5,7 @@
 # the grants file as `data.grants` and one request as `input`.
 #
 # input:
-#   action      file_task | write | erase | read
+#   action      file_task | write | erase | read | promote
 #   principal   {id, class}           class: owner | human | agent | tap | system
 #   domain      the domain acted on
 #   filing      own | held | session   (file_task) the system on the owner's behalf, a
@@ -14,6 +14,7 @@
 #   task        {requirements, origin} (file_task)
 #   parent      {requirements}         (file_task, filing == held) the task held
 #   write       {supersedes, supersedes_tier, supersedes_author, session_supersedes}
+#   promote     {phase, to, author, proposer}  phase: direct | propose | approve
 #
 # decision: {allow, admit, review, reason}
 #   review: none | human | approver    who has to look before this goes further
@@ -156,7 +157,68 @@ default read_filter := {"domains": [], "handling": "public", "min_tier": "verifi
 
 read_filter := base_filter
 
+# ---- promotion: raw to curated to verified ----
+
+# Curated means a librarian has summarised, merged or checked an entry: anyone but its
+# author may say so, and the owner always may. Verified is the review gate: it is
+# proposed, which files a task for a person, and approved by a person who did not
+# propose it. An agent never approves. This is the paper's defence against an exploit
+# found once becoming fleet-wide best practice: a librarian can propose but never
+# approve its own promotion.
+promotes_own if input.promote.author == input.principal.id
+
+promote_decision := {"allow": true, "admit": false, "review": "none", "reason": "curated by someone other than its author"} if {
+	input.promote.phase == "direct"
+	input.promote.to == "curated"
+	not promotes_own
+}
+
+promote_decision := {"allow": true, "admit": false, "review": "none", "reason": "curated by the owner"} if {
+	input.promote.phase == "direct"
+	input.promote.to == "curated"
+	promotes_own
+	class == "owner"
+}
+
+promote_decision := {"allow": false, "admit": false, "review": "none", "reason": "an author does not curate its own entry; a librarian or the owner does"} if {
+	input.promote.phase == "direct"
+	input.promote.to == "curated"
+	promotes_own
+	class != "owner"
+}
+
+promote_decision := {"allow": false, "admit": false, "review": "approver", "reason": "verified is proposed and approved, never set directly: use phase propose"} if {
+	input.promote.phase == "direct"
+	input.promote.to == "verified"
+}
+
+promote_decision := {"allow": true, "admit": true, "review": "approver", "reason": "proposed for verified; a person who did not propose it approves"} if {
+	input.promote.phase == "propose"
+	input.promote.to == "verified"
+}
+
+promote_decision := {"allow": false, "admit": false, "review": "approver", "reason": "the proposer does not approve its own promotion"} if {
+	input.promote.phase == "approve"
+	input.promote.proposer == input.principal.id
+}
+
+promote_decision := {"allow": false, "admit": false, "review": "approver", "reason": "an agent does not approve a promotion to verified; a person does"} if {
+	input.promote.phase == "approve"
+	input.promote.proposer != input.principal.id
+	not class in {"owner", "human"}
+}
+
+promote_decision := {"allow": true, "admit": false, "review": "none", "reason": "approved by a person who did not propose it"} if {
+	input.promote.phase == "approve"
+	input.promote.proposer != input.principal.id
+	class in {"owner", "human"}
+}
+
+default promote_decision := {"allow": false, "admit": false, "review": "none", "reason": "no promotion rule for this request"}
+
 default decision := {"allow": false, "admit": false, "review": "none", "reason": "no rule for this action"}
+
+decision := promote_decision if input.action == "promote"
 
 decision := file_decision if input.action == "file_task"
 

@@ -15,28 +15,38 @@ use std::pin::Pin;
 pub struct EgressDeputy {
     egress: Egress,
     destination: String,
-    model: String,
+    /// The model asked for, if any; otherwise resolved on first use.
+    given: Option<String>,
+    model: tokio::sync::OnceCell<String>,
 }
 
 impl EgressDeputy {
-    /// A deputy through `egress` to `destination`, on `model` or the destination's
-    /// small default.
+    /// A deputy through `egress` to `destination`, on `model` or, resolved when it is
+    /// first asked, the destination's small default ([`model::resolve`]).
     #[must_use]
     pub fn new(egress: Egress, destination: &str, model: Option<&str>) -> EgressDeputy {
         EgressDeputy {
             egress,
             destination: destination.to_string(),
-            model: model.map_or_else(
-                || model::default_model(destination).to_string(),
-                str::to_string,
-            ),
+            given: model.map(str::to_string),
+            model: tokio::sync::OnceCell::new(),
         }
+    }
+
+    async fn model_now(&self) -> &str {
+        self.model
+            .get_or_init(|| model::resolve(&self.egress, &self.destination, self.given.as_deref()))
+            .await
     }
 }
 
 impl Deputy for EgressDeputy {
     fn model(&self) -> String {
-        self.model.clone()
+        self.model.get().cloned().unwrap_or_else(|| {
+            self.given
+                .clone()
+                .unwrap_or_else(|| model::default_model(&self.destination).to_string())
+        })
     }
 
     fn complete<'a>(
@@ -44,7 +54,8 @@ impl Deputy for EgressDeputy {
         prompt: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
-            let (path, body) = model::request(&self.destination, &self.model, prompt);
+            let m = self.model_now().await;
+            let (path, body) = model::request(&self.destination, m, prompt);
             let answer = self
                 .egress
                 .call(&self.destination, &path, &body)

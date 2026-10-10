@@ -19,7 +19,8 @@ use dm_core::{Confidence, Entry, EntryType, Frontmatter, Label, ReadFilter, Stat
 use dm_index::{Hit, Index};
 use dm_ledger::{Claim, Created, Ledger, Task, TaskSpec};
 use dm_policy::decide::{
-    Action, Class, Decision, Filing, Input, ParentInput, Policy, Principal, TaskInput, WriteInput,
+    Action, Class, Decision, Filing, Input, ParentInput, Policy, Principal, PromoteInput,
+    TaskInput, WriteInput,
 };
 use dm_policy::{scan, Grants, Session};
 use dm_store::Store;
@@ -132,6 +133,24 @@ pub struct WriteRequest {
 
 fn default_type() -> EntryType {
     EntryType::Fact
+}
+
+/// What a promotion did.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "lowercase")]
+pub enum Promotion {
+    /// The entry is at the tier now.
+    Promoted {
+        /// The entry.
+        id: String,
+        /// Its tier.
+        tier: TrustTier,
+    },
+    /// A proposal is filed for a person to approve.
+    Proposed {
+        /// The proposal.
+        task: Box<Task>,
+    },
 }
 
 /// What an entry may have reached, as [`Memory::taint`] computes it.
@@ -323,6 +342,7 @@ impl Memory {
             task: None,
             parent: None,
             write: None,
+            promote: None,
         };
         let f = self
             .policy
@@ -678,6 +698,7 @@ impl Memory {
         if req.body.trim().is_empty() {
             return Err(Error::Denied("an entry needs a body".into()));
         }
+        let tier = self.tier_for_write(req.supersedes.is_some()).await;
         let classification = {
             let s = lock(&self.session);
             self.grants
@@ -699,7 +720,7 @@ impl Memory {
                 created: now,
                 source: req.source,
                 confidence: req.confidence,
-                trust_tier: TrustTier::Raw,
+                trust_tier: tier,
                 review_by,
                 supersedes: req.supersedes,
                 policy_context: Vec::new(),
@@ -742,6 +763,173 @@ impl Memory {
         })
     }
 
+    /// The tier a write lands at: curated when it replaces an entry in a session working
+    /// a librarian's or the checker's task, which is what curation is; raw otherwise.
+    async fn tier_for_write(&self, supersedes: bool) -> TrustTier {
+        if !supersedes {
+            return TrustTier::Raw;
+        }
+        let Some(held) = self.held.get() else {
+            return TrustTier::Raw;
+        };
+        let curating = self.ledger.lock().await.get(held).await.is_ok_and(|t| {
+            t.spec
+                .origin
+                .as_deref()
+                .is_some_and(|o| o.starts_with("librarian:") || o.starts_with("checker:"))
+        });
+        if curating {
+            TrustTier::Curated
+        } else {
+            TrustTier::Raw
+        }
+    }
+
+    /// Promote an entry: to curated at once where the policy allows it, by anyone but
+    /// its author; to verified only by proposal, which files a task for a person to
+    /// approve with [`Memory::approve`]. The entry is never edited in place: a
+    /// promotion is a new version of it, the old one kept in its history.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an entry this session cannot read, [`Error::Denied`]
+    /// when the policy refuses or the entry is already at or above the tier.
+    pub async fn promote(&self, id: &str, to: TrustTier, why: &str) -> Result<Promotion, Error> {
+        let f = self.session_filter()?;
+        if self.index.lock().await.meta(id, &f)?.is_none() {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        let (_, entry) = self.find(id).await?;
+        if entry.front.trust_tier >= to {
+            return Err(Error::Denied(format!(
+                "{id} is {} already",
+                entry.front.trust_tier
+            )));
+        }
+        let phase = if to == TrustTier::Verified {
+            "propose"
+        } else {
+            "direct"
+        };
+        let d = self.decide_promotion(&entry, to, phase, &self.author)?;
+        if !d.allow {
+            return Err(Error::Denied(d.reason));
+        }
+        if to != TrustTier::Verified {
+            return self.set_tier(entry, to).await;
+        }
+        let created = self
+            .file_own(TaskSpec {
+                domain: entry.front.domain.clone(),
+                title: format!(
+                    "Approve: verified for {}",
+                    entry.front.title.as_deref().unwrap_or(id)
+                ),
+                body: format!(
+                    "`{}` proposes that `{id}`, written by `{}`, be promoted to verified.\n\n{why}\n\nRead it with `amem get {id}`. Approve with `amem approve <this task>` if it holds; a person who did not propose it approves, and an agent never does. Invalidate this task to decline.",
+                    self.author, entry.front.author
+                ),
+                requirements: vec!["human".into()],
+                depends_on: Vec::new(),
+                origin: Some(format!("promote:{id}")),
+                upstream_event: Some("verified".into()),
+                created_by: String::new(),
+                classification: entry.front.classification,
+                priority: 3,
+            })
+            .await?;
+        Ok(Promotion::Proposed {
+            task: Box::new(created.task),
+        })
+    }
+
+    /// Approve a proposal to promote to verified: the person approving did not propose
+    /// it, and the policy says so. The entry is promoted and the proposal task completed
+    /// by the approver, the entry its record.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a task that is not a live promotion proposal or an
+    /// approval the policy refuses; a ledger or store error.
+    pub async fn approve(&self, task_id: &str) -> Result<Promotion, Error> {
+        let task = self.ledger.lock().await.get(task_id).await?;
+        self.task_in_grants(&task)?;
+        let Some(id) = task
+            .spec
+            .origin
+            .as_deref()
+            .and_then(|o| o.strip_prefix("promote:"))
+        else {
+            return Err(Error::Denied(format!(
+                "{task_id} is not a promotion proposal"
+            )));
+        };
+        if task.status.is_terminal() {
+            return Err(Error::Denied(format!("{task_id} is {:?}", task.status)));
+        }
+        let (_, entry) = self.find(id).await?;
+        let d = self.decide_promotion(
+            &entry,
+            TrustTier::Verified,
+            "approve",
+            &task.spec.created_by,
+        )?;
+        if !d.allow {
+            return Err(Error::Denied(d.reason));
+        }
+        let id = id.to_string();
+        let promoted = self.set_tier(entry, TrustTier::Verified).await?;
+        let mut l = self.ledger.lock().await;
+        if task.status == dm_ledger::Status::Proposed {
+            l.admit(task_id).await?;
+        }
+        l.claim(
+            task_id,
+            &self.author,
+            Duration::minutes(5),
+            &task.spec.requirements,
+        )
+        .await?;
+        l.complete(task_id, &self.author, &id).await?;
+        Ok(promoted)
+    }
+
+    fn decide_promotion(
+        &self,
+        entry: &Entry,
+        to: TrustTier,
+        phase: &str,
+        proposer: &str,
+    ) -> Result<Decision, Error> {
+        self.decide(&Input {
+            action: Action::Promote,
+            principal: self.principal(),
+            domain: entry.front.domain.clone(),
+            filing: None,
+            task: None,
+            parent: None,
+            write: None,
+            promote: Some(PromoteInput {
+                phase: phase.to_string(),
+                to: to.to_string(),
+                author: entry.front.author.clone(),
+                proposer: proposer.to_string(),
+            }),
+        })
+    }
+
+    /// A new version of the entry at the tier.
+    async fn set_tier(&self, mut entry: Entry, tier: TrustTier) -> Result<Promotion, Error> {
+        entry.front.trust_tier = tier;
+        self.store.put(&entry).await?;
+        self.index.lock().await.upsert(&entry)?;
+        self.refresh_projection().await;
+        Ok(Promotion::Promoted {
+            id: entry.front.id,
+            tier,
+        })
+    }
+
     /// The gates on a write: the scan, then the policy. Returns the entry this one
     /// replaces, read once for the policy and for the index.
     async fn gate(&self, entry: &Entry) -> Result<Option<Entry>, Error> {
@@ -769,6 +957,7 @@ impl Memory {
                 session_supersedes: self.superseded.load(Ordering::Relaxed),
                 findings: scan::kinds(&findings),
             }),
+            promote: None,
         })?;
         if !decision.allow {
             return Err(self.quarantine(entry.clone(), &decision, &findings).await);
@@ -1096,6 +1285,7 @@ impl Memory {
                 requirements: p.spec.requirements.clone(),
             }),
             write: None,
+            promote: None,
         })?;
         if d.admit {
             Ok(l.admit(&task.id).await?)
@@ -1496,6 +1686,7 @@ impl Memory {
             task: None,
             parent: None,
             write: None,
+            promote: None,
         })?;
         if !d.allow || self.author != self.grants.owner {
             return Err(Error::Denied(format!(
@@ -1626,10 +1817,12 @@ fn cites(text: &str, id: &str) -> bool {
 
 impl Memory {
     /// Flag every granted entry that names `id`, in its body, its sources or as the
-    /// entry it supersedes: its review date becomes today, so curation re-derives it from
-    /// what remains or erases it too. Returns the ids flagged.
+    /// entry it supersedes, and every entry a session wrote after reading it, which is
+    /// the paper's lineage from the read log: its review date becomes today, so curation
+    /// re-derives it from what remains or erases it too. Returns the ids flagged.
     async fn flag_citers(&self, id: &str) -> Result<Vec<String>, Error> {
         let today = OffsetDateTime::now_utc().date();
+        let read_then_wrote: HashSet<String> = self.taint(id).written.into_iter().collect();
         let mut flagged = Vec::new();
         for domain in self.domains() {
             for other in self.store.list(&domain).await? {
@@ -1641,7 +1834,8 @@ impl Memory {
                 };
                 let names_it = cites(&e.body, id)
                     || e.front.source.iter().any(|s| cites(s, id))
-                    || e.front.supersedes.as_deref() == Some(id);
+                    || e.front.supersedes.as_deref() == Some(id)
+                    || read_then_wrote.contains(&other);
                 if !names_it || e.front.status == Some(Status::Erased) {
                     continue;
                 }
@@ -2039,6 +2233,207 @@ mod tests {
             log.lines()
                 .any(|l| l.contains("\"action\":\"read\"") && l.contains("at most public")),
             "the scope is a logged decision:\n{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn curated_is_anyones_but_the_authors() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:librarian");
+        let own = agent.write(req("The agent's fact.\n")).await.unwrap().id;
+        let r = agent
+            .promote(&theirs, TrustTier::Curated, "checked")
+            .await
+            .unwrap();
+        assert!(matches!(
+            r,
+            Promotion::Promoted {
+                tier: TrustTier::Curated,
+                ..
+            }
+        ));
+        assert_eq!(
+            agent.get(&theirs).await.unwrap().front.trust_tier,
+            TrustTier::Curated
+        );
+        let err = agent
+            .promote(&own, TrustTier::Curated, "mine")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("own entry"), "{err}");
+        assert!(
+            agent
+                .promote(&theirs, TrustTier::Curated, "again")
+                .await
+                .is_err(),
+            "already"
+        );
+        // a promotion is a new version, the old one in the history
+        let history = dir.path().join("record");
+        let versions = walk(&history)
+            .into_iter()
+            .filter(|p| p.to_string_lossy().contains(&theirs))
+            .count();
+        assert!(versions >= 2, "the raw version is kept: {versions}");
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn verified_is_proposed_and_approved_by_a_person_who_did_not_propose_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner
+            .write(req("A fact worth verifying.\n"))
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:librarian");
+        let Promotion::Proposed { task } = agent
+            .promote(&id, TrustTier::Verified, "checked against the tree")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed, not set")
+        };
+        assert_eq!(task.spec.requirements, vec!["human".to_string()]);
+        assert_eq!(
+            agent.get(&id).await.unwrap().front.trust_tier,
+            TrustTier::Raw
+        );
+        let err = agent.approve(&task.id).await.unwrap_err();
+        assert!(err.to_string().contains("proposer"), "{err}");
+        let other_agent = Memory::open(dir.path()).unwrap().with_author("agent:other");
+        let err = other_agent.approve(&task.id).await.unwrap_err();
+        assert!(err.to_string().contains("agent does not approve"), "{err}");
+        let r = owner.approve(&task.id).await.unwrap();
+        assert!(matches!(
+            r,
+            Promotion::Promoted {
+                tier: TrustTier::Verified,
+                ..
+            }
+        ));
+        assert_eq!(
+            owner.get(&id).await.unwrap().front.trust_tier,
+            TrustTier::Verified
+        );
+        let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(closed.status, Status::Completed);
+        assert_eq!(
+            closed.holder.as_deref(),
+            Some("human:test:me"),
+            "the approver closed it"
+        );
+        // and the owner's own proposal is not the owner's to approve
+        let mine = owner.write(req("Another.\n")).await.unwrap().id;
+        let Promotion::Proposed { task } = owner
+            .promote(&mine, TrustTier::Verified, "mine")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        assert!(
+            owner.approve(&task.id).await.is_err(),
+            "approver is not the proposer"
+        );
+        // and now the verified gate has something real to guard
+        let err = agent
+            .write(WriteRequest {
+                supersedes: Some(id.clone()),
+                ..req("Rewritten.\n")
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("verified"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_librarians_rewrite_lands_curated() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let old = owner
+            .write(req("Clipped summary entry.\n"))
+            .await
+            .unwrap()
+            .id;
+        let task = owner
+            .file_own(TaskSpec {
+                domain: "dom-me".into(),
+                title: "Librarian: rewrite".into(),
+                body: "b".into(),
+                requirements: Vec::new(),
+                depends_on: Vec::new(),
+                origin: Some("librarian:resummarise".into()),
+                upstream_event: Some("x".into()),
+                created_by: String::new(),
+                classification: Label::Public,
+                priority: -1,
+            })
+            .await
+            .unwrap()
+            .task;
+        let lib = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:librarian");
+        lib.set_held_task(&task.id);
+        let new = lib
+            .write(WriteRequest {
+                supersedes: Some(old),
+                ..req("Clipped summary entry.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(
+            lib.get(&new).await.unwrap().front.trust_tier,
+            TrustTier::Curated
+        );
+        let plain = lib.write(req("A new fact.\n")).await.unwrap().id;
+        assert_eq!(
+            lib.get(&plain).await.unwrap().front.trust_tier,
+            TrustTier::Raw
+        );
+    }
+
+    #[tokio::test]
+    async fn erasure_flags_what_its_readers_wrote_after_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let gone = owner.write(req("Written in error.\n")).await.unwrap().id;
+        let reader = Memory::open(dir.path()).unwrap().with_author("agent:r");
+        let before = reader.write(req("Before reading.\n")).await.unwrap().id;
+        reader.get(&gone).await.unwrap();
+        let after = reader
+            .write(req("Drawn from what it read.\n"))
+            .await
+            .unwrap()
+            .id;
+        let receipt = owner.erase(&gone, Reason::Mistaken).await.unwrap();
+        assert!(receipt.flagged.contains(&after), "{:?}", receipt.flagged);
+        assert!(!receipt.flagged.contains(&before), "{:?}", receipt.flagged);
+        let today = OffsetDateTime::now_utc().date();
+        assert_eq!(
+            owner.get(&after).await.unwrap().front.review_by,
+            Some(today)
         );
     }
 

@@ -7,6 +7,7 @@
 
 use crate::recall::{self, Budget, Depth};
 use crate::{Error, Memory, WriteRequest};
+use dm_core::TrustTier;
 use dm_index::Hit;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -128,6 +129,18 @@ pub struct RecallParams {
 pub struct GetParams {
     /// The entry id, as a hit or T0 names it.
     pub id: String,
+}
+
+/// Parameters of `promote`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct PromoteParams {
+    /// The entry id.
+    pub id: String,
+    /// `curated` or `verified`.
+    pub to: String,
+    /// One sentence of why: what was checked, and against what.
+    #[serde(default)]
+    pub why: Option<String>,
 }
 
 /// Parameters of `write`.
@@ -434,6 +447,21 @@ impl McpServer {
             "domain": w.domain,
             "classification": w.classification.to_string(),
         }))
+    }
+
+    #[tool(
+        description = "Promote an entry's trust tier. `curated`: you checked, summarised or merged someone else's entry; never your own. `verified`: files a proposal a person approves; you never verify an entry yourself. Say why in one sentence."
+    )]
+    async fn promote(&self, p: Parameters<PromoteParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let to: TrustTier = parse("to", Some(p.to))?
+            .ok_or_else(|| McpError::invalid_params("to: curated or verified", None))?;
+        let r = self
+            .memory
+            .promote(&p.id, to, p.why.as_deref().unwrap_or(""))
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(r).unwrap_or_default())
     }
 
     #[tool(

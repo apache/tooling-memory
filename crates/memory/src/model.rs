@@ -16,6 +16,65 @@ pub fn default_model(destination: &str) -> &'static str {
     }
 }
 
+/// The model to use on a destination: the one given, else for the gateway the one
+/// `LLMAO_MODEL` names, else the smallest-looking model the gateway lists, else the
+/// destination's default. A gateway serves whatever its operator put behind it, so a
+/// fixed name is a guess that fails with a 400 on a gateway that does not serve it; the
+/// Foundation's serves open models only.
+pub async fn resolve(egress: &dm_egress::Egress, destination: &str, given: Option<&str>) -> String {
+    if let Some(m) = given {
+        return m.to_string();
+    }
+    if destination == "llmao" {
+        if let Ok(m) = std::env::var("LLMAO_MODEL") {
+            if !m.trim().is_empty() {
+                return m.trim().to_string();
+            }
+        }
+        if let Ok(v) = egress.get(destination, "v1/models").await {
+            if let Some(m) = smallest(&model_ids(&v)) {
+                return m;
+            }
+        }
+    }
+    default_model(destination).to_string()
+}
+
+/// The model a name says is small, by the markers vendors use, else the first listed.
+#[must_use]
+pub fn smallest(ids: &[String]) -> Option<String> {
+    const SMALL: [&str; 8] = ["haiku", "mini", "flash", "lite", "small", "8b", "7b", "4b"];
+    SMALL
+        .iter()
+        .find_map(|marker| ids.iter().find(|id| id.to_lowercase().contains(marker)))
+        .or_else(|| ids.first())
+        .cloned()
+}
+
+/// Model ids out of a listing in OpenAI's shape (`data[].id`), Google's
+/// (`models[].name`, prefixed `models/`) or a plain `models[].id`.
+#[must_use]
+pub fn model_ids(v: &Value) -> Vec<String> {
+    let items = v
+        .get("data")
+        .or_else(|| v.get("models"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut ids: Vec<String> = items
+        .iter()
+        .filter_map(|m| {
+            m.get("id")
+                .or_else(|| m.get("name"))
+                .and_then(Value::as_str)
+                .map(|s| s.trim_start_matches("models/").to_string())
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// The path and body of one user-turn request for a destination's API shape.
 #[must_use]
 pub fn request(destination: &str, model: &str, prompt: &str) -> (String, Value) {
@@ -64,6 +123,23 @@ mod tests {
         assert_eq!(b["model"], "m");
         assert_eq!(default_model("anthropic"), "claude-haiku-4-5-20251001");
         assert_eq!(default_model("openai"), "gpt-5-mini");
+    }
+
+    #[test]
+    fn the_smallest_listed_model_is_the_default_on_a_gateway() {
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            smallest(&ids(&["gemma4-26b", "qwen3-8b", "qwen3.8-27b"])).as_deref(),
+            Some("qwen3-8b")
+        );
+        assert_eq!(
+            smallest(&ids(&["claude-haiku-4-5", "gpt-5-mini"])).as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(smallest(&ids(&["big-model"])).as_deref(), Some("big-model"));
+        assert_eq!(smallest(&[]), None);
+        let listing = serde_json::json!({"data": [{"id": "b"}, {"id": "a"}, {"id": "a"}]});
+        assert_eq!(model_ids(&listing), ids(&["a", "b"]));
     }
 
     #[test]

@@ -4,11 +4,14 @@
 #
 #   scripts/demo.sh <demo-root> <markdown-dir>... 
 #
-# Needs target/release/amem (make build) and a harness login; HARNESS and AUTH override
-# the defaults (claude, subscription). Rerunning reuses the record and adds another task;
+# Needs target/release/amem (make build) and a harness login. HARNESS names the harness,
+# with no default, as everywhere else; AUTH defaults to subscription; RECALL_MODEL pins
+# the deputy's model on the gateway, which otherwise takes the smallest one the gateway
+# lists. Rerunning reuses the record and adds another task;
 # the entry the erasure step writes and erases is new each run, so the corpus is kept.
 set -eu
 root=${1:?demo root}; shift
+harness=${HARNESS:?name the harness: HARNESS=claude, codex, gemini, antigravity, qwen, grok, muse, pi, copilot or opencode}
 [ $# -ge 1 ] || { echo "give one or more directories or files of Markdown to seed from" >&2; exit 2; }
 here=$(cd "$(dirname "$0")/.." && pwd)
 memory="$here/target/release/amem"
@@ -46,9 +49,9 @@ title=${TASK_TITLE:-"Answer: what did DR-19 decide about MoinMoin, and why?"}
 body=${TASK_BODY:-"Use the memory tools: search the record, open only the entries you need, and answer in a handoff entry: what was decided, the reasons given, and the entry ids you cite. Then complete this task with that handoff. Do not read files from the working tree; the record is the source."}
 id=$("$memory" --root "$root" task create "$title" --body "$body" --priority 5 | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 "$memory" --root "$root" task admit "$id" >/dev/null
-echo "== task $id filed and admitted; a ${HARNESS:-claude} session claims and works it"
+echo "== task $id filed and admitted; a $harness session claims and works it"
 work=$(mktemp -d)
-( cd "$work" && "$memory" --root "$root" work --harness "${HARNESS:-claude}" --auth "${AUTH:-subscription}" --lease-seconds 300 ) || true
+( cd "$work" && "$memory" --root "$root" work --harness "$harness" --auth "${AUTH:-subscription}" --lease-seconds 300 ) || true
 echo
 echo "== erasure: a throwaway entry, erased by the owner; the stub and the receipt remain"
 gone=$(echo "A note that should never have been written: the demo passphrase is kestrel-91." \
@@ -58,7 +61,7 @@ echo "search for the passphrase after the erasure: $("$memory" --root "$root" se
 echo
 if [ -n "${LLMAO_KEY:-}" ]; then
   echo "== recall through the gateway: the deputy reads, a cited brief comes back"
-  "$memory" --root "$root" recall "$question" --provider llmao --auth gateway | show_recall || true
+  "$memory" --root "$root" recall "$question" --provider llmao --auth gateway ${RECALL_MODEL:+--model "$RECALL_MODEL"} | show_recall || true
 elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   echo "== recall with a key: the deputy reads, a cited brief comes back"
   "$memory" --root "$root" recall "$question" --provider anthropic --auth key | show_recall || true

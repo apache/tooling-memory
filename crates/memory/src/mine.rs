@@ -5,7 +5,7 @@
 //! model call, made through the same egress and destination as the session's own calls.
 
 use crate::hooks::transcript_tail;
-pub use crate::model::{answer_text, default_model};
+pub use crate::model::answer_text;
 use dm_client::{MemoryClient, NewEntry};
 use dm_egress::Egress;
 use serde::Deserialize;

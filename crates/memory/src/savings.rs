@@ -43,6 +43,11 @@ pub struct Report {
     pub known_items: usize,
     /// Of those, how many ranked in the top three.
     pub known_items_top3: usize,
+    /// Search latency over those lookups, in milliseconds, measured in process: the floor
+    /// under the paper's SLO of 100 at p50 and 500 at p99, which is end to end, through
+    /// the serving binding and the network, so this cannot show the SLO is met.
+    pub search_p50_ms: f64,
+    pub search_p99_ms: f64,
     /// Per session: tokens memory served, tokens the model ingested.
     pub sessions: Vec<SessionRow>,
     /// Recall, by regime: the brief against the pack it would be written from.
@@ -172,18 +177,38 @@ async fn retrieval(
             report.hit_bodies_tokens += approx_tokens(&e.body);
         }
     }
+    let mut took = Vec::new();
     for (id, title) in titles.iter().take(200) {
         let q = title.trim();
         if q.is_empty() {
             continue;
         }
         report.known_items += 1;
+        let started = std::time::Instant::now();
         let hits = memory.search(q, None, 3).await?;
+        took.push(started.elapsed().as_secs_f64() * 1000.0);
         if hits.iter().any(|h| &h.id == id) {
             report.known_items_top3 += 1;
         }
     }
+    report.search_p50_ms = percentile(&mut took, 0.50);
+    report.search_p99_ms = percentile(&mut took, 0.99);
     Ok(())
+}
+
+/// The `q` quantile of the samples, nearest rank; zero for none.
+fn percentile(samples: &mut [f64], q: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(f64::total_cmp);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )] // a rank
+    let rank = ((q * samples.len() as f64).ceil() as usize).clamp(1, samples.len());
+    samples[rank - 1]
 }
 
 /// One read's share of the recall row.
@@ -320,6 +345,10 @@ pub fn render(r: &Report) -> String {
         r.known_items,
         pct(r.known_items_top3, r.known_items)
     ));
+    s.push_str(&format!(
+        "  search, in process  p50 {:>6.1} ms   p99 {:>6.1} ms  (the floor under the paper's end-to-end 100 and 500 ms: no transport, no network, one machine)\n",
+        r.search_p50_ms, r.search_p99_ms
+    ));
     s.push_str(
         "\nFunnel: tokens memory served each session, beside what its model calls ingested\n",
     );
@@ -379,6 +408,17 @@ fn render_recall(r: &RecallRow) -> String {
         pct(r.pushed_then_opened, r.gets)
     ));
     s
+}
+
+#[cfg(test)]
+mod percentile_tests {
+    #[test]
+    fn nearest_rank() {
+        let mut v = vec![5.0, 1.0, 3.0, 2.0, 4.0];
+        assert!((super::percentile(&mut v, 0.5) - 3.0).abs() < 1e-9);
+        assert!((super::percentile(&mut v, 0.99) - 5.0).abs() < 1e-9);
+        assert!(super::percentile(&mut [], 0.5).abs() < 1e-9);
+    }
 }
 
 #[cfg(test)]
@@ -551,5 +591,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("known items in top 3"), "{text}");
+        assert!(text.contains("search, in process"), "{text}");
+        assert!(r.search_p99_ms >= r.search_p50_ms);
     }
 }
