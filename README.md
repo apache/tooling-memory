@@ -4,6 +4,38 @@ Shared memory and coordination for fleets of agents, built so that the record ou
 
 The design is the paper in [docs/](docs/durable-memory-for-disposable-agents.md). The plan, including the first milestone, is [PLAN.md](PLAN.md). The stack this grows into is [docs/reference-stack.md](docs/reference-stack.md).
 
+## This is a proof of concept
+
+What is proven here is the paper's contracts, not a system that scales. The entry
+format and its frontmatter, the ledger's rules (one holder, leases, dedup by origin and
+upstream event, recursive invalidation), the MCP surface, trust tiers and review clocks,
+summaries first, the hook protocol, the egress as the only way out, and the containment
+set (canaries, an independent checker, reversible writes) are built and exercised end to
+end, by real harnesses on real models, and the conformance suite in `crates/memory/tests`
+is the statement of them. Every store behind those contracts is the simplest thing that
+could hold them on one laptop: the record as files under one directory, the index, the
+ledger and the metering each a SQLite file, the read log a JSONL file, one process holding
+every lock, one host. That is deliberate. It let the contracts be tried against ten
+harnesses in two weeks, and it is also why none of it is the production shape.
+
+Where it stops. The ledger is one writer under one mutex; ten thousand committers filing
+tasks and agents claiming around the clock need per-domain ledgers in a database that
+takes a claim as one row-locked statement. The index is SQLite FTS5; a fleet needs a
+search engine sharded by domain. The metering and the read log are private tables that
+only this binary writes and reads; a fleet needs OpenTelemetry from the egress, the
+server and the ledger into a collector, and the librarian's signals computed over that
+stream rather than by scanning the record. The curation cycle surveys a domain by
+reading every entry; at scale it is event-driven. The perimeter, admission and the gates
+on writes, is Rego already, run in process over the grants file; at scale the same rules
+run in OPA and its partial evaluation pushes the read filter into the index. Shared memory
+is an injection surface and a channel between agents, and what is here against that, the
+write scan and quarantine, the blast-radius and verified-tier gates, the decision and
+write logs, taint and the relay alarm, is the start of the paper's answer, not the end. The targets for each are named in
+[docs/reference-stack.md](docs/reference-stack.md) and the order in the register in
+[PLAN.md](PLAN.md): the production backends go in behind the same crates and must pass
+the same conformance suite, and the evaluation harness and `amem savings` give the
+numbers for each swap, so that nothing in the move is argued from taste.
+
 ## What you get
 
 A per-session memory server, `amem`, that an agent harness reaches over MCP. It holds the record as Markdown files with frontmatter, an index and a task ledger in one SQLite file, and a grants file the owner edits. An agent starts empty, loads a small index called T0, writes a handoff when it stops, and the next agent continues from the handoff rather than a transcript.

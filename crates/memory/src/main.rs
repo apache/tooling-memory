@@ -524,6 +524,22 @@ enum Command {
         #[command(subcommand)]
         op: CanaryOp,
     },
+    /// The policy in force: the checkable perimeter as Rego, built in or the root's own
+    /// under policy/*.rego. `show` prints it with its version; `eval` decides one
+    /// request read as JSON from a file or standard input.
+    Policy {
+        #[command(subcommand)]
+        op: PolicyOp,
+    },
+    /// Writes the gates refused, held under state/quarantine and never served: list
+    /// them, show one, release one into the record as it was, or drop it.
+    Quarantine {
+        #[command(subcommand)]
+        op: QuarantineOp,
+    },
+    /// What an entry may have reached: the sessions that read it and the entries they
+    /// wrote after; where to look when an entry turns out to be poison.
+    Taint { id: String },
     /// The models a destination lists, as JSON: what the web form offers to pick from.
     /// Routed as a launch would be, with the destination's credential; a login mode has
     /// no list, since the login is the harness's own.
@@ -859,6 +875,33 @@ enum TapOp {
         /// Run again every this many seconds until stopped.
         #[arg(long)]
         every: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyOp {
+    /// The policy text, its version and where it came from.
+    Show,
+    /// Decide one request: a JSON input, from a file or `-` for standard input.
+    Eval {
+        #[arg(default_value = "-")]
+        input: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuarantineOp {
+    List,
+    Show {
+        id: String,
+    },
+    /// Write it into the record as it was written, author and all. The owner's act.
+    Release {
+        id: String,
+    },
+    /// Discard it.
+    Drop {
+        id: String,
     },
 }
 
@@ -3119,6 +3162,7 @@ impl Session {
         let mut env = self.p.harness_env.clone();
         if let Some(t) = task {
             env.push(("MEMORY_TASK".to_string(), t.to_string()));
+            self.p.memory.set_held_task(t);
         }
         let mut full: Vec<String> = [self.program.as_slice(), args].concat();
         if let Some(m) = &self.model {
@@ -3813,6 +3857,75 @@ async fn check_cmd(
     }))
 }
 
+/// `amem policy`, `amem quarantine`, `amem taint`, `amem canary`, `amem erase` and
+/// `amem reindex`: the perimeter's commands and the record's repair.
+async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
+    match command {
+        Command::Policy { op: PolicyOp::Show } => {
+            println!(
+                "# policy {} from {}\n{}",
+                m.policy().version(),
+                m.policy().source(),
+                m.policy().text()
+            );
+            Ok(())
+        }
+        Command::Policy {
+            op: PolicyOp::Eval { input },
+        } => {
+            let text = if input == "-" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                s
+            } else {
+                std::fs::read_to_string(&input)?
+            };
+            let input: dm_policy::decide::Input = serde_json::from_str(&text)?;
+            json(&m.policy().decide(&input)?)
+        }
+        Command::Quarantine {
+            op: QuarantineOp::List,
+        } => json(
+            &m.quarantined()?
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "id": e.front.id, "domain": e.front.domain, "author": e.front.author,
+                        "created": e.front.created.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                        "title": e.front.title,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        ),
+        Command::Quarantine {
+            op: QuarantineOp::Show { id },
+        } => {
+            let e = m
+                .quarantined()?
+                .into_iter()
+                .find(|e| e.front.id == id)
+                .ok_or_else(|| format!("{id} is not in quarantine"))?;
+            print!("{}", e.render());
+            Ok(())
+        }
+        Command::Quarantine {
+            op: QuarantineOp::Release { id },
+        } => json(&m.release_quarantined(&id, true).await?),
+        Command::Quarantine {
+            op: QuarantineOp::Drop { id },
+        } => json(&m.release_quarantined(&id, false).await?),
+        Command::Taint { id } => json(&m.taint(&id)),
+        Command::Canary { op } => canary_cmd(m, op).await,
+        Command::Erase { id, reason } => json(&m.erase(&id, reason.into()).await?),
+        Command::Reindex => {
+            let (n, events) = m.reindex().await?;
+            println!("indexed {n} entries, replayed {events} ledger events");
+            Ok(())
+        }
+        _ => unreachable!("routed by maintain"),
+    }
+}
+
 /// `amem librarian`: the survey, or the survey filed as tasks.
 async fn librarian_cmd(
     m: &Memory,
@@ -3870,12 +3983,6 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
             );
             Ok(())
         }
-        Command::Reindex => {
-            let (n, events) = m.reindex().await?;
-            println!("indexed {n} entries, replayed {events} ledger events");
-            Ok(())
-        }
-        Command::Erase { id, reason } => json(&m.erase(&id, reason.into()).await?),
         Command::Librarian {
             domain,
             file,
@@ -3892,7 +3999,12 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
             let workdir = workdir.or_else(|| std::env::current_dir().ok());
             librarian_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
         }
-        Command::Canary { op } => canary_cmd(m, op).await,
+        cmd @ (Command::Canary { .. }
+        | Command::Erase { .. }
+        | Command::Reindex
+        | Command::Policy { .. }
+        | Command::Quarantine { .. }
+        | Command::Taint { .. }) => perimeter_cmd(m, cmd).await,
         Command::Init { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }

@@ -53,6 +53,70 @@ pub struct ReadLog {
     enabled: AtomicBool,
 }
 
+/// A line appended to a JSONL file under the state directory; a failure is dropped,
+/// as a log's is.
+pub fn append_line(path: &Path, line: &str) {
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// One write, as the write log records it: which session wrote which entry, so a
+/// poisoned or erased entry's reach can be followed from what its readers wrote.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Wrote {
+    /// When.
+    pub at: String,
+    /// Which session.
+    pub session: String,
+    /// The entry written.
+    pub id: String,
+    /// Its author.
+    pub author: String,
+    /// The entry it replaced, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+}
+
+/// Record a write.
+pub fn wrote(root: &Path, session: &str, id: &str, author: &str, supersedes: Option<&str>) {
+    let w = Wrote {
+        at: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        session: session.to_string(),
+        id: id.to_string(),
+        author: author.to_string(),
+        supersedes: supersedes.map(str::to_string),
+    };
+    if let Ok(line) = serde_json::to_string(&w) {
+        append_line(&root.join("state/writes.jsonl"), &line);
+    }
+}
+
+/// Every write recorded under a root.
+///
+/// # Errors
+///
+/// When the log exists and cannot be read.
+pub fn all_writes(root: &Path) -> std::io::Result<Vec<Wrote>> {
+    let path = root.join("state/writes.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(std::fs::read_to_string(path)?
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect())
+}
+
 impl ReadLog {
     /// A log for this session under `root`.
     #[must_use]

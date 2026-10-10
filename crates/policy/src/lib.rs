@@ -24,6 +24,9 @@
 //! A destination that is not in the file has no ceiling and is refused. That is the
 //! deny-by-default the paper asks for.
 
+pub mod decide;
+pub mod scan;
+
 use dm_core::{Label, ReadFilter};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -49,6 +52,38 @@ pub enum Error {
     /// A value is well-formed but not allowed.
     #[error("grants file: {0}")]
     Invalid(String),
+    /// The policy would not compile or evaluate.
+    #[error("policy: {0}")]
+    Policy(String),
+}
+
+/// The gates on writes whose blast radius is not routine; `[gates]` in the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gates {
+    /// How many entries one agent session may supersede before the rest is the
+    /// owner's to admit.
+    #[serde(default = "default_max_supersedes")]
+    pub max_supersedes_per_session: usize,
+    /// Whether replacing a verified entry needs an approver who is not the proposer.
+    #[serde(default = "default_true")]
+    pub verified_needs_approver: bool,
+}
+
+fn default_max_supersedes() -> usize {
+    20
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Gates {
+    fn default() -> Gates {
+        Gates {
+            max_supersedes_per_session: default_max_supersedes(),
+            verified_needs_approver: default_true(),
+        }
+    }
 }
 
 /// One domain's settings.

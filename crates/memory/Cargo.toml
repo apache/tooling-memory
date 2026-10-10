@@ -13,6 +13,7 @@ dm-core = { version = "0.1.0", path = "../core" }
 dm-egress = { version = "0.1.0", path = "../egress" }
 dm-index = { version = "0.1.0", path = "../index" }
 dm-ledger = { version = "0.1.0", path = "../ledger" }
+dm-policy = { version = "0.1.0", path = "../policy" }
 dm-sandbox = { version = "0.1.0", path = "../sandbox" }
 dm-server = { version = "0.1.0", path = "../server" }
 dm-taps = { version = "0.1.0", path = "../taps" }

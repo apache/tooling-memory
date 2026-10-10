@@ -26,6 +26,8 @@ pub struct AuthorStats {
     pub demotions: usize,
     /// Curation tasks this author completed, from the ledger.
     pub tasks_completed: usize,
+    /// Entries this author wrote, from the write log.
+    pub writes: usize,
 }
 
 /// Something the telemetry alerts on.
@@ -77,7 +79,58 @@ pub async fn telemetry(
     demotions(memory, &domain, &active, &mut t).await?;
     completed(memory, &domain, &mut t).await?;
     rates(&mut t);
+    channels(memory.root(), &mut t);
     Ok(t)
+}
+
+/// Memory as a channel: the shapes a rogue agent's traffic takes in the write and
+/// read logs, without reading the record. An author writing far more than curation
+/// or handoffs explain; an agent's entry read by several other sessions within an
+/// hour of being written, which is what a broadcast looks like from the outside.
+fn channels(root: &Path, t: &mut Telemetry) {
+    let writes = dm_server::reads::all_writes(root).unwrap_or_default();
+    let reads = dm_server::reads::all(root).unwrap_or_default();
+    let parse = |s: &str| {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+    };
+    let mut per_hour: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for w in &writes {
+        let hour = w.at.get(..13).unwrap_or("").to_string();
+        *per_hour.entry((w.author.clone(), hour)).or_default() += 1;
+        t.by_author.entry(w.author.clone()).or_default().writes += 1;
+    }
+    for ((who, hour), n) in per_hour {
+        if n >= 30 {
+            t.alarms.push(Alarm {
+                kind: "write-rate".into(),
+                who: who.clone(),
+                why: format!("{who} wrote {n} entries in the hour starting {hour}"),
+            });
+        }
+    }
+    for w in writes.iter().filter(|w| w.author.starts_with("agent:")) {
+        let Some(at) = parse(&w.at) else { continue };
+        let readers: BTreeSet<&str> = reads
+            .iter()
+            .filter(|r| r.session != w.session && r.ids.contains(&w.id))
+            .filter(|r| {
+                parse(&r.at).is_some_and(|ra| ra >= at && ra - at <= time::Duration::hours(1))
+            })
+            .map(|r| r.session.as_str())
+            .collect();
+        if readers.len() >= 3 {
+            t.alarms.push(Alarm {
+                kind: "relay".into(),
+                who: w.author.clone(),
+                why: format!(
+                    "`{}` by {} was read by {} other sessions within an hour of being written; a broadcast looks like this",
+                    w.id,
+                    w.author,
+                    readers.len()
+                ),
+            });
+        }
+    }
 }
 
 /// Every active entry that supersedes another is a curation: count it for its author,
