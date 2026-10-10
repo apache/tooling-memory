@@ -263,11 +263,13 @@ pub async fn replay_contexts(
             .call(&c.destination, &c.path, &resend(&c.request, model))
             .await?;
         let replayed_tools = dm_server::contexts::tools_in(&answer.to_string());
-        let recorded_tool = c.tools.first().map(|t| short(t));
+        // read again from the raw response, so a context kept by an older parser counts
+        let recorded_tools = dm_server::contexts::tools_in(&c.response);
+        let recorded_tool = recorded_tools.first().map(|t| short(t));
         let replayed_tool = replayed_tools.first().map(|t| short(t));
         let text = crate::model::answer_text(&c.destination, &answer);
         let overlap = (recorded_tool.is_none() && replayed_tool.is_none())
-            .then(|| overlap(&c.response, &text));
+            .then(|| overlap(&dm_server::contexts::text_in(&c.response), &text));
         let agrees = match (&recorded_tool, &replayed_tool) {
             (Some(a), Some(b)) => a == b,
             (None, None) => overlap.unwrap_or(0.0) >= 1.0 / 3.0,

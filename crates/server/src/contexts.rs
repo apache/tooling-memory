@@ -41,34 +41,122 @@ pub struct Context {
 
 /// The tools a model asked for in a response, in the shapes the providers speak:
 /// Anthropic's `tool_use` blocks, OpenAI's chat `function` calls, the Responses API's
-/// `function_call` items, Gemini's `functionCall` parts; streamed or not.
+/// `function_call` items, Gemini's `functionCall` parts; a whole JSON answer or a
+/// stream of `data:` events, each read as JSON and walked, so the order of fields in an
+/// object does not matter.
 #[must_use]
 pub fn tools_in(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for (marker, key) in [
-        ("\"type\":\"tool_use\"", "\"name\":\""),
-        ("\"type\":\"function_call\"", "\"name\":\""),
-        ("\"function\":{", "\"name\":\""),
-        ("\"functionCall\":{", "\"name\":\""),
-    ] {
-        let mut rest = raw;
-        while let Some(i) = rest.find(marker) {
-            let after = &rest[i + marker.len()..];
-            // the name is in the same object, within a short reach of its marker
-            let window: String = after.chars().take(400).collect();
-            if let Some(j) = window.find(key) {
-                let name: String = window[j + key.len()..]
-                    .chars()
-                    .take_while(|c| *c != '"')
-                    .collect();
-                if !name.is_empty() && !out.contains(&name) {
-                    out.push(name);
-                }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        walk(&v, &mut out);
+    } else {
+        for line in raw.lines() {
+            let line = line.trim_start_matches("data:").trim();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                walk(&v, &mut out);
             }
-            rest = after;
         }
     }
     out
+}
+
+/// The text a model answered with, from a whole answer or a stream of events, in the
+/// shapes the providers speak: the Responses API's `output_text` (and its deltas),
+/// chat completions' `content` (and its deltas), Anthropic's text blocks and
+/// `text_delta`s. Tool-call arguments are not text.
+#[must_use]
+pub fn text_in(raw: &str) -> String {
+    let mut out = String::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        text_of(&v, &mut out);
+    } else {
+        for line in raw.lines() {
+            let line = line.trim_start_matches("data:").trim();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                text_of(&v, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn text_of(v: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+    let s = |p: &str| v.pointer(p).and_then(Value::as_str);
+    match v.get("type").and_then(Value::as_str) {
+        // the Responses API, streamed
+        Some("response.output_text.delta") => out.push_str(s("/delta").unwrap_or_default()),
+        // Anthropic, streamed
+        Some("content_block_delta") if s("/delta/type") == Some("text_delta") => {
+            out.push_str(s("/delta/text").unwrap_or_default());
+        }
+        _ => {
+            // chat completions, streamed or whole
+            if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+                for c in choices {
+                    let t = c
+                        .pointer("/delta/content")
+                        .or_else(|| c.pointer("/message/content"));
+                    out.push_str(t.and_then(Value::as_str).unwrap_or_default());
+                }
+            }
+            // whole answers: Responses `output`, Messages `content`
+            for key in ["output", "content"] {
+                for item in v.get(key).and_then(Value::as_array).into_iter().flatten() {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("text" | "output_text") => {
+                            out.push_str(
+                                item.get("text").and_then(Value::as_str).unwrap_or_default(),
+                            );
+                        }
+                        Some("message") => text_of(item, out),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn push(out: &mut Vec<String>, name: String) {
+    if !out.contains(&name) {
+        out.push(name);
+    }
+}
+
+fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+    use serde_json::Value;
+    match v {
+        Value::Object(o) => {
+            let name = o.get("name").and_then(Value::as_str);
+            if let (Some("tool_use" | "function_call"), Some(n)) =
+                (o.get("type").and_then(Value::as_str), name)
+            {
+                push(
+                    out,
+                    match o.get("namespace").and_then(Value::as_str) {
+                        Some(ns) => format!("{ns}__{n}"),
+                        None => n.to_string(),
+                    },
+                );
+            }
+            for (k, inner) in o {
+                // a chat completion's call, and a Gemini part's
+                if k == "function" || k == "functionCall" {
+                    if let Some(n) = inner.get("name").and_then(Value::as_str) {
+                        push(out, n.to_string());
+                    }
+                }
+                walk(inner, out);
+            }
+        }
+        Value::Array(a) => {
+            for x in a {
+                walk(x, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn name_of(n: usize) -> String {
@@ -304,5 +392,26 @@ mod tests {
             vec!["t0"]
         );
         assert!(tools_in(r#"{"choices":[{"message":{"content":"DR-19 is open."}}]}"#).is_empty());
+        // the Responses API's stream: the name before the type, and a namespace
+        let streamed = "data: {\"type\":\"response.output_item.added\",\"item\":{\"arguments\":\"\",\"name\":\"search\",\"type\":\"function_call\",\"namespace\":\"mcp__memory\"}}\n\ndata: {\"type\":\"response.completed\"}\n";
+        assert_eq!(tools_in(streamed), vec!["mcp__memory__search"]);
+    }
+
+    #[test]
+    fn the_answers_text_is_read_from_streams_and_wholes() {
+        let responses = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"DR-19 is \"}\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"open.\"}\n";
+        assert_eq!(text_in(responses), "DR-19 is open.");
+        let chat = "data: {\"choices\":[{\"delta\":{\"content\":\"Still \"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"proposed.\"}}]}\n";
+        assert_eq!(text_in(chat), "Still proposed.");
+        assert_eq!(
+            text_in(r#"{"content":[{"type":"text","text":"Open."}]}"#),
+            "Open."
+        );
+        assert_eq!(
+            text_in(
+                r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"Open."}]}]}"#
+            ),
+            "Open."
+        );
     }
 }

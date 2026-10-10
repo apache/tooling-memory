@@ -125,9 +125,21 @@ pub fn request_sampled(
     (path, body)
 }
 
-/// The model's text out of a response in any of the three shapes.
+/// The model's text out of a response in any of the shapes: Messages, chat
+/// completions, generateContent, and the Responses API's `output` items, whichever
+/// destination served it.
 #[must_use]
 pub fn answer_text(destination: &str, v: &Value) -> String {
+    if let Some(items) = v.get("output").and_then(Value::as_array) {
+        return items
+            .iter()
+            .filter_map(|i| i.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter(|c| c.get("type").and_then(Value::as_str) == Some("output_text"))
+            .filter_map(|c| c.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
     let path = match destination {
         "anthropic" => v.pointer("/content/0/text"),
         "gemini" | "google" => v.pointer("/candidates/0/content/parts/0/text"),
@@ -191,6 +203,15 @@ mod tests {
         assert_eq!(b["messages"][0]["content"], "ask");
         // the unsampled request is what it was
         assert!(request("llmao", "m", "ask").1.get("temperature").is_none());
+    }
+
+    #[test]
+    fn a_responses_api_answer_is_read_from_its_output_items() {
+        let v = serde_json::json!({"output": [
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "think"}]},
+            {"type": "message", "content": [{"type": "output_text", "text": "DR-19 is open."}]}
+        ]});
+        assert_eq!(answer_text("llmao", &v), "DR-19 is open.");
     }
 
     #[test]
