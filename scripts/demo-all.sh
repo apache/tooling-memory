@@ -10,7 +10,7 @@
 set -eu
 root=${1:?demo root}; shift
 here=$(cd "$(dirname "$0")/.." && pwd)
-acts=${ACTS:-1 2 3 4 5 6}
+acts=${ACTS:-1 2 3 4 5 6 7}
 for n in $acts; do
   case $n in
     1) sh "$here/scripts/demo.sh" "$root" "$@" ;;

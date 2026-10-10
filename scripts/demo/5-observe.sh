@@ -42,6 +42,15 @@ if has drift && gateway; then
 fi
 
 if has transcript; then
-  say "transcripts are sources: stored in the record, not searchable, reached only by citation, by turn"
-  a transcript --help | sed -n '/Commands:/,/Options:/p' | sed 's/^/  /'
+  say "transcripts are sources: kept in the record, never searched, reached only by citation, by turn"
+  a transcript list | j "'\n'.join(f\"  {t['session']}  {t['harness']:<8} {t['turn_count']:>3} turns  {t['classification']:<9} {t['state']:<7} until {t['retain_until'][:10]}\" for t in d) or '  (none kept yet)'"
+  s=$(a transcript list | j "next((t['session'] for t in reversed(d) if t['state']=='live'), '')")
+  if [ -n "$s" ]; then
+    turn=$(a transcript show "$s" | j "next(iter(d['cited']), '')")
+    if [ -n "$turn" ]; then
+      echo "  $s turn $turn, cited by $(a transcript show "$s" | j "', '.join(d['cited']['$turn'])"):"
+      a transcript show "$s" --turn "$turn" | j "'    ' + d['role'] + ': ' + d['text'][:160].replace(chr(10), ' ')"
+    fi
+    echo "  searching the record for its words finds the entries, never the transcript: $(a search "$s" | j 'len(d)') hits"
+  fi
 fi

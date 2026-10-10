@@ -16,7 +16,8 @@ a task list --domain dom-demo --status admitted \
   | j "'\n'.join(f\"  {t['priority']:>3}  {t['id']}  {t['title']}\" for t in d if (t.get('origin') or '').startswith(('librarian:','checker:')))"
 
 say "a librarian run: $WORKER_HARNESS on the gateway's $WORKER_MODEL claims the top curation task and does it"
-( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --lease-seconds 900 2>&1 | grep -E '^memory: (claimed|task)' ) || true
+top=$(a task list --domain dom-demo --status admitted | j "next(t['id'] for t in d if (t.get('origin') or '').startswith(('librarian:','checker:')))")
+( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --lease-seconds 900 --task "$top" 2>&1 | grep -E '^memory: (claimed|task|prefetched)' ) || true
 echo "  what the librarian wrote lands curated, because it replaced an entry while holding a librarian's task:"
 a list --limit 50 | j "'\n'.join(f\"  {h['id']}  {h['trust_tier']}  {h['title']}\" for h in d if h['trust_tier']=='curated') or '  (none this run)'"
 

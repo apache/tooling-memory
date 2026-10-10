@@ -2933,6 +2933,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_worker_claims_the_top_tasks_contribution_it_can_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path()).with_manifest(vec!["tool:fs".into()]);
+        let needs_gpu = filed(&m, tspec("Train the ranker", 0, None, &[], &["gpu"])).await;
+        let can_do = filed(&m, tspec("Write the fixtures", 0, None, &[], &["tool:fs"])).await;
+        filed(
+            &m,
+            tspec("Release", 20, None, &[&needs_gpu.id, &can_do.id], &[]),
+        )
+        .await;
+        filed(&m, tspec("Unrelated, high", 9, None, &[], &[])).await;
+        m.rescore(None).await.unwrap();
+        let c = m
+            .claim_next(None, Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            c.task.id, can_do.id,
+            "the contribution to the top task it can do, over higher unrelated work"
+        );
+        let gpu = m.ledger.lock().await.get(&needs_gpu.id).await.unwrap();
+        assert_eq!(
+            gpu.status,
+            Status::Admitted,
+            "what needs a capability it lacks waits for one that has it"
+        );
+        assert!(
+            gpu.spec.priority > 9,
+            "but it was ranked above the unrelated work too"
+        );
+    }
+
+    #[tokio::test]
     async fn taint_follows_reads_to_what_was_written_after() {
         let dir = tempfile::tempdir().unwrap();
         let a = mem(dir.path());

@@ -35,6 +35,8 @@ pub struct Options {
     /// Put the summaries of the entries a task likely needs in its prompt; off for the
     /// no-memory comparisons.
     pub prefetch: bool,
+    /// Claim this task rather than the next one, and stop after it.
+    pub task: Option<String>,
 }
 
 /// How to mine after a task.
@@ -244,9 +246,20 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
     let client = Arc::new(client(session.memory()).await?);
     let mut last = NOTHING_TO_DO;
     loop {
-        let claimed = client
-            .claim_next(options.domain.as_deref(), options.lease_seconds)
-            .await?;
+        let claimed = match &options.task {
+            Some(id) => client.claim(id, options.lease_seconds).await?,
+            None => {
+                // rank first, so the claim is the highest-ranked contribution this
+                // session can do: whatever blocks or was filed for the top task has
+                // risen to it, and the manifest decides what is claimable
+                if let Err(e) = session.memory().rescore(options.domain.as_deref()).await {
+                    eprintln!("memory: rescore before claiming: {e}");
+                }
+                client
+                    .claim_next(options.domain.as_deref(), options.lease_seconds)
+                    .await?
+            }
+        };
         let Some(task) = claimed else {
             if !options.keep_going {
                 eprintln!("memory: nothing claimable");
@@ -260,6 +273,9 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
             continue;
         };
         last = one(session, &client, &task, options).await?;
+        if options.task.is_some() {
+            return Ok(last);
+        }
         if let Some(plan) = &options.mine {
             let via = if plan.via_harness {
                 crate::MineVia::Harness

@@ -41,8 +41,24 @@ if [ -n "${HARNESS:-}" ]; then
   say "subagents on the board: a $HARNESS session asked to delegate files each delegation as a task"
   parent=$(a task create "Compare two decisions" --domain dom-demo --priority 20 --body "Use two subagents, one per decision, to summarise DR-19 and DR-22 from the memory record; then combine their answers into a handoff and complete this task." | j "d['id']")
   a task admit "$parent" >/dev/null
-  ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" --lease-seconds 900 2>&1 | grep -E '^memory: (claimed|task|board|filed)' ) || true
-  a task tree "$parent" | j "f\"  {d['id']} {d['status']}: \" + ', '.join(f\"{c['id']} ({(c.get('origin') or '').split(':')[0]}) {c['status']}\" for c in d.get('children', []))" || true
+  ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" --lease-seconds 900 --task "$parent" 2>&1 | grep -E '^memory: (claimed|task|board|filed)' ) || true
+  tree() { a task tree "$parent" | j "'\n'.join(f\"  {c['id']}  {(c.get('origin') or '').split(':')[0]:<10} {c['status']:<11} {c['title']}\" for c in d.get('children', []))"; }
+  tree
+  kids=$(a task tree "$parent" | j "' '.join(c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('task:') and c['status']=='admitted')")
+  if [ -n "$kids" ]; then
+    say "the board runs the subagents' tasks: $WORKER_HARNESS on the gateway's $WORKER_MODEL, one task each"
+    for k in $kids; do
+      ( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --lease-seconds 900 --task "$k" 2>&1 | grep -E '^memory: (claimed|task)' ) || true
+    done
+    cont=$(a task tree "$parent" | j "next((c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('continues:') and c['status']=='admitted'), '')")
+    if [ -n "$cont" ]; then
+      say "fan-in: the continuation was waiting for both; it runs now with their handoffs in its prompt"
+      ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" --lease-seconds 900 --task "$cont" 2>&1 | grep -E '^memory: (claimed|task)' ) || true
+    fi
+    tree
+  else
+    echo "  (the session did not delegate this time; nothing went on the board)"
+  fi
 fi
 
 say "the fabric's telemetry: by family and status, why work was dropped, and capability gaps"

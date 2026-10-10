@@ -447,6 +447,9 @@ enum Command {
         /// likely needs, for comparisons against a run without memory's push.
         #[arg(long)]
         no_prefetch: bool,
+        /// Work this task rather than the next one, and stop after it.
+        #[arg(long)]
+        task: Option<String>,
     },
     /// The librarian's survey: what in a domain needs curation, from the record and
     /// the read log, as proposals; with --file, each becomes a task for a run to do with
@@ -2597,6 +2600,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         mine_model,
         mine_via,
         no_prefetch,
+        task,
         ..
     } = command
     else {
@@ -2628,6 +2632,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
             via_harness: session.mines_via_harness(mine_via),
         }),
         prefetch: !no_prefetch,
+        task,
     };
     let code = work::run(&session, &options).await?;
     session.finish(code);
@@ -2692,6 +2697,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
             idle: std::time::Duration::from_secs(idle_seconds),
             mine: None,
             prefetch: !no_prefetch,
+            task: None,
         };
         work::run(&session, &options).await?
     } else {

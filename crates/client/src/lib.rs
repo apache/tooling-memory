@@ -346,6 +346,18 @@ impl MemoryClient {
         Self::task_of("claim_next", &v)
     }
 
+    /// Claim one named task, under the same rules as [`Client::claim_next`].
+    ///
+    /// # Errors
+    ///
+    /// A transport or tool error, including a task that is not claimable.
+    pub async fn claim(&self, id: &str, lease_seconds: i64) -> Result<Option<Task>> {
+        let v = self
+            .call("claim", json!({ "id": id, "lease_seconds": lease_seconds }))
+            .await?;
+        Self::task_of("claim", &v)
+    }
+
     /// Renew the lease on a task this session holds.
     ///
     /// # Errors

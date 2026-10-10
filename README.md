@@ -12,31 +12,79 @@ upstream event, recursive invalidation), the MCP surface, trust tiers and review
 summaries first, the hook protocol, the egress as the only way out, and the containment
 set (canaries, an independent checker, reversible writes) are built and exercised end to
 end, by real harnesses on real models, and the conformance suite in `crates/memory/tests`
-is the statement of them. Every store behind those contracts is the simplest thing that
+is the statement of them. Beyond the read path, so are the paper's other commitments:
+trust tiers that move only by a person's approval, policy as memory with scoped
+exceptions, the write gates and the quarantine, the task fabric's rubric, the
+librarian's curation and its own telemetry, prefetch and the read metrics, vendor-drift
+probes, and transcripts kept as sources. Every store behind those contracts is the simplest thing that
 could hold them on one laptop: the record as files under one directory, the index, the
 ledger and the metering each a SQLite file, the read log a JSONL file, one process holding
 every lock, one host. That is deliberate. It let the contracts be tried against ten
 harnesses in two weeks, and it is also why none of it is the production shape.
 
-Where it stops. The ledger is one writer under one mutex per process; ten thousand committers filing
-tasks and agents claiming around the clock need per-domain ledgers in a database that
-takes a claim as one row-locked statement. That has started: the ledger runs on
-PostgreSQL behind the same type, with the claim as one `SKIP LOCKED` statement, and the
-conformance suite passes on it, with one schema per domain. The index is SQLite FTS5; a fleet needs a
-search engine sharded by domain. The metering and the read log are private tables that
-only this binary writes and reads; a fleet needs OpenTelemetry from the egress, the
-server and the ledger into a collector, and the librarian's signals computed over that
-stream rather than by scanning the record. The curation cycle surveys a domain by
-reading every entry; at scale it is event-driven. The perimeter, admission and the gates
-on writes, is Rego already, run in process over the grants file; at scale the same rules
-run in OPA and its partial evaluation pushes the read filter into the index. Shared memory
-is an injection surface and a channel between agents, and what is here against that, the
-write scan and quarantine, the blast-radius and verified-tier gates, the decision and
-write logs, taint and the relay alarm, is the start of the paper's answer, not the end. The targets for each are named in
-[docs/reference-stack.md](docs/reference-stack.md) and the order in the register in
-[PLAN.md](PLAN.md): the production backends go in behind the same crates and must pass
-the same conformance suite, and the evaluation harness and `amem savings` give the
-numbers for each swap, so that nothing in the move is argued from taste.
+### What the paper asks for that is not built
+
+- **Replay.** Neither frozen-context replay of a logged decision point nor live
+  re-execution of a task against a point-in-time snapshot. The evaluation harness, memory
+  against none on a fixed question set, is the nearest thing.
+- **The platform as a domain.** Harness configuration, agent definitions and their
+  authoring, decomposition templates and eval suites are not held in memory, and there is
+  no evolution loop that loads only verified configuration into a harness. Policy is the
+  one artifact that already follows that rule: a rule is enforced only once verified.
+- **Identity.** One principal, the owner of a root. Other people appear only as a class
+  of claimant (`human`) and as approvers by convention; nobody authenticates.
+- **Federation.** No cross-domain request tasks, interface summaries between domains, or
+  portfolio orchestration; a cross-domain dependency is seen, nothing more.
+- **The event log.** No log the record, index and ledger are projections of, no single
+  materializer per domain, and no freshness fast lane with a published bound.
+- **Spend limits per resource class**, a policy the paper puts in the perimeter.
+- **Drift beyond metadata.** No logprob divergence, change-point detection over many
+  runs, or schedule; the probes run when someone runs them, against fixed thresholds.
+- **Smaller pieces.** Prefetch happens when a task is claimed, not appended to a fetch at
+  serve time; "used" in the wasted-read ratio is "cited in the handoff", not a model's
+  judgement; requirements inflation is refused at admission but not tracked per creator;
+  transcripts have no MCP tool and their excerpts are not restored on import; a harness's
+  own copy of its transcript is left in its private home.
+- **Platforms and CI.** No confinement on macOS, no bridge to Gofannon, and CI has not
+  run since a billing failure; every change is gated locally by `make check`.
+
+### What is built but works only at demo scale
+
+These do what the paper says, on one laptop, and each names what replaces it.
+
+- **The record** is files under one directory on one disk. Production: an object store
+  with versioning, through OpenDAL, as the reference stack says.
+- **The index** is one SQLite FTS5 file, BM25 in process. Production: a search engine
+  sharded by domain, with the read filter compiled into its query by OPA.
+- **The ledger** is SQLite by default, one writer under a mutex per process; on
+  PostgreSQL it has a schema per domain and a `SKIP LOCKED` claim, but one connection per
+  process and no pool. Production: the Postgres shape, pooled, as a projection of the log.
+- **The logs**, reads, writes, decisions and the egress's metering, are JSONL and SQLite
+  files under `state/`, and everything computed from them, the librarian's retrieval
+  signals and telemetry, taint, the read metrics, the policy rates, the relay and
+  write-rate alarms, prefetch's co-retrieval, reads them whole. Production: the same
+  events as OpenTelemetry spans, already emitted, into a collector and analytics tables.
+- **Curation** surveys a domain by reading every entry, hunts contradictions pair by
+  pair through search, and runs as a cycle someone starts. Production: event-driven, per
+  write, on a schedule with a budget per domain.
+- **The rubric's rescore** reads a domain's whole queue each cycle and settles its edges
+  by repeated passes. Fine for hundreds of tasks; production ranks incrementally.
+- **The policy** is Rego in process through regorus, compiled again whenever a policy
+  entry changes, with record rules read from files at open. Production: OPA as a sidecar,
+  partial evaluation for the read filter, decision logs to telemetry.
+- **The quarantine** is files under `state/`, reviewed by a model on request, released
+  by the owner by hand.
+- **Transcripts' citations** are found by scanning a domain's entries on every lookup.
+- **The evaluation** is four questions graded by regular expression, on one harness and
+  model per run.
+- **The web launcher** listens on loopback for the one owner.
+
+None of this is hidden in the code: the conformance suite states the contracts, the
+reference stack in [docs/reference-stack.md](docs/reference-stack.md) names each
+production backend, and the register in [PLAN.md](PLAN.md) the order. Production
+backends go in behind the same crates and must pass the same suite, and the evaluation
+harness and `amem savings` give the numbers for each swap, so that nothing in the move is
+argued from taste.
 
 ## What you get
 

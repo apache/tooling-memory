@@ -12,7 +12,7 @@
 set -eu
 root=${1:?demo root}; shift
 harness=${HARNESS:?name the harness: HARNESS=claude, codex, gemini, antigravity, qwen, grok, muse, pi, copilot or opencode}
-[ $# -ge 1 ] || { echo "give one or more directories or files of Markdown to seed from" >&2; exit 2; }
+[ $# -ge 1 ] || [ -f "$root/grants.toml" ] || { echo "give one or more directories or files of Markdown to seed from" >&2; exit 2; }
 here=$(cd "$(dirname "$0")/.." && pwd)
 memory="$here/target/release/amem"
 [ -x "$memory" ] || { echo "build first: make build" >&2; exit 2; }
@@ -51,7 +51,7 @@ id=$("$memory" --root "$root" task create "$title" --body "$body" --priority 5 |
 "$memory" --root "$root" task admit "$id" >/dev/null
 echo "== task $id filed and admitted; a $harness session claims and works it"
 work=$(mktemp -d)
-( cd "$work" && "$memory" --root "$root" work --harness "$harness" --auth "${AUTH:-subscription}" --lease-seconds 300 ) || true
+( cd "$work" && "$memory" --root "$root" work --harness "$harness" --auth "${AUTH:-subscription}" --lease-seconds 300 --task "$id" ) || true
 echo
 echo "== erasure: a throwaway entry, erased by the owner; the stub and the receipt remain"
 gone=$(echo "A note that should never have been written: the demo passphrase is kestrel-91." \
@@ -74,4 +74,8 @@ echo "== after: recovery, retrieval, the funnel and recall, with that session in
 echo
 echo "The handoff the session wrote:"
 h=$("$memory" --root "$root" task get "$id" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("handoff") or "")')
-[ -n "$h" ] && "$memory" --root "$root" get "$h" | sed -n '/^---$/,$p' | tail -n +2 | head -40
+if [ -n "$h" ]; then
+  "$memory" --root "$root" get "$h" | sed -n '/^---$/,$p' | tail -n +2 | head -40
+else
+  echo "  (the session did not complete the task; its output is on the task as a handoff)"
+fi
