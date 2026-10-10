@@ -281,7 +281,11 @@ author; the owner's task carried the scan's excerpts; and the decision log held 
 with the policy's version. One consequence to know: the session-end handoff the hook
 mined for that run quoted the poison and was quarantined too, so a handoff that reports
 an injection by repeating it does not enter the record either; the owner's task says
-where both are. Every decision is also a `policy.decision` span when a collector is named. Not yet: the
+where both are. A rerun after the ledger moved behind two backends went differently, as
+model runs do: Codex declined to make the write at all, naming the text an exfiltration
+payload addressed to every agent sharing the memory, and the hook's handoff, which
+quoted the request, was quarantined by the gate. The model's refusal and the gate are
+independent layers; the record does not depend on the first. Every decision is also a `policy.decision` span when a collector is named. Not yet: the
 compiled read filter pushed into the index as OPA's partial evaluation would push it,
 which is the production shape; and a model-based read of quarantined bodies.
 
