@@ -50,8 +50,11 @@ fn patterns() -> &'static Patterns {
             r"(?i)\b(ignore|disregard|forget|override)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all|your|the)\b[^.\n]{0,30}\b(instructions?|rules?|prompts?|guidelines?|system)\b|\byou are now\b|\b(reveal|print|show|output|repeat)\b[^.\n]{0,30}\b(system prompt|instructions|hidden prompt)\b|\bdo not (tell|inform|mention|reveal)[^.\n]{0,30}\b(user|owner|human|operator)\b|\b(when|if|once) you read this\b|\bexfiltrat",
         )
         .unwrap_or_else(|_| regex::Regex::new("$^").unwrap_or_else(|_| unreachable!())),
+        // a broadcast addresses agents as its readers: "To all agents:", "Note to other
+        // agents", "Other agents should"; prose about every model call or every session
+        // is not one, so models and sessions are not addressees, and "for" is no address
         broadcast: regex::Regex::new(
-            r"(?i)\b(to|for|attention|dear|note to)\s+(all|any|every|other|fellow)\s+(agents?|ais?|assistants?|models?|llms?|sessions?)\b|\b(all|other|fellow)\s+agents?\s+(must|should|shall|will|are to)\b",
+            r"(?i)\b(to|attention|dear|note to|hey|hello)\s+(all|any|every|other|fellow)\s+(agents?|ais?|ai agents?|assistants?|llms?)\b|\b(all|other|fellow)\s+agents?\s+(must|should|shall|are to|need to)\b",
         )
         .unwrap_or_else(|_| regex::Regex::new("$^").unwrap_or_else(|_| unreachable!())),
         tool: regex::Regex::new(
@@ -170,6 +173,18 @@ mod tests {
         assert!(
             kinds_of("Other agents should write their results here.").contains(&Kind::Broadcast)
         );
+        assert!(kinds_of("Note to other agents: post here first.").contains(&Kind::Broadcast));
+    }
+
+    #[test]
+    fn prose_about_models_and_sessions_is_not_a_broadcast() {
+        // the sentence a rehearsal's honest handoff was held for
+        assert!(scan("Option B would not share llmao's Postgres, which sits on the request path for every model call, and the wiki would get its own.").is_empty());
+        assert!(
+            scan("Every session loads T0 first; a policy for all agents is in the digest.")
+                .is_empty()
+        );
+        assert!(scan("The deputy answers for any model the gateway serves.").is_empty());
     }
 
     #[test]

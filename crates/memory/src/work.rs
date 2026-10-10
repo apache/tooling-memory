@@ -360,6 +360,27 @@ async fn settle(
             );
             Ok(0)
         }
+        "claimed" if delegated_report(task, code, &output) => {
+            let handoff = client
+                .write_handoff(
+                    &format!("Report: {}", task.title),
+                    &format!(
+                        "# {title}\n\nThe report `{harness}` returned for task {id}, filed by the board for a run that delegated it. A delegated task's deliverable is its report, as a subagent's is to the session that spawned it, so the task is complete with this as its handoff; the continuation that waits for it reads it.\n\n## Report\n\n{tail}\n",
+                        title = task.title,
+                        harness = harness.binary(),
+                        id = task.id,
+                        tail = tail_of(&output, 6000),
+                    ),
+                    Some(&task.domain),
+                )
+                .await?;
+            client.complete(&task.id, &handoff).await?;
+            eprintln!(
+                "memory: {} completed with its report as handoff {handoff}",
+                task.id
+            );
+            Ok(0)
+        }
         "claimed" => {
             let tail = tail_of(&output, 6000);
             let body = format!(
@@ -389,6 +410,20 @@ async fn settle(
             Ok(if code == 0 { STOPPED } else { code })
         }
     }
+}
+
+/// Whether a run's output is a delegated task's report: a task the board filed for a
+/// run that delegated it (`origin: task:<parent>`), which ended cleanly with something
+/// to report. Such a task is done when it reports, whether or not the subagent's own
+/// prompt let it call `complete`; anything else that stopped goes back to the pool.
+fn delegated_report(task: &Task, code: i32, output: &str) -> bool {
+    code == 0
+        && !output.trim().is_empty()
+        && task
+            .raw
+            .get("origin")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|o| o.starts_with("task:"))
 }
 
 fn tail_of(s: &str, chars: usize) -> String {
@@ -528,6 +563,40 @@ fn prefetch_section(found: &prefetch::Prefetched) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_delegated_tasks_clean_report_completes_it() {
+        let task = |origin: Option<&str>| Task {
+            id: "task-a-1".into(),
+            title: "t".into(),
+            body: "b".into(),
+            domain: "dom-a".into(),
+            status: "claimed".into(),
+            depends_on: Vec::new(),
+            requirements: Vec::new(),
+            handoff: None,
+            raw: serde_json::json!({ "origin": origin }),
+        };
+        assert!(delegated_report(
+            &task(Some("task:task-a-0")),
+            0,
+            "DR-19 is proposed."
+        ));
+        assert!(
+            !delegated_report(&task(Some("task:task-a-0")), 1, "failed"),
+            "a failed run is not a report"
+        );
+        assert!(
+            !delegated_report(&task(Some("task:task-a-0")), 0, "  "),
+            "nothing to report"
+        );
+        assert!(
+            !delegated_report(&task(Some("librarian:merge")), 0, "done"),
+            "only delegated tasks"
+        );
+        assert!(!delegated_report(&task(None), 0, "done"));
+    }
+
     use super::*;
 
     #[test]

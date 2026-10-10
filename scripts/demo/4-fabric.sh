@@ -51,9 +51,12 @@ if [ -n "${HARNESS:-}" ]; then
       ( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --lease-seconds 900 --task "$k" 2>&1 | grep -E '^memory: (claimed|task)' ) || true
     done
     cont=$(a task tree "$parent" | j "next((c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('continues:') and c['status']=='admitted'), '')")
-    if [ -n "$cont" ]; then
+    open=$(a task tree "$parent" | j "' '.join(c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('task:') and c['status']!='completed')")
+    if [ -n "$cont" ] && [ -z "$open" ]; then
       say "fan-in: the continuation was waiting for both; it runs now with their handoffs in its prompt"
       ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" --lease-seconds 900 --task "$cont" 2>&1 | grep -E '^memory: (claimed|task)' ) || true
+    elif [ -n "$cont" ]; then
+      echo "  the continuation $cont still waits for: $open"
     fi
     tree
   else
