@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 dm-core = { version = "0.1.0", path = "../core" }
+dm-otel = { version = "0.1.0", path = "../otel" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0.151"
@@ -28,6 +29,8 @@ pg-test = ["dep:postgresql_archive", "dep:postgresql_embedded"]
 workspace = true
 
 [dev-dependencies]
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 postgresql_archive = { version = "=0.20.0", default-features = false }
 postgresql_embedded = { version = "=0.20.0", default-features = false, features = ["theseus", "rustls"] }
 tempfile = "3.27.0"

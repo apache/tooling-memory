@@ -26,6 +26,7 @@ mod model;
 mod open;
 mod profiles;
 mod requests;
+mod review;
 mod savings;
 mod status;
 mod taps;
@@ -518,6 +519,10 @@ enum Command {
         /// Hunt contradictions too: pairs a search puts side by side, judged by the model.
         #[arg(long)]
         contradictions: bool,
+        /// Read the quarantine too: each held write not yet reviewed gets the model's
+        /// verdict, malicious, report or benign, kept beside it for the owner.
+        #[arg(long)]
+        quarantine: bool,
     },
     /// Canary entries: planted with known content, checked for alteration.
     Canary {
@@ -2234,18 +2239,14 @@ async fn curation_cmd(root: &Path, command: Command) -> Fallible {
             sample,
             file,
             contradictions,
+            quarantine,
         } => {
-            check_cmd(
-                root,
-                auth,
-                provider,
-                model,
-                domain,
-                sample,
+            let what = CheckWhat {
                 file,
                 contradictions,
-            )
-            .await
+                quarantine,
+            };
+            check_cmd(root, auth, provider, model, domain, sample, what).await
         }
         Command::Curate {
             domain,
@@ -3720,6 +3721,14 @@ async fn checker_pass(
         cycle.contradictions = found.len();
         checker::file_contradictions(m, domain, model, &found).await?;
     }
+    if !spend.exhausted() {
+        let reviewed = review::review(&p.egress, m, &p.provider, model, plan.sample).await?;
+        cycle.reviewed = reviewed.len();
+        cycle.malicious = reviewed
+            .iter()
+            .filter(|r| r.verdict == review::Kind::Malicious)
+            .count();
+    }
     if let Some(t) = p.egress.telemetry().session(m.session_id())? {
         cycle.calls = t.calls;
         cycle.tokens_in = t.input_tokens;
@@ -3795,7 +3804,16 @@ async fn curate_cmd(root: &Path, plan: &CuratePlan) -> Fallible {
     json(&cycle)
 }
 
-#[allow(clippy::too_many_arguments)] // the checker's flags
+/// What a checker run does besides judging summaries.
+struct CheckWhat {
+    /// File what it finds as tasks.
+    file: bool,
+    /// Hunt contradictions.
+    contradictions: bool,
+    /// Read the quarantine.
+    quarantine: bool,
+}
+
 async fn check_cmd(
     root: &Path,
     auth: AuthArg,
@@ -3803,8 +3821,7 @@ async fn check_cmd(
     model: Option<String>,
     domain: Option<String>,
     sample: usize,
-    file: bool,
-    contradictions: bool,
+    what: CheckWhat,
 ) -> Fallible {
     let auth = AuthMode::from(auth);
     let provider = checker_destination(auth, provider);
@@ -3829,7 +3846,7 @@ async fn check_cmd(
         None,
     )
     .await?;
-    let found = if contradictions {
+    let found = if what.contradictions {
         checker::hunt(
             &p.egress,
             &p.memory,
@@ -3843,8 +3860,13 @@ async fn check_cmd(
     } else {
         Vec::new()
     };
+    let reviewed = if what.quarantine {
+        review::review(&p.egress, &p.memory, &p.provider, &model, sample).await?
+    } else {
+        Vec::new()
+    };
     let mut filed = Vec::new();
-    if file {
+    if what.file {
         let summaries = summaries_of(&p.memory, &report.domain, sample).await?;
         filed = checker::file(&p.memory, &report, &summaries).await?;
         filed
@@ -3856,6 +3878,7 @@ async fn check_cmd(
         "checked": report.checked,
         "rejected": report.checked.iter().filter(|v| !v.entails).count(),
         "contradictions": found,
+        "quarantine": reviewed,
         "filed": filed,
     }))
 }
@@ -3892,7 +3915,9 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
             &m.quarantined()?
                 .iter()
                 .map(|e| {
+                    let review = review::read(m.root(), &e.front.id);
                     serde_json::json!({
+                        "review": review.map(|r| serde_json::json!({"verdict": r.verdict, "why": r.why, "model": r.model})),
                         "id": e.front.id, "domain": e.front.domain, "author": e.front.author,
                         "created": e.front.created.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                         "title": e.front.title,

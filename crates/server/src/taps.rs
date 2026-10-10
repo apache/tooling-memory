@@ -23,7 +23,7 @@ impl Memory {
     ) -> Result<Vec<(Task, Entry)>, Error> {
         let domain = self.resolve_domain(Some(domain))?;
         let tasks = self.ledger.lock().await.unposted(&domain).await?;
-        let mut filter = self.grants.read_filter();
+        let mut filter = self.session_filter()?;
         filter.handling = filter.handling.min(ceiling);
         let mut out = Vec::new();
         for task in tasks {

@@ -132,12 +132,19 @@ async fn the_seven_steps_pass_over_stdio_with_a_postgres_ledger() {
         .await
         .unwrap();
     tokio::spawn(conn);
+    // each in its domain's schema, routed by the directory
     let row = client
-        .query_one("SELECT COUNT(*) FROM tasks", &[])
+        .query_one(
+            "SELECT COUNT(*), COUNT(DISTINCT d.schema) FROM public.ledger_tasks t
+             JOIN public.ledger_domains d ON d.domain = t.domain",
+            &[],
+        )
         .await
         .unwrap();
     let tasks: i64 = row.get(0);
+    let schemas: i64 = row.get(1);
     assert!(tasks > 0, "the steps filed tasks on the server");
+    assert_eq!(schemas, 1, "one domain, one schema");
     assert!(
         !root.join("state").join("ledger.db").exists(),
         "no SQLite ledger was opened once the URL was set"

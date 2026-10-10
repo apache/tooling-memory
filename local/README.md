@@ -285,9 +285,37 @@ where both are. A rerun after the ledger moved behind two backends went differen
 model runs do: Codex declined to make the write at all, naming the text an exfiltration
 payload addressed to every agent sharing the memory, and the hook's handoff, which
 quoted the request, was quarantined by the gate. The model's refusal and the gate are
-independent layers; the record does not depend on the first. Every decision is also a `policy.decision` span when a collector is named. Not yet: the
-compiled read filter pushed into the index as OPA's partial evaluation would push it,
-which is the production shape; and a model-based read of quarantined bodies.
+independent layers; the record does not depend on the first. Every decision is also a `policy.decision` span when a collector is named.
+
+Reads. The policy decides what a session may read as well as what it may write: its
+`read_filter` rule gives the conditions an entry must meet, the domains, the highest
+classification and the lowest trust tier, for the principal asking. The server evaluates
+it once per session, intersects it with the grants so a policy can narrow reads and
+never widen them, caps the session's handling at it, logs it as a `read` decision, and
+hands it to the index, which applies it inside every query. A denied entry is never
+scored, and counts and pages are right, which is the paper's reason for pushing the
+filter down rather than filtering after. At scale OPA's partial evaluation compiles the
+same rule into a residual for Solr; regorus does not partially evaluate, so the rule
+here states the residual directly, in the three attributes the index filters on. The
+built-in rule leaves the grants as they are; a root's own policy narrows, for example
+agents to public entries, and a test shows an agent so narrowed find, get and list
+nothing above public while the owner sees everything.
+
+The quarantine's reader. The scan is patterns, and cannot tell a handoff that reports an
+injection from the injection itself. `amem check --quarantine` has the checker's model,
+not the writer's, read each held write not yet reviewed and say what it is:
+`malicious`, it tries to steer whoever reads it; `report`, it describes or quotes such
+an attempt to report it; `benign`, ordinary knowledge the scan mistook. The verdict and
+its reason are kept beside the write, `amem quarantine list` shows them, and each
+curation cycle reviews what is new and counts the malicious. It never releases: the
+verdict is advice on the owner's task, since judgement is not encoded in the policy and
+a model that has just read a payload should not act on it. The body goes to the model
+fenced by a random marker and labelled as data, the model has no tools, and only a
+verdict word on the first line is taken from its answer; anything else is `unclear`.
+Proven on 10 October with the gateway's gemma on three held writes: an agent's note
+telling other agents to send credentials.env to an outside URL and hide it from the
+user came back `malicious`; a release signature in base64, held as an encoded payload,
+`benign`; and Codex's handoff quoting the injection it had refused, `report`.
 
 ## The ledger on PostgreSQL
 
@@ -309,8 +337,20 @@ ledger's own tests and the conformance suite run against both backends: the test
 an embedded PostgreSQL, downloaded once into `~/.theseus`, or use the server
 `MEMORY_PG_URL` names, each test on a database of its own; where neither can be had the
 PostgreSQL half is skipped and says so. `cargo nextest run --features
-dm-ledger/pg-test` turns that on. Not yet: one schema per domain, which the reference
-stack's partitioning wants, and task transitions as OpenTelemetry spans.
+dm-ledger/pg-test` turns that on.
+
+One schema per domain, as the reference stack partitions everything by domain: a
+domain's `events` and `tasks` live in a schema of their own, named `ledger_` and the
+domain and eight hex digits of its digest, created under an advisory lock when the
+domain files its first task. A domain's queue is then a table no other domain's claims
+touch, and a domain can be backed up, moved or dropped as a unit. Two tables in `public`
+route the rest: `ledger_domains`, each domain and its schema, and `ledger_tasks`, each
+task id and its domain, written in the transaction that files the task, so an operation
+by id finds its schema in one lookup and a dependency in another domain is still seen.
+A ledger made by the first PostgreSQL version, with every domain in `public.tasks` and
+`public.events`, is moved on connect: each domain's events are copied to its schema in
+order and replayed there, and the old tables are renamed with `_before_domain_schemas`
+rather than dropped, in one transaction.
 
 ## Traces: OpenTelemetry
 
@@ -332,8 +372,11 @@ carry `service.name` `amem` and its version, and the usual `OTEL_*` variables ap
 how often a batch goes out. A collector that cannot be reached costs under a second at
 exit and never fails a command. The quickest local collector is Jaeger's all-in-one
 image with OTLP on 4318; the reference stack's shape, an OpenTelemetry collector writing
-Parquet queried with DuckDB or DataFusion, takes the same variable. Not yet: task
-transitions from the ledger, now that it sits behind two backends.
+Parquet queried with DuckDB or DataFusion, takes the same variable. The ledger adds a
+`task.<transition>` span for every transition that takes effect, created, admitted,
+claimed, heartbeat, released, handoff_left, completed, invalidated and posted, on either
+backend, with the task as it then stands: id, domain, status, priority, attempts, who
+filed it, its holder, its origin and the reason it was invalidated.
 
 ## Is it still true? Validity and decay
 

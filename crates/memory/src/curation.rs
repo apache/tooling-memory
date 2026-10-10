@@ -312,6 +312,10 @@ pub struct Cycle {
     pub tokens_out: u64,
     /// The cycle's token budget; the checker stops at it.
     pub budget_tokens: u64,
+    /// Held writes the quarantine's reader reviewed this cycle, and how many of them it
+    /// called malicious.
+    pub reviewed: usize,
+    pub malicious: usize,
 }
 
 /// Append a cycle's record.

@@ -921,6 +921,9 @@ name = "dm-ledger"
 version = "0.1.0"
 dependencies = [
  "dm-core",
+ "dm-otel",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "postgresql_archive",
  "postgresql_embedded",
  "rusqlite",

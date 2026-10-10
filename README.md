@@ -22,7 +22,7 @@ Where it stops. The ledger is one writer under one mutex per process; ten thousa
 tasks and agents claiming around the clock need per-domain ledgers in a database that
 takes a claim as one row-locked statement. That has started: the ledger runs on
 PostgreSQL behind the same type, with the claim as one `SKIP LOCKED` statement, and the
-conformance suite passes on it; one schema per domain has not. The index is SQLite FTS5; a fleet needs a
+conformance suite passes on it, with one schema per domain. The index is SQLite FTS5; a fleet needs a
 search engine sharded by domain. The metering and the read log are private tables that
 only this binary writes and reads; a fleet needs OpenTelemetry from the egress, the
 server and the ledger into a collector, and the librarian's signals computed over that

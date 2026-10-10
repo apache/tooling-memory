@@ -5,7 +5,7 @@
 # the grants file as `data.grants` and one request as `input`.
 #
 # input:
-#   action      file_task | write | erase
+#   action      file_task | write | erase | read
 #   principal   {id, class}           class: owner | human | agent | tap | system
 #   domain      the domain acted on
 #   filing      own | held | session   (file_task) the system on the owner's behalf, a
@@ -134,6 +134,27 @@ write_decision := {"allow": true, "admit": false, "review": "none", "reason": "w
 erase_decision := {"allow": true, "admit": false, "review": "none", "reason": "the owner erases"} if class == "owner"
 
 erase_decision := {"allow": false, "admit": false, "review": "human", "reason": "erasure is irreversible and the owner's alone"} if class != "owner"
+
+# ---- reads: the session's filter, evaluated once and pushed into the index ----
+
+# What a session may read, as the conditions on an entry's attributes: its domain, its
+# classification at most `handling`, its trust tier at least `min_tier`. The server
+# evaluates this once per session and the index applies it inside every query, so a
+# denied entry is never scored and counts are right; this is the residual OPA's partial
+# evaluation would compile, written out, since regorus does not partially evaluate. It
+# can only narrow the grants: the server intersects it with them. The built-in rule
+# leaves them as they are; a root's own policy narrows, for example agents to public:
+#
+#   read_filter := object.union(base_filter, {"handling": "public"}) if class == "agent"
+base_filter := {
+	"domains": [d | some d, _ in data.grants.domains],
+	"handling": data.grants.handling,
+	"min_tier": "raw",
+}
+
+default read_filter := {"domains": [], "handling": "public", "min_tier": "verified"}
+
+read_filter := base_filter
 
 default decision := {"allow": false, "admit": false, "review": "none", "reason": "no rule for this action"}
 

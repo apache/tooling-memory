@@ -187,6 +187,9 @@ pub struct Memory {
     held: OnceLock<String>,
     /// How many entries this session has superseded: the blast-radius gate's count.
     superseded: AtomicUsize,
+    /// What this session may read, as the policy computed it once and the index applies
+    /// inside every query.
+    scope: OnceLock<ReadFilter>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -300,7 +303,51 @@ impl Memory {
             policy,
             held: OnceLock::new(),
             superseded: AtomicUsize::new(0),
+            scope: OnceLock::new(),
         })
+    }
+
+    /// The read filter for this session: the policy's read scope for this principal,
+    /// evaluated once and narrowed against the grants, so the policy can take reads
+    /// away and never add them. The session's handling is capped at it as well. The
+    /// decision is logged like any other.
+    fn session_filter(&self) -> Result<ReadFilter, Error> {
+        if let Some(f) = self.scope.get() {
+            return Ok(f.clone());
+        }
+        let input = Input {
+            action: Action::Read,
+            principal: self.principal(),
+            domain: String::new(),
+            filing: None,
+            task: None,
+            parent: None,
+            write: None,
+        };
+        let f = self
+            .policy
+            .read_scope(&input)?
+            .narrow(&self.grants.read_filter());
+        {
+            let mut s = lock(&self.session);
+            s.handling = s.handling.min(f.handling);
+        }
+        self.log_decision(
+            &input,
+            &Decision {
+                allow: true,
+                admit: false,
+                review: dm_policy::decide::Review::None,
+                reason: format!(
+                    "reads {} at most {} from {} up",
+                    f.domains.join(", "),
+                    f.handling,
+                    f.min_tier
+                ),
+                policy: self.policy.version().to_string(),
+            },
+        );
+        Ok(self.scope.get_or_init(|| f).clone())
     }
 
     /// The task this session runs on: a launcher sets it before the harness starts,
@@ -327,6 +374,12 @@ impl Memory {
     /// deny, with the policy version that produced it, as the paper has decision logs.
     fn decide(&self, input: &Input) -> Result<Decision, Error> {
         let d = self.policy.decide(input)?;
+        self.log_decision(input, &d);
+        Ok(d)
+    }
+
+    /// A decision to the log under the record's state and, with a collector, a span.
+    fn log_decision(&self, input: &Input, d: &Decision) {
         let line = serde_json::json!({
             "at": OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
             "session": self.session_id,
@@ -362,7 +415,6 @@ impl Memory {
                 ],
             );
         }
-        Ok(d)
     }
 
     /// Keep the record projected as files under `dir` for this session: rendered on
@@ -391,6 +443,8 @@ impl Memory {
     #[must_use]
     pub fn with_author(mut self, author: impl Into<String>) -> Memory {
         self.author = author.into();
+        // the read scope is the principal's; a new author is asked afresh
+        self.scope = OnceLock::new();
         self
     }
 
@@ -481,9 +535,14 @@ impl Memory {
     }
 
     fn filter_for(&self, domain: Option<&str>) -> Result<ReadFilter, Error> {
-        let mut f = self.grants.read_filter();
+        let mut f = self.session_filter()?;
         if let Some(d) = domain {
             let d = self.resolve_domain(Some(d))?;
+            if !f.domains.contains(&d) {
+                return Err(Error::Denied(format!(
+                    "domain {d} is outside what this session's policy lets it read"
+                )));
+            }
             f.domains = vec![d];
         }
         Ok(f)
@@ -541,7 +600,7 @@ impl Memory {
     ///
     /// [`Error::NotFound`] when absent or above the session's handling, or a store error.
     pub async fn archived(&self, id: &str) -> Result<Entry, Error> {
-        let mut f = self.grants.read_filter();
+        let mut f = self.session_filter()?;
         f.include_inactive = true;
         let meta = self.index.lock().await.meta(id, &f)?;
         let Some(meta) = meta else {
@@ -585,7 +644,7 @@ impl Memory {
     ///
     /// [`Error::NotFound`] when absent or not for this session, or a store error.
     pub async fn get(&self, id: &str) -> Result<Entry, Error> {
-        let f = self.grants.read_filter();
+        let f = self.session_filter()?;
         let meta = self.index.lock().await.meta(id, &f)?;
         let Some(meta) = meta else {
             self.forget_pushed(id);
@@ -788,7 +847,12 @@ impl Memory {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             return Ok(out);
         };
-        let mut paths: Vec<PathBuf> = rd.filter_map(Result::ok).map(|e| e.path()).collect();
+        let mut paths: Vec<PathBuf> = rd
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            // the entries; a reviewer's notes sit beside them as JSON
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+            .collect();
         paths.sort();
         for p in paths {
             let text = std::fs::read_to_string(&p).map_err(|e| Error::Io {
@@ -836,6 +900,7 @@ impl Memory {
             path: path.display().to_string(),
             source: e,
         })?;
+        let _ = std::fs::remove_file(path.with_extension("review.json"));
         Ok(written)
     }
 
@@ -1391,7 +1456,7 @@ impl Memory {
                 self.grants.handling
             )));
         }
-        let scope = bundle::export_scope(&self.grants.read_filter(), &domain, max_label)?;
+        let scope = bundle::export_scope(&self.session_filter()?, &domain, max_label)?;
         // the index is read and released before the record is, so the future is Send
         let hits = self.index.lock().await.list(&scope, None, usize::MAX / 2)?;
         Ok(bundle::export(
@@ -1927,6 +1992,53 @@ mod tests {
                 .iter()
                 .any(|s| attr(s, "policy.action") == Some(Value::from("file_task"))),
             "the owner's task filing is a decision too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_roots_policy_narrows_what_an_agent_reads_inside_the_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let public = owner
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("Backoff is exponential, public.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let internal = owner
+            .write(req("Backoff is exponential, internal.\n"))
+            .await
+            .unwrap()
+            .id;
+        // the root's own policy: the built-in one with agents narrowed to public
+        let text = dm_policy::decide::BUILTIN.replace(
+            "read_filter := base_filter\n",
+            "read_filter := object.union(base_filter, {\"handling\": \"public\"}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n",
+        );
+        std::fs::create_dir_all(dir.path().join("policy")).unwrap();
+        std::fs::write(dir.path().join("policy/local.rego"), text).unwrap();
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:narrowed");
+        let hits = agent.search("backoff", None, 10).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|h| &h.id).collect::<Vec<_>>(),
+            vec![&public]
+        );
+        assert!(
+            agent.get(&internal).await.is_err(),
+            "not found, not filtered after"
+        );
+        assert_eq!(agent.list(None, None, 10).await.unwrap().len(), 1);
+        let owner = Memory::open(dir.path()).unwrap();
+        assert_eq!(owner.search("backoff", None, 10).await.unwrap().len(), 2);
+        let log = std::fs::read_to_string(dir.path().join("state/decisions.jsonl")).unwrap();
+        assert!(
+            log.lines()
+                .any(|l| l.contains("\"action\":\"read\"") && l.contains("at most public")),
+            "the scope is a logged decision:\n{log}"
         );
     }
 

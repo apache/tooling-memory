@@ -59,6 +59,8 @@ pub enum Action {
     Write,
     /// Erase an entry.
     Erase,
+    /// Read: the session's filter, asked once.
+    Read,
 }
 
 /// How a task is being filed.
@@ -167,6 +169,41 @@ pub struct Decision {
     pub policy: String,
 }
 
+/// What a session may read, as the policy computes it: the conditions an entry must
+/// meet, pushed into the index's query. Narrowed against the grants by the caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadScope {
+    /// The domains readable.
+    pub domains: Vec<String>,
+    /// The highest classification readable.
+    pub handling: dm_core::Label,
+    /// The lowest trust tier returned.
+    pub min_tier: dm_core::TrustTier,
+}
+
+impl ReadScope {
+    /// The filter the index applies: this scope intersected with what the grants
+    /// allow, so a policy can narrow a session's reads and never widen them.
+    #[must_use]
+    pub fn narrow(&self, granted: &dm_core::ReadFilter) -> dm_core::ReadFilter {
+        let mut f = granted.clone();
+        f.domains = granted
+            .domains
+            .iter()
+            .filter(|d| self.domains.contains(d))
+            .cloned()
+            .collect();
+        if f.domains.is_empty() {
+            // an empty list means every domain to the index; a scope that leaves none
+            // must read nothing, so it names a domain no entry has
+            f.domains = vec![String::new()];
+        }
+        f.handling = granted.handling.min(self.handling);
+        f.min_tier = granted.min_tier.max(self.min_tier);
+        f
+    }
+}
+
 /// A compiled policy over one grants file.
 #[derive(Clone)]
 pub struct Policy {
@@ -269,24 +306,37 @@ impl Policy {
         &self.source
     }
 
-    /// Decide one request.
+    /// The read scope for one principal: `data.amem.read_filter`.
     ///
     /// # Errors
     ///
-    /// When the policy fails to evaluate or its decision is not the shape expected.
-    pub fn decide(&self, input: &Input) -> Result<Decision, Error> {
+    /// When the policy fails to evaluate or its answer is not a scope.
+    pub fn read_scope(&self, input: &Input) -> Result<ReadScope, Error> {
+        let json = self.eval("data.amem.read_filter", input)?;
+        serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))
+    }
+
+    fn eval(&self, rule: &str, input: &Input) -> Result<String, Error> {
         let mut engine = self.engine.clone();
         let value = regorus::Value::from_json_str(
             &serde_json::to_string(input).map_err(|e| Error::Policy(e.to_string()))?,
         )
         .map_err(|e| Error::Policy(e.to_string()))?;
         engine.set_input(value);
-        let out = engine
-            .eval_rule("data.amem.decision".to_string())
-            .map_err(|e| Error::Policy(e.to_string()))?;
-        let json = out
+        engine
+            .eval_rule(rule.to_string())
+            .map_err(|e| Error::Policy(e.to_string()))?
             .to_json_str()
-            .map_err(|e| Error::Policy(e.to_string()))?;
+            .map_err(|e| Error::Policy(e.to_string()))
+    }
+
+    /// Decide one request.
+    ///
+    /// # Errors
+    ///
+    /// When the policy fails to evaluate or its decision is not the shape expected.
+    pub fn decide(&self, input: &Input) -> Result<Decision, Error> {
+        let json = self.eval("data.amem.decision", input)?;
         let mut d: Decision =
             serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))?;
         d.policy = self.version.clone();
@@ -474,6 +524,71 @@ mod tests {
         };
         assert!(ask(Class::Owner).allow);
         assert!(!ask(Class::Agent).allow);
+    }
+
+    fn read_input(class: Class) -> Input {
+        Input {
+            action: Action::Read,
+            principal: Principal {
+                id: "x".into(),
+                class,
+            },
+            domain: String::new(),
+            filing: None,
+            task: None,
+            parent: None,
+            write: None,
+        }
+    }
+
+    #[test]
+    fn the_built_in_read_scope_is_the_grants() {
+        let g = grants();
+        let p = Policy::builtin(&g).unwrap();
+        let scope = p.read_scope(&read_input(Class::Agent)).unwrap();
+        assert_eq!(scope.domains, vec!["dom-t".to_string()]);
+        assert_eq!(scope.handling, g.handling);
+        assert_eq!(scope.min_tier, dm_core::TrustTier::Raw);
+        assert_eq!(scope.narrow(&g.read_filter()), g.read_filter());
+    }
+
+    #[test]
+    fn a_policy_narrows_reads_and_cannot_widen_them() {
+        let g = grants();
+        let text = BUILTIN.replace(
+            "read_filter := base_filter\n",
+            "read_filter := object.union(base_filter, {\"handling\": \"public\", \"min_tier\": \"curated\", \"domains\": [\"dom-t\", \"dom-elsewhere\"]}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n",
+        );
+        assert_ne!(text, BUILTIN, "the rule was replaced");
+        let p = Policy::compile(&text, "test", &g).unwrap();
+        let f = p
+            .read_scope(&read_input(Class::Agent))
+            .unwrap()
+            .narrow(&g.read_filter());
+        assert_eq!(f.handling, dm_core::Label::Public);
+        assert_eq!(f.min_tier, dm_core::TrustTier::Curated);
+        assert_eq!(
+            f.domains,
+            vec!["dom-t".to_string()],
+            "a domain the grants lack is not added"
+        );
+        let owner = p
+            .read_scope(&read_input(Class::Owner))
+            .unwrap()
+            .narrow(&g.read_filter());
+        assert_eq!(owner, g.read_filter());
+    }
+
+    #[test]
+    fn a_scope_with_no_domains_reads_nothing_rather_than_everything() {
+        let g = grants();
+        let none = ReadScope {
+            domains: Vec::new(),
+            handling: dm_core::Label::Restricted,
+            min_tier: dm_core::TrustTier::Raw,
+        };
+        let f = none.narrow(&g.read_filter());
+        assert_eq!(f.domains, vec![String::new()]);
     }
 
     #[test]

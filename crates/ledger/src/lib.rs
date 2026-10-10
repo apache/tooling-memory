@@ -581,6 +581,9 @@ impl Ledger {
         let now = self.now();
         let until = now + lease;
         let claimed = on_backend!(&mut self.backend, db => db.claim_next(domain, now, holder, until, manifest))?;
+        if let Some(id) = &claimed {
+            self.trace("claimed", id).await;
+        }
         match claimed {
             Some(id) => Ok(Some(Claim {
                 task: self.get(&id).await?,
@@ -606,6 +609,7 @@ impl Ledger {
         let now = self.now();
         let until = now + lease;
         on_backend!(&mut self.backend, db => db.claim(id, now, holder, until, manifest))?;
+        self.trace("claimed", id).await;
         Ok(Claim {
             task: self.get(id).await?,
             lease_until: until,
@@ -832,7 +836,42 @@ impl Ledger {
         at: OffsetDateTime,
         event: &Event,
     ) -> Result<(), Error> {
-        on_backend!(&mut self.backend, db => db.append(id, at, event))
+        on_backend!(&mut self.backend, db => db.append(id, at, event))?;
+        let task_id = match event {
+            Event::Created { id: new_id, .. } => new_id.as_str(),
+            _ => id,
+        };
+        self.trace(event.kind(), task_id).await;
+        Ok(())
+    }
+
+    /// A `task.<kind>` span for a transition that took effect, with the task as it now
+    /// stands. Only when a collector is configured, since it reads the task back.
+    async fn trace(&self, kind: &str, id: &str) {
+        if !dm_otel::enabled() {
+            return;
+        }
+        let Ok(t) = self.get(id).await else {
+            return;
+        };
+        let mut attrs: Vec<(&'static str, dm_otel::Value<'_>)> = vec![
+            ("task.id", t.id.as_str().into()),
+            ("memory.domain", t.spec.domain.as_str().into()),
+            ("task.status", t.status.as_str().into()),
+            ("task.priority", t.spec.priority.into()),
+            ("task.attempts", i64::from(t.attempts).into()),
+            ("task.created_by", t.spec.created_by.as_str().into()),
+        ];
+        if let Some(h) = &t.holder {
+            attrs.push(("task.holder", h.as_str().into()));
+        }
+        if let Some(o) = &t.spec.origin {
+            attrs.push(("task.origin", o.as_str().into()));
+        }
+        if let Some(r) = &t.reason {
+            attrs.push(("task.reason", r.as_str().into()));
+        }
+        dm_otel::event(&format!("task.{kind}"), &attrs);
     }
 }
 
@@ -909,6 +948,7 @@ mod tests {
         not_found_and_persistence,
         a_completed_task_from_upstream_is_posted_back_once,
         two_claimers_on_two_connections_get_two_tasks,
+        a_domain_claims_only_its_own_queue,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1317,5 +1357,234 @@ mod tests {
         expected.sort();
         assert_eq!(ids, expected);
         assert!(next(&mut l1, "s3", mins(5)).await.is_none());
+    }
+
+    /// Two domains, one ledger: each claims only from its own queue, sees only its own
+    /// tasks listed, and finds either task by id.
+    async fn a_domain_claims_only_its_own_queue(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let a = admitted(&mut l, spec("In a")).await;
+        let other = admitted(
+            &mut l,
+            TaskSpec {
+                domain: "dom-b".into(),
+                ..spec("In b")
+            },
+        )
+        .await;
+        let listed = l.list("dom-b", Status::Admitted).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            vec![&other.id]
+        );
+        let got = l
+            .claim_next("dom-b", "s", mins(5), &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.task.id, other.id);
+        assert!(l
+            .claim_next("dom-b", "s", mins(5), &[])
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(l.get(&a.id).await.unwrap().status, Status::Admitted);
+        a_domain_with_no_tasks_has_an_empty_queue(&mut l).await;
+    }
+
+    async fn a_domain_with_no_tasks_has_an_empty_queue(l: &mut Ledger) {
+        assert!(l
+            .list("dom-none", Status::Admitted)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(l
+            .claim_next("dom-none", "s", mins(5), &[])
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    async fn pg_client(server: &PgServer) -> tokio_postgres::Client {
+        let (client, conn) = tokio_postgres::connect(server.url(), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        client
+    }
+
+    #[tokio::test]
+    async fn on_postgres_each_domain_has_a_schema_of_its_own() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        let a = admitted(&mut l, spec("In a")).await;
+        let b = admitted(
+            &mut l,
+            TaskSpec {
+                domain: "dom-b".into(),
+                ..spec("In b")
+            },
+        )
+        .await;
+        let c = pg_client(&server).await;
+        let count = |schema: String, id: String| {
+            let c = &c;
+            async move {
+                let row = c
+                    .query_one(
+                        &format!("SELECT COUNT(*) FROM {schema}.tasks WHERE id = $1"),
+                        &[&id],
+                    )
+                    .await
+                    .unwrap();
+                row.get::<_, i64>(0)
+            }
+        };
+        let sa = crate::postgres::schema_for("dom-a");
+        let sb = crate::postgres::schema_for("dom-b");
+        assert_ne!(sa, sb);
+        assert_eq!(count(sa.clone(), a.id.clone()).await, 1);
+        assert_eq!(count(sb.clone(), b.id.clone()).await, 1);
+        assert_eq!(
+            count(sa, b.id.clone()).await,
+            0,
+            "dom-b's task is not in dom-a's schema"
+        );
+        assert_eq!(count(sb, a.id.clone()).await, 0);
+        assert!(
+            c.query_one("SELECT to_regclass('public.tasks') IS NULL", &[])
+                .await
+                .unwrap()
+                .get::<_, bool>(0),
+            "no shared tasks table"
+        );
+        // a schema name is readable and does not collide for domains that read alike
+        assert!(crate::postgres::schema_for("dom-a").starts_with("\"ledger_dom_a_"));
+        assert_ne!(
+            crate::postgres::schema_for("dom-a.b"),
+            crate::postgres::schema_for("dom-a_b")
+        );
+    }
+
+    #[tokio::test]
+    async fn on_postgres_a_ledger_from_before_domain_schemas_moves_into_them() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let c = pg_client(&server).await;
+        // the shared tables as the first PostgreSQL ledger made them, with one task in
+        // each of two domains, one of them admitted
+        c.batch_execute(
+            "CREATE TABLE public.events (seq BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL,
+                 kind TEXT NOT NULL, at TEXT NOT NULL, payload TEXT NOT NULL);
+             CREATE TABLE public.tasks (id TEXT PRIMARY KEY, domain TEXT NOT NULL);",
+        )
+        .await
+        .unwrap();
+        let mut ids = Vec::new();
+        for (domain, admit) in [("dom-a", true), ("dom-b", false)] {
+            let id = dm_core::id::new_task_id(domain);
+            let created = Event::Created {
+                id: id.clone(),
+                spec: TaskSpec {
+                    domain: domain.into(),
+                    ..spec("Old")
+                },
+            };
+            let mut events = vec![created];
+            if admit {
+                events.push(Event::Admitted);
+            }
+            for e in &events {
+                c.execute(
+                    "INSERT INTO public.events (task_id, kind, at, payload) VALUES ($1, $2, $3, $4)",
+                    &[&id, &e.kind(), &fmt_time(T0), &e.payload(&id).unwrap()],
+                )
+                .await
+                .unwrap();
+            }
+            c.execute(
+                "INSERT INTO public.tasks (id, domain) VALUES ($1, $2)",
+                &[&id, &domain],
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let l = Ledger::connect(server.url()).await.unwrap();
+        assert_eq!(l.get(&ids[0]).await.unwrap().status, Status::Admitted);
+        assert_eq!(l.get(&ids[1]).await.unwrap().status, Status::Proposed);
+        assert_eq!(l.get(&ids[1]).await.unwrap().spec.domain, "dom-b");
+        assert_eq!(l.event_count().await.unwrap(), 3);
+        let kept = c
+            .query_one(
+                "SELECT to_regclass('public.events_before_domain_schemas') IS NOT NULL
+                    AND to_regclass('public.tasks') IS NULL",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            kept.get::<_, bool>(0),
+            "the old tables are renamed, not dropped"
+        );
+        // and a second connect finds nothing left to move
+        let again = Ledger::connect(server.url()).await.unwrap();
+        assert_eq!(again.event_count().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn every_transition_is_a_span_with_the_task_as_it_stands() {
+        use opentelemetry::Value;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let _guard = dm_otel::install(provider);
+        let mut l = Ledger::in_memory().unwrap();
+        let t = admitted(&mut l, spec("Traced")).await;
+        let c = l
+            .claim_next("dom-a", "agent:x", mins(5), &[])
+            .await
+            .unwrap()
+            .unwrap();
+        l.complete(&c.task.id, "agent:x", "mem-a-handoff")
+            .await
+            .unwrap();
+        let spans: Vec<_> = exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .filter(|sp| {
+                sp.attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "task.id" && kv.value.as_str() == t.id.as_str())
+            })
+            .collect();
+        let names: Vec<String> = spans.iter().map(|sp| sp.name.to_string()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "task.created",
+                "task.admitted",
+                "task.claimed",
+                "task.completed"
+            ]
+        );
+        let attr = |i: usize, k: &str| {
+            spans[i]
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == k)
+                .map(|kv| kv.value.clone())
+        };
+        assert_eq!(attr(0, "task.status"), Some(Value::from("proposed")));
+        assert_eq!(attr(2, "task.holder"), Some(Value::from("agent:x")));
+        assert_eq!(attr(2, "task.attempts"), Some(Value::I64(1)));
+        assert_eq!(attr(3, "task.status"), Some(Value::from("completed")));
+        assert_eq!(attr(3, "memory.domain"), Some(Value::from("dom-a")));
     }
 }
