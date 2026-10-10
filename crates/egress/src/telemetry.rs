@@ -266,6 +266,28 @@ impl Telemetry {
         Ok((totals.calls > 0).then_some(totals))
     }
 
+    /// Tokens in and out spent at a destination: by one session, or since a time, or
+    /// both. What the spend limits are checked against.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn spent(
+        &self,
+        destination: &str,
+        session: Option<&str>,
+        since: Option<OffsetDateTime>,
+    ) -> Result<u64, Error> {
+        let since = since.map(|t| t.format(&Rfc3339).unwrap_or_default());
+        let n: i64 = lock(&self.conn).query_row(
+            "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) FROM usage
+             WHERE destination = ?1 AND (?2 IS NULL OR session = ?2) AND (?3 IS NULL OR at >= ?3)",
+            params![destination, session, since],
+            |r| r.get(0),
+        )?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
     /// Totals by destination and model, most tokens first.
     ///
     /// # Errors

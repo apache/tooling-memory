@@ -5,7 +5,7 @@
 # the grants file as `data.grants` and one request as `input`.
 #
 # input:
-#   action      file_task | write | erase | read | promote
+#   action      file_task | write | erase | read | promote | spend
 #   principal   {id, class}           class: owner | human | agent | tap | system
 #   domain      the domain acted on
 #   filing      own | held | session   (file_task) the system on the owner's behalf, a
@@ -15,6 +15,7 @@
 #   parent      {requirements}         (file_task, filing == held) the task held
 #   write       {supersedes, supersedes_tier, supersedes_author, session_supersedes}
 #   promote     {phase, to, author, proposer}  phase: direct | propose | approve
+#   spend       {destination, session_tokens, day_tokens}
 #
 # decision: {allow, admit, review, reason}
 #   review: none | human | approver    who has to look before this goes further
@@ -226,6 +227,31 @@ promote_decision := {"allow": true, "admit": false, "review": "none", "reason": 
 }
 
 default promote_decision := {"allow": false, "admit": false, "review": "none", "reason": "no promotion rule for this request"}
+
+# ---- spend: limits per resource class, checked before a model call leaves ----
+
+# The grants file sets them per destination, `[spend.<destination>]`: tokens one
+# session may spend there, and tokens the root may spend there in a day. The egress
+# asks before every model call with what it has metered; over a limit, the call does
+# not leave. A record policy may add its own limits in the rules package.
+spend_limits := object.get(object.get(data.grants, "spend", {}), input.spend.destination, {})
+
+over_session if input.spend.session_tokens >= spend_limits.session_tokens
+
+over_day if input.spend.day_tokens >= spend_limits.day_tokens
+
+spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: this session has spent %v tokens at %v, its limit is %v", [input.spend.session_tokens, input.spend.destination, spend_limits.session_tokens])} if {
+	over_session
+}
+
+spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: the root has spent %v tokens at %v in the last day, its limit is %v", [input.spend.day_tokens, input.spend.destination, spend_limits.day_tokens])} if {
+	not over_session
+	over_day
+}
+
+default spend_decision := {"allow": true, "admit": false, "review": "none", "reason": "within the spend limits"}
+
+base_decision := spend_decision if input.action == "spend"
 
 default base_decision := {"allow": false, "admit": false, "review": "none", "reason": "no rule for this action"}
 

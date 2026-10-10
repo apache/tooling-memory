@@ -299,6 +299,9 @@ impl Egress {
         let inner = &self.inner;
         let dest =
             admit(inner, destination).map_err(|_| Error::Refused(destination.to_string()))?;
+        if let Some(reason) = over_budget(inner, destination) {
+            return Err(Error::Refused(format!("{destination}: {reason}")));
+        }
         let req = Request::builder()
             .method(Method::POST)
             .uri(format!("/{destination}/{}", path.trim_start_matches('/')))
@@ -500,6 +503,26 @@ fn only_destination(inner: &Inner, destination: String, rest: String) -> (String
 
 /// The destination for a request, or the response that refuses it: unknown name, or a
 /// session label above the destination's ceiling.
+/// The spend limits, before a model call leaves: what this session and the root have
+/// spent at the destination, as metered here, against the policy. Over a limit the
+/// call is refused with the reason, as a permission error, which a harness does not
+/// retry.
+fn over_budget(inner: &Inner, destination: &str) -> Option<String> {
+    let day_ago = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    let session = inner
+        .telemetry
+        .spent(destination, Some(inner.memory.session_id()), None)
+        .unwrap_or(0);
+    let day = inner
+        .telemetry
+        .spent(destination, None, Some(day_ago))
+        .unwrap_or(0);
+    match inner.memory.check_spend(destination, session, day) {
+        Ok(d) if !d.allow => Some(d.reason),
+        _ => None,
+    }
+}
+
 fn admit(inner: &Inner, destination: &str) -> Result<Destination, Box<Response>> {
     let Some(dest) = inner.destinations.get(destination) else {
         return Err(Box::new(error_json(
@@ -837,6 +860,12 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
         Ok(d) => d,
         Err(refusal) => return *refusal,
     };
+    // a model call spends; a listing does not
+    if req.method() == Method::POST {
+        if let Some(reason) = over_budget(inner, &destination) {
+            return error_json(StatusCode::FORBIDDEN, "permission_error", &reason);
+        }
+    }
     let (req, replaced) = match shaped(&dest, &rest, req).await {
         Ok(pair) => pair,
         Err(refusal) => return *refusal,
@@ -1112,6 +1141,71 @@ mod tests {
             e.call("nowhere", "v1/x", &serde_json::json!({})).await,
             Err(Error::Refused(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_model_call_over_the_spend_limit_does_not_leave() {
+        let fake = Router::new().route(
+            "/v1/chat/completions",
+            any(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":40,"completion_tokens":2}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("m");
+        Memory::init(&root, "human:test:me", "dom-me").unwrap();
+        let grants = root.join("grants.toml");
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(
+            &grants,
+            format!("{text}\n[spend.openai]\nsession_tokens = 50\n"),
+        )
+        .unwrap();
+        let m = Arc::new(Memory::open(&root).unwrap().with_author("agent:a"));
+        let mut d = HashMap::new();
+        d.insert(
+            "openai".to_string(),
+            Destination::forward(format!("http://{addr}"), Auth::PassThrough),
+        );
+        let e = Egress::new(m, d, &dir.path().join("t.db")).unwrap();
+        let ask = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        let refused = e
+            .call("openai", "v1/chat/completions", &ask)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("spend limit"), "{refused}");
+        let r = e
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(ask.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("84 tokens"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let log = std::fs::read_to_string(root.join("state/decisions.jsonl")).unwrap();
+        assert!(
+            log.contains("\"action\":\"spend\"") && log.contains("\"allow\":false"),
+            "{log}"
+        );
     }
 
     #[test]

@@ -63,6 +63,8 @@ pub enum Action {
     Read,
     /// Promote an entry's trust tier.
     Promote,
+    /// Send a model call: spend against a destination's limits.
+    Spend,
 }
 
 /// How a task is being filed.
@@ -137,6 +139,17 @@ pub struct PromoteInput {
     pub proposer: String,
 }
 
+/// The spend being decided: a model call about to leave for a destination.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SpendInput {
+    /// The destination.
+    pub destination: String,
+    /// Tokens this session has spent there.
+    pub session_tokens: u64,
+    /// Tokens the root has spent there in the last day.
+    pub day_tokens: u64,
+}
+
 /// One request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Input {
@@ -164,6 +177,9 @@ pub struct Input {
     /// The task this session holds, which an exception may be scoped to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_task: Option<String>,
+    /// The spend, for `spend`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<SpendInput>,
 }
 
 /// Who has to look before this goes further.
@@ -494,6 +510,7 @@ mod tests {
             write: None,
             promote: None,
             held_task: None,
+            spend: None,
         })
         .unwrap()
     }
@@ -520,6 +537,7 @@ mod tests {
             }),
             promote: None,
             held_task: None,
+            spend: None,
         })
         .unwrap()
     }
@@ -583,6 +601,7 @@ mod tests {
                 write: None,
                 promote: None,
                 held_task: None,
+                spend: None,
             })
             .unwrap();
         assert!(!d.allow, "{d:?}");
@@ -630,6 +649,7 @@ mod tests {
                 }),
                 promote: None,
                 held_task: None,
+                spend: None,
             })
             .unwrap()
         };
@@ -659,6 +679,7 @@ mod tests {
                 write: None,
                 promote: None,
                 held_task: None,
+                spend: None,
             })
             .unwrap()
         };
@@ -680,6 +701,7 @@ mod tests {
             write: None,
             promote: None,
             held_task: None,
+            spend: None,
         }
     }
 
@@ -770,6 +792,7 @@ mod tests {
             }),
             promote: None,
             held_task: held.map(str::to_string),
+            spend: None,
         })
         .unwrap()
     }
@@ -858,6 +881,50 @@ mod tests {
         assert_eq!(p.refused().len(), 1);
         let d = write(Class::Agent, Some("verified"), 0);
         assert!(!d.allow, "the base gate still holds: {d:?}");
+    }
+
+    #[test]
+    fn a_model_call_over_a_spend_limit_does_not_leave() {
+        let mut g = grants();
+        g.spend.insert(
+            "llmao".into(),
+            crate::SpendLimit {
+                session_tokens: Some(1000),
+                day_tokens: Some(5000),
+            },
+        );
+        let p = Policy::builtin(&g).unwrap();
+        let ask = |dest: &str, session: u64, day: u64| {
+            p.decide(&Input {
+                action: Action::Spend,
+                principal: Principal {
+                    id: "agent:x".into(),
+                    class: Class::Agent,
+                },
+                domain: String::new(),
+                filing: None,
+                task: None,
+                parent: None,
+                write: None,
+                promote: None,
+                held_task: None,
+                spend: Some(SpendInput {
+                    destination: dest.into(),
+                    session_tokens: session,
+                    day_tokens: day,
+                }),
+            })
+            .unwrap()
+        };
+        assert!(ask("llmao", 999, 100).allow);
+        let d = ask("llmao", 1000, 100);
+        assert!(!d.allow && d.reason.contains("this session"), "{d:?}");
+        let d = ask("llmao", 10, 5000);
+        assert!(!d.allow && d.reason.contains("last day"), "{d:?}");
+        assert!(
+            ask("anthropic", 1_000_000, 1_000_000).allow,
+            "no limit set there"
+        );
     }
 
     #[test]

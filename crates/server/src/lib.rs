@@ -376,6 +376,7 @@ impl Memory {
             write: None,
             promote: None,
             held_task: None,
+            spend: None,
         };
         let f = self
             .policy()
@@ -454,6 +455,42 @@ impl Memory {
         input.held_task = self.held.get().cloned();
         let d = self.policy().decide(&input)?;
         self.log_decision(&input, &d);
+        Ok(d)
+    }
+
+    /// Whether a model call may leave for `destination`, given what this session and
+    /// the root have spent there as the egress metered it. A refusal is a logged
+    /// decision; an allow is not, since every model call asks.
+    ///
+    /// # Errors
+    ///
+    /// When the policy fails to evaluate.
+    pub fn check_spend(
+        &self,
+        destination: &str,
+        session_tokens: u64,
+        day_tokens: u64,
+    ) -> Result<Decision, Error> {
+        let input = Input {
+            action: Action::Spend,
+            principal: self.principal(),
+            domain: String::new(),
+            filing: None,
+            task: None,
+            parent: None,
+            write: None,
+            promote: None,
+            held_task: self.held.get().cloned(),
+            spend: Some(dm_policy::decide::SpendInput {
+                destination: destination.to_string(),
+                session_tokens,
+                day_tokens,
+            }),
+        };
+        let d = self.policy().decide(&input)?;
+        if !d.allow {
+            self.log_decision(&input, &d);
+        }
         Ok(d)
     }
 
@@ -981,6 +1018,7 @@ impl Memory {
                 proposer: proposer.to_string(),
             }),
             held_task: None,
+            spend: None,
         })
     }
 
@@ -1030,6 +1068,7 @@ impl Memory {
             }),
             promote: None,
             held_task: None,
+            spend: None,
         })?;
         if !decision.allow {
             return Err(self.quarantine(entry.clone(), &decision, &findings).await);
@@ -1431,6 +1470,7 @@ impl Memory {
             write: None,
             promote: None,
             held_task: None,
+            spend: None,
         })?;
         if d.admit {
             let admitted = l.admit(&task.id).await?;
@@ -1887,6 +1927,7 @@ impl Memory {
             write: None,
             promote: None,
             held_task: None,
+            spend: None,
         })?;
         if !d.allow || self.author != self.grants.owner {
             return Err(Error::Denied(format!(

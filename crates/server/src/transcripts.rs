@@ -474,6 +474,31 @@ impl Memory {
         }
     }
 
+    /// A live transcript's turns, whole: the decision contexts replay presents again.
+    /// The owner's alone: replay reads what no agent may read whole, and only while the
+    /// transcript is live, since the sweep keeps only the turns entries cite.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for anyone but the owner or a transcript no longer live;
+    /// [`Error::NotFound`]; a store error.
+    pub async fn replay_turns(&self, session: &str) -> Result<Vec<Turn>, Error> {
+        if self.author != self.grants.owner {
+            return Err(Error::Denied(format!(
+                "replay is the owner's: {} reads whole transcripts",
+                self.grants.owner
+            )));
+        }
+        let t = self.find_transcript(session).await?;
+        if t.state != State::Live {
+            return Err(Error::Denied(format!(
+                "{session} is {:?}: its decision contexts are gone, its cited turns kept as excerpts",
+                t.state
+            )));
+        }
+        Ok(t.turns)
+    }
+
     /// A transcript by id across the granted domains, whatever its state.
     async fn find_transcript(&self, session: &str) -> Result<Transcript, Error> {
         for domain in self.domains() {
@@ -790,6 +815,7 @@ impl Memory {
             write: None,
             promote: None,
             held_task: None,
+            spend: None,
         })?;
         if !d.allow || self.author != self.grants.owner {
             return Err(Error::Denied(format!(

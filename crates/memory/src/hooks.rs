@@ -711,6 +711,37 @@ fn muse_turn(v: &Value) -> Option<(&'static str, String)> {
     }
 }
 
+/// A Codex rollout item's turn: a user or assistant message, or a tool call named in
+/// the shape Claude Code's turns name theirs, so the record holds what was done as well
+/// as what was said.
+fn codex_turn(p: &Value) -> Option<Turn> {
+    let kept = |role: &str, text: String| {
+        let text = text.trim().to_string();
+        (!text.is_empty() && text != "[tool result]").then(|| Turn {
+            role: role.to_string(),
+            text,
+        })
+    };
+    match p.get("type").and_then(Value::as_str)? {
+        "message" => {
+            let who = p.get("role").and_then(Value::as_str)?;
+            if who != "user" && who != "assistant" {
+                return None;
+            }
+            kept(who, text_of(p.get("content").unwrap_or(&Value::Null)))
+        }
+        "function_call" => {
+            let name = p.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let full = match p.get("namespace").and_then(Value::as_str) {
+                Some(ns) => format!("{ns}__{name}"),
+                None => name.to_string(),
+            };
+            kept("assistant", format!("[used tool {full}]"))
+        }
+        _ => None,
+    }
+}
+
 fn turns_in(v: &Value) -> Vec<Turn> {
     let keep = |role: &str, text: String| {
         let text = text.trim().to_string();
@@ -763,15 +794,7 @@ fn turns_in(v: &Value) -> Vec<Turn> {
             }
         }
         if role == "response_item" {
-            if let Some(p) = v.get("payload") {
-                let is_message = p.get("type").and_then(Value::as_str) == Some("message");
-                let who = p.get("role").and_then(Value::as_str).unwrap_or_default();
-                if is_message && (who == "user" || who == "assistant") {
-                    return keep(who, text_of(p.get("content").unwrap_or(&Value::Null)))
-                        .into_iter()
-                        .collect();
-                }
-            }
+            return v.get("payload").and_then(codex_turn).into_iter().collect();
         }
     }
     let mut out = Vec::new();
@@ -1098,6 +1121,16 @@ not json
         let t = transcript_tail(TRANSCRIPT, 10, 10_000);
         assert!(t.starts_with("**user**\n\nLoad T0"), "{t}");
         assert!(t.contains("[used tool mcp__memory__t0]"), "{t}");
+        let codex = r#"{"type":"response_item","payload":{"type":"function_call","name":"get","namespace":"mcp__memory","arguments":"{}"}}"#;
+        let turns = transcript_turns(codex);
+        assert_eq!(
+            turns,
+            vec![(
+                "assistant".to_string(),
+                "[used tool mcp__memory__get]".to_string()
+            )],
+            "Codex's tool calls are turns too"
+        );
         assert!(!t.contains("big"), "tool results are elided: {t}");
         assert!(t.ends_with("one decision."), "{t}");
         let last = transcript_tail(TRANSCRIPT, 1, 10_000);

@@ -58,6 +58,18 @@ pub enum Error {
     Policy(String),
 }
 
+/// What one destination's model calls may spend, in tokens in and out: per session,
+/// and across the root in the last day. Checked by the egress before a call leaves.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendLimit {
+    /// Tokens one session may spend here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_tokens: Option<u64>,
+    /// Tokens the root may spend here in the last day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_tokens: Option<u64>,
+}
+
 /// The gates on writes whose blast radius is not routine; `[gates]` in the file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gates {
@@ -161,6 +173,9 @@ pub struct Grants {
     /// The gates on writes; defaults apply when the table is absent.
     #[serde(default)]
     pub gates: Gates,
+    /// Spend limits per resource class, by destination: `[spend.llmao]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub spend: BTreeMap<String, SpendLimit>,
     /// Where the task ledger lives when not in the SQLite file under the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<LedgerSettings>,
@@ -227,6 +242,7 @@ impl Grants {
             taps: BTreeMap::new(),
             ledger: None,
             gates: Gates::default(),
+            spend: BTreeMap::new(),
         }
     }
 

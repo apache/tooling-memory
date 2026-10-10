@@ -26,6 +26,7 @@ mod mine;
 mod model;
 mod open;
 mod profiles;
+mod replay;
 mod requests;
 mod review;
 mod savings;
@@ -534,6 +535,24 @@ enum Command {
         /// verdict, malicious, report or benign, kept beside it for the owner.
         #[arg(long)]
         quarantine: bool,
+    },
+    /// Frozen-context replay: a kept transcript's decision points presented again to a
+    /// model, its next action scored against the one recorded. The owner's; the run is
+    /// logged under state/replay.
+    Replay {
+        /// The session whose transcript holds the decision points.
+        session: String,
+        /// Only this turn; every assistant turn otherwise, up to --limit.
+        #[arg(long)]
+        turn: Option<usize>,
+        #[arg(long, default_value_t = 6)]
+        limit: usize,
+        #[arg(long, value_enum, default_value = "gateway")]
+        auth: AuthArg,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Canary entries: planted with known content, checked for alteration.
     Canary {
@@ -1300,6 +1319,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         cmd @ (Command::Mine { .. }
         | Command::Check { .. }
         | Command::Curate { .. }
+        | Command::Replay { .. }
         | Command::Models { .. }
         | Command::WslcApiCheck { .. }
         | Command::Savings { .. }
@@ -2225,7 +2245,9 @@ async fn list_models(
 async fn tools_cmd(root: &Path, command: Command) -> Fallible {
     match command {
         Command::Models { auth, provider } => models_cmd(root, auth, provider).await,
-        cmd @ (Command::Check { .. } | Command::Curate { .. }) => curation_cmd(root, cmd).await,
+        cmd @ (Command::Check { .. } | Command::Curate { .. } | Command::Replay { .. }) => {
+            curation_cmd(root, cmd).await
+        }
         Command::Mine {
             transcript,
             auth,
@@ -2289,6 +2311,36 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
     }
 }
 
+/// `amem replay`.
+#[allow(clippy::too_many_arguments)] // one per flag of the command
+async fn replay_cmd(
+    root: &Path,
+    session: &str,
+    turn: Option<usize>,
+    limit: usize,
+    auth: AuthArg,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Fallible {
+    let auth = AuthMode::from(auth);
+    let provider = checker_destination(auth, provider);
+    let p = prepare_launch(
+        root,
+        Harness::Command,
+        Credentials::keyed(auth, &provider),
+        None,
+        None,
+        Projected::No,
+    )
+    .await?;
+    p.memory.disable_read_log();
+    let model = model::resolve(&p.egress, &p.provider, model.as_deref()).await;
+    // the decision contexts are read as the owner; the calls go through the egress
+    let owner = Memory::open(root)?.without_read_log();
+    let run = replay::replay(&p.egress, &owner, session, &p.provider, &model, turn, limit).await?;
+    json(&run)
+}
+
 /// The curation commands: the checker, and the cycle.
 async fn curation_cmd(root: &Path, command: Command) -> Fallible {
     match command {
@@ -2334,6 +2386,14 @@ async fn curation_cmd(root: &Path, command: Command) -> Fallible {
             };
             curate_loop(root, &plan, every).await
         }
+        Command::Replay {
+            session,
+            turn,
+            limit,
+            auth,
+            provider,
+            model,
+        } => replay_cmd(root, &session, turn, limit, auth, provider, model).await,
         _ => unreachable!("routed by tools_cmd"),
     }
 }
@@ -4239,6 +4299,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Mine { .. }
         | Command::Check { .. }
         | Command::Curate { .. }
+        | Command::Replay { .. }
         | Command::Models { .. }
         | Command::WslcApiCheck { .. }
         | Command::Savings { .. }
