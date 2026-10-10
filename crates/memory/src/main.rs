@@ -542,11 +542,12 @@ enum Command {
         #[arg(long)]
         quarantine: bool,
     },
-    /// Frozen-context replay: a kept transcript's decision points presented again to a
-    /// model, its next action scored against the one recorded. The owner's; the run is
-    /// logged under state/replay.
+    /// Frozen-context replay: the decision contexts the egress recorded for a session sent
+    /// again with only the model changed, the next action scored against the one
+    /// recorded; a session with no contexts falls back to its transcript, and says so.
+    /// The owner's; the run is logged under state/replay.
     Replay {
-        /// The session whose transcript holds the decision points.
+        /// The session whose decision contexts, or transcript, hold the decision points.
         session: String,
         /// Only this turn; every assistant turn otherwise, up to --limit.
         #[arg(long)]

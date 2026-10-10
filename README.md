@@ -75,6 +75,9 @@ These do what the paper says, on one laptop, and each names what replaces it.
 - **The quarantine** is files under `state/`, reviewed by a model on request, released
   by the owner by hand.
 - **Transcripts' citations** are found by scanning a domain's entries on every lookup.
+- **Cost** is priced from a table the owner keeps by hand, and a task's share is its
+  session's spend divided evenly among the tasks it completed. Production: the gateway's
+  per-key spend, with each call tagged with its task and trace.
 - **The evaluation** is four questions graded by regular expression, on one harness and
   model per run.
 - **The web launcher** listens on loopback for the one owner.
@@ -86,15 +89,44 @@ backends go in behind the same crates and must pass the same suite, and the eval
 harness and `amem savings` give the numbers for each swap, so that nothing in the move is
 argued from taste.
 
-## What you get
+## What it is
 
-A per-session memory server, `amem`, that an agent harness reaches over MCP. It holds the record as Markdown files with frontmatter, an index and a task ledger in one SQLite file, and a grants file the owner edits. An agent starts empty, loads a small index called T0, writes a handoff when it stops, and the next agent continues from the handoff rather than a transcript.
+Two halves around one record. The **memory server** is what an agent harness reaches
+over MCP: it serves the record by summaries first, holds the task ledger, and checks every
+read and write against the policy. The **launcher** runs a harness confined, with no
+network except the **egress**, which forwards its model calls to a provider or a gateway,
+meters them, holds the credentials, enforces spend limits and records each call's
+decision context. An agent starts empty, loads a small index called T0, works a task it
+claimed, and writes a handoff when it stops; the next agent continues from the handoff,
+not a transcript. Around them, the **librarian** curates the record on a budget, the
+**perimeter** decides what may be read, written and admitted, and a person promotes what
+the system may rely on.
 
 ```
-  harness (Claude Code, Codex, ...) ──MCP──▶ amem ──▶ record/   Markdown, versioned
-                                            ├──▶ index.db  SQLite FTS5 + ledger
-                                            └──▶ grants.toml
+  person ──▶ amem: web launcher, CLI, profiles
+               │ launch / work (a claimed task)
+               ▼
+  ┌─ confined harness, no network ───────┐
+  │ Claude Code, Codex, Gemini CLI, ...  │──MCP──▶ memory server ──▶ record/   entries, transcripts, contexts
+  └──────────────┬───────────────────────┘          │  policy:  ├──▶ index    SQLite FTS5, BM25
+                 │ model calls                      │  Rego     ├──▶ ledger   SQLite, or PostgreSQL
+                 ▼                                  │           └──▶ logs     reads, writes, decisions
+              egress ──▶ provider or gateway        │
+       metered, spend-limited, contexts recorded    └── librarian: curation, checker, canaries, drift
 ```
+
+Everything lives under one root, `~/memory` unless `--root` or `MEMORY_ROOT` says
+otherwise, and the process touches nothing outside it:
+
+| Path | What |
+|---|---|
+| `grants.toml` | The perimeter's data: domains and their labels, destinations and their ceilings, `[gates]`, `[spend.<destination>]`, and `[ledger]` for PostgreSQL |
+| `credentials.env` | API keys, `LLMAO_KEY`, `GH_TOKEN`, as `NAME=value`, mode 600; the environment wins |
+| `profiles.toml` | Named launches: harness, auth, model, subagents |
+| `prices.toml` | USD per million tokens per model, for `amem cost` |
+| `policy/*.rego` | Optional: replaces the built-in policy |
+| `record/<domain>/` | The entries, Markdown with frontmatter, never edited in place; `.history`, `.erasures`, `.transcripts` and `.contexts` beside them |
+| `state/` | Rebuildable and operational: `index.db`, `ledger.db`, `telemetry.db`, the read, write and decision logs as JSONL, the quarantine, drift and replay runs |
 
 ## Build and run
 
@@ -102,24 +134,21 @@ Rust stable, then:
 
 ```sh
 cargo install --path crates/memory --locked   # or `make install`; puts `amem` on the PATH
-amem init --domain dom-me                     # a record at ~/memory; --root or MEMORY_ROOT for elsewhere
+amem init --domain dom-me                     # a root at ~/memory
 amem doctor                                   # what this host can run, and what is missing
 amem                                          # the web launcher, opened in the browser
 ```
 
-`amem` with no command starts the web launcher over the record, or finds the one already
+`amem` with no command starts the web launcher over the root, or finds the one already
 running, and opens the browser on a link that pairs it: a code good once, for two
 minutes, which the page trades for a key of its own. Run it from the project sessions
-should start in, or give `--workdir`. The server listens on loopback only, answers
-nothing past its static pages without a key, and keeps its token in
-`~/memory/state/web.json`, owner-only; a paired browser's key lasts as long as the server.
-Credentials the launcher needs, the API keys, `LLMAO_KEY` for the
-gateway, `GH_TOKEN` for Copilot, go in `~/memory/credentials.env` as `NAME=value`, mode
-600; the environment wins over the file, and a `gh auth login` stands in for `GH_TOKEN`.
-`amem doctor` names which are found where, never their values. `LLMAO_KEY` alone points at the local LiteLLM on port 4000; a PAT for the Foundation's gateway wants `LLMAO_URL=https://llm.apache.org` beside it, which `amem doctor` says when the local one does not answer.
+should start in, or give `--workdir`. The server listens on loopback only and answers
+nothing past its static pages without a key. `amem doctor` names which credentials are
+found where, never their values. `LLMAO_KEY` alone points at a local LiteLLM on port 4000;
+a PAT for the Foundation's gateway wants `LLMAO_URL=https://llm.apache.org` beside it.
 
 A profile names the flags of a launch, so the name is the whole command. Every harness
-is one, `amem claude`, and `~/memory/profiles.toml` adds more:
+is one, `amem claude`, and `profiles.toml` adds more:
 
 ```toml
 [nightly]
@@ -130,27 +159,40 @@ subagents = "board"
 ```
 
 `amem nightly` launches it, `amem work nightly` works the ledger with it, and a flag
-typed after the name wins over the file; `amem profiles` lists them, and the web form
-offers them first.
+typed after the name wins over the file. The launcher runs Claude Code, Codex, Gemini
+CLI, Qwen Code, Grok Build, Copilot CLI and OpenCode in native Linux namespaces from the
+harness image once `make unpack` has put it in place, or under WSL containers; auth is
+`key`, `gateway`, or `subscription`, the harness's own login, which the egress passes
+through and meters as plan quota. [local/README.md](local/README.md) is the full guide.
 
-To run a harness confined, with the memory server attached and every model call metered,
-interactively, on a prompt, or on the next task from the ledger,
-see [local/README.md](local/README.md): `make launch` runs Claude Code, Codex, Gemini CLI,
-Qwen Code, Grok Build, Copilot CLI or OpenCode in native namespaces with no network except
-the egress, from the harness image once `make unpack` has put it in place, and Antigravity
-CLI from the host's own install, since the image does not carry it yet. The gateway half of that page runs LiteLLM
-locally so the Foundation's shape can be tried end to end.
-
-Or point a harness at the memory server alone over stdio. For Claude Code:
+Or point a harness at the memory server alone over stdio, unconfined:
 
 ```sh
 claude mcp add memory -- /path/to/amem --root ~/memory serve --author "agent:claude-code"
 ```
 
-The agent gets `t0`, `search`, `get`, `write`, `list`, the ledger tools, and a
-`memory://t0/dom-me` resource. Its writes land at raw trust under the author you gave.
+The agent gets `t0`, `search`, `get`, `write`, `list`, `recall`, `promote`, the ledger's tools
+and `transcript_turn`, and its writes land at raw trust under the author given.
 
-From the command line, the same operations:
+## The parts, and their commands
+
+Each part is described in [local/README.md](local/README.md) under its own heading.
+
+| Part | What it does | Commands |
+|---|---|---|
+| The read path | T0, BM25 search with summaries first, one body on `get`, recall as a cited brief or a pack, prefetch on claim and at fetch | `t0`, `search`, `get`, `list`, `recall`, `write` |
+| The task fabric | Tasks with leases and handoffs; a rubric from the L1 strategy ranks along the ledger's edges at admission and in the triage cycle, and workers only claim; subagents filed on the board as children with a continuation | `task create, admit, claim-next, complete, release, tree, retry, rescore, stats`, `work` |
+| Trust tiers | Raw, curated, verified; verified only by a person who did not propose it; review clocks and decay | `promote`, `approve` |
+| The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced once verified, with scoped exceptions); admission, the read filter, the write scan and quarantine, blast-radius gates; every decision logged | `policy show, eval, list, lint`, `quarantine`, `taint` |
+| The librarian | A survey of what needs curation, an independent checker, contradiction hunting, canaries, its own telemetry and alarms, a cycle on a budget | `librarian`, `curate`, `check`, `canary` |
+| The egress | Model calls forwarded and metered, spend limits per destination, decision contexts recorded | `launch`, `usage`, `cost` |
+| Sources and replay | Transcripts kept in the record and reached by citation, swept on a clock; frozen-context replay on the recorded contexts | `transcript`, `replay` |
+| Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
+| Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without | `savings`, `golden`, `scripts/eval.py` |
+| Interchange | Bundles at or below a label, erasure with a stub and a receipt, taps as WASI components | `export`, `import`, `erase`, `tap` |
+| Traces | OpenTelemetry spans for model calls, reads, policy decisions and task transitions, to any OTLP collector | `OTEL_EXPORTER_OTLP_ENDPOINT` |
+
+From the command line:
 
 ```sh
 echo "Stopped at step 3. Next: digests." | amem write --kind handoff --title "Import, step 3"
@@ -158,25 +200,44 @@ amem search digests
 amem get mem-me-xxxxxxxx
 amem task create "Finish the import" --priority 5
 amem task admit task-me-xxxxxxxx
-amem task claim-next
-amem recall "how does the import retry?"          # the pack, synthesis owed to the caller
-amem recall "how does the import retry?" --provider anthropic   # the brief, a key or the gateway
-amem export ../bundle --max-label internal
-amem erase mem-me-xxxxxxxx --reason requested      # the owner only; a stub and a receipt remain
-amem tap install github-issues taps/target/wasm32-wasip2/release/tap_github_issues.wasm
-amem tap run github-issues --config '{"repo":"owner/name"}'
-amem                # the web launcher and the browser reader, opened in the browser
-amem doctor         # logins, keys, harnesses, backend and gateway, checked
-amem claude         # a profile: every harness is one, profiles.toml adds more
-amem reindex
-amem savings        # the paper's read-path claims, measured on this record
-amem golden golden/docs.toml   # recall scored on a question suite
+amem work --harness claude                 # claim the top task, run the harness on it
+amem recall "how does the import retry?" --provider anthropic
+amem curate --auth gateway --contradictions  # one curation cycle
+amem quarantine list
+amem taint mem-me-xxxxxxxx                 # where a bad entry may have reached
+amem replay <session> --model gemma4-26b   # the same decisions, another model
+amem cost                                  # spend per session and per completed task
+amem savings                               # the paper's read-path claims, measured
 ```
 
-`crates/memory/tests/cli.rs` runs the seven steps PLAN.md calls M0, end to end, against the
-built binary. `scripts/conformance.py` runs the same seven over MCP against any server
-exposing the surface, this one included (`make conformance`); a serving layer that passes
-it serves the harnesses this one serves.
+`crates/memory/tests/cli.rs` runs the paper's first milestone end to end against the
+built binary, and `scripts/conformance.py` runs the same steps over MCP against any
+server exposing the surface (`make conformance`): a serving layer that passes it serves
+the harnesses this one serves.
+
+## The demo
+
+`make demo-all HARNESS=claude` runs the whole demo in acts on one record, `DEMO_ROOT`,
+`~/memory-demo` by default, seeded from the Markdown directories in `DEMO_FROM`. The
+acts that need a model use `local/.virtual-key` on llm.apache.org, so they want the
+network; `ACTS="1 4"` runs a subset.
+
+1. **The read path.** A few hundred entries seeded, a harness working a real task from T0 and a handoff, and the savings measured.
+2. **Curation and the trust tiers.** A curation cycle, a librarian run whose rewrite lands curated, and a person approving an entry for verified.
+3. **The perimeter.** A write that speaks to agents held in quarantine, taint, policy as memory with a scoped exception, the read filter, and a spend limit refusing a call.
+4. **The task fabric.** The rubric compiled from a strategy, a rescore along the edges, and subagents filed on the board and continued.
+5. **Watching it.** Traces in a collector, the read metrics, drift probes, transcripts by citation, and replay.
+6. **The evaluation.** The same questions to a harness with memory and with an empty one, graded, timed and counted.
+7. **The limits.** The two lists at the top of this page, read from it.
+
+## Checks
+
+`make init` installs the pre-commit hook, which runs `make check`: formatting, clippy
+with `-D warnings`, the workspace's tests including the browser reader's under a Chrome
+from `CHROME` or Playwright's image, the conformance script's own test against a fake
+server with one defect switched on per run, the guard and docs-only scripts, unsafe-code and taps checks. `make verify` adds
+`cargo deny`, `machete`, coverage and the WebAssembly build. CI has not run since a
+billing failure, so the hook is the gate.
 
 ## Layout
 
@@ -185,24 +246,28 @@ it serves the harnesses this one serves.
 | `crates/core` | Entries, frontmatter, bundles, digests, labels. No I/O |
 | `crates/store` | The record over OpenDAL |
 | `crates/index` | SQLite FTS5 index, summaries first |
-| `crates/ledger` | Tasks, leases, origin dedup |
-| `crates/policy` | The grants file |
-| `crates/server` | The MCP surface |
-| `crates/client` | A typed MCP client for the ledger and the record; what the launcher's task mode and an orchestrator use |
+| `crates/ledger` | Tasks, leases, origin dedup, the rubric; SQLite and PostgreSQL |
+| `crates/policy` | The grants file, the Rego policy through regorus, the write scan and the gates |
+| `crates/server` | The MCP surface, prefetch, transcripts and contexts |
+| `crates/egress` | The way out: forwarding, metering, spend limits, recorded contexts |
+| `crates/sandbox` | Confinement in Linux namespaces |
+| `crates/client` | A typed MCP client for the ledger and the record, used by the launcher and an orchestrator |
+| `crates/otel` | OpenTelemetry traces over OTLP |
+| `crates/taps` | Taps as WASI components, with exactly the access their grant allows |
+| `crates/reader` | The core crate for the browser reader, compiled to WebAssembly |
+| `crates/web` | The web launcher: sessions in pseudo-terminals, a reading pane, the board |
 | `crates/wslc-api` | The WSL containers C API, bound by hand, Windows only |
-| `crates/web` | The web terminal: sessions in pseudo-terminals, a reading pane over the record |
-| `crates/memory` | The binary, `amem` |
-| `images/harness` | The harness image: seven harnesses, Node, Python, and `memory`, pinned |
-| `docs/` | The paper, its case study, the stack |
+| `crates/memory` | The binary, `amem`: the launcher, the librarian, the CLI |
+| `taps/` | The GitHub issues and comments taps |
+| `probes/drift.toml` | The pinned vendor-drift probe set |
+| `images/harness` | The harness image: the harnesses, Node, Python and `amem`, pinned |
+| `scripts/` | The demo and its acts, the evaluation, conformance |
+| `docs/` | The paper, the reference stack, the design book, seeding a foundation |
 
 ## Status
 
-M0 code complete as of 2 October 2026, plus the confined launcher: Claude Code, Codex,
-Gemini CLI, Copilot CLI and OpenCode run in native Linux namespaces with the memory
-server attached over MCP and model calls forwarded and metered through the egress, on
-your own logins or on keys the egress holds. First cuts landed 3 and 4 October: `recall`
-in two tiers with a golden suite; erasure with a stub and a receipt; taps as WASI
-components, GitHub issues in and handoffs posted back as comments; the browser reader
-over an exported bundle, searched with the server's own index compiled to WebAssembly;
-and the projection, the record as read-only files beside the working tree with a
-pre-read hook that makes every open a `get`. See [PLAN.md](PLAN.md).
+As of 11 October 2026, the paper's contracts are built and exercised end to end on one
+laptop, every part live against real harnesses on the Foundation's gateway and a Claude
+login: the list in the first section above is what is not, and the list after it is what
+works only at demo scale. [PLAN.md](PLAN.md) holds the decisions and the register, and
+the order production backends go in.

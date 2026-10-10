@@ -434,6 +434,34 @@ metered; over a limit the call does not leave, refused as a permission error wit
 reason, which a harness does not retry, and the refusal is a logged decision. Listing a
 destination's models is not a model call and is not limited.
 
+## Cost: `prices.toml` and `amem cost`
+
+Every model call the egress meters records its billing. A call is metered when it went
+out on a key or a gateway the launcher holds, and plan when it ran on the harness's own
+login: a destination that passes the harness's credential through, a tunnel, or a
+harness's own usage report. Plan calls cost quota, not money, so they are counted in
+tokens and never priced.
+
+`prices.toml` under the root, written as a template by `amem init`, prices each model in
+US dollars per million tokens, with input, output, cache reads and cache writes apart:
+
+```toml
+[models."qwen3.8-27b"]
+input = 0.20
+output = 0.60
+cache_read = 0.05
+cache_write = 0.25
+```
+
+A model is matched by its exact name, or else by the longest name in the table it starts
+with, so `claude-sonnet-5` prices every dated release of it. `amem cost` lists each
+session's metered spend on priced models, with unpriced models and plan quota beside it
+in tokens, and each completed task's cost: the session that wrote the task's closing
+handoff, shared among the tasks that session completed. A task marked `+` was completed
+by a session that also spent on models the table does not name, so its figure is a
+floor. `--json` gives the same report for a script. Nothing is guessed: a model the
+table does not name stays unpriced until the owner prices it.
+
 ## Replay: `amem replay`, on decision contexts the egress records
 
 The egress is in the path of every metered model call, so it keeps each one's
