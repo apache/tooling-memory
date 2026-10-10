@@ -2342,7 +2342,13 @@ async fn replay_cmd(
     let model = model::resolve(&p.egress, &p.provider, model.as_deref()).await;
     // the decision contexts are read as the owner; the calls go through the egress
     let owner = Memory::open(root)?.without_read_log();
-    let run = replay::replay(&p.egress, &owner, session, &p.provider, &model, turn, limit).await?;
+    // the egress's record when the session has one; its transcript otherwise
+    let recorded = owner.contexts(session).await.is_ok_and(|c| !c.is_empty());
+    let run = if recorded {
+        replay::replay_contexts(&p.egress, &owner, session, &model, turn, limit).await?
+    } else {
+        replay::replay(&p.egress, &owner, session, &p.provider, &model, turn, limit).await?
+    };
     json(&run)
 }
 

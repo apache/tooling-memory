@@ -35,6 +35,7 @@ use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
 pub mod bundle;
+pub mod contexts;
 pub mod fabric;
 pub mod mcp;
 pub mod prefetch;
@@ -235,6 +236,8 @@ pub struct Memory {
     /// What this session may read, as the policy computed it once and the index applies
     /// inside every query.
     scope: OnceLock<ReadFilter>,
+    /// How many decision contexts this session has kept.
+    contexts_kept: AtomicUsize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -355,6 +358,7 @@ impl Memory {
             held: OnceLock::new(),
             superseded: AtomicUsize::new(0),
             scope: OnceLock::new(),
+            contexts_kept: AtomicUsize::new(0),
         })
     }
 
@@ -1968,9 +1972,10 @@ impl Memory {
             stub.front.domain.clone_from(&domain);
             stub.front.id = id.to_string();
             // the record's versions, and the transcript turns it kept as excerpts
-            receipt
-                .removed
-                .extend(self.erase_with_excerpts(&domain, id, &stub).await?);
+            receipt.removed.extend(
+                self.erase_with_excerpts(&domain, id, &stub, &entry.body)
+                    .await?,
+            );
         }
         let stub = self
             .store
@@ -3130,6 +3135,50 @@ mod tests {
             .unwrap();
         let st = owner.task_stats(None).await.unwrap();
         assert_eq!(st["inflated_by_creator"]["agent:a"], 1, "{st}");
+    }
+
+    #[tokio::test]
+    async fn contexts_are_the_owners_and_go_with_an_erased_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let gone = owner
+            .write(req(
+                "The demo passphrase is kestrel-91, written here in error.\n",
+            ))
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let body = serde_json::json!({ "messages": [{ "role": "user", "content": "The demo passphrase is kestrel-91, written here in error." }] });
+        agent
+            .keep_context(
+                "llmao",
+                "v1/chat/completions",
+                body.to_string().as_bytes(),
+                b"{}",
+            )
+            .await
+            .unwrap();
+        agent
+            .keep_context("llmao", "v1/chat/completions", br#"{"messages":[]}"#, b"{}")
+            .await
+            .unwrap();
+        assert!(
+            agent.contexts(agent.session_id()).await.is_err(),
+            "an agent does not read them"
+        );
+        assert_eq!(owner.contexts(agent.session_id()).await.unwrap().len(), 2);
+        let receipt = owner.erase(&gone, Reason::Mistaken).await.unwrap();
+        assert!(
+            receipt
+                .removed
+                .iter()
+                .any(|r| r.version.starts_with("decision context")),
+            "{:?}",
+            receipt.removed
+        );
+        let left = owner.contexts(agent.session_id()).await.unwrap();
+        assert_eq!(left.len(), 1, "only the context that carried the body went");
     }
 
     #[tokio::test]

@@ -335,6 +335,17 @@ impl Egress {
             status,
             &usage,
         );
+        if (200..300).contains(&status) {
+            let _ = inner
+                .memory
+                .keep_context(
+                    destination,
+                    &rest,
+                    body.to_string().as_bytes(),
+                    text.as_bytes(),
+                )
+                .await;
+        }
         if !(200..300).contains(&status) {
             return Err(Error::Upstream(format!(
                 "{destination} answered {status}: {text}"
@@ -783,7 +794,8 @@ async fn shaped(
     let cap = dest.max_output_tokens.filter(|_| {
         path.ends_with("messages") || path.ends_with("responses") || path.ends_with("completions")
     });
-    if req.method() != Method::POST || (!fold && !fold_responses && cap.is_none()) {
+    // every POST is buffered: its body is the decision context the egress keeps
+    if req.method() != Method::POST {
         return Ok((req, None));
     }
     let (parts, body) = req.into_parts();
@@ -873,6 +885,7 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
         Ok(pair) => pair,
         Err(refusal) => return *refusal,
     };
+    let sent = replaced.clone();
     let builder = upstream_request(inner, &dest, &rest, req, replaced);
     let started = std::time::SystemTime::now();
     let upstream = match builder.send().await {
@@ -920,9 +933,15 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
     let body_stream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
+    let (body_stream, tapped) = tap(body_stream);
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<Usage>>();
     let stream = usage_tail(body_stream, content_type.as_deref(), tx);
-    record_when_done(egress.clone(), started, destination, status, rx);
+    let context = Sent {
+        path: rest,
+        request: sent,
+        response: tapped,
+    };
+    record_when_done(egress.clone(), started, destination, status, rx, context);
 
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -934,12 +953,46 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
 /// that reported usage is recorded as such; a call the upstream refused is recorded by
 /// its status, so a refused key or an expired login shows up in `memory usage` rather
 /// than vanishing; anything else, a listing say, is not a model call.
+/// A copy of a response as it streams through, up to a cap, for its decision context.
+fn tap<S>(
+    stream: S,
+) -> (
+    impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    Arc<std::sync::Mutex<Vec<u8>>>,
+)
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    let tapped = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let copy = tapped.clone();
+    let stream = stream.map(move |chunk| {
+        if let Ok(bytes) = &chunk {
+            let mut t = copy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if t.len() < dm_server::contexts::MAX_BYTES {
+                t.extend_from_slice(bytes);
+            }
+        }
+        chunk
+    });
+    (stream, tapped)
+}
+
+/// What a proxied model call sent and got back, for its decision context.
+struct Sent {
+    path: String,
+    request: Option<Bytes>,
+    response: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
 fn record_when_done(
     egress: Egress,
     started: std::time::SystemTime,
     destination: String,
     status: StatusCode,
     rx: tokio::sync::oneshot::Receiver<Option<Usage>>,
+    sent: Sent,
 ) {
     let status_code = status.as_u16();
     tokio::spawn(async move {
@@ -960,6 +1013,18 @@ fn record_when_done(
             &usage,
         ) {
             eprintln!("egress: telemetry: {e}");
+        }
+        // a model call that answered: its context is kept, as the egress saw it
+        if let (true, Some(request)) = (status.is_success(), &sent.request) {
+            let response = sent
+                .response
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let _ = inner
+                .memory
+                .keep_context(&destination, &sent.path, request, &response)
+                .await;
         }
     });
 }
@@ -1209,6 +1274,63 @@ mod tests {
             log.contains("\"action\":\"spend\"") && log.contains("\"allow\":false"),
             "{log}"
         );
+    }
+
+    #[tokio::test]
+    async fn every_model_call_leaves_its_decision_context() {
+        let fake = Router::new().route(
+            "/v1/chat/completions",
+            any(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"model":"m","choices":[{"message":{"tool_calls":[{"function":{"name":"search","arguments":"{}"}}]}}],"usage":{"prompt_tokens":40,"completion_tokens":2}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let (_d, e) = fixture(Some((
+            "openai",
+            Destination::forward(format!("http://{addr}"), Auth::PassThrough),
+        )))
+        .await;
+        let ask = serde_json::json!({ "model": "m", "messages": [{ "role": "user", "content": "find the retry policy" }] });
+        e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        let r = e
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(ask.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        let _ = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        // the proxied call's context is kept when its stream has ended
+        let m = e.inner.memory.clone();
+        let mut kept = Vec::new();
+        for _ in 0..50 {
+            kept = m.contexts(m.session_id()).await.unwrap_or_default();
+            if kept.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(kept.len(), 2, "both calls kept");
+        for c in &kept {
+            assert_eq!(c.request, ask, "the request exactly as it left");
+            assert_eq!(
+                c.tools,
+                vec!["search".to_string()],
+                "the tool the model asked for"
+            );
+            assert_eq!(c.destination, "openai");
+        }
     }
 
     #[test]

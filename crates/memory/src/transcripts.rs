@@ -71,7 +71,12 @@ pub async fn cmd(m: &Memory, op: TranscriptOp) -> Fallible {
 ///
 /// A store error.
 pub async fn sweep(m: &Memory) -> Result<Vec<Swept>, Box<dyn std::error::Error>> {
-    let swept = m.sweep_transcripts(time::OffsetDateTime::now_utc()).await?;
+    let now = time::OffsetDateTime::now_utc();
+    let swept = m.sweep_transcripts(now).await?;
+    // decision contexts run on the same clock, and go whole: no entry cites them
+    for session in m.sweep_contexts(now).await? {
+        eprintln!("memory: decision contexts of {session} expired and were dropped");
+    }
     for s in &swept {
         eprintln!(
             "memory: transcript {} expired: {} turns kept as {} excerpts, {} dropped",

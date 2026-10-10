@@ -978,8 +978,18 @@ impl Memory {
         domain: &str,
         id: &str,
         stub: &Entry,
+        body: &str,
     ) -> Result<Vec<Removed>, Error> {
-        let removed = self.erase_excerpts(domain, id).await?;
+        let mut removed = self.erase_excerpts(domain, id).await?;
+        // the decision contexts that carried the body: what a model was sent must not
+        // keep what the record no longer holds
+        for c in self.erase_from_contexts(body).await? {
+            removed.push(Removed {
+                version: format!("decision context {c}"),
+                digest: digest(body),
+                body_digest: Some(erasure::body_digest(body)),
+            });
+        }
         self.store.erase(domain, id, stub).await?;
         Ok(removed)
     }

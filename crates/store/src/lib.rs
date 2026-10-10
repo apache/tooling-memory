@@ -42,6 +42,7 @@ const HISTORY: &str = ".history";
 const ERASURES: &str = ".erasures";
 const TRANSCRIPTS: &str = ".transcripts";
 const EXCERPTS: &str = ".excerpts";
+const CONTEXTS: &str = ".contexts";
 const STAMP: &[FormatItem<'_>] =
     format_description!("[year][month][day]T[hour][minute][second].[subsecond digits:6]Z");
 
@@ -104,6 +105,9 @@ pub enum Area {
     Transcripts,
     /// Excerpts of transcripts, one directory per entry that keeps them.
     Excerpts,
+    /// Decision contexts: what each model call of a session was sent and returned, as
+    /// the egress saw it; one directory per session.
+    Contexts,
 }
 
 impl Area {
@@ -111,6 +115,7 @@ impl Area {
         match self {
             Area::Transcripts => TRANSCRIPTS,
             Area::Excerpts => EXCERPTS,
+            Area::Contexts => CONTEXTS,
         }
     }
 }

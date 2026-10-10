@@ -1,11 +1,16 @@
 //! Frozen-context replay, the paper's cheapest mode: the exact recorded context at a
 //! logged decision point is presented again, to the model that made it or another, and
 //! the next action is scored against the one recorded. Pointwise decision quality; a
-//! regression between models; the confirmation step for vendor drift. The decision
-//! contexts here are the turns of a kept transcript before the decision, so replay
-//! runs while a transcript is live, and is the owner's: it reads whole what no agent
-//! may. Every run is a line in `state/replay/<session>.jsonl`, pinned by a digest of
-//! the context and the prompt, so two runs compare like for like.
+//! regression between models; the confirmation step for vendor drift.
+//!
+//! The decision contexts are the egress's: each model call a session made, the request
+//! exactly as it left and the response as it came back, which the agent cannot shape.
+//! Replay sends the recorded request again to the same destination and path with only
+//! the model changed, and compares the tools the candidate asks for with the tools the
+//! upstream returned. A session from before contexts were kept falls back to its
+//! transcript, the harness's own account, and the run says which it used. Replay is the
+//! owner's, and every run is a line in `state/replay/<session>.jsonl`, pinned by a
+//! digest of the contexts and the prompt, so two runs compare like for like.
 
 use dm_egress::Egress;
 use dm_server::transcripts::Turn;
@@ -37,6 +42,8 @@ pub struct Point {
 /// A replay run.
 #[derive(Clone, Debug, Serialize)]
 pub struct Run {
+    /// `contexts`, the egress's record; or `transcript`, the harness's own account.
+    pub source: String,
     pub at: String,
     pub session: String,
     pub destination: String,
@@ -183,6 +190,7 @@ pub async fn replay(
         scored.iter().filter(|p| p.agrees).count() as f64 / scored.len() as f64
     };
     let run = Run {
+        source: "transcript".into(),
         at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
@@ -194,6 +202,13 @@ pub async fn replay(
         points: scored,
         agreement,
     };
+    log(memory, &run)?;
+    Ok(run)
+}
+
+/// Keep a run's line.
+fn log(memory: &Memory, run: &Run) -> Result<(), Box<dyn std::error::Error>> {
+    let session = &run.session;
     let dir = memory.root().join("state/replay");
     std::fs::create_dir_all(&dir)?;
     let line = serde_json::to_string(&run)? + "\n";
@@ -204,6 +219,95 @@ pub async fn replay(
             .open(dir.join(format!("{session}.jsonl")))?,
         line.as_bytes(),
     )?;
+    Ok(())
+}
+
+/// A recorded request made ready to send again: the candidate's model, and the whole
+/// answer at once rather than streamed. Nothing else changes: the context is exact.
+#[must_use]
+pub fn resend(request: &Value, model: &str) -> Value {
+    let mut body = request.clone();
+    if let Some(o) = body.as_object_mut() {
+        o.insert("model".into(), json!(model));
+        o.insert("stream".into(), json!(false));
+        o.remove("stream_options");
+    }
+    body
+}
+
+/// Replay a session's recorded decision contexts, up to `limit`, or only the call
+/// numbered `turn`, on `model` at the destination each was sent to, and log the run.
+///
+/// # Errors
+///
+/// When the contexts cannot be read, the model cannot be reached, or the log cannot be
+/// written.
+pub async fn replay_contexts(
+    egress: &Egress,
+    memory: &Memory,
+    session: &str,
+    model: &str,
+    turn: Option<usize>,
+    limit: usize,
+) -> Result<Run, Box<dyn std::error::Error>> {
+    let contexts = memory.contexts(session).await?;
+    let mut points = Vec::new();
+    let mut destination = String::new();
+    for c in contexts
+        .iter()
+        .filter(|c| !c.request.is_null() && turn.is_none_or(|n| c.n == n))
+        .take(limit)
+    {
+        destination.clone_from(&c.destination);
+        let answer = egress
+            .call(&c.destination, &c.path, &resend(&c.request, model))
+            .await?;
+        let replayed_tools = dm_server::contexts::tools_in(&answer.to_string());
+        let recorded_tool = c.tools.first().map(|t| short(t));
+        let replayed_tool = replayed_tools.first().map(|t| short(t));
+        let text = crate::model::answer_text(&c.destination, &answer);
+        let overlap = (recorded_tool.is_none() && replayed_tool.is_none())
+            .then(|| overlap(&c.response, &text));
+        let agrees = match (&recorded_tool, &replayed_tool) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => overlap.unwrap_or(0.0) >= 1.0 / 3.0,
+            _ => false,
+        };
+        let shown = if text.trim().is_empty() {
+            replayed_tools.join(", ")
+        } else {
+            text
+        };
+        points.push(Point {
+            turn: c.n,
+            recorded_tool,
+            replayed_tool,
+            overlap,
+            agrees,
+            replayed: shown.chars().take(160).collect(),
+        });
+    }
+    #[allow(clippy::cast_precision_loss)] // counts of points
+    let agreement = if points.is_empty() {
+        0.0
+    } else {
+        points.iter().filter(|p| p.agrees).count() as f64 / points.len() as f64
+    };
+    let pinned: Vec<&Value> = contexts.iter().map(|c| &c.request).collect();
+    let run = Run {
+        source: "contexts".into(),
+        at: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        session: session.to_string(),
+        destination,
+        model: model.to_string(),
+        context_digest: dm_core::digest(&serde_json::to_string(&pinned)?)[..16].to_string(),
+        prompt_digest: "exact".into(),
+        points,
+        agreement,
+    };
+    log(memory, &run)?;
     Ok(run)
 }
 
