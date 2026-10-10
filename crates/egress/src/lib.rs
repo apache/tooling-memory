@@ -306,6 +306,7 @@ impl Egress {
             .body(Body::from(body.to_string()))
             .map_err(|e| Error::Upstream(e.to_string()))?;
         let rest = path.trim_start_matches('/').to_string();
+        let started = std::time::SystemTime::now();
         let resp = upstream_request(inner, &dest, &rest, req, None)
             .send()
             .await
@@ -321,9 +322,13 @@ impl Egress {
             model: Some(format!("http {status}")),
             ..Usage::default()
         });
-        let _ = inner
-            .telemetry
-            .record(inner.memory.session_id(), destination, status, &usage);
+        let _ = inner.telemetry.record(
+            started,
+            inner.memory.session_id(),
+            destination,
+            status,
+            &usage,
+        );
         if !(200..300).contains(&status) {
             return Err(Error::Upstream(format!(
                 "{destination} answered {status}: {text}"
@@ -586,6 +591,7 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
     let on_upgrade = hyper::upgrade::on(&mut req);
     let name = name.clone();
     let session = inner.memory.session_id().to_string();
+    let started = std::time::SystemTime::now();
     tokio::spawn(async move {
         let Ok(upgraded) = on_upgrade.await else {
             return;
@@ -596,6 +602,7 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
         let mut inbound = hyper_util::rt::TokioIo::new(upgraded);
         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
         let _ = inner.telemetry.record(
+            started,
             &session,
             &name,
             200,
@@ -835,6 +842,7 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
         Err(refusal) => return *refusal,
     };
     let builder = upstream_request(inner, &dest, &rest, req, replaced);
+    let started = std::time::SystemTime::now();
     let upstream = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
@@ -877,18 +885,32 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let egress2 = egress.clone();
-    let session = inner.memory.session_id().to_string();
-    let status_code = status.as_u16();
     let body_stream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<Usage>>();
     let stream = usage_tail(body_stream, content_type.as_deref(), tx);
+    record_when_done(egress.clone(), started, destination, status, rx);
+
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    *response.headers_mut() = resp_headers;
+    response
+}
+
+/// Record the call once its usage is known, when the body has streamed through. A call
+/// that reported usage is recorded as such; a call the upstream refused is recorded by
+/// its status, so a refused key or an expired login shows up in `memory usage` rather
+/// than vanishing; anything else, a listing say, is not a model call.
+fn record_when_done(
+    egress: Egress,
+    started: std::time::SystemTime,
+    destination: String,
+    status: StatusCode,
+    rx: tokio::sync::oneshot::Receiver<Option<Usage>>,
+) {
+    let status_code = status.as_u16();
     tokio::spawn(async move {
-        // a call that reported usage is recorded as such; a call the upstream refused is
-        // recorded by its status, so a refused key or an expired login shows up in
-        // `memory usage` rather than vanishing
         let usage = match rx.await {
             Ok(Some(u)) => u,
             Ok(None) if !status.is_success() => Usage {
@@ -897,19 +919,17 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
             },
             _ => return,
         };
-        if let Err(e) = egress2
-            .inner
-            .telemetry
-            .record(&session, &destination, status_code, &usage)
-        {
+        let inner = &egress.inner;
+        if let Err(e) = inner.telemetry.record(
+            started,
+            inner.memory.session_id(),
+            &destination,
+            status_code,
+            &usage,
+        ) {
             eprintln!("egress: telemetry: {e}");
         }
     });
-
-    let mut response = Response::new(Body::from_stream(stream));
-    *response.status_mut() = status;
-    *response.headers_mut() = resp_headers;
-    response
 }
 
 /// Wrap a byte stream so that the chunks are also fed to a sniffer, and when the stream

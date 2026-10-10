@@ -1103,6 +1103,9 @@ fn main() {
         }
         std::process::exit(0);
     }
+    // Traces, when a collector is named; the guard flushes at exit. After the relay
+    // and the hook: neither runs a runtime, and the relay may not have a second thread.
+    let _otel = dm_otel::init("amem");
     let cli = match parse_with_profiles(args) {
         Ok(cli) => cli,
         Err(e) => {

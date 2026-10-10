@@ -9,6 +9,7 @@ repository.workspace = true
 dm-core = { version = "0.1.0", path = "../core" }
 dm-index = { version = "0.1.0", path = "../index" }
 dm-ledger = { version = "0.1.0", path = "../ledger" }
+dm-otel = { version = "0.1.0", path = "../otel" }
 dm-policy = { version = "0.1.0", path = "../policy" }
 dm-store = { version = "0.1.0", path = "../store" }
 rmcp = { version = "3.5.0", features = ["server", "transport-io", "macros"] }
@@ -22,6 +23,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io
 workspace = true
 
 [dev-dependencies]
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 # a paused clock, for asserting a timeout exactly rather than by a margin
 tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

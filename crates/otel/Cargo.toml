@@ -1,0 +1,27 @@
+[package]
+name = "dm-otel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenTelemetry traces from the memory binary: a facade over the OTLP exporter"
+
+[dependencies]
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+# the same TLS choices as the egress, so one rustls with one provider serves both
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "rustls-native-certs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+axum = "0.8"
+bytes = "1.12.1"
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace"] }
+prost = "0.14"
+tokio = { workspace = true, features = ["macros", "net"] }

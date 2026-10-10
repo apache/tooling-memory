@@ -6,6 +6,7 @@ use crate::usage::Usage;
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::SystemTime;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -132,19 +133,27 @@ impl Telemetry {
         })
     }
 
-    /// Record one call.
+    /// Record one call that started at `started`.
     ///
     /// # Errors
     ///
     /// A database error.
     pub fn record(
         &self,
+        started: SystemTime,
         session: &str,
         destination: &str,
         status: u16,
         usage: &Usage,
     ) -> Result<(), Error> {
-        self.insert(session, destination, status, usage, SOURCE_EGRESS)
+        self.insert(
+            Some(started),
+            session,
+            destination,
+            status,
+            usage,
+            SOURCE_EGRESS,
+        )
     }
 
     /// Record what a harness reported about itself: usage read from its transcript
@@ -159,11 +168,12 @@ impl Telemetry {
         destination: &str,
         usage: &Usage,
     ) -> Result<(), Error> {
-        self.insert(session, destination, 0, usage, SOURCE_HARNESS)
+        self.insert(None, session, destination, 0, usage, SOURCE_HARNESS)
     }
 
     fn insert(
         &self,
+        started: Option<SystemTime>,
         session: &str,
         destination: &str,
         status: u16,
@@ -189,6 +199,7 @@ impl Telemetry {
                 source,
             ],
         )?;
+        trace(started, session, destination, status, usage, source);
         Ok(())
     }
 
@@ -287,6 +298,40 @@ impl Telemetry {
     }
 }
 
+/// The row as a span for a collector: from the request's start when there was a request,
+/// an instant for a count the harness reported.
+fn trace(
+    started: Option<SystemTime>,
+    session: &str,
+    destination: &str,
+    status: u16,
+    usage: &Usage,
+    source: &str,
+) {
+    if !dm_otel::enabled() {
+        return;
+    }
+    let mut attrs: Vec<(&str, dm_otel::Value<'_>)> = vec![
+        ("memory.session", session.into()),
+        ("egress.destination", destination.into()),
+        ("gen_ai.usage.input_tokens", usage.input_tokens.into()),
+        ("gen_ai.usage.output_tokens", usage.output_tokens.into()),
+        ("memory.cache_read_tokens", usage.cache_read_tokens.into()),
+        ("memory.cache_write_tokens", usage.cache_write_tokens.into()),
+        ("memory.source", source.into()),
+    ];
+    if let Some(model) = &usage.model {
+        attrs.push(("gen_ai.request.model", model.as_str().into()));
+    }
+    if status != 0 {
+        attrs.push(("http.response.status_code", i64::from(status).into()));
+    }
+    match started {
+        Some(at) => dm_otel::span_since(at, "model.call", &attrs).end(),
+        None => dm_otel::event("model.call", &attrs),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,9 +346,12 @@ mod tests {
             cache_read_tokens: 2,
             cache_write_tokens: 0,
         };
-        t.record("s1", "anthropic", 200, &u).unwrap();
-        t.record("s1", "anthropic", 200, &u).unwrap();
+        t.record(SystemTime::now(), "s1", "anthropic", 200, &u)
+            .unwrap();
+        t.record(SystemTime::now(), "s1", "anthropic", 200, &u)
+            .unwrap();
         t.record(
+            SystemTime::now(),
             "s2",
             "openai",
             200,
@@ -335,5 +383,72 @@ mod tests {
         assert_eq!(t.session("s3").unwrap(), None, "no calls yet");
         let all = t.by_session().unwrap();
         assert_eq!(all.iter().find(|x| x.session == "s1"), Some(&one));
+    }
+
+    #[test]
+    fn calls_are_traced_beside_their_rows() {
+        use opentelemetry::Value;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use std::time::{Duration, SystemTime};
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let _guard = dm_otel::install(provider);
+        let t = Telemetry::in_memory().unwrap();
+        let u = Usage {
+            model: Some("claude-x".into()),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 2,
+            cache_write_tokens: 1,
+        };
+        let started = SystemTime::now() - Duration::from_millis(20);
+        t.record(started, "sess-traced", "anthropic", 200, &u)
+            .unwrap();
+        t.record_reported("sess-traced", "anthropic", &u).unwrap();
+        let spans: Vec<_> = exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .filter(|s| {
+                s.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "memory.session" && kv.value.as_str() == "sess-traced"
+                })
+            })
+            .collect();
+        assert_eq!(spans.len(), 2, "one span per row");
+        let attr = |i: usize, k: &str| {
+            spans[i]
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == k)
+                .map(|kv| kv.value.clone())
+        };
+        assert!(spans.iter().all(|s| s.name == "model.call"));
+        assert_eq!(
+            spans[0].start_time, started,
+            "the span starts with the request"
+        );
+        assert_eq!(
+            attr(0, "egress.destination"),
+            Some(Value::from("anthropic"))
+        );
+        assert_eq!(
+            attr(0, "gen_ai.request.model"),
+            Some(Value::from("claude-x"))
+        );
+        assert_eq!(attr(0, "http.response.status_code"), Some(Value::I64(200)));
+        assert_eq!(attr(0, "gen_ai.usage.input_tokens"), Some(Value::I64(10)));
+        assert_eq!(attr(0, "gen_ai.usage.output_tokens"), Some(Value::I64(5)));
+        assert_eq!(attr(0, "memory.cache_read_tokens"), Some(Value::I64(2)));
+        assert_eq!(attr(0, "memory.cache_write_tokens"), Some(Value::I64(1)));
+        assert_eq!(attr(0, "memory.source"), Some(Value::from("egress")));
+        assert_eq!(attr(1, "memory.source"), Some(Value::from("harness")));
+        assert_eq!(
+            attr(1, "http.response.status_code"),
+            None,
+            "the harness's count has no response"
+        );
     }
 }

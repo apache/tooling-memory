@@ -10,6 +10,7 @@ repository.workspace = true
 axum = "0.8"
 bytes = "1.12.1"
 dm-core = { version = "0.1.0", path = "../core" }
+dm-otel = { version = "0.1.0", path = "../otel" }
 dm-server = { version = "0.1.0", path = "../server" }
 futures-util = "0.3.34"
 hyper = { version = "1", features = ["client", "http1"] }
@@ -27,5 +28,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 workspace = true
 
 [dev-dependencies]
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }

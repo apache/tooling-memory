@@ -197,6 +197,7 @@ mod tests {
         let p = dir.path().join("s.json");
         let t = Telemetry::open(&dir.path().join("t.db")).unwrap();
         t.record(
+            std::time::SystemTime::now(),
             m.session_id(),
             "llmao",
             200,

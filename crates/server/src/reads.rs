@@ -192,6 +192,7 @@ impl ReadLog {
             ids: ids.to_vec(),
             via: via.map(str::to_string),
         };
+        trace(&read);
         let _g = self
             .lock
             .lock()
@@ -243,6 +244,28 @@ impl ReadLog {
     }
 }
 
+/// The same read as a span for a collector: an instant, since a read is answered whole.
+fn trace(read: &Read) {
+    if !dm_otel::enabled() {
+        return;
+    }
+    let mut attrs: Vec<(&str, dm_otel::Value<'_>)> = vec![
+        ("memory.session", read.session.as_str().into()),
+        ("memory.tool", read.tool.as_str().into()),
+        ("memory.hits", read.hits.into()),
+        ("memory.tokens", read.tokens.into()),
+        ("memory.cached", read.cached.into()),
+        ("memory.ids", read.ids.join(",").into()),
+    ];
+    if let Some(q) = &read.query {
+        attrs.push(("memory.query", q.as_str().into()));
+    }
+    if let Some(v) = &read.via {
+        attrs.push(("memory.via", v.as_str().into()));
+    }
+    dm_otel::event("memory.read", &attrs);
+}
+
 /// What a page of hits costs the reader: id, title, summary and a little metadata each.
 #[must_use]
 pub fn hits_tokens(hits: &[Hit]) -> usize {
@@ -284,5 +307,55 @@ mod tests {
         assert_eq!(reads[0].tokens, 6 + 2);
         assert_eq!(reads[1].query.as_deref(), Some("import"));
         assert_eq!(reads[1].session, "sess-1");
+    }
+
+    #[test]
+    fn reads_are_traced_while_the_log_is_enabled() {
+        use opentelemetry::Value;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let _guard = dm_otel::install(provider);
+        let dir = tempfile::tempdir().unwrap();
+        let log = ReadLog::new(dir.path(), "sess-traced");
+        log.served_ids(
+            "search",
+            Some("import"),
+            2,
+            90,
+            false,
+            Some("brief"),
+            &["mem-a".to_string(), "mem-b".to_string()],
+        );
+        log.disable();
+        log.text("t0", "not a session's read");
+        let spans: Vec<_> = exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .filter(|s| {
+                s.attributes.iter().any(|kv| {
+                    kv.key.as_str() == "memory.session" && kv.value.as_str() == "sess-traced"
+                })
+            })
+            .collect();
+        assert_eq!(spans.len(), 1, "one read traced; the disabled log's is not");
+        let s = &spans[0];
+        assert_eq!(s.name, "memory.read");
+        let attr = |k: &str| {
+            s.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == k)
+                .map(|kv| kv.value.clone())
+        };
+        assert_eq!(attr("memory.tool"), Some(Value::from("search")));
+        assert_eq!(attr("memory.query"), Some(Value::from("import")));
+        assert_eq!(attr("memory.hits"), Some(Value::I64(2)));
+        assert_eq!(attr("memory.tokens"), Some(Value::I64(90)));
+        assert_eq!(attr("memory.cached"), Some(Value::Bool(false)));
+        assert_eq!(attr("memory.via"), Some(Value::from("brief")));
+        assert_eq!(attr("memory.ids"), Some(Value::from("mem-a,mem-b")));
     }
 }
