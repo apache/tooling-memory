@@ -423,6 +423,19 @@ took its excerpts with it. Agents follow a citation with the `transcript_turn` M
 under the same rule. Not yet: excerpts on import, and the copy the harness keeps in its
 own home.
 
+A turn keeps why as well as what. The reasoning before an assistant turn is folded into
+it, as `[reasoning] ...` where the provider returned it, `[reasoning] (summarised) ...`
+where it returned a summary, and `[reasoning withheld by the provider]` where it returned
+a signature alone, so a decision with nothing before it is never mistaken for one made
+without thought. Reasoning adds no turn of its own, so a citation's turn number is the
+same with it as without it. The launcher asks for what it can get: Claude Code with
+`showThinkingSummaries` in its settings and `--thinking-display summarized` headless,
+since in print mode it otherwise omits its thinking and leaves a bare "Thinking" before
+each decision; Codex with `show_raw_agent_reasoning`, which keeps the raw reasoning an
+open model on the gateway returns. A provider that withholds its reasoning entirely is
+covered by the work prompt, which asks the agent to say in one plain sentence why before
+each decision that changes something, and to say why in its handoff.
+
 ## Spend limits: `[spend]` in grants.toml
 
 Spend limits per resource class sit in the perimeter, as the paper has them: in

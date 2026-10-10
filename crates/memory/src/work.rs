@@ -450,7 +450,10 @@ async fn prompt_for(
     let mut p = String::new();
     p.push_str(
         "You are working one task from a shared task ledger, reached through the `memory` MCP server. \
-         The launcher holds the lease and renews it for you; do not call `heartbeat`.\n\n",
+         The launcher holds the lease and renews it for you; do not call `heartbeat`. \
+         Your transcript is kept as a source, and your provider may keep your reasoning out of it, \
+         so before each decision that changes something, choosing between entries, writing, \
+         completing or releasing, say in one plain sentence why.\n\n",
     );
     p.push_str(&format!(
         "# Task {}: {}\n\n{}\n",
@@ -500,8 +503,8 @@ async fn prompt_for(
     let t0 = client.t0(Some(&task.domain)).await?;
     p.push_str(&format!("\n# T0 for {}\n\n{}\n", task.domain, t0.trim()));
     p.push_str(&format!(
-        "\n# When you stop\n\nWrite a `handoff` entry with the `write` tool (entry_type handoff): what you did, \
-         what is left, where to look. Then call `complete` with task id `{id}` and the handoff's id. \
+        "\n# When you stop\n\nWrite a `handoff` entry with the `write` tool (entry_type handoff): what you did \
+         and why, what is left, where to look. Then call `complete` with task id `{id}` and the handoff's id. \
          If you cannot finish, still write the handoff and stop; do not call `complete`, and the task \
          returns to the pool with your handoff attached.\n",
         id = task.id

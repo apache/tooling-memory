@@ -152,7 +152,15 @@ impl Harness {
     pub fn headless(self, prompt: &str) -> Vec<String> {
         let p = prompt.to_string();
         match self {
-            Harness::Claude => vec!["-p".into(), p, "--dangerously-skip-permissions".into()],
+            // headless, Claude Code omits its thinking unless asked, which leaves a bare
+            // "Thinking" in the transcript before each decision; summaries say why
+            Harness::Claude => vec![
+                "-p".into(),
+                p,
+                "--dangerously-skip-permissions".into(),
+                "--thinking-display".into(),
+                "summarized".into(),
+            ],
             // codex exec cannot ask, and refuses an MCP tool call that would need
             // approval; its own gate and sandbox are bypassed, since ours is the boundary
             Harness::Codex => vec![
@@ -854,6 +862,7 @@ fn setup_claude(
     write(&req.home.join(".claude-mcp.json"), &mcp.to_string())?;
     claude_global_config(&req.home.join(".claude.json"), req.workdir_inside())?;
     claude_hooks(&req.home.join(".claude/settings.json"))?;
+    claude_thinking_shown(&req.home.join(".claude/settings.json"))?;
     // anthropic, or the gateway's destination when that is the route
     env.insert("ANTHROPIC_BASE_URL".into(), format!("{relay}/{provider}"));
     env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
@@ -885,6 +894,25 @@ fn claude_hooks(path: &Path) -> Result<(), Error> {
         "claude",
         &["PreCompact", "SessionEnd", "PreToolUse"],
         30,
+    )
+}
+
+/// Claude Code asks for its thinking as summaries, so its transcript says why before a
+/// decision instead of a bare "Thinking" with nothing in it. Off by default in Claude
+/// Code, where thinking comes back as a signature alone; the record is the reason to
+/// turn it on.
+fn claude_thinking_shown(path: &Path) -> Result<(), Error> {
+    let mut settings: serde_json::Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !settings.is_object() {
+        settings = serde_json::json!({});
+    }
+    settings["showThinkingSummaries"] = serde_json::Value::Bool(true);
+    write(
+        path,
+        &serde_json::to_string_pretty(&settings).unwrap_or_default(),
     )
 }
 
@@ -933,7 +961,9 @@ fn setup_codex(
         };
         format!(
             r#"# written by memory launch; edits are overwritten
-{base}[features]
+{base}show_raw_agent_reasoning = true
+
+[features]
 hooks = true
 
 [mcp_servers.memory]
@@ -945,6 +975,8 @@ url = "{relay}/mcp"
         format!(
             r#"# written by memory launch; edits are overwritten
 model_provider = "egress"
+# the reasoning an open model returns is kept in the rollout, so the record has the why
+show_raw_agent_reasoning = true
 
 [model_providers.egress]
 name = "egress ({provider})"
@@ -2198,6 +2230,7 @@ mod tests {
             settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "/opt/memory/memory hook claude"
         );
+        assert_eq!(settings["showThinkingSummaries"], true);
     }
 
     #[test]
@@ -2251,6 +2284,27 @@ mod tests {
             .plan(Harness::Claude, AuthMode::Gateway, "h2", &[], false)
             .unwrap();
         assert_eq!(plan.env["ANTHROPIC_AUTH_TOKEN"], "egress");
+    }
+
+    #[test]
+    fn claude_headless_asks_for_its_thinking() {
+        let headless = Harness::Claude.headless("hi");
+        assert!(
+            headless
+                .windows(2)
+                .any(|w| w == ["--thinking-display", "summarized"]),
+            "headless, Claude Code omits its thinking unless asked"
+        );
+    }
+
+    #[test]
+    fn codex_keeps_the_reasoning_an_open_model_returns() {
+        let f = fixture();
+        let (home, _plan) = f
+            .plan(Harness::Codex, AuthMode::Gateway, "c1", &[], false)
+            .unwrap();
+        let cfg = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(cfg.contains("show_raw_agent_reasoning = true"), "{cfg}");
     }
 
     #[test]

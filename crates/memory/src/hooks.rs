@@ -676,8 +676,14 @@ fn text_of(content: &Value) -> String {
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(|b| match b.get("type").and_then(Value::as_str) {
+                // Gemini's thought parts are text marked as thought, labelled in place
                 Some("text" | "input_text" | "output_text") | None => {
-                    b.get("text").and_then(Value::as_str).map(str::to_string)
+                    let text = b.get("text").and_then(Value::as_str)?;
+                    if b.get("thought").and_then(Value::as_bool) == Some(true) {
+                        Some(format!("{REASONING} {}", capped(text)))
+                    } else {
+                        Some(text.to_string())
+                    }
                 }
                 Some("tool_use") => b
                     .get("name")
@@ -815,16 +821,113 @@ fn turns_in(v: &Value) -> Vec<Turn> {
     out
 }
 
+/// How reasoning the provider gave is introduced in a turn.
+const REASONING: &str = "[reasoning]";
+/// What a turn says where the provider kept the reasoning back: Claude's thinking with
+/// only a signature, redacted thinking, Codex's encrypted reasoning. A decision with
+/// this before it was reasoned about; the record says so instead of showing nothing.
+pub const REASONING_WITHHELD: &str = "[reasoning withheld by the provider]";
+/// The most of one reasoning block a turn keeps, in characters.
+const REASONING_CAP: usize = 4000;
+
+fn capped(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() <= REASONING_CAP {
+        return text.to_string();
+    }
+    format!("{}…", text.chars().take(REASONING_CAP).collect::<String>())
+}
+
+/// The reasoning one block or item carries: its text where the provider gave it, a
+/// summary as one, and the withheld marker where there is only a signature.
+fn reasoning_text(text: Option<&str>, summarised: bool) -> String {
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) if summarised => format!("{REASONING} (summarised) {}", capped(t)),
+        Some(t) => format!("{REASONING} {}", capped(t)),
+        None => REASONING_WITHHELD.to_string(),
+    }
+}
+
+fn joined(parts: Option<&Value>, kind: &str) -> Option<String> {
+    let text = parts?
+        .as_array()?
+        .iter()
+        .filter(|p| p.get("type").and_then(Value::as_str) == Some(kind))
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// The reasoning one transcript line carries, in Claude Code's or Codex's shape. Kept
+/// apart from the turns, so a line that is only reasoning adds no turn and a citation's
+/// numbering is the same with it as without it.
+fn reasoning_in(v: &Value) -> Vec<String> {
+    match v.get("type").and_then(Value::as_str) {
+        Some("assistant") => v
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("thinking") => Some(reasoning_text(
+                    b.get("thinking").and_then(Value::as_str),
+                    false,
+                )),
+                Some("redacted_thinking") => Some(REASONING_WITHHELD.to_string()),
+                _ => None,
+            })
+            .collect(),
+        Some("response_item") => {
+            let Some(p) = v
+                .get("payload")
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("reasoning"))
+            else {
+                return Vec::new();
+            };
+            let raw = joined(p.get("content"), "reasoning_text");
+            let summary = joined(p.get("summary"), "summary_text");
+            vec![match (raw, summary) {
+                (Some(r), _) => reasoning_text(Some(&r), false),
+                (None, Some(s)) => reasoning_text(Some(&s), true),
+                (None, None) => REASONING_WITHHELD.to_string(),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Every user and assistant turn of a transcript, as `(role, text)`, in order: what the
 /// record keeps of it, numbered from one, and what a citation's turn number counts.
+///
+/// Reasoning is folded into the assistant turn it came before, so the record keeps why
+/// as well as what, and where the provider withheld it the turn says that.
 #[must_use]
 pub fn transcript_turns(jsonl: &str) -> Vec<(String, String)> {
-    jsonl
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for v in jsonl
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .flat_map(|v| turns_in(&v))
-        .map(|t| (t.role, t.text))
-        .collect()
+    {
+        pending.extend(reasoning_in(&v));
+        pending.dedup();
+        for t in turns_in(&v) {
+            let text = if t.role == "assistant" && !pending.is_empty() {
+                let why = std::mem::take(&mut pending).join("\n");
+                format!("{why}\n{}", t.text)
+            } else {
+                t.text
+            };
+            out.push((t.role, text));
+        }
+    }
+    if let Some(last) = out.last_mut().filter(|l| l.0 == "assistant") {
+        if !pending.is_empty() {
+            last.1 = format!("{}\n{}", last.1, pending.join("\n"));
+        }
+    }
+    out
 }
 
 /// The last `turns` user and assistant turns of a transcript, as Markdown, capped at
@@ -1115,6 +1218,37 @@ mod tests {
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"T0 says: two handoffs, one decision."}]}}
 not json
 "#;
+
+    #[test]
+    fn reasoning_is_kept_with_the_turn_it_led_to_and_withheld_reasoning_is_said() {
+        let claude = [
+            r#"{"type":"user","message":{"role":"user","content":"Which entry?"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"abc"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The handoff."}]}}"#,
+        ]
+        .join("\n");
+        let turns = transcript_turns(&claude);
+        assert_eq!(turns.len(), 2, "a line of reasoning alone adds no turn");
+        assert_eq!(turns[1].1, format!("{REASONING_WITHHELD}\nThe handoff."));
+        let codex = [
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Go."}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"T0 names the import; search for it."}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"search","namespace":"mcp__memory","arguments":"{}"}}"#,
+            r#"{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Found it."}],"encrypted_content":"x"}}"#,
+        ]
+        .join("\n");
+        let turns = transcript_turns(&codex);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            turns[1].1,
+            "[reasoning] T0 names the import; search for it.\n[used tool mcp__memory__search]\n[reasoning] (summarised) Found it."
+        );
+        let gemini = r#"{"$set":{"messages":[{"type":"gemini","content":[{"text":"weigh both","thought":true},{"text":"The first."}]}]}}"#;
+        assert_eq!(
+            transcript_turns(gemini)[0].1,
+            "[reasoning] weigh both\nThe first."
+        );
+    }
 
     #[test]
     fn the_tail_keeps_text_and_names_tools_but_drops_results() {
