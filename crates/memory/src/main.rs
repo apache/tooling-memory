@@ -11,6 +11,7 @@
 mod board;
 mod canary;
 mod checker;
+mod cost;
 mod credentials;
 mod curation;
 mod deputy;
@@ -698,6 +699,13 @@ enum Command {
     },
     /// Token usage recorded by the egress, by destination and model.
     Usage,
+    /// What runs cost: the egress's metering priced by prices.toml under the root, per
+    /// session and per completed task, with plan quota and unpriced models shown as
+    /// tokens beside the money.
+    Cost {
+        #[arg(long)]
+        json: bool,
+    },
     /// The paper's read-path claims measured on this record: recovery from T0 and a
     /// handoff against transcript replay, a page of hits against bodies and corpus,
     /// known-item lookups in the top three, and tokens served per session beside what
@@ -1282,6 +1290,41 @@ async fn serve_stdio_cmd(root: &Path, author: Option<String>, manifest: Vec<Stri
     Ok(())
 }
 
+/// `amem init`, `amem usage` and `amem cost`: the root made, and what it has spent.
+async fn bookkeeping_cmd(root: &Path, command: Command) -> Fallible {
+    let root = root.to_path_buf();
+    match command {
+        Command::Init { owner, domain } => {
+            let m = Memory::init(&root, &owner.unwrap_or_else(default_owner), &domain)?;
+            let prices = root.join("prices.toml");
+            if !prices.exists() {
+                std::fs::write(&prices, cost::TEMPLATE)?;
+            }
+            println!(
+                "initialised {} for {} with domain {domain}",
+                m.root().display(),
+                m.author()
+            );
+            Ok(())
+        }
+        Command::Usage => {
+            let t = Telemetry::open(&root.join("state/telemetry.db"))?;
+            print_usage(&t.summary()?);
+            Ok(())
+        }
+        Command::Cost { json: as_json } => {
+            let r = cost::report(&root).await?;
+            if as_json {
+                json(&r)
+            } else {
+                print!("{}", cost::render(&r));
+                Ok(())
+            }
+        }
+        _ => unreachable!("routed by run_cli"),
+    }
+}
+
 #[tokio::main]
 async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
     refuse_invocation(&cli, &root)?;
@@ -1302,14 +1345,8 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         .await;
     };
     match command {
-        Command::Init { owner, domain } => {
-            let m = Memory::init(&root, &owner.unwrap_or_else(default_owner), &domain)?;
-            println!(
-                "initialised {} for {} with domain {domain}",
-                m.root().display(),
-                m.author()
-            );
-            Ok(())
+        cmd @ (Command::Init { .. } | Command::Usage | Command::Cost { .. }) => {
+            bookkeeping_cmd(&root, cmd).await
         }
         Command::Serve { author, manifest } => serve_stdio_cmd(&root, author, manifest).await,
         cmd @ (Command::Launch { .. } | Command::Work { .. } | Command::Inside { .. }) => {
@@ -1346,11 +1383,6 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
             },
         },
         Command::Relay { .. } => unreachable!("handled in main"),
-        Command::Usage => {
-            let t = Telemetry::open(&root.join("state/telemetry.db"))?;
-            print_usage(&t.summary()?);
-            Ok(())
-        }
         Command::Task { op } => task(&Memory::open(&root)?, op).await,
         Command::Transcript { op } => transcripts::cmd(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
@@ -4336,6 +4368,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Profiles { .. }
         | Command::Relay { .. }
         | Command::Usage
+        | Command::Cost { .. }
         | Command::Task { .. }
         | Command::Transcript { .. }
         | Command::Tap { .. }

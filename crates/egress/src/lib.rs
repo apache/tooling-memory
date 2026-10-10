@@ -234,12 +234,20 @@ impl Egress {
             .connect_timeout(std::time::Duration::from_secs(20))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()?;
+        let telemetry = Telemetry::open(telemetry_path)?;
+        // a destination that forwards the harness's own credential is its login
+        telemetry.set_plan(
+            destinations
+                .iter()
+                .filter(|(_, d)| matches!(d.auth, Auth::PassThrough))
+                .map(|(n, _)| n.clone()),
+        );
         Ok(Egress {
             inner: Arc::new(Inner {
                 memory,
                 destinations,
                 client,
-                telemetry: Telemetry::open(telemetry_path)?,
+                telemetry,
             }),
         })
     }

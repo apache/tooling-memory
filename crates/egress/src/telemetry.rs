@@ -64,6 +64,41 @@ pub struct Totals {
 /// The usage log.
 pub struct Telemetry {
     conn: Mutex<Connection>,
+    /// Destinations whose calls ride the harness's own login: plan quota, not metered
+    /// spend.
+    plan: Mutex<std::collections::BTreeSet<String>>,
+}
+
+/// A call billed per token, on a key or a gateway the launcher holds.
+pub const BILLING_METERED: &str = "metered";
+/// A call on the harness's own login: it counts against a plan, not a price per token.
+pub const BILLING_PLAN: &str = "plan";
+
+/// One session's usage at one destination and model, as cost is computed from it.
+#[derive(Clone, Debug)]
+pub struct SessionModel {
+    /// The memory session.
+    pub session: String,
+    /// Where the calls went.
+    pub destination: String,
+    /// The model the provider reported.
+    pub model: String,
+    /// `metered` or `plan`.
+    pub billing: String,
+    /// Who counted: the egress, or the harness about itself.
+    pub source: String,
+    /// How many calls.
+    pub calls: u64,
+    /// Input tokens, cache reads excluded.
+    pub input_tokens: u64,
+    /// Output tokens.
+    pub output_tokens: u64,
+    /// Cache reads.
+    pub cache_read_tokens: u64,
+    /// Cache writes.
+    pub cache_write_tokens: u64,
+    /// When the session's first call here was made.
+    pub first: String,
 }
 
 const SCHEMA: &str = "
@@ -97,10 +132,26 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if !has_source {
         conn.execute_batch("ALTER TABLE usage ADD COLUMN source TEXT NOT NULL DEFAULT 'egress';")?;
     }
+    // older rows predate billing; a harness's own report was a login, the rest metered
+    let has_billing = conn
+        .prepare("SELECT 1 FROM pragma_table_info('usage') WHERE name = 'billing'")?
+        .exists([])?;
+    if !has_billing {
+        conn.execute_batch(
+            "ALTER TABLE usage ADD COLUMN billing TEXT NOT NULL DEFAULT 'metered';
+             UPDATE usage SET billing = 'plan' WHERE source = 'harness' OR model = 'tunnel';",
+        )?;
+    }
     Ok(())
 }
 
 fn lock(m: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn lock_set(
+    m: &Mutex<std::collections::BTreeSet<String>>,
+) -> MutexGuard<'_, std::collections::BTreeSet<String>> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -116,6 +167,7 @@ impl Telemetry {
         migrate(&conn)?;
         Ok(Telemetry {
             conn: Mutex::new(conn),
+            plan: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -130,6 +182,7 @@ impl Telemetry {
         migrate(&conn)?;
         Ok(Telemetry {
             conn: Mutex::new(conn),
+            plan: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -171,6 +224,59 @@ impl Telemetry {
         self.insert(None, session, destination, 0, usage, SOURCE_HARNESS)
     }
 
+    /// Mark destinations whose calls ride the harness's own login, so their usage is
+    /// recorded as plan quota rather than metered spend.
+    pub fn set_plan(&self, destinations: impl IntoIterator<Item = String>) {
+        lock_set(&self.plan).extend(destinations);
+    }
+
+    fn billing(&self, destination: &str, source: &str, usage: &Usage) -> &'static str {
+        if source == SOURCE_HARNESS
+            || usage.model.as_deref() == Some("tunnel")
+            || lock_set(&self.plan).contains(destination)
+        {
+            BILLING_PLAN
+        } else {
+            BILLING_METERED
+        }
+    }
+
+    /// Usage by session, destination, model and billing: what cost is computed from.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn by_session_model(&self) -> Result<Vec<SessionModel>, Error> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT session, destination, COALESCE(model, '?'), billing, source, COUNT(*),
+                    SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), MIN(at)
+             FROM usage
+             WHERE COALESCE(model, '') NOT LIKE 'http %'
+             GROUP BY session, destination, model, billing, source
+             ORDER BY MIN(at)",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let u = |i: usize| -> rusqlite::Result<u64> {
+                Ok(u64::try_from(r.get::<_, Option<i64>>(i)?.unwrap_or(0)).unwrap_or(0))
+            };
+            Ok(SessionModel {
+                session: r.get(0)?,
+                destination: r.get(1)?,
+                model: r.get(2)?,
+                billing: r.get(3)?,
+                source: r.get(4)?,
+                calls: u(5)?,
+                input_tokens: u(6)?,
+                output_tokens: u(7)?,
+                cache_read_tokens: u(8)?,
+                cache_write_tokens: u(9)?,
+                first: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     fn insert(
         &self,
         started: Option<SystemTime>,
@@ -183,9 +289,10 @@ impl Telemetry {
         let at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_default();
+        let billing = self.billing(destination, source, usage);
         lock(&self.conn).execute(
-            "INSERT INTO usage (at, session, destination, model, status, input_tokens, output_tokens, cache_read, cache_write, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO usage (at, session, destination, model, status, input_tokens, output_tokens, cache_read, cache_write, source, billing)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 at,
                 session,
@@ -197,6 +304,7 @@ impl Telemetry {
                 i64::try_from(usage.cache_read_tokens).unwrap_or(i64::MAX),
                 i64::try_from(usage.cache_write_tokens).unwrap_or(i64::MAX),
                 source,
+                billing,
             ],
         )?;
         trace(started, session, destination, status, usage, source);
