@@ -22,7 +22,8 @@ pub struct Read {
     /// Who it read as: the owner, or an agent. Empty in lines written before this was kept.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub author: String,
-    /// t0, search, list or get.
+    /// t0, search, list, get, recall, or prefetch: the summaries a claimed task's prompt
+    /// carried.
     pub tool: String,
     /// The query, for search.
     #[serde(default, skip_serializing_if = "Option::is_none")]

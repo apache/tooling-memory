@@ -639,5 +639,11 @@ mod tests {
         assert!(text.contains("known items in top 3"), "{text}");
         assert!(text.contains("search, in process"), "{text}");
         assert!(r.search_p99_ms >= r.search_p50_ms);
+        assert!(
+            text.contains("Metrics") && text.contains("cited by id"),
+            "{text}"
+        );
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json["metrics"]["total"].is_object(), "{json}");
     }
 }

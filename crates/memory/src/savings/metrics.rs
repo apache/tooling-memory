@@ -308,6 +308,7 @@ mod tests {
         Read {
             at: "2026-10-10T00:00:00Z".into(),
             session: session.into(),
+            author: String::new(),
             tool: tool.into(),
             query: None,
             hits: ids.len(),
