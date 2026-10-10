@@ -2,7 +2,7 @@
 //!
 //! Three numbers, each against the alternative it replaces. Recovery: what a fresh
 //! session loads (T0 and the latest handoff) against replaying the transcripts of the
-//! sessions that ran here. Retrieval: what a page of hits costs against the bodies it
+//! sessions that ran here, as the record keeps them while they are live. Retrieval: what a page of hits costs against the bodies it
 //! stands for and the corpus it was chosen from, and whether known items land in the top
 //! three. The funnel: what memory served each session, from the reads log, beside what
 //! the session's model calls ingested, from the egress telemetry. Then the paper's
@@ -31,7 +31,7 @@ pub struct Report {
     pub t0_tokens: usize,
     /// Tokens of the latest handoff, when there is one.
     pub handoff_tokens: usize,
-    /// Transcripts found under the sandbox homes.
+    /// Live transcripts the record keeps as sources.
     pub transcripts: usize,
     /// Their tokens in total.
     pub transcript_tokens: usize,
@@ -99,30 +99,43 @@ pub struct SessionRow {
     pub reported: bool,
 }
 
-/// Transcripts the harnesses left in their private homes under the record's state.
+/// The transcripts the record keeps whole, `record/<domain>/.transcripts/<session>.jsonl`:
+/// the harness's own lines, there until the domain's clock runs out.
 fn transcripts(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(homes) = std::fs::read_dir(root.join("state/sandbox")) else {
+    let Ok(domains) = std::fs::read_dir(root.join("record")) else {
         return out;
     };
-    for home in homes.flatten() {
-        let projects = home.path().join(".claude/projects");
-        let Ok(dirs) = std::fs::read_dir(&projects) else {
-            continue;
-        };
-        for d in dirs.flatten() {
-            if let Ok(files) = std::fs::read_dir(d.path()) {
-                out.extend(
-                    files
-                        .flatten()
-                        .map(|f| f.path())
-                        .filter(|p| p.extension().is_some_and(|e| e == "jsonl")),
-                );
-            }
+    for d in domains.flatten() {
+        if let Ok(files) = std::fs::read_dir(d.path().join(".transcripts")) {
+            out.extend(
+                files
+                    .flatten()
+                    .map(|f| f.path())
+                    .filter(|p| p.extension().is_some_and(|e| e == "jsonl")),
+            );
         }
     }
     out.sort();
     out
+}
+
+/// Tokens of a kept transcript: its messages in Claude Code's shape, or, for another
+/// harness's lines, the turns the record numbered beside them.
+fn kept_tokens(path: &Path, raw: &str) -> usize {
+    let n = transcript_tokens(raw);
+    if n > 0 {
+        return n;
+    }
+    std::fs::read_to_string(path.with_extension("json"))
+        .ok()
+        .and_then(|h| serde_json::from_str::<serde_json::Value>(&h).ok())
+        .and_then(|h| h.get("turns").and_then(|t| t.as_array()).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| t.get("text").and_then(|x| x.as_str()))
+        .map(approx_tokens)
+        .sum()
 }
 
 /// Tokens a transcript costs to replay: the text of its messages, tool results included,
@@ -333,7 +346,7 @@ pub async fn measure(root: &Path, query: Option<&str>) -> Fallible<Report> {
     for t in transcripts(root) {
         if let Ok(text) = std::fs::read_to_string(&t) {
             report.transcripts += 1;
-            report.transcript_tokens += transcript_tokens(&text);
+            report.transcript_tokens += kept_tokens(&t, &text);
         }
     }
     retrieval(&memory, &mut report, query, &titles).await?;
@@ -378,7 +391,7 @@ pub fn render(r: &Report) -> String {
             pct(load, per)
         ));
     } else {
-        s.push_str("  no transcripts under state/sandbox yet; run a session first\n");
+        s.push_str("  no live transcripts in the record yet; run a session first\n");
     }
     s.push_str(&format!(
         "\nRetrieval: search \"{}\"\n  {} hits                 {:>8} tokens  (their bodies: {}; the corpus: {})\n",
@@ -616,6 +629,11 @@ mod tests {
         let home = dir.path().join("state/sandbox/claude/.claude/projects/p");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("s.jsonl"), format!("{}\n", r#"{"type":"user","message":{"content":"a very long transcript line repeated many many many times to cost tokens"}}"#).repeat(50)).unwrap();
+        // a transcript left in a home and never kept is not the record's
+        assert_eq!(transcripts(dir.path()).len(), 0);
+        crate::transcripts::keep_file(&m, "claude", None, None, &home.join("s.jsonl"))
+            .await
+            .unwrap();
         let r = measure(dir.path(), Some("import")).await.unwrap();
         assert_eq!(r.entries, 3);
         assert!(r.corpus_tokens > 0 && r.t0_tokens > 0);

@@ -72,10 +72,12 @@ async fn handoff_ids(client: &MemoryClient, domain: Option<&str>) -> Fallible<BT
         .collect())
 }
 
-/// File what the harness's hooks left in the outbox. A note from before compaction is
-/// always filed: what it holds is gone from the harness's context. A note from session
-/// end is filed only when the run left no handoff of its own, as the handoff of last
-/// resort; otherwise it is dropped. Returns the ids filed.
+/// File what the harness's hooks left in the outbox. The transcript the run left is
+/// kept in the record first, as a source in `domain`, the session's, so each note cites
+/// the turns it was drawn from. A note from before compaction is always filed: what it
+/// holds is gone from the harness's context. A note from session end is filed only when
+/// the run left no handoff of its own, as the handoff of last resort; otherwise it is
+/// dropped. Returns the ids filed.
 ///
 /// # Errors
 ///
@@ -84,14 +86,36 @@ pub async fn file_outbox(
     session: &Session,
     client: &MemoryClient,
     wrote_handoff: bool,
+    domain: Option<&str>,
 ) -> Fallible<Vec<String>> {
+    let memory = session.memory();
+    let kept = crate::transcripts::keep_newest(
+        &memory,
+        session.harness().binary(),
+        domain,
+        session.home(),
+    )
+    .await;
     let mut filed = Vec::new();
     for note in hooks::notes(&session.outbox())? {
         if note.event == Event::SessionEnd && wrote_handoff {
             std::fs::remove_file(&note.path).ok();
             continue;
         }
-        let id = client.write_handoff(&note.title, &note.body, None).await?;
+        let source = kept
+            .as_ref()
+            .map(|k| dm_server::transcripts::cite(&k.session, &note.turns))
+            .unwrap_or_default();
+        let id = client
+            .write_entry(&dm_client::NewEntry {
+                kind: "handoff",
+                title: &note.title,
+                body: &note.body,
+                confidence: None,
+                source,
+                domain,
+            })
+            .await?;
         eprintln!(
             "memory: handoff {id} from the harness's hook ({})",
             note.event.suffix()
@@ -113,7 +137,13 @@ pub async fn interactive(session: &Session, args: &[String]) -> Fallible<i32> {
     let before = handoff_ids(&client, None).await?;
     let (code, _) = session.run(args, false).await?;
     let after = handoff_ids(&client, None).await?;
-    file_outbox(session, &client, after.difference(&before).next().is_some()).await?;
+    file_outbox(
+        session,
+        &client,
+        after.difference(&before).next().is_some(),
+        None,
+    )
+    .await?;
     client.close().await.ok();
     Ok(code)
 }
@@ -147,7 +177,7 @@ pub async fn prompted(
     }
     let mut after = handoff_ids(&client, None).await?;
     let wrote = after.difference(&before).next().is_some();
-    after.extend(file_outbox(session, &client, wrote).await?);
+    after.extend(file_outbox(session, &client, wrote, None).await?);
     let new: Vec<&String> = after.difference(&before).collect();
     if new.is_empty() && !no_handoff {
         eprintln!(
@@ -282,7 +312,13 @@ async fn one(
     let (code, output) = run?;
     let output = output.map(|o| answer_of(session, o));
     let now = client.get_task(&task.id).await?;
-    file_outbox(session, client, now.status == "completed").await?;
+    file_outbox(
+        session,
+        client,
+        now.status == "completed",
+        Some(&task.domain),
+    )
+    .await?;
     let output = output.unwrap_or_default();
     if !output.trim().is_empty() {
         print!("{output}");

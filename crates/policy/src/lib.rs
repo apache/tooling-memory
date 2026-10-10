@@ -98,6 +98,23 @@ pub struct DomainGrant {
     /// say, stay proposed until the owner admits them either way.
     #[serde(default)]
     pub admit_own: bool,
+    /// How many days a session's transcript is kept whole in the record before the turns
+    /// no entry cites are dropped; [`DEFAULT_TRANSCRIPT_RETENTION_DAYS`] when unset. The
+    /// owner sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_retention_days: Option<u32>,
+}
+
+/// How long a transcript is kept whole when the domain says nothing.
+pub const DEFAULT_TRANSCRIPT_RETENTION_DAYS: u32 = 30;
+
+impl DomainGrant {
+    /// The domain's transcript retention clock, in days.
+    #[must_use]
+    pub fn transcript_retention_days(&self) -> u32 {
+        self.transcript_retention_days
+            .unwrap_or(DEFAULT_TRANSCRIPT_RETENTION_DAYS)
+    }
 }
 
 /// One destination's settings.
@@ -178,6 +195,7 @@ impl Grants {
             DomainGrant {
                 default_classification: Label::Internal,
                 admit_own: true,
+                transcript_retention_days: None,
             },
         );
         let mut destinations = BTreeMap::new();
@@ -344,6 +362,7 @@ handling = "internal"
 
 [domains.dom-striker]
 default_classification = "internal"
+transcript_retention_days = 7
 
 [domains.dom-notes]
 
@@ -401,6 +420,12 @@ ceiling = "public"
             g.domains["dom-notes"].default_classification,
             Label::Public,
             "a domain table with nothing in it defaults to public"
+        );
+        assert_eq!(g.domains["dom-striker"].transcript_retention_days(), 7);
+        assert_eq!(
+            g.domains["dom-notes"].transcript_retention_days(),
+            DEFAULT_TRANSCRIPT_RETENTION_DAYS,
+            "a domain that says nothing keeps transcripts thirty days"
         );
     }
 

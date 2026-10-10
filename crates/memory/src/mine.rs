@@ -3,8 +3,12 @@
 //! their source, for a person to promote or drop. The third source of memory the harness
 //! did not write, after the hooks and the kept transcript; the only one that costs a
 //! model call, made through the same egress and destination as the session's own calls.
+//!
+//! The excerpt numbers its turns as the record numbers them, and the model names the
+//! turns each proposal came from; an entry cites those turns of the kept transcript, as
+//! `transcript:<session>#<turn>`, or every turn of the excerpt when the model named none.
 
-use crate::hooks::transcript_tail;
+use crate::hooks::tail_turns;
 pub use crate::model::answer_text;
 use dm_client::{MemoryClient, NewEntry};
 use dm_egress::Egress;
@@ -15,7 +19,7 @@ use std::path::Path;
 type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// What the model is asked to return, one per entry.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Proposal {
     /// fact, decision, convention or method.
     pub kind: String,
@@ -23,6 +27,40 @@ pub struct Proposal {
     pub title: String,
     /// Markdown.
     pub body: String,
+    /// The turns it was drawn from, by the numbers in the excerpt.
+    #[serde(default)]
+    pub turns: Vec<usize>,
+}
+
+/// What a mined entry cites: the kept transcript's id and the turns the excerpt held,
+/// or, for a transcript the record did not keep, its path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Cite {
+    /// A transcript the record keeps, by its id, and the excerpt's turns.
+    Kept(String, Vec<usize>),
+    /// A transcript only on disk.
+    Path(String),
+}
+
+impl Cite {
+    /// The sources for a proposal: the turns it names that the excerpt held, or every
+    /// turn of the excerpt when it names none of them.
+    #[must_use]
+    pub fn sources(&self, p: &Proposal) -> Vec<String> {
+        match self {
+            Cite::Path(path) => vec![format!("transcript:{path}")],
+            Cite::Kept(session, excerpt) => {
+                let named: Vec<usize> = p
+                    .turns
+                    .iter()
+                    .copied()
+                    .filter(|t| excerpt.contains(t))
+                    .collect();
+                let turns = if named.is_empty() { excerpt } else { &named };
+                dm_server::transcripts::cite(session, turns)
+            }
+        }
+    }
 }
 
 const INSTRUCTIONS: &str = "You are a librarian for a shared memory record used by agents and people. \
@@ -30,7 +68,8 @@ Read the transcript excerpt and extract only knowledge that would help a future 
 not seen it: facts about the codebase or system, decisions and their reasons, conventions, methods \
 that worked. Leave out chit-chat, tool noise, and anything already obvious from the task text. \
 Answer with a JSON array only, no prose, each element {\"kind\": \"fact\"|\"decision\"|\"convention\"|\"method\", \
-\"title\": one line, \"body\": Markdown, a paragraph or two}. An empty array is a fine answer.";
+\"title\": one line, \"body\": Markdown, a paragraph or two, \"turns\": the numbers of the turns it came from}. \
+An empty array is a fine answer.";
 
 /// The prompt, for a model reached directly or through a harness.
 #[must_use]
@@ -38,18 +77,20 @@ pub fn prompt_for(excerpt: &str) -> String {
     format!("{INSTRUCTIONS}\n\n## Transcript excerpt\n\n{excerpt}")
 }
 
-/// The excerpt a transcript yields, or none when there is nothing to read.
+/// The excerpt a transcript yields, its turns numbered, and the numbers of the turns it
+/// holds; none when there is nothing to read.
 ///
 /// # Errors
 ///
 /// When the transcript cannot be read.
-pub fn excerpt_of(transcript: &Path) -> std::io::Result<Option<String>> {
+pub fn excerpt_of(transcript: &Path) -> std::io::Result<Option<(String, Vec<usize>)>> {
     let text = std::fs::read_to_string(transcript)?;
-    let excerpt = transcript_tail(&text, 60, 40_000);
-    Ok((!excerpt.trim().is_empty()).then_some(excerpt))
+    let (excerpt, turns) = tail_turns(&text, 60, 40_000, true);
+    Ok((!excerpt.trim().is_empty()).then_some((excerpt, turns)))
 }
 
-/// Write proposals as entries: raw tier, low confidence, the transcript as source.
+/// Write proposals as entries: raw tier, low confidence, citing the turns they came
+/// from.
 ///
 /// # Errors
 ///
@@ -57,10 +98,9 @@ pub fn excerpt_of(transcript: &Path) -> std::io::Result<Option<String>> {
 pub async fn write_proposals(
     client: &MemoryClient,
     found: &[Proposal],
-    transcript: &Path,
+    cite: &Cite,
     model: &str,
 ) -> Fallible<Vec<String>> {
-    let source = format!("transcript:{}", transcript.display());
     let mut ids = Vec::new();
     for p in found {
         let id = client
@@ -73,7 +113,7 @@ pub async fn write_proposals(
                     p.body.trim()
                 ),
                 confidence: Some("low"),
-                source: vec![source.clone()],
+                source: cite.sources(p),
                 domain: None,
             })
             .await?;
@@ -120,8 +160,20 @@ pub fn proposals(text: &str) -> Vec<Proposal> {
         .collect()
 }
 
+/// How an entry mined from `transcript` cites it: by turn when the record keeps it as
+/// `kept`, by path otherwise.
+#[must_use]
+pub fn cite_for(kept: Option<&str>, transcript: &Path, turns: Vec<usize>) -> Cite {
+    match kept {
+        Some(session) => Cite::Kept(session.to_string(), turns),
+        None => Cite::Path(transcript.display().to_string()),
+    }
+}
+
 /// Mine one transcript: ask the model through the egress, write what comes back at raw
-/// tier and low confidence with the transcript as source. Returns the ids written.
+/// tier and low confidence, citing the turns of `kept`, the id the record keeps the
+/// transcript under, or the transcript's path when it keeps none. Returns the ids
+/// written.
 ///
 /// # Errors
 ///
@@ -132,14 +184,15 @@ pub async fn mine(
     destination: &str,
     model: &str,
     transcript: &Path,
+    kept: Option<&str>,
 ) -> Fallible<Vec<String>> {
-    let Some(excerpt) = excerpt_of(transcript)? else {
+    let Some((excerpt, turns)) = excerpt_of(transcript)? else {
         return Ok(Vec::new());
     };
     let (path, body) = request(destination, model, &excerpt);
     let answer = egress.call(destination, &path, &body).await?;
     let found = proposals(&answer_text(destination, &answer));
-    write_proposals(client, &found, transcript, model).await
+    write_proposals(client, &found, &cite_for(kept, transcript, turns), model).await
 }
 
 /// The newest transcript a harness left under its private home: Claude Code's project
@@ -212,6 +265,27 @@ mod tests {
         assert_eq!(p[0].kind, "fact");
         assert!(proposals("no json here").is_empty());
         assert!(proposals("[]").is_empty());
+    }
+
+    #[test]
+    fn a_mined_entry_cites_the_turns_it_names_or_the_whole_excerpt() {
+        let named = Proposal {
+            kind: "fact".into(),
+            title: "t".into(),
+            body: "b".into(),
+            turns: vec![4, 5, 99],
+        };
+        let unnamed = Proposal {
+            turns: vec![],
+            ..named.clone()
+        };
+        let kept = cite_for(Some("sess-a"), Path::new("/x.jsonl"), vec![3, 4, 5, 6]);
+        assert_eq!(kept.sources(&named), vec!["transcript:sess-a#4-5"]);
+        assert_eq!(kept.sources(&unnamed), vec!["transcript:sess-a#3-6"]);
+        let path = cite_for(None, Path::new("/x.jsonl"), vec![3]);
+        assert_eq!(path.sources(&named), vec!["transcript:/x.jsonl"]);
+        let p = proposals("[{\"kind\":\"fact\",\"title\":\"T\",\"body\":\"one two three four five\",\"turns\":[2]}]");
+        assert_eq!(p[0].turns, vec![2]);
     }
 
     #[test]

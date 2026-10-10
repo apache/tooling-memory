@@ -792,28 +792,103 @@ fn turns_in(v: &Value) -> Vec<Turn> {
     out
 }
 
-/// The last `turns` user and assistant turns of a transcript, as Markdown, capped at
-/// `max_chars`. Tool calls are named, their results elided. Claude Code, Codex and Gemini
-/// CLI shapes are all read.
+/// Every user and assistant turn of a transcript, as `(role, text)`, in order: what the
+/// record keeps of it, numbered from one, and what a citation's turn number counts.
 #[must_use]
-pub fn transcript_tail(jsonl: &str, turns: usize, max_chars: usize) -> String {
-    let mut all: Vec<Turn> = jsonl
+pub fn transcript_turns(jsonl: &str) -> Vec<(String, String)> {
+    jsonl
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .flat_map(|v| turns_in(&v))
-        .collect();
-    let keep = all.len().saturating_sub(turns);
-    all.drain(..keep);
+        .map(|t| (t.role, t.text))
+        .collect()
+}
+
+/// The last `turns` user and assistant turns of a transcript, as Markdown, capped at
+/// `max_chars`. Tool calls are named, their results elided. Claude Code, Codex and Gemini
+/// CLI shapes are all read.
+#[cfg(test)]
+#[must_use]
+pub fn transcript_tail(jsonl: &str, turns: usize, max_chars: usize) -> String {
+    tail_turns(jsonl, turns, max_chars, false).0
+}
+
+/// The tail as [`transcript_tail`] makes it, and the numbers, from one, of the turns any
+/// of whose text is in it: the turns a note or a mined entry was drawn from, which it
+/// cites. With `numbered`, each turn's heading carries its number.
+#[must_use]
+pub fn tail_turns(
+    jsonl: &str,
+    turns: usize,
+    max_chars: usize,
+    numbered: bool,
+) -> (String, Vec<usize>) {
+    let all = transcript_turns(jsonl);
+    let first = all.len().saturating_sub(turns);
     let mut out = String::new();
-    for t in &all {
-        out.push_str(&format!("**{}**\n\n{}\n\n", t.role, t.text));
+    // where each turn ends in `out`, in characters
+    let mut ends = Vec::new();
+    for (i, (role, text)) in all.iter().enumerate().skip(first) {
+        if numbered {
+            out.push_str(&format!("**{role}** (turn {})\n\n{text}\n\n", i + 1));
+        } else {
+            out.push_str(&format!("**{role}**\n\n{text}\n\n"));
+        }
+        ends.push((i + 1, out.chars().count()));
     }
     let out = out.trim_end().to_string();
-    if out.chars().count() <= max_chars {
-        return out;
+    let total = out.chars().count();
+    let skip = total.saturating_sub(max_chars);
+    let drawn = ends
+        .into_iter()
+        .filter(|(_, end)| *end > skip)
+        .map(|(n, _)| n)
+        .collect();
+    if skip == 0 {
+        return (out, drawn);
     }
-    let skip = out.chars().count() - max_chars;
-    format!("…{}", out.chars().skip(skip).collect::<String>())
+    (
+        format!("…{}", out.chars().skip(skip).collect::<String>()),
+        drawn,
+    )
+}
+
+/// The line a note carries naming the turns it was drawn from, for the launcher to cite
+/// and take out before filing.
+const TURNS_MARK: &str = "<!-- memory:turns ";
+
+/// A note's body with the turns it was drawn from named at its end.
+#[must_use]
+pub fn with_turns(body: &str, turns: &[usize]) -> String {
+    if turns.is_empty() {
+        return body.to_string();
+    }
+    format!(
+        "{}\n\n{TURNS_MARK}{} -->\n",
+        body.trim_end(),
+        dm_server::transcripts::ranges(turns)
+    )
+}
+
+/// The turns a note names, and its body without the line that names them.
+fn take_turns(body: &str) -> (String, Vec<usize>) {
+    let mut turns = Vec::new();
+    let kept: Vec<&str> = body
+        .lines()
+        .filter(|l| {
+            let Some(spec) = l
+                .strip_prefix(TURNS_MARK)
+                .and_then(|r| r.strip_suffix(" -->"))
+            else {
+                return true;
+            };
+            if let Some((_, t)) = dm_server::transcripts::cited(&format!("transcript:x#{spec}")) {
+                turns.extend(t);
+            }
+            false
+        })
+        .collect();
+    (format!("{}\n", kept.join("\n").trim_end()), turns)
 }
 
 /// Title and body of the note for an event.
@@ -838,8 +913,9 @@ pub fn note(input: &HookInput, event: Event, tail: &str) -> (String, String) {
     let body =
         format!(
         "# {title}\n\nLeft by the launcher's hook, not by the agent: the last exchanges of the \
-         transcript, {when}. Treat as raw. The full transcript is at `{transcript}` in the \
-         session's private home.\n\n## Last exchanges\n\n{}\n",
+         transcript, {when}. Treat as raw. The harness left the transcript at `{transcript}` in \
+         the session's private home; the launcher keeps it in the record as a source, and this \
+         note cites the turns below by number.\n\n## Last exchanges\n\n{}\n",
         if tail.is_empty() { "(nothing yet)" } else { tail }
     );
     (title, body)
@@ -928,8 +1004,9 @@ pub fn run(outbox: &Path, harness: &str) -> Fallible<()> {
         .as_deref()
         .and_then(|p| std::fs::read_to_string(transcript_file(p)).ok())
         .unwrap_or_default();
-    let tail = transcript_tail(&transcript, 10, 6000);
+    let (tail, turns) = tail_turns(&transcript, 10, 6000, false);
     let (_, body) = note(&input, event, &tail);
+    let body = with_turns(&body, &turns);
     std::fs::create_dir_all(outbox)?;
     let stamp = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
     let name = note_name(harness, &input.session_id, event, stamp);
@@ -954,6 +1031,8 @@ pub struct Note {
     pub title: String,
     /// The whole Markdown.
     pub body: String,
+    /// The turns of the transcript it was drawn from, numbered from one.
+    pub turns: Vec<usize>,
 }
 
 /// The notes in an outbox, oldest first.
@@ -982,7 +1061,7 @@ pub fn notes(outbox: &Path) -> Fallible<Vec<Note>> {
         } else {
             continue;
         };
-        let body = std::fs::read_to_string(&path)?;
+        let (body, turns) = take_turns(&std::fs::read_to_string(&path)?);
         let title = body
             .lines()
             .find_map(|l| l.strip_prefix("# "))
@@ -993,6 +1072,7 @@ pub fn notes(outbox: &Path) -> Fallible<Vec<Note>> {
             event,
             title,
             body,
+            turns,
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1200,6 +1280,30 @@ not json
         assert_eq!(n[0].title, "Compact");
         assert_eq!(n[1].event, Event::SessionEnd);
         assert!(notes(&dir.path().join("missing")).unwrap().is_empty());
+        assert!(n[0].turns.is_empty());
+    }
+
+    #[test]
+    fn a_note_names_the_turns_it_was_drawn_from_and_the_launcher_takes_the_line_out() {
+        // five text turns; the tool result is not one
+        let (tail, turns) = tail_turns(TRANSCRIPT, 10, 10_000, false);
+        assert_eq!(tail, transcript_tail(TRANSCRIPT, 10, 10_000));
+        assert_eq!(turns, vec![1, 2, 3]);
+        assert_eq!(transcript_turns(TRANSCRIPT).len(), 3);
+        assert_eq!(tail_turns(TRANSCRIPT, 2, 10_000, false).1, vec![2, 3]);
+        // a cap that reaches only into the last turn draws from the last turn only
+        assert_eq!(tail_turns(TRANSCRIPT, 10, 20, false).1, vec![3]);
+        let (numbered, _) = tail_turns(TRANSCRIPT, 10, 10_000, true);
+        assert!(numbered.contains("**assistant** (turn 3)"), "{numbered}");
+        let dir = tempfile::tempdir().unwrap();
+        let body = with_turns("# Session s at session end (other)\n\nbody\n", &[2, 3]);
+        assert!(body.contains("<!-- memory:turns 2-3 -->"), "{body}");
+        std::fs::write(dir.path().join("1-sessionend.md"), &body).unwrap();
+        let n = notes(dir.path()).unwrap();
+        assert_eq!(n[0].turns, vec![2, 3]);
+        assert!(!n[0].body.contains("memory:turns"), "{}", n[0].body);
+        assert!(n[0].body.ends_with("body\n"));
+        assert_eq!(with_turns("x\n", &[]), "x\n");
     }
 
     fn read(p: &str) -> Value {

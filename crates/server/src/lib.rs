@@ -43,6 +43,7 @@ pub mod reads;
 pub mod recall;
 pub mod t0;
 mod taps;
+pub mod transcripts;
 
 /// The grants file, relative to the root.
 pub const GRANTS_FILE: &str = "grants.toml";
@@ -89,6 +90,9 @@ pub enum Error {
     /// The recall deputy failed or timed out.
     #[error("deputy: {0}")]
     Deputy(String),
+    /// A transcript or excerpt in the record that does not parse.
+    #[error("transcript {0}")]
+    Transcript(String),
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
@@ -1755,7 +1759,7 @@ impl Memory {
         let scope = bundle::export_scope(&self.session_filter()?, &domain, max_label)?;
         // the index is read and released before the record is, so the future is Send
         let hits = self.index.lock().await.list(&scope, None, usize::MAX / 2)?;
-        Ok(bundle::export(
+        let ex = bundle::export(
             &self.store,
             hits,
             &domain,
@@ -1763,7 +1767,10 @@ impl Memory {
             &self.grants.owner,
             dest,
         )
-        .await?)
+        .await?;
+        self.export_excerpts(&domain, &ex.manifest.entries, max_label, dest)
+            .await?;
+        Ok(ex)
     }
 
     /// Erase an entry: the body leaves every version in the record and the index, the
@@ -1833,7 +1840,10 @@ impl Memory {
             let mut stub = erasure::stub(&entry, receipt.reason);
             stub.front.domain.clone_from(&domain);
             stub.front.id = id.to_string();
-            self.store.erase(&domain, id, &stub).await?;
+            // the record's versions, and the transcript turns it kept as excerpts
+            receipt
+                .removed
+                .extend(self.erase_with_excerpts(&domain, id, &stub).await?);
         }
         let stub = self
             .store

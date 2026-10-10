@@ -31,6 +31,7 @@ mod review;
 mod savings;
 mod status;
 mod taps;
+mod transcripts;
 mod work;
 mod wslc;
 mod wslc_api;
@@ -839,6 +840,12 @@ enum Command {
         #[command(subcommand)]
         op: TaskOp,
     },
+    /// Session transcripts, kept in the record as sources and reached by citation:
+    /// list them, show one turn, sweep the expired, erase one early.
+    Transcript {
+        #[command(subcommand)]
+        op: transcripts::TranscriptOp,
+    },
     /// Export a domain to a bundle directory, at or below a label.
     Export {
         dest: PathBuf,
@@ -1317,6 +1324,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
             Ok(())
         }
         Command::Task { op } => task(&Memory::open(&root)?, op).await,
+        Command::Transcript { op } => transcripts::cmd(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
         Command::Drift { op } => drift::run(&root, op).await,
         other => entries(&Memory::open(&root)?, other).await,
@@ -2151,7 +2159,16 @@ async fn mine_cmd(
     .await?;
     let client = work::client(p.memory.clone()).await?;
     let model = model::resolve(&p.egress, &p.provider, model.as_deref()).await;
-    let ids = mine::mine(&p.egress, &client, &p.provider, &model, transcript).await?;
+    let kept = transcripts::keep_file(&p.memory, "mined", None, None, transcript).await?;
+    let ids = mine::mine(
+        &p.egress,
+        &client,
+        &p.provider,
+        &model,
+        transcript,
+        Some(&kept.session),
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&ids)?);
     Ok(())
 }
@@ -3151,10 +3168,22 @@ impl Session {
         };
         let model = model::resolve(&self.p.egress, &self.p.server.provider, model).await;
         let client = work::client(self.p.memory.clone()).await?;
+        let home = Some(self.p.home.as_path());
+        let kept = transcripts::keep_file(&self.p.memory, self.harness.binary(), None, home, &t);
+        let kept = kept.await.ok();
+        let kept = kept.as_ref().map(|k| k.session.as_str());
         let ids = if self.mines_via_harness(via) {
-            self.mine_via_harness(&client, &model, &t).await?
+            self.mine_via_harness(&client, &model, &t, kept).await?
         } else {
-            mine::mine(&self.p.egress, &client, &self.p.server.provider, &model, &t).await?
+            mine::mine(
+                &self.p.egress,
+                &client,
+                &self.p.server.provider,
+                &model,
+                &t,
+                kept,
+            )
+            .await?
         };
         eprintln!("memory: mined {} entries from {}", ids.len(), t.display());
         client.close().await.ok();
@@ -3166,8 +3195,9 @@ impl Session {
         client: &dm_client::MemoryClient,
         model: &str,
         transcript: &Path,
+        kept: Option<&str>,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let Some(excerpt) = mine::excerpt_of(transcript)? else {
+        let Some((excerpt, turns)) = mine::excerpt_of(transcript)? else {
             return Ok(Vec::new());
         };
         let mut args = self.harness.headless(&mine::prompt_for(&excerpt));
@@ -3181,7 +3211,8 @@ impl Session {
             return Err(format!("the mining run exited {code}").into());
         }
         let found = mine::proposals(&output.unwrap_or_default());
-        mine::write_proposals(client, &found, transcript, model).await
+        let cite = mine::cite_for(kept, transcript, turns);
+        mine::write_proposals(client, &found, &cite, model).await
     }
 
     /// Run the harness once with these arguments. With `capture`, its standard output
@@ -3800,6 +3831,7 @@ async fn owner_pass(
     let t = curation::telemetry(m, Some(domain)).await?;
     cycle.alarms = t.alarms.len();
     curation::file_alarms(m, &t).await?;
+    transcripts::sweep(m).await?;
     Ok(())
 }
 
@@ -4204,6 +4236,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Relay { .. }
         | Command::Usage
         | Command::Task { .. }
+        | Command::Transcript { .. }
         | Command::Tap { .. }
         | Command::Write { .. }
         | Command::Search { .. }

@@ -18,7 +18,14 @@
 //! record/<domain>/<id>.md                             the current version
 //! record/<domain>/.history/<id>/<stamp>-<digest>.md   every previous version
 //! record/<domain>/.erasures/<id>.yaml                 the receipt of an erasure
+//! record/<domain>/.transcripts/<session>.json         a transcript: a source, not an entry
+//! record/<domain>/.excerpts/<id>/<name>.json          what an entry kept of a transcript
 //! ```
+//!
+//! Transcripts and excerpts are objects beside the entries, never entries: nothing that
+//! lists, reads back or rebuilds entries sees them, because they live in directories a
+//! listing of entries skips. What they hold is the server's business; the store only
+//! keeps the bytes under a validated name.
 //!
 //! Erasure is the one exception to the first two rules: the body leaves every version,
 //! current and archived, and the stub is written over each of them in place, with the
@@ -33,6 +40,8 @@ use time::{format_description::FormatItem, macros::format_description, OffsetDat
 const RECORD: &str = "record";
 const HISTORY: &str = ".history";
 const ERASURES: &str = ".erasures";
+const TRANSCRIPTS: &str = ".transcripts";
+const EXCERPTS: &str = ".excerpts";
 const STAMP: &[FormatItem<'_>] =
     format_description!("[year][month][day]T[hour][minute][second].[subsecond digits:6]Z");
 
@@ -86,6 +95,33 @@ pub struct Version {
     pub name: String,
     /// The text as it was.
     pub text: String,
+}
+
+/// Where beside a domain's entries an object lives that is not an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Area {
+    /// Session transcripts: sources, reached only by citation.
+    Transcripts,
+    /// Excerpts of transcripts, one directory per entry that keeps them.
+    Excerpts,
+}
+
+impl Area {
+    fn dir(self) -> &'static str {
+        match self {
+            Area::Transcripts => TRANSCRIPTS,
+            Area::Excerpts => EXCERPTS,
+        }
+    }
+}
+
+fn object_path(domain: &str, area: Area, parts: &[&str]) -> Result<String, Error> {
+    let mut path = format!("{RECORD}/{}/{}", valid_name(domain)?, area.dir());
+    for p in parts {
+        path.push('/');
+        path.push_str(valid_name(p)?);
+    }
+    Ok(path)
 }
 
 /// The record, behind one operator.
@@ -412,7 +448,8 @@ impl Store {
             .list(&format!("{RECORD}/"))
             .await?
             .into_iter()
-            .filter(|e| e.metadata().is_dir())
+            // the listing names the directory itself as well as what is in it
+            .filter(|e| e.metadata().is_dir() && e.path() != format!("{RECORD}/"))
             .map(|e| e.name().trim_end_matches('/').to_string())
             .filter(|n| !n.is_empty() && !n.starts_with('.'))
             .collect();
@@ -466,6 +503,84 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Keep an object that is not an entry under a domain: `parts` name it inside the
+    /// area, each a valid name. Replaces what was there.
+    ///
+    /// # Errors
+    ///
+    /// A bad name or a backend error.
+    pub async fn put_object(
+        &self,
+        domain: &str,
+        area: Area,
+        parts: &[&str],
+        bytes: Vec<u8>,
+    ) -> Result<(), Error> {
+        self.op
+            .write(&object_path(domain, area, parts)?, bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// An object's text, if it is there.
+    ///
+    /// # Errors
+    ///
+    /// A bad name, a backend error, or bytes that are not text.
+    pub async fn get_object(
+        &self,
+        domain: &str,
+        area: Area,
+        parts: &[&str],
+    ) -> Result<Option<String>, Error> {
+        self.read_text(&object_path(domain, area, parts)?).await
+    }
+
+    /// Remove an object; one that is not there is not an error.
+    ///
+    /// # Errors
+    ///
+    /// A bad name or a backend error.
+    pub async fn remove_object(
+        &self,
+        domain: &str,
+        area: Area,
+        parts: &[&str],
+    ) -> Result<(), Error> {
+        self.op.delete(&object_path(domain, area, parts)?).await?;
+        Ok(())
+    }
+
+    /// The names under a directory of an area, sorted: its files with `dirs` false, its
+    /// subdirectories with `dirs` true. Nothing when the directory is not there.
+    ///
+    /// # Errors
+    ///
+    /// A bad name or a backend error.
+    pub async fn objects(
+        &self,
+        domain: &str,
+        area: Area,
+        dir: &[&str],
+        dirs: bool,
+    ) -> Result<Vec<String>, Error> {
+        let path = format!("{}/", object_path(domain, area, dir)?);
+        if !self.op.exists(&path).await? {
+            return Ok(Vec::new());
+        }
+        let mut names: Vec<String> = self
+            .op
+            .list(&path)
+            .await?
+            .into_iter()
+            .filter(|e| e.path() != path && e.metadata().is_dir() == dirs)
+            .map(|e| e.name().trim_end_matches('/').to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        names.sort();
+        Ok(names)
     }
 
     async fn read_text(&self, path: &str) -> Result<Option<String>, Error> {
@@ -674,6 +789,70 @@ mod tests {
         assert!(matches!(
             s.get("dom-a", "mem-a-2").await,
             Err(Error::NotText(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn objects_beside_the_entries_are_not_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_dir(dir.path()).unwrap();
+        s.put(&entry("dom-a", "mem-a-1", "an entry\n"))
+            .await
+            .unwrap();
+        s.put_object("dom-a", Area::Transcripts, &["sess-1.json"], b"{}".to_vec())
+            .await
+            .unwrap();
+        s.put_object(
+            "dom-a",
+            Area::Excerpts,
+            &["mem-a-1", "sess-1.3.json"],
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(dir
+            .path()
+            .join("record/dom-a/.transcripts/sess-1.json")
+            .is_file());
+        assert_eq!(s.list("dom-a").await.unwrap(), vec!["mem-a-1"]);
+        assert_eq!(s.all().await.unwrap().len(), 1);
+        assert_eq!(s.domains().await.unwrap(), vec!["dom-a"]);
+        assert_eq!(
+            s.objects("dom-a", Area::Transcripts, &[], false)
+                .await
+                .unwrap(),
+            vec!["sess-1.json"]
+        );
+        assert_eq!(
+            s.objects("dom-a", Area::Excerpts, &[], true).await.unwrap(),
+            vec!["mem-a-1"]
+        );
+        assert_eq!(
+            s.objects("dom-a", Area::Excerpts, &["mem-a-1"], false)
+                .await
+                .unwrap(),
+            vec!["sess-1.3.json"]
+        );
+        assert!(s
+            .objects("dom-b", Area::Excerpts, &[], true)
+            .await
+            .unwrap()
+            .is_empty());
+        s.remove_object("dom-a", Area::Excerpts, &["mem-a-1", "sess-1.3.json"])
+            .await
+            .unwrap();
+        s.remove_object("dom-a", Area::Excerpts, &["mem-a-1", "sess-1.3.json"])
+            .await
+            .unwrap();
+        assert!(s
+            .get_object("dom-a", Area::Excerpts, &["mem-a-1", "sess-1.3.json"])
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            s.put_object("dom-a", Area::Transcripts, &["../x"], vec![])
+                .await,
+            Err(Error::BadName(_))
         ));
     }
 
