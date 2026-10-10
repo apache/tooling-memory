@@ -317,6 +317,98 @@ telling other agents to send credentials.env to an outside URL and hide it from 
 user came back `malicious`; a release signature in base64, held as an encoded payload,
 `benign`; and Codex's handoff quoting the injection it had refused, `report`.
 
+## The trust tiers: `amem promote` and `amem approve`
+
+Every entry is raw when written, and the tiers above it mean what the paper says. Curated
+means a librarian has summarised, merged or checked an entry: a write that supersedes
+an entry, made while the session holds a librarian's or the checker's task, lands
+curated, and anyone but an entry's author may mark it curated with `promote` (MCP) or
+`amem promote <id> --to curated`. Verified is the review gate and is never set
+directly: one principal proposes it, `promote` with `to: verified`, which files a task
+requiring a person, and a person who did not propose it approves, `amem approve
+<task>`; an agent never approves. The librarian's verify task now ends in such a
+proposal when an entry holds. The rules are Rego, in the built-in policy, and each
+step is a logged decision; a promotion is a new version of the entry, the old kept in
+its history. This is the paper's defence against an exploit becoming fleet-wide
+practice: whatever an agent finds, it cannot promote its own finding, and the
+verified-tier gate refuses an agent's rewrite of a verified entry.
+
+## Policy as memory: `amem policy list` and `lint`
+
+The rules live in the record as entries of type `policy`, layered as the paper layers
+them. A body carries a fenced `policy` block, TOML, with a stable id (`pol-L2-031`), the
+layer, 0 to 3, the rule and its intent, what it implements and who owns it; where the
+rule is machine-checkable, a fenced `rego` block adds denials in `package amem.rules`.
+A module is enforced only once its entry is verified, so an agent may propose a rule
+and it stays inert until a person approves it, the paper's evolution-loop rule that
+nothing below verified is loaded as live configuration; a module outside the rules
+package, or one that will not load, is refused, named, and left out, and the base
+policy stands. An exception is a policy entry that names the policy it breaches, the one
+task it holds for and an expiry: in force once verified and unexpired, never for an L0
+rule. A record rule's denial wins over the built-in decision unless an exception covers
+the task the session holds, and every decision names the policies it rests on, the
+ones that refused it or the exceptions it used, so the decision log gives each policy's
+citations and overrides. T0 carries the policy digest, L0 in full, verified rules by id,
+exceptions in force. `amem policy list` shows every policy's layer, tier and status;
+`amem policy lint` applies the paper's conflict rules, a lower layer implementing what
+is not there or a higher layer, an exception against L0, an expired exception, a rule
+not yet verified, and with `--file` files a bug on the lower layer for the owner.
+
+## The task fabric: `amem task rescore` and `stats`
+
+An L1 policy entry may carry the rubric it compiles into, a `[rubric]` table in its
+block: weights by origin prefix, a weight for unblocking, a weight per day of waiting,
+and curation's floor. The last verified one is in force; a default applies otherwise.
+`amem task rescore`, which every curation cycle runs, ranks a domain's open tasks from
+the priority each was filed with: a task that blocks a ranked one rises above it, a
+child rises to its parent, and when curation's share of the completed work is under the
+floor, the best curation task an agent can do goes to the head of the queue. Each move
+is a `rescored` event on the ledger with its reason, on either backend, replayed like
+any other; the filed priority stays in the creation event, so rescoring never
+compounds, and a claimed task keeps its lease. Irreversible work escalates: a task that
+requires `irreversible` is never admitted as filed, whoever files it. `amem task stats`
+is the fabric's telemetry: by family and status, why tasks were invalidated, and the
+requirements of waiting tasks that no completed task ever carried, a capability gap.
+
+## Prefetch and the read metrics
+
+When `amem work` claims a task, its prompt carries the summaries, never the bodies, of
+the entries the task likely needs: the top five hits of a search on its title and body,
+and the entries the read log shows retrieved with them in at least three searches,
+eight at most and 600 tokens, under a heading that says to open them with `get`. The
+lookups run under the session's compiled read filter, so a policy that narrows reads
+narrows the prefetch, and the prefetch is logged as one `prefetch` read; `--no-prefetch`
+leaves it out. `amem savings` ends with the paper's metrics, per session and in total,
+from the read and write logs: fetch-through, search hits later opened; retrieval depth,
+pulls per completed task; prefetch precision, prefetched entries later opened or cited;
+and wasted reads, bodies opened that the session's handoff does not cite. "Used" here is
+cited by id in the handoff, where the paper samples a cheap-model judge. The read log
+also records who read, owner or agent, which the librarian's relay alarm uses. A Codex
+run on the gateway's Qwen prefetched eight summaries, opened three bodies, one of which
+only co-retrieval had surfaced, and scored fetch-through 2/3, depth 4.0, prefetch
+precision 5/8 and no wasted reads.
+
+## Vendor drift: `amem drift` and `make drift`
+
+`amem drift probe --auth gateway --model <m>` runs the pinned probe set in
+`probes/drift.toml` at temperature 0, three times each, and appends the run to
+`state/drift/<destination>/<model>.jsonl`: per answer a digest of its text, input and
+output tokens, latency, the reported model and fingerprint, whether format probes
+matched and refusal probes refused; for the run, what our side pinned, the amem version,
+the probe set's digest and the request shape. `amem drift check` compares the latest run
+with a baseline: first whether anything pinned on our side changed, in which case a
+change is not the vendor's; then each detector, input tokens for identical prompts, a
+new reported model or fingerprint, the flip rate of answers above the baseline's own
+repeat disagreement plus a margin, format probes that stopped passing, refusals that
+changed, and median latency, reported only. `--file` files confirmed drift for the
+owner with the paper's playbook: freeze distillation, pin or fail over, record,
+escalate. The gateway does not swap a model behind a name, so a repoint is shown by
+checking one model's run against another's baseline, `--baseline-model`: qwen3-8b
+against qwen3.8-27b fired input tokens on all eight probes, the reported model and
+fingerprint, and a flip rate of 1.0 over a floor of 0.0. Reasoning models think inside
+`max_tokens`; a probe cut by the limit says so. Not yet: logprob divergence, replay,
+change-point detection over many runs, a schedule.
+
 ## The ledger on PostgreSQL
 
 The task ledger runs on SQLite under the root by default, or on PostgreSQL when

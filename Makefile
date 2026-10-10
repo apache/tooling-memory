@@ -125,6 +125,13 @@ demo: build
 	LLMAO_KEY="$${LLMAO_KEY:-$$(cat local/.virtual-key 2>/dev/null)}" \
 	scripts/demo.sh "$(DEMO_ROOT)" $(DEMO_FROM)
 
+# The whole demo in acts on one record: ACTS="1 2 3 4 5 6" chooses (all by default).
+demo-all: build
+	@test -n "$(HARNESS)" || { echo "HARNESS= is required: claude, codex, gemini, antigravity, qwen, grok, muse, pi, copilot or opencode" >&2; exit 2; }
+	@set -a; [ -f $(LOCAL_ENV) ] && . ./$(LOCAL_ENV); set +a; \
+	LLMAO_KEY="$${LLMAO_KEY:-$$(cat local/.virtual-key 2>/dev/null)}" \
+	ACTS="$(ACTS)" scripts/demo-all.sh "$(DEMO_ROOT)" $(DEMO_FROM)
+
 # The paper's read-path claims measured on this record.
 savings: build
 	@set -a; . ./$(LOCAL_ENV); set +a; target/release/amem --root "$$MEMORY_ROOT" savings $(if $(QUERY),--query '$(QUERY)',)
