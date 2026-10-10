@@ -434,22 +434,33 @@ metered; over a limit the call does not leave, refused as a permission error wit
 reason, which a harness does not retry, and the refusal is a logged decision. Listing a
 destination's models is not a model call and is not limited.
 
-## Replay: `amem replay`
+## Replay: `amem replay`, on decision contexts the egress records
 
-`amem replay <session>` is the paper's frozen-context replay: each decision point of a
-kept transcript, every assistant turn up to `--limit` or one `--turn`, is presented again
-as the conversation up to that point, to the model given, through the egress, metered
-and under the spend limits; the candidate's next step, a tool or a reply, is scored
-against the one recorded, the same tool or a reply that overlaps by a third. The run is
-logged in `state/replay/<session>.jsonl` with digests of the context and the prompt, so
-two models replayed on the same session compare like for like: a regression between
-models, or the confirmation step for vendor drift. It is the owner's, since it reads a
-transcript whole, and runs while the transcript is live. The recorded side is the
-harness's own transcript, a self-report: the memory server's logs and the egress's
-metering are observed, the transcript is not, and a stronger replay would present what
-the egress saw the model sent, which is not yet kept. Codex's transcripts now record its
-tool calls as turns, as Claude Code's do. On the rehearsal's sessions the gateway's Qwen
-agreed with Claude's recorded steps between a quarter and three quarters of the time.
+The egress is in the path of every metered model call, so it keeps each one's
+decision context: the request exactly as it left, the response as it came back, and the
+tools the model asked for. A context sits beside the session's domain's entries, under
+`.contexts/<session>/`, at the session's label when the call was made; it is never
+indexed or searched, only the owner reads it, and `amem transcript sweep` drops it on
+the transcripts' clock. It carries every entry body the session had read, so erasing an
+entry removes the contexts that carry its text and lists them on the receipt.
+
+`amem replay <session>` is the paper's frozen-context replay on those contexts: each
+recorded request, up to `--limit` or one `--turn`, is sent again to the same
+destination and path with only the model changed and the answer unstreamed, through the
+egress, metered and under the spend limits; the tools the candidate asks for are
+compared with the tools the upstream returned, and where both answered in text, the
+texts' overlap decides. The run is logged in `state/replay/<session>.jsonl` with a
+digest of the contexts, so two models replayed on one session compare like for like: a
+regression between models, or the confirmation step for vendor drift. A session with no
+contexts, one from before they were kept or a login run through a tunnel the egress
+cannot see into, is replayed from its transcript instead, the harness's own account, and
+the run says `source: transcript`.
+
+Live on 10 October, a Codex session on the gateway's Qwen left four contexts, the
+Responses API requests of 55 to 65 KB each. Replayed on Qwen itself, all four steps
+agreed: the same search, the same two opens, and an answer overlapping the recorded one.
+Replayed on Gemma, two of four: the same search and open, then an answer where Qwen had
+opened another entry.
 
 ## Vendor drift: `amem drift` and `make drift`
 

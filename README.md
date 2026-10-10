@@ -25,10 +25,11 @@ harnesses in two weeks, and it is also why none of it is the production shape.
 
 ### What the paper asks for that is not built
 
-- **Replay, beyond its first mode.** Frozen-context replay is built, `amem replay`, but
-  its decision contexts are the harness's own transcript, a self-report an agent could
-  shape; the egress sees the exact context each model call carried and does not yet keep
-  it. Live re-execution of a task against a point-in-time snapshot is not built.
+- **Replay, beyond its first mode.** Frozen-context replay is built, `amem replay`, on
+  decision contexts the egress records. Live re-execution of a task against a
+  point-in-time snapshot is not built, and a login run through a tunnel, which the egress
+  cannot see into, has no contexts, so its replay falls back to the harness's own
+  transcript, a self-report, and says so.
 - **The platform as a domain.** Harness configuration, agent definitions and their
   authoring, decomposition templates and eval suites are not held in memory, and there is
   no evolution loop that loads only verified configuration into a harness. Policy is the
