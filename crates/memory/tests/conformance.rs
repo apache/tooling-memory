@@ -90,6 +90,58 @@ fn the_seven_steps_pass_over_stdio_with_the_operator() {
     );
 }
 
+/// The same seven steps with the ledger on PostgreSQL rather than in the SQLite file:
+/// the grants name the server, the binary connects to it, and the tasks the steps file
+/// land there. Skipped, saying so, where no server can be had (see
+/// `dm_ledger::testing`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_seven_steps_pass_over_stdio_with_a_postgres_ledger() {
+    let Some(server) = dm_ledger::testing::PgServer::start().await.unwrap() else {
+        eprintln!("skipped: the seven steps over a PostgreSQL ledger need a server");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("memory");
+    init(&root);
+    let grants = root.join("grants.toml");
+    let mut text = std::fs::read_to_string(&grants).unwrap();
+    text.push_str(&format!("\n[ledger]\nurl = \"{}\"\n", server.url()));
+    std::fs::write(&grants, text).unwrap();
+    let amem = quoted(Path::new(env!("CARGO_BIN_EXE_amem")));
+    let index = root.join("state").join("index.db");
+    let args = vec![
+        "--stdio".into(),
+        format!("{amem} --root {} serve", quoted(&root)),
+        "--operator".into(),
+        format!("{amem} --root {}", quoted(&root)),
+        "--drop-index".into(),
+        format!(
+            "{} -c \"import os; os.remove(r'{}')\"",
+            python(),
+            index.display()
+        ),
+    ];
+    let text = tokio::task::spawn_blocking(move || conforms(&args))
+        .await
+        .unwrap();
+    assert!(text.contains("7 of 7 steps passed"), "{text}");
+    // the tasks are on the server, and nothing was written to the SQLite file
+    let (client, conn) = tokio_postgres::connect(server.url(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let row = client
+        .query_one("SELECT COUNT(*) FROM tasks", &[])
+        .await
+        .unwrap();
+    let tasks: i64 = row.get(0);
+    assert!(tasks > 0, "the steps filed tasks on the server");
+    assert!(
+        !root.join("state").join("ledger.db").exists(),
+        "no SQLite ledger was opened"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_seven_steps_pass_over_http() {
     let dir = tempfile::tempdir().unwrap();

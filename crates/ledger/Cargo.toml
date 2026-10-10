@@ -11,10 +11,23 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0.151"
 thiserror.workspace = true
+tokio = { workspace = true }
+tokio-postgres = "0.7.18"
 time = { version = "0.3.55", features = ["formatting", "parsing", "macros", "serde-well-known"] }
+# Pinned: postgresql_archive 0.20.1 and later want reqwest 0.13.2+, which dropped the
+# `rustls-native-certs` feature the egress still uses; 0.20.0 sits on its own reqwest 0.12.
+postgresql_archive = { version = "=0.20.0", default-features = false, optional = true }
+postgresql_embedded = { version = "=0.20.0", default-features = false, features = ["theseus", "rustls"], optional = true }
+
+[features]
+# A PostgreSQL server for tests, embedded or the one MEMORY_PG_URL names: `testing::PgServer`.
+# For test code only; the other crates' tests turn it on as a dev-dependency.
+pg-test = ["dep:postgresql_archive", "dep:postgresql_embedded"]
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+postgresql_archive = { version = "=0.20.0", default-features = false }
+postgresql_embedded = { version = "=0.20.0", default-features = false, features = ["theseus", "rustls"] }
 tempfile = "3.27.0"

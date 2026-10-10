@@ -105,6 +105,21 @@ pub struct Grants {
     /// Taps the wrapper may run, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub taps: BTreeMap<String, TapGrant>,
+    /// Where the task ledger lives when not in the SQLite file under the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<LedgerSettings>,
+}
+
+/// The ledger's backend, when it is a server rather than the file under the root:
+///
+/// ```toml
+/// [ledger]
+/// url = "postgres://memory:secret@localhost:5432/memory"
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerSettings {
+    /// A PostgreSQL connection URL. The tables are created on first use.
+    pub url: String,
 }
 
 fn restricted() -> Label {
@@ -153,6 +168,7 @@ impl Grants {
             domains,
             destinations,
             taps: BTreeMap::new(),
+            ledger: None,
         }
     }
 

@@ -7,7 +7,8 @@
 //! <root>/grants.toml        what the owner may read, and where things may go
 //! <root>/record/            the record (dm-store), versioned Markdown
 //! <root>/state/index.db     the index (dm-index), derived, rebuildable
-//! <root>/state/ledger.db    the ledger (dm-ledger), events plus projection
+//! <root>/state/ledger.db    the ledger (dm-ledger), events plus projection; or a
+//!                           PostgreSQL server when the grants name one under [ledger]
 //! ```
 //!
 //! Every read goes through the grants' filter. Every write is classified at least as high
@@ -21,7 +22,9 @@ use dm_policy::{Grants, Session};
 use dm_store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
@@ -250,7 +253,10 @@ impl Memory {
         std::fs::create_dir_all(root.join("state")).map_err(io(root))?;
         let store = Store::open_dir(root)?;
         let index = Index::open(&root.join(INDEX_FILE))?;
-        let ledger = Ledger::open(&root.join(LEDGER_FILE))?;
+        let ledger = match &grants.ledger {
+            Some(settings) => Ledger::connect_blocking(&settings.url)?,
+            None => Ledger::open(&root.join(LEDGER_FILE))?,
+        };
         let session = grants.session();
         let session_id = dm_core::id::new_task_id("session").replace("task-session-", "sess-");
         Ok(Memory {
@@ -607,7 +613,8 @@ impl Memory {
             .ledger
             .lock()
             .await
-            .list(&domain, dm_ledger::Status::Admitted)?
+            .list(&domain, dm_ledger::Status::Admitted)
+            .await?
             .len();
         self.observe(&handoffs);
         self.observe(&decisions);
@@ -650,7 +657,7 @@ impl Memory {
         )?;
         spec.created_by = self.author.clone();
         spec.classification = spec.classification.max(self.label());
-        Ok(self.ledger.lock().await.create(spec)?)
+        Ok(self.ledger.lock().await.create(spec).await?)
     }
 
     /// File a task the system files on the owner's behalf, as the librarian's survey,
@@ -663,7 +670,7 @@ impl Memory {
     pub async fn file_own(&self, spec: TaskSpec) -> Result<Created, Error> {
         let created = self.create_task(spec).await?;
         let mut l = self.ledger.lock().await;
-        let task = self.admit_own_in(&mut l, created.task)?;
+        let task = self.admit_own_in(&mut l, created.task).await?;
         Ok(Created {
             task,
             deduplicated: created.deduplicated,
@@ -677,8 +684,8 @@ impl Memory {
     /// A ledger error, or a task outside the grants.
     pub async fn admit(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id)?)?;
-        Ok(l.admit(id)?)
+        self.task_in_grants(&l.get(id).await?)?;
+        Ok(l.admit(id).await?)
     }
 
     /// Whether tasks a session files from a task it holds are admitted as they are
@@ -688,9 +695,9 @@ impl Memory {
     }
 
     /// Admit `task` where the domain's grant says so and it is still proposed.
-    fn admit_own_in(&self, l: &mut Ledger, task: Task) -> Result<Task, Error> {
+    async fn admit_own_in(&self, l: &mut Ledger, task: Task) -> Result<Task, Error> {
         if task.status == dm_ledger::Status::Proposed && self.admits_own(&task.spec.domain) {
-            Ok(l.admit(&task.id)?)
+            Ok(l.admit(&task.id).await?)
         } else {
             Ok(task)
         }
@@ -709,13 +716,13 @@ impl Memory {
     /// A parent outside the grants, or a ledger error.
     pub async fn fan_out(&self, parent: &str, items: &[(String, String)]) -> Result<FanOut, Error> {
         let mut l = self.ledger.lock().await;
-        let parent = l.get(parent)?;
+        let parent = l.get(parent).await?;
         self.task_in_grants(&parent)?;
         // the chain this parent belongs to: a continuation or a retry resumes a root,
         // and what an earlier run of the chain already asked for is not asked again
-        let root = Memory::root_of(&l, &parent);
+        let root = Memory::root_of(&l, &parent).await;
         let mut done = Vec::new();
-        Memory::tree_in(&l, root)?.flatten(&mut done);
+        Memory::tree_in(&l, root).await?.flatten(&mut done);
         let mut children = Vec::new();
         let mut existing = Vec::new();
         for (title, body) in items {
@@ -730,19 +737,21 @@ impl Memory {
                 existing.push(earlier.clone());
                 continue;
             }
-            let created = l.create(TaskSpec {
-                domain: parent.spec.domain.clone(),
-                title: title.clone(),
-                body: body.clone(),
-                requirements: Vec::new(),
-                depends_on: Vec::new(),
-                origin: Some(format!("task:{}", parent.id)),
-                upstream_event: Some(hash),
-                created_by: self.author.clone(),
-                classification: parent.spec.classification.max(self.label()),
-                priority: parent.spec.priority,
-            })?;
-            children.push(self.admit_own_in(&mut l, created.task)?);
+            let created = l
+                .create(TaskSpec {
+                    domain: parent.spec.domain.clone(),
+                    title: title.clone(),
+                    body: body.clone(),
+                    requirements: Vec::new(),
+                    depends_on: Vec::new(),
+                    origin: Some(format!("task:{}", parent.id)),
+                    upstream_event: Some(hash),
+                    created_by: self.author.clone(),
+                    classification: parent.spec.classification.max(self.label()),
+                    priority: parent.spec.priority,
+                })
+                .await?;
+            children.push(self.admit_own_in(&mut l, created.task).await?);
         }
         if children.is_empty() {
             return Ok(FanOut {
@@ -770,8 +779,9 @@ impl Memory {
             created_by: self.author.clone(),
             classification: parent.spec.classification.max(self.label()),
             priority: parent.spec.priority,
-        })?;
-        let continuation = self.admit_own_in(&mut l, created.task)?;
+        })
+        .await?;
+        let continuation = self.admit_own_in(&mut l, created.task).await?;
         Ok(FanOut {
             children,
             existing,
@@ -780,7 +790,7 @@ impl Memory {
     }
 
     /// The root of a task's chain: what a continuation or a retry ultimately resumes.
-    fn root_of(l: &Ledger, task: &Task) -> Task {
+    async fn root_of(l: &Ledger, task: &Task) -> Task {
         let mut current = task.clone();
         let mut seen = HashSet::new();
         while let Some(up) = current
@@ -796,7 +806,7 @@ impl Memory {
             if !seen.insert(up.clone()) {
                 break;
             }
-            match l.get(&up) {
+            match l.get(&up).await {
                 Ok(t) => current = t,
                 Err(_) => break,
             }
@@ -812,17 +822,24 @@ impl Memory {
     /// A task outside the grants, or a ledger error.
     pub async fn task_tree(&self, id: &str) -> Result<TaskTree, Error> {
         let l = self.ledger.lock().await;
-        let task = l.get(id)?;
+        let task = l.get(id).await?;
         self.task_in_grants(&task)?;
-        Ok(Memory::tree_in(&l, task)?)
+        Ok(Memory::tree_in(&l, task).await?)
     }
 
-    fn tree_in(l: &Ledger, task: Task) -> Result<TaskTree, dm_ledger::Error> {
-        let mut children = Vec::new();
-        for t in l.filed_from(&task.id)? {
-            children.push(Memory::tree_in(l, t)?);
-        }
-        Ok(TaskTree { task, children })
+    /// Boxed, since the tree is as deep as the work and an async fn cannot recurse
+    /// unboxed.
+    fn tree_in<'a>(
+        l: &'a Ledger,
+        task: Task,
+    ) -> Pin<Box<dyn Future<Output = Result<TaskTree, dm_ledger::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut children = Vec::new();
+            for t in l.filed_from(&task.id).await? {
+                children.push(Memory::tree_in(l, t).await?);
+            }
+            Ok(TaskTree { task, children })
+        })
     }
 
     /// File a task again from one that dead-ended: the same spec, with the chain's
@@ -835,9 +852,9 @@ impl Memory {
     /// A task outside the grants, or a ledger error.
     pub async fn retry_task(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        let root = l.get(id)?;
+        let root = l.get(id).await?;
         self.task_in_grants(&root)?;
-        let tree = Memory::tree_in(&l, root.clone())?;
+        let tree = Memory::tree_in(&l, root.clone()).await?;
         let mut lessons = Vec::new();
         tree.handoffs(&mut lessons);
         let mut body = root.spec.body.trim_end().to_string();
@@ -856,19 +873,21 @@ impl Memory {
                 ));
             }
         }
-        let created = l.create(TaskSpec {
-            domain: root.spec.domain.clone(),
-            title: root.spec.title.clone(),
-            body,
-            requirements: root.spec.requirements.clone(),
-            depends_on: Vec::new(),
-            origin: Some(format!("retries:{}", root.id)),
-            upstream_event: None,
-            created_by: self.author.clone(),
-            classification: root.spec.classification.max(self.label()),
-            priority: root.spec.priority,
-        })?;
-        self.admit_own_in(&mut l, created.task)
+        let created = l
+            .create(TaskSpec {
+                domain: root.spec.domain.clone(),
+                title: root.spec.title.clone(),
+                body,
+                requirements: root.spec.requirements.clone(),
+                depends_on: Vec::new(),
+                origin: Some(format!("retries:{}", root.id)),
+                upstream_event: None,
+                created_by: self.author.clone(),
+                classification: root.spec.classification.max(self.label()),
+                priority: root.spec.priority,
+            })
+            .await?;
+        self.admit_own_in(&mut l, created.task).await
     }
 
     /// Claim the highest-ranked claimable task in a domain that this session's manifest
@@ -883,11 +902,12 @@ impl Memory {
         lease: Duration,
     ) -> Result<Option<Claim>, Error> {
         let domain = self.resolve_domain(domain)?;
-        let claim =
-            self.ledger
-                .lock()
-                .await
-                .claim_next(&domain, &self.author, lease, &self.manifest)?;
+        let claim = self
+            .ledger
+            .lock()
+            .await
+            .claim_next(&domain, &self.author, lease, &self.manifest)
+            .await?;
         if let Some(c) = &claim {
             lock(&self.session).observe(c.task.spec.classification);
         }
@@ -901,8 +921,8 @@ impl Memory {
     /// A ledger error, or a task outside the grants.
     pub async fn claim(&self, id: &str, lease: Duration) -> Result<Claim, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id)?)?;
-        let c = l.claim(id, &self.author, lease, &self.manifest)?;
+        self.task_in_grants(&l.get(id).await?)?;
+        let c = l.claim(id, &self.author, lease, &self.manifest).await?;
         lock(&self.session).observe(c.task.spec.classification);
         Ok(c)
     }
@@ -914,8 +934,8 @@ impl Memory {
     /// A ledger error, including a lease already lost, or a task outside the grants.
     pub async fn heartbeat(&self, id: &str, lease: Duration) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id)?)?;
-        Ok(l.heartbeat(id, &self.author, lease)?)
+        self.task_in_grants(&l.get(id).await?)?;
+        Ok(l.heartbeat(id, &self.author, lease).await?)
     }
 
     /// Complete a task with the handoff entry that records what happened. The handoff
@@ -926,7 +946,7 @@ impl Memory {
     /// [`Error::NotFound`] for a missing handoff, a ledger error, or a task outside the
     /// grants.
     pub async fn complete(&self, id: &str, handoff: &str) -> Result<Task, Error> {
-        let task = self.ledger.lock().await.get(id)?;
+        let task = self.ledger.lock().await.get(id).await?;
         self.task_in_grants(&task)?;
         if self.store.get(&task.spec.domain, handoff).await?.is_none() {
             return Err(Error::NotFound(format!("handoff {handoff}")));
@@ -935,7 +955,8 @@ impl Memory {
             .ledger
             .lock()
             .await
-            .complete(id, &self.author, handoff)?)
+            .complete(id, &self.author, handoff)
+            .await?)
     }
 
     /// Give a task back to the pool.
@@ -948,8 +969,8 @@ impl Memory {
             self.get(h).await?; // the handoff must exist and be readable here
         }
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id)?)?;
-        Ok(l.release(id, &self.author, handoff)?)
+        self.task_in_grants(&l.get(id).await?)?;
+        Ok(l.release(id, &self.author, handoff).await?)
     }
 
     /// Close a task without doing it, and everything still open that was filed from it:
@@ -966,17 +987,18 @@ impl Memory {
         superseded_by: Option<&str>,
     ) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id)?)?;
-        let task = l.invalidate(id, reason, superseded_by)?;
-        let mut pending = l.filed_from(id)?;
+        self.task_in_grants(&l.get(id).await?)?;
+        let task = l.invalidate(id, reason, superseded_by).await?;
+        let mut pending = l.filed_from(id).await?;
         while let Some(t) = pending.pop() {
-            pending.extend(l.filed_from(&t.id)?);
+            pending.extend(l.filed_from(&t.id).await?);
             if !t.status.is_terminal() {
                 l.invalidate(
                     &t.id,
                     &format!("filed from {id}, which was invalidated: {reason}"),
                     superseded_by,
-                )?;
+                )
+                .await?;
             }
         }
         Ok(task)
@@ -988,7 +1010,7 @@ impl Memory {
     ///
     /// [`Error::NotFound`], including for a task outside the grants.
     pub async fn get_task(&self, id: &str) -> Result<Task, Error> {
-        let t = self.ledger.lock().await.get(id)?;
+        let t = self.ledger.lock().await.get(id).await?;
         self.task_in_grants(&t)?;
         Ok(t)
     }
@@ -1004,7 +1026,7 @@ impl Memory {
         status: dm_ledger::Status,
     ) -> Result<Vec<Task>, Error> {
         let domain = self.resolve_domain(domain)?;
-        Ok(self.ledger.lock().await.list(&domain, status)?)
+        Ok(self.ledger.lock().await.list(&domain, status).await?)
     }
 
     // ---- leaving, arriving, rebuilding ----
@@ -1288,7 +1310,7 @@ impl Memory {
     pub async fn reindex(&self) -> Result<(usize, u64), Error> {
         let entries = self.store.all().await?;
         let n = self.index.lock().await.rebuild(entries)?;
-        let m = self.ledger.lock().await.rebuild()?;
+        let m = self.ledger.lock().await.rebuild().await?;
         Ok((n, m))
     }
 }

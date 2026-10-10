@@ -29,4 +29,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 workspace = true
 
 [dev-dependencies]
+dm-ledger = { version = "0.1.0", path = "../ledger", features = ["pg-test"] }
 tempfile = "3.27.0"
+tokio-postgres = "0.7.18"

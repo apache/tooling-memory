@@ -22,7 +22,7 @@ impl Memory {
         ceiling: Label,
     ) -> Result<Vec<(Task, Entry)>, Error> {
         let domain = self.resolve_domain(Some(domain))?;
-        let tasks = self.ledger.lock().await.unposted(&domain)?;
+        let tasks = self.ledger.lock().await.unposted(&domain).await?;
         let mut filter = self.grants.read_filter();
         filter.handling = filter.handling.min(ceiling);
         let mut out = Vec::new();
@@ -75,7 +75,7 @@ impl Memory {
             ));
         }
         let mut l = self.ledger.lock().await;
-        let task = l.get(id)?;
+        let task = l.get(id).await?;
         self.task_in_grants(&task)?;
         if task.spec.domain != domain {
             return Err(Error::Denied(format!("{id} is not a task of {domain}")));
@@ -86,7 +86,7 @@ impl Memory {
                 task.spec.classification
             )));
         }
-        Ok(l.post(id, to)?)
+        Ok(l.post(id, to).await?)
     }
 }
 
