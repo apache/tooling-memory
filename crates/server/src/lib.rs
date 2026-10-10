@@ -1464,7 +1464,36 @@ impl Memory {
                 continuation: None,
             });
         }
-        let ids: Vec<String> = children.iter().map(|c| c.id.clone()).collect();
+        // a harness that delegates twice from one run, as Claude Code does with one
+        // Agent call per subagent, gets one continuation waiting on all of them: an open
+        // continuation of this parent is folded into the new one and closed as superseded
+        let (ids, folded) = Memory::fold_continuations(&l, &parent, &children).await?;
+        let continuation = self.file_continuation(&mut l, &parent, ids).await?;
+        for old in folded {
+            l.invalidate(
+                &old,
+                &format!(
+                    "folded into {}, which waits for every subagent of this run",
+                    continuation.id
+                ),
+                Some(&continuation.id),
+            )
+            .await?;
+        }
+        Ok(FanOut {
+            children,
+            existing,
+            continuation: Some(continuation),
+        })
+    }
+
+    /// File the continuation that resumes `parent` once `ids` are done.
+    async fn file_continuation(
+        &self,
+        l: &mut Ledger,
+        parent: &Task,
+        ids: Vec<String>,
+    ) -> Result<Task, Error> {
         let created = l.create(TaskSpec {
             domain: parent.spec.domain.clone(),
             title: format!(
@@ -1486,13 +1515,33 @@ impl Memory {
         })
         .await?;
         let continuation = self
-            .admit_per_policy(&mut l, created.task, Filing::Held, Some(&parent))
+            .admit_per_policy(l, created.task, Filing::Held, Some(parent))
             .await?;
-        Ok(FanOut {
-            children,
-            existing,
-            continuation: Some(continuation),
-        })
+        Ok(continuation)
+    }
+
+    /// The children a new continuation waits for: this fan-out's, and those of any
+    /// continuation of the same parent still open, which the new one replaces.
+    async fn fold_continuations(
+        l: &Ledger,
+        parent: &Task,
+        children: &[Task],
+    ) -> Result<(Vec<String>, Vec<String>), Error> {
+        let mut ids: Vec<String> = Vec::new();
+        let mut folded = Vec::new();
+        let marker = format!("continues:{}", parent.id);
+        for t in l.filed_from(&parent.id).await? {
+            if t.spec.origin.as_deref() == Some(marker.as_str()) && !t.status.is_terminal() {
+                ids.extend(t.spec.depends_on.iter().cloned());
+                folded.push(t.id);
+            }
+        }
+        for c in children {
+            if !ids.contains(&c.id) {
+                ids.push(c.id.clone());
+            }
+        }
+        Ok((ids, folded))
     }
 
     /// The root of a task's chain: what a continuation or a retry ultimately resumes.
@@ -2834,6 +2883,53 @@ mod tests {
         assert_eq!(st["invalidated_because"]["obsolete"], 1);
         assert_eq!(st["unmatched_requirements"]["gpu"], 1, "{st}");
         assert!(st["unmatched_requirements"].get("deploy").is_none());
+    }
+
+    #[tokio::test]
+    async fn two_delegations_from_one_run_get_one_continuation_waiting_for_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let parent = filed(&m, tspec("Compare two decisions", 5, None, &[], &[])).await;
+        let first = m
+            .fan_out(&parent.id, &[("DR-19".into(), "Summarise DR-19.".into())])
+            .await
+            .unwrap();
+        let second = m
+            .fan_out(&parent.id, &[("DR-22".into(), "Summarise DR-22.".into())])
+            .await
+            .unwrap();
+        let c1 = first.continuation.unwrap();
+        let c2 = second.continuation.unwrap();
+        assert_eq!(
+            c2.spec.depends_on,
+            vec![first.children[0].id.clone(), second.children[0].id.clone()],
+            "the second waits for both"
+        );
+        let old = m.ledger.lock().await.get(&c1.id).await.unwrap();
+        assert_eq!(old.status, Status::Invalidated);
+        assert_eq!(old.superseded_by.as_deref(), Some(c2.id.as_str()));
+        let child = m
+            .ledger
+            .lock()
+            .await
+            .get(&first.children[0].id)
+            .await
+            .unwrap();
+        assert_eq!(child.status, Status::Admitted, "the first child stays open");
+        let tree = m.task_tree(&parent.id).await.unwrap();
+        let open: Vec<_> = tree
+            .children
+            .iter()
+            .filter(|c| {
+                c.task
+                    .spec
+                    .origin
+                    .as_deref()
+                    .is_some_and(|o| o.starts_with("continues:"))
+            })
+            .filter(|c| !c.task.status.is_terminal())
+            .collect();
+        assert_eq!(open.len(), 1, "one live continuation");
     }
 
     #[tokio::test]

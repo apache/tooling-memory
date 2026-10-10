@@ -388,6 +388,27 @@ run on the gateway's Qwen prefetched eight summaries, opened three bodies, one o
 only co-retrieval had surfaced, and scored fetch-through 2/3, depth 4.0, prefetch
 precision 5/8 and no wasted reads.
 
+## Transcripts are sources: `amem transcript`
+
+When a session ends, the launcher keeps the harness's transcript in the record as a
+source, not an entry: under `record/<domain>/.transcripts/`, in the session's domain,
+classified at the session's label and never below the domain's default, with a
+retention clock from `transcript_retention_days` on the domain's grant, thirty days if
+unset. It is never indexed, never in T0, and no search, list or recall returns it. The
+handoff the hooks leave, and entries mined from the session, cite the turns they were
+drawn from as `transcript:<session>#<turn>`. `amem transcript show <session> --turn N`
+serves a turn only when an entry the reader may read cites it, and raises the reader's
+label as `get` does; `amem transcript list` shows what is kept and when each runs out.
+When a clock runs out, `amem transcript sweep`, which every curation cycle runs, keeps
+each cited turn as an excerpt of the entry that cites it and drops the rest, logging
+what it kept and dropped in `state/transcripts.jsonl`; an excerpt is demoted, erased and
+exported with its entry. `amem transcript erase <session> --reason ...` erases one early,
+the owner's act: a stub and a receipt remain, and the entries that cite it are flagged.
+A live Codex session's handoff cited `#1-3`; with the clock at zero, the sweep kept the
+cited turns as excerpts, dropped the rest and the raw lines, and erasing the handoff
+took its excerpts with it. Not yet: an MCP tool, excerpts on import, and the copy the
+harness keeps in its own home.
+
 ## Vendor drift: `amem drift` and `make drift`
 
 `amem drift probe --auth gateway --model <m>` runs the pinned probe set in

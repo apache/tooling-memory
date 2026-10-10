@@ -4164,7 +4164,8 @@ async fn librarian_cmd(
     }
 }
 
-async fn maintain(m: &Memory, command: Command) -> Fallible {
+/// `amem export` and `amem import`: a domain as a bundle, out and in.
+async fn bundle_cmd(m: &Memory, command: Command) -> Fallible {
     match command {
         Command::Export {
             dest,
@@ -4191,6 +4192,13 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
             );
             Ok(())
         }
+        _ => unreachable!("routed by maintain"),
+    }
+}
+
+async fn maintain(m: &Memory, command: Command) -> Fallible {
+    match command {
+        cmd @ (Command::Export { .. } | Command::Import { .. }) => bundle_cmd(m, cmd).await,
         Command::Librarian {
             domain,
             file,

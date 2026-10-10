@@ -31,9 +31,14 @@ fi
 
 if has drift && gateway; then
   say "vendor drift: a pinned probe battery against a model, compared with its own baseline"
+  show_drift="print('  verdict: ' + d['verdict'] + ('; our side changed: ' + str(d['attribution']['differences']) if d['attribution']['ours_changed'] else '; our side pinned, unchanged')); print('\\n'.join(f\"    {x['name']:<13} {'FIRED' if x['fired'] else 'quiet':<6} {x['catches']}\" for x in d['detectors']))"
   a drift probe --auth gateway --model "$WORKER_MODEL" >/dev/null
   a drift probe --auth gateway --model "$WORKER_MODEL" >/dev/null
-  a drift check --provider llmao --model "$WORKER_MODEL" | sed 's/^/  /' | head -20
+  echo "  $WORKER_MODEL, two runs of the same pinned probes:"
+  a drift check --provider llmao --model "$WORKER_MODEL" | python3 -c "import json,sys; d=json.load(sys.stdin); $show_drift"
+  echo "  a repoint, as a vendor swapping the model behind a name would look: $CHECKER_MODEL against $WORKER_MODEL's baseline"
+  a drift probe --auth gateway --model "$CHECKER_MODEL" >/dev/null
+  a drift check --provider llmao --model "$CHECKER_MODEL" --baseline-model "$WORKER_MODEL" | python3 -c "import json,sys; d=json.load(sys.stdin); $show_drift"
 fi
 
 if has transcript; then
