@@ -40,6 +40,16 @@ use time::{Duration, OffsetDateTime};
 pub const CITATION: &str = "transcript:";
 /// Where sweeps and early erasures say what they dropped, under the root.
 pub const LOG: &str = "state/transcripts.jsonl";
+/// Who observed what a record holds: the harness, reporting on itself, as a transcript
+/// does; a harness may leave out, reorder or invent what it did.
+pub const OBSERVED_BY_HARNESS: &str = "harness";
+/// The egress, in the path of every model call, as a decision context is.
+pub const OBSERVED_BY_EGRESS: &str = "egress";
+
+fn by_harness() -> String {
+    OBSERVED_BY_HARNESS.to_string()
+}
+
 /// The widest range one citation may name, so a typo cannot ask for a billion turns.
 const WIDEST: usize = 10_000;
 
@@ -100,6 +110,9 @@ pub struct Transcript {
     /// After a sweep: each kept turn and the entries holding it as an excerpt.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub excerpts: BTreeMap<usize, Vec<String>>,
+    /// Who observed it: always the harness, a transcript being its own account.
+    #[serde(default = "by_harness")]
+    pub observed_by: String,
 }
 
 impl Transcript {
@@ -131,6 +144,9 @@ pub struct Excerpt {
     /// When it was kept.
     #[serde(with = "time::serde::rfc3339")]
     pub kept_at: OffsetDateTime,
+    /// Who observed it: the harness, as for the transcript it came from.
+    #[serde(default = "by_harness")]
+    pub observed_by: String,
 }
 
 /// What the launcher hands the record at the end of a session.
@@ -181,6 +197,8 @@ pub struct TurnRead {
     pub cited_by: Vec<String>,
     /// Whether it came from an excerpt, the transcript having expired.
     pub excerpt: bool,
+    /// Who observed it: the harness, so a reader weighs it as a self-report.
+    pub observed_by: String,
 }
 
 /// What a transcript looks like to the owner's `show`: the header, and which turns the
@@ -372,6 +390,7 @@ impl Memory {
                     turn_count: turns.len(),
                     turns,
                     excerpts: BTreeMap::new(),
+                    observed_by: by_harness(),
                 };
                 self.put_transcript(&t, Some(&keep.raw)).await?;
                 t
@@ -626,6 +645,7 @@ impl Memory {
             classification: t.classification,
             cited_by,
             excerpt: false,
+            observed_by: t.observed_by.clone(),
         }))
     }
 
@@ -669,6 +689,7 @@ impl Memory {
                 classification: x.classification,
                 cited_by: vec![x.entry],
                 excerpt: true,
+                observed_by: x.observed_by,
             }));
         }
         Ok(None)
@@ -748,6 +769,7 @@ impl Memory {
                     classification: t.classification,
                     entry: entry.clone(),
                     kept_at: now,
+                    observed_by: t.observed_by.clone(),
                 };
                 let text = serde_json::to_string_pretty(&x).map_err(|e| bad(entry, &e))?;
                 self.store
@@ -1278,6 +1300,10 @@ mod tests {
         assert_eq!(t.role, "assistant");
         assert_eq!(t.cited_by, vec![h]);
         assert!(!t.excerpt);
+        assert_eq!(
+            t.observed_by, OBSERVED_BY_HARNESS,
+            "a transcript is a self-report"
+        );
         assert_eq!(reader.label(), Label::Internal, "raised as a get raises it");
         for uncited in [1, 3, 9] {
             assert!(
@@ -1418,6 +1444,7 @@ mod tests {
         let reader = Memory::open(dir.path()).unwrap();
         let t = reader.transcript_turn(&session, 2).await.unwrap();
         assert!(t.excerpt && t.text.contains("zanzibar"));
+        assert_eq!(t.observed_by, OBSERVED_BY_HARNESS);
         assert_eq!(reader.label(), Label::Internal);
         assert!(matches!(
             reader.transcript_turn(&session, 1).await,

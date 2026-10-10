@@ -497,6 +497,13 @@ contexts, one from before they were kept or a login run through a tunnel the egr
 cannot see into, is replayed from its transcript instead, the harness's own account, and
 the run says `source: transcript`.
 
+Every record of what a session did says who observed it, as `observed_by`. A transcript,
+each turn read by citation and each excerpt says `harness`: the harness's own account,
+which may leave out, reorder or invent what it did. A decision context says `egress`,
+which every model call passes through. A replay run says which it replayed, and `amem
+usage` keeps the same two words in its `source` column, for the egress's metering and a
+harness's own usage report.
+
 Live on 10 October, a Codex session on the gateway's Qwen left four contexts, the
 Responses API requests of 55 to 65 KB each. Replayed on Qwen itself, all four steps
 agreed: the same search, the same two opens, and an answer overlapping the recorded one.

@@ -37,6 +37,13 @@ pub struct Context {
     pub response: String,
     /// The tools the model asked for in it, by name.
     pub tools: Vec<String>,
+    /// Who observed it: the egress, which every model call passes through.
+    #[serde(default = "by_egress")]
+    pub observed_by: String,
+}
+
+fn by_egress() -> String {
+    crate::transcripts::OBSERVED_BY_EGRESS.to_string()
 }
 
 /// The tools a model asked for in a response, in the shapes the providers speak:
@@ -206,6 +213,7 @@ impl Memory {
             request,
             tools: tools_in(&response),
             response,
+            observed_by: by_egress(),
         };
         let bytes = serde_json::to_vec(&c).map_err(|e| Error::Transcript(e.to_string()))?;
         self.store

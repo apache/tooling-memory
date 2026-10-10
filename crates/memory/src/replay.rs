@@ -44,6 +44,9 @@ pub struct Point {
 pub struct Run {
     /// `contexts`, the egress's record; or `transcript`, the harness's own account.
     pub source: String,
+    /// Who observed what was replayed: `egress` for contexts, `harness` for a transcript,
+    /// a self-report.
+    pub observed_by: String,
     pub at: String,
     pub session: String,
     pub destination: String,
@@ -191,6 +194,7 @@ pub async fn replay(
     };
     let run = Run {
         source: "transcript".into(),
+        observed_by: dm_server::transcripts::OBSERVED_BY_HARNESS.into(),
         at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
@@ -298,6 +302,7 @@ pub async fn replay_contexts(
     let pinned: Vec<&Value> = contexts.iter().map(|c| &c.request).collect();
     let run = Run {
         source: "contexts".into(),
+        observed_by: dm_server::transcripts::OBSERVED_BY_EGRESS.into(),
         at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),

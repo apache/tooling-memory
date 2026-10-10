@@ -3167,7 +3167,9 @@ mod tests {
             agent.contexts(agent.session_id()).await.is_err(),
             "an agent does not read them"
         );
-        assert_eq!(owner.contexts(agent.session_id()).await.unwrap().len(), 2);
+        let kept = owner.contexts(agent.session_id()).await.unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|c| c.observed_by == "egress"));
         let receipt = owner.erase(&gone, Reason::Mistaken).await.unwrap();
         assert!(
             receipt
