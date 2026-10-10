@@ -1225,6 +1225,22 @@ fn refuse_invocation(cli: &Cli, root: &Path) -> Fallible {
     Ok(())
 }
 
+/// `amem serve`: the root over MCP on standard input and output, as an author, holding
+/// the task `MEMORY_TASK` names if a launcher set it.
+async fn serve_stdio_cmd(root: &Path, author: Option<String>, manifest: Vec<String>) -> Fallible {
+    let mut m = Memory::open(root)?.with_manifest(manifest);
+    if let Some(a) = author {
+        m = m.with_author(a);
+    }
+    // a harness working a task has it in MEMORY_TASK, as the launcher sets it;
+    // what this session files or writes is judged against that task
+    if let Some(t) = std::env::var("MEMORY_TASK").ok().filter(|t| !t.is_empty()) {
+        m.set_held_task(&t);
+    }
+    mcp::serve_stdio(Arc::new(m)).await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
     refuse_invocation(&cli, &root)?;
@@ -1254,19 +1270,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
             );
             Ok(())
         }
-        Command::Serve { author, manifest } => {
-            let mut m = Memory::open(&root)?.with_manifest(manifest);
-            if let Some(a) = author {
-                m = m.with_author(a);
-            }
-            // a harness working a task has it in MEMORY_TASK, as the launcher sets it;
-            // what this session files or writes is judged against that task
-            if let Some(t) = std::env::var("MEMORY_TASK").ok().filter(|t| !t.is_empty()) {
-                m.set_held_task(&t);
-            }
-            mcp::serve_stdio(Arc::new(m)).await?;
-            Ok(())
-        }
+        Command::Serve { author, manifest } => serve_stdio_cmd(&root, author, manifest).await,
         cmd @ (Command::Launch { .. } | Command::Work { .. } | Command::Inside { .. }) => {
             launch_cmd(&root, cmd).await
         }

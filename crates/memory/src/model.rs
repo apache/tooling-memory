@@ -174,6 +174,26 @@ mod tests {
     }
 
     #[test]
+    fn sampled_requests_pin_temperature_and_length_in_each_shape() {
+        let (_, b) = request_sampled("anthropic", "m", "ask", 0.0, 64);
+        assert_eq!(b["temperature"], 0.0);
+        assert_eq!(b["max_tokens"], 64);
+        let (_, b) = request_sampled("google", "m", "ask", 0.0, 64);
+        assert_eq!(b["generationConfig"]["maxOutputTokens"], 64);
+        let (_, b) = request_sampled("openai", "m", "ask", 0.0, 64);
+        assert_eq!(b["max_completion_tokens"], 64);
+        let (p, b) = request_sampled("llmao", "m", "ask", 0.0, 64);
+        assert_eq!(p, "v1/chat/completions");
+        assert_eq!(
+            (b["temperature"].as_f64(), b["max_tokens"].as_u64()),
+            (Some(0.0), Some(64))
+        );
+        assert_eq!(b["messages"][0]["content"], "ask");
+        // the unsampled request is what it was
+        assert!(request("llmao", "m", "ask").1.get("temperature").is_none());
+    }
+
+    #[test]
     fn answers_are_read_from_each_shape() {
         let a = json!({ "content": [{ "type": "text", "text": "hi" }] });
         assert_eq!(answer_text("anthropic", &a), "hi");
