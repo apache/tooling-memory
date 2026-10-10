@@ -12,7 +12,8 @@ What the gateway answered on 11 October 2026, with a PAT:
 | Route | Answer |
 |---|---|
 | `/v1/models` | `gemma4-26b`, `qwen3-8b`, `qwen3.8-27b`; `qwen3-8b` is listed but often answers that it does not exist |
-| `/v1beta/models` | 404: no Gemini route |
+| `/v1beta/models/<model>:generateContent` | 200 on `gemma4-26b` and `qwen3.8-27b`: the Gemini route is deployed, and Gemini CLI and Antigravity run on it |
+| `/v1beta/models` | 404: the Gemini-shaped model list is not routed |
 | `/v1/mcp/server` | 200 with an empty list: LiteLLM's MCP gateway is reachable, with no servers on it yet |
 
 ## Already in LiteLLM: switch it on or pass it through
@@ -28,8 +29,9 @@ What the gateway answered on 11 October 2026, with a PAT:
 
 ## Configuration or fixes upstream
 
-- **The `/v1beta` Gemini route.** Gemini CLI and Antigravity speak only Gemini's API, so
-  they cannot use the gateway. It still answered 404 on 11 October.
+- **The Gemini-shaped model list.** Generating through `/v1beta` works; listing models
+  there answers 404, so a client that discovers models the Gemini way finds none. Ours
+  lists them through `/v1/models`, so this is small.
 - **LiteLLM's Gemini adapter** drops a tool result sent under the model's role. Our
   egress folds it into the shape the adapter keeps; the upstream issue was closed by a
   stale bot, unfixed.
