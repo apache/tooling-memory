@@ -933,20 +933,25 @@ impl Memory {
         }
     }
 
-    /// File a task in a granted domain. It is born proposed.
+    /// File a task in a granted domain, as a session does: admitted as filed when the
+    /// session holds a task and this one asks for nothing more than that one did, and
+    /// the domain admits its own; otherwise born proposed.
     ///
     /// # Errors
     ///
-    /// An ungranted domain, or a ledger error.
-    pub async fn create_task(&self, mut spec: TaskSpec) -> Result<Created, Error> {
-        spec.domain = self.resolve_domain(
-            Some(&spec.domain)
-                .filter(|d| !d.is_empty())
-                .map(String::as_str),
-        )?;
-        spec.created_by = self.author.clone();
-        spec.classification = spec.classification.max(self.label());
-        Ok(self.ledger.lock().await.create(spec).await?)
+    /// An ungranted domain, or a ledger or policy error.
+    pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
+        let mut l = self.ledger.lock().await;
+        let held = match self.held.get() {
+            Some(id) => l.get(id).await.ok(),
+            None => None,
+        };
+        let filing = if held.is_some() {
+            Filing::Held
+        } else {
+            Filing::Session
+        };
+        self.file_in(&mut l, spec, filing, held.as_ref()).await
     }
 
     /// File a task the system files on the owner's behalf, as the librarian's survey,
@@ -957,9 +962,30 @@ impl Memory {
     ///
     /// As [`Memory::create_task`].
     pub async fn file_own(&self, spec: TaskSpec) -> Result<Created, Error> {
-        let created = self.create_task(spec).await?;
         let mut l = self.ledger.lock().await;
-        let task = self.admit_own_in(&mut l, created.task).await?;
+        self.file_in(&mut l, spec, Filing::Own, None).await
+    }
+
+    /// One filing: the spec stamped with this session's author and label, created, and
+    /// admitted if the policy says so. One decision per filing, logged.
+    async fn file_in(
+        &self,
+        l: &mut Ledger,
+        mut spec: TaskSpec,
+        filing: Filing,
+        parent: Option<&Task>,
+    ) -> Result<Created, Error> {
+        spec.domain = self.resolve_domain(
+            Some(&spec.domain)
+                .filter(|d| !d.is_empty())
+                .map(String::as_str),
+        )?;
+        spec.created_by = self.author.clone();
+        spec.classification = spec.classification.max(self.label());
+        let created = l.create(spec).await?;
+        let task = self
+            .admit_per_policy(l, created.task, filing, parent)
+            .await?;
         Ok(Created {
             task,
             deduplicated: created.deduplicated,
@@ -979,13 +1005,34 @@ impl Memory {
 
     /// Whether tasks a session files from a task it holds are admitted as they are
     /// filed in this domain; see `admit_own` in the grants.
-    fn admits_own(&self, domain: &str) -> bool {
-        self.grants.domains.get(domain).is_some_and(|g| g.admit_own)
-    }
-
-    /// Admit `task` where the domain's grant says so and it is still proposed.
-    async fn admit_own_in(&self, l: &mut Ledger, task: Task) -> Result<Task, Error> {
-        if task.status == dm_ledger::Status::Proposed && self.admits_own(&task.spec.domain) {
+    /// Admit a task as filed where the policy says so: the system's own filings and a
+    /// session's filings from a task it holds, within that task's requirements, where
+    /// the domain admits its own; everything else stays proposed for the owner.
+    async fn admit_per_policy(
+        &self,
+        l: &mut Ledger,
+        task: Task,
+        filing: Filing,
+        parent: Option<&Task>,
+    ) -> Result<Task, Error> {
+        if task.status != dm_ledger::Status::Proposed {
+            return Ok(task);
+        }
+        let d = self.decide(&Input {
+            action: Action::FileTask,
+            principal: self.principal(),
+            domain: task.spec.domain.clone(),
+            filing: Some(filing),
+            task: Some(TaskInput {
+                requirements: task.spec.requirements.clone(),
+                origin: task.spec.origin.clone(),
+            }),
+            parent: parent.map(|p| ParentInput {
+                requirements: p.spec.requirements.clone(),
+            }),
+            write: None,
+        })?;
+        if d.admit {
             Ok(l.admit(&task.id).await?)
         } else {
             Ok(task)
@@ -1040,7 +1087,10 @@ impl Memory {
                     priority: parent.spec.priority,
                 })
                 .await?;
-            children.push(self.admit_own_in(&mut l, created.task).await?);
+            children.push(
+                self.admit_per_policy(&mut l, created.task, Filing::Held, Some(&parent))
+                    .await?,
+            );
         }
         if children.is_empty() {
             return Ok(FanOut {
@@ -1070,7 +1120,9 @@ impl Memory {
             priority: parent.spec.priority,
         })
         .await?;
-        let continuation = self.admit_own_in(&mut l, created.task).await?;
+        let continuation = self
+            .admit_per_policy(&mut l, created.task, Filing::Held, Some(&parent))
+            .await?;
         Ok(FanOut {
             children,
             existing,
@@ -1176,7 +1228,8 @@ impl Memory {
                 priority: root.spec.priority,
             })
             .await?;
-        self.admit_own_in(&mut l, created.task).await
+        self.admit_per_policy(&mut l, created.task, Filing::Held, Some(&root))
+            .await
     }
 
     /// Claim the highest-ranked claimable task in a domain that this session's manifest
@@ -1815,6 +1868,12 @@ mod tests {
             inflated.status,
             Status::Proposed,
             "requirements it does not hold"
+        );
+        let log = std::fs::read_to_string(dir.path().join("state/decisions.jsonl")).unwrap();
+        assert_eq!(log.lines().count(), 4, "one decision per filing:\n{log}");
+        assert!(
+            log.lines().next().unwrap().contains("\"filing\":\"own\""),
+            "{log}"
         );
     }
 

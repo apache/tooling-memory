@@ -285,6 +285,29 @@ where both are. Every decision is also a `policy.decision` span when a collector
 compiled read filter pushed into the index as OPA's partial evaluation would push it,
 which is the production shape; and a model-based read of quarantined bodies.
 
+## The ledger on PostgreSQL
+
+The task ledger runs on SQLite under the root by default, or on PostgreSQL when
+`grants.toml` names a server:
+
+```toml
+[ledger]
+url = "postgres://memory:secret@localhost:5432/memory"
+```
+
+The tables are created on first use, and the semantics are the same on both: every
+operation appends one event and updates the projection in one transaction, `amem
+reindex` replays the events, and on PostgreSQL a claim takes its row with `SELECT ...
+FOR UPDATE SKIP LOCKED`, so many claimers on many connections each get a different task
+and none waits on another's lock. Lease expiry is judged by the ledger's own clock on
+both. The record, the index and the read log stay under the root either way. The
+ledger's own tests and the conformance suite run against both backends: the tests start
+an embedded PostgreSQL, downloaded once into `~/.theseus`, or use the server
+`MEMORY_PG_URL` names, each test on a database of its own; where neither can be had the
+PostgreSQL half is skipped and says so. `cargo nextest run --features
+dm-ledger/pg-test` turns that on. Not yet: one schema per domain, which the reference
+stack's partitioning wants, and task transitions as OpenTelemetry spans.
+
 ## Traces: OpenTelemetry
 
 `amem` sends OpenTelemetry traces beside the usage it records in SQLite, which stays
@@ -306,7 +329,7 @@ how often a batch goes out. A collector that cannot be reached costs under a sec
 exit and never fails a command. The quickest local collector is Jaeger's all-in-one
 image with OTLP on 4318; the reference stack's shape, an OpenTelemetry collector writing
 Parquet queried with DuckDB or DataFusion, takes the same variable. Not yet: task
-transitions from the ledger, which wait on the ledger's move behind two backends.
+transitions from the ledger, now that it sits behind two backends.
 
 ## Is it still true? Validity and decay
 

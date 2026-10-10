@@ -107,6 +107,8 @@ async fn the_seven_steps_pass_over_stdio_with_a_postgres_ledger() {
     let mut text = std::fs::read_to_string(&grants).unwrap();
     text.push_str(&format!("\n[ledger]\nurl = \"{}\"\n", server.url()));
     std::fs::write(&grants, text).unwrap();
+    // init opened the file ledger before the URL was there; from here on nothing may
+    std::fs::remove_file(root.join("state").join("ledger.db")).unwrap();
     let amem = quoted(Path::new(env!("CARGO_BIN_EXE_amem")));
     let index = root.join("state").join("index.db");
     let args = vec![
@@ -138,7 +140,7 @@ async fn the_seven_steps_pass_over_stdio_with_a_postgres_ledger() {
     assert!(tasks > 0, "the steps filed tasks on the server");
     assert!(
         !root.join("state").join("ledger.db").exists(),
-        "no SQLite ledger was opened"
+        "no SQLite ledger was opened once the URL was set"
     );
 }
 

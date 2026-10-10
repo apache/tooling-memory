@@ -140,6 +140,9 @@ pub struct Grants {
     /// Taps the wrapper may run, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub taps: BTreeMap<String, TapGrant>,
+    /// The gates on writes; defaults apply when the table is absent.
+    #[serde(default)]
+    pub gates: Gates,
     /// Where the task ledger lives when not in the SQLite file under the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<LedgerSettings>,
@@ -204,6 +207,7 @@ impl Grants {
             destinations,
             taps: BTreeMap::new(),
             ledger: None,
+            gates: Gates::default(),
         }
     }
 
