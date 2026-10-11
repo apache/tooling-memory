@@ -1581,8 +1581,10 @@ mod tests {
         );
         clock_zero(dir.path());
         let m = Memory::open(dir.path()).unwrap();
+        // a minute on, not now: a host clock that steps back (WSL2 does when it resyncs)
+        // would otherwise leave the transcript unexpired and nothing swept
         let swept = m
-            .sweep_transcripts(OffsetDateTime::now_utc())
+            .sweep_transcripts(OffsetDateTime::now_utc() + Duration::minutes(1))
             .await
             .unwrap();
         (dir, m, k.session, a, b, swept)
