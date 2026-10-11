@@ -220,15 +220,19 @@ def main():
                         cmd += ["--provider", args.provider]
                     cwd = tempfile.mkdtemp(prefix="eval-mem-")
                     out, err, code, secs = run(cmd, cwd, env, args.timeout)
-                    homes = [str(root / "state" / "sandbox" / harness / "**" / "*.jsonl")]
-                    m = re.search(r"empty memory at (\S+)", err)
-                    if m:
-                        homes.append(str(Path(m.group(1)) / "state" / "sandbox" / harness / "**" / "*.jsonl"))
-                    transcript = newest(homes, since)
                     session = None
                     m = re.search(r"session (sess-[a-z0-9]+)", err)
                     if m:
                         session = m.group(1)
+                    roots = [root]
+                    m = re.search(r"empty memory at (\S+)", err)
+                    if m:
+                        roots.append(Path(m.group(1)))
+                    # the record keeps the session's transcript and takes it out of the
+                    # harness's home at the session's end: read the record's copy, by session
+                    homes = [str(r / "record" / "*" / ".transcripts" / f"{session}*.jsonl") for r in roots if session]
+                    homes += [str(r / "state" / "sandbox" / harness / "**" / "*.jsonl") for r in roots]
+                    transcript = newest(homes, since)
                     empty_root = re.search(r"empty memory at (\S+)", err)
                 else:
                     empty_root = None
