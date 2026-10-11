@@ -894,7 +894,14 @@ impl ServerHandler for McpServer {
         let tool = request.name.to_string();
         let arguments = Value::Object(request.arguments.clone().unwrap_or_default());
         if let Some(play) = self.memory.playback() {
-            match play.answer(&tool, &arguments, kind_of(&tool)) {
+            // a tool this server does not have is the router's to refuse, as it was
+            let kind = if self.tool_router.get(&tool).is_some() {
+                kind_of(&tool)
+            } else {
+                tape::Kind::Read
+            };
+            let memory = &self.memory;
+            match play.answer_within(&tool, &arguments, kind, &|l| memory.handles(l)) {
                 tape::Answer::Recorded {
                     result,
                     is_error,

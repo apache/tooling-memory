@@ -695,6 +695,52 @@ mod tests {
             .into_iter()
             .map(|c| c.tool)
             .collect();
-        assert!(!left.contains(&"get".to_string()), "{left:?}");
+        assert_eq!(left, ["t0"], "the write and the get carried it");
+    }
+
+    #[tokio::test]
+    async fn a_short_secret_leaves_the_tape_by_its_id() {
+        let (dir, m, c) = pair().await;
+        let w = c
+            .call("write", json!({"body": "Door code 4417."}))
+            .await
+            .unwrap();
+        let id = w["id"].as_str().unwrap().to_string();
+        c.call("search", json!({"query": "door"})).await.unwrap();
+        c.call("get", json!({"id": id})).await.unwrap();
+        c.close().await.unwrap();
+        let owner = Memory::open(dir.path()).unwrap();
+        owner
+            .erase(&id, dm_core::erasure::Reason::Sensitive)
+            .await
+            .unwrap();
+        let tape = owner.tape(m.session_id()).await.unwrap();
+        assert!(tape.calls.is_empty(), "{:?}", tape.calls);
+    }
+
+    #[tokio::test]
+    async fn a_re_run_under_a_lower_ceiling_is_refused_what_the_tape_holds_above_it() {
+        let (dir, tape, wrote, _) = recorded().await;
+        let rerun = Arc::new(
+            Memory::open(dir.path())
+                .unwrap()
+                .with_author("agent:test")
+                .with_handling_cap(dm_core::Label::Public),
+        );
+        rerun.set_playback(Arc::new(dm_server::tape::Playback::new(tape)));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server_io);
+        let server = McpServer::new(rerun.clone());
+        tokio::spawn(async move {
+            if let Ok(s) = server.serve((sr, sw)).await {
+                let _ = s.waiting().await;
+            }
+        });
+        let (cr, cw) = tokio::io::split(client_io);
+        let again = MemoryClient::connect((cr, cw)).await.unwrap();
+        assert!(
+            again.call("get", json!({"id": wrote["id"]})).await.is_err(),
+            "an internal body is not served to a public re-run from the tape"
+        );
     }
 }

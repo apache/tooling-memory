@@ -1038,7 +1038,7 @@ impl Memory {
             });
         }
         // and the tape calls that served it, for the same reason
-        for c in self.erase_from_tapes(body).await? {
+        for c in self.erase_from_tapes(body, id).await? {
             removed.push(Removed {
                 version: format!("tape call {c}"),
                 digest: digest(body),

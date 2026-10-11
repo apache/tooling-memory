@@ -73,9 +73,9 @@ pub struct RunArgs {
     /// The model; the original's by default.
     #[arg(long)]
     model: Option<String>,
-    /// Whose credential the harness's calls go out on. A subscription login allows one
-    /// run, started by you; repeated runs go on a key or the gateway.
-    #[arg(long, value_enum, default_value = "subscription")]
+    /// Whose credential the harness's calls go out on, said every time: a subscription
+    /// login allows one run, started by you; repeated runs go on a key or the gateway.
+    #[arg(long, value_enum)]
     auth: AuthArg,
     /// Where model calls go under --auth key, as for a launch.
     #[arg(long)]
@@ -251,22 +251,25 @@ fn scored(played: &Played) -> (usize, f64, Vec<serde_json::Value>, bool) {
     (n, alignment, captured, handoff)
 }
 
-/// Where git's own environment points it; cleared, since every call here names the
-/// repository it means, and a git hook that runs amem sets them for another.
-const GIT_PLACES: &[&str] = &[
-    "GIT_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_PREFIX",
-];
-
+/// Git, run on the host against a repository a confined harness could write: with an
+/// environment of nothing but where git is and whose it is, so neither the launcher's
+/// credentials nor a hook's own `GIT_*` reach it, and with the repository's hooks and
+/// fsmonitor off, so nothing the harness planted in `.git` runs here.
 fn git(repo: &Path, args: &[&str]) -> Fallibly<String> {
     let mut cmd = std::process::Command::new("git");
-    for v in GIT_PLACES {
-        cmd.env_remove(v);
+    cmd.env_clear();
+    for keep in ["PATH", "HOME", "SYSTEMROOT", "USERPROFILE"] {
+        if let Some(v) = std::env::var_os(keep) {
+            cmd.env(keep, v);
+        }
     }
+    cmd.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "--no-optional-locks",
+    ]);
     let out = cmd.arg("-C").arg(repo).args(args).output()?;
     if !out.status.success() {
         return Err(format!(
@@ -288,7 +291,9 @@ pub fn commit_of(workdir: &Path) -> Option<(String, bool)> {
     Some((commit, dirty))
 }
 
-/// A detached checkout of `commit` beside `repo`, named for the run.
+/// A clone of `repo` at `commit`, detached, beside the repository and named for the run:
+/// a repository of its own, objects hardlinked rather than borrowed, so git works inside
+/// the sandbox, which mounts the working tree and nothing of the repository it came from.
 fn checkout(repo: &Path, commit: &str, run: &str) -> Fallibly<PathBuf> {
     let repo = std::fs::canonicalize(repo)?;
     let name = repo
@@ -304,30 +309,21 @@ fn checkout(repo: &Path, commit: &str, run: &str) -> Fallibly<PathBuf> {
             repo.display()
         )
     })?;
-    git(
-        &repo,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            &into.display().to_string(),
-            commit,
-        ],
-    )?;
+    if into.exists() {
+        return Err(format!("{} is in the way", into.display()).into());
+    }
+    let to = into.display().to_string();
+    git(&repo, &["clone", "--quiet", "--no-checkout", ".", &to])?;
+    if let Err(e) = git(&into, &["checkout", "--quiet", "--detach", commit]) {
+        remove_checkout(&into);
+        return Err(e);
+    }
     Ok(into)
 }
 
-fn remove_checkout(repo: &Path, into: &Path) {
-    if git(
-        repo,
-        &["worktree", "remove", "--force", &into.display().to_string()],
-    )
-    .is_err()
-    {
-        eprintln!(
-            "memory: the checkout at {} was left; remove it with git worktree remove",
-            into.display()
-        );
+fn remove_checkout(into: &Path) {
+    if std::fs::remove_dir_all(into).is_err() {
+        eprintln!("memory: the checkout at {} was left", into.display());
     }
 }
 
@@ -413,15 +409,33 @@ async fn one(
     i: usize,
 ) -> Fallibly<RunReport> {
     let stamp = time::OffsetDateTime::now_utc().unix_timestamp();
-    let run = format!("rx-{stamp}-{i}");
+    let run = format!("rx-{stamp}-{}-{i}", std::process::id());
     let start = &tape.header.start;
     let (workdir, scratch) = tree_for(repo, start.commit.as_deref(), &args.session, &run)?;
     let home = root.join(RUNS).join(&args.session).join(&run).join("home");
     let play = Arc::new(Playback::new(tape.clone()));
     let h: Harness = harness.into();
     // the tree is put away however the run ends
-    let ran = run_once(root, args, h, model.clone(), &workdir, home, prompt, &play).await;
-    let kept_at = put_away(repo, &workdir, scratch, args.keep_tree);
+    let ran = run_once(
+        root,
+        args,
+        h,
+        model.clone(),
+        &workdir,
+        home.clone(),
+        prompt,
+        &play,
+    )
+    .await;
+    let kept_at = put_away(&workdir, scratch, args.keep_tree);
+    // the run's home held its login's copy and a transcript of what it was served
+    if let Some(run_dir) = home.parent() {
+        std::fs::remove_dir_all(run_dir).ok();
+        // and the session's directory, once no other run is in it
+        if let Some(session_dir) = run_dir.parent() {
+            std::fs::remove_dir(session_dir).ok();
+        }
+    }
     let (exit, output, rerun_session, tokens, seconds) = ran?;
     let played = play.played();
     let (aligned, alignment, captured, handoff) = scored(&played);
@@ -477,7 +491,7 @@ async fn run_once(
             server_provider: None,
         },
         workdir.to_path_buf(),
-        runner_for(backend_of(args.backend, args.unconfined, root, h), root)?,
+        runner_for(backend(args, root, h)?, root)?,
         RunOptions::new(model, SubagentsArg::Harness, Vec::new(), None).home(home),
     )
     .await?;
@@ -500,6 +514,21 @@ async fn run_once(
     Ok((exit, output, id, tokens, seconds))
 }
 
+/// Where a re-run's harness runs: as a launch's does, except that the `wslc` backend,
+/// which a launch hands to its own path, is not one a re-run takes yet; refused rather
+/// than run unconfined.
+fn backend(args: &RunArgs, root: &Path, h: Harness) -> Fallibly<crate::Backend> {
+    let b = backend_of(args.backend, args.unconfined, root, h);
+    if b == crate::Backend::Wslc {
+        return Err(
+            "a re-run does not take the wslc backend yet; run it under WSL with \
+                    --backend namespaces or image, or pass --unconfined"
+                .into(),
+        );
+    }
+    Ok(b)
+}
+
 /// The working tree for a run: a checkout of the commit, or an empty directory made for
 /// the run when the session recorded none, which is the second of the pair.
 fn tree_for(
@@ -509,7 +538,7 @@ fn tree_for(
     run: &str,
 ) -> Fallibly<(PathBuf, Option<PathBuf>)> {
     if let Some(c) = commit {
-        return Ok((checkout(repo, c, run)?, None));
+        return Ok((checkout(repo, c, &format!("{session}-{run}"))?, None));
     }
     eprintln!("memory: {session} recorded no commit; the re-run works in an empty directory");
     // as an empty record is made for an evaluation's baseline
@@ -520,7 +549,7 @@ fn tree_for(
 
 /// Put a run's tree away: an empty directory goes, a checkout is removed unless asked to
 /// stay. Where it stayed, if it did.
-fn put_away(repo: &Path, workdir: &Path, scratch: Option<PathBuf>, keep: bool) -> Option<String> {
+fn put_away(workdir: &Path, scratch: Option<PathBuf>, keep: bool) -> Option<String> {
     if let Some(d) = scratch {
         std::fs::remove_dir_all(d).ok();
         return None;
@@ -528,7 +557,7 @@ fn put_away(repo: &Path, workdir: &Path, scratch: Option<PathBuf>, keep: bool) -
     if keep {
         return Some(workdir.display().to_string());
     }
-    remove_checkout(repo, workdir);
+    remove_checkout(workdir);
     None
 }
 
@@ -547,6 +576,20 @@ fn tokens_of(session: &Session, id: &str) -> Tokens {
             cache_read: t.cache_read_tokens,
         })
         .unwrap_or_default()
+}
+
+/// Drop what the re-runs of `session` left under the root: their reports and any run
+/// directory an interrupted run did not put away. With the tape, on its clock.
+pub fn forget_runs(root: &Path, session: &str) {
+    if !session
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return;
+    }
+    let dir = root.join(RUNS);
+    std::fs::remove_file(dir.join(format!("{session}.jsonl"))).ok();
+    std::fs::remove_dir_all(dir.join(session)).ok();
 }
 
 /// The runs of a session, read back.
@@ -794,5 +837,47 @@ mod tests {
             "{text}"
         );
         assert!(report(dir.path(), "../x").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_on_the_host_runs_nothing_the_harness_planted_and_carries_no_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]).unwrap();
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.org",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "c",
+            ],
+        )
+        .unwrap();
+        // what a confined harness could leave in the working tree's .git
+        let marker = dir.path().join("ran");
+        let script = dir.path().join("planted.sh");
+        std::fs::write(&script, format!("#!/bin/sh\nenv > {}\n", marker.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = repo.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!("[core]\n\tfsmonitor = {}\n", script.display()));
+        std::fs::write(&config, text).unwrap();
+        std::fs::copy(&script, repo.join(".git/hooks/post-checkout")).unwrap();
+        std::fs::write(repo.join("new.txt"), "x").unwrap();
+        let (commit, dirty) = commit_of(&repo).unwrap();
+        assert_eq!(commit.len(), 40);
+        assert!(dirty);
+        let into = checkout(&repo, &commit, "t").unwrap();
+        assert!(!marker.exists(), "a planted fsmonitor or hook ran");
+        remove_checkout(&into);
     }
 }

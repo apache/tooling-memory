@@ -79,7 +79,9 @@ pub async fn sweep(m: &Memory) -> Result<Vec<Swept>, Box<dyn std::error::Error>>
     }
     // and the tapes a re-run is answered from, unless pinned for a benchmark
     for session in m.sweep_tapes(now).await? {
-        eprintln!("memory: the tape of {session} expired and was dropped");
+        // and the reports of its re-runs, which quote what the runs wrote and said
+        crate::reenact::forget_runs(m.root(), &session);
+        eprintln!("memory: the tape of {session} expired and was dropped, with its re-runs");
     }
     // and so do the sources tools brought in, except what a live entry cites
     for id in m.sweep_sources(now).await? {

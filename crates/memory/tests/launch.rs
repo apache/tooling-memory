@@ -991,11 +991,25 @@ fn a_kept_tree_is_the_commit_and_repeated_runs_are_not_a_subscription_s() {
         std::fs::read_to_string(kept.join("steps.txt")).unwrap(),
         "five steps"
     );
-    git_in(
-        &repo,
-        &["worktree", "remove", "--force", kept.to_str().unwrap()],
+    // a repository of its own, so git works in it where only it is mounted
+    assert!(kept.join(".git").is_dir());
+    std::fs::remove_dir_all(&kept).unwrap();
+    // the run's home is gone with the run
+    let runs = root.join("state/reenact").join(&session);
+    assert!(!runs.exists(), "{}", runs.display());
+    let out = amem_with(
+        &root,
+        &bins,
+        &[
+            "reenact",
+            "run",
+            &session,
+            "--auth",
+            "subscription",
+            "--runs",
+            "2",
+        ],
     );
-    let out = amem_with(&root, &bins, &["reenact", "run", &session, "--runs", "2"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("API key or the gateway"));
 }

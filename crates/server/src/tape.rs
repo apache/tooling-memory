@@ -257,10 +257,28 @@ impl Playback {
     /// when this is the next occurrence of the same call there, otherwise by kind, and
     /// the first such call is the first divergence.
     pub fn answer(&self, tool: &str, arguments: &Value, kind: Kind) -> Answer {
+        self.answer_within(tool, arguments, kind, &|_| true)
+    }
+
+    /// As [`Playback::answer`], with a recorded result above what `admits` lets the
+    /// re-run read treated as a call not on the tape: the re-run's own ceiling holds, and
+    /// the live path refuses what the filter would refuse.
+    pub fn answer_within(
+        &self,
+        tool: &str,
+        arguments: &Value,
+        kind: Kind,
+        admits: &dyn Fn(Label) -> bool,
+    ) -> Answer {
         let k = key(tool, arguments);
         let mut st = lock(&self.state);
         let used = st.used.get(&k).copied().unwrap_or(0);
-        let hit = self.by_key.get(&k).and_then(|v| v.get(used)).copied();
+        let hit = self
+            .by_key
+            .get(&k)
+            .and_then(|v| v.get(used))
+            .copied()
+            .filter(|i| admits(self.calls[*i].label));
         let n = st.steps.len() + 1;
         let (answer, matched, served) = match hit {
             Some(i) => {
@@ -478,6 +496,22 @@ impl Memory {
         }
     }
 
+    /// A header for a listing or a sweep: one that does not parse is said and passed
+    /// over, so one torn file stops nothing else.
+    async fn header_or_skip(
+        &self,
+        domain: &str,
+        session: &str,
+    ) -> Result<Option<TapeHeader>, Error> {
+        match self.header_in(domain, session).await {
+            Err(Error::Transcript(e)) => {
+                eprintln!("memory: the tape of {session} has a header that does not parse, left as it is: {e}");
+                Ok(None)
+            }
+            other => other,
+        }
+    }
+
     /// Every tape the record keeps, the owner's view: how each session was started,
     /// how many calls, and whether it is pinned.
     ///
@@ -488,7 +522,7 @@ impl Memory {
         self.owner_only("tapes")?;
         let mut out = Vec::new();
         for (domain, session) in self.tape_sessions().await? {
-            let Some(header) = self.header_in(&domain, &session).await? else {
+            let Some(header) = self.header_or_skip(&domain, &session).await? else {
                 continue;
             };
             let calls = self
@@ -566,7 +600,7 @@ impl Memory {
     pub async fn sweep_tapes(&self, at: OffsetDateTime) -> Result<Vec<String>, Error> {
         let mut swept = Vec::new();
         for (domain, session) in self.tape_sessions().await? {
-            let Some(h) = self.header_in(&domain, &session).await? else {
+            let Some(h) = self.header_or_skip(&domain, &session).await? else {
                 continue;
             };
             if h.pinned {
@@ -608,18 +642,18 @@ impl Memory {
         Ok(swept)
     }
 
-    /// Erase every tape call that carries `body`, as an erased entry's text must not
-    /// outlive it in what a session was served; returns the calls removed, as
-    /// `<session>/<n>`. Matched as decision contexts are.
+    /// Erase every tape call that carries the entry `id` or its `body`, as an erased
+    /// entry's text must not outlive it in what a session was served; returns the calls
+    /// removed, as `<session>/<n>`.
     ///
     /// # Errors
     ///
     /// A store error.
-    pub async fn erase_from_tapes(&self, body: &str) -> Result<Vec<String>, Error> {
+    pub async fn erase_from_tapes(&self, body: &str, id: &str) -> Result<Vec<String>, Error> {
+        // the text, where it is long enough to be its own; and the id, wherever a call
+        // named the entry or served it: its body, its summary, its title
         let probe: String = body.trim().chars().take(160).collect();
-        if probe.chars().count() < 24 {
-            return Ok(Vec::new());
-        }
+        let by_text = probe.chars().count() >= 24;
         let escaped = serde_json::to_string(&probe).unwrap_or_default();
         let escaped = escaped.trim_matches('"').to_string();
         // the result's text is itself JSON inside a JSON string: escaped twice
@@ -642,7 +676,12 @@ impl Memory {
                 else {
                     continue;
                 };
-                if text.contains(&probe) || text.contains(&escaped) || text.contains(&twice) {
+                let carries = text.contains(id)
+                    || (by_text
+                        && (text.contains(&probe)
+                            || text.contains(&escaped)
+                            || text.contains(&twice)));
+                if carries {
                     self.store
                         .remove_object(&domain, Area::Tapes, &[&session, &n])
                         .await?;
@@ -656,6 +695,12 @@ impl Memory {
     /// Whether this session keeps decision contexts: a re-run keeps none.
     pub(crate) fn keeps_contexts(&self) -> bool {
         self.playback.get().is_none()
+    }
+
+    /// Whether this session may read at `label`: at or below its handling.
+    #[must_use]
+    pub fn handles(&self, label: Label) -> bool {
+        label <= lock(&self.session).handling
     }
 
     /// Raise this session's label as a recorded call raised the original's.
@@ -779,7 +824,7 @@ mod tests {
         );
         // erasure takes the call that carried the body, and only it
         assert_eq!(
-            m.erase_from_tapes(body).await.unwrap(),
+            m.erase_from_tapes(body, "mem-nothere").await.unwrap(),
             [format!("{session}/000001.json")]
         );
         assert_eq!(m.tape(&session).await.unwrap().calls.len(), 1);
@@ -795,6 +840,50 @@ mod tests {
             .is_empty());
         assert_eq!(m.sweep_tapes(later).await.unwrap(), vec![session.clone()]);
         assert!(m.tape(&session).await.is_err());
+    }
+
+    #[test]
+    fn a_recorded_result_above_the_re_run_s_ceiling_is_not_served() {
+        let p = Playback::new(tape(vec![call(1, "get", json!({"id": "mem-1"}), 1)]));
+        let below = |l: Label| l <= Label::Public;
+        assert_eq!(
+            p.answer_within("get", &json!({"id": "mem-1"}), Kind::Read, &below),
+            Answer::Live,
+            "internal on the tape, public here: a miss, for the live path to refuse"
+        );
+        assert!(p.played().diverged);
+        assert!(
+            matches!(
+                p.answer("get", &json!({"id": "mem-1"}), Kind::Read),
+                Answer::Recorded { .. }
+            ),
+            "not used up by the miss"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_torn_header_is_passed_over_and_stops_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        m.tape_call("t0", &json!({}), &json!({}), false)
+            .await
+            .unwrap();
+        let other = Memory::open(dir.path()).unwrap();
+        other
+            .tape_call("t0", &json!({}), &json!({}), false)
+            .await
+            .unwrap();
+        let torn = dir.path().join(format!(
+            "record/dom-me/.tapes/{}/header.json",
+            m.session_id()
+        ));
+        std::fs::write(&torn, "{\"session\": ").unwrap();
+        assert_eq!(m.tapes().await.unwrap().len(), 1);
+        let later = OffsetDateTime::now_utc() + Duration::days(31);
+        assert_eq!(
+            m.sweep_tapes(later).await.unwrap(),
+            vec![other.session_id().to_string()]
+        );
     }
 
     #[tokio::test]
