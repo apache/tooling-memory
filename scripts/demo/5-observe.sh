@@ -3,7 +3,7 @@
 # task transitions; the paper's read metrics; vendor-drift probes; and transcripts kept
 # as sources, reached only by citation. Each part runs when this build has it.
 . "$(dirname "$0")/lib.sh"
-act 5 "Watching it" "What the system shows about itself: traces of every model call, read, decision and task transition; the paper's read metrics; probes for a vendor changing a model under its name; transcripts kept as sources; and replay of a session's decisions on another model."
+act 5 "Watching it" "What the system shows about itself: traces of every model call, read, decision and task transition; the paper's read metrics; probes for a vendor changing a model under its name; transcripts kept as sources; and replay of a session's decisions on another model." "the system itself: a loopback OpenTelemetry sink counting spans; the drift probes, run against $WORKER_MODEL and then $CHECKER_MODEL; the egress, whose recorded decision contexts are replayed; and $WORKER_MODEL, replaying a session another model ran."
 has() { a "$1" --help >/dev/null 2>&1; }
 
 say "Traces" "Every model call, read, policy decision and task transition is an OpenTelemetry span, sent when a collector is named. Here a small loopback sink counts them."
@@ -20,7 +20,8 @@ if gateway; then a recall "what did DR-19 decide" --provider llmao --auth gatewa
 unset OTEL_EXPORTER_OTLP_ENDPOINT
 sleep 1; kill "$sink" 2>/dev/null || true
 for name in memory.read policy.decision task.created task.admitted task.invalidated model.call; do
-  printf '  %-18s %s\n' "$name" "$(grep -a -o "$name" "$spans" | wc -l | tr -d ' ')"
+  # whole names only: an attribute such as task.created_by is not a task.created span
+  printf '  %-18s %s\n' "$name" "$(grep -a -o -w "$name" "$spans" | wc -l | tr -d ' ')"
 done
 echo "  (a loopback sink for the demo; the same variable points amem at Jaeger or an OpenTelemetry collector)"
 
@@ -51,7 +52,7 @@ if has transcript; then
       echo "  $s turn $turn, cited by $(a transcript show "$s" | j "', '.join(d['cited']['$turn'])"):"
       a transcript show "$s" --turn "$turn" | j "'    ' + d['role'] + ': ' + d['text'][:160].replace(chr(10), ' ')"
     fi
-    echo "  searching the record for its words finds the entries, never the transcript: $(a search "$s" | j 'len(d)') hits"
+    echo "  search never reaches a transcript: searching for its session id finds $(a search "$s" | j 'len(d)') hits"
     if gateway; then
       say "Frozen-context replay" "The egress recorded what each model call of that session was sent. Sent again with only the model changed, here to $WORKER_MODEL, each decision point is scored against what was done."
       # the session just shown: a harness at work, whose recorded calls go back where

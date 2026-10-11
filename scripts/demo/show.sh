@@ -2,7 +2,7 @@
 # short description of what is about to be shown, so a transcript reads as a script.
 # Sourced by scripts/demo.sh (act 1) and scripts/demo/lib.sh (the others).
 #
-#   act <n> "<title>" "<what the act shows>"
+#   act <n> "<title>" "<what the act shows>" "<who acts in it>"
 #   say "<title>" "<what the step shows>"        numbered <act>.<step>
 #
 # Bold on a terminal only, so a captured transcript is plain text.
@@ -16,6 +16,7 @@ act() {
   printf '\n'; _rule =
   printf '%sAct %s · %s%s\n' "$_b" "$1" "$2" "$_r"
   _wrap 0 "${3:-}"
+  [ -n "${4:-}" ] && { printf '\n'; _wrap 0 "Actors: $4"; }
   _rule =
 }
 say() {

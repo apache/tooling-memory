@@ -2,7 +2,7 @@
 # The close: what the demo did not show, and what it showed only at demo scale, read
 # from the README's own lists so the two never disagree.
 . "$(dirname "$0")/lib.sh"
-act 7 "What this is not, yet" "A proof of concept: the paper's contracts are built and exercised, the stores behind them are the simplest that hold them on one laptop. The two lists at the top of the README, read from it."
+act 7 "What this is not, yet" "A proof of concept: the paper's contracts are built and exercised, the stores behind them are the simplest that hold them on one laptop. The two lists at the top of the README, read from it." "you, reading them out."
 python3 - "$here/README.md" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()

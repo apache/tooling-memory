@@ -3,7 +3,7 @@
 # run on a cheap model working what it filed, its rewrite landing curated; an agent
 # proposing an entry for verified and a person approving it; and the gate on the tier.
 . "$(dirname "$0")/lib.sh"
-act 2 "Curation, and the trust tiers" "Memory that is never tended rots. A curation cycle on a checker model surveys the record and files what needs doing; a cheap worker model does the top task through the same tools any agent has, and what it writes lands curated. Then the one step only a person can take: approving an entry for verified."
+act 2 "Curation, and the trust tiers" "Memory that is never tended rots. A curation cycle on a checker model surveys the record and files what needs doing; a cheap worker model does the top task through the same tools any agent has, and what it writes lands curated. Then the one step only a person can take: approving an entry for verified." "the curation cycle, with $CHECKER_MODEL on the gateway as its checker; the librarian, $WORKER_HARNESS on $WORKER_MODEL (agent:$WORKER_HARNESS), a real session doing the task; agent:librarian, played by the demo script through the same tools, proposing an entry for verified; and you, the person who approves it."
 gateway || { echo "skipped: the checker and the librarian run need the gateway (local/.virtual-key)"; exit 0; }
 
 say "One curation cycle" "The survey looks at every entry and files a task for each one that needs work; the checker model reads a sample of summaries against their bodies; contradictions are hunted, canaries checked, and the queue rescored. All of it under a token budget."

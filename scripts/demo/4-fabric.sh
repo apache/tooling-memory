@@ -3,7 +3,7 @@
 # queue along its edges and keeps curation's floor; a harness that would spawn
 # subagents has them filed on the board instead; and the flow is counted.
 . "$(dirname "$0")/lib.sh"
-act 4 "The task fabric" "Work is a shared ledger of tasks with leases and handoffs. A strategy compiles into the rubric that ranks it, the ranking moves along dependencies, and a harness that would spawn subagents files them on the board instead, where any worker can take them."
+act 4 "The task fabric" "Work is a shared ledger of tasks with leases and handoffs. A strategy compiles into the rubric that ranks it, the ranking moves along dependencies, and a harness that would spawn subagents files them on the board instead, where any worker can take them." "you, who file the tasks and verify the strategy; the ledger, which ranks and moves them, not a worker; ${HARNESS:-a harness} on your login (agent:${HARNESS:-...}), the session asked to delegate and later the continuation; and $WORKER_HARNESS on $WORKER_MODEL, the board's worker for each subagent task."
 
 say "A strategy that compiles into the rubric" "An L1 policy entry says what matters this period: work a running task filed comes first, curation keeps a floor. A person verifies it, and the rubric the queue is ranked by is compiled from it."
 strategy=$(a write --kind policy --title "pol-L1-007 This period: subagent work first" <<'POL' | j "d['id']"
@@ -55,7 +55,7 @@ if [ -n "${HARNESS:-}" ]; then
     cont=$(a task tree "$parent" | j "next((c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('continues:') and c['status']=='admitted'), '')")
     open=$(a task tree "$parent" | j "' '.join(c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('task:') and c['status']!='completed')")
     if [ -n "$cont" ] && [ -z "$open" ]; then
-      say "Fan-in" "The continuation waited for both; it runs now, with their handoffs in its prompt, and completes the original task."
+      say "Fan-in" "The continuation waited for both; it runs now, with their handoffs in its prompt, and completes with a handoff of its own. The parent it resumes went back to the pool when its session ended, and stays there."
       ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" --lease-seconds 900 --task "$cont" 2>&1 | grep -E '^memory: (claimed|task)' ) || true
     elif [ -n "$cont" ]; then
       echo "  the continuation $cont still waits for: $open"

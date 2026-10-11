@@ -39,7 +39,7 @@ print("cites: " + ", ".join(r["citations"]))
 PY
 )
 show_recall() { python3 -c "$show"; }
-act 1 "The read path" "A few hundred entries of real decisions and docs in a record of their own. A harness session works one real task through the memory tools, starting from T0 and leaving a handoff, and the paper's read-path claims are measured before and after."
+act 1 "The read path" "A few hundred entries of real decisions and docs in a record of their own. A harness session works one real task through the memory tools, starting from T0 and leaving a handoff, and the paper's read-path claims are measured before and after." "you, the owner of the record (human:demo:$(id -un)), who files the task and erases a note; $harness, a real harness session on your own login, confined in the harness image (agent:$harness); the memory server, which serves its tools and keeps its transcript; the egress, the only way out, which meters its model calls; and in 1.5 a small model on the Foundation's gateway, the server's recall deputy."
 say "Before: the record, T0 and retrieval" "What a fresh session would load, T0, against the whole corpus, and how well search finds known items, before any session has run."
 "$memory" --root "$root" savings --query "$question" | sed -n '1,12p'
 say "Recall with no model behind it" "With no model of its own, the server answers a question with a pack of the best sections, cited, and leaves the synthesis to the caller."
@@ -55,8 +55,8 @@ work=$(mktemp -d)
 say "Erasure" "An entry written in error is erased by the owner: the body leaves every version, the index and what sessions were sent; a stub and a receipt remain, and search no longer finds it."
 gone=$(echo "A note that should never have been written: the demo passphrase is kestrel-91." \
   | "$memory" --root "$root" write --title "Written in error" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
-"$memory" --root "$root" erase "$gone" --reason mistaken | sed -n '1,14p'
-echo "search for the passphrase after the erasure: $("$memory" --root "$root" search "kestrel-91")"
+"$memory" --root "$root" erase "$gone" --reason mistaken | python3 "$here/scripts/demo/receipt.py"
+echo "  search for the passphrase after the erasure: $("$memory" --root "$root" search "kestrel-91")"
 if [ -n "${LLMAO_KEY:-}" ]; then
   say "Recall through the gateway" "Now with a small model of the server's own on the Foundation's gateway: it reads the pack and a cited brief comes back."
   "$memory" --root "$root" recall "$question" --provider llmao --auth gateway ${RECALL_MODEL:+--model "$RECALL_MODEL"} | show_recall || true
