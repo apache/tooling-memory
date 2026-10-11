@@ -19,6 +19,11 @@ and from llmao at `266122c`. What the gateway answered that day, with a PAT:
 | `/v1beta/models` | 404: the Gemini-shaped model list is not routed |
 | `/v1/mcp/server` | 200 with an empty list: the proxy's MCP registry is reachable, with no servers on it yet |
 
+Each proposal ends with potential implementation details, naming the proxy's own
+setting where one exists. The setting names are from LiteLLM's documentation and should
+be checked against the version the gateway runs, which llmao reads from the proxy's
+readiness endpoint.
+
 What llmao already has, and these proposals build on: Apache identity on every key,
 keys per project, user and purpose, budgets per project, `drop_params`, and a health
 roll-up per model on its own pages.
@@ -47,6 +52,18 @@ shared backend where a PAT's owner can query their own traces can come later.
 **Ours.** The launcher's egress sends `traceparent` and `baggage` on every request and
 records the gateway's request id on its span.
 
+**Potential implementation details.**
+
+- LiteLLM's OpenTelemetry callback, `litellm_settings: callbacks: ["otel"]`, configured
+  by `OTEL_EXPORTER`, `OTEL_ENDPOINT` and `OTEL_HEADERS`, with `OTEL_SERVICE_NAME` set to
+  `llm.apache.org`. It continues an incoming `traceparent`, so the gateway's spans join
+  the caller's trace without code in llmao.
+- An OpenTelemetry Collector between the proxy and the backend, with a `filter` or
+  `transform` processor that drops or renames the proxy's internal spans and strips
+  prompt and response attributes, so what leaves is llmao's contract.
+- The request id the proxy already returns, `x-litellm-call-id`, documented as llmao's
+  request id; llmao can rename it at its vhost if the name should stay hidden.
+
 ## 2. Sessions as a caller the gateway can tell apart
 
 **Why.** A key is per project, user and purpose. A fleet of agents runs on one
@@ -71,6 +88,20 @@ session-scoped token later.
 **Ours.** The egress already holds the PAT so that a harness never sees it; it would set
 the session id, strip any the harness sends, and later do the exchange.
 
+**Potential implementation details.**
+
+- The session id rides on the proxy's own fields: `litellm_session_id` in the request,
+  which its spend logs and UI group by, and `tags`, or the `x-litellm-tags` header, for
+  the task. A small pre-call hook in llmao maps W3C `baggage` onto them, so callers
+  speak the standard and never the proxy's names.
+- Limits per key are parameters of the proxy's key API that llmao already calls to
+  issue PATs: `max_budget` with `budget_duration`, and `tpm_limit`, `rpm_limit` and
+  `max_parallel_requests`. Automation keys would get them by default.
+- The session token is llmao code over the same key API: on a token exchange, llmao
+  checks the PAT and mints a virtual key with a short `duration`, the PAT's team, the
+  session in its `metadata`, and its own limits; revoking it is a key delete. No new
+  store, and the proxy enforces it like any key.
+
 ## 3. A model list that tells the truth
 
 **Why.** A harness discovers models from the list and fails on the first call to one
@@ -84,6 +115,23 @@ pages. Each alias also names the version it points at, a versioned name or a fie
 change of version is visible. The Gemini-shaped list at `/v1beta/models` is routed like
 the rest. Logprobs pass through where vLLM returns them: they are the most sensitive
 drift signal there is, and nothing else shows a model changing before its answers do.
+
+**Potential implementation details.**
+
+- llmao's model status already decides "in service"; the same loop can remove a
+  deployment that fails its probes from the proxy, with `/model/delete`, and push it
+  back with `/model/new` when it recovers, which llmao already uses. The proxy's
+  `general_settings: background_health_checks` with `health_check_interval`, and the
+  router's `allowed_fails` and `cooldown_time`, keep a failing deployment out of
+  routing in between, but not out of the list.
+- Versions in the `model_info` llmao sends with `/model/new`, such as `version` and
+  `base_model`, which the proxy serves on `/v1/model/info`; or versioned model names with
+  the alias kept as a second name.
+- `logprobs` and `top_logprobs` are OpenAI parameters the proxy passes to `hosted_vllm`
+  and vLLM honours; the check is that `drop_params` does not drop them for these
+  deployments.
+- The Gemini-shaped list is a small route in llmao or its vhost that answers
+  `GET /v1beta/models` from `/v1/models`, in Gemini's shape.
 
 ## 4. Compatibility for harnesses, fixed once in the gateway
 
@@ -104,6 +152,19 @@ spent working rather than debugging.
 move the tool result to the user's role, cap output at the model's room, map effort to
 the nearest level the model takes. Each is a few lines with a test, and the upstream fix
 where there is one: the Gemini translation's issue was closed by a stale bot, unfixed.
+
+**Potential implementation details.**
+
+- One `CustomLogger` in llmao with an `async_pre_call_hook`, registered under
+  `litellm_settings: callbacks`, that rewrites the request before it is routed: fold a
+  late system message into the first, move a Gemini tool result to the user's role, clamp
+  `max_tokens` to the model's room, and map `reasoning_effort` to the nearest level the
+  model takes. Each is a few lines with a test.
+- `litellm_settings: modify_params: true` already fixes some message shapes for some
+  providers; whether it covers these four on `hosted_vllm` is worth one test before the
+  hook is written.
+- The Gemini translation bug is also worth an upstream fix, since the hook only works
+  around it.
 
 ## 5. Tool servers: what the registry needs to hold
 
@@ -137,6 +198,23 @@ egress, logged with its policy decision, and labelled, where today a harness's t
 reach the record only through its own transcript, a self-report. What a tool returns is
 data, never instructions: the memory server's write scan applies before any of it is
 written to the record.
+
+**Potential implementation details.**
+
+- Servers registered in the proxy's MCP gateway, in its `mcp_servers` configuration or
+  through its API, each pointing at its own host.
+- Grants through the proxy's object permissions on keys and teams, which name the MCP
+  servers a key may reach; llmao sets them as it issues keys, private by default. Where
+  the deployed version cannot narrow to single tools, llmao's seam filters the tool
+  list.
+- Pinned definitions are llmao code: at registration it records a digest of the
+  server's tool list and descriptions, and a server whose list changes is taken out of
+  the registry until a person approves the new digest.
+- The label is registry metadata llmao keeps beside each server and returns with its
+  results in a header, for a caller's egress to read.
+- Acting as the person: the server receives the caller's identity from llmao, never a
+  shared credential, and holds per-person tokens itself; how the proxy forwards a
+  caller's credential to a server is to be checked against the deployed version.
 
 The memory server itself stays beside the harness, per session, until proposal 2's
 session token exists; before then, a hosted read-only search over public entries is the
