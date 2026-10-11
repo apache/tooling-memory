@@ -51,8 +51,10 @@ harnesses in two weeks, and it is also why none of it is the production shape.
 - **Smaller pieces.** The search tool has met only a fake of Brave's API, never the live
   provider.
 - **Platforms and CI.** Confinement on macOS is dry-coded: a Seatbelt profile made from
-  the plan, unit-tested on Linux and not yet run on a Mac. No bridge to Gofannon, and CI
-  has not run since a billing failure; every change is gated locally by `make check`.
+  the plan, unit-tested on Linux and not yet run on a Mac. The bridge to Gofannon is
+  built against its REST surface and a fake of it, not yet a live deployment, and on its
+  session cookie, the only credential Gofannon issues. CI has not run since a billing
+  failure; every change is gated locally by `make check`.
 
 ### What is built but works only at demo scale
 
@@ -205,6 +207,7 @@ Each part is described in [local/README.md](local/README.md) under its own headi
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without | `savings`, `golden`, `scripts/eval.py` |
 | Interchange | Bundles at or below a label, erasure with a stub and a receipt, taps as WASI components | `export`, `import`, `erase`, `tap` |
 | Tools | Fetch and search as taps an agent calls mid-turn: every request decided by the policy at the session's label, answers scanned and kept as sources | `tool`, `source`; MCP `fetch`, `web_search` |
+| Gofannon | Its deployed agents as a tool tap on the same terms: listed, run, read back; and a worker that runs one on the ledger's tasks, its result filed as the handoff | `gofannon agents`, `gofannon work`; MCP `gofannon` |
 | Traces | OpenTelemetry spans for model calls, reads, policy decisions and task transitions, to any OTLP collector | `OTEL_EXPORTER_OTLP_ENDPOINT` |
 
 From the command line:

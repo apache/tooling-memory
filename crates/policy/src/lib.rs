@@ -177,6 +177,11 @@ pub struct TapGrant {
     /// The classification what a tool returns is kept at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub results: Option<Label>,
+    /// Every call of the tool goes out, its answer kept as a source but never answered
+    /// from: for a tool whose answer changes from one call to the next, as a run's
+    /// state does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh: bool,
 }
 
 /// Hosts a tool may reach at a higher label than its own ceiling.

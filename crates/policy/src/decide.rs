@@ -988,6 +988,7 @@ mod tests {
                 loopback: false,
                 config: None,
                 results: None,
+                fresh: false,
             },
         );
         g

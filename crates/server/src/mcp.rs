@@ -143,6 +143,25 @@ pub struct FetchParams {
     pub url: String,
 }
 
+/// Parameters of `gofannon`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct GofannonParams {
+    /// `agents` to list what is deployed, `run` to run one and wait a while for it,
+    /// `start` to start one and come back later, `status` to read a run, `stop` to stop
+    /// one.
+    pub op: String,
+    /// The deployed agent's name, for `run` and `start`.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// The agent's input, a JSON object in its input schema, for `run` and `start`. It
+    /// leaves this machine, so it carries nothing you read from memory above public.
+    #[serde(default)]
+    pub input: Option<Value>,
+    /// The run, for `status` and `stop`.
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
 /// Parameters of `web_search`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct SearchWebParams {
@@ -408,7 +427,7 @@ const READS: &[&str] = &[
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
-const OUTSIDE: &[&str] = &["fetch", "web_search"];
+const OUTSIDE: &[&str] = &["fetch", "web_search", "gofannon"];
 
 fn kind_of(tool: &str) -> tape::Kind {
     if READS.contains(&tool) {
@@ -576,6 +595,29 @@ impl McpServer {
         let v = self
             .memory
             .use_tool("fetch", json!({ "url": p.0.url }))
+            .await
+            .map_err(mcp_err)?;
+        ok(v)
+    }
+
+    #[tool(
+        description = "Gofannon's deployed agents, through the memory server: list them with their input schemas (`agents`), run one on an input and wait up to half a minute for its result (`run`), or `start` one and read it later with `status`, or `stop` it. Every request is checked against the policy at your session's label, since the input leaves this machine; what comes back is scanned and kept as a source. Cite what you use as its `cite_as`."
+    )]
+    async fn gofannon(&self, p: Parameters<GofannonParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let mut args = json!({ "op": p.op });
+        if let Some(a) = p.agent {
+            args["agent"] = json!(a);
+        }
+        if let Some(i) = p.input {
+            args["input"] = i;
+        }
+        if let Some(r) = p.run_id {
+            args["run_id"] = json!(r);
+        }
+        let v = self
+            .memory
+            .use_tool("gofannon", args)
             .await
             .map_err(mcp_err)?;
         ok(v)

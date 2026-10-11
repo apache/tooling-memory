@@ -183,26 +183,15 @@ impl Memory {
     /// session may not read the tool's results label, or the answer is held;
     /// [`Error::Tool`] when the tool fails or a request it needed was refused.
     pub async fn use_tool(self: &Arc<Self>, tool: &str, args: Value) -> Result<Value, Error> {
-        let grant = self
-            .grants
-            .taps
-            .get(tool)
-            .filter(|g| g.tool)
-            .ok_or_else(|| {
-                Error::Denied(format!(
-                    "no tool {tool} is granted; the owner adds [taps.{tool}] with tool = true"
-                ))
-            })?;
-        let label = grant.results.unwrap_or(Label::Public);
-        if label > self.grants.handling {
-            return Err(Error::Denied(format!(
-                "{tool}'s results are {label}, above what this root handles"
-            )));
-        }
+        let (grant, label) = self.tool_grant(tool)?;
         let id = source_id(tool, &args);
         let now = OffsetDateTime::now_utc();
         if let Some(s) = self.source(&grant.domain, &id).await? {
-            if !s.held && s.retain_until > now && lock(&self.session).observe(s.classification) {
+            if !s.held
+                && !grant.fresh
+                && s.retain_until > now
+                && lock(&self.session).observe(s.classification)
+            {
                 return Ok(served(&s, true));
             }
         }
@@ -260,6 +249,28 @@ impl Memory {
             )));
         }
         Ok(served(&s, false))
+    }
+
+    /// A tool's grant and its results label, when it is granted as a tool and this
+    /// root handles what it returns.
+    fn tool_grant(&self, tool: &str) -> Result<(&dm_policy::TapGrant, Label), Error> {
+        let grant = self
+            .grants
+            .taps
+            .get(tool)
+            .filter(|g| g.tool)
+            .ok_or_else(|| {
+                Error::Denied(format!(
+                    "no tool {tool} is granted; the owner adds [taps.{tool}] with tool = true"
+                ))
+            })?;
+        let label = grant.results.unwrap_or(Label::Public);
+        if label > self.grants.handling {
+            return Err(Error::Denied(format!(
+                "{tool}'s results are {label}, above what this root handles"
+            )));
+        }
+        Ok((grant, label))
     }
 
     async fn put_source(&self, s: &Source) -> Result<(), Error> {

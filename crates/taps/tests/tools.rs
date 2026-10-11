@@ -29,8 +29,12 @@ mod common;
 fn component(tool: &str) -> PathBuf {
     static FETCH: OnceLock<PathBuf> = OnceLock::new();
     static SEARCH: OnceLock<PathBuf> = OnceLock::new();
+    static GOFANNON: OnceLock<PathBuf> = OnceLock::new();
     match tool {
         "fetch" => FETCH.get_or_init(|| common::build("tap-fetch")).clone(),
+        "gofannon" => GOFANNON
+            .get_or_init(|| common::build("tap-gofannon"))
+            .clone(),
         _ => SEARCH.get_or_init(|| common::build("tap-search")).clone(),
     }
 }
@@ -334,4 +338,174 @@ async fn search_carries_the_credential_in_the_header_its_grant_names() {
     let path = &seen.paths()[0];
     assert!(path.starts_with("/res/v1/web/search?"), "{path}");
     assert!(path.contains("import"), "{path}");
+}
+
+// ---- Gofannon: its deployed agents, listed, run and read back ----
+
+/// A fake Gofannon: one deployed agent, a run that is running when first asked after
+/// and done the next time.
+async fn fake_gofannon() -> (u16, Seen) {
+    use axum::routing::post;
+    let seen = Seen::default();
+    let polls = Arc::new(Mutex::new(0usize));
+    let deployments = |State(seen): State<Seen>, uri: axum::http::Uri, headers: HeaderMap| async move {
+        seen.note(&uri, &headers);
+        Json(
+            json!([{"friendlyName": "triage", "agentId": "a1", "description": "Triage an issue",
+            "inputSchema": {"issue": "string"}, "outputSchema": {"label": "string"}}]),
+        )
+    };
+    let start = |State(seen): State<Seen>, uri: axum::http::Uri, headers: HeaderMap| async move {
+        seen.note(&uri, &headers);
+        (
+            axum::http::StatusCode::ACCEPTED,
+            Json(json!({"runId": "run-1"})),
+        )
+    };
+    let run = move |State(seen): State<Seen>, uri: axum::http::Uri, headers: HeaderMap| {
+        let polls = polls.clone();
+        async move {
+            seen.note(&uri, &headers);
+            let n = {
+                let mut p = polls.lock().unwrap();
+                *p += 1;
+                *p
+            };
+            let status = if n == 1 { "running" } else { "completed" };
+            Json(
+                json!({"runId": "run-1", "agentName": "triage", "status": status,
+                "result": (n > 1).then(|| json!({"label": "bug"})), "error": null,
+                "events": [{"type": "log", "text": "read the issue"}]}),
+            )
+        }
+    };
+    let app = Router::new()
+        .route("/deployments", get(deployments))
+        .route("/rest/triage/start", post(start))
+        .route("/runs/run-1", get(run))
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, seen)
+}
+
+fn root_with_gofannon(dir: &Path, port: u16) -> (Arc<Memory>, Arc<Memory>) {
+    let (owner, _) = root_with_tools(dir, port);
+    drop(owner);
+    let grants_path = dir.join(dm_server::GRANTS_FILE);
+    let mut grants = Grants::load(&grants_path).unwrap();
+    grants.taps.insert(
+        "gofannon".into(),
+        TapGrant {
+            domain: "dom-me".into(),
+            hosts: vec!["127.0.0.1".into()],
+            ceiling: Label::Public,
+            tool: true,
+            loopback: true,
+            methods: vec!["GET".into(), "POST".into()],
+            credential: Some("GOFANNON_SID".into()),
+            credential_header: Some("Cookie".into()),
+            config: Some(
+                json!({"base": format!("http://127.0.0.1:{port}"), "wait_seconds": 10}).to_string(),
+            ),
+            results: Some(Label::Public),
+            fresh: true,
+            ..TapGrant::default()
+        },
+    );
+    std::fs::write(&grants_path, grants.render().unwrap()).unwrap();
+    let open = |author: Option<&str>| {
+        let m = Memory::open(dir).unwrap();
+        let m = Arc::new(match author {
+            Some(a) => m.with_author(a),
+            None => m,
+        });
+        m.set_tools(Arc::new(Taps));
+        m
+    };
+    (open(None), open(Some("agent:test")))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gofannon_s_agents_are_listed_run_and_read_back_with_the_cookie_kept_from_the_tool() {
+    let (port, seen) = fake_gofannon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, agent) = root_with_gofannon(dir.path(), port);
+    let listed = agent
+        .use_tool("gofannon", json!({"op": "agents"}))
+        .await
+        .unwrap();
+    assert_eq!(listed["agents"][0]["name"], "triage");
+    assert_eq!(listed["agents"][0]["input_schema"]["issue"], "string");
+    let done = agent
+        .use_tool(
+            "gofannon",
+            json!({"op": "run", "agent": "triage", "input": {"issue": "Import fails"}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(done["result"]["label"], "bug");
+    assert_eq!(done["run_id"], "run-1");
+    // read again, and again it goes out: a run's state is never answered from a source
+    let again = agent
+        .use_tool("gofannon", json!({"op": "status", "run_id": "run-1"}))
+        .await
+        .unwrap();
+    assert_eq!(again["cached"], false);
+    let paths = seen.paths();
+    assert_eq!(
+        paths,
+        [
+            "/deployments",
+            "/rest/triage/start",
+            "/runs/run-1",
+            "/runs/run-1",
+            "/runs/run-1"
+        ]
+    );
+    assert_eq!(
+        seen.header("cookie"),
+        vec![KEY; 5],
+        "the cookie on every request"
+    );
+    assert!(seen.header("authorization").is_empty());
+    // a name that is not one segment goes nowhere
+    assert!(agent
+        .use_tool(
+            "gofannon",
+            json!({"op": "start", "agent": "../admin", "input": {}})
+        )
+        .await
+        .is_err());
+    assert_eq!(seen.paths().len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_above_the_ceiling_starts_no_gofannon_run() {
+    let (port, seen) = fake_gofannon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, agent) = root_with_gofannon(dir.path(), port);
+    let w = owner
+        .write(WriteRequest {
+            body: "The deploy key rotates on Fridays.\n".into(),
+            classification: Some(Label::Internal),
+            ..WriteRequest::default()
+        })
+        .await
+        .unwrap();
+    agent.get(&w.id).await.unwrap();
+    let err = agent
+        .use_tool(
+            "gofannon",
+            json!({"op": "start", "agent": "triage", "input": {"issue": "the key"}}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Tool(m) if m.contains("has read internal entries")),
+        "{err}"
+    );
+    assert!(seen.paths().is_empty(), "{:?}", seen.paths());
 }
