@@ -412,15 +412,38 @@ impl Memory {
         origin: &str,
     ) -> Result<Option<Transcript>, Error> {
         for t in self.transcripts_in(domain).await? {
-            let ours = t.session == self.session_id
-                || t.session
-                    .strip_prefix(&self.session_id)
-                    .is_some_and(|r| r.starts_with('-'));
-            if ours && t.origin == origin {
+            if self.is_ours(&t) && t.origin == origin {
                 return Ok(Some(t));
             }
         }
         Ok(None)
+    }
+
+    /// Where the harness left each transcript this session kept, relative to its private
+    /// home: the copies the record now holds, which the launcher may take out of the
+    /// home at the session's end.
+    ///
+    /// # Errors
+    ///
+    /// A store error, or a header that does not parse.
+    pub async fn kept_origins(&self) -> Result<Vec<String>, Error> {
+        let mut out = Vec::new();
+        for domain in self.domains() {
+            for t in self.transcripts_in(&domain).await? {
+                if self.is_ours(&t) && t.state == State::Live && !out.contains(&t.origin) {
+                    out.push(t.origin);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether this session kept `t`: its id is the session's, or the session's with `-n`.
+    fn is_ours(&self, t: &Transcript) -> bool {
+        t.session == self.session_id
+            || t.session
+                .strip_prefix(&self.session_id)
+                .is_some_and(|r| r.starts_with('-'))
     }
 
     /// The id for this session's next transcript in `domain`.

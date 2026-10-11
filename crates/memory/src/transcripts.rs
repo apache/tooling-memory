@@ -155,6 +155,51 @@ pub async fn keep_newest(
     }
 }
 
+/// Take out of the private home `home` each transcript this session's record now holds:
+/// the record is where a transcript lives from here, on its clock and under erasure, and
+/// a copy left in the home would outlive both. Only a regular file inside the home goes,
+/// named by an origin the record keeps; anything else is left where it is. Returns what
+/// was removed.
+pub async fn remove_kept(memory: &Memory, home: &Path) -> Vec<std::path::PathBuf> {
+    let origins = match memory.kept_origins().await {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("memory: the harness's transcripts were left in its home: {e}");
+            return Vec::new();
+        }
+    };
+    let Ok(home) = home.canonicalize() else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for origin in origins {
+        let Some(path) = inside(&home, &origin) else {
+            continue;
+        };
+        if std::fs::remove_file(&path).is_ok() {
+            eprintln!("memory: the harness's copy of {origin} removed; the record keeps it");
+            removed.push(path);
+        }
+    }
+    removed
+}
+
+/// `origin` as a regular file under `home`, which is canonical: a relative path of plain
+/// names, no link on the way or at the end.
+fn inside(home: &Path, origin: &str) -> Option<std::path::PathBuf> {
+    let rel = Path::new(origin);
+    let plain = rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !plain || rel.as_os_str().is_empty() {
+        return None;
+    }
+    let path = home.join(rel);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    let real = path.canonicalize().ok()?;
+    (meta.file_type().is_file() && real == path && real.starts_with(home)).then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +228,61 @@ mod tests {
             again.session, k.session,
             "the same place, the same transcript"
         );
+    }
+
+    #[tokio::test]
+    async fn only_a_kept_transcript_leaves_the_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(&dir.path().join("root"), "human:test:me", "dom-me").unwrap();
+        let home = dir.path().join("home");
+        let p = home.join(".claude/projects/p");
+        std::fs::create_dir_all(&p).unwrap();
+        let line = "{\"type\":\"user\",\"message\":{\"content\":\"Fix the build.\"}}\n";
+        std::fs::write(p.join("other.jsonl"), line).unwrap();
+        std::fs::write(p.join("s.jsonl"), line).unwrap();
+        keep_file(&m, "claude", None, Some(&home), &p.join("s.jsonl"))
+            .await
+            .unwrap();
+        let removed = remove_kept(&m, &home).await;
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(!p.join("s.jsonl").exists(), "the kept copy goes");
+        assert!(
+            p.join("other.jsonl").exists(),
+            "a transcript not kept stays"
+        );
+        assert!(
+            m.transcript(&m.transcripts().await.unwrap()[0].session)
+                .await
+                .is_ok(),
+            "the record still holds it"
+        );
+    }
+
+    #[test]
+    fn an_origin_outside_the_home_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home").canonicalize().ok();
+        assert!(home.is_none(), "not created yet");
+        std::fs::create_dir_all(dir.path().join("home/d")).unwrap();
+        std::fs::write(dir.path().join("outside.jsonl"), "x").unwrap();
+        std::fs::write(dir.path().join("home/d/t.jsonl"), "x").unwrap();
+        let home = dir.path().join("home").canonicalize().unwrap();
+        assert!(inside(&home, "d/t.jsonl").is_some());
+        assert!(inside(&home, "../outside.jsonl").is_none());
+        assert!(inside(&home, "").is_none());
+        assert!(inside(&home, "d").is_none(), "a directory");
+        let abs = dir.path().join("outside.jsonl");
+        assert!(inside(&home, abs.to_str().unwrap()).is_none());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("outside.jsonl"), home.join("l.jsonl"))
+                .unwrap();
+            assert!(inside(&home, "l.jsonl").is_none(), "a link");
+            std::os::unix::fs::symlink(dir.path(), home.join("up")).unwrap();
+            assert!(
+                inside(&home, "up/outside.jsonl").is_none(),
+                "a link on the way"
+            );
+        }
     }
 }

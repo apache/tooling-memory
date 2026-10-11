@@ -791,4 +791,7 @@ fn mining_can_go_through_the_harness_on_a_small_model() {
         titles.iter().any(|t| t == "The import has five steps"),
         "{titles:?}"
     );
+    // mined first, then taken out of the home: the record holds it from here
+    assert!(!projects.join("s.jsonl").exists(), "{stderr}");
+    assert!(stderr.contains("removed; the record keeps it"), "{stderr}");
 }

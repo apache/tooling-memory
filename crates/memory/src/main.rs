@@ -2694,7 +2694,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     if mine_after {
         session.mine(mine_model.as_deref(), mine_via).await?;
     }
-    session.finish(code);
+    session.finish(code).await;
     std::process::exit(code);
 }
 
@@ -2776,7 +2776,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         task,
     };
     let code = work::run(&session, &options).await?;
-    session.finish(code);
+    session.finish(code).await;
     std::process::exit(code);
 }
 
@@ -2852,7 +2852,7 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
             None => work::interactive(&session, &args).await?,
         }
     };
-    session.finish(code);
+    session.finish(code).await;
     std::process::exit(code);
 }
 
@@ -3507,8 +3507,10 @@ impl Session {
         }
     }
 
-    /// Stop serving, report usage, and tell the host the final code where there is one.
-    pub fn finish(self, code: i32) {
+    /// Stop serving, report usage, take the transcripts the record now keeps out of the
+    /// private home, and tell the host the final code where there is one. After mining,
+    /// which reads the home's copy.
+    pub async fn finish(self, code: i32) {
         if let Runner::Unconfined(Some((_, serve))) = &self.runner {
             serve.abort();
         }
@@ -3521,6 +3523,7 @@ impl Session {
             record_reported_usage(&self.p);
         }
         report_usage(&self.p.egress);
+        transcripts::remove_kept(&self.p.memory, &self.p.home).await;
         // the render was this session's alone, and goes with it; here as well as in the
         // guard, since a launch ends in process::exit, which runs no destructors
         std::fs::remove_dir_all(&self.p.projection).ok();
