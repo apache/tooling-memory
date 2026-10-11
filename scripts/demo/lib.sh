@@ -12,8 +12,7 @@ a() { "$memory" --root "$root" "$@"; }
 j() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 # a tool call as an agent: author, tool, JSON arguments, optional held task
 agent() { python3 "$here/scripts/demo/mcp.py" "$memory" "$root" "$@"; }
-act() { printf '\n\033[1m==== %s\033[0m\n' "$*"; }
-say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+. "$here/scripts/demo/show.sh"
 # the gateway: the Foundation's, with the PAT kept in local/.virtual-key
 export LLMAO_URL=${LLMAO_URL:-https://llm.apache.org}
 export LLMAO_KEY=${LLMAO_KEY:-$(cat "$here/local/.virtual-key" 2>/dev/null || true)}

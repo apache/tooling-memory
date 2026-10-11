@@ -245,7 +245,9 @@ the harnesses this one serves.
 `make demo-all HARNESS=claude` runs the whole demo in acts on one record, `DEMO_ROOT`,
 `~/memory-demo` by default, seeded from the Markdown directories in `DEMO_FROM`. The
 acts that need a model use `local/.virtual-key` on llm.apache.org, so they want the
-network; `ACTS="1 4"` runs a subset.
+network; `ACTS="1 4"` runs a subset. Each act and each step opens with a rule, a
+number and a sentence on what it shows; `TRANSCRIPT=demo.txt` also writes the whole
+run there as plain text, to read back with a narrative.
 
 `make demo-ready HARNESS=claude` gets it to a state it can run first: it seeds the
 record when there is none (`RESET=1` starts a demo record over), builds the harness

@@ -3,10 +3,10 @@
 # task transitions; the paper's read metrics; vendor-drift probes; and transcripts kept
 # as sources, reached only by citation. Each part runs when this build has it.
 . "$(dirname "$0")/lib.sh"
-act "Act 5: observability"
+act 5 "Watching it" "What the system shows about itself: traces of every model call, read, decision and task transition; the paper's read metrics; probes for a vendor changing a model under its name; transcripts kept as sources; and replay of a session's decisions on another model."
 has() { a "$1" --help >/dev/null 2>&1; }
 
-say "traces: every model call, read, policy decision and task transition is a span, sent when a collector is named"
+say "Traces" "Every model call, read, policy decision and task transition is an OpenTelemetry span, sent when a collector is named. Here a small loopback sink counts them."
 spans=$(mktemp)
 python3 "$here/scripts/demo/otlp_sink.py" "$spans" 4319 & sink=$!
 sleep 1
@@ -25,12 +25,12 @@ done
 echo "  (a loopback sink for the demo; the same variable points amem at Jaeger or an OpenTelemetry collector)"
 
 if a savings --help 2>/dev/null | grep -q . && a savings | grep -q "Metrics"; then
-  say "the paper's read metrics, from the read and write logs"
+  say "The read metrics" "Fetch-through, retrieval depth per task, prefetch precision and wasted reads, computed from the read and write logs."
   a savings | sed -n '/Metrics/,/^$/p' | sed 's/^/  /'
 fi
 
 if has drift && gateway; then
-  say "vendor drift: a pinned probe battery against a model, compared with its own baseline"
+  say "Vendor drift" "A pinned battery of probes against a model, compared with its own baseline. Two runs of the same model stay quiet; a different model behind the same name fires the detectors."
   show_drift="print('  verdict: ' + d['verdict'] + ('; our side changed: ' + str(d['attribution']['differences']) if d['attribution']['ours_changed'] else '; our side pinned, unchanged')); print('\\n'.join(f\"    {x['name']:<13} {'FIRED' if x['fired'] else 'quiet':<6} {x['catches']}\" for x in d['detectors']))"
   a drift probe --auth gateway --model "$WORKER_MODEL" >/dev/null
   a drift probe --auth gateway --model "$WORKER_MODEL" >/dev/null
@@ -42,7 +42,7 @@ if has drift && gateway; then
 fi
 
 if has transcript; then
-  say "transcripts are sources: kept in the record, never searched, reached only by citation, by turn"
+  say "Transcripts are sources" "A session's transcript is kept in the record on a clock, never searched and never in T0, and reached only through an entry that cites one of its turns."
   a transcript list | j "'\n'.join(f\"  {t['session']}  {t['harness']:<8} {t['turn_count']:>3} turns  {t['classification']:<9} {t['state']:<7} until {t['retain_until'][:10]}\" for t in d) or '  (none kept yet)'"
   s=$(a transcript list | j "next((t['session'] for t in reversed(d) if t['state']=='live'), '')")
   if [ -n "$s" ]; then
@@ -53,7 +53,7 @@ if has transcript; then
     fi
     echo "  searching the record for its words finds the entries, never the transcript: $(a search "$s" | j 'len(d)') hits"
     if gateway; then
-      say "frozen-context replay: the decision contexts the egress recorded, sent again to $WORKER_MODEL"
+      say "Frozen-context replay" "The egress recorded what each model call of that session was sent. Sent again with only the model changed, here to $WORKER_MODEL, each decision point is scored against what was done."
       # the session just shown: a harness at work, whose recorded calls go back where
       # they went, or, for a native Claude session, to the gateway, which speaks Messages
       rs=$s

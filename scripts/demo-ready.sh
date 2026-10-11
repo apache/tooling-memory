@@ -4,7 +4,8 @@
 #   scripts/demo-ready.sh <demo-root> <markdown-dir>...      (make demo-ready)
 #
 # The record: made and seeded when there is none, as the first act would; RESET=1
-# starts it over. The harness image: unpacked into the record, so the sessions run the
+# starts a demo record over (one holding dom-demo, never MEMORY_ROOT's), and a record an
+# older demo made is reported, since today's acts assume what `amem init` now writes. The harness image: unpacked into the record, so the sessions run the
 # harness versions images/harness/Dockerfile pins, built first when there is none and
 # rebuilt when the unpacked one is not the pinned Claude Code (IMAGE_REBUILD=1 forces
 # it). The gateway: its key, and whether it answers. The logins: what `amem doctor`
@@ -25,13 +26,18 @@ need() { printf '  NO    %s\n' "$*"; missing=1; }
 echo "demo-ready · $root"
 
 # ---- the record
+# a demo's record: it holds dom-demo, and it is not the record MEMORY_ROOT names
+is_demo() {
+  grep -q '^\[domains\.dom-demo\]' "$root/grants.toml" 2>/dev/null || return 1
+  [ -z "${MEMORY_ROOT:-}" ] && return 0
+  [ "$(cd "$root" && pwd -P)" != "$(cd "$MEMORY_ROOT" 2>/dev/null && pwd -P)" ]
+}
 if [ "${RESET:-}" = 1 ] && [ -f "$root/grants.toml" ]; then
-  # only a demo's record goes: its owner is human:demo:<you>
-  if grep -q '^owner = "human:demo:' "$root/grants.toml"; then
+  if is_demo; then
     rm -rf "$root"
     echo "  reset: $root removed"
   else
-    need "RESET=1 refused: $root is not a demo record (its owner is not human:demo:...)"
+    need "RESET=1 refused: $root is not a demo record (no dom-demo, or it is MEMORY_ROOT)"
     exit 1
   fi
 fi
@@ -41,7 +47,18 @@ if [ ! -f "$root/grants.toml" ]; then
   python3 "$here/scripts/seed-corpus.py" --root "$root" --memory "$memory" "$@" | tail -n 1
 fi
 n=$(find "$root/record" -mindepth 2 -maxdepth 2 -name '*.md' | wc -l | tr -d ' ')
-ok "record           $n entries"
+# what today's acts assume of the record: the domain admits the system's own filings, as
+# a record `amem init` makes now does; an older demo's record files curation as proposed
+if python3 - "$root/grants.toml" <<'PY'
+import sys, tomllib
+g = tomllib.load(open(sys.argv[1], "rb"))
+sys.exit(0 if g.get("domains", {}).get("dom-demo", {}).get("admit_own") else 1)
+PY
+then
+  ok "record           $n entries"
+else
+  need "record           $n entries, made by an older demo (dom-demo does not admit its own filings): make demo-ready RESET=1"
+fi
 
 # ---- the harness image, unpacked into the record
 pinned=$(sed -n 's/^ARG CLAUDE_CODE=\(.*\)$/\1/p' "$here/images/harness/Dockerfile")
