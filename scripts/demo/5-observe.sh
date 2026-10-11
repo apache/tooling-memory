@@ -54,8 +54,7 @@ if has transcript; then
     echo "  searching the record for its words finds the entries, never the transcript: $(a search "$s" | j 'len(d)') hits"
     if gateway; then
       say "frozen-context replay: the decision contexts the egress recorded, sent again to $WORKER_MODEL"
-      a replay "$s" --limit 4 --model "$WORKER_MODEL" | j "f\"  agreement {d['agreement']:.0%} with the recorded steps, observed by the {d['observed_by']}\n\" + '\n'.join(f\"    turn {p['turn']:>2}: recorded {p['recorded_tool'] or 'a reply'}, replayed {p['replayed_tool'] or 'a reply'}  {'agrees' if p['agrees'] else 'differs'}\" for p in d['points'])" || true
-      echo "  (the recorded side is the harness's own transcript, a self-report; see the README)"
+      a replay "$s" --limit 4 --model "$WORKER_MODEL" | j "f\"  agreement {d['agreement']:.0%} with the recorded steps, observed by the {d['observed_by']}\n\" + '\n'.join(f\"    turn {p['turn']:>2}: recorded {p['recorded_tool'] or 'a reply'}, replayed {p['replayed_tool'] or 'a reply'}  {'agrees' if p['agrees'] else 'differs'}\" for p in d['points']) + ('\n  (the egress saw these calls itself; a run with no contexts would replay the transcript, a self-report, and say so)' if d['observed_by'] == 'egress' else '\n  (no contexts: the recorded side is the transcript, a self-report by the harness)')" || true
     fi
   fi
 fi

@@ -34,6 +34,8 @@ blocker=$(a task create "Migrate the fixtures" --domain dom-demo --body "Needed 
 ranked=$(a task create "Cut the release" --domain dom-demo --priority 8 --after "$blocker" --body "Blocked on the fixtures." | j "d['id']")
 plain=$(a task create "Tidy the README" --domain dom-demo --priority 1 --body "Small." | j "d['id']")
 for t in "$blocker" "$ranked" "$plain"; do a task admit "$t" >/dev/null; done
+echo "  admitted: the blocker rose above what it blocks, a move along the ledger's edge, not a worker's"
+a task list --status admitted | j "'\n'.join(f\"  {t['priority']:>3}  {t['title']:<24} {'(blocks Cut the release)' if t['id'] == '$blocker' else ''}\" for t in (d if isinstance(d, list) else d.get('tasks', [])) if t['id'] in ('$blocker', '$ranked', '$plain'))"
 say "the cycle's rescore: every move a ledger event with its reason"
 a task rescore | j "f\"  rubric {d['rubric']}; curation's share of the completed work {d['maintenance_share']:.0%} against a floor of {d['floor']:.0%}\n\" + '\n'.join(f\"  {c['from']:>3} -> {c['to']:<3} {c['title']:<40} {c['why']}\" for c in d['changed'])"
 

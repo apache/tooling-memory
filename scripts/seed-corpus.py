@@ -11,6 +11,9 @@ trust under the owner, like any other write.
 """
 import argparse, os, re, subprocess, sys
 
+# a directory's index and the form new files are written from: neither is knowledge
+SKIP = {"README.MD", "TEMPLATE.MD"}
+
 def sections(text):
     text = re.sub(r"^---\n.*?\n---\n", "", text, count=1, flags=re.S)  # frontmatter
     title = None
@@ -38,7 +41,7 @@ def main():
     for p in a.paths:
         if os.path.isdir(p):
             for d, _, fs in os.walk(p):
-                files += [os.path.join(d, f) for f in sorted(fs) if f.endswith(".md") and f != "README.md"]
+                files += [os.path.join(d, f) for f in sorted(fs) if f.endswith(".md") and f.upper() not in SKIP]
         elif p.endswith(".md"): files.append(p)
     written = 0
     for f in files:

@@ -84,10 +84,10 @@ a policy lint | j "'\n'.join([f\"  {f['policy']}: {f['kind']}\" for f in d['find
 if gateway; then
   say "spend limits: a destination's budget, checked by the egress before each model call leaves"
   cp "$root/grants.toml" "$root/grants.toml.before-spend"
-  printf '\n[spend.llmao]\nsession_tokens = 1500\n' >> "$root/grants.toml"
-  echo "  grants.toml: [spend.llmao] session_tokens = 1500; the checker on a sample of eight:"
+  printf '\n[spend.llmao]\nsession_tokens = 400\n' >> "$root/grants.toml"
+  echo "  grants.toml: [spend.llmao] session_tokens = 400; the checker on a sample of eight, a few hundred tokens a call:"
   a check --auth gateway --model "$CHECKER_MODEL" --sample 8 2>&1 | grep -o 'spend limit[^"]*' | head -1 | sed 's/^/  refused: /' || true
-  tail -1 "$root/state/decisions.jsonl" | j "f\"  the decision log: {d['action']} {'allowed' if d['allow'] else 'refused'}, {d['reason']}\""
+  grep '"action":"spend"' "$root/state/decisions.jsonl" | tail -1 | j "f\"  the decision log: {d['action']} {'allowed' if d['allow'] else 'refused'}, {d['reason']}\"" || true
   mv "$root/grants.toml.before-spend" "$root/grants.toml"
 fi
 
