@@ -247,6 +247,14 @@ the harnesses this one serves.
 acts that need a model use `local/.virtual-key` on llm.apache.org, so they want the
 network; `ACTS="1 4"` runs a subset.
 
+`make demo-ready HARNESS=claude` gets it to a state it can run first: it seeds the
+record when there is none (`RESET=1` starts a demo record over), builds the harness
+image at its pins when the one unpacked is not and unpacks it into the record, checks
+that the gateway answers with the key, and shows the logins `amem doctor` finds. It
+says what is missing and how to fix it, and ends with the command to run. The demo
+needs no podman where `wslc.exe` builds the image; the local stack does, and
+`make local-up` now says how to fix a shell whose `/run/user/<uid>` is missing.
+
 1. **The read path.** A few hundred entries seeded, a harness working a real task from T0 and a handoff, and the savings measured.
 2. **Curation and the trust tiers.** A curation cycle, a librarian run whose rewrite lands curated, and a person approving an entry for verified.
 3. **The perimeter.** A write that speaks to agents held in quarantine, taint, policy as memory with a scoped exception, the read filter, and a spend limit refusing a call.

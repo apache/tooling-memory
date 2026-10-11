@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test conformance-test conformance deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
+.PHONY: demo-ready podman-ready e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test conformance-test conformance deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
 	local-up local-down local-logs local-key local-memory launch usage golden drift taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
@@ -15,13 +15,22 @@ TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo t
 COMPOSE ?= podman compose
 LOCAL_ENV = local/.env
 
-local-up:
+local-up: podman-ready
 	@test -f $(LOCAL_ENV) || { echo "copy local/.env.example to local/.env and fill it in"; exit 1; }
 	$(COMPOSE) --env-file $(LOCAL_ENV) -f local/compose.yaml up -d
 	@echo "LiteLLM on http://127.0.0.1:4000; next: make local-key"
 
+# Rootless podman keeps its state under XDG_RUNTIME_DIR, /run/user/<uid>, which systemd
+# makes for a login session. A WSL shell may have none, and podman then fails with
+# "mkdir /run/user/1000: permission denied"; lingering makes the directory for good.
+podman-ready:
+	@d="$${XDG_RUNTIME_DIR:-}"; if [ -n "$$d" ] && [ ! -d "$$d" ]; then \
+		echo "podman cannot run in this shell: $$d is missing, since no login session made it." >&2; \
+		echo "Once, then open a new terminal:  sudo loginctl enable-linger $$(id -un)" >&2; \
+		echo "The demo does not need podman: make demo-ready" >&2; exit 1; fi
+
 # LiteLLM shares Postgres's network namespace, so it goes first or down trips over it.
-local-down:
+local-down: podman-ready
 	$(COMPOSE) --env-file $(LOCAL_ENV) -f local/compose.yaml rm -sf litellm
 	$(COMPOSE) --env-file $(LOCAL_ENV) -f local/compose.yaml down
 
@@ -124,6 +133,15 @@ demo: build
 	@set -a; [ -f $(LOCAL_ENV) ] && . ./$(LOCAL_ENV); set +a; \
 	LLMAO_KEY="$${LLMAO_KEY:-$$(cat local/.virtual-key 2>/dev/null)}" \
 	scripts/demo.sh "$(DEMO_ROOT)" $(DEMO_FROM)
+
+# Get the demo to a state it can run: the record seeded (RESET=1 starts it over), the
+# harness image at its pins unpacked into it, the gateway's key checked, the logins
+# shown. Says what is missing and how to fix it; HARNESS= checks that harness's login.
+demo-ready: build
+	@set -a; [ -f $(LOCAL_ENV) ] && . ./$(LOCAL_ENV); set +a; \
+	LLMAO_KEY="$${LLMAO_KEY:-$$(cat local/.virtual-key 2>/dev/null)}" \
+	RESET="$(RESET)" HARNESS="$(HARNESS)" IMAGE="$(IMAGE)" \
+	scripts/demo-ready.sh "$(DEMO_ROOT)" $(DEMO_FROM)
 
 # The whole demo in acts on one record: ACTS="1 2 3 4 5 6" chooses (all by default).
 demo-all: build
