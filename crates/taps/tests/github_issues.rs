@@ -136,6 +136,7 @@ fn root_with_tap(dir: &Path, hosts: Vec<String>) -> (Arc<Memory>, TapGrant) {
         hosts,
         ceiling: Label::Public,
         credential: Some("GH_TOKEN".into()),
+        ..TapGrant::default()
     };
     grants.taps.insert("github-issues".into(), grant.clone());
     std::fs::write(&grants_path, grants.render().unwrap()).unwrap();

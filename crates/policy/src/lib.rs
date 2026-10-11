@@ -137,7 +137,7 @@ pub struct Destination {
 }
 
 /// What one tap may do: a connector the wrapper hosts as a WASI component.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TapGrant {
     /// The domain its proposals land in.
     pub domain: String,
@@ -151,6 +151,41 @@ pub struct TapGrant {
     /// never the secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
+    /// A tool an agent calls mid-turn, such as fetch or search, rather than a
+    /// connector run on a schedule. A tool's hosts may be patterns, `*.apache.org`, and
+    /// every request it makes is decided by the policy's `fetch` action.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool: bool,
+    /// Hosts trusted further: a session may reach them up to this ceiling, above the
+    /// tool's own, since what a URL or a query carries goes only to them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<Trusted>,
+    /// The methods a tool may send; `GET` when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    /// The header the credential goes in, as `X-Subscription-Token`; `Authorization`,
+    /// as a bearer, when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_header: Option<String>,
+    /// Whether a tool may reach this machine's loopback, for a fake in development.
+    /// Private and link-local addresses stay refused either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loopback: bool,
+    /// The tool's own configuration, JSON, handed to every call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    /// The classification what a tool returns is kept at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<Label>,
+}
+
+/// Hosts a tool may reach at a higher label than its own ceiling.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trusted {
+    /// Hosts or patterns, as the tool's own.
+    pub hosts: Vec<String>,
+    /// The highest label of a session that may reach them.
+    pub ceiling: Label,
 }
 
 /// The grants file, as parsed.

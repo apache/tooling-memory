@@ -95,6 +95,7 @@ fn root_with_tap(dir: &Path, hosts: Vec<String>) -> (Memory, Arc<Memory>, TapGra
         hosts,
         ceiling: Label::Internal,
         credential: Some("GH_TOKEN".into()),
+        ..TapGrant::default()
     };
     grants.taps.insert("github-comments".into(), grant.clone());
     std::fs::write(&grants_path, grants.render().unwrap()).unwrap();

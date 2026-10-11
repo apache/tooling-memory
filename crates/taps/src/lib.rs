@@ -28,6 +28,8 @@ use wasmtime_wasi_http::{
 #[allow(missing_docs)] // generated from wit/tap.wit, which carries the documentation
 mod bindings;
 
+pub mod tool;
+
 use bindings::durable_memory::tap::memory::{Done, Filed, Host, Proposal, Task};
 use bindings::Tap;
 
@@ -315,7 +317,7 @@ impl Default for Limits {
     }
 }
 
-fn engine() -> wasmtime::Result<Engine> {
+pub(crate) fn engine() -> wasmtime::Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     // the epoch is what lets a busy guest be interrupted: a timer ticks it, the store
@@ -325,7 +327,7 @@ fn engine() -> wasmtime::Result<Engine> {
 }
 
 /// How often the epoch ticks while a tap runs.
-const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+pub(crate) const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Run a tap once. `memory` is opened by the caller under the tap's author;
 /// `credential` is the value of the variable the grant names, if it was set.

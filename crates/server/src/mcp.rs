@@ -32,9 +32,11 @@ const MAX_LIMIT: usize = 100;
 
 fn mcp_err(e: Error) -> McpError {
     match e {
-        Error::Denied(_) | Error::NotFound(_) | Error::Gone(_) | Error::Moved { .. } => {
-            McpError::invalid_params(e.to_string(), None)
-        }
+        Error::Denied(_)
+        | Error::NotFound(_)
+        | Error::Gone(_)
+        | Error::Moved { .. }
+        | Error::Tool(_) => McpError::invalid_params(e.to_string(), None),
         Error::Ledger(
             dm_ledger::Error::NotFound(_)
             | dm_ledger::Error::WrongState { .. }
@@ -131,6 +133,24 @@ pub struct RecallParams {
 pub struct GetParams {
     /// The entry id, as a hit or T0 names it.
     pub id: String,
+}
+
+/// Parameters of `fetch`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct FetchParams {
+    /// An https URL.
+    pub url: String,
+}
+
+/// Parameters of `web_search`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct SearchWebParams {
+    /// What to search the web for. It leaves this machine, so it carries nothing you
+    /// read from memory above public.
+    pub query: String,
+    /// How many results, at most 20.
+    #[serde(default)]
+    pub count: Option<u32>,
 }
 
 /// Parameters of `transcript_turn`.
@@ -474,6 +494,34 @@ impl McpServer {
             "domain": w.domain,
             "classification": w.classification.to_string(),
         }))
+    }
+
+    #[tool(
+        description = "Fetch a web page as text, through the memory server: every request, each redirect included, is checked against the policy, the page is scanned and kept as a source, and an answer that carries instructions is held for the owner, not served. Cite what you use as its `cite_as`, `source:<id>`. What you have read from memory limits where you may fetch: a URL carries data out."
+    )]
+    async fn fetch(&self, p: Parameters<FetchParams>) -> Result<CallToolResult, McpError> {
+        let v = self
+            .memory
+            .use_tool("fetch", json!({ "url": p.0.url }))
+            .await
+            .map_err(mcp_err)?;
+        ok(v)
+    }
+
+    #[tool(
+        description = "Search the web, through the memory server, as the fetch tool does: the query is checked against the policy before it leaves, the results are scanned and kept as a source. Cite what you use as its `cite_as`. Fetch a result's URL to read it."
+    )]
+    async fn web_search(&self, p: Parameters<SearchWebParams>) -> Result<CallToolResult, McpError> {
+        let mut args = json!({ "query": p.0.query });
+        if let Some(c) = p.0.count {
+            args["count"] = json!(c);
+        }
+        let v = self
+            .memory
+            .use_tool("search", args)
+            .await
+            .map_err(mcp_err)?;
+        ok(v)
     }
 
     #[tool(

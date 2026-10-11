@@ -43,6 +43,7 @@ const ERASURES: &str = ".erasures";
 const TRANSCRIPTS: &str = ".transcripts";
 const EXCERPTS: &str = ".excerpts";
 const CONTEXTS: &str = ".contexts";
+const SOURCES: &str = ".sources";
 const STAMP: &[FormatItem<'_>] =
     format_description!("[year][month][day]T[hour][minute][second].[subsecond digits:6]Z");
 
@@ -108,6 +109,9 @@ pub enum Area {
     /// Decision contexts: what each model call of a session was sent and returned, as
     /// the egress saw it; one directory per session.
     Contexts,
+    /// What a tool, fetch or search, brought in from outside: kept on a clock and
+    /// reached by citation, as transcripts are.
+    Sources,
 }
 
 impl Area {
@@ -116,6 +120,7 @@ impl Area {
             Area::Transcripts => TRANSCRIPTS,
             Area::Excerpts => EXCERPTS,
             Area::Contexts => CONTEXTS,
+            Area::Sources => SOURCES,
         }
     }
 }

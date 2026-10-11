@@ -450,6 +450,74 @@ open model on the gateway returns. A provider that withholds its reasoning entir
 covered by the work prompt, which asks the agent to say in one plain sentence why before
 each decision that changes something, and to say why in its handoff.
 
+## Tools: fetch and search, as taps the agent calls
+
+A confined harness has no network, and the vendors' own web tools do nothing on the
+gateway's open models. Fetch and search are taps instead: WASI components the launcher
+hosts in its own process, outside the sandbox, that an agent calls mid-turn through the
+memory server's `fetch` and `web_search` tools. The calls leave from this machine.
+
+```sh
+make taps-build
+amem tap install fetch taps/target/wasm32-wasip2/release/tap_fetch.wasm
+amem tap install search taps/target/wasm32-wasip2/release/tap_search.wasm
+```
+
+```toml
+[taps.fetch]
+domain = "dom-me"
+tool = true
+ceiling = "public"                 # any session may reach these while it has read only public entries
+hosts = ["docs.python.org", "*.apache.org"]
+
+[taps.fetch.trusted]
+hosts = ["*.apache.org"]           # and these up to internal
+ceiling = "internal"
+
+[taps.search]
+domain = "dom-me"
+tool = true
+ceiling = "public"
+hosts = ["api.search.brave.com"]
+credential = "BRAVE_API_KEY"       # the variable; the host puts its value on the request
+credential_header = "X-Subscription-Token"
+config = '{"endpoint": "https://api.search.brave.com/res/v1/web/search"}'
+```
+
+Every request a tool makes, every redirect hop a request of its own, is decided by the
+policy's `fetch` action before it leaves, and logged. The hard rules no exception lifts:
+https only, a method the grant names (GET when none), not a tap granted as something
+else, and no host that resolves to this machine's network turned inward, loopback,
+private, link-local or shared address space, the cloud metadata address among them.
+Then reach, which an exception can lift for one task: the host must match the tool's
+hosts, `*.apache.org` matching any name under it, and the session's label must be at
+most the ceiling of the hosts it matched. A URL's path and query, and a search's words,
+are data leaving: a session that has read internal entries reaches only the trusted
+hosts, and one that has read restricted entries reaches none. A record policy can narrow
+this further; widening it is the owner's, in the grants. `loopback = true` on a tool lets
+it reach this machine's loopback, for a fake in development.
+
+What a tool returns is data, never instructions. It is scanned as a write is, and from
+anyone but the owner an answer that carries instructions, a broadcast, tool syntax,
+hidden text, a payload or a secret is held for the owner and not served. What is served
+is kept as a source under `record/<domain>/.sources/`, at the tool's `results` label,
+public unless the grant says otherwise, never indexed, and handed to the agent with
+`cite_as: source:<id>` and `observed_by: tap`. The same call again while its source is
+live is answered from it. Sources run on the domain's transcript clock, and the sweep
+every curation cycle runs drops an expired one unless a live entry cites it.
+
+`amem tool fetch '{"url": "https://www.apache.org/foundation/"}'` calls a tool as the
+owner; `amem source list`, `show` and `sweep` look after what tools brought in.
+
+Live on 11 October: fetch read an apache.org page through the policy, kept it as a source
+and answered the same call again from it; a host off the grant, plain http, and the cloud
+metadata address were each refused before anything left, each a line in the decision
+log. Not yet: search against a live provider, since no key was at hand, though both
+Brave's and SearXNG's answers are read; an automated end-to-end test of the tools against
+a fake site; connecting to the address the policy checked, so a name that changes its
+answer between the check and the connection is not caught; and a release for a held
+answer, which the owner reads with `amem source show`.
+
 ## Spend limits: `[spend]` in grants.toml
 
 Spend limits per resource class sit in the perimeter, as the paper has them: in

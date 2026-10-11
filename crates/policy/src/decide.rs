@@ -65,6 +65,9 @@ pub enum Action {
     Promote,
     /// Send a model call: spend against a destination's limits.
     Spend,
+    /// Send a tool's outbound request: a fetch or a search, every redirect hop asked
+    /// again.
+    Fetch,
 }
 
 /// How a task is being filed.
@@ -150,6 +153,34 @@ pub struct SpendInput {
     pub day_tokens: u64,
 }
 
+/// A tool's outbound request, as the host is about to send it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FetchInput {
+    /// The tool tap, by its name in the grants.
+    pub tool: String,
+    /// `GET`, `POST`.
+    pub method: String,
+    /// `https`, `http`.
+    pub scheme: String,
+    /// The host, lowercased, without a port.
+    pub host: String,
+    /// The port, when the URL names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// The path and query. Data leaves in it as surely as in a body.
+    pub path: String,
+    /// Whether any address the host resolves to is private, loopback or link-local:
+    /// a name pointed inward to reach what the machine can reach and the tool may not.
+    pub private_address: bool,
+    /// Whether every address it resolves to is this machine's loopback.
+    pub loopback_address: bool,
+    /// The calling session's label: what it has read, and so what a URL or a query
+    /// from it may carry.
+    pub label: dm_core::Label,
+    /// Which request of the call this is: 0 for the first, then one per redirect.
+    pub hop: u32,
+}
+
 /// One request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Input {
@@ -177,6 +208,9 @@ pub struct Input {
     /// The task this session holds, which an exception may be scoped to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_task: Option<String>,
+    /// The outbound request, for `fetch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch: Option<FetchInput>,
     /// The spend, for `spend`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<SpendInput>,
@@ -511,6 +545,7 @@ mod tests {
             promote: None,
             held_task: None,
             spend: None,
+            fetch: None,
         })
         .unwrap()
     }
@@ -538,6 +573,7 @@ mod tests {
             promote: None,
             held_task: None,
             spend: None,
+            fetch: None,
         })
         .unwrap()
     }
@@ -602,6 +638,7 @@ mod tests {
                 promote: None,
                 held_task: None,
                 spend: None,
+                fetch: None,
             })
             .unwrap();
         assert!(!d.allow, "{d:?}");
@@ -650,6 +687,7 @@ mod tests {
                 promote: None,
                 held_task: None,
                 spend: None,
+                fetch: None,
             })
             .unwrap()
         };
@@ -680,6 +718,7 @@ mod tests {
                 promote: None,
                 held_task: None,
                 spend: None,
+                fetch: None,
             })
             .unwrap()
         };
@@ -702,6 +741,7 @@ mod tests {
             promote: None,
             held_task: None,
             spend: None,
+            fetch: None,
         }
     }
 
@@ -793,6 +833,7 @@ mod tests {
             promote: None,
             held_task: held.map(str::to_string),
             spend: None,
+            fetch: None,
         })
         .unwrap()
     }
@@ -913,6 +954,7 @@ mod tests {
                     session_tokens: session,
                     day_tokens: day,
                 }),
+                fetch: None,
             })
             .unwrap()
         };
@@ -925,6 +967,128 @@ mod tests {
             ask("anthropic", 1_000_000, 1_000_000).allow,
             "no limit set there"
         );
+    }
+
+    fn fetch_grants() -> Grants {
+        let mut g = grants();
+        g.taps.insert(
+            "fetch".into(),
+            crate::TapGrant {
+                domain: "dom-t".into(),
+                hosts: vec!["docs.python.org".into(), "*.apache.org".into()],
+                ceiling: dm_core::Label::Public,
+                credential: None,
+                tool: true,
+                trusted: Some(crate::Trusted {
+                    hosts: vec!["*.apache.org".into()],
+                    ceiling: dm_core::Label::Internal,
+                }),
+                methods: Vec::new(),
+                credential_header: None,
+                loopback: false,
+                config: None,
+                results: None,
+            },
+        );
+        g
+    }
+
+    fn fetch(p: &Policy, f: FetchInput) -> Decision {
+        p.decide(&Input {
+            action: Action::Fetch,
+            principal: Principal {
+                id: "agent:x".into(),
+                class: Class::Agent,
+            },
+            domain: String::new(),
+            filing: None,
+            task: None,
+            parent: None,
+            write: None,
+            promote: None,
+            held_task: None,
+            spend: None,
+            fetch: Some(f),
+        })
+        .unwrap()
+    }
+
+    fn to(host: &str, label: dm_core::Label) -> FetchInput {
+        FetchInput {
+            tool: "fetch".into(),
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: host.into(),
+            port: None,
+            path: "/".into(),
+            private_address: false,
+            loopback_address: false,
+            label,
+            hop: 0,
+        }
+    }
+
+    #[test]
+    fn a_tool_reaches_its_granted_hosts_at_the_label_they_are_trusted_with() {
+        use dm_core::Label::{Internal, Public, Restricted};
+        let p = Policy::builtin(&fetch_grants()).unwrap();
+        assert!(fetch(&p, to("docs.python.org", Public)).allow);
+        assert!(fetch(&p, to("lists.apache.org", Public)).allow, "a pattern");
+        for host in ["evil.example", "apache.org.evil.example", "evilapache.org"] {
+            let d = fetch(&p, to(host, Public));
+            assert!(!d.allow && d.reason.contains("not a host"), "{host}: {d:?}");
+            assert_eq!(d.cites, vec!["pol-fetch-reach".to_string()]);
+        }
+        // a session that has read internal entries: only the trusted hosts
+        let d = fetch(&p, to("docs.python.org", Internal));
+        assert!(!d.allow && d.reason.contains("has read internal"), "{d:?}");
+        assert!(fetch(&p, to("lists.apache.org", Internal)).allow);
+        assert!(!fetch(&p, to("lists.apache.org", Restricted)).allow);
+    }
+
+    #[test]
+    fn a_tool_sends_nothing_in_the_clear_inward_or_by_another_method() {
+        use dm_core::Label::Public;
+        let mut g = fetch_grants();
+        let p = Policy::builtin(&g).unwrap();
+        let clear = FetchInput {
+            scheme: "http".into(),
+            ..to("docs.python.org", Public)
+        };
+        assert!(fetch(&p, clear).reason.contains("https only"));
+        let inward = FetchInput {
+            private_address: true,
+            ..to("docs.python.org", Public)
+        };
+        let d = fetch(&p, inward);
+        assert!(
+            !d.allow && d.reason.contains("does not reach inward"),
+            "{d:?}"
+        );
+        let post = FetchInput {
+            method: "POST".into(),
+            ..to("docs.python.org", Public)
+        };
+        assert!(fetch(&p, post).reason.contains("not a method"));
+        let not_tool = FetchInput {
+            tool: "github-issues".into(),
+            ..to("docs.python.org", Public)
+        };
+        assert!(fetch(&p, not_tool).reason.contains("not granted as a tool"));
+        // loopback, for a fake in development, only when the grant says so
+        let local = FetchInput {
+            scheme: "http".into(),
+            private_address: true,
+            loopback_address: true,
+            ..to("localhost", Public)
+        };
+        assert!(!fetch(&p, local.clone()).allow);
+        if let Some(t) = g.taps.get_mut("fetch") {
+            t.loopback = true;
+            t.hosts.push("localhost".into());
+        }
+        let p = Policy::builtin(&g).unwrap();
+        assert!(fetch(&p, local).allow);
     }
 
     #[test]

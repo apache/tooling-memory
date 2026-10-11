@@ -42,6 +42,7 @@ pub mod prefetch;
 pub mod projection;
 pub mod reads;
 pub mod recall;
+pub mod sources;
 pub mod t0;
 mod taps;
 pub mod transcripts;
@@ -107,6 +108,9 @@ pub enum Error {
     /// by nothing this session may read. Said only of an entry the session could read.
     #[error("gone: {0}")]
     Gone(String),
+    /// A tool tap failed, or a request it needed was refused; in words for the agent.
+    #[error("tool: {0}")]
+    Tool(String),
     /// The recall deputy failed or timed out.
     #[error("deputy: {0}")]
     Deputy(String),
@@ -257,6 +261,8 @@ pub struct Memory {
     scope: OnceLock<ReadFilter>,
     /// How many decision contexts this session has kept.
     contexts_kept: AtomicUsize,
+    /// The tools this session may call, when the launcher hosts them.
+    tools: OnceLock<std::sync::Arc<dyn sources::Tools>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -378,6 +384,7 @@ impl Memory {
             superseded: AtomicUsize::new(0),
             scope: OnceLock::new(),
             contexts_kept: AtomicUsize::new(0),
+            tools: OnceLock::new(),
         })
     }
 
@@ -400,6 +407,7 @@ impl Memory {
             promote: None,
             held_task: None,
             spend: None,
+            fetch: None,
         };
         let f = self
             .policy()
@@ -509,6 +517,7 @@ impl Memory {
                 session_tokens,
                 day_tokens,
             }),
+            fetch: None,
         };
         let d = self.policy().decide(&input)?;
         if !d.allow {
@@ -1101,6 +1110,7 @@ impl Memory {
             }),
             held_task: None,
             spend: None,
+            fetch: None,
         })
     }
 
@@ -1167,6 +1177,7 @@ impl Memory {
             promote: None,
             held_task: None,
             spend: None,
+            fetch: None,
         })?;
         if !decision.allow {
             return Err(self.quarantine(entry.clone(), &decision, &findings).await);
@@ -1569,6 +1580,7 @@ impl Memory {
             promote: None,
             held_task: None,
             spend: None,
+            fetch: None,
         })?;
         if d.admit {
             let admitted = l.admit(&task.id).await?;
@@ -2026,6 +2038,7 @@ impl Memory {
             promote: None,
             held_task: None,
             spend: None,
+            fetch: None,
         })?;
         if !d.allow || self.author != self.grants.owner {
             return Err(Error::Denied(format!(

@@ -74,7 +74,12 @@ These do what the paper says, on one laptop, and each names what replaces it.
   partial evaluation for the read filter, decision logs to telemetry.
 - **The quarantine** is files under `state/`, reviewed by a model on request, released
   by the owner by hand.
-- **Transcripts' citations** are found by scanning a domain's entries on every lookup.
+- **Transcripts' citations** are found by scanning a domain's entries on every lookup,
+  and so are the citations that keep a tool's source past its clock.
+- **Tools** fetch and search from the launcher's own machine, one compiled component per
+  call, with the address resolved once for the policy and again to connect. Production:
+  the same tools as hosted servers on the Foundation's gateway, reached through the
+  egress, with the address pinned.
 - **Cost** is priced from a table the owner keeps by hand, and a task's share is its
   session's spend divided evenly among the tasks it completed. Production: the gateway's
   per-key spend, with each call tagged with its task and trace.
@@ -190,6 +195,7 @@ Each part is described in [local/README.md](local/README.md) under its own headi
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without | `savings`, `golden`, `scripts/eval.py` |
 | Interchange | Bundles at or below a label, erasure with a stub and a receipt, taps as WASI components | `export`, `import`, `erase`, `tap` |
+| Tools | Fetch and search as taps an agent calls mid-turn: every request decided by the policy at the session's label, answers scanned and kept as sources | `tool`, `source`; MCP `fetch`, `web_search` |
 | Traces | OpenTelemetry spans for model calls, reads, policy decisions and task transitions, to any OTLP collector | `OTEL_EXPORTER_OTLP_ENDPOINT` |
 
 From the command line:

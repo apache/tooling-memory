@@ -1,0 +1,20 @@
+package durable-memory:tap@0.1.0;
+
+/// A tool tap: a connector an agent calls mid-turn, through the memory server, and gets
+/// an answer from at once, where a tap proper reconciles on a schedule.
+///
+/// A tool gets outbound HTTP and nothing else: no filesystem, no sockets, no
+/// environment, and no access to the record. Every request it makes, every redirect it
+/// follows included, is decided by the policy before it leaves: the scheme, the method,
+/// the host against the tool's grant, the address the host resolves to, and the label
+/// of what the calling session has read, since a URL or a query is itself data leaving.
+/// A credential the grant names is put on the request by the host; the tool never holds
+/// it. What the tool returns is handed to the memory server, which scans it, keeps it as
+/// a source, and only then gives it to the agent: content from outside is data, never
+/// instructions.
+world tool {
+    /// One call. `config` is the tool's own, as JSON, written by the owner in the
+    /// grant; `args` are the agent's, as JSON. The answer is JSON, in the tool's own
+    /// shape, which its name documents: `fetch` returns a page, `search` a list of hits.
+    export call: func(config: string, args: string) -> result<string, string>;
+}

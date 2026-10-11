@@ -31,6 +31,7 @@ mod replay;
 mod requests;
 mod review;
 mod savings;
+mod sources;
 mod status;
 mod taps;
 mod transcripts;
@@ -882,6 +883,21 @@ enum Command {
         #[command(subcommand)]
         op: transcripts::TranscriptOp,
     },
+    /// Call a tool tap as the owner, fetch or search: every request it makes is decided
+    /// by the policy, and its answer is scanned and kept as a source. `args` is JSON,
+    /// `{"url": "https://..."}` for fetch, `{"query": "..."}` for search.
+    Tool {
+        /// The tool, by its name in the grants.
+        name: String,
+        /// The tool's arguments, as JSON.
+        args: String,
+    },
+    /// What tools brought in from outside, kept as sources and cited as `source:<id>`:
+    /// list them, show one, sweep the expired.
+    Source {
+        #[command(subcommand)]
+        op: sources::SourceOp,
+    },
     /// Export a domain to a bundle directory, at or below a label.
     Export {
         dest: PathBuf,
@@ -1287,6 +1303,7 @@ async fn serve_stdio_cmd(root: &Path, author: Option<String>, manifest: Vec<Stri
     if let Some(t) = std::env::var("MEMORY_TASK").ok().filter(|t| !t.is_empty()) {
         m.set_held_task(&t);
     }
+    m.set_tools(taps::TapTools::for_root(root));
     mcp::serve_stdio(Arc::new(m)).await?;
     Ok(())
 }
@@ -1386,6 +1403,8 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Relay { .. } => unreachable!("handled in main"),
         Command::Task { op } => task(&Memory::open(&root)?, op).await,
         Command::Transcript { op } => transcripts::cmd(&Memory::open(&root)?, op).await,
+        Command::Tool { name, args } => sources::call(&root, &name, &args).await,
+        Command::Source { op } => sources::cmd(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
         Command::Drift { op } => drift::run(&root, op).await,
         other => entries(&Memory::open(&root)?, other).await,
@@ -1824,9 +1843,8 @@ async fn prepare_launch(
             recall_model,
         )) as Arc<dyn Deputy>
     });
-    if let Some(d) = &deputy {
-        memory.set_deputy(d);
-    }
+    deputy.iter().for_each(|d| memory.set_deputy(d));
+    memory.set_tools(taps::TapTools::for_root(root));
     let run_dir = root.join("state/run");
     std::fs::create_dir_all(&run_dir)?;
     Ok(Prepared {
@@ -4376,6 +4394,8 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Cost { .. }
         | Command::Task { .. }
         | Command::Transcript { .. }
+        | Command::Tool { .. }
+        | Command::Source { .. }
         | Command::Tap { .. }
         | Command::Write { .. }
         | Command::Search { .. }

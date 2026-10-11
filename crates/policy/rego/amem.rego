@@ -5,7 +5,7 @@
 # the grants file as `data.grants` and one request as `input`.
 #
 # input:
-#   action      file_task | write | erase | read | promote | spend
+#   action      file_task | write | erase | read | promote | spend | fetch
 #   principal   {id, class}           class: owner | human | agent | tap | system
 #   domain      the domain acted on
 #   filing      own | held | session   (file_task) the system on the owner's behalf, a
@@ -16,6 +16,8 @@
 #   write       {supersedes, supersedes_tier, supersedes_author, session_supersedes}
 #   promote     {phase, to, author, proposer}  phase: direct | propose | approve
 #   spend       {destination, session_tokens, day_tokens}
+#   fetch       {tool, method, scheme, host, port, path, private_address,
+#                loopback_address, label, hop}
 #
 # decision: {allow, admit, review, reason}
 #   review: none | human | approver    who has to look before this goes further
@@ -251,6 +253,103 @@ spend_decision := {"allow": false, "admit": false, "review": "human", "reason": 
 
 default spend_decision := {"allow": true, "admit": false, "review": "none", "reason": "within the spend limits"}
 
+# ---- fetch: a tool's outbound request, decided at every hop ----
+
+# A tool, fetch or search, is a tap an agent calls mid-turn, and everything it sends is
+# data leaving: the URL's path and query, a search's words. So a request is decided on
+# what it carries as well as where it goes. Hard rules first, which no exception lifts:
+# TLS, a method the grant names, an address that is not this machine's network turned
+# inward, and a tap granted as a tool. Then reach, which an exception can lift for one
+# task: the host must be one the tool's grant names, `*.apache.org` matching any name
+# under it, and the session's label must be at most the ceiling of the hosts it matched.
+# A session that has read internal entries reaches the trusted hosts, if the grant has
+# them, and nothing else. A redirect is a new request, decided again.
+tool_grant := object.get(object.get(data.grants, "taps", {}), input.fetch.tool, {})
+
+label_rank := {"public": 0, "internal": 1, "restricted": 2}
+
+host_matches(p) if lower(p) == input.fetch.host
+
+host_matches(p) if {
+	startswith(p, "*.")
+	endswith(input.fetch.host, lower(trim_prefix(p, "*")))
+}
+
+in_hosts(hosts) if {
+	some p in hosts
+	host_matches(p)
+}
+
+general_hosts := object.get(tool_grant, "hosts", [])
+
+trusted_grant := object.get(tool_grant, "trusted", {})
+
+trusted_hosts := object.get(trusted_grant, "hosts", [])
+
+known_host if in_hosts(general_hosts)
+
+known_host if in_hosts(trusted_hosts)
+
+may_reach if {
+	in_hosts(general_hosts)
+	label_rank[input.fetch.label] <= label_rank[tool_grant.ceiling]
+}
+
+may_reach if {
+	in_hosts(trusted_hosts)
+	label_rank[input.fetch.label] <= label_rank[trusted_grant.ceiling]
+}
+
+fetch_methods := ["GET"] if count(object.get(tool_grant, "methods", [])) == 0
+
+fetch_methods := tool_grant.methods if count(object.get(tool_grant, "methods", [])) > 0
+
+loopback_ok if {
+	object.get(tool_grant, "loopback", false)
+	input.fetch.loopback_address
+}
+
+fetch_refusals contains sprintf("%v is not granted as a tool", [input.fetch.tool]) if {
+	not object.get(tool_grant, "tool", false)
+}
+
+fetch_refusals contains sprintf("%v to %v would leave in the clear; https only", [input.fetch.scheme, input.fetch.host]) if {
+	input.fetch.scheme != "https"
+	not loopback_ok
+}
+
+fetch_refusals contains sprintf("%v resolves to a private or loopback address; a tool does not reach inward", [input.fetch.host]) if {
+	input.fetch.private_address
+	not loopback_ok
+}
+
+fetch_refusals contains sprintf("%v is not a method the tool is granted", [input.fetch.method]) if {
+	not upper(input.fetch.method) in fetch_methods
+}
+
+fetch_decision := {"allow": false, "admit": false, "review": "none", "reason": concat("; ", fetch_refusals)} if {
+	count(fetch_refusals) > 0
+}
+
+fetch_decision := {"allow": true, "admit": false, "review": "none", "reason": sprintf("%v may reach %v", [input.fetch.tool, input.fetch.host])} if {
+	count(fetch_refusals) == 0
+}
+
+builtin_denials contains {"policy": "pol-fetch-reach", "reason": sprintf("%v is not a host the %v tool is granted", [input.fetch.host, input.fetch.tool])} if {
+	input.action == "fetch"
+	count(fetch_refusals) == 0
+	not known_host
+}
+
+builtin_denials contains {"policy": "pol-fetch-reach", "reason": sprintf("this session has read %v entries, and %v is not trusted at that label: what a request carries would leave with it", [input.fetch.label, input.fetch.host])} if {
+	input.action == "fetch"
+	count(fetch_refusals) == 0
+	known_host
+	not may_reach
+}
+
+base_decision := fetch_decision if input.action == "fetch"
+
 base_decision := spend_decision if input.action == "spend"
 
 default base_decision := {"allow": false, "admit": false, "review": "none", "reason": "no rule for this action"}
@@ -284,13 +383,18 @@ excepted(pid) if {
 	e.scope_task == input.held_task
 }
 
+# The record's rules and the built-in ones an exception may lift, such as a tool's reach.
+all_denials contains d if some d in data.amem.rules.deny
+
+all_denials contains d if some d in builtin_denials
+
 rule_denials contains d if {
-	some d in data.amem.rules.deny
+	some d in all_denials
 	not excepted(d.policy)
 }
 
 exceptions_used contains x if {
-	some d in data.amem.rules.deny
+	some d in all_denials
 	excepted(d.policy)
 	some ex in data.exceptions
 	ex.breaches == d.policy

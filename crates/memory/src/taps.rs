@@ -104,6 +104,70 @@ pub async fn run(
     }
 }
 
+/// The tool taps installed under the root, as the memory server calls them: each call
+/// loads the tool's component and its grant, and runs it with the credential the grant
+/// names, every request it makes decided by the policy.
+pub struct TapTools {
+    root: std::path::PathBuf,
+}
+
+impl TapTools {
+    /// The tools under `root`. They run in the launcher's process, outside the sandbox,
+    /// and every request they make is decided against the calling session's label.
+    #[must_use]
+    pub fn for_root(root: &Path) -> Arc<dyn dm_server::sources::Tools> {
+        Arc::new(TapTools {
+            root: root.to_path_buf(),
+        })
+    }
+}
+
+/// How long one tool call may take, and the memory its component may grow to.
+const TOOL_LIMITS: dm_taps::Limits = dm_taps::Limits {
+    wall: std::time::Duration::from_secs(60),
+    memory: 128 << 20,
+};
+
+impl dm_server::sources::Tools for TapTools {
+    fn call(
+        &self,
+        memory: Arc<Memory>,
+        tool: String,
+        config: String,
+        args: String,
+    ) -> dm_server::sources::Answer<'static> {
+        let root = self.root.clone();
+        Box::pin(async move {
+            let path = component_path(&root, &tool).map_err(|e| e.to_string())?;
+            if !path.is_file() {
+                return Err(format!(
+                    "no component installed as {tool}; the owner runs: amem tap install {tool} <file.wasm>"
+                ));
+            }
+            let grant = memory
+                .grants()
+                .taps
+                .get(&tool)
+                .cloned()
+                .ok_or_else(|| format!("grants.toml has no [taps.{tool}]"))?;
+            let credential = grant
+                .credential
+                .as_deref()
+                .and_then(|var| crate::present(std::env::var(var).ok()));
+            let call = dm_taps::tool::Call {
+                tool: &tool,
+                grant: &grant,
+                credential: credential.as_deref(),
+                config: &config,
+                args: &args,
+            };
+            dm_taps::tool::call(memory, &path, call, TOOL_LIMITS)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -183,6 +183,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tap-fetch"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wasi",
+ "wit-bindgen 0.62.0",
+]
+
+[[package]]
 name = "tap-github-comments"
 version = "0.1.0"
 dependencies = [
@@ -194,6 +204,16 @@ dependencies = [
 
 [[package]]
 name = "tap-github-issues"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wasi",
+ "wit-bindgen 0.62.0",
+]
+
+[[package]]
+name = "tap-search"
 version = "0.1.0"
 dependencies = [
  "serde",

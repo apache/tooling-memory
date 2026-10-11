@@ -54,7 +54,22 @@ if has transcript; then
     echo "  searching the record for its words finds the entries, never the transcript: $(a search "$s" | j 'len(d)') hits"
     if gateway; then
       say "frozen-context replay: the decision contexts the egress recorded, sent again to $WORKER_MODEL"
-      a replay "$s" --limit 4 --model "$WORKER_MODEL" | j "f\"  agreement {d['agreement']:.0%} with the recorded steps, observed by the {d['observed_by']}\n\" + '\n'.join(f\"    turn {p['turn']:>2}: recorded {p['recorded_tool'] or 'a reply'}, replayed {p['replayed_tool'] or 'a reply'}  {'agrees' if p['agrees'] else 'differs'}\" for p in d['points']) + ('\n  (the egress saw these calls itself; a run with no contexts would replay the transcript, a self-report, and say so)' if d['observed_by'] == 'egress' else '\n  (no contexts: the recorded side is the transcript, a self-report by the harness)')" || true
+      # the newest session whose recorded calls went to the gateway: a replay changes
+      # only the model, so a session on another destination is not one to replay here
+      rs=$(python3 - "$root" <<'PY'
+import glob, json, os, sys
+best = (0, "")
+for f in glob.glob(os.path.join(sys.argv[1], "record", "*", ".contexts", "*", "*.json")):
+    try:
+        if json.load(open(f)).get("destination") == "llmao":
+            best = max(best, (os.path.getmtime(f), os.path.basename(os.path.dirname(f))))
+    except (OSError, ValueError):
+        pass
+print(best[1])
+PY
+)
+      [ -n "$rs" ] && echo "  session $rs, on the gateway:"
+      [ -n "$rs" ] && a replay "$rs" --limit 4 --model "$WORKER_MODEL" | j "f\"  agreement {d['agreement']:.0%} with the recorded steps, observed by the {d['observed_by']}\n\" + '\n'.join(f\"    turn {p['turn']:>2}: recorded {p['recorded_tool'] or 'a reply'}, replayed {p['replayed_tool'] or 'a reply'}  {'agrees' if p['agrees'] else 'differs'}\" for p in d['points']) + ('\n  (the egress saw these calls itself; a run with no contexts would replay the transcript, a self-report, and say so)' if d['observed_by'] == 'egress' else '\n  (no contexts: the recorded side is the transcript, a self-report by the harness)')" || true
     fi
   fi
 fi
