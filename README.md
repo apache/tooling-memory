@@ -32,10 +32,14 @@ harnesses in two weeks, and it is also why none of it is the production shape.
   run again, a task run's tape does not yet carry its task's prompt, and a login run
   through a tunnel, which the egress cannot see into, has no contexts, so its replay
   falls back to the harness's own transcript, a self-report, and says so.
-- **The platform as a domain.** Harness configuration, agent definitions and their
-  authoring, decomposition templates and eval suites are not held in memory, and there is
-  no evolution loop that loads only verified configuration into a harness. Policy is the
-  one artifact that already follows that rule: a rule is enforced only once verified.
+- **The platform as a domain, in part.** The grants may name a platform domain whose
+  entries carry artifacts, fenced `platform <kind> <name>` blocks: an agent definition
+  and a template that open a task's prompt, an eval suite `amem golden --platform` scores,
+  and a harness's default model. Each loads only from an active entry a person verified,
+  as a policy rule is enforced only once verified (`amem platform list` says why the rest
+  do not). Not yet: harness settings beyond the model, decomposition templates for the
+  board, authoring agent definitions, and the loop that proposes changes to them from
+  cost and telemetry.
 - **Identity.** One principal, the owner of a root. Other people appear only as a class
   of claimant (`human`) and as approvers by convention; nobody authenticates.
 - **Federation.** No cross-domain request tasks, interface summaries between domains, or

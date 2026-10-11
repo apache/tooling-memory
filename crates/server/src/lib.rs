@@ -39,6 +39,7 @@ pub mod contexts;
 pub mod fabric;
 pub mod log;
 pub mod mcp;
+pub mod platform;
 pub mod prefetch;
 pub mod projection;
 pub mod reads;

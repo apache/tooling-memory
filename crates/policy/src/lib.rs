@@ -201,6 +201,10 @@ pub struct Grants {
     /// The highest classification the owner reads.
     #[serde(default = "restricted")]
     pub handling: Label,
+    /// The domain that holds the platform: agent definitions, prompt templates, eval
+    /// suites and harness configurations, loaded by the launcher only once verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
     /// Domains the owner holds, by id.
     #[serde(default)]
     pub domains: BTreeMap<String, DomainGrant>,
@@ -277,6 +281,7 @@ impl Grants {
         Grants {
             owner: owner.to_string(),
             handling: Label::Restricted,
+            platform: None,
             domains,
             destinations,
             taps: BTreeMap::new(),
@@ -299,6 +304,15 @@ impl Grants {
         }
         if g.domains.is_empty() {
             return Err(Error::Invalid("at least one domain is required".into()));
+        }
+        if let Some(p) = g
+            .platform
+            .as_deref()
+            .filter(|p| !g.domains.contains_key(*p))
+        {
+            return Err(Error::Invalid(format!(
+                "platform = {p:?} names a domain the owner does not hold"
+            )));
         }
         Ok(g)
     }

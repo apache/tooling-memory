@@ -28,6 +28,7 @@ mod mcp_http;
 mod mine;
 mod model;
 mod open;
+mod platform;
 mod profiles;
 mod reenact;
 mod replay;
@@ -744,7 +745,12 @@ enum Command {
     /// with no model; with `--provider`, the deputy's brief too.
     Golden {
         /// The suite, TOML; see golden/docs.toml.
-        suite: PathBuf,
+        #[arg(required_unless_present = "platform")]
+        suite: Option<PathBuf>,
+        /// The suite from the platform's domain instead: a verified `eval` artifact by
+        /// this name.
+        #[arg(long, conflicts_with = "suite")]
+        platform: Option<String>,
         /// Hits count within the top k.
         #[arg(long, default_value_t = 8)]
         k: usize,
@@ -895,6 +901,12 @@ enum Command {
     Task {
         #[command(subcommand)]
         op: TaskOp,
+    },
+    /// The platform's domain: agent definitions, prompt templates, eval suites and
+    /// harness configurations, which the launcher loads only once verified.
+    Platform {
+        #[command(subcommand)]
+        op: platform::PlatformOp,
     },
     /// Gofannon's deployed agents: list them, or work the ledger's tasks with one, its
     /// result filed as each task's handoff. Through the `gofannon` tool's grant.
@@ -1444,6 +1456,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Reenact { op } => reenact::cmd(&root, op).await,
         Command::Log { op } => eventlog::cmd(&Memory::open(&root)?, op).await,
         Command::Gofannon { op } => gofannon::cmd(&root, op).await,
+        Command::Platform { op } => platform::cmd(&Memory::open(&root)?, op).await,
         Command::Tool { name, args } => sources::call(&root, &name, &args).await,
         Command::Source { op } => sources::cmd(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
@@ -2228,18 +2241,39 @@ fn deputy_auth(auth: AuthArg) -> Result<AuthMode, Box<dyn std::error::Error>> {
     }
 }
 
+/// The suite `golden` scores: a file, or a verified `eval` artifact in the platform.
+async fn golden_suite(
+    root: &Path,
+    suite: Option<PathBuf>,
+    platform: Option<String>,
+) -> Result<golden::Suite, Box<dyn std::error::Error>> {
+    match (suite, platform) {
+        (Some(path), _) => golden::Suite::load(&path),
+        (None, Some(name)) => {
+            let a = Memory::open(root)?
+                .platform_artifact("eval", &name)
+                .await?
+                .ok_or_else(|| {
+                    format!("the platform holds no verified eval artifact named {name}")
+                })?;
+            eprintln!("memory: the suite is the platform's {}", a.entry);
+            golden::Suite::parse(&a.text)
+        }
+        (None, None) => Err("name a suite, or --platform".into()),
+    }
+}
+
 /// `golden`: the suite against this root, with the deputy's brief when a provider is
 /// named.
 async fn golden_cmd(
     root: &Path,
-    suite: &Path,
+    suite: golden::Suite,
     k: usize,
     as_json: bool,
     provider: Option<String>,
     auth: AuthArg,
     model: Option<&str>,
 ) -> Fallible {
-    let suite = golden::Suite::load(suite)?;
     let r = match provider {
         Some(provider) => {
             let p = prepare_launch(
@@ -2408,12 +2442,16 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
         } => wslc_api_check(root, &image, wslc_storage.as_deref(), refresh),
         Command::Golden {
             suite,
+            platform,
             k,
             json: as_json,
             provider,
             auth,
             model,
-        } => golden_cmd(root, &suite, k, as_json, provider, auth, model.as_deref()).await,
+        } => {
+            let suite = golden_suite(root, suite, platform).await?;
+            golden_cmd(root, suite, k, as_json, provider, auth, model.as_deref()).await
+        }
         Command::Savings {
             query,
             json: as_json,
@@ -3240,6 +3278,20 @@ fn start_status(
     )
 }
 
+/// The model a verified `harness` artifact in the platform's domain names for this
+/// harness, `{"model": "..."}`, when the launch names none.
+async fn platform_model(memory: &Memory, harness: Harness) -> Option<String> {
+    let a = memory
+        .platform_artifact("harness", harness.binary())
+        .await
+        .ok()
+        .flatten()?;
+    let v: serde_json::Value = serde_json::from_str(&a.text).ok()?;
+    let model = v.get("model")?.as_str()?.to_string();
+    eprintln!("memory: model {model} from the platform's {}", a.entry);
+    Some(model)
+}
+
 /// A started session: the memory opened, the egress serving, the harness not yet run.
 /// `launch` runs it once; `work` runs it once per task.
 pub struct Session {
@@ -3319,6 +3371,10 @@ impl Session {
             root
         };
         let mut p = prepare_launch(root, harness, creds, socket, None, projected).await?;
+        let mut options = options;
+        if options.model.is_none() {
+            options.model = platform_model(&p.memory, harness).await;
+        }
         apply_run_options(&mut p, harness, auth, &options);
         if let Some(h) = &options.home {
             p.home.clone_from(h);
@@ -4535,6 +4591,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Reenact { .. }
         | Command::Log { .. }
         | Command::Gofannon { .. }
+        | Command::Platform { .. }
         | Command::Tool { .. }
         | Command::Source { .. }
         | Command::Tap { .. }

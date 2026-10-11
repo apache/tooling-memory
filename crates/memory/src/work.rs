@@ -310,7 +310,14 @@ async fn one(
     let lease_seconds = options.lease_seconds;
     eprintln!("memory: claimed {}: {}", task.id, task.title);
     let memory = session.memory();
-    let prompt = prompt_for(client, task, options.prefetch.then_some(&*memory)).await?;
+    let platform = Platform::for_harness(&memory, session.harness()).await;
+    let prompt = prompt_for(
+        client,
+        task,
+        options.prefetch.then_some(&*memory),
+        &platform,
+    )
+    .await?;
     // the reads above were the launcher's: neither the fan-out rule nor the pushed set
     // should carry them into the harness's session
     session.memory().harness_starts();
@@ -455,19 +462,67 @@ fn tail_of(s: &str, chars: usize) -> String {
 /// The prompt: the task, what the tasks it depends on left behind, the summaries of what
 /// it likely needs when `prefetch_from` gives the session's memory, T0 for its domain, and how
 /// to stop.
+/// What the platform's domain gives a task's prompt: verified artifacts only.
+#[derive(Default)]
+pub struct Platform {
+    /// The opening, a `template` named `work`, in place of the launcher's own.
+    template: Option<dm_server::platform::Artifact>,
+    /// An `agent` definition for this harness, or the `default` one.
+    agent: Option<dm_server::platform::Artifact>,
+}
+
+impl Platform {
+    /// The verified artifacts for `harness`; none where the platform holds none.
+    pub async fn for_harness(memory: &Memory, harness: Harness) -> Platform {
+        let get = |kind: &'static str, name: String| async move {
+            memory.platform_artifact(kind, &name).await.ok().flatten()
+        };
+        let agent = match get("agent", harness.binary().to_string()).await {
+            Some(a) => Some(a),
+            None => get("agent", "default".to_string()).await,
+        };
+        Platform {
+            template: get("template", "work".to_string()).await,
+            agent,
+        }
+    }
+}
+
+impl Platform {
+    /// The prompt's opening: the platform's template or the launcher's own, then the
+    /// agent definition, each said to be the platform's.
+    fn opening(&self) -> String {
+        let mut p = match &self.template {
+            Some(t) => t.text.trim().to_string(),
+            None => OPENING.to_string(),
+        };
+        p.push_str("\n\n");
+        if let Some(a) = &self.agent {
+            p.push_str(&format!(
+                "# How to work here ({}, verified)\n\n{}\n\n",
+                a.entry,
+                a.text.trim()
+            ));
+        }
+        p
+    }
+}
+
+/// The launcher's own opening of a task's prompt, when the platform gives none.
+const OPENING: &str =
+    "You are working one task from a shared task ledger, reached through the `memory` MCP server. \
+     The launcher holds the lease and renews it for you; do not call `heartbeat`. \
+     Your transcript is kept as a source, and your provider may keep your reasoning out of it, \
+     so before each decision that changes something, choosing between entries, writing, \
+     completing or releasing, say in one plain sentence why.";
+
 async fn prompt_for(
     client: &MemoryClient,
     task: &Task,
     prefetch_from: Option<&Memory>,
+    platform: &Platform,
 ) -> Fallible<String> {
-    let mut p = String::new();
-    p.push_str(
-        "You are working one task from a shared task ledger, reached through the `memory` MCP server. \
-         The launcher holds the lease and renews it for you; do not call `heartbeat`. \
-         Your transcript is kept as a source, and your provider may keep your reasoning out of it, \
-         so before each decision that changes something, choosing between entries, writing, \
-         completing or releasing, say in one plain sentence why.\n\n",
-    );
+    let mut p = platform.opening();
     p.push_str(&format!(
         "# Task {}: {}\n\n{}\n",
         task.id,
@@ -579,6 +634,43 @@ fn prefetch_section(found: &prefetch::Prefetched) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn artifact(kind: &str, text: &str) -> dm_server::platform::Artifact {
+        dm_server::platform::Artifact {
+            kind: kind.into(),
+            name: "x".into(),
+            text: text.into(),
+            entry: format!("mem-plat-{kind}"),
+            created: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_platform_s_template_and_agent_open_the_prompt_and_say_whose_they_are() {
+        let none = Platform::default().opening();
+        assert!(none.starts_with(OPENING), "{none}");
+        let p = Platform {
+            template: Some(artifact(
+                "template",
+                "Work the task; say why before each write.",
+            )),
+            agent: Some(artifact(
+                "agent",
+                "Read the decision entry before a migration.",
+            )),
+        }
+        .opening();
+        assert!(
+            p.starts_with("Work the task; say why before each write."),
+            "{p}"
+        );
+        assert!(!p.contains(OPENING));
+        assert!(
+            p.contains("# How to work here (mem-plat-agent, verified)"),
+            "{p}"
+        );
+        assert!(p.contains("before a migration"));
+    }
 
     #[test]
     fn a_delegated_tasks_clean_report_completes_it() {
