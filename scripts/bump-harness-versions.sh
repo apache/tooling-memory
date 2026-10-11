@@ -1,11 +1,20 @@
 #!/bin/sh
 # Bump the harness pins in images/harness/Dockerfile to the latest published versions.
-# Prints one line per change; exits 0 whether or not anything changed. Needs npm and curl.
+# Prints one line per change; exits 0 whether or not anything changed. Needs curl, and
+# npm when it is there; without it the registry is asked directly.
 set -eu
 df="$(dirname "$0")/../images/harness/Dockerfile"
+latest() { # npm package
+  if command -v npm >/dev/null 2>&1; then
+    npm view "$1" version 2>/dev/null | tail -1
+  else
+    curl -fsSL "https://registry.npmjs.org/$1/latest" 2>/dev/null |
+      sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1
+  fi
+}
 bump() { # ARG name, npm package
   cur=$(sed -n "s/^ARG $1=\(.*\)$/\1/p" "$df")
-  new=$(npm view "$2" version 2>/dev/null | tail -1)
+  new=$(latest "$2")
   if [ -n "$new" ] && [ "$new" != "$cur" ]; then
     sed -i "s/^ARG $1=.*$/ARG $1=$new/" "$df"
     echo "$1: $cur -> $new ($2)"
