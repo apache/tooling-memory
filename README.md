@@ -262,7 +262,7 @@ billing failure, so the hook is the gate.
 | `probes/drift.toml` | The pinned vendor-drift probe set |
 | `images/harness` | The harness image: the harnesses, Node, Python and `amem`, pinned |
 | `scripts/` | The demo and its acts, the evaluation, conformance |
-| `docs/` | The paper, the reference stack, the design book, seeding a foundation, the asks of llm.apache.org |
+| `docs/` | The paper, the reference stack, the design book, seeding a foundation, proposals for llm.apache.org |
 
 ## Status
 
@@ -272,5 +272,6 @@ login: the list in the first section above is what is not, and the list after it
 works only at demo scale. [PLAN.md](PLAN.md) holds the decisions and the register, and
 the order production backends go in.
 
-What we would ask of the Foundation's gateway, llm.apache.org, including for the hosted
-MCP servers it is to offer, is in [docs/llm-apache-org.md](docs/llm-apache-org.md).
+What we propose to the Foundation's gateway, llmao at llm.apache.org, and why, from one
+trace across the wrapper and the gateway to the tool servers the gateway hosts, is in
+[docs/llm-apache-org.md](docs/llm-apache-org.md).
