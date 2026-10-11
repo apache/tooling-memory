@@ -4352,8 +4352,10 @@ async fn bundle_cmd(m: &Memory, command: Command) -> Fallible {
         Command::Import { src, domain } => {
             let im = m.import(&src, domain.as_deref()).await?;
             println!(
-                "imported {} entries, skipped {} already present, refused {} erased here",
+                "imported {} entries with {} transcript excerpts, skipped {} already present, \
+                 refused {} erased here",
                 im.written.len(),
+                im.excerpts,
                 im.skipped.len(),
                 im.erased.len()
             );

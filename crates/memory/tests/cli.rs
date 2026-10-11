@@ -249,9 +249,15 @@ fn step_export_import(d: &Demo) {
         None,
     );
     let out = ok(&other, &["import", bundle_arg], None);
-    assert!(out.contains("imported 2 entries, skipped 0"), "{out}");
+    assert!(
+        out.contains("imported 2 entries with 0 transcript excerpts, skipped 0"),
+        "{out}"
+    );
     let out = ok(&other, &["import", bundle_arg], None);
-    assert!(out.contains("imported 0 entries, skipped 2"), "{out}");
+    assert!(
+        out.contains("imported 0 entries with 0 transcript excerpts, skipped 2"),
+        "{out}"
+    );
     let theirs = ok(&other, &["get", &d.handoff], None);
     assert!(theirs.contains("trust_tier: raw"), "{theirs}");
     assert!(theirs.contains("domain: dom-other"), "{theirs}");

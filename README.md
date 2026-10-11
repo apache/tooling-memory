@@ -43,9 +43,8 @@ harnesses in two weeks, and it is also why none of it is the production shape.
 - **Drift beyond metadata.** No logprob divergence or change-point detection over many
   runs; the probes run each curation cycle with `--drift`, against fixed thresholds.
 - **Smaller pieces.** "Used" in the wasted-read ratio is "cited in the handoff", not a
-  model's judgement; transcripts' excerpts are not restored on import; the search tool
-  has not met a live provider, the tools have no end-to-end test against a fake site, and
-  a held tool answer has no release.
+  model's judgement; the search tool has not met a live provider, the tools have no
+  end-to-end test against a fake site, and a held tool answer has no release.
 - **Platforms and CI.** No confinement on macOS, no bridge to Gofannon, and CI has not
   run since a billing failure; every change is gated locally by `make check`.
 

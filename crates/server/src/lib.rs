@@ -2254,7 +2254,8 @@ impl Memory {
                     .flat_map(|v| std::iter::once(v.digest).chain(v.body_digest))
             })
             .collect();
-        let imported = bundle::import(
+        let carried = transcripts::carried_excerpts(src)?;
+        let mut imported = bundle::import(
             &self.store,
             &mut ix,
             &self.grants.owner,
@@ -2265,6 +2266,9 @@ impl Memory {
         )
         .await?;
         drop(ix);
+        imported.excerpts = self
+            .restore_excerpts(&domain, carried, &imported, default, &erased)
+            .await?;
         self.refresh_projection().await;
         Ok(imported)
     }

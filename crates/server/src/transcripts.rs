@@ -12,8 +12,9 @@
 //! [`Memory::sweep_transcripts`] keeps the turns live entries cite as excerpts, one per
 //! citing entry, each carrying the turn's classification, and drops the rest; the drop is
 //! a line in `state/transcripts.jsonl`. An excerpt belongs to its entry: it is served
-//! only while the entry is, so it is demoted with it, it is erased with it, and an export
-//! of the entry carries it. Erasing a transcript before its clock is the owner's act and
+//! only while the entry is, so it is demoted with it, it is erased with it, an export of
+//! the entry carries it, and an import restores it under the id the entry lands under,
+//! beside a swept header for its transcript. Erasing a transcript before its clock is the owner's act and
 //! takes its turns and their excerpts alike, leaving a stub and a receipt.
 //!
 //! On disk, under the record:
@@ -1109,6 +1110,154 @@ impl Memory {
     }
 }
 
+/// Where a bundle carries its entries' excerpts.
+const BUNDLE_EXCERPTS: &str = "excerpts";
+
+/// Read the excerpts a bundle carries, `excerpts/<entry>/<session>.<turn>.json`, and
+/// check each before an import writes anything: plain names, no links, a body that
+/// parses and names the entry and turn its path does. A bundle with one bad excerpt is
+/// refused whole, as one with a bad entry is.
+pub(crate) fn carried_excerpts(src: &Path) -> Result<Vec<Excerpt>, Error> {
+    let dir = src.join(BUNDLE_EXCERPTS);
+    let invalid = |what: String| Error::Bundle(crate::bundle::Error::Invalid(what));
+    match std::fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(crate::io(&dir)(e)),
+        Ok(m) if !m.is_dir() => return Err(invalid("excerpts is not a directory".into())),
+        Ok(_) => {}
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(crate::io(&dir))? {
+        let entry = entry.map_err(crate::io(&dir))?;
+        let id = entry.file_name().to_string_lossy().to_string();
+        if !plain_name(&id) || !entry.file_type().map_err(crate::io(&dir))?.is_dir() {
+            return Err(invalid(format!(
+                "excerpts/{id} is not an entry's directory"
+            )));
+        }
+        let held = entry.path();
+        for file in std::fs::read_dir(&held).map_err(crate::io(&held))? {
+            let file = file.map_err(crate::io(&held))?;
+            let name = file.file_name().to_string_lossy().to_string();
+            if !file.file_type().map_err(crate::io(&held))?.is_file() {
+                return Err(invalid(format!("excerpts/{id}/{name} is not a file")));
+            }
+            let path = file.path();
+            let text = std::fs::read_to_string(&path).map_err(crate::io(&path))?;
+            let x: Excerpt = serde_json::from_str(&text)
+                .map_err(|e| invalid(format!("excerpts/{id}/{name}: {e}")))?;
+            if x.entry != id || !plain_name(&x.session) || x.turn == 0 {
+                return Err(invalid(format!(
+                    "excerpts/{id}/{name} names {}#{} of {}",
+                    x.session, x.turn, x.entry
+                )));
+            }
+            if excerpt_name(&x.session, x.turn) != name {
+                return Err(invalid(format!(
+                    "excerpts/{id}/{name} holds {}",
+                    excerpt_name(&x.session, x.turn)
+                )));
+            }
+            out.push(x);
+        }
+    }
+    Ok(out)
+}
+
+/// A name that is one path component and nothing else.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+impl Memory {
+    /// Restore what a bundle carried of transcripts, as excerpts of the entries the
+    /// import wrote: each under the id its entry landed under, at the higher of its own
+    /// label and the domain's default, and none whose text is on an erasure receipt here
+    /// or whose transcript this record erased. The transcript each names gets a header,
+    /// swept and holding only these excerpts, or the one already here takes them in, so
+    /// a citation by turn finds them as it finds a sweep's. Returns how many landed.
+    pub(crate) async fn restore_excerpts(
+        &self,
+        domain: &str,
+        carried: Vec<Excerpt>,
+        imported: &crate::bundle::Imported,
+        default: Label,
+        erased: &std::collections::HashSet<String>,
+    ) -> Result<usize, Error> {
+        let now = OffsetDateTime::now_utc();
+        // each transcript named, and whether its header is new here
+        let mut headers: BTreeMap<String, (Transcript, bool)> = BTreeMap::new();
+        let mut n = 0;
+        for mut x in carried {
+            let Some(landed) = imported.landed.get(&x.entry) else {
+                continue;
+            };
+            if erased.contains(&digest(&x.text)) || erased.contains(&erasure::body_digest(&x.text))
+            {
+                continue;
+            }
+            if !headers.contains_key(&x.session) {
+                let t = match self.find_transcript(&x.session).await {
+                    Ok(t) => (t, false),
+                    Err(Error::NotFound(_)) => (
+                        Transcript {
+                            session: x.session.clone(),
+                            domain: domain.to_string(),
+                            harness: "imported".into(),
+                            origin: imported.from.clone(),
+                            classification: Label::Public,
+                            kept_at: now,
+                            retain_until: now,
+                            state: State::Swept,
+                            ended_at: Some(now),
+                            turn_count: 0,
+                            turns: Vec::new(),
+                            excerpts: BTreeMap::new(),
+                            observed_by: x.observed_by.clone(),
+                        },
+                        true,
+                    ),
+                    Err(e) => return Err(e),
+                };
+                headers.insert(x.session.clone(), t);
+            }
+            let Some((t, fresh)) = headers.get_mut(&x.session) else {
+                continue;
+            };
+            if t.state == State::Erased {
+                continue;
+            }
+            x.entry.clone_from(landed);
+            x.classification = x.classification.max(default);
+            let text = serde_json::to_string_pretty(&x).map_err(|e| bad(landed, &e))?;
+            self.store
+                .put_object(
+                    domain,
+                    Area::Excerpts,
+                    &[landed, &excerpt_name(&x.session, x.turn)],
+                    text.into_bytes(),
+                )
+                .await?;
+            let holders = t.excerpts.entry(x.turn).or_default();
+            if !holders.contains(landed) {
+                holders.push(landed.clone());
+            }
+            if *fresh {
+                t.classification = t.classification.max(x.classification);
+            }
+            t.turn_count = t.turn_count.max(x.turn);
+            n += 1;
+        }
+        for (t, _) in headers.values().filter(|(t, _)| t.state != State::Erased) {
+            self.put_transcript(t, None).await?;
+        }
+        Ok(n)
+    }
+}
+
 fn excerpt_removed(entry: &str, x: &Excerpt) -> Removed {
     Removed {
         version: format!("excerpt {}#{} held by {entry}", x.session, x.turn),
@@ -1514,6 +1663,99 @@ mod tests {
             !public.join("excerpts").exists(),
             "nothing leaves below its label"
         );
+    }
+
+    #[tokio::test]
+    async fn an_import_restores_excerpts_under_the_ids_their_entries_land_under() {
+        let (dir, m, session, a, b, _) = swept().await;
+        let out = dir.path().join("bundle");
+        m.export(None, Label::Internal, &out).await.unwrap();
+        // the receiving record already holds an entry under A's id: A lands under another
+        let there = tempfile::tempdir().unwrap();
+        let r = Memory::init(there.path(), "human:test:bob", "dom-b").unwrap();
+        let clash = format!(
+            "---\nid: {a}\ntype: fact\ndomain: dom-b\nauthor: human:test:bob\n\
+             created: 2026-10-01T09:00:00Z\ntrust_tier: raw\nclassification: internal\n---\n\
+             # Bob's\n\nBob's own.\n"
+        );
+        r.store.put(&Entry::parse(&clash).unwrap()).await.unwrap();
+        let im = r.import(&out, None).await.unwrap();
+        assert_eq!(im.excerpts, 3, "{im:?}");
+        let a2 = im.landed[&a].clone();
+        assert_ne!(a2, a, "a clash lands under a new id");
+        assert_eq!(im.landed[&b], b);
+        let rec = there.path().join("record/dom-b/.excerpts");
+        let x = std::fs::read_to_string(rec.join(&a2).join(format!("{session}.2.json"))).unwrap();
+        assert!(x.contains(&format!("\"entry\": \"{a2}\"")), "{x}");
+        assert!(!rec.join(&a).exists(), "nothing under the id that clashed");
+        // a citation by turn finds them, as it finds a sweep's
+        let reader = Memory::open(there.path()).unwrap();
+        let two = reader.transcript_turn(&session, 2).await.unwrap();
+        assert!(two.excerpt);
+        assert_eq!(two.text, TURNS[1].1);
+        assert!(two.cited_by == vec![a2.clone()] || two.cited_by == vec![b.clone()]);
+        assert_eq!(
+            reader.transcript_turn(&session, 3).await.unwrap().cited_by,
+            vec![b.clone()]
+        );
+        let t = reader.transcripts().await.unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].state, State::Swept);
+        assert_eq!(t[0].origin, "bundle:human:test:me/dom-me");
+        assert_eq!(t[0].classification, Label::Internal);
+        assert_eq!(t[0].excerpts[&2].len(), 2);
+        // once
+        let again = r.import(&out, None).await.unwrap();
+        assert_eq!((again.written.len(), again.excerpts), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn an_excerpt_erased_here_or_out_of_shape_does_not_come_back() {
+        let (dir, m, session, a, b, _) = swept().await;
+        let out = dir.path().join("bundle");
+        m.export(None, Label::Internal, &out).await.unwrap();
+        let there = tempfile::tempdir().unwrap();
+        let r = Memory::init(there.path(), "human:test:bob", "dom-b").unwrap();
+        // the receipt of an erasure here names turn two's text: only turn three lands
+        let erased: std::collections::HashSet<String> =
+            std::iter::once(digest(TURNS[1].1)).collect();
+        let imported = crate::bundle::Imported {
+            landed: [(a.clone(), a.clone()), (b.clone(), b.clone())].into(),
+            ..crate::bundle::Imported::default()
+        };
+        let carried = carried_excerpts(&out).unwrap();
+        assert_eq!(carried.len(), 3);
+        let n = r
+            .restore_excerpts("dom-b", carried, &imported, Label::Internal, &erased)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // an excerpt whose body names another entry than its place is refused, whole
+        let x = out
+            .join("excerpts")
+            .join(&b)
+            .join(format!("{session}.3.json"));
+        let text = std::fs::read_to_string(&x).unwrap();
+        std::fs::write(
+            &x,
+            text.replace(&format!("\"entry\": \"{b}\""), "\"entry\": \"mem-x\""),
+        )
+        .unwrap();
+        let fresh = tempfile::tempdir().unwrap();
+        let f = Memory::init(fresh.path(), "human:test:carol", "dom-c").unwrap();
+        assert!(matches!(
+            f.import(&out, None).await,
+            Err(Error::Bundle(crate::bundle::Error::Invalid(_)))
+        ));
+        assert!(
+            f.list(None, None, 10).await.unwrap().is_empty(),
+            "nothing written"
+        );
+        // and so is one under a name that is not the turn it holds
+        std::fs::write(&x, &text).unwrap();
+        assert!(carried_excerpts(&out).is_ok());
+        std::fs::write(out.join("excerpts").join(&b).join("sess-x.3.json"), &text).unwrap();
+        assert!(carried_excerpts(&out).is_err());
     }
 
     #[tokio::test]

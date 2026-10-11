@@ -15,7 +15,7 @@ use dm_core::manifest::{Manifest, ManifestEntry};
 use dm_core::{digest, Entry, Label, ReadFilter, TrustTier};
 use dm_index::{Hit, Index};
 use dm_store::Store;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// What can go wrong at the bundle boundary.
@@ -67,6 +67,13 @@ pub struct Imported {
     /// Ids refused because their text was erased from this domain: the receipt kept the
     /// digest, and a bundle from before the erasure still carries the body.
     pub erased: Vec<String>,
+    /// For each entry written, the id it landed under, keyed by the bundle's: the same
+    /// unless the bundle's id was already in use here.
+    pub landed: BTreeMap<String, String>,
+    /// Transcript turns restored as excerpts of the entries written.
+    pub excerpts: usize,
+    /// Where the bundle came from: `bundle:<exporter>/<domain>`.
+    pub from: String,
 }
 
 /// Where the binary keeps the bundles it serves, under the root's state.
@@ -196,7 +203,10 @@ pub async fn import(
     // Pass one: every path and digest, before anything is written. A bundle with one bad
     // entry is refused whole, so a partial import never happens. Text this domain erased
     // is known by its digest and is not an error: the bundle is older than the erasure.
-    let mut out = Imported::default();
+    let mut out = Imported {
+        from: format!("bundle:{}/{}", manifest.exported_by, manifest.domain),
+        ..Imported::default()
+    };
     let mut checked: Vec<Entry> = Vec::with_capacity(manifest.entries.len());
     let mut inside: Vec<(String, Label)> = Vec::with_capacity(manifest.entries.len());
     for m in &manifest.entries {
@@ -253,6 +263,7 @@ pub async fn import(
         // an id names one entry across the record, whichever domain holds it: a bundle's
         // id that is in use here, in this domain or another, lands under a new one. The
         // record is asked, since the index can lag it and is what a reindex rebuilds.
+        let bundle_id = entry.front.id.clone();
         if store.holds(&entry.front.id).await? {
             entry.front.id = dm_core::id::new_entry_id(into_domain);
         }
@@ -268,6 +279,7 @@ pub async fn import(
                 index.upsert(&old)?;
             }
         }
+        out.landed.insert(bundle_id, entry.front.id.clone());
         out.written.push(entry.front.id.clone());
     }
     Ok(out)
