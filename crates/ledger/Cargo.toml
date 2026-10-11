@@ -34,3 +34,7 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 postgresql_archive = { version = "=0.20.0", default-features = false }
 postgresql_embedded = { version = "=0.20.0", default-features = false, features = ["theseus", "rustls"] }
 tempfile = "3.27.0"
+
+[package.metadata.cargo-machete]
+# postgresql_archive is a version pin, never imported: see its comment above
+ignored = ["postgresql_archive"]
