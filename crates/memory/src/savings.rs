@@ -9,6 +9,7 @@
 //! retrieval metrics, per session and in total: fetch-through, retrieval depth per task,
 //! prefetch precision and wasted reads, from the read and write logs.
 
+pub mod judge;
 pub mod metrics;
 
 use dm_core::approx_tokens;
@@ -58,6 +59,17 @@ pub struct Report {
     pub recall: RecallRow,
     /// The paper's retrieval metrics.
     pub metrics: metrics::Metrics,
+    /// The judge's reading of a sample of what was opened, when one was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judged: Option<judge::Judgement>,
+}
+
+/// A judge for the report: a model through a destination, and how many reads it samples.
+pub struct Judge<'a> {
+    /// The model.
+    pub deputy: &'a dyn dm_server::recall::Deputy,
+    /// How many opened entries to sample.
+    pub sample: usize,
 }
 
 /// Recall in the funnel. One turn for the caller either way; what differs is the
@@ -286,8 +298,12 @@ fn funnel(root: &Path, report: &mut Report) -> Fallible<()> {
 }
 
 /// The handoffs among the entries the write log names, with the text a citation is
-/// looked for in, and the handoffs of the tasks completed in the granted domains.
-async fn metrics_of(memory: &Memory, root: &Path) -> Fallible<metrics::Metrics> {
+/// looked for in, and the handoffs of the tasks completed in the granted domains. The
+/// metrics, and the handoffs' texts by id.
+async fn metrics_of(
+    memory: &Memory,
+    root: &Path,
+) -> Fallible<(metrics::Metrics, BTreeMap<String, String>)> {
     let all = reads::all(root)?;
     let writes = reads::all_writes(root)?;
     let mut handoffs = BTreeMap::new();
@@ -315,12 +331,13 @@ async fn metrics_of(memory: &Memory, root: &Path) -> Fallible<metrics::Metrics> 
             .unwrap_or_default();
         completed.extend(done.into_iter().filter_map(|t| t.handoff));
     }
-    Ok(metrics::compute(&metrics::Inputs {
+    let m = metrics::compute(&metrics::Inputs {
         reads: &all,
         writes: &writes,
         handoffs: &handoffs,
         completed: &completed,
-    }))
+    });
+    Ok((m, handoffs))
 }
 
 /// Measure.
@@ -328,7 +345,11 @@ async fn metrics_of(memory: &Memory, root: &Path) -> Fallible<metrics::Metrics> 
 /// # Errors
 ///
 /// When the record cannot be read.
-pub async fn measure(root: &Path, query: Option<&str>) -> Fallible<Report> {
+pub async fn measure(
+    root: &Path,
+    query: Option<&str>,
+    judge: Option<Judge<'_>>,
+) -> Fallible<Report> {
     let memory = Memory::open(root)?.without_read_log();
     let mut report = Report::default();
     let titles = corpus(&memory, &mut report).await?;
@@ -351,7 +372,11 @@ pub async fn measure(root: &Path, query: Option<&str>) -> Fallible<Report> {
     }
     retrieval(&memory, &mut report, query, &titles).await?;
     funnel(root, &mut report)?;
-    report.metrics = metrics_of(&memory, root).await?;
+    let (m, handoffs) = metrics_of(&memory, root).await?;
+    if let Some(j) = judge {
+        report.judged = Some(judge::judge(&memory, &m, &handoffs, j.deputy, j.sample).await);
+    }
+    report.metrics = m;
     Ok(report)
 }
 
@@ -435,6 +460,9 @@ pub fn render(r: &Report) -> String {
     }
     s.push_str(&render_recall(&r.recall));
     s.push_str(&metrics::render(&r.metrics));
+    if let Some(j) = &r.judged {
+        s.push_str(&judge::render(j));
+    }
     s
 }
 
@@ -540,7 +568,7 @@ mod tests {
             .await
             .unwrap();
         drop(m);
-        let r = measure(dir.path(), Some("import")).await.unwrap();
+        let r = measure(dir.path(), Some("import"), None).await.unwrap();
         assert_eq!(
             r.recall,
             RecallRow {
@@ -586,7 +614,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let r = measure(dir.path(), Some("import")).await.unwrap();
+        let r = measure(dir.path(), Some("import"), None).await.unwrap();
         assert_eq!(
             r.sessions[0].served_tokens,
             usize::MAX,
@@ -634,7 +662,7 @@ mod tests {
         crate::transcripts::keep_file(&m, "claude", None, None, &home.join("s.jsonl"))
             .await
             .unwrap();
-        let r = measure(dir.path(), Some("import")).await.unwrap();
+        let r = measure(dir.path(), Some("import"), None).await.unwrap();
         assert_eq!(r.entries, 3);
         assert!(r.corpus_tokens > 0 && r.t0_tokens > 0);
         assert_eq!(r.transcripts, 1);

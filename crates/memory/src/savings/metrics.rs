@@ -5,14 +5,15 @@
 //!
 //! The paper judges "used" with a sampled cheap-model judge. Here an entry is used when
 //! the session's handoff cites it by id, which needs no model and undercounts what a
-//! session used without saying so.
+//! session used without saying so; [`super::judge`] runs the paper's judge on a sample
+//! when a destination is named, and reports how often the two agree.
 
 use dm_server::reads::{Read, Wrote};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What "used" means in these numbers, for the report to say.
-pub const USED: &str = "used means cited by id in the session's handoff; the paper samples a cheap-model judge, this needs no model";
+pub const USED: &str = "used means cited by id in the session's handoff; the paper samples a cheap-model judge, which --judge-provider runs";
 
 /// What the metrics are computed from.
 pub struct Inputs<'a> {
@@ -64,6 +65,9 @@ pub struct SessionMetrics {
     pub session: String,
     /// The handoffs it wrote.
     pub handoffs: Vec<String>,
+    /// The entries it opened, which the judge samples from.
+    #[serde(skip)]
+    pub opened: Vec<String>,
     /// Its numbers.
     #[serde(flatten)]
     pub counts: Counts,
@@ -225,14 +229,15 @@ pub fn compute(inputs: &Inputs<'_>) -> Metrics {
             .iter()
             .filter_map(|id| inputs.handoffs.get(*id).map(String::as_str))
             .collect();
-        let counts = Trail::of(reads.into_iter())
-            .counts(&citing, completed.get(session).copied().unwrap_or(0));
+        let trail = Trail::of(reads.into_iter());
+        let counts = trail.counts(&citing, completed.get(session).copied().unwrap_or(0));
         if counts.search_hits + counts.prefetched + counts.opened + counts.tasks_completed == 0 {
             continue;
         }
         sessions.push(SessionMetrics {
             session: session.to_string(),
             handoffs: ids.iter().map(|i| (*i).to_string()).collect(),
+            opened: trail.opened.into_iter().collect(),
             counts,
         });
     }

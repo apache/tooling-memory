@@ -42,8 +42,7 @@ harnesses in two weeks, and it is also why none of it is the production shape.
   materializer per domain, and no freshness fast lane with a published bound.
 - **Drift beyond metadata.** No logprob divergence or change-point detection over many
   runs; the probes run each curation cycle with `--drift`, against fixed thresholds.
-- **Smaller pieces.** "Used" in the wasted-read ratio is "cited in the handoff", not a
-  model's judgement; the search tool has met only a fake of Brave's API, never the live
+- **Smaller pieces.** The search tool has met only a fake of Brave's API, never the live
   provider.
 - **Platforms and CI.** No confinement on macOS, no bridge to Gofannon, and CI has not
   run since a billing failure; every change is gated locally by `make check`.
@@ -214,6 +213,7 @@ amem taint mem-me-xxxxxxxx                 # where a bad entry may have reached
 amem replay <session> --model gemma4-26b   # the same decisions, another model
 amem cost                                  # spend per session and per completed task
 amem savings                               # the paper's read-path claims, measured
+amem savings --judge-provider anthropic   # with a small model judging what was "used"
 ```
 
 `crates/memory/tests/cli.rs` runs the paper's first milestone end to end against the

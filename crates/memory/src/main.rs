@@ -719,6 +719,19 @@ enum Command {
         /// Numbers as JSON instead of the text report.
         #[arg(long)]
         json: bool,
+        /// A destination for the paper's judge of "used": a small model reads a sample
+        /// of what sessions opened beside their handoffs, reported against the citation
+        /// rule.
+        #[arg(long)]
+        judge_provider: Option<String>,
+        #[arg(long, value_enum, default_value = "key", requires = "judge_provider")]
+        judge_auth: AuthArg,
+        /// The judge's model; a small default per destination otherwise.
+        #[arg(long, requires = "judge_provider")]
+        judge_model: Option<String>,
+        /// How many opened entries the judge reads.
+        #[arg(long, default_value_t = 20, requires = "judge_provider")]
+        judge_sample: usize,
     },
     /// Score a golden suite: questions and the entries that answer them, each question
     /// asked as written, stripped of stopwords, and by its keywords, through the pack
@@ -2354,17 +2367,52 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
         Command::Savings {
             query,
             json: as_json,
+            judge_provider,
+            judge_auth,
+            judge_model,
+            judge_sample,
         } => {
-            let r = savings::measure(root, query.as_deref()).await?;
-            if as_json {
-                println!("{}", serde_json::to_string_pretty(&r)?);
-            } else {
-                print!("{}", savings::render(&r));
-            }
-            Ok(())
+            let judge = judge_provider.map(|p| (p, judge_auth, judge_model, judge_sample));
+            savings_cmd(root, query.as_deref(), as_json, judge).await
         }
         _ => unreachable!("routed by run_cli"),
     }
+}
+
+/// `amem savings`, with the judge through a destination when one is named.
+async fn savings_cmd(
+    root: &Path,
+    query: Option<&str>,
+    as_json: bool,
+    judge: Option<(String, AuthArg, Option<String>, usize)>,
+) -> Fallible {
+    let r = match judge {
+        Some((provider, auth, model, sample)) => {
+            let p = prepare_launch(
+                root,
+                Harness::Command,
+                Credentials::keyed(deputy_auth(auth)?, &provider),
+                None,
+                None,
+                Projected::No,
+            )
+            .await?;
+            p.memory.disable_read_log();
+            let deputy = deputy::EgressDeputy::new(p.egress.clone(), &p.provider, model.as_deref());
+            let judge = savings::Judge {
+                deputy: &deputy,
+                sample,
+            };
+            savings::measure(root, query, Some(judge)).await?
+        }
+        None => savings::measure(root, query, None).await?,
+    };
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+    } else {
+        print!("{}", savings::render(&r));
+    }
+    Ok(())
 }
 
 /// `amem replay`.
