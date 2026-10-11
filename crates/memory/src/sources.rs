@@ -20,6 +20,12 @@ pub enum SourceOp {
     },
     /// Drop the sources whose clock ran out and that no live entry cites.
     Sweep,
+    /// Release a held answer once you have read it (`amem source show`): the same call
+    /// is served from it from then on, with what the scan found.
+    Release {
+        /// Its id: `source:<id>` or `<id>`.
+        id: String,
+    },
 }
 
 /// Call a tool as the owner: `args` is the tool's JSON.
@@ -66,6 +72,20 @@ pub async fn cmd(m: &Memory, op: SourceOp) -> Fallible {
                 "{}",
                 serde_json::to_string_pretty(&m.source_for_owner(id).await?)?
             );
+        }
+        SourceOp::Release { id } => {
+            let id = id.strip_prefix(dm_server::sources::CITATION).unwrap_or(&id);
+            let s = m.release_source(id).await?;
+            eprintln!(
+                "memory: {} released; it carries {}",
+                s.id,
+                if s.findings.is_empty() {
+                    "nothing the scan found".to_string()
+                } else {
+                    s.findings.join(", ")
+                }
+            );
+            println!("{}", serde_json::to_string_pretty(&s)?);
         }
         SourceOp::Sweep => {
             let dropped = m.sweep_sources(time::OffsetDateTime::now_utc()).await?;

@@ -76,9 +76,25 @@ pub struct Source {
     /// Held for the owner: never served to anyone else.
     #[serde(default)]
     pub held: bool,
+    /// The owner's release of a held answer: served from then on, findings and all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released: Option<Released>,
     /// The tool's answer.
     pub answer: Value,
 }
+
+/// Who released a held answer, and when.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Released {
+    /// The owner.
+    pub by: String,
+    /// When.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
+/// Where releases are a line each, under the root.
+pub const LOG: &str = "state/sources.jsonl";
 
 fn file(id: &str) -> String {
     format!("{id}.json")
@@ -115,6 +131,11 @@ fn served(s: &Source, cached: bool) -> Value {
     v["classification"] = json!(s.classification.to_string());
     v["observed_by"] = json!(s.observed_by);
     v["cached"] = json!(cached);
+    if s.released.is_some() {
+        // the agent is told what the scan found, and that a person let it through
+        v["released_by_owner"] = json!(true);
+        v["findings"] = json!(s.findings);
+    }
     v
 }
 
@@ -223,6 +244,7 @@ impl Memory {
             observed_by: OBSERVED_BY_TAP.to_string(),
             findings: findings.clone(),
             held,
+            released: None,
             answer,
         };
         self.put_source(&s).await?;
@@ -298,6 +320,41 @@ impl Memory {
             .into_iter()
             .find(|s| s.id == id)
             .ok_or_else(|| Error::NotFound(id.to_string()))
+    }
+
+    /// Release a held answer: the owner has read it and lets it be served. From then on
+    /// the same call is answered from it, with what the scan found and that the owner
+    /// released it, until its clock runs out; the release is a line in
+    /// `state/sources.jsonl`. Releasing what is not held changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for anyone but the owner, [`Error::NotFound`], or a store
+    /// error.
+    pub async fn release_source(&self, id: &str) -> Result<Source, Error> {
+        let mut s = self.source_for_owner(id).await?;
+        if !s.held {
+            return Ok(s);
+        }
+        let now = OffsetDateTime::now_utc();
+        s.held = false;
+        s.released = Some(Released {
+            by: self.author.clone(),
+            at: now,
+        });
+        self.put_source(&s).await?;
+        let at = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        crate::reads::append_line(
+            &self.root.join(LOG),
+            &json!({
+                "at": at, "action": "release", "source": s.id, "tool": s.tool,
+                "by": self.author, "findings": s.findings,
+            })
+            .to_string(),
+        );
+        Ok(s)
     }
 
     /// Sweep the sources whose clock ran out at `now`, unless a live entry cites them:

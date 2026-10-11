@@ -14,12 +14,16 @@ dm-policy = { version = "0.1.0", path = "../policy" }
 dm-server = { version = "0.1.0", path = "../server" }
 http = "1"
 http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 wasmtime = { version = "49", default-features = false, features = ["async", "component-model", "cranelift", "runtime", "std", "parallel-compilation"] }
 wasmtime-wasi = { version = "49", default-features = false }
 wasmtime-wasi-http = { version = "49" }
+webpki-roots = "1"
 
 [dev-dependencies]
 axum = "0.8"

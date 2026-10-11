@@ -43,8 +43,8 @@ harnesses in two weeks, and it is also why none of it is the production shape.
 - **Drift beyond metadata.** No logprob divergence or change-point detection over many
   runs; the probes run each curation cycle with `--drift`, against fixed thresholds.
 - **Smaller pieces.** "Used" in the wasted-read ratio is "cited in the handoff", not a
-  model's judgement; the search tool has not met a live provider, the tools have no
-  end-to-end test against a fake site, and a held tool answer has no release.
+  model's judgement; the search tool has met only a fake of Brave's API, never the live
+  provider.
 - **Platforms and CI.** No confinement on macOS, no bridge to Gofannon, and CI has not
   run since a billing failure; every change is gated locally by `make check`.
 
@@ -77,9 +77,9 @@ These do what the paper says, on one laptop, and each names what replaces it.
 - **Transcripts' citations** are found by scanning a domain's entries on every lookup,
   and so are the citations that keep a tool's source past its clock.
 - **Tools** fetch and search from the launcher's own machine, one compiled component per
-  call, with the address resolved once for the policy and again to connect. Production:
-  the same tools as hosted servers on the Foundation's gateway, reached through the
-  egress, with the address pinned.
+  call, connecting to the address the policy checked. A held answer is released by the
+  owner by hand (`amem source release`). Production: the same tools as hosted servers on
+  the Foundation's gateway, reached through the egress.
 - **Cost** is priced from a table the owner keeps by hand, and a task's share is its
   session's spend divided evenly among the tasks it completed. Production: the gateway's
   per-key spend, with each call tagged with its task and trace.

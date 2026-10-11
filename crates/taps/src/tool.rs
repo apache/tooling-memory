@@ -7,16 +7,16 @@
 //! resolves inward, and the calling session's label, since a URL or a query is data
 //! leaving. Each decision is a line in the decision log. A credential the grant names
 //! goes on the request after the decision, in the header the grant names, so the tool
-//! never holds it. The residual: the address is resolved here and again when the
-//! request connects, so a name that changes its answer between the two is not caught;
-//! connecting to the checked address is the fix.
+//! never holds it. The request then connects to the addresses the policy was shown, not
+//! to whatever the name answers a moment later ([`crate::pinned`]), so a name that
+//! answers outward to the check and inward to the connect gets nowhere.
 
 use crate::{engine, Error, Limits, EPOCH_TICK};
 use dm_policy::decide::FetchInput;
 use dm_policy::TapGrant;
 use dm_server::Memory;
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -61,28 +61,23 @@ pub fn is_inward(ip: IpAddr) -> bool {
     }
 }
 
-/// Whether a host resolves inward, and whether only to loopback. A name that does not
-/// resolve is neither; its request fails when it connects.
-async fn resolves(host: &str, port: u16) -> (bool, bool) {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return (is_inward(ip), ip.is_loopback());
+/// What a host resolves to, once: the addresses the request will connect to, whether
+/// any is inward, and whether all are loopback. A name that does not resolve has no
+/// address, is neither, and its request goes nowhere.
+async fn resolves(host: &str, port: u16) -> (Vec<SocketAddr>, bool, bool) {
+    let addrs: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![SocketAddr::new(ip, port)],
+        Err(_) => tokio::net::lookup_host((host, port))
+            .await
+            .map(Iterator::collect)
+            .unwrap_or_default(),
+    };
+    if addrs.is_empty() {
+        return (addrs, false, false);
     }
-    if host == "localhost" {
-        return (true, true);
-    }
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => {
-            let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-            if ips.is_empty() {
-                return (false, false);
-            }
-            (
-                ips.iter().any(|i| is_inward(*i)),
-                ips.iter().all(IpAddr::is_loopback),
-            )
-        }
-        Err(_) => (false, false),
-    }
+    let inward = addrs.iter().any(|a| is_inward(a.ip()));
+    let loopback = addrs.iter().all(|a| a.ip().is_loopback());
+    (addrs, inward, loopback)
 }
 
 /// The outbound hook for a tool: the policy decides, then the credential goes on.
@@ -116,7 +111,7 @@ impl WasiHttpHooks for Hooks {
                 .to_ascii_lowercase();
             let port = uri.port_u16();
             let default_port = if scheme == "http" { 80 } else { 443 };
-            let (private_address, loopback_address) =
+            let (addrs, private_address, loopback_address) =
                 resolves(&host, port.unwrap_or(default_port)).await;
             let ask = FetchInput {
                 tool,
@@ -147,12 +142,7 @@ impl WasiHttpHooks for Hooks {
             if let Some((name, value)) = credential {
                 request.headers_mut().insert(name, value);
             }
-            use http_body_util::BodyExt;
-            let (res, io) = wasmtime_wasi_http::default_send_request(request, options).await?;
-            Ok((
-                res.map(BodyExt::boxed_unsync),
-                Box::new(io) as Box<dyn Future<Output = _> + Send>,
-            ))
+            crate::pinned::send(request, options, &addrs).await
         })
     }
 }

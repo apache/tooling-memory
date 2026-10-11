@@ -1036,15 +1036,19 @@ dependencies = [
  "dm-server",
  "http",
  "http-body-util",
+ "hyper",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-rustls",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
