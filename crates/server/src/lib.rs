@@ -37,6 +37,7 @@ use tokio::sync::Mutex as AsyncMutex;
 pub mod bundle;
 pub mod contexts;
 pub mod fabric;
+pub mod log;
 pub mod mcp;
 pub mod prefetch;
 pub mod projection;
@@ -936,7 +937,7 @@ impl Memory {
             body: req.body,
         };
         self.gate(&entry).await?;
-        self.store.put(&entry).await?;
+        self.put_logged(&entry).await?;
         self.index_put(&entry).await?;
         if entry.front.supersedes.is_some() {
             self.superseded.fetch_add(1, Ordering::Relaxed);
@@ -1140,7 +1141,7 @@ impl Memory {
     /// A new version of the entry at the tier.
     async fn set_tier(&self, mut entry: Entry, tier: TrustTier) -> Result<Promotion, Error> {
         entry.front.trust_tier = tier;
-        self.store.put(&entry).await?;
+        self.put_logged(&entry).await?;
         self.index.lock().await.upsert(&entry)?;
         self.refresh_projection().await;
         if entry.front.entry_type == EntryType::Policy {
@@ -1302,7 +1303,7 @@ impl Memory {
         let text = std::fs::read_to_string(&path).map_err(|_| Error::NotFound(id.to_string()))?;
         let entry = Entry::parse(&text)?;
         let written = if keep {
-            self.store.put(&entry).await?;
+            self.put_logged(&entry).await?;
             self.index_put(&entry).await?;
             self.refresh_projection().await;
             Some(Written {
@@ -2203,7 +2204,7 @@ impl Memory {
                     continue;
                 }
                 e.front.review_by = Some(today);
-                self.store.put(&e).await?;
+                self.put_logged(&e).await?;
                 self.index.lock().await.upsert(&e)?;
                 flagged.push(other);
             }
@@ -2265,6 +2266,10 @@ impl Memory {
         let mut imported = bundle::import(
             &self.store,
             &mut ix,
+            bundle::LogTo {
+                root: &self.root,
+                by: &self.author,
+            },
             &self.grants.owner,
             src,
             &domain,

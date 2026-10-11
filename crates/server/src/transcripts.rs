@@ -1045,6 +1045,7 @@ impl Memory {
                 body_digest: Some(erasure::body_digest(body)),
             });
         }
+        self.log_erased(domain, id)?;
         self.store.erase(domain, id, stub).await?;
         Ok(removed)
     }

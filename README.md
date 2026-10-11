@@ -40,8 +40,12 @@ harnesses in two weeks, and it is also why none of it is the production shape.
   of claimant (`human`) and as approvers by convention; nobody authenticates.
 - **Federation.** No cross-domain request tasks, interface summaries between domains, or
   portfolio orchestration; a cross-domain dependency is seen, nothing more.
-- **The event log.** No log the record, index and ledger are projections of, no single
-  materializer per domain, and no freshness fast lane with a published bound.
+- **The event log, in part.** Every write of an entry goes through its domain's
+  append-only log first, ids and digests and never bodies, one writer per domain, and
+  one materializer per domain builds the index from the log and the record and replays
+  the ledger's own events (`amem log`). The ledger keeps its events in its own table
+  rather than the domain's log, the index is not yet fed from the log as it grows, only
+  rebuilt from it, and there is no freshness fast lane with a published bound.
 - **Drift beyond metadata.** No logprob divergence or change-point detection over many
   runs; the probes run each curation cycle with `--drift`, against fixed thresholds.
 - **Smaller pieces.** The search tool has met only a fake of Brave's API, never the live
@@ -66,6 +70,9 @@ These do what the paper says, on one laptop, and each names what replaces it.
   signals and telemetry, taint, the read metrics, the policy rates, the relay and
   write-rate alarms, prefetch's co-retrieval, reads them whole. Production: the same
   events as OpenTelemetry spans, already emitted, into a collector and analytics tables.
+- **The event log** is a JSONL file per domain under `state/log`, behind a file lock.
+  Production: a partitioned log, Kafka in the reference stack, a partition per domain
+  and the materializer a consumer of it.
 - **Curation** surveys a domain by reading every entry, hunts contradictions pair by
   pair through search, and runs as a cycle someone starts. Production: event-driven, per
   write, on a schedule with a budget per domain.

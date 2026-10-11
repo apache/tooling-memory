@@ -57,6 +57,44 @@ pub struct Exported {
     pub manifest: Manifest,
 }
 
+/// Where an import's writes are logged: the root, and who writes.
+#[derive(Clone, Copy, Debug)]
+pub struct LogTo<'a> {
+    /// The root, whose `state/log` holds the domain's log.
+    pub root: &'a Path,
+    /// The author the log names.
+    pub by: &'a str,
+}
+
+/// Whether this code reads the bundle's format.
+fn format_read(manifest: &Manifest) -> Result<(), Error> {
+    if manifest.format == dm_core::manifest::FORMAT {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "format {:?}; this code reads {:?}",
+        manifest.format,
+        dm_core::manifest::FORMAT
+    )))
+}
+
+impl LogTo<'_> {
+    fn put(self, domain: &str, entry: &Entry) -> Result<(), Error> {
+        crate::log::append(
+            self.root,
+            domain,
+            self.by,
+            crate::log::Change::Put {
+                id: entry.front.id.clone(),
+                digest: digest(&entry.render()),
+                active: entry.is_active(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| Error::Invalid(format!("the log: {e}")))
+    }
+}
+
 /// The outcome of an import.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Imported {
@@ -179,9 +217,11 @@ async fn is_own(store: &Store, domain: &str, id: Option<&str>) -> Result<bool, E
 /// A bad or missing manifest, a path that is not a plain file name, a digest that does
 /// not match, a manifest whose labels are not the entries' own, an entry that does not
 /// parse, or a store or index error.
+#[allow(clippy::too_many_arguments)] // the stores, the log, and what the import is told
 pub async fn import(
     store: &Store,
     index: &mut Index,
+    log: LogTo<'_>,
     owner: &str,
     src: &Path,
     into_domain: &str,
@@ -191,13 +231,7 @@ pub async fn import(
     let mpath = src.join("manifest.yaml");
     let mtext = std::fs::read_to_string(&mpath).map_err(io(&mpath))?;
     let manifest = Manifest::from_yaml(&mtext)?;
-    if manifest.format != dm_core::manifest::FORMAT {
-        return Err(Error::Invalid(format!(
-            "format {:?}; this code reads {:?}",
-            manifest.format,
-            dm_core::manifest::FORMAT
-        )));
-    }
+    format_read(&manifest)?;
     let same_owner = manifest.exported_by == owner;
 
     // Pass one: every path and digest, before anything is written. A bundle with one bad
@@ -271,6 +305,8 @@ pub async fn import(
             entry.front.trust_tier = TrustTier::Raw;
         }
         entry.front.classification = entry.front.classification.max(default_classification);
+        // through the domain's log, as every write of an entry goes
+        log.put(into_domain, &entry)?;
         store.put(&entry).await?;
         index.upsert(&entry)?;
         // the entry it replaces, which the store just marked superseded

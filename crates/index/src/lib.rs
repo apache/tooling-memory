@@ -392,6 +392,31 @@ impl Index {
         Ok(n)
     }
 
+    /// Replace one domain's part of the index with `entries`, in one transaction: what a
+    /// domain's materializer builds, leaving every other domain as it was.
+    ///
+    /// # Errors
+    ///
+    /// A database error; the index is left as it was.
+    pub fn rebuild_domain<I>(&mut self, domain: &str, entries: I) -> Result<usize, Error>
+    where
+        I: IntoIterator<Item = Entry>,
+    {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM entries_fts WHERE id IN (SELECT id FROM entries WHERE domain = ?1)",
+            params![domain],
+        )?;
+        tx.execute("DELETE FROM entries WHERE domain = ?1", params![domain])?;
+        let mut n = 0;
+        for e in entries {
+            Index::upsert_in(&tx, &e)?;
+            n += 1;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Ranked full-text search over title, summary, and body, within the filter.
     /// Summaries only; the caller opens an entry with `get` if a summary warrants it.
     ///

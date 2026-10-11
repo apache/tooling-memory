@@ -17,6 +17,7 @@ mod curation;
 mod deputy;
 mod doctor;
 mod drift;
+mod eventlog;
 mod golden;
 mod harness_usage;
 mod hooks;
@@ -894,6 +895,12 @@ enum Command {
         #[command(subcommand)]
         op: TaskOp,
     },
+    /// The event log of a domain, the order of record of its entries, and the
+    /// materializer that builds the index from it.
+    Log {
+        #[command(subcommand)]
+        op: eventlog::LogOp,
+    },
     /// Re-enactment: a session run again on its prompt and commit against its tape,
     /// the memory calls answered from the tape until the run diverges; the tapes, and
     /// a report of the runs by harness and model.
@@ -1428,6 +1435,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Task { op } => task(&Memory::open(&root)?, op).await,
         Command::Transcript { op } => transcripts::cmd(&Memory::open(&root)?, op).await,
         Command::Reenact { op } => reenact::cmd(&root, op).await,
+        Command::Log { op } => eventlog::cmd(&Memory::open(&root)?, op).await,
         Command::Tool { name, args } => sources::call(&root, &name, &args).await,
         Command::Source { op } => sources::cmd(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
@@ -4517,6 +4525,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Task { .. }
         | Command::Transcript { .. }
         | Command::Reenact { .. }
+        | Command::Log { .. }
         | Command::Tool { .. }
         | Command::Source { .. }
         | Command::Tap { .. }
