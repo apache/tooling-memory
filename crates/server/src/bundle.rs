@@ -262,6 +262,12 @@ pub async fn import(
         entry.front.classification = entry.front.classification.max(default_classification);
         store.put(&entry).await?;
         index.upsert(&entry)?;
+        // the entry it replaces, which the store just marked superseded
+        if let Some(older) = &entry.front.supersedes {
+            if let Some(old) = store.get(&entry.front.domain, older).await? {
+                index.upsert(&old)?;
+            }
+        }
         out.written.push(entry.front.id.clone());
     }
     Ok(out)
