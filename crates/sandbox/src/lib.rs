@@ -22,9 +22,16 @@
 //!
 //! Backends:
 //! - Linux: user, mount, network, uts, ipc and pid namespaces, native, unprivileged, no
-//!   bubblewrap or container runtime needed.
-//! - macOS: not yet; the plan is Seatbelt. Until then `run` refuses rather than pretend.
+//!   bubblewrap or container runtime needed. The plan's mounts build a root of its own,
+//!   so things sit at fixed paths inside ([`Layout::namespaces`]).
+//! - macOS: Seatbelt, through `sandbox-exec`, with a profile made from the plan
+//!   ([`seatbelt`]). There is no mount namespace, so everything sits at its host path
+//!   ([`Layout::seatbelt`]) and the plan's mounts are what the profile grants. Dry-coded:
+//!   the profile is unit-tested everywhere, but the backend has not yet run on a Mac.
 //! - Windows: run under WSL2.
+//!
+//! Where things sit inside is the [`Layout`], a property of the backend: [`prepare`]
+//! uses the namespaces layout, [`prepare_in`] the one it is given.
 
 use dm_core::Label;
 use serde::{Deserialize, Serialize};
@@ -33,6 +40,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod seatbelt;
 
 /// What can go wrong preparing or running a sandbox.
 #[derive(Debug, thiserror::Error)]
@@ -51,8 +59,8 @@ pub enum Error {
     /// The combination of harness, auth and provider is not supported.
     #[error("{0}")]
     Unsupported(String),
-    /// This platform has no confinement backend yet.
-    #[error("no confinement backend on this platform; run under WSL2 or Linux")]
+    /// This platform has no backend for the plan: namespaces need Linux, Seatbelt macOS.
+    #[error("no confinement backend for this plan on this platform; namespaces need Linux or WSL2, Seatbelt needs macOS")]
     NoBackend,
     /// The confinement itself failed.
     #[error("confinement: {0}")]
@@ -331,6 +339,111 @@ pub struct Plan {
     /// Symlinks to recreate at the root, as `(name, target)`: merged-usr's `/bin ->
     /// usr/bin` and friends, taken from the rootfs the plan runs in.
     pub links: Vec<(PathBuf, PathBuf)>,
+    /// Where things sit inside, and so which backend runs the plan.
+    pub layout: Layout,
+    /// The host's home, which no backend may hand the harness: Seatbelt's profile
+    /// refuses a grant of it, or of anything above it.
+    pub host_home: Option<PathBuf>,
+}
+
+/// Which backend a plan is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// Linux namespaces: a root of the sandbox's own, built from the plan's mounts.
+    Namespaces,
+    /// macOS Seatbelt: the host's own paths, with the plan's mounts as the grants of a
+    /// deny-by-default profile.
+    Seatbelt,
+}
+
+/// Where a plan puts things as the harness sees them. A property of the backend: one
+/// with a mount namespace puts each at a fixed path of the sandbox's own; one without
+/// has the harness see each where it is on the host, so the harness's configuration is
+/// written against the host's paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    /// The backend this layout is for.
+    pub backend: Backend,
+    /// The private home.
+    pub home: PathBuf,
+    /// The egress socket.
+    pub socket: PathBuf,
+    /// The memory binary, which runs the relay and the hooks.
+    pub memory: PathBuf,
+    /// The loopback address the relay listens on, as `host:port`.
+    pub relay: String,
+    /// The projection, when there is one to mount.
+    pub projection: Option<PathBuf>,
+    /// The temporary directory, `TMPDIR`.
+    pub tmp: PathBuf,
+}
+
+impl Layout {
+    /// The namespaces backend's: the [`INSIDE_HOME`], [`INSIDE_SOCKET`],
+    /// [`INSIDE_MEMORY`], [`INSIDE_RELAY`] and [`INSIDE_PROJECTION`] constants, and a
+    /// `/tmp` of the sandbox's own.
+    #[must_use]
+    pub fn namespaces() -> Layout {
+        Layout {
+            backend: Backend::Namespaces,
+            home: PathBuf::from(INSIDE_HOME),
+            socket: PathBuf::from(INSIDE_SOCKET),
+            memory: PathBuf::from(INSIDE_MEMORY),
+            relay: INSIDE_RELAY.to_string(),
+            projection: Some(PathBuf::from(INSIDE_PROJECTION)),
+            tmp: PathBuf::from("/tmp"),
+        }
+    }
+
+    /// Seatbelt's: everything at its host path, since macOS has no mount namespace. The
+    /// relay listens on `relay`, a loopback port the launcher picked for this session,
+    /// since the host's loopback is shared with every other session; the temporary
+    /// directory is under the private home, since the host's `/tmp` is shared too.
+    #[must_use]
+    pub fn seatbelt(req: &Request<'_>, relay: &str) -> Layout {
+        Layout {
+            backend: Backend::Seatbelt,
+            home: req.home.to_path_buf(),
+            socket: req.egress_socket.to_path_buf(),
+            memory: req.memory_binary.to_path_buf(),
+            relay: relay.to_string(),
+            projection: req.projection.map(Path::to_path_buf),
+            tmp: req.home.join(".tmp"),
+        }
+    }
+
+    /// A path under the private home, as the harness sees it.
+    fn under_home(&self, rel: &str) -> String {
+        self.home.join(rel).display().to_string()
+    }
+
+    /// The shell command that runs the memory's hook for `harness`.
+    fn hook(&self, harness: &str) -> String {
+        format!("{} hook {harness}", shell_word(&self.memory))
+    }
+
+    /// The memory binary as a JSON, and so JavaScript, string literal.
+    fn memory_literal(&self) -> String {
+        serde_json::to_string(&self.memory.display().to_string()).unwrap_or_default()
+    }
+}
+
+/// A path as one shell word: as it is when nothing in it is special to a shell, single-
+/// quoted otherwise. A hook command is run by the harness through a shell, and a host
+/// path on macOS may hold a space.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    let plain = |c: char| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c);
+    if !text.is_empty() && text.chars().all(plain) {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// A string as the inside of a TOML basic string.
+fn toml_escaped(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// The inputs to a plan.
@@ -378,7 +491,7 @@ pub struct Request<'a> {
     /// `image`.
     pub rootfs: Option<&'a Path>,
     /// The record's projection the launcher rendered for this session, on the host, to
-    /// mount read-only at [`INSIDE_PROJECTION`]; `None` when there is none.
+    /// mount read-only at the layout's projection; `None` when there is none.
     pub projection: Option<&'a Path>,
 }
 
@@ -390,7 +503,7 @@ impl Request<'_> {
     }
 }
 
-/// Where things sit inside the sandbox.
+/// Where things sit inside the sandbox under the namespaces backend, [`Layout::namespaces`].
 pub const INSIDE_HOME: &str = "/home/user";
 /// The egress socket inside.
 pub const INSIDE_SOCKET: &str = "/run/memory/egress.sock";
@@ -576,14 +689,14 @@ fn harness_mounts(real: &Path) -> (Vec<Mount>, Option<PathBuf>) {
 
 /// The environment every harness starts with: a private home, the terminal's locale and
 /// colour settings, and whatever credential the harness must hold itself.
-fn base_env(harness_env: &[(String, String)]) -> BTreeMap<String, String> {
+fn base_env(harness_env: &[(String, String)], at: &Layout) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
-    env.insert("HOME".into(), INSIDE_HOME.into());
+    env.insert("HOME".into(), at.home.display().to_string());
     // where every harness's hooks leave notes for the launcher
-    env.insert("MEMORY_OUTBOX".into(), format!("{INSIDE_HOME}/{OUTBOX}"));
+    env.insert("MEMORY_OUTBOX".into(), at.under_home(OUTBOX));
     env.insert("USER".into(), "user".into());
     env.insert("LOGNAME".into(), "user".into());
-    env.insert("TMPDIR".into(), "/tmp".into());
+    env.insert("TMPDIR".into(), at.tmp.display().to_string());
     for k in [
         "TERM",
         "COLORTERM",
@@ -609,26 +722,36 @@ fn base_env(harness_env: &[(String, String)]) -> BTreeMap<String, String> {
 
 /// Where the projection is inside, when the launcher rendered one: the same read-only
 /// mount on every backend, so the hook has one path to know.
-fn projection_env(req: &Request<'_>, env: &mut BTreeMap<String, String>) {
-    if req.projection.is_some_and(Path::is_dir) {
-        env.insert("MEMORY_PROJECTION".into(), INSIDE_PROJECTION.to_string());
+fn projection_env(req: &Request<'_>, at: &Layout, env: &mut BTreeMap<String, String>) {
+    if let Some(inside) = at.projection.as_ref() {
+        if req.projection.is_some_and(Path::is_dir) {
+            env.insert("MEMORY_PROJECTION".into(), inside.display().to_string());
+        }
     }
 }
 
 /// Everything mounted into the sandbox, in order, and the directory the harness's own
-/// binaries want on PATH.
-fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<PathBuf>) {
-    let mut mounts = system_mounts();
+/// binaries want on PATH. The host's system is mounted only where the backend builds a
+/// root of its own; under Seatbelt the system is the profile's, and these are its grants.
+fn plan_mounts(
+    req: &Request<'_>,
+    at: &Layout,
+    harness_bin: &Path,
+) -> (Vec<Mount>, Option<PathBuf>) {
+    let mut mounts = match at.backend {
+        Backend::Namespaces => system_mounts(),
+        Backend::Seatbelt => Vec::new(),
+    };
     mounts.push(Mount {
         source: req.memory_binary.to_path_buf(),
-        target: PathBuf::from(INSIDE_MEMORY),
+        target: at.memory.clone(),
         read_only: true,
     });
     let (harness_m, extra_path) = harness_mounts(harness_bin);
     mounts.extend(harness_m);
     mounts.push(Mount {
         source: req.home.to_path_buf(),
-        target: PathBuf::from(INSIDE_HOME),
+        target: at.home.clone(),
         read_only: false,
     });
     mounts.push(Mount {
@@ -636,10 +759,10 @@ fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<Pat
         target: req.workdir_inside().to_path_buf(),
         read_only: false,
     });
-    mounts.extend(projection_mount(req));
+    mounts.extend(projection_mount(req, at));
     mounts.push(Mount {
         source: req.egress_socket.to_path_buf(),
-        target: PathBuf::from(INSIDE_SOCKET),
+        target: at.socket.clone(),
         read_only: false,
     });
     (mounts, extra_path)
@@ -647,12 +770,13 @@ fn plan_mounts(req: &Request<'_>, harness_bin: &Path) -> (Vec<Mount>, Option<Pat
 
 /// The projection, when the launcher rendered one: its own directory, mounted read-only,
 /// so the harness reads it there and nowhere else and cannot edit it into lies. Every
-/// backend that names [`INSIDE_PROJECTION`] in the environment mounts it; a container
+/// backend that names the layout's projection in the environment mounts it; a container
 /// backend does so itself, from the host's view of the path.
-fn projection_mount(req: &Request<'_>) -> Option<Mount> {
+fn projection_mount(req: &Request<'_>, at: &Layout) -> Option<Mount> {
+    let target = at.projection.as_ref()?;
     req.projection.filter(|p| p.is_dir()).map(|p| Mount {
         source: p.to_path_buf(),
-        target: PathBuf::from(INSIDE_PROJECTION),
+        target: target.clone(),
         read_only: true,
     })
 }
@@ -702,27 +826,35 @@ fn provider_of(req: &Request<'_>) -> Result<String, Error> {
 /// tree, under it or at it, hides that part of the tree; a tree at or above one of them
 /// hides the sandbox's own, the home among them. A tree under the home stays: the home
 /// is mounted first.
-fn refuse_a_hidden_workdir(req: &Request<'_>) -> Result<(), Error> {
+///
+/// Where the layout is the host's own, as Seatbelt's is, nothing is mounted and nothing
+/// hidden, but the tree is granted read-write: it may not sit in the read-only
+/// projection, nor hold the private home, the projection, the memory binary that runs
+/// the hooks, or the egress socket.
+fn refuse_a_hidden_workdir(req: &Request<'_>, at: &Layout) -> Result<(), Error> {
     let inside = req.workdir_inside();
+    let projection = at.projection.as_deref();
+    let mounted = at.backend == Backend::Namespaces;
     let after_the_tree = [
-        Path::new(INSIDE_PROJECTION),
-        Path::new(INSIDE_MEMORY)
-            .parent()
-            .unwrap_or(Path::new(INSIDE_MEMORY)),
-        Path::new(INSIDE_SOCKET)
-            .parent()
-            .unwrap_or(Path::new(INSIDE_SOCKET)),
+        projection,
+        mounted.then(|| at.memory.parent().unwrap_or(&at.memory)),
+        mounted.then(|| at.socket.parent().unwrap_or(&at.socket)),
     ];
     let own = [
-        Path::new(INSIDE_HOME),
-        Path::new(INSIDE_PROJECTION),
-        Path::new(INSIDE_MEMORY),
-        Path::new(INSIDE_SOCKET),
+        Some(at.home.as_path()),
+        projection,
+        Some(at.memory.as_path()),
+        Some(at.socket.as_path()),
     ];
     let hidden = after_the_tree
         .into_iter()
+        .flatten()
         .find(|own| inside.starts_with(own))
-        .or_else(|| own.into_iter().find(|own| own.starts_with(inside)));
+        .or_else(|| {
+            own.into_iter()
+                .flatten()
+                .find(|own| own.starts_with(inside))
+        });
     match hidden {
         Some(own) => Err(Error::Unsupported(format!(
             "the working tree {} would sit under the sandbox's own {}; run from another directory",
@@ -733,16 +865,33 @@ fn refuse_a_hidden_workdir(req: &Request<'_>) -> Result<(), Error> {
     }
 }
 
-/// Build the plan: write the harness's configuration into the private home and decide
-/// mounts, environment, and command.
+/// Build the plan for the namespaces backend: write the harness's configuration into the
+/// private home and decide mounts, environment, and command.
 ///
 /// # Errors
 ///
 /// A harness not on PATH, an unsupported harness, auth and provider combination, or a
 /// file under the home that cannot be written.
 pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
-    refuse_a_hidden_workdir(req)?;
+    prepare_in(req, Layout::namespaces())
+}
+
+/// Build the plan for the backend `at` is the layout of: the harness's configuration is
+/// written against the layout's paths, and the mounts put each thing there.
+///
+/// # Errors
+///
+/// As [`prepare`], and the harness image under a layout that is not the namespaces
+/// backend's.
+pub fn prepare_in(req: &Request<'_>, at: Layout) -> Result<Plan, Error> {
+    refuse_a_hidden_workdir(req, &at)?;
     let image = req.image || req.rootfs.is_some();
+    if image && at.backend != Backend::Namespaces {
+        return Err(Error::Unsupported(
+            "the harness image runs under Linux namespaces or in a container, not under Seatbelt"
+                .into(),
+        ));
+    }
     let harness_bin = if req.harness == Harness::Command {
         program_of(req.harness_args, image)?
     } else if image {
@@ -756,49 +905,34 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         req.harness_args
     };
     std::fs::create_dir_all(req.home).map_err(io(req.home))?;
-    let relay = format!("http://{INSIDE_RELAY}");
+    if at.backend == Backend::Seatbelt {
+        std::fs::create_dir_all(&at.tmp).map_err(io(&at.tmp))?;
+    }
+    let relay = format!("http://{}", at.relay);
     let provider = provider_of(req)?;
 
-    let mut env = base_env(req.harness_env);
+    let mut env = base_env(req.harness_env, &at);
     // the memory server's address, for the hooks as for the harness
     env.insert("MEMORY_MCP_URL".into(), format!("{relay}/mcp"));
-    projection_env(req, &mut env);
-    let (mounts, extra_path) = match req.rootfs {
-        Some(rootfs) => {
-            let mut m = rootfs_mounts(rootfs);
-            // the launcher's own binary over the image's copy, so the relay and the
-            // hooks inside are the launcher's build, not the image's; a container
-            // backend has no such mount and runs what its image carries
-            m.push(Mount {
-                source: req.memory_binary.to_path_buf(),
-                target: PathBuf::from(INSIDE_MEMORY),
-                read_only: true,
-            });
-            m.extend(image_mounts(req));
-            m.extend(projection_mount(req));
-            m.push(Mount {
-                source: req.egress_socket.to_path_buf(),
-                target: PathBuf::from(INSIDE_SOCKET),
-                read_only: false,
-            });
-            (m, None)
-        }
-        None if image => (image_mounts(req), None),
-        None => plan_mounts(req, &harness_bin),
+    projection_env(req, &at, &mut env);
+    let (mounts, extra_path) = mounts_of(req, &at, image, &harness_bin);
+    let links = match at.backend {
+        Backend::Namespaces => root_links(req.rootfs.unwrap_or(Path::new("/"))),
+        Backend::Seatbelt => Vec::new(),
     };
-    let links = root_links(req.rootfs.unwrap_or(Path::new("/")));
-    let mut path = String::from("/opt/memory:/usr/local/bin:/usr/bin:/bin");
+    let memory_dir = at.memory.parent().unwrap_or(Path::new("/"));
+    let mut path = format!("{}:/usr/local/bin:/usr/bin:/bin", memory_dir.display());
     if let Some(p) = extra_path {
         path = format!("{}:{path}", p.display());
     }
     env.insert("PATH".into(), path);
     let mut argv = vec![
-        INSIDE_MEMORY.to_string(),
+        at.memory.display().to_string(),
         "relay".into(),
         "--socket".into(),
-        INSIDE_SOCKET.into(),
+        at.socket.display().to_string(),
         "--listen".into(),
-        INSIDE_RELAY.into(),
+        at.relay.clone(),
         "--".into(),
         harness_bin.display().to_string(),
     ];
@@ -806,7 +940,7 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
     // them: a harness whose flags belong to a subcommand, as Muse's do to `exec`,
     // takes them at the end, where every one of them accepts options after the prompt
     let mut tail = Vec::new();
-    setup_harness(req, &relay, &provider, &mut env, &mut argv, &mut tail)?;
+    setup_harness(req, &at, &relay, &provider, &mut env, &mut argv, &mut tail)?;
     argv.extend(harness_args.iter().cloned());
     argv.extend(tail);
 
@@ -818,13 +952,50 @@ pub fn prepare(req: &Request<'_>) -> Result<Plan, Error> {
         hostname: "memory-sandbox".into(),
         handling_cap: req.destination_ceiling,
         links,
+        layout: at,
+        host_home: req.host_home.map(Path::to_path_buf),
     })
+}
+
+/// The plan's mounts, and the directory the harness's own binaries want on PATH: the
+/// image's system with the session's own on top, the session's own alone in a harness
+/// container, or this host's system and the harness's install.
+fn mounts_of(
+    req: &Request<'_>,
+    at: &Layout,
+    image: bool,
+    harness_bin: &Path,
+) -> (Vec<Mount>, Option<PathBuf>) {
+    match req.rootfs {
+        Some(rootfs) => {
+            let mut m = rootfs_mounts(rootfs);
+            // the launcher's own binary over the image's copy, so the relay and the
+            // hooks inside are the launcher's build, not the image's; a container
+            // backend has no such mount and runs what its image carries
+            m.push(Mount {
+                source: req.memory_binary.to_path_buf(),
+                target: at.memory.clone(),
+                read_only: true,
+            });
+            m.extend(image_mounts(req));
+            m.extend(projection_mount(req, at));
+            m.push(Mount {
+                source: req.egress_socket.to_path_buf(),
+                target: at.socket.clone(),
+                read_only: false,
+            });
+            (m, None)
+        }
+        None if image => (image_mounts(req), None),
+        None => plan_mounts(req, at, harness_bin),
+    }
 }
 
 /// The adapter for the requested harness: each writes its config into the private home
 /// and sets the environment that points it at the relay.
 fn setup_harness(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
@@ -832,16 +1003,16 @@ fn setup_harness(
     tail: &mut Vec<String>,
 ) -> Result<(), Error> {
     match req.harness {
-        Harness::Claude => setup_claude(req, relay, provider, env, argv),
-        Harness::Codex => setup_codex(req, relay, provider, env),
-        Harness::Gemini => setup_gemini(req, relay, provider, env),
-        Harness::Antigravity => setup_antigravity(req, relay, provider, env),
-        Harness::Qwen => setup_qwen(req, relay, provider, env),
-        Harness::Grok => setup_grok(req, relay, provider, env),
-        Harness::Muse => setup_muse(req, relay, provider, env, tail),
-        Harness::Pi => setup_pi(req, relay, provider, env),
-        Harness::Copilot => setup_copilot(req, relay, env),
-        Harness::OpenCode => setup_opencode(req, relay, provider, env),
+        Harness::Claude => setup_claude(req, at, relay, provider, env, argv),
+        Harness::Codex => setup_codex(req, at, relay, provider, env),
+        Harness::Gemini => setup_gemini(req, at, relay, provider, env),
+        Harness::Antigravity => setup_antigravity(req, at, relay, provider, env),
+        Harness::Qwen => setup_qwen(req, at, relay, provider, env),
+        Harness::Grok => setup_grok(req, at, relay, provider, env),
+        Harness::Muse => setup_muse(req, at, relay, provider, env, tail),
+        Harness::Pi => setup_pi(req, at, relay, provider, env),
+        Harness::Copilot => setup_copilot(req, at, relay, env),
+        Harness::OpenCode => setup_opencode(req, at, relay, provider, env),
         Harness::Command => {
             setup_command(req, relay, provider, env);
             Ok(())
@@ -851,6 +1022,7 @@ fn setup_harness(
 
 fn setup_claude(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
@@ -861,7 +1033,7 @@ fn setup_claude(
     });
     write(&req.home.join(".claude-mcp.json"), &mcp.to_string())?;
     claude_global_config(&req.home.join(".claude.json"), req.workdir_inside())?;
-    claude_hooks(&req.home.join(".claude/settings.json"))?;
+    claude_hooks(at, &req.home.join(".claude/settings.json"))?;
     claude_thinking_shown(&req.home.join(".claude/settings.json"))?;
     // anthropic, or the gateway's destination when that is the route
     env.insert("ANTHROPIC_BASE_URL".into(), format!("{relay}/{provider}"));
@@ -876,7 +1048,7 @@ fn setup_claude(
         }
     }
     argv.push("--mcp-config".into());
-    argv.push(format!("{INSIDE_HOME}/.claude-mcp.json"));
+    argv.push(at.under_home(".claude-mcp.json"));
     argv.push("--strict-mcp-config".into());
     Ok(())
 }
@@ -888,8 +1060,9 @@ fn setup_claude(
 /// session end, the `memory` binary inside reads the event and the transcript and
 /// drops a note in the outbox for the launcher to file. Merged into the user settings
 /// in the private home, which the launcher owns.
-fn claude_hooks(path: &Path) -> Result<(), Error> {
+fn claude_hooks(at: &Layout, path: &Path) -> Result<(), Error> {
     merge_hooks(
+        at,
         path,
         "claude",
         &["PreCompact", "SessionEnd", "PreToolUse"],
@@ -920,7 +1093,13 @@ fn claude_thinking_shown(path: &Path) -> Result<(), Error> {
 /// Claude Code's `settings.json`, Codex's `hooks.json`, Qwen Code's `settings.json`.
 /// All share the shape, `hooks → event → matcher groups → command handlers`; they differ
 /// in the name of the compaction event and in how long a session-end hook may run.
-fn merge_hooks(path: &Path, harness: &str, events: &[&str], timeout: u32) -> Result<(), Error> {
+fn merge_hooks(
+    at: &Layout,
+    path: &Path,
+    harness: &str,
+    events: &[&str],
+    timeout: u32,
+) -> Result<(), Error> {
     let mut settings: serde_json::Value = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -930,7 +1109,7 @@ fn merge_hooks(path: &Path, harness: &str, events: &[&str], timeout: u32) -> Res
     }
     let hook = serde_json::json!([{
         "matcher": "*",
-        "hooks": [{ "type": "command", "command": format!("{INSIDE_MEMORY} hook {harness}"), "timeout": timeout }]
+        "hooks": [{ "type": "command", "command": at.hook(harness), "timeout": timeout }]
     }]);
     for e in events {
         settings["hooks"][*e] = hook.clone();
@@ -943,6 +1122,7 @@ fn merge_hooks(path: &Path, harness: &str, events: &[&str], timeout: u32) -> Res
 
 fn setup_codex(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
@@ -1008,14 +1188,15 @@ url = "{relay}/mcp"
     // Codex gives a session-end hook three seconds at most; the projection's guard
     // before a tool runs has the time a tool hook may take
     let hooks = req.home.join(".codex/hooks.json");
-    merge_hooks(&hooks, "codex", &["PreCompact", "SessionEnd"], 3)?;
-    merge_hooks(&hooks, "codex", &["PreToolUse"], 30)?;
-    env.insert("CODEX_HOME".into(), format!("{INSIDE_HOME}/.codex"));
+    merge_hooks(at, &hooks, "codex", &["PreCompact", "SessionEnd"], 3)?;
+    merge_hooks(at, &hooks, "codex", &["PreToolUse"], 30)?;
+    env.insert("CODEX_HOME".into(), at.under_home(".codex"));
     Ok(())
 }
 
 fn setup_gemini(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
@@ -1053,7 +1234,7 @@ fn setup_gemini(
     let hook = |timeout: u32| {
         serde_json::json!([{
             "matcher": "*",
-            "hooks": [{ "type": "command", "command": format!("{INSIDE_MEMORY} hook gemini"), "timeout": timeout }]
+            "hooks": [{ "type": "command", "command": at.hook("gemini"), "timeout": timeout }]
         }])
     };
     let mut settings = serde_json::json!({
@@ -1063,7 +1244,7 @@ fn setup_gemini(
         "privacy": { "usageStatisticsEnabled": false },
         "mcpServers": { "memory": { "httpUrl": format!("{relay}/mcp") } }
     });
-    include_projection(req, &mut settings);
+    include_projection(req, at, &mut settings);
     write(
         &req.home.join(".gemini/settings.json"),
         &serde_json::to_string_pretty(&settings).unwrap_or_default(),
@@ -1077,9 +1258,12 @@ fn setup_gemini(
 /// model so refused falls back to a shell the hook does not see; when the projection is
 /// mounted, the settings include it in the workspace, so a read of it goes through the
 /// tool, and the hook, as a `get`.
-fn include_projection(req: &Request<'_>, settings: &mut serde_json::Value) {
-    if req.projection.is_some_and(Path::is_dir) {
-        settings["context"]["includeDirectories"] = serde_json::json!([INSIDE_PROJECTION]);
+fn include_projection(req: &Request<'_>, at: &Layout, settings: &mut serde_json::Value) {
+    if let Some(inside) = at.projection.as_ref() {
+        if req.projection.is_some_and(Path::is_dir) {
+            settings["context"]["includeDirectories"] =
+                serde_json::json!([inside.display().to_string()]);
+        }
     }
 }
 
@@ -1091,6 +1275,7 @@ fn include_projection(req: &Request<'_>, settings: &mut serde_json::Value) {
 /// under `.gemini/config`, not in the settings, and a remote server is `serverUrl`.
 fn setup_antigravity(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
@@ -1133,7 +1318,7 @@ fn setup_antigravity(
     // too, so a `work` run has no observation here. There is no pre-compaction event.
     let command = serde_json::json!({
         "type": "command",
-        "command": format!("{INSIDE_MEMORY} hook antigravity"),
+        "command": at.hook("antigravity"),
         "timeout": 30
     });
     let hooks = serde_json::json!({
@@ -1159,6 +1344,7 @@ fn setup_antigravity(
 /// seconds.
 fn setup_qwen(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
@@ -1179,13 +1365,14 @@ fn setup_qwen(
         "privacy": { "usageStatisticsEnabled": false },
         "mcpServers": { "memory": { "httpUrl": format!("{relay}/mcp") } }
     });
-    include_projection(req, &mut settings);
+    include_projection(req, at, &mut settings);
     let path = req.home.join(".qwen/settings.json");
     write(
         &path,
         &serde_json::to_string_pretty(&settings).unwrap_or_default(),
     )?;
     merge_hooks(
+        at,
         &path,
         "qwen",
         &["PreCompact", "SessionEnd", "PreToolUse"],
@@ -1208,6 +1395,7 @@ fn setup_qwen(
 /// key and chat-completions backend, and `-m <id>` then selects it.
 fn setup_grok(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
@@ -1230,10 +1418,11 @@ fn setup_grok(
             }
         }
     }
+    let command = toml_escaped(&at.hook("grok"));
     let hook = |event: &str| {
         format!(
             r#"[[hooks.{event}]]
-hooks = [{{ type = "command", command = "{INSIDE_MEMORY} hook grok", timeout = 30 }}]
+hooks = [{{ type = "command", command = "{command}", timeout = 30 }}]
 "#
         )
     };
@@ -1293,6 +1482,7 @@ url = "{relay}/mcp"
 /// The launcher's update check is off, since the image pins what it carries.
 fn setup_muse(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
@@ -1333,6 +1523,7 @@ fn setup_muse(
         &serde_json::to_string_pretty(&settings).unwrap_or_default(),
     )?;
     merge_hooks(
+        at,
         &path,
         "muse",
         &["PreCompact", "SessionEnd", "PreToolUse"],
@@ -1353,6 +1544,7 @@ fn setup_muse(
 /// clients, so a login mode is refused.
 fn setup_pi(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
@@ -1389,13 +1581,14 @@ fn setup_pi(
         &agent.join("mcp.json"),
         &serde_json::to_string_pretty(&mcp).unwrap_or_default(),
     )?;
+    let memory = at.memory_literal();
     let extension = format!(
         r#"// written by memory launch; edits are overwritten. The launcher's hooks, as a pi
 // extension: pi has none of its own, so the hook binary is run from here.
 import {{ spawnSync }} from "node:child_process";
 
 function hook(event: string, payload: Record<string, unknown>): any {{
-  const r = spawnSync("{INSIDE_MEMORY}", ["hook", "pi"], {{
+  const r = spawnSync({memory}, ["hook", "pi"], {{
     input: JSON.stringify({{ hook_event_name: event, ...payload }}),
     encoding: "utf8",
     timeout: 30000,
@@ -1436,6 +1629,7 @@ export default function (pi: any) {{
 
 fn setup_copilot(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
@@ -1460,7 +1654,7 @@ fn setup_copilot(
     // seconds, and a command hook that errors denies
     let hook = serde_json::json!([{
         "type": "command",
-        "bash": format!("{INSIDE_MEMORY} hook copilot"),
+        "bash": at.hook("copilot"),
         "timeoutSec": 30
     }]);
     let hooks = serde_json::json!({
@@ -1471,7 +1665,7 @@ fn setup_copilot(
         &req.home.join(".copilot/hooks/memory.json"),
         &serde_json::to_string_pretty(&hooks).unwrap_or_default(),
     )?;
-    env.insert("COPILOT_HOME".into(), format!("{INSIDE_HOME}/.copilot"));
+    env.insert("COPILOT_HOME".into(), at.under_home(".copilot"));
     env.insert("COPILOT_AUTO_UPDATE".into(), "false".into());
     // no base-url override exists, so its HTTPS goes through the egress as a CONNECT
     // tunnel to the hosts the github destination allows
@@ -1523,6 +1717,7 @@ fn setup_command(
 /// GitHub's hosts, as Copilot CLI's does. Pinned egress without metering.
 fn setup_opencode_copilot(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
@@ -1539,11 +1734,8 @@ fn setup_opencode_copilot(
         &req.home.join(".config/opencode/opencode.json"),
         &serde_json::to_string_pretty(&config).unwrap_or_default(),
     )?;
-    env.insert("XDG_CONFIG_HOME".into(), format!("{INSIDE_HOME}/.config"));
-    env.insert(
-        "XDG_DATA_HOME".into(),
-        format!("{INSIDE_HOME}/.local/share"),
-    );
+    env.insert("XDG_CONFIG_HOME".into(), at.under_home(".config"));
+    env.insert("XDG_DATA_HOME".into(), at.under_home(".local/share"));
     Ok(())
 }
 
@@ -1650,16 +1842,17 @@ export const MemoryPlugin = async () => ({
 
 fn setup_opencode(
     req: &Request<'_>,
+    at: &Layout,
     relay: &str,
     provider: &str,
     env: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
     write(
         &req.home.join(".config/opencode/plugins/memory.js"),
-        &OPENCODE_PLUGIN.replace("__MEMORY__", INSIDE_MEMORY),
+        &OPENCODE_PLUGIN.replace("\"__MEMORY__\"", &at.memory_literal()),
     )?;
     if req.auth == AuthMode::Subscription && provider == "github-copilot" {
-        return setup_opencode_copilot(req, relay, env);
+        return setup_opencode_copilot(req, at, relay, env);
     }
     if req.auth == AuthMode::Subscription {
         return Err(Error::Unsupported(
@@ -1698,12 +1891,9 @@ fn setup_opencode(
         &req.home.join(".config/opencode/opencode.json"),
         &serde_json::to_string_pretty(&config).unwrap_or_default(),
     )?;
-    env.insert("XDG_CONFIG_HOME".into(), format!("{INSIDE_HOME}/.config"));
-    env.insert(
-        "XDG_DATA_HOME".into(),
-        format!("{INSIDE_HOME}/.local/share"),
-    );
-    env.insert("XDG_CACHE_HOME".into(), format!("{INSIDE_HOME}/.cache"));
+    env.insert("XDG_CONFIG_HOME".into(), at.under_home(".config"));
+    env.insert("XDG_DATA_HOME".into(), at.under_home(".local/share"));
+    env.insert("XDG_CACHE_HOME".into(), at.under_home(".cache"));
     env.insert(key_env.into(), "egress".into());
     Ok(())
 }
@@ -1721,20 +1911,34 @@ fn claude_global_config(path: &Path, workdir: &Path) -> Result<(), Error> {
     write(path, &serde_json::to_string_pretty(&v).unwrap_or_default())
 }
 
-/// Run a plan under this platform's backend, returning the harness's exit code.
+/// Run a plan under the backend its layout is for, returning the harness's exit code.
 ///
 /// # Errors
 ///
-/// [`Error::NoBackend`] off Linux, or a confinement failure.
+/// [`Error::NoBackend`] for a namespaces plan off Linux or a Seatbelt plan off macOS,
+/// or a confinement failure.
 pub fn run(plan: &Plan) -> Result<i32, Error> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::run(plan)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = plan;
-        Err(Error::NoBackend)
+    match plan.layout.backend {
+        Backend::Namespaces => {
+            #[cfg(target_os = "linux")]
+            {
+                linux::run(plan)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(Error::NoBackend)
+            }
+        }
+        Backend::Seatbelt => {
+            #[cfg(target_os = "macos")]
+            {
+                seatbelt::run(plan)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(Error::NoBackend)
+            }
+        }
     }
 }
 
@@ -1743,16 +1947,29 @@ pub fn run(plan: &Plan) -> Result<i32, Error> {
 ///
 /// # Errors
 ///
-/// [`Error::NoBackend`] off Linux, or a confinement failure.
+/// As [`run`].
 pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>), Error> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::run_captured(plan)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = plan;
-        Err(Error::NoBackend)
+    match plan.layout.backend {
+        Backend::Namespaces => {
+            #[cfg(target_os = "linux")]
+            {
+                linux::run_captured(plan)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(Error::NoBackend)
+            }
+        }
+        Backend::Seatbelt => {
+            #[cfg(target_os = "macos")]
+            {
+                seatbelt::run_captured(plan)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(Error::NoBackend)
+            }
+        }
     }
 }
 
@@ -3340,5 +3557,223 @@ await ev("session.idle", { sessionID: "../../evil" });
             !f.root.join("q3/.qwen/oauth_creds.json").exists(),
             "nothing copied in"
         );
+    }
+
+    /// A plan for Seatbelt's layout, from the fixture: everything at its host path. Unix
+    /// only, as the profile's paths are: a Windows path is never one Seatbelt is given.
+    #[cfg(unix)]
+    fn seatbelt_plan(
+        f: &Fixture,
+        harness: Harness,
+        home: &str,
+        projection: Option<&Path>,
+        model: Option<&str>,
+    ) -> Result<(PathBuf, Plan), Error> {
+        let home = f.root.join(home);
+        let _path = path_lock();
+        let old = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![f.bins.clone()];
+        paths.extend(std::env::split_paths(&old));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        let req = Request {
+            harness,
+            auth: AuthMode::Key,
+            provider: None,
+            workdir: &f.work,
+            home: &home,
+            egress_socket: &f.sock,
+            memory_binary: &f.memory_bin,
+            destination_ceiling: Label::Public,
+            harness_args: &[],
+            host_home: None,
+            harness_env: &[],
+            model,
+            image: false,
+            workdir_inside: None,
+            rootfs: None,
+            projection,
+        };
+        let r = prepare_in(&req, Layout::seatbelt(&req, "127.0.0.1:51234"));
+        std::env::set_var("PATH", old);
+        r.map(|p| (home, p))
+    }
+
+    /// Every file under `dir`, with its text.
+    #[cfg(unix)]
+    fn files_under(dir: &Path) -> Vec<(PathBuf, String)> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(files_under(&p));
+            } else {
+                out.push((p.clone(), std::fs::read_to_string(&p).unwrap_or_default()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_namespaces_layout_is_the_inside_constants() {
+        let at = Layout::namespaces();
+        assert_eq!(at.backend, Backend::Namespaces);
+        assert_eq!(at.home, Path::new(INSIDE_HOME));
+        assert_eq!(at.socket, Path::new(INSIDE_SOCKET));
+        assert_eq!(at.memory, Path::new(INSIDE_MEMORY));
+        assert_eq!(at.relay, INSIDE_RELAY);
+        assert_eq!(at.projection.as_deref(), Some(Path::new(INSIDE_PROJECTION)));
+        assert_eq!(at.tmp, Path::new("/tmp"));
+        assert_eq!(at.hook("claude"), format!("{INSIDE_MEMORY} hook claude"));
+        assert_eq!(at.memory_literal(), format!("\"{INSIDE_MEMORY}\""));
+    }
+
+    #[test]
+    fn a_hook_command_quotes_a_path_a_shell_would_split() {
+        assert_eq!(
+            shell_word(Path::new("/opt/memory/memory")),
+            "/opt/memory/memory"
+        );
+        assert_eq!(
+            shell_word(Path::new("/Users/me/My Tools/amem")),
+            "'/Users/me/My Tools/amem'"
+        );
+        assert_eq!(shell_word(Path::new("/a/it's")), r"'/a/it'\''s'");
+        assert_eq!(toml_escaped(r#"'/a/"b"\c' hook"#), r#"'/a/\"b\"\\c' hook"#);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn under_seatbelt_the_harness_sees_its_host_paths() {
+        let f = fixture();
+        let projection = f.root.join("projection");
+        std::fs::create_dir_all(&projection).unwrap();
+        let (home, plan) =
+            seatbelt_plan(&f, Harness::Claude, "sb", Some(&projection), None).unwrap();
+        let shown = |p: &Path| p.display().to_string();
+        assert_eq!(plan.layout.backend, Backend::Seatbelt);
+        assert_eq!(plan.env["HOME"], shown(&home));
+        assert_eq!(plan.env["MEMORY_OUTBOX"], shown(&home.join(OUTBOX)));
+        assert_eq!(plan.env["TMPDIR"], shown(&home.join(".tmp")));
+        assert!(home.join(".tmp").is_dir());
+        assert_eq!(plan.env["MEMORY_PROJECTION"], shown(&projection));
+        assert!(plan.env["PATH"].contains(&shown(f.memory_bin.parent().unwrap())));
+        assert_eq!(plan.argv[0], shown(&f.memory_bin));
+        assert_eq!(plan.argv[3], shown(&f.sock));
+        assert_eq!(plan.argv[5], "127.0.0.1:51234");
+        assert!(plan.argv.contains(&shown(&home.join(".claude-mcp.json"))));
+        assert_eq!(plan.cwd, f.work);
+        let settings = json_file(&home.join(".claude/settings.json"));
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            format!("{} hook claude", f.memory_bin.display())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn under_seatbelt_the_mounts_are_the_profile_grants() {
+        let f = fixture();
+        let projection = f.root.join("projection");
+        std::fs::create_dir_all(&projection).unwrap();
+        let (home, plan) =
+            seatbelt_plan(&f, Harness::Claude, "sb", Some(&projection), None).unwrap();
+        let shown = |p: &Path| p.display().to_string();
+        // the mounts are grants at the host's paths, and the system is not among them
+        assert!(plan.mounts.iter().all(|m| m.source == m.target));
+        assert!(!plan.mounts.iter().any(|m| m.target.starts_with("/usr")));
+        assert!(plan.links.is_empty());
+        let profile = seatbelt::profile(&plan).unwrap();
+        assert!(profile.contains(&format!("(subpath \"{}\")", shown(&home))));
+        assert!(profile.contains(&format!("(subpath \"{}\")", shown(&projection))));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn under_seatbelt_no_adapter_names_a_namespaces_path() {
+        let f = fixture();
+        let projection = f.root.join("projection");
+        std::fs::create_dir_all(&projection).unwrap();
+        for (i, h) in [
+            Harness::Claude,
+            Harness::Codex,
+            Harness::Gemini,
+            Harness::Antigravity,
+            Harness::Qwen,
+            Harness::Grok,
+            Harness::Muse,
+            Harness::Pi,
+            Harness::OpenCode,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (home, plan) =
+                seatbelt_plan(&f, h, &format!("h{i}"), Some(&projection), Some("m")).unwrap();
+            let memory = f.memory_bin.display().to_string();
+            let mut hooked = false;
+            for (p, text) in files_under(&home) {
+                // OpenCode's plugin falls back on the namespaces home only where HOME
+                // is unset, which no plan leaves it
+                let text = text.replace(r#"process.env.HOME || "/home/user""#, "");
+                for inside in [INSIDE_HOME, INSIDE_MEMORY, "/run/memory"] {
+                    assert!(
+                        !text.contains(inside),
+                        "{h:?}: {} names {inside}",
+                        p.display()
+                    );
+                }
+                hooked |= text.contains(&memory);
+            }
+            assert!(hooked, "{h:?}: no file runs the memory's hook");
+            for (k, v) in &plan.env {
+                for inside in [INSIDE_HOME, INSIDE_MEMORY, INSIDE_SOCKET, INSIDE_RELAY] {
+                    assert!(!v.contains(inside), "{h:?}: {k}={v}");
+                }
+            }
+            assert!(!plan.argv.iter().any(|a| a.contains(INSIDE_HOME)), "{h:?}");
+        }
+    }
+
+    #[test]
+    fn seatbelt_refuses_the_image_and_a_tree_over_its_own() {
+        let f = fixture();
+        let req = |workdir: &'static str, image: bool| {
+            let workdir = if workdir.is_empty() {
+                f.root.clone()
+            } else {
+                f.work.clone()
+            };
+            (workdir, image)
+        };
+        for (workdir, image) in [req("", false), req("work", true)] {
+            let home = f.root.join("sb");
+            let r = Request {
+                harness: Harness::Claude,
+                auth: AuthMode::Key,
+                provider: None,
+                workdir: &workdir,
+                home: &home,
+                egress_socket: &f.sock,
+                memory_binary: &f.memory_bin,
+                destination_ceiling: Label::Public,
+                harness_args: &[],
+                host_home: None,
+                harness_env: &[],
+                model: None,
+                image,
+                workdir_inside: None,
+                rootfs: None,
+                projection: None,
+            };
+            match prepare_in(&r, Layout::seatbelt(&r, "127.0.0.1:51234")) {
+                Err(Error::Unsupported(why)) => {
+                    assert!(
+                        why.contains("Seatbelt") || why.contains("working tree"),
+                        "{why}"
+                    );
+                }
+                other => panic!("{} image {image}: {other:?}", workdir.display()),
+            }
+        }
     }
 }

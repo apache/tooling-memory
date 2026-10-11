@@ -243,7 +243,7 @@ pub enum MineVia {
 /// Where the harness runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum BackendArg {
-    /// Namespaces on Linux; WSL containers on Windows.
+    /// Namespaces on Linux; Seatbelt on macOS; WSL containers on Windows.
     Auto,
     /// Native Linux namespaces, from this host's binaries.
     Namespaces,
@@ -252,6 +252,9 @@ enum BackendArg {
     Image,
     /// WSL containers: the harness image in a session VM, through `wslc`.
     Wslc,
+    /// Seatbelt, macOS's sandbox, over this host's binaries, with a profile made from the
+    /// plan. What `auto` picks on macOS. Dry-coded: not yet run on a Mac.
+    Seatbelt,
     /// No confinement: the egress still proxies and meters, nothing else.
     None,
 }
@@ -1972,18 +1975,23 @@ async fn run_confined(
     args: &[String],
     env: &[(String, String)],
     capture: bool,
-    rootfs: Option<&Path>,
+    runner: &Runner,
 ) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
     let host_home = home_dir();
+    let rootfs = match runner {
+        Runner::Image(rootfs) => Some(rootfs.as_path()),
+        _ => None,
+    };
+    let memory_binary = std::env::current_exe()?;
     p.memory.project_into(&p.projection).await?;
-    let mut plan = dm_sandbox::prepare(&dm_sandbox::Request {
+    let req = dm_sandbox::Request {
         harness,
         auth,
         provider: Some(p.provider.as_str()),
         workdir,
         home: &p.home,
         egress_socket: &p.socket,
-        memory_binary: &std::env::current_exe()?,
+        memory_binary: &memory_binary,
         destination_ceiling: p.ceiling,
         harness_args: args,
         host_home: host_home.as_deref(),
@@ -1993,7 +2001,15 @@ async fn run_confined(
         workdir_inside: None,
         rootfs,
         projection: Some(&p.projection),
-    })?;
+    };
+    let mut plan = match runner {
+        // no network namespace: the relay takes a loopback port of its own on the host's
+        Runner::Seatbelt => dm_sandbox::prepare_in(
+            &req,
+            dm_sandbox::Layout::seatbelt(&req, &free_loopback_port()?),
+        )?,
+        _ => dm_sandbox::prepare(&req)?,
+    };
     // the hook frees a recall page of this session only
     plan.env
         .insert("MEMORY_SESSION".into(), p.memory.session_id().to_string());
@@ -2009,6 +2025,14 @@ async fn run_confined(
         }
     })
     .await??)
+}
+
+/// A loopback address no listener holds now, for a relay on the host's own loopback.
+/// The port is free when asked and taken by the relay a moment later; another process
+/// could take it between, and the relay then says it cannot listen rather than share it.
+fn free_loopback_port() -> std::io::Result<String> {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(probe.local_addr()?.to_string())
 }
 
 /// `web`: the web terminal.
@@ -2155,6 +2179,7 @@ fn web_config(
         BackendArg::Namespaces => "namespaces",
         BackendArg::Image => "image",
         BackendArg::Wslc => "wslc",
+        BackendArg::Seatbelt => "seatbelt",
         BackendArg::None => "none",
     };
     Ok(dm_web::Config {
@@ -3104,12 +3129,14 @@ enum Backend {
     Namespaces,
     Image,
     Wslc,
+    Seatbelt,
     None,
 }
 
 /// Which backend a launch resolves to. `auto` on Linux is the unpacked image when there
 /// is one that carries the harness, so homogeneity is the default once you have it, and
 /// the host's binaries otherwise: Antigravity CLI, say, which the image does not carry.
+/// On macOS it is Seatbelt over the host's binaries.
 fn backend_of(arg: BackendArg, unconfined: bool, root: &Path, harness: Harness) -> Backend {
     if unconfined {
         return Backend::None;
@@ -3118,6 +3145,7 @@ fn backend_of(arg: BackendArg, unconfined: bool, root: &Path, harness: Harness) 
         BackendArg::Namespaces => Backend::Namespaces,
         BackendArg::Image => Backend::Image,
         BackendArg::Wslc => Backend::Wslc,
+        BackendArg::Seatbelt => Backend::Seatbelt,
         BackendArg::None => Backend::None,
         BackendArg::Auto => {
             if cfg!(target_os = "linux") {
@@ -3126,6 +3154,8 @@ fn backend_of(arg: BackendArg, unconfined: bool, root: &Path, harness: Harness) 
                 } else {
                     Backend::Namespaces
                 }
+            } else if cfg!(target_os = "macos") {
+                Backend::Seatbelt
             } else if cfg!(windows) {
                 Backend::Wslc
             } else {
@@ -3138,6 +3168,7 @@ fn backend_of(arg: BackendArg, unconfined: bool, root: &Path, harness: Harness) 
 fn runner_for(backend: Backend, root: &Path) -> Result<Runner, Box<dyn std::error::Error>> {
     Ok(match backend {
         Backend::Namespaces => Runner::Namespaces,
+        Backend::Seatbelt => Runner::Seatbelt,
         Backend::Image => Runner::Image(
             image::present(root).ok_or("no unpacked image; run `memory image unpack` first")?,
         ),
@@ -3150,6 +3181,7 @@ fn runner_for(backend: Backend, root: &Path) -> Result<Runner, Box<dyn std::erro
 fn announce(runner: &Runner, p: &Prepared, harness: Harness, workdir: &Path) {
     let how = match runner {
         Runner::Namespaces => "confined to",
+        Runner::Seatbelt => "confined by Seatbelt to",
         Runner::Image(_) => "confined, in the harness image, to",
         Runner::Unconfined(_) => "unconfined in",
         Runner::Requests(_) => "in the harness image, working tree at",
@@ -3219,6 +3251,8 @@ pub enum Runner {
     Namespaces,
     /// Native Linux namespaces, pivoted into this unpacked image.
     Image(PathBuf),
+    /// Seatbelt on macOS, from this host's binaries at their own paths.
+    Seatbelt,
     /// On the host, with the egress on a loopback TCP port.
     Unconfined(
         Option<(
@@ -3296,7 +3330,7 @@ impl Session {
         #[cfg(not(unix))]
         if matches!(
             runner,
-            Runner::Namespaces | Runner::Image(_) | Runner::Requests(_)
+            Runner::Namespaces | Runner::Image(_) | Runner::Seatbelt | Runner::Requests(_)
         ) {
             return Err(
                 "confinement needs Linux; run under WSL2, or pass --backend wslc or --unconfined"
@@ -3489,7 +3523,7 @@ impl Session {
                 capture,
             ),
             Runner::Unconfined(None) => Err("the unconfined runner was not started".into()),
-            Runner::Namespaces => {
+            Runner::Namespaces | Runner::Image(_) | Runner::Seatbelt => {
                 run_confined(
                     &self.p,
                     self.harness,
@@ -3498,20 +3532,7 @@ impl Session {
                     args,
                     &env,
                     capture,
-                    None,
-                )
-                .await
-            }
-            Runner::Image(rootfs) => {
-                run_confined(
-                    &self.p,
-                    self.harness,
-                    self.auth,
-                    &self.workdir,
-                    args,
-                    &env,
-                    capture,
-                    Some(rootfs),
+                    &self.runner,
                 )
                 .await
             }
@@ -4949,5 +4970,34 @@ mod backend_tests {
             runner_for(Backend::None, dir.path()).unwrap(),
             Runner::Unconfined(None)
         ));
+    }
+
+    #[test]
+    fn seatbelt_is_auto_on_macos_and_named_anywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            backend_of(BackendArg::Seatbelt, false, dir.path(), Harness::Claude),
+            Backend::Seatbelt
+        );
+        assert_eq!(
+            backend_of(BackendArg::Seatbelt, true, dir.path(), Harness::Claude),
+            Backend::None,
+            "--unconfined still wins"
+        );
+        assert!(matches!(
+            runner_for(Backend::Seatbelt, dir.path()).unwrap(),
+            Runner::Seatbelt
+        ));
+        let auto = backend_of(BackendArg::Auto, false, dir.path(), Harness::Claude);
+        assert_eq!(
+            auto == Backend::Seatbelt,
+            cfg!(target_os = "macos"),
+            "auto on this platform is {auto:?}"
+        );
+        let port = free_loopback_port().unwrap();
+        assert!(
+            port.starts_with("127.0.0.1:") && !port.ends_with(":0"),
+            "{port}"
+        );
     }
 }

@@ -345,6 +345,9 @@ async fn harnesses(root: &Path, checks: &mut Vec<Check>, found: &mut Found) {
             "auto is namespaces over this host's binaries; `make unpack` makes it the image".into()
         }
         (Backend::Wslc, _) => "auto is wslc: the image in a WSL container".into(),
+        (Backend::Seatbelt, _) => {
+            "auto is Seatbelt over this host's binaries; dry-coded, not yet run on a Mac".into()
+        }
         _ => "auto runs unconfined: no backend for this platform".into(),
     };
     let status = if backend == Backend::None {

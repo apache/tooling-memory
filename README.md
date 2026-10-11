@@ -46,8 +46,9 @@ harnesses in two weeks, and it is also why none of it is the production shape.
   runs; the probes run each curation cycle with `--drift`, against fixed thresholds.
 - **Smaller pieces.** The search tool has met only a fake of Brave's API, never the live
   provider.
-- **Platforms and CI.** No confinement on macOS, no bridge to Gofannon, and CI has not
-  run since a billing failure; every change is gated locally by `make check`.
+- **Platforms and CI.** Confinement on macOS is dry-coded: a Seatbelt profile made from
+  the plan, unit-tested on Linux and not yet run on a Mac. No bridge to Gofannon, and CI
+  has not run since a billing failure; every change is gated locally by `make check`.
 
 ### What is built but works only at demo scale
 
