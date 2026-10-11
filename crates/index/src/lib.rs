@@ -235,6 +235,9 @@ fn compile_filter(f: &ReadFilter, first: usize) -> (String, Vec<rusqlite::types:
     (sql, values)
 }
 
+/// The longest chain of replacements [`Index::replaced_by`] walks, against a cycle.
+const MAX_CHAIN: usize = 64;
+
 impl Index {
     /// Open or create the index file.
     ///
@@ -502,6 +505,36 @@ impl Index {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| Ok(hit_from_row(row, 0.0)))?;
         rows.map(|r| r?).collect()
+    }
+
+    /// Where a reader of a replaced entry goes: the end of its chain of successors,
+    /// the newest active entry the filter admits, resolved in one query however many
+    /// times the entry was replaced, so a reader is redirected once, not hop by hop.
+    /// `None` when no active successor is admitted.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn replaced_by(&self, id: &str, filter: &ReadFilter) -> Result<Option<String>, Error> {
+        let (where_sql, mut values) = compile_filter(filter, 2);
+        values.insert(0, id.to_string().into());
+        let sql = format!(
+            "WITH RECURSIVE chain(id, depth) AS (
+                 SELECT e.id, 1 FROM entries e WHERE e.supersedes = ?1
+                 UNION
+                 SELECT e.id, c.depth + 1 FROM entries e JOIN chain c ON e.supersedes = c.id
+                 WHERE c.depth < {MAX_CHAIN}
+             )
+             SELECT e.id FROM chain c JOIN entries e ON e.id = c.id
+             WHERE e.status IS NULL{where_sql}
+             ORDER BY c.depth DESC, e.created DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(values))?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
     }
 
     /// One entry's metadata, if the filter admits it. `None` both when the entry is absent

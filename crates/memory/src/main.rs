@@ -3684,7 +3684,11 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
         }
         cmd @ (Command::Search { .. } | Command::Recall { .. }) => retrieve(m, cmd).await,
         Command::Get { id } => {
-            print!("{}", m.get(&id).await?.render());
+            let (e, from) = m.get_following(&id).await?;
+            for old in &from {
+                eprintln!("amem: {old} was replaced; reading its successor");
+            }
+            print!("{}", e.render());
             Ok(())
         }
         Command::List {

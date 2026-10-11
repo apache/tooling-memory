@@ -32,7 +32,9 @@ const MAX_LIMIT: usize = 100;
 
 fn mcp_err(e: Error) -> McpError {
     match e {
-        Error::Denied(_) | Error::NotFound(_) => McpError::invalid_params(e.to_string(), None),
+        Error::Denied(_) | Error::NotFound(_) | Error::Gone(_) | Error::Moved { .. } => {
+            McpError::invalid_params(e.to_string(), None)
+        }
         Error::Ledger(
             dm_ledger::Error::NotFound(_)
             | dm_ledger::Error::WrongState { .. }
@@ -408,8 +410,12 @@ impl McpServer {
         description = "One entry in full: its frontmatter and Markdown body. Reading it raises this session's label to the entry's classification. `read_with`, when present, gives the summaries of entries usually read alongside it."
     )]
     async fn get(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
-        let e = self.memory.get(&p.0.id).await.map_err(mcp_err)?;
-        let with = self.memory.read_with(&p.0.id, 2).await.unwrap_or_default();
+        let (e, from) = self.memory.get_following(&p.0.id).await.map_err(mcp_err)?;
+        let with = self
+            .memory
+            .read_with(&e.front.id, 2)
+            .await
+            .unwrap_or_default();
         let f = &e.front;
         let mut v = json!({
             "id": f.id,
@@ -425,6 +431,10 @@ impl McpServer {
             "title": e.title(),
             "body": e.body,
         });
+        if !from.is_empty() {
+            // as a client shows the URL it was redirected to: cite this id, not the one asked
+            v["redirected_from"] = json!(from);
+        }
         if !with.is_empty() {
             v["read_with"] = json!(with
                 .iter()
@@ -1020,6 +1030,25 @@ mod tests {
         let t0 = s.t0(Parameters(DomainParams::default())).await.unwrap();
         let t0 = t0.content[0].as_text().unwrap().text.clone();
         assert!(t0.contains(&id), "{t0}");
+
+        // an id from a list a moment ago, replaced since: the reader is redirected
+        let w2 = payload(
+            &s.write(Parameters(WriteParams {
+                body: "# Stopped at step 4\n\nResume with the manifest.\n".into(),
+                entry_type: Some("handoff".into()),
+                supersedes: Some(id.clone()),
+                ..WriteParams::default()
+            }))
+            .await
+            .unwrap(),
+        );
+        let moved = payload(
+            &s.get(Parameters(GetParams { id: id.clone() }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(moved["id"], w2["id"], "the successor is read");
+        assert_eq!(moved["redirected_from"], json!([id]));
     }
 
     #[tokio::test]

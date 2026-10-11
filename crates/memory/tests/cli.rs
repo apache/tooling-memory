@@ -324,7 +324,7 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
     assert_eq!(receipt["flagged"], serde_json::json!([citing]));
     assert!(!ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
     let err = fails(&d.root, &["get", &secret]);
-    assert!(err.contains("not found"), "{err}");
+    assert!(err.contains("gone") && err.contains("erased"), "{err}");
     let err = fails(&d.root, &["erase", &secret, "--reason", "legal"]);
     assert!(err.contains("already erased"), "{err}");
     let stub = std::fs::read_to_string(d.root.join(format!("record/dom-me/{secret}.md"))).unwrap();

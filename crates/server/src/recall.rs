@@ -1221,7 +1221,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(matches!(m.get(&x).await, Err(Error::NotFound(_))));
+        assert!(matches!(m.get(&x).await, Err(Error::Moved { .. })));
         assert!(m.cached(&x).is_none(), "a refused id leaves the cache");
     }
 

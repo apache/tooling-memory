@@ -380,6 +380,20 @@ requirements of waiting tasks that no completed task ever carried, a capability 
 and per creator the filings held back for asking more than the creator holds, the
 paper's requirements inflation, which the librarian's telemetry flags at three.
 
+## When an entry has moved: redirects
+
+A list or a search can offer an entry that a curation replaces a moment later, and the
+reader's `get` then arrives at an entry no longer served. It is not told "not found".
+A replaced entry answers as an HTTP 301 would: `moved`, with the location of its current
+version, the end of its chain of successors, resolved by the server in one query however
+many times the entry was replaced. The MCP `get` tool and `amem get` follow it and serve
+the current version, through the same checks as any read, with `redirected_from` naming
+what was asked for, so a reader cites what it read. They follow again only if the current
+version was itself replaced in between, at most eight times. A demoted or erased entry,
+or one replaced by nothing the reader may read, answers `gone`, as a 410 would. Either
+answer is given only about an entry the reader could read; anything else stays "not
+found", so a redirect tells nothing a search would not.
+
 ## Prefetch and the read metrics
 
 When `amem work` claims a task, its prompt carries the summaries, never the bodies, of

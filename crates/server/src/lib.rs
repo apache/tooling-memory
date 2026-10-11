@@ -53,6 +53,10 @@ pub const INDEX_FILE: &str = "state/index.db";
 /// The ledger, relative to the root.
 pub const LEDGER_FILE: &str = "state/ledger.db";
 
+/// How many redirects [`Memory::get_following`] follows before it gives up. Each names
+/// the end of its chain, so more than one means the record moved under the reader.
+pub const MAX_REDIRECTS: usize = 8;
+
 /// What can go wrong at the surface.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -88,6 +92,21 @@ pub enum Error {
     /// Not there, or not for this session to see. The two are deliberately the same.
     #[error("not found: {0}")]
     NotFound(String),
+    /// Replaced: the entry this session could read has a successor, which is where to
+    /// read now, as an HTTP 301 names its location. The location is the end of the chain,
+    /// so one redirect reaches the current version. [`Memory::get_following`] follows it.
+    #[error("moved: {id} was replaced by {to}")]
+    Moved {
+        /// The entry asked for.
+        id: String,
+        /// The current version: the last of its successors, active, that this session
+        /// may read.
+        to: String,
+    },
+    /// No longer served and nowhere to go, as an HTTP 410: demoted, erased, or replaced
+    /// by nothing this session may read. Said only of an entry the session could read.
+    #[error("gone: {0}")]
+    Gone(String),
     /// The recall deputy failed or timed out.
     #[error("deputy: {0}")]
     Deputy(String),
@@ -771,7 +790,7 @@ impl Memory {
         let meta = self.index.lock().await.meta(id, &f)?;
         let Some(meta) = meta else {
             self.forget_pushed(id);
-            return Err(Error::NotFound(id.to_string()));
+            return Err(self.not_served(id, None).await);
         };
         self.note_get();
         let entry = self
@@ -779,15 +798,80 @@ impl Memory {
             .get(&meta.hit.domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        if !lock(&self.session).observe(entry.front.classification)
-            || (!entry.is_active() && !f.include_inactive)
-        {
+        // the index can lag the record: a list or search a moment ago may have offered
+        // an entry a curation has since replaced, and the reader is redirected, not lost
+        if !entry.is_active() && !f.include_inactive {
+            self.forget_pushed(id);
+            return Err(self.not_served(id, entry.front.status).await);
+        }
+        if !lock(&self.session).observe(entry.front.classification) {
             self.forget_pushed(id);
             return Err(Error::NotFound(id.to_string()));
         }
         let pushed = self.was_pushed(&entry);
         self.reads.opened(id, &entry.body, pushed);
         Ok(entry)
+    }
+
+    /// Why an entry is not served, for an entry this session could read: moved to its
+    /// successor, or gone. Anything the session could not read stays not found, so the
+    /// answer tells nothing a search would not.
+    async fn not_served(&self, id: &str, known: Option<Status>) -> Error {
+        let Ok(mut wide) = self.session_filter() else {
+            return Error::NotFound(id.to_string());
+        };
+        wide.include_inactive = true;
+        let ix = self.index.lock().await;
+        let Ok(Some(meta)) = ix.meta(id, &wide) else {
+            return Error::NotFound(id.to_string());
+        };
+        match known.or(meta.status) {
+            Some(Status::Superseded) => match ix.replaced_by(id, &wide) {
+                Ok(Some(to)) => Error::Moved {
+                    id: id.to_string(),
+                    to,
+                },
+                _ => Error::Gone(format!("{id} was replaced; search for its current version")),
+            },
+            Some(Status::Demoted) => Error::Gone(format!(
+                "{id} was demoted by curation; the archive keeps it for audit"
+            )),
+            Some(Status::Erased) => {
+                Error::Gone(format!("{id} was erased; a stub and a receipt remain"))
+            }
+            None => Error::NotFound(id.to_string()),
+        }
+    }
+
+    /// [`Memory::get`], following its redirect: a replaced entry's current version is
+    /// read in its place, through the same checks. The redirect names the end of the
+    /// chain, so this is one more read; it follows again only when the current version
+    /// was itself replaced in between, up to [`MAX_REDIRECTS`] times. Returns the entry
+    /// read and the ids it was redirected from, in order, so a reader cites what it read
+    /// and knows what it asked for was replaced.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::get`], or [`Error::Gone`] past the redirect limit or on a cycle.
+    pub async fn get_following(&self, id: &str) -> Result<(Entry, Vec<String>), Error> {
+        let mut from = Vec::new();
+        let mut at = id.to_string();
+        loop {
+            match self.get(&at).await {
+                Ok(e) => return Ok((e, from)),
+                Err(Error::Moved { to, .. })
+                    if from.len() < MAX_REDIRECTS && to != id && !from.contains(&to) =>
+                {
+                    from.push(std::mem::replace(&mut at, to));
+                }
+                Err(Error::Moved { .. }) => {
+                    return Err(Error::Gone(format!(
+                        "{id} was replaced, and its successors redirect too far"
+                    )))
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Write an entry at raw trust, attributed to this session's author, classified at
@@ -2702,6 +2786,33 @@ mod tests {
             !found.contains(&old),
             "search serves what get refuses: {found:?}"
         );
+        // a reader holding the old id, from a list a moment ago, is redirected
+        match owner.get(&old).await {
+            Err(Error::Moved { to, .. }) => assert_eq!(to, new),
+            other => panic!("a replaced entry answers moved: {other:?}"),
+        }
+        let newest = owner
+            .write(WriteRequest {
+                supersedes: Some(new.clone()),
+                ..req("Zanzibar retries seven times.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        match owner.get(&old).await {
+            Err(Error::Moved { to, .. }) => {
+                assert_eq!(to, newest, "one redirect, to the end of the chain")
+            }
+            other => panic!("{other:?}"),
+        }
+        let (read, from) = owner.get_following(&old).await.unwrap();
+        assert_eq!(read.front.id, newest);
+        assert_eq!(from, vec![old.clone()], "one round trip, not one per hop");
+        // erased is gone, with nowhere to go
+        owner.erase(&newest, Reason::Mistaken).await.unwrap();
+        let err = owner.get(&newest).await.unwrap_err();
+        assert!(matches!(err, Error::Gone(_)), "{err}");
+        assert!(err.to_string().contains("erased"), "{err}");
     }
 
     #[tokio::test]
@@ -4099,7 +4210,7 @@ mod tests {
         assert!(r.unresolved.iter().any(|u| u.contains("exports")));
 
         assert!(
-            matches!(m.get(&a).await, Err(Error::NotFound(_))),
+            matches!(m.get(&a).await, Err(Error::Gone(ref why)) if why.contains("erased")),
             "the stub is not an active entry"
         );
         let hits = m.search("vault", None, 10).await.unwrap();
@@ -4419,7 +4530,7 @@ mod tests {
         // the record moves on without the index: another process demoted it
         m.store.demote("dom-me", &w.id).await.unwrap();
         assert!(
-            matches!(m.get(&w.id).await, Err(Error::NotFound(_))),
+            matches!(m.get(&w.id).await, Err(Error::Gone(ref why)) if why.contains("demoted")),
             "an inactive record is not served because the index is behind"
         );
     }
@@ -4460,7 +4571,7 @@ mod tests {
         drop(stmt);
         drop(reader);
         assert!(
-            matches!(m.get(&a).await, Err(Error::NotFound(_))),
+            matches!(m.get(&a).await, Err(Error::Gone(ref why)) if why.contains("erased")),
             "the stub is not served"
         );
         let pending = m.receipt(&a).await.unwrap().unwrap();
