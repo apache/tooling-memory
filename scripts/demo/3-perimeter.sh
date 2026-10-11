@@ -91,6 +91,57 @@ if gateway; then
   mv "$root/grants.toml.before-spend" "$root/grants.toml"
 fi
 
+# fetch, a tool the agent calls: the component built from taps/ when it is not yet
+fetch_wasm="$here/taps/target/wasm32-wasip2/release/tap_fetch.wasm"
+[ -f "$fetch_wasm" ] || cargo build -q --manifest-path "$here/taps/Cargo.toml" -p tap-fetch \
+  --target wasm32-wasip2 --release 2>/dev/null || true
+if [ -f "$fetch_wasm" ]; then
+  say "tools from outside: fetch, every request decided by the policy at what the session has read"
+  a tap install fetch "$fetch_wasm" >/dev/null
+  grep -q '^\[taps.fetch\]' "$root/grants.toml" || cat >> "$root/grants.toml" <<'GRANT'
+
+[taps.fetch]
+domain = "dom-demo"
+tool = true
+ceiling = "public"
+hosts = ["docs.python.org", "*.apache.org"]
+
+[taps.fetch.trusted]
+hosts = ["*.apache.org"]
+ceiling = "internal"
+GRANT
+  echo "  grants.toml: fetch reaches docs.python.org and *.apache.org; once a session has read"
+  echo "  internal entries, only *.apache.org, since a URL carries what it read out"
+  internal=$(a list --kind decision --limit 1 | j "d[0]['id']")
+  agent agent:reader steps "[
+    {\"tool\": \"fetch\", \"arguments\": {\"url\": \"https://docs.python.org/3/\"}},
+    {\"tool\": \"fetch\", \"arguments\": {\"url\": \"https://example.com/\"}},
+    {\"tool\": \"get\", \"arguments\": {\"id\": \"$internal\"}},
+    {\"tool\": \"fetch\", \"arguments\": {\"url\": \"https://docs.python.org/3/library/\"}},
+    {\"tool\": \"fetch\", \"arguments\": {\"url\": \"https://www.apache.org/foundation/\"}},
+    {\"tool\": \"fetch\", \"arguments\": {\"url\": \"https://docs.python.org/3/\"}}
+  ]" | python3 -c '
+import json, sys
+for line in sys.stdin:
+    s = json.loads(line)
+    r = s.get("result") or {}
+    if s["tool"] == "get":
+        print("  get " + r.get("id", "?") + ": the session has now read an " + r.get("classification", "?") + " entry")
+    elif s["ok"]:
+        how = "from its source, nothing sent" if r.get("cached") else "fetched"
+        print("  " + how + ": " + r.get("title", "")[:60] + "  cite as " + r.get("cite_as", ""))
+    else:
+        print("  refused: " + s["refused"].split("; the tap then reported")[0].replace("tool: refused: ", "")[:220])
+'
+  echo "  the decision log, one line per request:"
+  grep '"action":"fetch"' "$root/state/decisions.jsonl" | tail -5 | python3 -c '
+import json, sys
+for line in sys.stdin:
+    d = json.loads(line)
+    print("    " + ("allow " if d["allow"] else "refuse") + "  " + d["reason"][:110])
+'
+fi
+
 say "reads are the policy's too: a root's policy narrowing agents to public entries, inside the query"
 mkdir -p "$root/policy"
 sed 's/^read_filter := base_filter$/read_filter := object.union(base_filter, {"handling": "public"}) if class == "agent"\n\nread_filter := base_filter if class != "agent"/' \

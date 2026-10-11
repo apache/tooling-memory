@@ -313,13 +313,14 @@ impl Egress {
         if let Some(reason) = over_budget(inner, destination) {
             return Err(Error::OverBudget(reason));
         }
+        let rest = path.trim_start_matches('/').to_string();
+        let shaped = shape_body(&dest, &rest, Bytes::from(body.to_string()));
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/{destination}/{}", path.trim_start_matches('/')))
+            .uri(format!("/{destination}/{rest}"))
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
+            .body(Body::from(shaped))
             .map_err(|e| Error::Upstream(e.to_string()))?;
-        let rest = path.trim_start_matches('/').to_string();
         let started = std::time::SystemTime::now();
         let resp = upstream_request(inner, &dest, &rest, req, None)
             .send()
@@ -790,18 +791,39 @@ fn is_function_response(part: &serde_json::Value) -> bool {
 /// Messages request with its system role folded, a Gemini request with a model turn's
 /// tool results moved to a user turn, a request asking for more output tokens than the
 /// cap. Everything else streams through untouched.
+/// A request body as `dest` needs it: a late system message folded in, a Gemini tool
+/// result moved to the user's role, the output asked for capped. The proxy and a direct
+/// call both go through it, so a replay leaves as the session's own calls did.
+fn shape_body(dest: &Destination, rest: &str, bytes: Bytes) -> Bytes {
+    let path = rest.trim_end_matches('/');
+    let mut out = bytes;
+    if dest.fold_system_messages && path.ends_with("messages") {
+        if let Some(folded) = fold_system_messages(&out) {
+            out = Bytes::from(folded);
+        }
+    }
+    if dest.fold_function_responses
+        && (path.ends_with(":generateContent") || path.ends_with(":streamGenerateContent"))
+    {
+        if let Some(folded) = fold_function_responses(&out) {
+            out = Bytes::from(folded);
+        }
+    }
+    let capped_path =
+        path.ends_with("messages") || path.ends_with("responses") || path.ends_with("completions");
+    if let Some(cap) = dest.max_output_tokens.filter(|_| capped_path) {
+        if let Some(capped) = cap_output_tokens(&out, cap) {
+            out = Bytes::from(capped);
+        }
+    }
+    out
+}
+
 async fn shaped(
     dest: &Destination,
     rest: &str,
     req: Request,
 ) -> Result<(Request, Option<Bytes>), Box<Response>> {
-    let path = rest.trim_end_matches('/');
-    let fold = dest.fold_system_messages && path.ends_with("messages");
-    let fold_responses = dest.fold_function_responses
-        && (path.ends_with(":generateContent") || path.ends_with(":streamGenerateContent"));
-    let cap = dest.max_output_tokens.filter(|_| {
-        path.ends_with("messages") || path.ends_with("responses") || path.ends_with("completions")
-    });
     // every POST is buffered: its body is the decision context the egress keeps
     if req.method() != Method::POST {
         return Ok((req, None));
@@ -814,22 +836,7 @@ async fn shaped(
             &format!("request body: {e}"),
         ))
     })?;
-    let mut out = bytes.clone();
-    if fold {
-        if let Some(folded) = fold_system_messages(&out) {
-            out = Bytes::from(folded);
-        }
-    }
-    if fold_responses {
-        if let Some(folded) = fold_function_responses(&out) {
-            out = Bytes::from(folded);
-        }
-    }
-    if let Some(cap) = cap {
-        if let Some(capped) = cap_output_tokens(&out, cap) {
-            out = Bytes::from(capped);
-        }
-    }
+    let out = shape_body(dest, rest, bytes.clone());
     if std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
         // the request as it leaves, for an adapter whose harness says one thing
         // on a laptop and another in the sandbox
@@ -853,7 +860,7 @@ async fn shaped(
                 Some(v.to_string())
             })
             .unwrap_or_else(|| String::from_utf8_lossy(&out).chars().take(300).collect());
-        eprintln!("egress debug: {path} as shaped, parameters: {shown}");
+        eprintln!("egress debug: {rest} as shaped, parameters: {shown}");
     }
     Ok((Request::from_parts(parts, Body::empty()), Some(out)))
 }

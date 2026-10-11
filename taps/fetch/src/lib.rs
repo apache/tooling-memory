@@ -293,7 +293,11 @@ fn html_to_text(html: &str) -> (String, String) {
             i = end + 1;
             continue;
         }
-        let next = html[i + 1..].find('<').map_or(html.len(), |p| i + 1 + p);
+        // a run starts with any character, `¶` or `—` among them: step past it whole
+        let step = html[i..].chars().next().map_or(1, char::len_utf8);
+        let next = html[i + step..]
+            .find('<')
+            .map_or(html.len(), |p| i + step + p);
         let run = &html[i..next];
         if pre {
             out.push_str(run);
@@ -460,6 +464,13 @@ export!(Component);
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_run_of_text_may_start_with_any_character() {
+        let (_, text) = html_to_text("<p>¶ Pilcrow</p><p>—dash<b>é</b></p>");
+        assert_eq!(text, "¶ Pilcrow\n\n—dashé");
+    }
+
     use super::*;
 
     #[test]

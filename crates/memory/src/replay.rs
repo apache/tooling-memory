@@ -47,6 +47,10 @@ pub struct Run {
     /// Who observed what was replayed: `egress` for contexts, `harness` for a transcript,
     /// a self-report.
     pub observed_by: String,
+    /// Where the session's calls went, when the replay sent them elsewhere: a native
+    /// Claude session's Messages calls, replayed on the gateway, which speaks Messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retargeted_from: Option<String>,
     pub at: String,
     pub session: String,
     pub destination: String,
@@ -195,6 +199,7 @@ pub async fn replay(
     let run = Run {
         source: "transcript".into(),
         observed_by: dm_server::transcripts::OBSERVED_BY_HARNESS.into(),
+        retargeted_from: None,
         at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
@@ -239,8 +244,19 @@ pub fn resend(request: &Value, model: &str) -> Value {
     body
 }
 
+/// Where a session's recorded calls are replayed, when not where they went: the
+/// gateway speaks every API a harness under this launcher records, Messages, chat
+/// completions, Responses and generateContent, so a call to any provider can be sent
+/// there unchanged but for the model. Another provider speaks only its own. `None` when
+/// the calls go back where they went, or cannot go to `available` at all.
+#[must_use]
+pub fn retarget(recorded: &str, available: &str) -> Option<String> {
+    (recorded != available && available == "llmao").then(|| available.to_string())
+}
+
 /// Replay a session's recorded decision contexts, up to `limit`, or only the call
-/// numbered `turn`, on `model` at the destination each was sent to, and log the run.
+/// numbered `turn`, on `model` at the destination each was sent to, or at `to` when the
+/// replay retargets them, and log the run.
 ///
 /// # Errors
 ///
@@ -253,8 +269,10 @@ pub async fn replay_contexts(
     model: &str,
     turn: Option<usize>,
     limit: usize,
+    to: Option<&str>,
 ) -> Result<Run, Box<dyn std::error::Error>> {
     let contexts = memory.contexts(session).await?;
+    let mut from = None;
     let mut points = Vec::new();
     let mut destination = String::new();
     for c in contexts
@@ -262,9 +280,13 @@ pub async fn replay_contexts(
         .filter(|c| !c.request.is_null() && turn.is_none_or(|n| c.n == n))
         .take(limit)
     {
-        destination.clone_from(&c.destination);
+        let target = to.unwrap_or(&c.destination);
+        if target != c.destination {
+            from = Some(c.destination.clone());
+        }
+        target.clone_into(&mut destination);
         let answer = egress
-            .call(&c.destination, &c.path, &resend(&c.request, model))
+            .call(target, &c.path, &resend(&c.request, model))
             .await?;
         let replayed_tools = dm_server::contexts::tools_in(&answer.to_string());
         // read again from the raw response, so a context kept by an older parser counts
@@ -303,6 +325,7 @@ pub async fn replay_contexts(
     let run = Run {
         source: "contexts".into(),
         observed_by: dm_server::transcripts::OBSERVED_BY_EGRESS.into(),
+        retargeted_from: from,
         at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),

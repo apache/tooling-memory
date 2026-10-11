@@ -586,6 +586,17 @@ which every model call passes through. A replay run says which it replayed, and 
 usage` keeps the same two words in its `source` column, for the egress's metering and a
 harness's own usage report.
 
+A session's calls are replayed where they went when this replay can reach that
+destination. When it cannot, and the replay runs on the gateway, they are sent there
+unchanged but for the model, since the gateway speaks every API a harness here records:
+a native Claude Code session's Messages calls, recorded on a subscription, replay on the
+gateway's Qwen as they were sent, an accuracy, speed and cost comparison across vendors.
+The run says `retargeted_from: anthropic`. The egress shapes a replayed call as it shapes
+a harness's own, so Claude Code's late system message is folded for the gateway as it
+would be live. Anywhere else, the replay refuses and names the destination to replay on.
+Live on 11 October, a Claude Code session's four calls replayed on Qwen agreed on two
+steps.
+
 Live on 10 October, a Codex session on the gateway's Qwen left four contexts, the
 Responses API requests of 55 to 65 KB each. Replayed on Qwen itself, all four steps
 agreed: the same search, the same two opens, and an answer overlapping the recorded one.
