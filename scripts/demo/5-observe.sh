@@ -54,20 +54,9 @@ if has transcript; then
     echo "  searching the record for its words finds the entries, never the transcript: $(a search "$s" | j 'len(d)') hits"
     if gateway; then
       say "frozen-context replay: the decision contexts the egress recorded, sent again to $WORKER_MODEL"
-      # the newest session the egress recorded calls for, wherever they went: a native
-      # Claude session's Messages calls are replayed on the gateway, which speaks them
-      rs=$(python3 - "$root" <<'PY'
-import glob, json, os, sys
-best = (0, "")
-for f in glob.glob(os.path.join(sys.argv[1], "record", "*", ".contexts", "*", "*.json")):
-    try:
-        json.load(open(f))
-        best = max(best, (os.path.getmtime(f), os.path.basename(os.path.dirname(f))))
-    except (OSError, ValueError):
-        pass
-print(best[1])
-PY
-)
+      # the session just shown: a harness at work, whose recorded calls go back where
+      # they went, or, for a native Claude session, to the gateway, which speaks Messages
+      rs=$s
       [ -n "$rs" ] && echo "  session $rs, its recorded calls sent again with only the model changed:"
       [ -n "$rs" ] && a replay "$rs" --limit 4 --model "$WORKER_MODEL" | j "(f\"  recorded at {d['retargeted_from']}, replayed at {d['destination']}: an accuracy, speed and cost comparison across vendors\n\" if d.get('retargeted_from') else '') + f\"  agreement {d['agreement']:.0%} with the recorded steps, observed by the {d['observed_by']}\n\" + '\n'.join(f\"    turn {p['turn']:>2}: recorded {p['recorded_tool'] or 'a reply'}, replayed {p['replayed_tool'] or 'a reply'}  {'agrees' if p['agrees'] else 'differs'}\" for p in d['points']) + ('\n  (the egress saw these calls itself; a run with no contexts would replay the transcript, a self-report, and say so)' if d['observed_by'] == 'egress' else '\n  (no contexts: the recorded side is the transcript, a self-report by the harness)')" || true
     fi
