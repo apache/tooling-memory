@@ -20,8 +20,11 @@ if gateway; then a recall "what did DR-19 decide" --provider llmao --auth gatewa
 unset OTEL_EXPORTER_OTLP_ENDPOINT
 sleep 1; kill "$sink" 2>/dev/null || true
 for name in memory.read policy.decision task.created task.admitted task.invalidated model.call; do
-  # whole names only: an attribute such as task.created_by is not a task.created span
-  printf '  %-18s %s\n' "$name" "$(grep -a -o -w "$name" "$spans" | wc -l | tr -d ' ')"
+  # whole names only: an attribute such as task.created_by is not a task.created span. The
+  # sink keeps raw protobuf, where a name can run straight into the next field's tag byte,
+  # often a digit, so -w would miss it: only a letter, `_` or `.` continues a name.
+  re=$(printf '%s' "$name" | sed 's/\./\\./g')
+  printf '  %-18s %s\n' "$name" "$(grep -a -o -P "(?<![A-Za-z_.])$re(?![A-Za-z_.])" "$spans" | wc -l | tr -d ' ')"
 done
 echo "  (a loopback sink for the demo; the same variable points amem at Jaeger or an OpenTelemetry collector)"
 
@@ -45,7 +48,13 @@ fi
 if has transcript; then
   say "Transcripts are sources" "A session's transcript is kept in the record on a clock, never searched and never in T0, and reached only through an entry that cites one of its turns."
   a transcript list | j "'\n'.join(f\"  {t['session']}  {t['harness']:<8} {t['turn_count']:>3} turns  {t['classification']:<9} {t['state']:<7} until {t['retain_until'][:10]}\" for t in d) or '  (none kept yet)'"
-  s=$(a transcript list | j "next((t['session'] for t in reversed(d) if t['state']=='live'), '')")
+  # act 4's delegating session: of this harness's live sessions, the latest kept with a
+  # cited turn. A run that leaves no handoff of its own gets the hook's session-end note,
+  # which cites its turns, and here that is the run that delegated and stopped. Session ids
+  # are random, so neither the list's order nor its last entry says which
+  s=$(a transcript list | j "' '.join(t['session'] for t in sorted(d, key=lambda t: t['kept_at'], reverse=True) if t['state']=='live' and t['harness']=='${HARNESS:-}')")
+  s=$(for c in $s; do [ -n "$(a transcript show "$c" | j "next(iter(d['cited']), '')")" ] && { echo "$c"; break; }; done)
+  [ -n "$s" ] || s=$(a transcript list | j "next((t['session'] for t in sorted(d, key=lambda t: t['kept_at'], reverse=True) if t['state']=='live'), '')")
   if [ -n "$s" ]; then
     turn=$(a transcript show "$s" | j "next(iter(d['cited']), '')")
     if [ -n "$turn" ]; then
