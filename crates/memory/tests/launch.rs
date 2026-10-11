@@ -795,3 +795,207 @@ fn mining_can_go_through_the_harness_on_a_small_model() {
     assert!(!projects.join("s.jsonl").exists(), "{stderr}");
     assert!(stderr.contains("removed; the record keeps it"), "{stderr}");
 }
+
+// ---- re-enactment: a prompted session run again against its tape ----
+
+/// Shell that speaks MCP to the egress: T0, then a handoff carrying what the working
+/// tree says.
+const READS_THE_TREE: &str = r#"
+base="${ANTHROPIC_BASE_URL%/anthropic}"
+H1='content-type: application/json'; H2='accept: application/json, text/event-stream'
+sid=$(curl -s -D - -o /dev/null -X POST "$base/mcp" -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake","version":"0"}}}' | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:"{print $2}')
+curl -s -o /dev/null -X POST "$base/mcp" -H "$H1" -H "$H2" -H "mcp-session-id: $sid" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+curl -s -o /dev/null -X POST "$base/mcp" -H "$H1" -H "$H2" -H "mcp-session-id: $sid" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"t0","arguments":{}}}'
+steps=$(cat steps.txt)
+curl -s -X POST "$base/mcp" -H "$H1" -H "$H2" -H "mcp-session-id: $sid" -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"write\",\"arguments\":{\"body\":\"The import has $steps.\",\"entry_type\":\"handoff\",\"title\":\"Import\"}}}" | grep -o 'mem-[a-z0-9]*-[a-z0-9]*' | head -1
+"#;
+
+/// `git` on the repository named, whatever a hook running the tests set for its own.
+fn git_cmd() -> Command {
+    let mut cmd = Command::new("git");
+    for v in [
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_PREFIX",
+    ] {
+        cmd.env_remove(v);
+    }
+    cmd
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = git_cmd()
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.org"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A git repository under `dir` whose one commit says the import has five steps; it and
+/// its commit.
+fn repo_of_five_steps(dir: &Path) -> (PathBuf, String) {
+    let repo = dir.join("work");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_in(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("steps.txt"), "five steps").unwrap();
+    git_in(&repo, &["add", "steps.txt"]);
+    git_in(&repo, &["commit", "-q", "-m", "five"]);
+    let head = git_cmd()
+        .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+    (repo, String::from_utf8(head).unwrap().trim().to_string())
+}
+
+/// `amem` on `root` with the fake harness first on the path and a placeholder key.
+fn amem_with(root: &Path, bins: &Path, args: &[&str]) -> Output {
+    let mut cmd = memory();
+    cmd.args(["--root", root.to_str().unwrap()]).args(args);
+    cmd.env("PATH", path_with(bins));
+    cmd.env("ANTHROPIC_API_KEY", "sk-ant-placeholder");
+    cmd.stdin(Stdio::null());
+    cmd.output().unwrap()
+}
+
+/// A prompted launch in `repo` and the session its tape names, checked against `head`.
+fn taped_session(root: &Path, bins: &Path, repo: &Path, head: &str) -> String {
+    let out = amem_with(
+        root,
+        bins,
+        &[
+            "launch",
+            "--harness",
+            "claude",
+            "--auth",
+            "key",
+            "--unconfined",
+            "--workdir",
+            repo.to_str().unwrap(),
+            "--prompt",
+            "finish the import",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tapes = cli(root, &["reenact", "tapes"]);
+    let tape = &tapes[0];
+    assert_eq!(tape["prompt"], "finish the import");
+    assert_eq!(tape["harness"], "claude");
+    assert_eq!(tape["commit"], head);
+    assert_eq!(tape["calls"], 2, "{tapes}");
+    tape["session"].as_str().unwrap().to_string()
+}
+
+fn re_enact(
+    root: &Path,
+    bins: &Path,
+    session: &str,
+    repo: &Path,
+    more: &[&str],
+) -> serde_json::Value {
+    let mut args = vec![
+        "reenact",
+        "run",
+        session,
+        "--auth",
+        "key",
+        "--unconfined",
+        "--repo",
+        repo.to_str().unwrap(),
+    ];
+    args.extend_from_slice(more);
+    let out = amem_with(root, bins, &args);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn a_prompted_session_is_re_enacted_at_its_commit_against_its_tape() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), READS_THE_TREE);
+    let (repo, head) = repo_of_five_steps(dir.path());
+    let session = taped_session(&root, &bins, &repo, &head);
+    // the tree moves on; the re-run works at the session's commit all the same
+    std::fs::write(repo.join("steps.txt"), "six steps").unwrap();
+    git_in(&repo, &["commit", "-q", "-am", "six"]);
+    let r = re_enact(&root, &bins, &session, &repo, &[]);
+    assert_eq!(r["diverged"], false, "{r}");
+    assert_eq!(
+        (r["steps_to_divergence"].as_u64(), r["calls"].as_u64()),
+        (Some(2), Some(2))
+    );
+    assert_eq!(
+        (&r["handoff"], &r["exit"], &r["alignment"]),
+        (&true.into(), &0.into(), &1.0.into())
+    );
+    assert_eq!(r["tree"]["commit"], head.as_str());
+    // nothing written: one handoff, the original's
+    assert_eq!(
+        cli(&root, &["list", "--kind", "handoff"])
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // the checkout is gone, and the re-run kept no tape of its own
+    let siblings: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains("reenact"))
+        .collect();
+    assert!(siblings.is_empty(), "{siblings:?}");
+    assert_eq!(
+        cli(&root, &["reenact", "tapes"]).as_array().unwrap().len(),
+        1
+    );
+    let report = cli_text(&root, &["reenact", "report", &session]);
+    assert!(
+        report.contains("1 runs") && report.contains("claude"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_kept_tree_is_the_commit_and_repeated_runs_are_not_a_subscription_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), READS_THE_TREE);
+    let (repo, head) = repo_of_five_steps(dir.path());
+    let session = taped_session(&root, &bins, &repo, &head);
+    std::fs::write(repo.join("steps.txt"), "six steps").unwrap();
+    git_in(&repo, &["commit", "-q", "-am", "six"]);
+    let r = re_enact(&root, &bins, &session, &repo, &["--keep-tree"]);
+    let kept = PathBuf::from(r["tree"]["kept_at"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(kept.join("steps.txt")).unwrap(),
+        "five steps"
+    );
+    git_in(
+        &repo,
+        &["worktree", "remove", "--force", kept.to_str().unwrap()],
+    );
+    let out = amem_with(&root, &bins, &["reenact", "run", &session, "--runs", "2"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("API key or the gateway"));
+}

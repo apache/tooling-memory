@@ -77,6 +77,10 @@ pub async fn sweep(m: &Memory) -> Result<Vec<Swept>, Box<dyn std::error::Error>>
     for session in m.sweep_contexts(now).await? {
         eprintln!("memory: decision contexts of {session} expired and were dropped");
     }
+    // and the tapes a re-run is answered from, unless pinned for a benchmark
+    for session in m.sweep_tapes(now).await? {
+        eprintln!("memory: the tape of {session} expired and was dropped");
+    }
     // and so do the sources tools brought in, except what a live entry cites
     for id in m.sweep_sources(now).await? {
         eprintln!("memory: source {id} expired, uncited, and was dropped");

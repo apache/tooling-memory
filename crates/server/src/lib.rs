@@ -44,6 +44,7 @@ pub mod reads;
 pub mod recall;
 pub mod sources;
 pub mod t0;
+pub mod tape;
 mod taps;
 pub mod transcripts;
 
@@ -263,6 +264,10 @@ pub struct Memory {
     contexts_kept: AtomicUsize,
     /// The tools this session may call, when the launcher hosts them.
     tools: OnceLock<std::sync::Arc<dyn sources::Tools>>,
+    /// The tape this session is re-enacting, when it is a re-run.
+    playback: OnceLock<std::sync::Arc<tape::Playback>>,
+    /// This session's own tape, as it is kept.
+    recording: Mutex<tape::Recording>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -385,6 +390,8 @@ impl Memory {
             scope: OnceLock::new(),
             contexts_kept: AtomicUsize::new(0),
             tools: OnceLock::new(),
+            playback: OnceLock::new(),
+            recording: Mutex::new(tape::Recording::default()),
         })
     }
 

@@ -1037,6 +1037,14 @@ impl Memory {
                 body_digest: Some(erasure::body_digest(body)),
             });
         }
+        // and the tape calls that served it, for the same reason
+        for c in self.erase_from_tapes(body).await? {
+            removed.push(Removed {
+                version: format!("tape call {c}"),
+                digest: digest(body),
+                body_digest: Some(erasure::body_digest(body)),
+            });
+        }
         self.store.erase(domain, id, stub).await?;
         Ok(removed)
     }

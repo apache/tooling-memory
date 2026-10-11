@@ -25,11 +25,13 @@ harnesses in two weeks, and it is also why none of it is the production shape.
 
 ### What the paper asks for that is not built
 
-- **Replay, beyond its first mode.** Frozen-context replay is built, `amem replay`, on
-  decision contexts the egress records. Live re-execution of a task against a
-  point-in-time snapshot is not built, and a login run through a tunnel, which the egress
-  cannot see into, has no contexts, so its replay falls back to the harness's own
-  transcript, a self-report, and says so.
+- **Replay, in part.** Frozen-context replay is built, `amem replay`, on decision
+  contexts the egress records, and so is live re-execution, `amem reenact`: a prompted
+  session run again on its prompt at its commit, its memory calls answered from a tape
+  of what they returned until the run diverges. An interactive session has no prompt to
+  run again, a task run's tape does not yet carry its task's prompt, and a login run
+  through a tunnel, which the egress cannot see into, has no contexts, so its replay
+  falls back to the harness's own transcript, a self-report, and says so.
 - **The platform as a domain.** Harness configuration, agent definitions and their
   authoring, decomposition templates and eval suites are not held in memory, and there is
   no evolution loop that loads only verified configuration into a harness. Policy is the
@@ -190,7 +192,7 @@ Each part is described in [local/README.md](local/README.md) under its own headi
 | The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced once verified, with scoped exceptions); admission, the read filter, the write scan and quarantine, blast-radius gates; every decision logged | `policy show, eval, list, lint`, `quarantine`, `taint` |
 | The librarian | A survey of what needs curation, an independent checker, contradiction hunting, canaries, its own telemetry and alarms, a cycle on a budget | `librarian`, `curate`, `check`, `canary` |
 | The egress | Model calls forwarded and metered, spend limits per destination, decision contexts recorded | `launch`, `usage`, `cost` |
-| Sources and replay | Transcripts kept in the record and reached by citation, swept on a clock; frozen-context replay on the recorded contexts | `transcript`, `replay` |
+| Sources and replay | Transcripts kept in the record and reached by citation, swept on a clock; frozen-context replay on the recorded contexts; re-enactment of a session at its commit against the tape of its memory calls | `transcript`, `replay`, `reenact` |
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without | `savings`, `golden`, `scripts/eval.py` |
 | Interchange | Bundles at or below a label, erasure with a stub and a receipt, taps as WASI components | `export`, `import`, `erase`, `tap` |
@@ -211,6 +213,8 @@ amem curate --auth gateway --contradictions  # one curation cycle
 amem quarantine list
 amem taint mem-me-xxxxxxxx                 # where a bad entry may have reached
 amem replay <session> --model gemma4-26b   # the same decisions, another model
+amem reenact run <session> --auth gateway --model qwen3.8-27b --runs 3   # the same task again
+amem reenact report <session>              # each harness and model against the tape
 amem cost                                  # spend per session and per completed task
 amem savings                               # the paper's read-path claims, measured
 amem savings --judge-provider anthropic   # with a small model judging what was "used"

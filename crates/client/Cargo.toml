@@ -13,6 +13,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "io-util", "macros"] }
 
 [dev-dependencies]
+dm-core = { version = "0.1.0", path = "../core" }
 dm-ledger = { version = "0.1.0", path = "../ledger" }
 dm-server = { version = "0.1.0", path = "../server" }
 tempfile = "3.27.0"

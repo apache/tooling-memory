@@ -172,7 +172,8 @@ fn name_of(n: usize) -> String {
 
 impl Memory {
     /// Keep one model call's context, under this session in its domain: the domain of
-    /// the task it holds, else the only granted one; a session with neither keeps none.
+    /// the task it holds, else the only granted one; a session with neither keeps none,
+    /// and nor does a re-run.
     ///
     /// # Errors
     ///
@@ -184,15 +185,11 @@ impl Memory {
         request: &[u8],
         response: &[u8],
     ) -> Result<(), Error> {
-        let domain = match self.held.get() {
-            Some(id) => match self.ledger.lock().await.get(id).await {
-                Ok(t) => t.spec.domain,
-                Err(_) => return Ok(()),
-            },
-            None => match self.resolve_domain(None) {
-                Ok(d) => d,
-                Err(_) => return Ok(()),
-            },
+        if !self.keeps_contexts() {
+            return Ok(());
+        }
+        let Some(domain) = self.recording_domain().await else {
+            return Ok(());
         };
         let n = self.contexts_kept.fetch_add(1, Ordering::Relaxed) + 1;
         let request = if request.len() > MAX_BYTES {

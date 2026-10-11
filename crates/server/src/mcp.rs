@@ -6,15 +6,16 @@
 //! never gets is a path on disk, a credential, or an entry its grants do not admit.
 
 use crate::recall::{self, Budget, Depth};
-use crate::{Error, Memory, WriteRequest};
+use crate::{tape, Error, Memory, WriteRequest};
 use dm_core::TrustTier;
 use dm_index::Hit;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ServerCapabilities, ServerConfig,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -388,16 +389,88 @@ fn recall_budget(limit: Option<usize>, tokens: Option<usize>) -> Budget {
 pub struct McpServer {
     memory: Arc<Memory>,
     tool_router: ToolRouter<Self>,
+    /// Whether the calls are the harness's, kept on the session's tape and, in a re-run,
+    /// answered from the tape; the launcher's own in-process calls are neither.
+    taped: bool,
+}
+
+/// The tools that only read the record, served as it is now after a re-run diverges.
+const READS: &[&str] = &[
+    "search",
+    "get",
+    "list",
+    "t0",
+    "recall",
+    "transcript_turn",
+    "task_tree",
+    "get_task",
+    "list_tasks",
+];
+
+/// The tools that reach outside, refused after a re-run diverges.
+const OUTSIDE: &[&str] = &["fetch", "web_search"];
+
+fn kind_of(tool: &str) -> tape::Kind {
+    if READS.contains(&tool) {
+        tape::Kind::Read
+    } else if OUTSIDE.contains(&tool) {
+        tape::Kind::Outside
+    } else {
+        tape::Kind::Mutation
+    }
+}
+
+/// A recorded result, given back as it was: a result, or the refusal it was.
+fn recorded(result: Value, is_error: bool) -> Result<CallToolResponse, McpError> {
+    if is_error {
+        if let Some(e) = result.get("error") {
+            if let Ok(e) = serde_json::from_value::<McpError>(e.clone()) {
+                return Err(e);
+            }
+        }
+    }
+    serde_json::from_value::<CallToolResult>(result)
+        .map(CallToolResponse::from)
+        .map_err(|e| McpError::internal_error(format!("the tape's result: {e}"), None))
+}
+
+/// A result as the tape keeps it, and whether it was an error.
+fn to_tape(result: &Result<CallToolResponse, McpError>) -> (Value, bool) {
+    match result {
+        Ok(CallToolResponse::Complete(r)) => (
+            serde_json::to_value(r).unwrap_or(Value::Null),
+            r.is_error.unwrap_or(false),
+        ),
+        // input asked of the client, or a task made of the call: nothing a re-run
+        // could be answered with
+        Ok(_) => (json!({ "error": "not a complete result" }), true),
+        Err(e) => (
+            json!({ "error": serde_json::to_value(e).unwrap_or(Value::Null) }),
+            true,
+        ),
+    }
 }
 
 #[tool_router]
 impl McpServer {
-    /// A server over an opened memory.
+    /// A server over an opened memory, for a harness: its calls are kept on the
+    /// session's tape, or answered from the tape the session re-enacts.
     #[must_use]
     pub fn new(memory: Arc<Memory>) -> Self {
         Self {
             memory,
             tool_router: Self::tool_router(),
+            taped: true,
+        }
+    }
+
+    /// A server for the launcher's own calls in the same process, which are not the
+    /// harness's and stay off its tape.
+    #[must_use]
+    pub fn for_launcher(memory: Arc<Memory>) -> Self {
+        Self {
+            taped: false,
+            ..Self::new(memory)
         }
     }
 
@@ -765,6 +838,54 @@ fn t0_uri(domain: &str) -> String {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
+    /// Every call goes through the router, as the macro would route it; a harness's call
+    /// is kept on the session's tape, and in a re-run answered from the tape first.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        if !self.taped {
+            let tcc = ToolCallContext::new(self, request, context);
+            return self.tool_router.call(tcc).await;
+        }
+        let tool = request.name.to_string();
+        let arguments = Value::Object(request.arguments.clone().unwrap_or_default());
+        if let Some(play) = self.memory.playback() {
+            match play.answer(&tool, &arguments, kind_of(&tool)) {
+                tape::Answer::Recorded {
+                    result,
+                    is_error,
+                    label,
+                } => {
+                    self.memory.observe_recorded(label);
+                    return recorded(result, is_error);
+                }
+                tape::Answer::Live => {}
+                tape::Answer::Captured => {
+                    return Ok(CallToolResult::success(vec![ContentBlock::json(json!({
+                        "reenactment": "captured, not applied: this call is not on the tape",
+                    }))?])
+                    .into());
+                }
+                tape::Answer::Refused(why) => return Err(McpError::invalid_params(why, None)),
+            }
+            let tcc = ToolCallContext::new(self, request, context);
+            return self.tool_router.call(tcc).await;
+        }
+        let tcc = ToolCallContext::new(self, request, context);
+        let result = self.tool_router.call(tcc).await;
+        let (value, is_error) = to_tape(&result);
+        if let Err(e) = self
+            .memory
+            .tape_call(&tool, &arguments, &value, is_error)
+            .await
+        {
+            eprintln!("memory: {tool} was not kept on the tape: {e}");
+        }
+        result
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
             ServerCapabilities::builder()
@@ -832,8 +953,34 @@ where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
+    serve_with(McpServer::new(memory), reader, writer).await
+}
+
+/// Serve the launcher's own client over a byte pair: its calls stay off the harness's
+/// tape.
+///
+/// # Errors
+///
+/// When the MCP handshake fails or the service task panics.
+pub async fn serve_launcher_pipe<R, W>(
+    memory: Arc<Memory>,
+    reader: R,
+    writer: W,
+) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    serve_with(McpServer::for_launcher(memory), reader, writer).await
+}
+
+async fn serve_with<R, W>(server: McpServer, reader: R, writer: W) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
     use rmcp::ServiceExt;
-    let service = McpServer::new(memory)
+    let service = server
         .serve((reader, writer))
         .await
         .map_err(|e| format!("mcp: {e}"))?;

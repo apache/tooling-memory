@@ -57,7 +57,7 @@ pub async fn client(memory: Arc<Memory>) -> Fallible<MemoryClient> {
     let (client_io, server_io) = tokio::io::duplex(256 * 1024);
     let (sr, sw) = tokio::io::split(server_io);
     tokio::spawn(async move {
-        if let Err(e) = mcp::serve_pipe(memory, sr, sw).await {
+        if let Err(e) = mcp::serve_launcher_pipe(memory, sr, sw).await {
             eprintln!("memory: in-process server: {e}");
         }
     });
@@ -165,6 +165,19 @@ pub async fn prompted(
 ) -> Fallible<i32> {
     let client = client(session.memory()).await?;
     let before = handoff_ids(&client, None).await?;
+    // the head of the session's tape: what a re-enactment starts the same way from
+    let commit = crate::reenact::commit_of(session.workdir());
+    session
+        .memory()
+        .tape_start(dm_server::tape::TapeStart {
+            harness: session.harness().binary().to_string(),
+            model: session.model().map(str::to_string),
+            prompt: Some(prompt.to_string()),
+            dirty: commit.as_ref().is_some_and(|(_, d)| *d),
+            commit: commit.map(|(c, _)| c),
+        })
+        .await
+        .ok();
     // the harness's own arguments follow its headless form, where every harness takes
     // a flag after the prompt
     let mut argv = session.harness().headless(prompt);

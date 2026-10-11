@@ -160,7 +160,12 @@ impl MemoryClient {
             .map_err(|e| Error::Mcp(e.to_string()))
     }
 
-    async fn call(&self, tool: &str, args: Value) -> Result<Value> {
+    /// Call any tool with JSON arguments; the answer is the tool's JSON.
+    ///
+    /// # Errors
+    ///
+    /// A transport error, or the tool's refusal.
+    pub async fn call(&self, tool: &str, args: Value) -> Result<Value> {
         let arguments: Map<String, Value> = match args {
             Value::Object(m) => m,
             _ => Map::new(),
@@ -533,5 +538,163 @@ mod tests {
             priority: 0,
             classification: Default::default(),
         }
+    }
+
+    const IMPORT: &str = "# Import\n\nThe import has five steps.\n";
+
+    /// A session that reads T0, writes an entry, searches, opens it and asks for one that
+    /// is not there; its tape, and what the write and the first get answered.
+    async fn recorded() -> (tempfile::TempDir, dm_server::tape::Tape, Value, Value) {
+        let (dir, memory, client) = pair().await;
+        memory
+            .tape_start(dm_server::tape::TapeStart {
+                harness: "claude".into(),
+                prompt: Some("Finish the import.".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        client.call("t0", json!({})).await.unwrap();
+        let wrote = client
+            .call("write", json!({ "body": IMPORT }))
+            .await
+            .unwrap();
+        client
+            .call("search", json!({"query": "import"}))
+            .await
+            .unwrap();
+        let first = client
+            .call("get", json!({"id": wrote["id"]}))
+            .await
+            .unwrap();
+        assert!(client
+            .call("get", json!({"id": "mem-me-nothere"}))
+            .await
+            .is_err());
+        client.close().await.unwrap();
+        let tape = Memory::open(dir.path())
+            .unwrap()
+            .tape(memory.session_id())
+            .await
+            .unwrap();
+        (dir, tape, wrote, first)
+    }
+
+    /// A client of a re-run of `tape` over the root at `dir`.
+    async fn re_run(
+        dir: &std::path::Path,
+        tape: dm_server::tape::Tape,
+    ) -> (Arc<dm_server::tape::Playback>, MemoryClient) {
+        let rerun = Arc::new(Memory::open(dir).unwrap().with_author("agent:test"));
+        let play = Arc::new(dm_server::tape::Playback::new(tape));
+        rerun.set_playback(play.clone());
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server_io);
+        let server = McpServer::new(rerun);
+        tokio::spawn(async move {
+            if let Ok(s) = server.serve((sr, sw)).await {
+                let _ = s.waiting().await;
+            }
+        });
+        let (cr, cw) = tokio::io::split(client_io);
+        (play, MemoryClient::connect((cr, cw)).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_session_s_calls_and_results_are_kept_on_its_tape_for_the_owner() {
+        let (dir, tape, _, _) = recorded().await;
+        assert_eq!(
+            tape.header.start.prompt.as_deref(),
+            Some("Finish the import.")
+        );
+        let tools: Vec<&str> = tape.calls.iter().map(|c| c.tool.as_str()).collect();
+        assert_eq!(tools, ["t0", "write", "search", "get", "get"]);
+        assert!(tape.calls[4].is_error, "a refusal is on the tape too");
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:test");
+        assert!(
+            agent.tape(&tape.header.session).await.is_err(),
+            "the owner's alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_s_tape_answers_its_re_run_until_it_diverges() {
+        let (dir, tape, wrote, first) = recorded().await;
+        // the re-run: the same calls but the search, answered from the tape
+        let (play, again) = re_run(dir.path(), tape).await;
+        again.call("t0", json!({})).await.unwrap();
+        let rewrote = again
+            .call("write", json!({ "body": IMPORT }))
+            .await
+            .unwrap();
+        assert_eq!(rewrote["id"], wrote["id"], "the recorded answer");
+        assert_eq!(
+            again.call("get", json!({"id": wrote["id"]})).await.unwrap(),
+            first
+        );
+        assert!(again
+            .call("get", json!({"id": "mem-me-nothere"}))
+            .await
+            .is_err());
+        // off the tape: a write is captured, a read is served live, nothing is applied
+        let captured = again
+            .call("write", json!({"body": "# Retry\n\nRetry step four.\n"}))
+            .await
+            .unwrap();
+        assert!(captured["reenactment"]
+            .as_str()
+            .unwrap()
+            .contains("captured"));
+        let live = again
+            .call("search", json!({"query": "retry"}))
+            .await
+            .unwrap();
+        assert_eq!(live["hits"].as_array().unwrap().len(), 0, "{live}");
+        assert!(again
+            .call("fetch", json!({"url": "https://example.org/"}))
+            .await
+            .is_err());
+        again.close().await.unwrap();
+        let played = play.played();
+        assert_eq!((played.steps_to_divergence, played.diverged), (4, true));
+        let served: Vec<&str> = played.steps.iter().map(|s| s.served.as_str()).collect();
+        assert_eq!(
+            served,
+            ["tape", "tape", "tape", "tape", "captured", "live", "refused"]
+        );
+        // the record holds one entry, the original's, and one tape, the original's
+        let owner = Memory::open(dir.path()).unwrap();
+        assert_eq!(owner.list(None, None, 10).await.unwrap().len(), 1);
+        assert_eq!(owner.tape_sessions().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn erasing_an_entry_takes_the_calls_that_served_it_off_the_tape() {
+        let body = "The import has five steps, and the fourth rereads every row once more.";
+        let (dir2, m2, c2) = pair().await;
+        let w = c2
+            .call("write", json!({"body": format!("# Steps\n\n{body}\n")}))
+            .await
+            .unwrap();
+        let wid = w["id"].as_str().unwrap().to_string();
+        c2.call("get", json!({"id": wid})).await.unwrap();
+        c2.call("t0", json!({})).await.unwrap();
+        c2.close().await.unwrap();
+        let owner2 = Memory::open(dir2.path()).unwrap();
+        let s2 = m2.session_id().to_string();
+        assert_eq!(owner2.tape(&s2).await.unwrap().calls.len(), 3);
+        owner2
+            .erase(&wid, dm_core::erasure::Reason::Mistaken)
+            .await
+            .unwrap();
+        let left: Vec<String> = owner2
+            .tape(&s2)
+            .await
+            .unwrap()
+            .calls
+            .into_iter()
+            .map(|c| c.tool)
+            .collect();
+        assert!(!left.contains(&"get".to_string()), "{left:?}");
     }
 }

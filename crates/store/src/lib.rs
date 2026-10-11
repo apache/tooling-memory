@@ -20,6 +20,9 @@
 //! record/<domain>/.erasures/<id>.yaml                 the receipt of an erasure
 //! record/<domain>/.transcripts/<session>.json         a transcript: a source, not an entry
 //! record/<domain>/.excerpts/<id>/<name>.json          what an entry kept of a transcript
+//! record/<domain>/.contexts/<session>/<n>.json        a model call, as the egress saw it
+//! record/<domain>/.sources/<id>.json                  what a tool brought in
+//! record/<domain>/.tapes/<session>/<n>.json           a memory tool call and its result
 //! ```
 //!
 //! Transcripts and excerpts are objects beside the entries, never entries: nothing that
@@ -44,6 +47,7 @@ const TRANSCRIPTS: &str = ".transcripts";
 const EXCERPTS: &str = ".excerpts";
 const CONTEXTS: &str = ".contexts";
 const SOURCES: &str = ".sources";
+const TAPES: &str = ".tapes";
 const STAMP: &[FormatItem<'_>] =
     format_description!("[year][month][day]T[hour][minute][second].[subsecond digits:6]Z");
 
@@ -112,6 +116,9 @@ pub enum Area {
     /// What a tool, fetch or search, brought in from outside: kept on a clock and
     /// reached by citation, as transcripts are.
     Sources,
+    /// Tapes: each memory tool call of a session and its full result, for a re-run to
+    /// be answered from; one directory per session.
+    Tapes,
 }
 
 impl Area {
@@ -121,6 +128,7 @@ impl Area {
             Area::Excerpts => EXCERPTS,
             Area::Contexts => CONTEXTS,
             Area::Sources => SOURCES,
+            Area::Tapes => TAPES,
         }
     }
 }

@@ -856,6 +856,7 @@ dependencies = [
 name = "dm-client"
 version = "0.1.0"
 dependencies = [
+ "dm-core",
  "dm-ledger",
  "dm-server",
  "rmcp",

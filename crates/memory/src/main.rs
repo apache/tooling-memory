@@ -27,6 +27,7 @@ mod mine;
 mod model;
 mod open;
 mod profiles;
+mod reenact;
 mod replay;
 mod requests;
 mod review;
@@ -890,6 +891,13 @@ enum Command {
         #[command(subcommand)]
         op: TaskOp,
     },
+    /// Re-enactment: a session run again on its prompt and commit against its tape,
+    /// the memory calls answered from the tape until the run diverges; the tapes, and
+    /// a report of the runs by harness and model.
+    Reenact {
+        #[command(subcommand)]
+        op: reenact::ReenactOp,
+    },
     /// Session transcripts, kept in the record as sources and reached by citation:
     /// list them, show one turn, sweep the expired, erase one early.
     Transcript {
@@ -1416,6 +1424,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Relay { .. } => unreachable!("handled in main"),
         Command::Task { op } => task(&Memory::open(&root)?, op).await,
         Command::Transcript { op } => transcripts::cmd(&Memory::open(&root)?, op).await,
+        Command::Reenact { op } => reenact::cmd(&root, op).await,
         Command::Tool { name, args } => sources::call(&root, &name, &args).await,
         Command::Source { op } => sources::cmd(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
@@ -2929,6 +2938,9 @@ struct RunOptions {
     projection: Option<String>,
     /// Run over an empty record made for this run, for an evaluation's baseline.
     empty_memory: bool,
+    /// A private home of the run's own, for a re-run, which must not leave its
+    /// transcript among the harness's real sessions.
+    home: Option<PathBuf>,
 }
 
 impl RunOptions {
@@ -2944,7 +2956,13 @@ impl RunOptions {
             program,
             projection,
             empty_memory: false,
+            home: None,
         }
+    }
+
+    fn home(mut self, home: PathBuf) -> RunOptions {
+        self.home = Some(home);
+        self
     }
 
     fn empty_memory(mut self, yes: bool) -> RunOptions {
@@ -3252,6 +3270,9 @@ impl Session {
         };
         let mut p = prepare_launch(root, harness, creds, socket, None, projected).await?;
         apply_run_options(&mut p, harness, auth, &options);
+        if let Some(h) = &options.home {
+            p.home.clone_from(h);
+        }
 
         #[cfg(unix)]
         let serve_unix = {
@@ -3336,6 +3357,16 @@ impl Session {
     /// The private home, where the harness leaves its transcript.
     pub fn home(&self) -> &Path {
         &self.p.home
+    }
+
+    /// The working tree the harness runs in.
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
+    }
+
+    /// The model the session was given, if any.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     /// Whether mining goes through the harness: always on a subscription login, since
@@ -4464,6 +4495,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Cost { .. }
         | Command::Task { .. }
         | Command::Transcript { .. }
+        | Command::Reenact { .. }
         | Command::Tool { .. }
         | Command::Source { .. }
         | Command::Tap { .. }
