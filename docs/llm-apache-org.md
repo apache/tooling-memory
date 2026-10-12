@@ -219,3 +219,77 @@ written to the record.
 The memory server itself stays beside the harness, per session, until proposal 2's
 session token exists; before then, a hosted read-only search over public entries is the
 safe first step.
+
+## Where things stand, 12 October 2026
+
+A reviewer at llmao will ask two things before any of the above: whether LiteLLM, the
+proxy behind the gateway, already offers memory the Foundation could use instead of
+this design, and what llmao itself has done since these proposals were written. Both,
+as of 12 October.
+
+### LiteLLM's own memory, and why it is not the record
+
+LiteLLM ships one feature it calls memory, and it is a key-value store, not a record.
+
+- **`/v1/memory`** stores a text value, with optional JSON metadata, under a globally
+  unique key, in a Postgres table, scoped to the caller's user and team: create, read,
+  update, delete, and list by key prefix
+  ([docs](https://docs.litellm.ai/docs/proxy/memory),
+  [PR #26218](https://github.com/BerriAI/litellm/pull/26218), merged 25 April 2026, in
+  the open-source proxy since about v1.83). Nothing reads it while a model call runs:
+  remembering and recalling are the client's job. It was on a draft deprecation list in
+  July and kept after the community objected
+  ([discussion #32090](https://github.com/BerriAI/litellm/discussions/32090)). The
+  gateway runs LiteLLM 1.102.2 (llmao `4493935`, 8 October), so the route exists; with
+  an ordinary PAT it answers 401, "Only proxy admin can be used…", so no user can reach
+  it today.
+- **Memory the gateway would keep by itself** was built and dropped. Two PRs by a
+  BerriAI engineer had the gateway inject save, search and read tools into requests and
+  run hidden tool rounds, with saving and recall switched on per user
+  ([#40844](https://github.com/BerriAI/litellm/pull/40844), closed 12 September;
+  [#40894](https://github.com/BerriAI/litellm/pull/40894), closed 4 October without
+  comment). Neither was merged and nothing has replaced them.
+- **Near it, and not memory**: Responses API sessions, which rebuild a conversation from
+  the proxy's spend logs and S3 when `previous_response_id` is given
+  ([docs](https://docs.litellm.ai/docs/response_api)); vector stores, whose data stays
+  at the provider, the managed kind Enterprise-licensed
+  ([docs](https://docs.litellm.ai/docs/completion/knowledgebase)); prompt management,
+  which is templates ([docs](https://docs.litellm.ai/docs/proxy/prompt_management));
+  semantic caching, which LiteLLM's own docs warn "goes badly wrong on agentic traffic"
+  ([docs](https://docs.litellm.ai/docs/proxy/caching_semantic)); and Anthropic's memory
+  tool, passed through for the client to execute. The A2A and MCP gateways keep no
+  memory of their own.
+
+None of this is the record the paper describes. `/v1/memory` has no trust tiers, no
+labels or ceilings, no provenance, no search beyond a key prefix, no erasure with a
+receipt, and no domain to partition by. And the dropped gateway memory went the
+opposite way from this design: memory written and recalled out of sight of the harness
+is the poisoning surface the paper's gates exist for, where here every read and write
+is a tool call the harness makes and the policy decides, with its provenance kept. If
+that work comes back upstream, llmao should leave it switched off.
+
+What LiteLLM does offer this design is its MCP registry, with an approval step and a
+cost per tool call: the place, under proposal 5, where the memory server and the taps
+would be registered as tool servers. Its Anthropic memory-tool pass-through is a second,
+smaller opening: the tool's commands could be served by the memory server, so a harness
+that speaks only that tool still writes to the record.
+
+### llmao since these proposals
+
+These proposals were written against llmao at `266122c` (10 October). Since then:
+
+| Proposal | In llmao |
+|---|---|
+| 1. One trace from a task to a model's answer | Nothing yet. `76a6899` (12 October) times each LiteLLM admin request and each page handler, to find why My Keys is slow: llmao's own pages, not model calls. Nothing in the code reads or sends `traceparent`. |
+| 2. Sessions as a caller the gateway can tell apart | Nothing yet. |
+| 3. A model list that tells the truth | On the human side only. The Models page was redesigned from [issue #46](https://github.com/apache/tooling-llmao/issues/46): status per deployment rather than per model, privacy computed from every configured deployment (Private, External or Mixed, a down one included), and whether a model thinks by default (`266122c`, `689c4ae`, `45da9c2`, `957d607`). The `/v1/models` list harnesses read is unchanged. |
+| 4. Compatibility for harnesses | By documentation rather than in the gateway. The guide to pointing a harness at the gateway by hand (`811d775`, 9 October, contributed from this work) says what this launcher's egress fixes that a manual setup does not, the system-message fold among them; llmao's help now has a page per harness, [PR #51](https://github.com/apache/tooling-llmao/pull/51) (open) tightens the Claude Code setup, and [issue #44](https://github.com/apache/tooling-llmao/issues/44) asks for configuration snippets to copy. The fixes themselves are not in the gateway. |
+| 5. Tool servers | [Issue #25](https://github.com/apache/tooling-llmao/issues/25), "MCP server registration through llmao" (open since 8 September, no replies), proposes LiteLLM's MCP registry with its review workflow, project access groups and per-tool cost: the place proposal 5 builds on. |
+
+Beside them, [issue #43](https://github.com/apache/tooling-llmao/issues/43) (open)
+considers metrics in Prometheus or OpenMetrics form for Infra's Datadog. The numbers it
+would publish per key and model, calls, tokens and time, are the ones this launcher's
+egress now keeps per session from the other side (`amem usage`, `amem cost`), which is
+the argument for proposals 1 and 2: with a trace and a session on each call, the two
+sets of numbers join. Everything else in llmao since 10 October is the vLLM hosting
+fleet, the help pages and the navigation.
