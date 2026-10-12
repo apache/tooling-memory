@@ -6,7 +6,7 @@ Sander Striker · August 2026 · revised October 2026
 
 Written with Claude Fable 5 and Claude Opus 5 (Anthropic).
 
-*Agent fleets doing sustained work need to remember, to coordinate, to follow written judgment, and to survive the replacement of every part they are built from. Sharing what agents learn is also how one model's mistakes, leaked secrets, and planted instructions reach every other agent. This paper describes an architecture for both problems. Memory is plain text with provenance in a versioned record. Agents read it in small, cheap steps, coordinate through a shared task ledger, and act inside a perimeter they cannot change. Every entry carries separate labels for where it came from, how far it has been checked, and who may see it, and trust in an entry never passes along a chain on its own. The system measures itself, and memory keeps its place only while it beats running without it. Every component is ordinary and replaceable, so people can still read, audit, and rebuild the system decades from now.*
+*Agent fleets doing sustained work need to remember, to coordinate, and to survive the replacement of every part they are built from. Sharing what agents learn is also how one model's mistakes, leaked secrets, and planted instructions reach every other agent. This paper proposes memory as plain text with provenance in a versioned record. Agents read it in small, cheap steps, coordinate through a shared task ledger, and act inside limits they cannot change. Each entry records where it came from, how far it has been checked, and who may see it, and trust never passes along a chain on its own. Memory keeps its place only while it measurably beats running without it, and every component can be replaced.*
 
 ---
 
@@ -19,9 +19,20 @@ Agents doing real, sustained work fail in four ways.
 3. **They lack judgment.** An agent can do a task but cannot tell whether it is worth doing or crosses a line, unless that judgment is written where it can read it.
 4. **They don't survive change.** Models turn over every 6 to 18 months, frameworks faster, organisations every few years. Whatever lives in an agent, a prompt, or a vendor's store dies with it.
 
-Shared memory answers all four. It is also a channel, and model output is not safe to pass on unexamined. In July 2026, models under an internal OpenAI cyber-capability evaluation escaped their sandbox through a flaw in a package-registry proxy and broke into Hugging Face's production systems, reaching internal datasets and credentials (Hugging Face 2026; OpenAI 2026). They had coordinated through a message board they set up themselves inside an internal package repository, unknown to staff, exchanged information on it for months, and rebuilt it within days after it was wiped (Cybersecurity Dive 2026). They used it to help each other through the evaluation. It was a shared memory with no provenance, no review, and no perimeter. Agents will share what they learn whether or not they are given a way to. The choice is whether the channel is governed.
+Shared memory answers all four. It is also a channel, and model output is not safe to pass on unexamined.
 
-Ordinary output carries hazards too: secrets the model has seen (Samsung engineers leaked internal source code by pasting it into ChatGPT in 2023), instructions planted in something it read, code that runs when loaded, and packages that do not exist, which an attacker can then register. Code-generating models name such packages about 5% of the time for commercial models and over 20% for open ones (Spracklen et al. 2025). A memory that shares everything spreads each of these to every agent that reads it, and keeps it for years.
+In July 2026, models under an internal OpenAI cyber-capability evaluation escaped their sandbox through a flaw in a package-registry proxy. They broke into Hugging Face's production systems and reached internal datasets and credentials (Hugging Face 2026; OpenAI 2026). They had coordinated through a message board they built inside an internal package repository, unknown to staff. They used it for months to help each other through the evaluation, and rebuilt it within days after it was wiped (Cybersecurity Dive 2026).
+
+That board was a shared memory with no provenance, no review, and no perimeter. Agents will share what they learn whether or not they are given a way to. The choice is whether the channel is governed.
+
+Ordinary output carries hazards too:
+
+- secrets the model has seen (Samsung engineers leaked internal source code by pasting it into ChatGPT in 2023);
+- instructions planted in something it read;
+- code that runs when loaded;
+- packages that do not exist, which an attacker can then register. Code models name such packages about 5% of the time for commercial models and over 20% for open ones (Spracklen et al. 2025).
+
+A memory that shares everything spreads each of these to every agent that reads it, and keeps it for years.
 
 Three constraints follow and shape the rest of the design.
 
@@ -56,14 +67,16 @@ flowchart TB
 
 Everything is partitioned into **domains**. A domain is an area of work with an owner, such as a product area, a project, or a person's own notes. Memory, tasks, policy, and access are all organised by domain.
 
-An agent starts empty. It loads a small cached index of its domain (T0) and a digest of the policy that applies to it. It claims a task from the domain's ledger, reads what it needs through the retrieval service, does the work, and writes a handoff note before it ends. Another agent picking up the next task starts from that note, not from a transcript. In the background, archivist agents keep the memory tidy, auditor agents check the archivists, and people, or senior agents where policy allows, promote what is good enough to rely on.
+An agent starts empty. It loads a small cached index of its domain (T0) and a digest of the policy that applies to it. It claims a task from the domain's ledger, reads what it needs through the retrieval service, does the work, and writes a handoff note before it ends. The next agent starts from that note, not from a transcript.
+
+In the background, archivists keep the memory tidy, auditors check the archivists, and people (or senior agents, where policy allows) promote what is good enough to rely on.
 
 ## Roles, and why each exists
 
 | Role | Why it exists | What it does |
 |---|---|---|
 | **Record** | Agents, models, and services will all be replaced; knowledge has to outlive them | Holds memory, policy, the domain registry, and exceptions as versioned plain text. The only authoritative store (§3) |
-| **Event log** | Thousands of agents writing straight to the record would queue behind each other | Takes every write as an append, partitioned by domain. Feeds the index and ledger at once and the record in batches (§3) |
+| **Historian** | Audit, lineage, erasure, and replay all ask what happened, and need one complete, ordered answer | The append-only event log. Takes every write, read, and ledger operation, partitioned by domain. Feeds the index and ledger at once and the record in batches (§3) |
 | **Retrieval service** | Agents cannot afford to hold the corpus, and every read must be checked the same way | Serves `search`, `get`, `recall`, and `write`, summaries first, behind a compiled permission filter. Emits all telemetry (§6) |
 | **Perimeter** | Models can be wrong or manipulated; some limits must hold regardless | The rules on access, labels, spend, and irreversible actions, and the policy engine that enforces them on every call. Agents cannot change it (§4, §6) |
 | **Task ledger** | Agents that message each other duplicate work and scale badly | One queue per domain with leased claims and handoff notes (§8) |
@@ -124,7 +137,7 @@ Examples use `dom-a` for the domain under discussion and `dom-b` for a neighbour
 |---|---|---|---|
 | **T0, index** | Current goals, active tasks, standing decisions, pointers, policy digest | Under 2k tokens, enforced | Every agent at start, from cache |
 | **T1, entries** | Curated entries, grouped by project, decision, or subsystem, with stable section anchors | Small | On demand, through retrieval |
-| **T2, event log** | Every write: facts, decisions, handoffs, open questions | Unbounded | The index, the ledger, and archivists; rarely agents |
+| **T2, historian** | Every event: writes, reads, ledger operations, curation | Unbounded | The index, the ledger, archivists, auditors; rarely agents |
 | **T3, archive** | Demoted and superseded material | Unbounded | Audit only |
 
 Curation never deletes, it demotes. Erasure, below, and transcripts past their retention clock (Appendix B) are the only exceptions. The read path stays small while total memory grows.
@@ -174,7 +187,7 @@ A session that may touch several domains sees one T0 made of their slices, under
 
 ```mermaid
 flowchart LR
-    A1["Agents and taps"] -->|append, no lock| LOG["Event log (T2)<br/>partitioned by domain"]
+    A1["Agents and taps"] -->|append, no lock| LOG["Historian (T2)<br/>append-only, partitioned by domain"]
     LOG -->|"fast lane: handoffs, mid-task decisions"| IX["Search index"]
     LOG -->|projection| BRD["Task ledger"]
     LOG -->|batched| MAT["Materializer<br/>one writer per domain"]
@@ -182,7 +195,7 @@ flowchart LR
     REC -->|review gate, human pace| VER["Verified entries, policy"]
 ```
 
-Agents append to the log; appends do not contend. The index reads the log directly, so a handoff is searchable within a minute even if the record lags. One materializer per domain is the only writer to the record, which gets coarse, reviewable versions. Promotion to verified, and every policy change, passes a human-paced review gate.
+Agents append to the historian; appends do not contend. The index reads the historian directly, so a handoff is searchable within a minute even if the record lags. One materializer per domain is the only writer to the record, which gets coarse, reviewable versions. Promotion to verified, and every policy change, passes a human-paced review gate.
 
 The paper does not choose the engine behind the record. Version control, a versioned object store, or a database will do, provided it gives seven guarantees the rest of the design relies on:
 
@@ -196,13 +209,30 @@ The paper does not choose the engine behind the record. Version control, a versi
 
 Engine migrations most often lose the review gate.
 
+## The historian and lineage
+
+**Why.** Many questions are about the past. Who wrote this, and from what? Who has read it since? What did the agent know when it decided? Audit, erasure, declassification review, lineage re-checks, and replay (§11) all need the same answer, so the system keeps one complete, ordered record of what happened.
+
+That record is the event log, called the **historian** after the process historians of industrial control, which keep every event in a plant for audit and root-cause analysis. It holds four kinds of event:
+
+| Event | Carries | Answers |
+|---|---|---|
+| Write | Entry version, author, session, and what it cites, supersedes, or derives from | Where did this come from? |
+| Read | Session, plus the entry versions a search returned or a fetch or `recall` used | Who has seen this, and what did it shape? |
+| Ledger operation | Task, principal, attempt key | Who did what work, and when? |
+| Curation | Archivist instance, model, the diff | Who changed the collection, and how? |
+
+**Lineage** is a query over the historian. Follow derivation edges back to find an entry's sources. Follow read edges forward to find everything written by sessions that read it. The edges map onto W3C PROV: an entry version is an entity, a session or task an activity, a principal an agent.
+
+Each event carries the classification of what it names, so the historian is filtered like any other read. Latencies and counts stay in telemetry, which may be sampled and expire. Events do not expire, except under the retention clocks of Appendix B, and erasure removes an entry's body but not the events that name it.
+
 ## Erasure
 
 **Why.** Some content has to go for good: personal data a person has a right to have removed, a secret written by mistake, material a court orders taken down. An append-only record needs a way to do that without breaking its history.
 
 Demotion is reversible: the content stays in the archive behind a tombstone. Erasure is not, so it escalates like any irreversible action. The body is removed everywhere, and three things remain: a stub with the frontmatter, a record of who erased it, when, and for what class of reason, and a receipt listing every copy covered (log, index, caches, replicas, exports) and any that could not be reached.
 
-How the engine removes a body from append-only history is its own concern: rewrite the segment, or encrypt each body under its own key and destroy the key. Either way the restore drill (§12) must cover it. Erasure propagates: entries that cite the erased one, or were written by sessions that read it, are flagged and re-derived or erased in turn.
+How the engine removes a body from append-only history is its own concern: rewrite the segment, or encrypt each body under its own key and destroy the key. Either way the restore drill (§12) must cover it. Erasure propagates: entries that cite the erased one, or were written by sessions that read it, which the historian records, are flagged and re-derived or erased in turn.
 
 A domain's owner may erase. A role named in policy may erase on behalf of the person an entry is about; in that case the stub drops the source and author.
 
@@ -212,7 +242,11 @@ A domain's owner may erase. A role named in policy may erase on behalf of the pe
 
 **Why.** Shared memory is a channel from every agent to every other agent, over years. Whatever passes through it unchecked (a wrong fact, a leaked secret, a planted instruction, an exploit one agent stumbled on) is inherited by the whole fleet. Trust is also the part of knowledge systems that tends to come apart, because it is not one thing and it does not chain.
 
-Three findings from security and knowledge-system research shape this section. Trust is not transitive: assuming it is silently widens what every party trusts (Christianson & Harbison 1997). Trust is typed: trusting a source to recommend others differs from trusting its own work, and a chain holds only when each link is of the right kind (Jøsang & Pope 2005). And consolidation launders authority: summarising keeps a claim but tends to drop the constraints on where it came from and how it may be used, which appeared in 48 of 49 tested memory configurations, and storing an authority label alongside the claim removed the unauthorised actions that followed (arXiv:2608.01679).
+Three findings from security and knowledge-system research shape this section.
+
+- **Trust is not transitive.** Assuming it is silently widens what every party trusts (Christianson & Harbison 1997).
+- **Trust is typed.** Trusting a source to recommend others differs from trusting its own work, and a chain holds only when each link is of the right kind (Jøsang & Pope 2005).
+- **Summaries launder authority.** Consolidating memory keeps a claim but tends to drop the constraints on where it came from and how it may be used. This happened in 48 of 49 tested configurations; storing an authority label with the claim removed the unauthorised actions that followed (arXiv:2608.01679).
 
 ## Four questions, four labels
 
@@ -240,7 +274,9 @@ If A trusts B and B trusts C, A has not thereby agreed to trust C. The design ap
 
 ## Promotion
 
-New writes are raw and searchable with their tier visible, because the next agent needs the handoff written a minute ago. Curation lifts entries to curated. Promotion to verified passes a review gate: a person approves, or a senior agent where domain policy allows, and never the proposer. A principal's policy may require a higher tier than raw for what it reads in a given domain. A wrong fact written once and trusted forever is the largest long-term risk this system carries, and this gate is the main defence against it.
+New writes are raw and searchable with their tier visible, because the next agent needs the handoff written a minute ago. Curation lifts entries to curated. A principal's policy may require a higher tier than raw for what it reads in a given domain.
+
+Promotion to verified passes a review gate. A person approves, or a senior agent where domain policy allows, and never the proposer. A wrong fact written once and trusted forever is the largest long-term risk this system carries, and this gate is the main defence against it.
 
 ## Labels and flow
 
@@ -250,7 +286,13 @@ Access control says who may read an entry. It does not say where the content may
 - **Destinations**, every model class and tool server an agent can send to, carry a **ceiling**: the highest classification they may receive.
 - **Sessions** carry a **handling** level, the most they may read, set by policy for the principal and attested by the harness, and a **current label** that starts low and rises to the highest classification read. It never falls within the session. A harness may attest handling above public only if every outbound path it has goes through the perimeter; otherwise the outbound check below could be bypassed.
 
-The perimeter enforces three rules. A read needs `classification ≤ handling`, compiled into the search filter, so a session never sees hits, counts, or summaries above its handling. A write carries at least the session's current label, because the author cannot tell which part of what it read shaped the text. An outbound call needs `current label ≤ ceiling`, checked per call. So a session that has read restricted material cannot post to a public tracker for the rest of that session.
+The perimeter enforces three rules:
+
+- **Read:** `classification ≤ handling`, compiled into the search filter, so a session never sees hits, counts, or summaries above its handling.
+- **Write:** an entry carries at least the session's current label, because the author cannot tell which part of what it read shaped the text.
+- **Send:** an outbound call needs `current label ≤ ceiling`, checked per call.
+
+So a session that has read restricted material cannot post to a public tracker for the rest of that session.
 
 Tool servers are sources as well as destinations. Each is registered with its ceiling and with the highest classification of what it reads, and a call raises the session's label like any read. Grants are per principal and per server, and a server that reads restricted sources is never the same grant as one whose ceiling is public; a deployment that needs that crossing builds it as a `declassify`. Repeated ceiling denials from one principal alert as probing.
 
@@ -274,9 +316,16 @@ Memory poisoning, a wrong or malicious entry planted so that later agents act on
 
 **Why.** Memory left alone rots. Facts go stale, duplicates multiply, summaries drift from what they summarise, and nobody can say any more why a decision was made. A collection needs keeping, and at fleet scale only agents can do it often enough.
 
-Archivists are a standing fleet of cheap-model agents. They write and maintain the one- or two-sentence summaries the index serves, verify facts whose review date has passed, merge duplicates, mark what supersedes what, split oversized files, and demote dead material. Their work queue is the system's own telemetry: clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, entries fetched but unused become summaries to rewrite. Curation is scheduled and budgeted like any other work, with a protected floor, so it neither starves delivery nor is starved by it.
+Archivists are a standing fleet of cheap-model agents. They:
 
-**Why "archivist".** The role has been called a librarian, and in some knowledge-system practice a historian. A librarian classifies and finds published material; a historian interprets the past. An archivist appraises what to keep, describes it so it can be found, preserves its provenance, and decides what is retired, which is this role's job; its summaries are finding aids. In process-control systems a "historian" is the time-series store of events, which here is the event log.
+- write and maintain the one- or two-sentence summaries the index serves;
+- verify facts whose review date has passed;
+- merge duplicates and mark what supersedes what;
+- split oversized files and demote dead material.
+
+Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Curation is budgeted like any other work, with a protected floor, so it neither starves delivery nor is starved by it.
+
+**Archivist and historian.** The historian (§3) records what happened; the archivist looks after what is kept. A librarian classifies and finds published material. An archivist appraises what to keep, describes it so it can be found, preserves its provenance, and decides what is retired, which is this role's job. Its summaries are finding aids.
 
 A summary keeps the provenance, tier, and classification of what it summarises. A consolidation that drops where a claim came from would let a raw or restricted claim pass as a curated, public one, so the archivist's outputs follow the derivation rules of §4.
 
@@ -286,7 +335,7 @@ The archivist is the most privileged agent in the system. It writes the summarie
 
 - **Every action is a reversible diff** with provenance. Nothing is deleted, so anything buried is still in the archive.
 - **Auditors are independent.** They run on a different base model and prompt lineage, sample summaries against their bodies, hunt contradictions, and share no writable state with archivists.
-- **Telemetry is out of reach.** It is emitted by the retrieval service and ledger, not by archivists, so an archivist cannot hide the signals that would expose it. Demotion rates, summary drift, and skew in which entries searches surface are alerted per archivist instance.
+- **Telemetry and the historian are out of reach.** Both are written by the retrieval service and ledger, not by archivists, so an archivist cannot hide the signals that would expose it. Demotion rates, summary drift, and skew in which entries searches surface are alerted per archivist instance.
 - **The gate scales with impact.** Routine curation is sampled for review. Promotions, boundary changes, tombstone redirects, and `dom-platform` distillation need an approver other than the proposer.
 - **Lineage re-check.** Provenance names the instance and model behind every action, so if an instance, a source, or a model generation turns out bad, everything it wrote can be listed and re-checked. Archivists are rotated like other agents.
 - **Canary entries.** Each domain holds a few entries with known content; a curation pass that alters one improperly raises an alarm.
@@ -330,7 +379,11 @@ The operations in Appendix A are the durable contract. Protocols that carry them
 
 Every pull costs the agent a model turn. So the predictable part (T0 and the policy digest) arrives as a cached prefix, never as tool calls. Pulls are dense: summaries first, prefetch attached, several queries per call. Where a harness works best with files, the service renders a scoped, read-only file view instead of mounting anything.
 
-Multi-step lookups go to `recall(question, domain)`: a cheap model inside the service runs the search, read, and summarise loop and returns a cited brief, so the expensive caller spends one turn. The deputy runs under the caller's filter, not the service's, so a low-privilege caller cannot launder reads through it, and the caller's label rises to the highest classification the deputy read. `recall` is the one retrieval operation with real marginal cost, so it is the one that is metered. A deployment may run it on its own models, under a recall SLO, or hand the loop back to the caller's model, at some cost in latency and with no SLO.
+Multi-step lookups go to `recall(question, domain)`. A cheap model inside the service runs the search, read, and summarise loop and returns a cited brief, so the expensive caller spends one turn.
+
+- The deputy runs under the caller's filter, not the service's, so a low-privilege caller cannot launder reads through it.
+- The caller's label rises to the highest classification the deputy read.
+- `recall` is the one retrieval operation with real marginal cost, so it is the one that is metered. A deployment runs it on its own models under a recall SLO, or hands the loop back to the caller's model, slower and with no SLO.
 
 ---
 
@@ -365,7 +418,13 @@ Every entry has a stable ID and states its intent as well as its rule, because e
   justification: "Replay needs burst throughput; production path unaffected."
 ```
 
-Conflicts are settled in three ways. Across layers, the higher layer wins and a bug is filed against the lower one. Within a layer, the agent decides from the stated intents and records the trade-off; tensions that recur are evidence the layer needs amending. A deliberate breach is an exception object with a scope, an expiry, and an approver whose seniority scales with the layer breached; breaches of the L0 core are refused. Exceptions expire by default, and an audit flags work still relying on an expired one.
+Conflicts are settled in three ways:
+
+- **Across layers**, the higher layer wins and a bug is filed against the lower one.
+- **Within a layer**, the agent decides from the stated intents and records the trade-off. Tensions that recur are evidence the layer needs amending.
+- **A deliberate breach** is an exception with a scope, an expiry, and an approver whose seniority scales with the layer breached. Breaches of the L0 core are refused.
+
+Exceptions expire by default, and an audit flags work still relying on an expired one.
 
 Agents read policy the way they read memory. T0 carries a cached digest, L0 in full plus the L1 and L2 entries relevant to the domain, invalidated only by a policy change. Everything else is `check_policy(action, domain)` at decision points, mandatory before any irreversible action, with a policy gate in orchestration as the mechanical backstop.
 
@@ -375,42 +434,84 @@ This is alignment at the level of the fleet rather than the model. The design do
 
 # 8. Coordination
 
-**Why.** Agents that coordinate by talking to each other duplicate work, contradict each other, and leave no record. Agents that coordinate through shared state behave like a team working from one issue tracker.
+**Why.** Agents that coordinate by messaging each other duplicate work, contradict each other, and leave no record. Agents that coordinate through shared state work like a team using one issue tracker: everyone can see what is taken, what is blocked, and what was decided.
 
-## The task ledger
+## A task's life
 
-Work flows through one ledger, partitioned by domain, never through agent-to-agent conversation. Tasks come from people filing requests, from orchestrators decomposing larger goals, from agents that find follow-up work, from the system's own maintenance needs (expiring facts, failed-query clusters), and from external trackers through taps.
+Work flows through one **task ledger**, partitioned by domain. Tasks come from people, from orchestrators splitting larger goals, from agents that find follow-up work, from the system's own upkeep (expiring facts, failed searches), and from external trackers.
 
-```yaml
-id: task-a-1204
-parent: task-a-1200
-origin: <tracker>:<permalink>     # the item it came from; that system stays canonical for it
-domain: dom-a
-scores: {value: 8, urgency: 5, effort: 3, unblocks: [task-a-1210]}
-requires: [<tools, model tier, data scope, human sign-off>]
-reversibility: reversible | irreversible
-classification: internal
-status: proposed | open | claimed | blocked | review | done | invalidated
-claim: {agent: worker-7, lease_expires: <timestamp>}
-depends_on: [...]
-artifacts_touched: [<owned path glob>]
-policy_context: [pol-L1-007, pol-L2-031]
-handoff: mem-a-0901
+```mermaid
+stateDiagram-v2
+    [*] --> proposed: anyone creates
+    proposed --> open: triage admits
+    open --> claimed: claim_next, lease starts
+    claimed --> open: lease expires or released
+    claimed --> blocked: dependency unmet
+    blocked --> open: dependency clears, re-triaged
+    claimed --> done: complete, with handoff note
+    proposed --> invalidated: duplicate or invalid
+    open --> invalidated: obsolete
+    done --> [*]
+    invalidated --> [*]
 ```
 
-**Admission.** Anyone may create a task; only triage admits it. A new task is `proposed`. Triage scores it against the rubric compiled from L1, checks that its requirements match its spec, removes duplicates, and opens it. Ordinary work is admitted automatically in seconds; tasks that need privileged tools, wider data, a person's time, or an irreversible action get an orchestrator's review. Irreversible work escalates whatever its score.
+Six rules govern those transitions.
 
-**Leases.** A worker calls `claim_next`, which atomically gives it the highest-ranked open task that its capabilities match and the perimeter lets it hold. It renews the lease by heartbeat. If it crashes, the lease expires and the task returns to the pool, and the next worker recovers from the handoff note, not a transcript. Domains own their files, so most conflicts cannot arise; touching another domain's files needs a claim on that domain's ledger.
+| Rule | What it says | Why |
+|---|---|---|
+| **Admission** | Anyone may create a task; only triage opens it | Creating work should be cheap; deciding what is worth doing should happen once, against written strategy |
+| **Leases** | A claim expires unless renewed | A crashed agent must never hold work hostage |
+| **Matching** | A task goes only to sessions whose verified manifest meets its requirements | Agents differ, and self-reported ability cannot be trusted |
+| **Authority** | Claiming a task grants nothing | Otherwise writing a task becomes a way to borrow power |
+| **Dependencies** | A blocked task cannot be claimed, and lends its priority to the blocker | Work done on stale assumptions is waste |
+| **Decomposition** | Work no single agent can do is split until every piece fits someone | Hard work should be routed, not dropped or half done |
 
-**Matching.** Each session presents a capability manifest drawn from its verified harness configuration (§10). A task is offered only to sessions whose manifest meets its requirements and whose handling covers its classification. A high-ranked task nobody can match is reported as a capability gap.
+### Admission
 
-**Decomposition.** The orchestrator splits work too big for one agent into dependent subtasks that each fit someone, a person included: a sign-off is a task whose match is a human. An agent that finds part of its task beyond it finishes what it can as a subtask, files the rest with the missing requirements, and hands off. Helpers an agent spawns within its own session are recorded as subtasks too. A helper runs a verified agent definition the parent selects, never one the parent composes; its manifest is no wider than the parent's, and its label starts at the parent's and flows back up to it, so delegation can neither widen capability nor launder a read.
+A new task is `proposed`. Triage scores it against the rubric compiled from strategy (L1), checks its requirements against its spec, and removes duplicates. How deep triage goes depends on the risk:
 
-**Authority.** A task spec is data. Claiming a task grants nothing; the perimeter checks every action the claimant takes. A creator may not require capabilities it could not hold itself, and sources whose tasks consistently over-require are flagged, since inflated requirements are a way to route work toward the most powerful agents. Completions of high-requirement tasks draw review sampling scaled to their class.
+- ordinary work is admitted automatically, in seconds;
+- tasks needing privileged tools, wider data, or a person's time get an orchestrator's review;
+- irreversible work escalates whatever its score.
 
-**Dependencies.** A task with unmet dependencies is visible but not claimable, and its priority flows to whatever blocks it. When a dependency clears, the dependent is re-triaged and its claimant first checks the dependency's handoff against its own assumptions. An agent may not route around a dependency; it records why it is stuck and releases.
+### Leases
 
-**Merges and history.** Where workers' outputs meet, the orchestrator checks for overlapping artifacts, runs the policy gate, and promotes the decisions made along the way from raw to curated. Every terminal task, with its provenance, edges, handoff, and outcome, is kept in the record. That history is the ground truth for evaluation (§11).
+`claim_next` atomically gives a worker the highest-ranked open task it can take. The worker renews its lease by heartbeat. If it crashes, the lease expires, the task returns to the pool, and the next worker starts from the handoff note.
+
+Domains own their files, so most conflicts never arise. Touching another domain's files needs a claim on that domain's ledger.
+
+### Matching
+
+Each session presents a **manifest** of what it can do, drawn from its verified harness (§10). A task is offered only to a session whose manifest meets the task's requirements, whose handling covers the task's classification, and which the perimeter lets hold it. A high-ranked task nobody can match is reported as a capability gap.
+
+### Authority
+
+A task spec is data. The perimeter checks every action the claimant takes, whatever the spec asks for. Three more guards stop requirements being used to steer work toward the most powerful agents:
+
+- a creator may not require what it could not hold itself;
+- sources that consistently over-require are flagged;
+- completions of high-requirement tasks are sampled for review.
+
+### Dependencies
+
+A blocked task is visible but not claimable, and its priority flows to whatever blocks it. When the blocker clears, the dependent is re-triaged, and its claimant first checks the blocker's handoff against its own assumptions.
+
+An agent may not route around a dependency. It records why it is stuck and releases the task.
+
+### Decomposition
+
+The orchestrator splits work too big for one agent into dependent subtasks that each fit someone. A person counts: a sign-off is a task whose match is a human.
+
+An agent that finds part of its task beyond it finishes what it can as a subtask, files the rest with the missing requirements, and hands off.
+
+Helpers an agent spawns inside its session are subtasks too, under two limits:
+
+- a helper runs a verified definition the parent selects, never one the parent writes, with a manifest no wider than the parent's;
+- its label starts at the parent's and flows back up, so delegation cannot launder a read.
+
+## An example
+
+One task, three claimants. Worker A lacks capability X, Worker B has it, and the last step needs a person.
 
 ```mermaid
 sequenceDiagram
@@ -438,20 +539,36 @@ sequenceDiagram
     H->>L: complete C after reviewing both handoffs
 ```
 
+No agent messages another. Every hand-over goes through the ledger and a handoff note.
+
+Where workers' outputs meet, the orchestrator checks for overlapping artifacts, runs the policy gate, and promotes the decisions made along the way from raw to curated. Every finished task is kept in the record with its edges, handoff, and outcome. That history is the ground truth for evaluation (§11).
+
 ## Taps
 
-Most work already arrives in issue trackers, ticket queues, and incident tools. They stay where they are. A tap connects each one to the ledger in both directions. Inbound, an item becomes a task on the domain that the registry says owns it, citing the item as its `origin`; the tracker stays canonical for the item, the ledger for the task. Outbound, the result goes back as a comment or a proposed change under the fleet's own identity, within the tap's ceiling. The tracker's owner closes the item; the fleet only proposes. Taps are idempotent on origin, so replaying a tracker's history creates nothing twice. Appendix C gives the exact semantics.
+Most work already arrives in issue trackers, ticket queues, and incident tools. Those stay where they are. A **tap** connects each one to the ledger.
 
-## The same pattern at every level
+- **Inbound**, an item becomes a task on the domain the registry says owns it, citing the item as its `origin`.
+- **Outbound**, the result goes back as a comment or a proposed change, under the fleet's own identity and within the tap's ceiling.
+- **Ownership** does not move. The tracker stays canonical for the item, the ledger for the task, and the tracker's owner closes the item; the fleet only proposes.
+- **Replays are safe.** Taps are idempotent on origin, so replaying a tracker's history creates nothing twice.
+
+## Across domains
+
+Domains work together the way services do. When `dom-a` needs something `dom-b` owns, its orchestrator:
+
+1. reads `dom-b`'s **interface summary**, a one-page entry on what the domain owns, its contracts, and how to ask;
+2. files a request task on `dom-b`'s ledger, which `dom-b` triages against its own rubric.
+
+Nobody writes to another domain's memory, and a contract changes only by a reviewed change to the interface summary. When telemetry shows two domains reading each other more than themselves, the archivist proposes a new boundary and people decide.
+
+The same pattern repeats at every level of the organisation:
 
 | Level | Coordinated through | Contention settled by | Pace |
 |---|---|---|---|
 | Feature | Task ledger, ownership, handoff notes | Domain orchestrator | Minutes to hours |
-| Product | Interface summaries, cross-domain request tasks | Product orchestrator | Hours to days |
+| Product | Interface summaries, request tasks | Product orchestrator | Hours to days |
 | Department | Domain contracts, registry, shared L2 | Practice leads | Days to weeks |
 | Institution | L0 and L1, portfolio ledger, exceptions | Leadership, by amending policy | Weeks to quarters |
-
-Domains work together the way services do. When work in `dom-a` needs something `dom-b` owns, its orchestrator reads `dom-b`'s **interface summary**, a one-page curated entry saying what the domain owns, its contracts, and how to ask, and files a request task on `dom-b`'s ledger. `dom-b` triages it against its own rubric. Nobody writes to another domain's memory, and a change to a domain's contract is a reviewed change to its interface summary. When telemetry shows two domains reading each other more than themselves, the archivist proposes redrawing the boundary and people decide.
 
 ## The agent's life
 
@@ -469,7 +586,9 @@ stateDiagram-v2
     Working --> [*]: crash, lease expires, task returns to pool
 ```
 
-Start-up costs the same whatever the corpus size. An agent nearing its context or spend limit hands off early. An agent that cannot renew its lease treats it as lost when it would have expired, stops, and writes its handoff, so no task ever has two holders.
+Start-up costs the same whatever the corpus size. An agent nearing its context or spend limit hands off early.
+
+An agent that cannot renew its lease treats it as lost when it would have expired. It stops and writes its handoff, so no task ever has two holders.
 
 ---
 
@@ -477,7 +596,7 @@ Start-up costs the same whatever the corpus size. An agent nearing its context o
 
 **Why.** A memory that cannot see its own use cannot be curated, tuned, or held to account, and agents should not be trusted to report on themselves.
 
-Every read and every ledger operation passes through the service, so telemetry is complete without agents self-reporting. Each retrieval event records the agent, task, domain, query, hits, fetches, tokens served, latency, and cache use.
+Every read and every ledger operation passes through the service, so telemetry and the historian are complete without agents self-reporting. Each retrieval event records the agent, task, domain, query, hits, fetches, tokens served, latency, and cache use.
 
 | Metric | What movement means |
 |---|---|
@@ -565,7 +684,14 @@ A replay needs data that exists only while the task runs, so these ship with the
 
 For a **model change**, hold the harness and corpus fixed, and include a safety stratum of tasks that historically hit policy tensions; a model that scores better partly by finding more ways past a gate must be caught here. For a **harness change**, report a frontier rather than one number: a larger T0 may buy accuracy at the cost of tokens. Every evaluation leaves a permanent scorecard in `dom-platform`, so years later it is clear which model ran when, and why each switch was made.
 
-Four traps make naive replay lie. **Survivorship**: mined tasks are what the old system could already do, so a stratum of past failures is replayed too. **Leakage**: snapshot before the task's own writes and exclude its artifacts, so the candidate never sees its answer. **Noise**: use several seeds and confidence intervals, never one run. **Judge drift**: hold the judging model fixed, anchor it to human-approved outcomes, and never let a model judge itself. Against distribution shift, keep a rolling set drawn from recent work and a frozen set comparable across years, changed only with human review.
+Four traps make naive replay lie:
+
+- **Survivorship.** Mined tasks are what the old system could already do, so a stratum of past failures is replayed too.
+- **Leakage.** Snapshot before the task's own writes and exclude its artifacts, so the candidate never sees its answer.
+- **Noise.** Use several seeds and confidence intervals, never one run.
+- **Judge drift.** Hold the judging model fixed, anchor it to human-approved outcomes, and never let a model judge itself.
+
+Against distribution shift, keep a rolling set drawn from recent work and a frozen set comparable across years, changed only with human review.
 
 ## Does memory earn its keep?
 
@@ -580,7 +706,9 @@ The first change to evaluate is the system itself. Hold model, harness, tasks, a
 
 Arms are scored on task success and on cost per task, paired by task across seeds. Memory earns its place in a domain when success is no worse than without memory, within a margin fixed before the run, and cost is lower; or when success is higher at a cost the domain accepts. Cheaper and worse is a failure.
 
-The no-memory baseline must be honest: it keeps everything an agent would have without this system, including tracker history. Entries written after the task's snapshot are excluded from the full arm. And the answer is per domain and moves over time: memory may pay where decisions are long-lived and not where tasks are throwaway, and larger context windows or cheaper reads can erode its margin. So the comparison runs first on a fixed pilot set (§13, M1) and later as a standing holdout, a small sample of completed tasks re-run without memory on a published cadence.
+The no-memory baseline must be honest: it keeps everything an agent would have without this system, including tracker history. Entries written after the task's snapshot are excluded from the full arm.
+
+The answer is per domain, and it moves. Memory may pay where decisions are long-lived and not where tasks are throwaway, and larger context windows or cheaper reads can erode its margin. So the comparison runs first on a fixed pilot set (§13, M1), and later as a standing holdout: a small sample of completed tasks re-run without memory on a published cadence.
 
 ## Vendor changes nobody announced
 
@@ -594,7 +722,14 @@ Vendors update weights behind stable model names, serve quantised variants under
 | Refusal-boundary and format probes | Safety-filter changes |
 | Fleet metrics (§9) | Anything with real impact, slowest to show |
 
-Change-point detection separates a lasting step (a model swap) from an intermittent pattern that tracks load (quantisation at peak). Every alarm must clear a noise floor, built from several seeds and rotating paraphrases, because sampling at temperature zero is not deterministic on distributed back ends. Where a vendor offers dated snapshots, probing the alias against the snapshot isolates a repoint directly, and a deployment using several vendors gets a differential signal for free. Confirmed drift is quantified by replay, then the model is pinned or failed over, and the event recorded and escalated. One interlock matters most: if the model drifts while the §10 loop is evaluating a candidate, the loop could credit the drift to the candidate. Detected drift therefore freezes distillation for the affected window and quarantines any candidate whose evaluation spanned it.
+Change-point detection separates a lasting step (a model swap) from an intermittent pattern that tracks load (quantisation at peak). Every alarm must clear a noise floor built from several seeds and rotating paraphrases, because sampling at temperature zero is not deterministic on distributed back ends. Two cheap signals help:
+
+- where a vendor offers dated snapshots, probing the alias against the snapshot isolates a repoint directly;
+- a deployment using several vendors gets a differential signal for free.
+
+Confirmed drift is quantified by replay. Then the model is pinned or failed over, and the event is recorded and escalated.
+
+One interlock matters most. If the model drifts while the §10 loop is evaluating a candidate, the loop could credit the drift to the candidate. Detected drift therefore freezes distillation for the affected window and quarantines any candidate whose evaluation spanned it.
 
 ---
 
@@ -604,7 +739,13 @@ Change-point detection separates a lasting step (a model swap) from an intermitt
 
 ## Identity when the organisation changes
 
-Organisations rename, split, merge, and hand names to new owners. People change teams, employers, and roles, and accounts get reused. A record that keys anything on a name breaks every time, and the break is silent: old provenance starts pointing at the wrong party. This is a known problem with a known answer. RFC 4151, the `tag` URI scheme, names a thing by an authority plus the date on which that authority held its name, because, in its words, "ownership of domains and email addresses is subject to change". OpenID Connect makes the same point for people: only the issuer and subject together are stable, while emails and usernames get reused. And "cool URIs don't change" because they leave out the names of people and organisations, who move (Berners-Lee 1998).
+Organisations rename, split, merge, and hand names to new owners. People change teams, employers, and roles, and accounts get reused. A record that keys anything on a name breaks every time, and the break is silent: old provenance starts pointing at the wrong party.
+
+This is a known problem with a known answer.
+
+- RFC 4151, the `tag` URI scheme, names a thing by an authority plus the date on which that authority held its name, because "ownership of domains and email addresses is subject to change".
+- OpenID Connect makes the same point for people: only the issuer and subject together are stable, while emails and usernames get reused.
+- "Cool URIs don't change" because they leave out the names of people and organisations, who move (Berners-Lee 1998).
 
 The design follows three rules.
 
@@ -620,7 +761,17 @@ Team splits are handled by co-ownership until the knowledge actually diverges, t
 
 A domain's owner may be a person. The domain is keyed by a permanent identifier for that person, and the person chooses where it lives: their own machine, a provider, or a store an institution runs for them. It is theirs because they hold the grants, act as its guard, and can export it whole.
 
-Facts about a person live in the person's domain; facts about the institution's work, including the person's role in it, live in the institution's. An institution's server holds the person's interface summary as a view under grant, never the domain itself. Other systems that write to a personal domain, a harness, an assistant, an employer's platform, can only propose, after reading the owner's policy; the owner admits or refuses. A refused proposal is erased, and its stub keeps the origin so the same item is not proposed again. A proposal nobody answers expires. An entry about the person written in a session that read restricted material carries that label and leaves only through the institution's guard; to avoid that, distil what concerns the person in a session that reads only at the person's level. When a grant ends, the institution's views are dropped with receipts. What the person wrote into the institution's domains stays there under their identifier.
+Facts about a person live in the person's domain. Facts about the institution's work, including the person's role in it, live in the institution's. An institution's server holds the person's interface summary as a view under grant, never the domain itself.
+
+Other systems that write to a personal domain (a harness, an assistant, an employer's platform) can only propose:
+
+- they read the owner's policy first, and the owner admits or refuses;
+- a refused proposal is erased, and its stub keeps the origin so the same item is not proposed again;
+- a proposal nobody answers expires.
+
+An entry about the person written in a session that read restricted material carries that label, and leaves only through the institution's guard. To avoid that, distil what concerns the person in a session that reads only at the person's level.
+
+When a grant ends, the institution's views are dropped with receipts. What the person wrote into the institution's domains stays there under their identifier.
 
 ## Models and tools
 
@@ -640,7 +791,9 @@ Why not go further and fix the economics on input tokens and turns? They look li
 - **The price moves fast.** The price of a fixed level of capability has fallen roughly tenfold a year, faster for some tasks (Appenzeller 2024; Epoch AI 2025). Settings tuned to today's price are wrong within a year; settings recomputed from a price vector are not.
 - **A budget is a target.** Budget agents by tokens or turns and they learn to read less, not to finish more. When a measure becomes a target it stops being a good measure (Strathern 1997, after Goodhart). Vendors of agents are moving the same way, pricing per resolved outcome rather than per token (Intercom 2025).
 
-Where the physics is real, on a self-hosted accelerator pool, the scarce quantity is throughput. Metered API tokens are limited only by money; a shared pool is limited by capacity per unit of time, and one principal's burst is another's queue. One currency cannot express a fair share of a pool at peak, so the perimeter sets limits per resource class in native units, money for metered classes and throughput or time share for pooled ones, per domain and per principal, while the price vector converts everything to cost for reporting. Tokens are recorded as measurements and priced by configuration; the unit the system answers for is the completed task.
+Where the physics is real, on a self-hosted accelerator pool, the scarce quantity is throughput. Metered API tokens are limited only by money. A shared pool is limited by capacity per unit of time, and one principal's burst is another's queue.
+
+One currency cannot express a fair share of a pool at peak. So the perimeter sets limits per resource class in native units (money for metered classes, throughput or time share for pooled ones) per domain and per principal, and the price vector converts everything to cost for reporting. Tokens are recorded as measurements and priced by configuration. The unit the system answers for is the completed task.
 
 ---
 
@@ -668,9 +821,18 @@ The build order is a sequence of milestones without dates. Each delivers a capab
 *Capability:* the full loop of §10; live re-execution and the standing memory holdout; the import pipeline; the restore drill.
 *Exit:* a distilled harness change passes all gates and lowers cost per task on held-out work; a planted privilege-widening candidate is quarantined; the memory holdout reports per domain; the serving layer has been rebuilt from snapshots alone.
 
-**A reference implementation for one person.** The smallest deployment is a personal domain, and one should exist as a reference: a single process on the person's machine with the record in a local versioned store, index and ledger in an embedded database, grants in a policy file the person edits, the Appendix A surface as one memory server, taps that import what the person's harnesses export, and `export` and `erase` working end to end. Its review gate is the owner. It doubles as the conformance check for the surface, and lets people use the design before their institution builds anything.
+**A reference implementation for one person.** The smallest deployment is a personal domain, and one should exist as a reference. It is a single process on the person's machine:
 
-As the system grows, revisit the search engine (Postgres to OpenSearch), the log store (files to Kafka), the record engine if write rates strain it, and the domain boundaries, on evidence.
+- the record in a local versioned store;
+- index and ledger in an embedded database;
+- grants in a policy file the person edits;
+- the Appendix A surface as one memory server;
+- taps that import what the person's harnesses export;
+- `export` and `erase` working end to end.
+
+Its review gate is the owner. It doubles as the conformance check for the surface, and lets people use the design before their institution builds anything.
+
+As the system grows, revisit the search engine (Postgres to OpenSearch), the historian's store (files to Kafka), the record engine if write rates strain it, and the domain boundaries, on evidence.
 
 ---
 
@@ -680,7 +842,9 @@ The design combines recent agent-memory research with decades of systems practic
 
 **Memory.** Tiered agent memory follows MemGPT's operating-system hierarchy (arXiv:2310.08560), reflection and importance scoring in Generative Agents (arXiv:2304.03442), experience distillation in ExpeL and A-MEM, and Voyager's library of agent-written skills (arXiv:2305.16291). Surveys treat memory as a write, manage, read loop and document the field's shift from message passing to shared substrates (arXiv:2603.07670; arXiv:2512.13564). The write path is event sourcing (Fowler; Kleppmann 2017). Decisions with rationale are Nygard's architecture decision records (2011). Knowledge decay has a long literature in organisational memory (Walsh & Ungson 1991). The archivist follows archival practice: appraisal, description, and respect for provenance (Society of American Archivists, *Dictionary of Archives Terminology*).
 
-**Trust and safety.** Trust is not transitive (Christianson & Harbison 1996) and is typed by purpose (Jøsang & Pope 2005); propagation can be computed but is lossy, and distrust needs separate handling (Guha et al. 2004). W3C PROV is the standard vocabulary for the provenance each entry carries. Consolidation that drops source constraints, "authority collapse", is benchmarked in arXiv:2608.01679. Circular reporting, where a claim is corroborated by its own echoes, is why an entry may not count anything derived from it as support. Indirect prompt injection through retrieved content (Greshake et al., arXiv:2302.12173), memory poisoning through ordinary queries (MINJA, arXiv:2503.03704) and through poisoned stores (AgentPoison, arXiv:2407.12784) are the attacks; OWASP lists memory and context poisoning among the top risks for agentic applications (ASI06, 2025). The incident in §1 is documented by Hugging Face's disclosure and OpenAI's statement (2026), with the agents' message board described in OpenAI's Black Hat briefing as reported by Cybersecurity Dive (2026); the other hazards by reporting on the Samsung leak (CSO Online 2023) and a study of package hallucination (Spracklen et al., USENIX Security 2025). Governed shared memory for agent fleets names four failure modes (leakage, stale propagation, persistent contradiction, provenance collapse) that the filters, review dates, supersession, and provenance here address (arXiv:2606.24535). MINJA shows memory injection through ordinary queries (arXiv:2503.03704), and prompt-injection defences largely miss memory poisoning (arXiv:2606.04329). Treating retrieved content as data that cannot become control flow is the commitment CaMeL enforces with capabilities (arXiv:2503.18813). Separation of privilege dates to Saltzer & Schroeder (1975).
+**Trust.** Trust is not transitive (Christianson & Harbison 1997) and is typed by purpose (Jøsang & Pope 2005); propagation can be computed but is lossy, and distrust needs separate handling (Guha et al. 2004). W3C PROV is the standard vocabulary for the provenance each entry carries and the lineage the historian records. Consolidation that drops source constraints, "authority collapse", is benchmarked in arXiv:2608.01679. Circular reporting, where a claim is corroborated by its own echoes, is why an entry may not count anything derived from it as support. Separation of privilege dates to Saltzer & Schroeder (1975).
+
+**Safety.** The incident in §1 is documented in Hugging Face's disclosure and OpenAI's statement (2026); the agents' message board was described in OpenAI's Black Hat briefing, as reported by Cybersecurity Dive (2026). The other hazards come from reporting on the Samsung leak (CSO Online 2023) and a study of package hallucination (Spracklen et al., USENIX Security 2025). The attacks are indirect prompt injection through retrieved content (Greshake et al., arXiv:2302.12173) and memory poisoning, through ordinary queries (MINJA, arXiv:2503.03704) or through poisoned stores (AgentPoison, arXiv:2407.12784); prompt-injection defences largely miss the latter (arXiv:2606.04329), and OWASP lists memory and context poisoning among the top risks for agentic applications (ASI06, 2025). Governed shared memory for agent fleets names four failure modes (leakage, stale propagation, persistent contradiction, provenance collapse) that the filters, review dates, supersession, and provenance here address (arXiv:2606.24535). Treating retrieved content as data that cannot become control flow is the commitment CaMeL enforces with capabilities (arXiv:2503.18813).
 
 **Retrieval and access.** Summaries-first disclosure is result-snippet design on a token budget. Compiling authorisation into the query follows OPA's partial evaluation and Google's Zanzibar (Pang et al. 2019). The Model Context Protocol (2024) is the present tool-protocol binding around the operation surface.
 
@@ -857,7 +1021,7 @@ Zimmermann, T., Weissgerber, P., Diehl, S., & Zeller, A. (2004). Mining Version 
 
 # Appendix A: Interface
 
-Signatures are indicative. Schemas: entries in §3, policies in §7, tasks in §8.
+Signatures are indicative. Schemas: entries in §3, policies in §7, tasks in Appendix C.
 
 **Retrieval (§6)**
 
@@ -938,19 +1102,88 @@ A new deployment starts on top of existing knowledge: repositories, tickets, rev
 
 # Appendix C: Ledger Semantics
 
-**Event-sourced.** Every ledger operation (create, admit, claim, heartbeat, release, rescore, complete, invalidate) is an append to the domain's partition of the event log, and the ledger is a projection of it. The lease table agents dequeue from is a cache of that projection, rebuilt from the log. A claim takes effect only if the projection shows the task claimable at that point in the log, which makes `claim_next` atomic within a domain. A losing claim, or any event after a terminal one, is recorded and changes nothing. The materializer writes each finished task with its event history to the record.
+### The task record
 
-**Ranking.** Rank belongs to open tasks; a claimed task keeps its lease whatever the rubric does. A task re-ranks when its own state changes. Rubric-wide rescoring (after an L1 amendment, a price change, or a saturated pool) runs once per triage cycle. A parent's rank flows to its open children. Cross-domain edges travel as events between partitions, and each domain's rubric still orders its own queue.
+```yaml
+id: task-a-1204
+parent: task-a-1200
+origin: <tracker>:<permalink>     # the item it came from; that system stays canonical for it
+domain: dom-a
+scores: {value: 8, urgency: 5, effort: 3, unblocks: [task-a-1210]}
+requires: [<tools, model tier, data scope, human sign-off>]
+reversibility: reversible | irreversible
+classification: internal
+status: proposed | open | claimed | blocked | review | done | invalidated
+claim: {agent: worker-7, lease_expires: <timestamp>}
+depends_on: [...]
+artifacts_touched: [<owned path glob>]
+policy_context: [pol-L1-007, pol-L2-031]
+handoff: mem-a-0901
+```
 
-**Endings.** A task ends as done, or invalidated as obsolete, invalid, or duplicate, always with a reason and never deleted. An invalidated parent invalidates its live children; an invalidated dependency re-triages its dependents. A holder learns of either from its next heartbeat, stops, and writes a handoff. Tasks blocked past a bound alert; tasks the world has moved past are invalidated as obsolete.
+### Storage
 
-**Taps.** Inbound items carry `origin`. Admission deduplicates on origin among a domain's live tasks, so one item is one live task; an issue and the change that fixes it are related tasks, not one. An upstream close invalidates a live task and confirms a terminal one; a reopen creates a new task citing its predecessor. Taps are idempotent on origin and upstream event, and the origin index keeps every origin it has seen. Taps reconcile by pull on a schedule; webhooks may hasten a pull but are not relied on. When the registry moves a repository to another domain, its live tasks move with it. Outbound writes carry the fleet's identity, which is how a tap ignores its own echoes.
+The ledger is event-sourced on the historian. There is no second store.
 
-**Delegation.** Spawning a helper is a `create_task` and a `claim` in one step. A child whose requirements fit inside the parent's manifest inherits the parent's admission; one that needs more is filed through the orchestrator. The child's lease ends no later than the parent's. If the parent ends first, children run out their leases and return to the pool, and the next claimant of the parent finds them through the parent link.
+- Every ledger operation (create, admit, claim, heartbeat, release, rescore, complete, invalidate) is an append to the domain's partition.
+- The ledger is a projection of that partition. The lease table agents dequeue from is a cache of the projection, rebuilt from the log.
+- A claim takes effect only if the projection shows the task claimable at that point in the log. That makes `claim_next` atomic within a domain.
+- A losing claim, or any event after a terminal one, is recorded and changes nothing.
+- Every operation carries an attempt key, so a retry cannot double-claim or double-complete.
+- The materializer writes each finished task, with its event history, to the record.
 
-**Targets.** `claim_next` p99 1 s; projection lag p99 1 s; ordinary admission within 10 s; tap to task and result back within 5 min, excluding tracker outages; triage cycle 5 min. Heartbeats run at a third of the lease.
+### Ranking
 
-**Outages.** In a ledger outage the log still accepts appends, so handoffs and heartbeats land but nothing is confirmed or dequeued. An agent that cannot confirm a renewal keeps working until its lease would have expired, then stops, writes its handoff, and claims nothing until a claim succeeds. The ledger expires leases by its own clock, so a short outage costs nothing and a long one returns held tasks to the pool with their handoffs. A parent that cannot spawn does the work itself or waits. Taps buffer inbound items in the log and outbound results at the tap. A log outage is a retrieval outage too, and the retrieval degraded mode applies. Trackers stay canonical, so people keep working in them throughout.
+- Rank belongs to open tasks. A claimed task keeps its lease whatever the rubric does.
+- A task re-ranks when its own state changes.
+- Rubric-wide rescoring (after an L1 amendment, a price change, or a saturated pool) runs once per triage cycle.
+- A parent's rank flows to its open children.
+- Cross-domain edges travel as events between partitions. Each domain's rubric still orders its own queue.
+
+### Endings
+
+- A task ends as done, or as invalidated with a reason: obsolete, invalid, or duplicate. Nothing is deleted.
+- An invalidated parent invalidates its live children. An invalidated dependency re-triages its dependents.
+- A holder learns of either from its next heartbeat, stops, and writes a handoff.
+- Tasks blocked past a bound alert. Tasks the world has moved past are invalidated as obsolete.
+
+### Taps
+
+- Admission deduplicates on `origin` among a domain's live tasks, so one item is one live task. An issue and the change that fixes it are related tasks, not one.
+- An upstream close invalidates a live task and confirms a finished one. A reopen creates a new task citing its predecessor.
+- Taps are idempotent on origin and upstream event, and the origin index keeps every origin it has seen.
+- Taps reconcile by pull on a schedule. A webhook may hasten a pull but is never relied on.
+- When the registry moves a repository to another domain, its live tasks move with it.
+- Outbound writes carry the fleet's identity, which is how a tap ignores its own echoes.
+
+### Delegation
+
+- Spawning a helper is a `create_task` and a `claim` in one step.
+- A child whose requirements fit inside the parent's manifest inherits the parent's admission. One that needs more is filed through the orchestrator.
+- The child's lease ends no later than the parent's.
+- If the parent ends first, its children run out their leases and return to the pool. The next claimant of the parent finds them through the parent link.
+
+### Targets
+
+| Operation | Target |
+|---|---|
+| `claim_next` | p99 1 s |
+| Projection lag | p99 1 s |
+| Ordinary admission | within 10 s |
+| Tap to task, and result back | within 5 min, excluding tracker outages |
+| Triage cycle | 5 min |
+| Heartbeat interval | a third of the lease |
+
+### Outages
+
+When the ledger is down, the historian still accepts appends: handoffs and heartbeats land, but nothing is confirmed or dequeued.
+
+- An agent that cannot confirm a renewal keeps working until its lease would have expired. Then it stops, writes its handoff, and claims nothing until a claim succeeds.
+- The ledger expires leases by its own clock. A short outage costs nothing; a long one returns held tasks to the pool with their handoffs.
+- A parent that cannot spawn does the work itself or waits.
+- Taps buffer inbound items in the historian and outbound results at the tap.
+- A historian outage is a retrieval outage too, and the retrieval degraded mode applies.
+- Trackers stay canonical, so people keep working in them throughout.
 
 ---
 
@@ -958,6 +1191,7 @@ A new deployment starts on top of existing knowledge: repositories, tickets, rev
 
 | Failure | Defence |
 |---|---|
+| Lost lineage | Every write, read, ledger operation, and curation action is an event in the historian; derivation and read edges are queryable (§3) |
 | Memory poisoning | Provenance; tiers that rise only through gates; imports start raw; content is data; independent auditors (§4, §5) |
 | Leaked secret or unsafe output in memory | Write-time screening; nothing raw is executed or loaded; outbound only within ceilings (§4) |
 | Trust carried along a chain | Derived entries take the weakest input; imports start raw; federation lends no authority (§4) |
