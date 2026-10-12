@@ -4,7 +4,7 @@
 
 Sander Striker · August 2026 · revised September 2026
 
-*Fleets of AI agents doing sustained work at scale need shared memory, coordination, governance, and a way to survive the replacement of every component they are built from. This paper describes an architecture for that problem: a text-first system of record with tiered, provenance-tracked memory; retrieval built on progressive disclosure so agents read only what a cheaper signal could not rule out; coordination through leased shared state instead of messages; a layered policy stack behind a deterministic enforcement perimeter; eval-gated self-improvement that cannot widen its own permissions; and evaluation of change, whether self-initiated or vendor-inflicted, by replaying the system's own history. The components are ordinary on purpose (versioned plain text, lexical search, policy-as-code) so that the whole remains legible, auditable, and rebuildable by humans over decades.*
+*Fleets of AI agents doing sustained work at scale need shared memory, coordination, governance, and a way to survive the replacement of every component they are built from. This paper describes an architecture for that problem: a text-first system of record with tiered, provenance-tracked memory; retrieval built on progressive disclosure so agents read only what a cheaper signal could not rule out; coordination through leased shared state instead of messages; a layered policy stack behind a deterministic enforcement perimeter; eval-gated self-improvement that cannot widen its own permissions; and evaluation of change, whether self-initiated or vendor-inflicted, by replaying the system's own history, built in from the first task and applied first to memory itself. The components are ordinary on purpose (versioned plain text, lexical search, policy-as-code) so that the whole remains legible, auditable, and rebuildable by humans over decades.*
 
 ---
 
@@ -971,8 +971,8 @@ Resource classes differ in scarcity as well as price. Metered tokens are limited
 Milestones, not dates: each delivers a capability, states the outcome that proves it, and gates the next. Duration depends on team and context; the sequence and the evidence do not.
 
 **M1: Memory works.**
-*Capability:* a memory record with the entry schema; retrieval on Postgres FTS with summaries-first responses; T0 discipline; one domain's task ledger with leases and handoff notes.
-*Exit criteria:* a fresh agent recovers context from a handoff note and T0 alone, with no transcript replay; known-item lookups land top-3; cost-per-task on the pilot domain is measured and trending down against the pre-memory baseline.
+*Capability:* a memory record with the entry schema; retrieval on Postgres FTS with summaries-first responses; T0 discipline; one domain's task ledger with leases and handoff notes; the evaluation provisions of §11 (decision contexts logged against their snapshot, outcomes on the task graph, the memory off switch) and a fixed pilot task set.
+*Exit criteria:* a fresh agent recovers context from a handoff note and T0 alone, with no transcript replay; known-item lookups land top-3; the pilot task set, run paired in the no-memory and full arms (§11), shows task success no worse than without memory, within a margin fixed before the pilot, and lower cost per task, both with confidence intervals across seeds.
 
 **M2: The system senses itself.**
 *Capability:* the telemetry funnel and first SLOs; librarian v1 (summaries, decay enforcement, faithfulness sampling); the handoff fast lane; the first tap, inbound and outbound, with origin dedup; golden suite v1; frozen-context replay (nearly free once decision contexts are logged).
@@ -987,8 +987,8 @@ Milestones, not dates: each delivers a capability, states the outcome that prove
 *Exit criteria:* a cross-domain request completes through ledgers and summaries without foreign-memory writes; prefetch precision clears its threshold in production; an injected vendor-drift simulation (swapped model behind a fixed alias) is detected and attributed within the published bound.
 
 **M5: Self-improvement, gated.**
-*Capability:* dom-platform with the full evolution loop of §10; live re-execution replay; the acquisition import pipeline; the restore-from-snapshot drill as a standing exercise.
-*Exit criteria:* a distilled harness improvement passes performance, safety, and review gates and measurably lowers cost-per-task on held-out work; a planted privilege-widening candidate is quarantined by the safety gate; the serving layer has been rebuilt from snapshots of the record alone.
+*Capability:* dom-platform with the full evolution loop of §10; live re-execution replay, and with it the standing memory holdout of §11; the acquisition import pipeline; the restore-from-snapshot drill as a standing exercise.
+*Exit criteria:* a distilled harness improvement passes performance, safety, and review gates and measurably lowers cost-per-task on held-out work; a planted privilege-widening candidate is quarantined by the safety gate; the memory holdout reports per domain on its published cadence; the serving layer has been rebuilt from snapshots of the record alone.
 
 Milestones are cumulative and each is independently useful; a deployment can stop at M2 or M3 and still hold a coherent, valuable system. Within a milestone, order is free; across milestones, the exit criteria are the dependency.
 
