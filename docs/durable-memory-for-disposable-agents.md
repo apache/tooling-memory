@@ -101,7 +101,7 @@ When a question is not answered below, reason from these.
 6. **Judgment is written down.** Values, strategy, and quality bars are versioned files agents read.
 7. **Every write carries provenance, and trust does not pass along on its own.** Each entry is checked for the use it is put to, at the point of use (§4).
 8. **Curation is permanent work.** Without it, knowledge decays.
-9. **Agents decide within fixed limits.** A policy engine enforces the limits; agents use judgment inside them and leave a trail. Only people can widen the limits, and self-improvement cannot.
+9. **Agents decide within fixed limits.** A policy engine enforces the limits; agents use judgment inside them and leave a trail. Only a person can grant an agent wider permissions.
 10. **Everything stays human-legible.** People are the only continuity at decade scale.
 11. **Evaluation is built in.** Everything a later replay needs is recorded while the task runs, and every layer, memory included, can be switched off to compare against running without it.
 
