@@ -22,6 +22,7 @@ mod gofannon;
 mod golden;
 mod harness_usage;
 mod hooks;
+mod hosted;
 mod image;
 mod librarian;
 mod mcp_http;
@@ -38,6 +39,7 @@ mod savings;
 mod sources;
 mod status;
 mod taps;
+mod tool_server;
 mod transcripts;
 mod work;
 mod wslc;
@@ -942,6 +944,19 @@ enum Command {
         /// The tool's arguments, as JSON.
         args: String,
     },
+    /// Serve this root's tools over MCP's streamable HTTP, for launchers elsewhere to
+    /// call instead of carrying the components (`hosted = "<url>"` in their grant). Each
+    /// request a tool makes goes only to a host both this root's grant and the calling
+    /// session name, and the answer says every URL it reached. Off loopback it wants a
+    /// bearer token.
+    ToolServer {
+        /// Where to listen, as host:port; loopback unless a token is set.
+        #[arg(long, default_value = "127.0.0.1:4100")]
+        listen: String,
+        /// The environment variable holding the bearer token callers must send.
+        #[arg(long)]
+        token_env: Option<String>,
+    },
     /// What tools brought in from outside, kept as sources and cited as `source:<id>`:
     /// list them, show one, sweep the expired.
     Source {
@@ -1458,6 +1473,9 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Gofannon { op } => gofannon::cmd(&root, op).await,
         Command::Platform { op } => platform::cmd(&Memory::open(&root)?, op).await,
         Command::Tool { name, args } => sources::call(&root, &name, &args).await,
+        Command::ToolServer { listen, token_env } => {
+            tool_server::serve(&root, &listen, token_env.as_deref()).await
+        }
         Command::Source { op } => sources::cmd(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
         Command::Drift { op } => drift::run(&root, op).await,
@@ -4653,6 +4671,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Gofannon { .. }
         | Command::Platform { .. }
         | Command::Tool { .. }
+        | Command::ToolServer { .. }
         | Command::Source { .. }
         | Command::Tap { .. }
         | Command::Write { .. }

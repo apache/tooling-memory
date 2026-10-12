@@ -104,6 +104,13 @@ def digest(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def lease_for(t, seconds, now):
+    """Hold `t` for `seconds` from `now` on the monotonic clock; `lease_until` is the
+    same moment on the wall clock, for the caller to read."""
+    t["_deadline"] = now + seconds
+    t["lease_until"] = time.time() + seconds
+
+
 class Fake:
     def __init__(self):
         self.state = load()
@@ -193,18 +200,20 @@ class Fake:
         if t["status"] == "claimed" and FLAW == "second-claim":
             return True
         if t["status"] == "claimed" and FLAW != "lease-forever":
-            return t["lease_until"] < now
+            return t["_deadline"] < now
         return False
 
     def take(self, t, lease, now):
         t["status"] = "claimed"
         t["holder"] = None if FLAW == "no-holder" else "human:fake:owner"
-        t["lease_until"] = now + lease
+        lease_for(t, lease, now)
         t["attempts"] += 1
         return {"task": t, "lease_until": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t["lease_until"]))}
 
     def tool(self, name, a):
-        now = time.time()
+        # leases are timed on the monotonic clock: a wall clock that steps back (WSL2's
+        # does when it resyncs) would otherwise keep a lapsed lease held
+        now = time.monotonic()
         if name == "search":
             return {"hits": self.search(a["query"], a.get("depth"), a.get("limit") or 10)}
         if name == "get":
@@ -232,6 +241,7 @@ class Fake:
                 "status": "proposed",
                 "holder": None,
                 "lease_until": None,
+                "_deadline": None,
                 "attempts": 0,
                 "handoff": None,
             }
@@ -257,15 +267,15 @@ class Fake:
             return self.take(t, a.get("lease_seconds") or 1800, now)
         if name == "heartbeat":
             t = self.task(a["id"])
-            if t["status"] != "claimed" or (t["lease_until"] < now and FLAW != "lease-forever"):
+            if t["status"] != "claimed" or (t["_deadline"] < now and FLAW != "lease-forever"):
                 raise Refused("the lease is not held: it expired or was never yours")
             if FLAW != "heartbeat-noop":
-                t["lease_until"] = now + (a.get("lease_seconds") or 1800)
+                lease_for(t, a.get("lease_seconds") or 1800, now)
             return {"task": t}
         if name == "complete":
             t = self.task(a["id"])
             self.get(a["handoff"])
-            held = t["status"] == "claimed" and t["lease_until"] >= now
+            held = t["status"] == "claimed" and t["_deadline"] >= now
             if not held and FLAW != "complete-anyone":
                 raise Refused(f"task is {t['status']} and the lease is not held")
             t["status"] = "completed"
@@ -281,6 +291,7 @@ class Fake:
             t["status"] = "admitted"
             t["holder"] = None
             t["lease_until"] = None
+            t["_deadline"] = None
             return {"task": t}
         if name == "invalidate_task":
             t = self.task(a["id"])

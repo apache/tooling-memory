@@ -138,12 +138,6 @@ impl dm_server::sources::Tools for TapTools {
     ) -> dm_server::sources::Answer<'static> {
         let root = self.root.clone();
         Box::pin(async move {
-            let path = component_path(&root, &tool).map_err(|e| e.to_string())?;
-            if !path.is_file() {
-                return Err(format!(
-                    "no component installed as {tool}; the owner runs: amem tap install {tool} <file.wasm>"
-                ));
-            }
             let grant = memory
                 .grants()
                 .taps
@@ -154,6 +148,24 @@ impl dm_server::sources::Tools for TapTools {
                 .credential
                 .as_deref()
                 .and_then(|var| crate::present(std::env::var(var).ok()));
+            // hosted elsewhere: the tool server runs it, this side decides what it reached
+            if let Some(url) = &grant.hosted {
+                return crate::hosted::call(
+                    memory,
+                    url,
+                    credential.as_deref(),
+                    &tool,
+                    &config,
+                    &args,
+                )
+                .await;
+            }
+            let path = component_path(&root, &tool).map_err(|e| e.to_string())?;
+            if !path.is_file() {
+                return Err(format!(
+                    "no component installed as {tool}; the owner runs: amem tap install {tool} <file.wasm>"
+                ));
+            }
             let call = dm_taps::tool::Call {
                 tool: &tool,
                 grant: &grant,

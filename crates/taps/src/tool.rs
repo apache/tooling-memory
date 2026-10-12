@@ -10,6 +10,12 @@
 //! never holds it. The request then connects to the addresses the policy was shown, not
 //! to whatever the name answers a moment later ([`crate::pinned`]), so a name that
 //! answers outward to the check and inward to the connect gets nowhere.
+//!
+//! Who decides is a [`Gate`]: in the launcher, the calling session's policy
+//! ([`PolicyGate`]); in a tool server, which serves the same components to launchers
+//! elsewhere and has no session of its own, the hosts the caller passed, inside the
+//! server's own grant ([`HostGate`]). Either way every request the gate allows is
+//! recorded, so the answer can say where it was fetched from.
 
 use crate::{engine, Error, Limits, EPOCH_TICK};
 use dm_policy::decide::FetchInput;
@@ -80,12 +86,103 @@ async fn resolves(host: &str, port: u16) -> (Vec<SocketAddr>, bool, bool) {
     (addrs, inward, loopback)
 }
 
-/// The outbound hook for a tool: the policy decides, then the credential goes on.
+/// Decides each request a tool makes: `Ok` lets it go, `Err` says why not.
+pub trait Gate: Send + Sync {
+    /// Decide one request.
+    ///
+    /// # Errors
+    ///
+    /// The reason the request may not go.
+    fn decide(&self, ask: FetchInput) -> Result<(), String>;
+}
+
+/// The calling session's policy, its `fetch` action at the session's label.
+pub struct PolicyGate(pub Arc<Memory>);
+
+impl Gate for PolicyGate {
+    fn decide(&self, ask: FetchInput) -> Result<(), String> {
+        match self.0.check_fetch(ask) {
+            Ok(d) if d.allow => Ok(()),
+            Ok(d) => Err(d.reason),
+            Err(e) => Err(format!("the policy failed: {e}")),
+        }
+    }
+}
+
+/// A tool server's gate: the policy's hard rules (TLS, the granted methods, nothing
+/// inward), and a host only when both the server's own grant and the caller name it,
+/// so a caller can narrow what the server may reach and never widen it.
+#[derive(Clone, Debug, Default)]
+pub struct HostGate {
+    /// The hosts the server's grant names, the trusted ones included.
+    pub granted: Vec<String>,
+    /// The hosts the caller's session may reach at its label.
+    pub caller: Vec<String>,
+    /// The methods the grant names; `GET` when empty.
+    pub methods: Vec<String>,
+    /// Whether the grant lets the tool reach this machine's loopback, for development.
+    pub loopback: bool,
+}
+
+/// Whether `host` is one a pattern names: exactly, or under it for `*.example.org`.
+#[must_use]
+pub fn host_matches(pattern: &str, host: &str) -> bool {
+    let p = pattern.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    match p.strip_prefix('*') {
+        Some(suffix) if suffix.starts_with('.') => host.ends_with(suffix),
+        _ => p == host,
+    }
+}
+
+impl Gate for HostGate {
+    fn decide(&self, ask: FetchInput) -> Result<(), String> {
+        let loopback_ok = self.loopback && ask.loopback_address;
+        if ask.scheme != "https" && !loopback_ok {
+            return Err(format!(
+                "{} to {} would leave in the clear; https only",
+                ask.scheme, ask.host
+            ));
+        }
+        if ask.private_address && !loopback_ok {
+            return Err(format!(
+                "{} resolves to a private or loopback address; a tool does not reach inward",
+                ask.host
+            ));
+        }
+        let method = ask.method.to_ascii_uppercase();
+        let allowed = if self.methods.is_empty() {
+            method == "GET"
+        } else {
+            self.methods.iter().any(|m| m.eq_ignore_ascii_case(&method))
+        };
+        if !allowed {
+            return Err(format!("{method} is not a method the tool is granted"));
+        }
+        let named = |hosts: &[String]| hosts.iter().any(|p| host_matches(p, &ask.host));
+        if !named(&self.granted) {
+            return Err(format!(
+                "{} is not a host this tool server is granted",
+                ask.host
+            ));
+        }
+        if !named(&self.caller) {
+            return Err(format!(
+                "{} is not a host the calling session may reach",
+                ask.host
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The outbound hook for a tool: the gate decides, then the credential goes on.
 struct Hooks {
     tool: String,
-    memory: Arc<Memory>,
+    gate: Arc<dyn Gate>,
     credential: Option<(http::HeaderName, http::HeaderValue)>,
     refused: Arc<Mutex<Vec<String>>>,
+    reached: Arc<Mutex<Vec<String>>>,
     hop: Arc<AtomicU32>,
 }
 
@@ -96,10 +193,11 @@ impl WasiHttpHooks for Hooks {
         options: Option<RequestOptions>,
         _fut: Box<dyn Future<Output = Result<(), HttpError>> + Send>,
     ) -> Box<dyn Future<Output = SendResult> + Send> {
-        let memory = self.memory.clone();
+        let gate = self.gate.clone();
         let tool = self.tool.clone();
         let credential = self.credential.clone();
         let refused = self.refused.clone();
+        let reached = self.reached.clone();
         let hop = self.hop.fetch_add(1, Ordering::Relaxed);
         Box::new(async move {
             let uri = request.uri().clone();
@@ -113,32 +211,33 @@ impl WasiHttpHooks for Hooks {
             let default_port = if scheme == "http" { 80 } else { 443 };
             let (addrs, private_address, loopback_address) =
                 resolves(&host, port.unwrap_or(default_port)).await;
+            let path = uri
+                .path_and_query()
+                .map_or_else(|| "/".to_string(), |p| p.as_str().to_string());
             let ask = FetchInput {
                 tool,
                 method: request.method().as_str().to_string(),
-                scheme,
+                scheme: scheme.clone(),
                 host: host.clone(),
                 port,
-                path: uri
-                    .path_and_query()
-                    .map_or_else(|| "/".to_string(), |p| p.as_str().to_string()),
+                path: path.clone(),
                 private_address,
                 loopback_address,
                 label: dm_core::Label::Public,
                 hop,
             };
-            let why = match memory.check_fetch(ask) {
-                Ok(d) if d.allow => None,
-                Ok(d) => Some(d.reason),
-                Err(e) => Some(format!("the policy failed: {e}")),
-            };
-            if let Some(why) = why {
+            if let Err(why) = gate.decide(ask) {
                 refused
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push(format!("{host}: {why}"));
                 return Err(HttpError::HttpRequestDenied);
             }
+            let port = port.map(|p| format!(":{p}")).unwrap_or_default();
+            reached
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(format!("{scheme}://{host}{port}{path}"));
             if let Some((name, value)) = credential {
                 request.headers_mut().insert(name, value);
             }
@@ -223,6 +322,33 @@ pub async fn call(
     c: Call<'_>,
     limits: Limits,
 ) -> Result<String, Error> {
+    Ok(
+        call_gated(Arc::new(PolicyGate(memory)), component, c, limits)
+            .await?
+            .answer,
+    )
+}
+
+/// What a tool answered, and every URL it was let reach to answer it, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answered {
+    /// The tool's JSON.
+    pub answer: String,
+    /// `scheme://host[:port]/path?query` of each request the gate allowed.
+    pub reached: Vec<String>,
+}
+
+/// Call a tool once with `gate` deciding each request it makes.
+///
+/// # Errors
+///
+/// As [`call`].
+pub async fn call_gated(
+    gate: Arc<dyn Gate>,
+    component: &Path,
+    c: Call<'_>,
+    limits: Limits,
+) -> Result<Answered, Error> {
     let engine = engine()?;
     let component = Component::from_file(&engine, component)
         .map_err(|e| Error::Runtime(format!("{}: {e:#}", component.display())))?;
@@ -230,15 +356,17 @@ pub async fn call(
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
     let refused = Arc::new(Mutex::new(Vec::new()));
+    let reached = Arc::new(Mutex::new(Vec::new()));
     let state = State {
         wasi: WasiCtxBuilder::new().build(),
         http: WasiHttpCtx::new(),
         table: ResourceTable::new(),
         hooks: Hooks {
             tool: c.tool.to_string(),
-            memory,
+            gate,
             credential: credential_header(c.grant, c.credential)?,
             refused: refused.clone(),
+            reached: reached.clone(),
             hop: Arc::new(AtomicU32::new(0)),
         },
         limits: wasmtime::StoreLimitsBuilder::new()
@@ -275,8 +403,9 @@ pub async fn call(
         }
     };
     let refused = std::mem::take(&mut *refused.lock().unwrap_or_else(PoisonError::into_inner));
+    let reached = std::mem::take(&mut *reached.lock().unwrap_or_else(PoisonError::into_inner));
     match result {
-        Ok(answer) => Ok(answer),
+        Ok(answer) => Ok(Answered { answer, reached }),
         Err(e) if refused.is_empty() => Err(Error::Tap(e)),
         Err(e) => Err(Error::Refused(refused.join("; "), e)),
     }
@@ -285,6 +414,69 @@ pub async fn call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ask(scheme: &str, host: &str, method: &str) -> FetchInput {
+        FetchInput {
+            tool: "fetch".into(),
+            method: method.into(),
+            scheme: scheme.into(),
+            host: host.into(),
+            port: None,
+            path: "/".into(),
+            private_address: host == "127.0.0.1" || host == "10.0.0.1",
+            loopback_address: host == "127.0.0.1",
+            label: dm_core::Label::Public,
+            hop: 0,
+        }
+    }
+
+    #[test]
+    fn a_host_gate_lets_through_only_what_the_grant_and_the_caller_both_name() {
+        let g = HostGate {
+            granted: vec!["*.apache.org".into(), "docs.python.org".into()],
+            caller: vec!["*.apache.org".into()],
+            methods: Vec::new(),
+            loopback: false,
+        };
+        assert_eq!(g.decide(ask("https", "www.apache.org", "GET")), Ok(()));
+        assert!(g
+            .decide(ask("https", "docs.python.org", "GET"))
+            .unwrap_err()
+            .contains("calling session"));
+        assert!(g
+            .decide(ask("https", "example.com", "GET"))
+            .unwrap_err()
+            .contains("tool server is granted"));
+        assert!(g
+            .decide(ask("http", "www.apache.org", "GET"))
+            .unwrap_err()
+            .contains("https only"));
+        assert!(g
+            .decide(ask("https", "www.apache.org", "POST"))
+            .unwrap_err()
+            .contains("method"));
+        assert!(g
+            .decide(ask("https", "10.0.0.1", "GET"))
+            .unwrap_err()
+            .contains("inward"));
+        // the caller cannot widen what the server is granted
+        let wide = HostGate {
+            caller: vec!["example.com".into()],
+            ..g.clone()
+        };
+        assert!(wide.decide(ask("https", "example.com", "GET")).is_err());
+        // loopback only when the grant says so, and then in the clear too
+        let dev = HostGate {
+            granted: vec!["127.0.0.1".into()],
+            caller: vec!["127.0.0.1".into()],
+            loopback: true,
+            ..HostGate::default()
+        };
+        assert_eq!(dev.decide(ask("http", "127.0.0.1", "GET")), Ok(()));
+        assert!(host_matches("*.apache.org", "WWW.Apache.org"));
+        assert!(!host_matches("*.apache.org", "apache.org.evil.com"));
+        assert!(!host_matches("*apache.org", "evilapache.org"));
+    }
 
     #[test]
     fn inward_addresses_are_the_machine_s_own_networks() {

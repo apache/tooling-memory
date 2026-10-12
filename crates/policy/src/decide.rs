@@ -989,6 +989,7 @@ mod tests {
                 config: None,
                 results: None,
                 fresh: false,
+                hosted: None,
             },
         );
         g

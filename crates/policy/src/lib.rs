@@ -182,6 +182,13 @@ pub struct TapGrant {
     /// state does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fresh: bool,
+    /// A tool another host serves: the MCP endpoint of a tool server, called instead of
+    /// running the component here. `credential` then names the variable holding the
+    /// bearer for that server, which holds the tool's own credential itself; the
+    /// policy still decides the call, and every URL the server reports it reached.
+    /// `https`, or `http` to this machine's loopback for development.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted: Option<String>,
 }
 
 /// Hosts a tool may reach at a higher label than its own ceiling.
@@ -304,6 +311,21 @@ impl Grants {
         }
         if g.domains.is_empty() {
             return Err(Error::Invalid("at least one domain is required".into()));
+        }
+        for (name, t) in &g.taps {
+            if let Some(url) = &t.hosted {
+                let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+                    .iter()
+                    .any(|p| {
+                        url.strip_prefix(p)
+                            .is_some_and(|r| r.is_empty() || r.starts_with([':', '/']))
+                    });
+                if !t.tool || !(url.starts_with("https://") || local) {
+                    return Err(Error::Invalid(format!(
+                        "[taps.{name}] hosted = {url:?}: a hosted tool is a tool, served over https or on this machine's loopback"
+                    )));
+                }
+            }
         }
         if let Some(p) = g
             .platform

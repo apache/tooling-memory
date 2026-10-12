@@ -28,6 +28,10 @@ use time::{Duration, OffsetDateTime};
 pub const CITATION: &str = "source:";
 /// Who observed a source: the launcher's tap host, which made every request itself.
 pub const OBSERVED_BY_TAP: &str = "tap";
+/// A source a tool server fetched for this session: it made the requests, held to the
+/// hosts the session may reach, and reported where it went; the memory server checked
+/// each of those against the policy before keeping what came back.
+pub const OBSERVED_BY_TOOL_SERVER: &str = "tool-server";
 
 /// What a tool's answer future is.
 pub type Answer<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
@@ -230,7 +234,12 @@ impl Memory {
             author: self.author.clone(),
             kept_at: now,
             retain_until: now + Duration::days(i64::from(days)),
-            observed_by: OBSERVED_BY_TAP.to_string(),
+            observed_by: if grant.hosted.is_some() {
+                OBSERVED_BY_TOOL_SERVER
+            } else {
+                OBSERVED_BY_TAP
+            }
+            .to_string(),
             findings: findings.clone(),
             held,
             released: None,
@@ -249,6 +258,83 @@ impl Memory {
             )));
         }
         Ok(served(&s, false))
+    }
+
+    /// The hosts this session may reach through `tool` at its label now: the grant's
+    /// own up to its ceiling, and the trusted ones up to theirs. What a hosted tool is
+    /// told it may reach; an exception that lifts reach for one task is not in it, so
+    /// the list errs narrow, and every URL reached is decided by the policy again.
+    #[must_use]
+    pub fn fetch_hosts(&self, tool: &str) -> Vec<String> {
+        let Some(grant) = self.grants.taps.get(tool) else {
+            return Vec::new();
+        };
+        let label = self.label();
+        let mut hosts = Vec::new();
+        if label <= grant.ceiling {
+            hosts.extend(grant.hosts.iter().cloned());
+        }
+        if let Some(t) = grant.trusted.as_ref().filter(|t| label <= t.ceiling) {
+            hosts.extend(t.hosts.iter().cloned());
+        }
+        hosts
+    }
+
+    /// Decide, by the policy at this session's label, a URL a hosted tool reports it
+    /// reached, as the tap host decides a request before it leaves.
+    ///
+    /// # Errors
+    ///
+    /// Why the policy would not have let it go, or a URL that cannot be read.
+    pub fn check_reached(&self, tool: &str, url: &str) -> Result<(), String> {
+        let (scheme, rest) = url
+            .split_once("://")
+            .ok_or_else(|| format!("{url:?} is not a URL"))?;
+        let (authority, path) = rest.find('/').map_or((rest, "/"), |i| rest.split_at(i));
+        // `[v6]:port`, `[v6]`, `host:port` or `host`
+        let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+            let (h, after) = v6.split_once(']').unwrap_or((v6, ""));
+            (
+                h,
+                after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()),
+            )
+        } else {
+            match authority.rsplit_once(':') {
+                Some((h, p)) => (h, p.parse::<u16>().ok()),
+                None => (authority, None),
+            }
+        };
+        let host = host.to_ascii_lowercase();
+        let ip = host.parse::<std::net::IpAddr>().ok();
+        let loopback = host == "localhost" || ip.is_some_and(|ip| ip.is_loopback());
+        let private = loopback
+            || ip.is_some_and(|ip| match ip {
+                std::net::IpAddr::V4(v) => {
+                    v.is_private() || v.is_link_local() || v.is_unspecified()
+                }
+                std::net::IpAddr::V6(v) => {
+                    v.is_unspecified() || (v.segments()[0] & 0xfe00) == 0xfc00
+                }
+            });
+        let decision = self
+            .check_fetch(dm_policy::decide::FetchInput {
+                tool: tool.to_string(),
+                method: "GET".into(),
+                scheme: scheme.to_ascii_lowercase(),
+                host,
+                port,
+                path: path.to_string(),
+                private_address: private,
+                loopback_address: loopback,
+                label: Label::Public,
+                hop: 0,
+            })
+            .map_err(|e| format!("the policy failed: {e}"))?;
+        if decision.allow {
+            Ok(())
+        } else {
+            Err(decision.reason)
+        }
     }
 
     /// A tool's grant and its results label, when it is granted as a tool and this

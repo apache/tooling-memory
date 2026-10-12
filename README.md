@@ -102,9 +102,11 @@ These do what the paper says, on one laptop, and each names what replaces it.
 - **Transcripts' citations** are found by scanning a domain's entries on every lookup,
   and so are the citations that keep a tool's source past its clock.
 - **Tools** fetch and search from the launcher's own machine, one compiled component per
-  call, connecting to the address the policy checked. A held answer is released by the
-  owner by hand (`amem source release`). Production: the same tools as hosted servers on
-  the Foundation's gateway, reached through the egress.
+  call, connecting to the address the policy checked, or from a tool server
+  (`amem tool-server`) that runs the same components for launchers elsewhere, called
+  directly rather than through the egress. A held answer is released by the owner by
+  hand (`amem source release`). Production: the tool servers registered in the
+  Foundation's gateway, reached through the egress.
 - **Cost** is priced from a table the owner keeps by hand, and a task's share is its
   session's spend, wall clock and CPU divided evenly among the tasks it completed. A
   run's CPU and memory are counted when it is reaped (`wait4`), which sees a process tree
@@ -154,7 +156,7 @@ otherwise, and the process touches nothing outside it:
 
 | Path | What |
 |---|---|
-| `grants.toml` | The perimeter's data: domains and their labels, destinations and their ceilings, `[gates]`, `[spend.<destination>]`, `[taps.<name>]` for taps and tools, `platform = "<domain>"`, and `[ledger]` for PostgreSQL |
+| `grants.toml` | The perimeter's data: domains and their labels, destinations and their ceilings, `[gates]`, `[spend.<destination>]`, `[taps.<name>]` for taps and tools (`hosted` for one a tool server serves), `platform = "<domain>"`, and `[ledger]` for PostgreSQL |
 | `credentials.env` | API keys, `LLMAO_KEY`, `GH_TOKEN`, as `NAME=value`, mode 600; the environment wins |
 | `profiles.toml` | Named launches: harness, auth, model, subagents |
 | `prices.toml` | USD per million tokens per model, and per CPU-hour and GiB-hour under `[resources]`, for `amem cost` |
@@ -230,7 +232,7 @@ re-enactment, the event log, the platform domain and the Gofannon bridge so far 
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without | `savings`, `golden`, `scripts/eval.py` |
 | Interchange | Bundles at or below a label, erasure with a stub and a receipt, taps as WASI components | `export`, `import`, `erase`, `tap` |
-| Tools | Fetch and search as taps an agent calls mid-turn: every request decided by the policy at the session's label, answers scanned and kept as sources | `tool`, `source`; MCP `fetch`, `web_search` |
+| Tools | Fetch and search as taps an agent calls mid-turn: every request decided by the policy at the session's label, answers scanned and kept as sources; or hosted, the same components served by a tool server another launcher calls, which reaches only the hosts the calling session may and says where it went | `tool`, `source`, `tool-server`; MCP `fetch`, `web_search` |
 | Gofannon | Its deployed agents as a tool tap on the same terms: listed, run, read back; and a worker that runs one on the ledger's tasks, its result filed as the handoff | `gofannon agents`, `gofannon work`; MCP `gofannon` |
 | Traces | OpenTelemetry spans for model calls, reads, policy decisions and task transitions, to any OTLP collector | `OTEL_EXPORTER_OTLP_ENDPOINT` |
 

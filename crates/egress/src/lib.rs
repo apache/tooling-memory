@@ -204,8 +204,9 @@ pub struct Egress {
     inner: Arc<Inner>,
 }
 
-/// Install the TLS crypto provider once. Safe to call repeatedly.
-fn install_crypto() {
+/// Install the TLS crypto provider once. Safe to call repeatedly; the launcher calls it
+/// before any client of its own speaks TLS.
+pub fn install_crypto() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
