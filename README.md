@@ -32,7 +32,7 @@ harnesses in two weeks, and it is also why none of it is the production shape.
   run again, a task run's tape does not yet carry its task's prompt, and a login run
   through a tunnel, which the egress cannot see into, has no contexts, so its replay
   falls back to the harness's own transcript, a self-report, and says so. Re-enactment
-  has run only against a stand-in harness in its tests, not yet a real one.
+  has run on Codex through the gateway (demo act 8), not yet on the other harnesses.
 - **The platform as a domain, in part.** The grants may name a platform domain whose
   entries carry artifacts, fenced `platform <kind> <name>` blocks: an agent definition
   and a template that open a task's prompt, an eval suite `amem golden --platform` scores,
@@ -265,11 +265,12 @@ the harnesses this one serves.
 `make demo-all HARNESS=claude` runs the whole demo in acts on one record, `DEMO_ROOT`,
 `~/memory-demo` by default, seeded from the Markdown directories in `DEMO_FROM`. The
 acts that need a model use `local/.virtual-key` on llm.apache.org, so they want the
-network; `ACTS="1 4"` runs a subset. Each act and each step opens with a rule, a
-number and a sentence on what it shows; `TRANSCRIPT=demo.txt` also writes the whole
-run there as plain text, to read back with
-[docs/demo-narrative.md](docs/demo-narrative.md), the presenter's cues and a handout keyed
-to the step numbers. `DEMO_FROM` is `docs` by default: the record is seeded from `docs/` alone.
+network, and act 9 reads api.github.com; `ACTS="1 4"` runs a subset. Act 7 gives the
+record a second domain, the platform's, so run the acts in order on a fresh record. Each
+act and each step opens with a rule, a number and a sentence on what it shows;
+`TRANSCRIPT=demo.txt` also writes the whole run there as plain text, to read back with
+[docs/demo-narrative.md](docs/demo-narrative.md), the presenter's cues and a handout
+keyed to the step numbers. `DEMO_FROM` is `docs` by default: the record is seeded from `docs/` alone.
 
 `make demo-ready HARNESS=claude` gets it to a state it can run first: it seeds the
 record when there is none (`RESET=1` starts a demo record over), builds the harness
@@ -284,8 +285,12 @@ needs no podman where `wslc.exe` builds the image; the local stack does, and
 3. **The perimeter.** A write that speaks to agents held in quarantine, taint, policy as memory with a scoped exception, the read filter, and a spend limit refusing a call.
 4. **The task fabric.** The rubric compiled from a strategy, a rescore along the edges, and subagents filed on the board, their reports brought back by a follow-up task whose completion closes the task that delegated.
 5. **Watching it.** Traces in a collector, the read metrics, drift probes, transcripts by citation, and replay.
-6. **Memory against no memory.** The same questions to a harness with memory and with an empty one, graded, timed and counted.
-7. **What this is not, yet.** The two lists at the top of this page, read from it.
+6. **Memory against no memory.** The same questions to a harness with memory and with an empty one, graded, timed and counted in tokens, CPU and memory.
+7. **The platform.** An agent definition, an eval suite and a default model as entries in a platform domain, loaded only once a person verifies them; a task worked under the definition, the suite scored, and the run's cost in every resource the host counts.
+8. **Run it again.** A session from act 6 re-enacted from its tape, on its own model and on another, scored on how far each kept to the original.
+9. **From outside.** A real Apache repository's open issues filed as proposed tasks by the GitHub tap, under a grant that reaches one host; filed once, admitted by a person.
+10. **The record moves.** The event log, the index rebuilt from it, an export at a label, an import under another owner, and an erasure that refuses the text when the bundle comes again.
+11. **What this is not, yet.** The two lists at the top of this page, read from it.
 
 ## Checks
 
@@ -328,10 +333,10 @@ run by hand.
 As of 12 October 2026, the paper's contracts are built and exercised end to end on one
 laptop, and the demo runs them live against real harnesses on the Foundation's gateway
 and a Claude login. A few parts have met only stand-ins so far: the Gofannon bridge and
-the search tool fakes of their services, Seatbelt no Mac, and re-enactment no real
-harness; the first list above says so with the rest of what is not built, and the list
-after it is what works only at demo scale. [PLAN.md](PLAN.md) holds the decisions and the register, and
-the order production backends go in.
+the search tool fakes of their services, and Seatbelt no Mac; the first list above says
+so with the rest of what is not built, and the list after it is what works only at demo
+scale. [PLAN.md](PLAN.md) holds the decisions and the register, and the order production
+backends go in.
 
 What we propose to the Foundation's gateway, llmao at llm.apache.org, and why, from one
 trace across the wrapper and the gateway to the tool servers the gateway hosts, is in

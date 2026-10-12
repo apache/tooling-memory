@@ -1,7 +1,8 @@
 #!/bin/sh
 # The whole demo, act by act, on one record: the read path (scripts/demo.sh), then
-# curation and the trust tiers, the perimeter, the task fabric, observability, and the
-# evaluation, each in scripts/demo/. ACTS names which to run, by number; all by default.
+# curation and the trust tiers, the perimeter, the task fabric, observability, the
+# evaluation, the platform, re-enactment, taps, interchange and the limits, each in scripts/demo/. ACTS names which to
+# run, by number; all by default.
 #
 #   scripts/demo-all.sh <demo-root> <markdown-dir>...
 #
@@ -12,7 +13,7 @@
 set -eu
 root=${1:?demo root}; shift
 here=$(cd "$(dirname "$0")/.." && pwd)
-acts=${ACTS:-1 2 3 4 5 6 7}
+acts=${ACTS:-1 2 3 4 5 6 7 8 9 10 11}
 if [ -n "${DEMO_TRANSCRIPT:-}" ] && [ -z "${DEMO_TEED:-}" ]; then
   # run again with everything going through tee, and keep the run's own exit code
   status=$(mktemp)
@@ -24,7 +25,7 @@ fi
 . "$here/scripts/demo/show.sh"
 _rule '#'
 printf 'Durable memory for disposable agents: the demo\n'
-_wrap 0 "Shared memory and coordination for fleets of agents, built so the record outlives every agent, harness, model and vendor it was written with. One record, seeded from real decisions and docs; seven acts, each a part of the paper shown working."
+_wrap 0 "Shared memory and coordination for fleets of agents, built so the record outlives every agent, harness, model and vendor it was written with. One record, seeded from real decisions and docs; eleven acts, each a part of the paper shown working."
 printf '\n  %-9s %s\n  %-9s %s\n  %-9s %s\n  %-9s %s\n  %-9s %s\n' \
   when "$(date -u +%Y-%m-%dT%H:%MZ)" \
   commit "$(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
