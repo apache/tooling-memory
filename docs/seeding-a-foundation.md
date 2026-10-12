@@ -2,41 +2,47 @@
 
 ### The Apache Software Foundation as a test case for Durable Memory for Disposable Agents
 
-Sander Striker · August 2026 · revised September 2026
+Sander Striker · August 2026 · revised October 2026
 
-*The companion white paper describes an architecture in the abstract. This case study instantiates it against a real institution: the Apache Software Foundation, with its three-hundred-odd projects, a quarter century of public archives, and a governance culture that is itself the product. The exercise runs in both directions. The architecture is mapped onto ASF concretely enough to plan a deployment, and ASF is used to stress the architecture where an abstract paper cannot: federated strategy, volunteer bandwidth, radical transparency, and knowledge that outlives every one of its authors.*
+Written with Claude Fable 5 and Claude Opus 5 (Anthropic).
+
+*The companion paper describes an architecture in the abstract. This case study applies it to a real institution: the Apache Software Foundation, with more than two hundred top-level projects, a quarter century of public archives, and a governance culture it exists to protect. The exercise runs both ways. The design is mapped onto the Foundation concretely enough to plan a deployment, and the Foundation is used to stress the design where an abstract paper cannot.*
 
 ---
 
 ## 1. Why this test
 
-ASF is close to a worst case in every dimension the architecture claims to handle, which is what makes it an honest test.
+The Foundation is a hard case for this design, which makes it a useful one.
 
-**Scale and age.** Over three hundred top-level projects, each with its own codebase, community, and conventions, and mailing-list archives reaching back to the 1990s. No seeding effort can distill all of it; the two-speed doctrine is not optional here.
+| Stress | Why it is hard |
+|---|---|
+| **Scale and age** | More than two hundred top-level projects and some thirty podlings in the Incubator, each with its own code, community, and conventions, and archives going back to the 1990s. No one can distil all of it, so the paper's two speeds (index everything, distil on demand) are not optional |
+| **Governance matters as much as code** | The Apache Way (merit, community over code, vendor neutrality, consensus) is what the Foundation exists to protect. A memory that captures code but garbles governance has failed |
+| **Radical transparency** | Nearly everything is public: lists, issues, reviews, board minutes, rosters. Access is not the obstacle; deciding what to distil from material that is public but personal is |
+| **Open front door** | Anyone can post to a list, open an issue, or send a patch, so anyone can write into the raw tier |
+| **Constant churn** | Projects incubate, graduate, split, merge, and retire. Committers come and go over decades, and employers change while hats stay. The registry and the paper's churn rules are exercised all the time |
+| **No central direction** | The Foundation does not set what projects build. Strategy is federated, which stresses the policy stack in a way a company would not |
 
-**Governance as product.** The Apache Way, merit through contribution, community over code, vendor neutrality, consensus with veto rights, is not documentation around the software; it is the thing the foundation exists to protect. A memory system that captures code knowledge but garbles governance culture has failed the test.
-
-**Radical transparency.** Nearly everything is already public: lists, issues, reviews, board minutes, rosters. This removes the usual seeding obstacle (access) and replaces it with a sharper one (what should be distilled from material that is public but personal).
-
-**Perpetual churn.** Projects enter through an incubator, graduate, split, merge, and retire to an Attic. Committers arrive and leave over decades. Employers change while hats stay. The registry indirection and org-churn machinery of the paper get exercised constantly, not occasionally.
-
-**No central authority over direction.** The foundation does not direct what projects build; that is a founding choice. Strategy is federated by design, which stresses the policy stack in a way a conventional organization would not.
+Each section below tests one part of the paper. §10 collects what the Foundation taught the design.
 
 ---
 
-## 2. The domain map
+## 2. Domains and the project lifecycle
 
-The capability partition is unusually clean because ASF already partitions by capability: **one domain per top-level project**, keyed by project, not by PMC. Foundation-level domains sit alongside: governance, infrastructure, legal and licensing, security, brand, incubator.
+**Why.** Memory, policy, and access are organised by domain (paper §2), so the domain map decides everything that follows.
 
-The registry maps PMCs to the domains they own, and the foundation's project lifecycle maps onto the paper's churn machinery (§12) and archive tier (§3):
+The Foundation already partitions work by project: **one domain per top-level project**, keyed by a permanent ID, not by the PMC and not by the project's current name. Foundation-level domains sit alongside: governance, infrastructure, legal, security, brand, and the Incubator.
 
-- **Graduation.** A podling graduating from the incubator is a registry update: the new PMC takes ownership of a domain that already exists, seeded during incubation at raw and curated, with promotion to verified waiting on the PMC that graduation creates.
-- **Split.** When Lucene and Solr separated into distinct top-level projects in 2021, that was the paper's domain-split case executed by hand: shared history, diverging ownership, references that must not dangle. Under this architecture it is a curator-assisted split with tombstone redirects, and the shared pre-split history remains one lineage both domains cite. A merge is the same move in reverse, lazy, on real convergence.
-- **Orphaning.** A project whose PMC can no longer muster oversight is the paper's orphaned domain, the case §12 calls the dangerous one. The board's roll call and the Attic process are the existing check; the memory's ownership invariant flags the domain within days instead of at the next report. The domain returns to active if a PMC is re-formed, or retires to the Attic.
-- **Retirement.** The Attic is the archive tier made institutional. A retired project's domain demotes: still indexed, still citable, no longer curated, and its interface summary marked accordingly so agents stop treating its facts as live.
-- **Import.** Incubator IP clearance and the software grant process are the quarantined import tier already practiced as law: donated code and its history enter at low trust and earn promotion through review. The architecture adds nothing here except memory of the process itself.
+Each domain has a steward in the paper's sense (paper §5), the party that answers for it and under whose policy curators work. The registry records who that is:
 
-The lifecycle as the registry sees it, each transition the operation it becomes:
+| Domain | Steward |
+|---|---|
+| A top-level project | Its PMC (project management committee) |
+| A podling | Its podling PMC, under the Incubator PMC's oversight |
+| Infrastructure, legal, security, brand | The responsible officer and team |
+| Governance | The board |
+
+Every stage of a project's life becomes a registry operation:
 
 ```mermaid
 stateDiagram-v2
@@ -48,7 +54,7 @@ stateDiagram-v2
     Active --> Retired: Attic, domain demotes to the archive tier
     note right of Active
         split and merge are moves between Active domains,
-        tombstone redirects, one shared lineage
+        tombstone redirects, shared entries both cite
     end note
     note right of Retired
         still indexed and citable, no longer curated,
@@ -56,46 +62,102 @@ stateDiagram-v2
     end note
 ```
 
+| Lifecycle event | Becomes |
+|---|---|
+| **Import** | The Incubator already practises the paper's quarantined import: IP clearance and software grants bring donated code and history in at low trust, and promotion follows review. The design adds only a memory of the process |
+| **Rename** | Usually during incubation, after the podling name search. The domain ID stays; the new name is a dated assertion (paper §12) |
+| **Graduation** | A registry update. The new PMC takes over a domain that already exists, seeded during incubation at raw and curated. Verified waits for the PMC that graduation creates |
+| **Split** | In 2021 Solr left Lucene to become its own top-level project: the paper's domain split, done by hand. Here it is a curator-assisted split with tombstone redirects, and the shared history stays as entries both domains cite |
+| **Merge** | The reverse, done lazily and only on real convergence, as when Lucene and Solr merged their development in 2010 |
+| **Orphaning** | The case the paper calls dangerous (paper §12). Today the board catches it through missed or thin quarterly reports. The ownership invariant flags the domain within days instead |
+| **Retirement** | The Attic already is an archive tier. The domain demotes: still indexed and citable, no longer curated, and its interface summary marked so agents stop treating its facts as live |
+
 ---
 
-## 3. Sources to entries
+## 3. People and names
 
-Appendix B's source table instantiates row by row, and ASF's archive discipline supplies the one property seeding needs most: **stable citations**. Mailing-list permalinks and message identifiers are durable anchors, so distilled entries cite originals that will still resolve in twenty years. The upstream archives remain the canonical raw store; the memory holds distilled entries that point back.
+**Why.** Twenty-five years of provenance is only useful if it still points at the right person. At the Foundation, the names around a person change far more often than the person.
 
-| ASF source | Entry type | Notes |
+The paper's rule is opaque permanent keys plus dated names (paper §12, after RFC 4151). At the Foundation:
+
+- **Committers are keyed by Apache ID**, as `human:apache.org,<date>:<apache-id>`. The dated authority costs nothing and still holds if the Foundation's naming ever changes.
+- **Everyone else is keyed by issuer and subject.** Most authors in the archives (list posters, issue reporters, patch senders) have no Apache ID. A GitHub author is keyed by GitHub's numeric user ID, which survives renames; a Jira or Bugzilla author by that tracker's account; a list poster by the address and the date it was seen. When the person later gets an Apache ID, a dated assertion links the two.
+- **Other identities are dated assertions.** Commits carry employer email addresses that lapse when people move. GitHub usernames can be renamed, and an old name can pass to someone else. Each is recorded as "this person used this identity from this date to that", never as a key.
+- **Roles are dated too.** Committer and PMC membership are dated from the records that exist: rosters, account creation, board resolutions. "Release manager for 2.4.0" is a fact distilled from the release vote thread. An employer is a dated affiliation, never part of an identity, which is how "employers change while hats stay" becomes data.
+- **Nothing is rewritten.** A rename, a new employer, or a lapsed role adds an assertion. Old entries keep pointing at the same person.
+
+---
+
+## 4. Sources to entries
+
+**Why.** Twenty-five years of archives can seed far more than any new deployment could write. The question is which sources yield which kind of entry, and which can be cited for decades.
+
+The paper's source table (Appendix B) applies row by row. The Foundation's archive discipline supplies what seeding needs most: **stable citations**. Mailing-list permalinks and message IDs are durable, so entries cite originals that will still resolve in twenty years.
+
+The archives stay the original record. The memory holds distilled entries that link back, and its historian (paper §3) records what the fleet did with them.
+
+| Foundation source | Entry type | Notes |
 |---|---|---|
-| Improvement proposals (KIPs, FLIPs, SPIPs and kin) | Decisions | The richest target: context, options, dissent, and outcome already written down per proposal |
-| [VOTE] and [DISCUSS] threads | Decisions | Consensus mechanics preserved verbatim; the vote result is the label |
+| Improvement proposals (KIPs, FLIPs, SPIPs and kin) | Decisions | The richest target: context, options, dissent, and outcome already written down |
+| [VOTE] and [DISCUSS] threads | Decisions | Discussion kept verbatim; the vote result is the outcome |
 | Board minutes, bylaws, Apache Way documents | Policy L0 and L1 | Authored intent, publicly recorded, changing over years |
-| Release policy, security process, license policy | Policy L2 | The machine-checkable subset compiles to gates, including dependency-license rules |
-| Per-project style guides, commit conventions, review norms | Policy L3 | Owner is the project domain |
-| Commit histories | Decision provenance, hazard entries, co-change priors | Revert clusters mark fragile zones; co-change seeds prefetch before telemetry exists |
+| Release, security, and licence policy | Policy L2 | The checkable part compiles to gates, including dependency-licence rules |
+| Project style guides, commit and review norms | Policy L3 | Owned by the project domain |
+| Commit histories | Decision provenance, hazards, co-change priors | Revert clusters mark fragile code |
 | Reviews | L3 conventions, ownership map | Recurring review comments are the unwritten standards, cited to their threads |
-| Issue trackers with linked fixes | Golden-suite seeds, FAQ entries | Real user questions with ground-truth resolutions |
+| Issues with linked fixes (GitHub, Jira, Bugzilla) | Golden-suite seeds, FAQ entries | Real questions with known resolutions |
 | Project sites, docs, wikis | Interface summaries | The breadth-first layer |
 | Rosters, release lines, dependency matrices | Facts | Short review clocks; these rot fastest |
 
 ---
 
-## 4. A policy stack for a federation
+## 5. A policy stack for a federation
 
-Mapping the stack surfaces the case study's first genuine finding.
+**Why.** The paper's policy stack assumes one strategy layer. The Foundation has none at the centre, on purpose.
 
-**L0 is easy and already written.** The Apache Way, the license red lines (including the prohibited dependency categories), vendor neutrality, release-by-vote: these are the non-overridable core, authored over decades, publicly amended through documented process. Seeding L0 is transcription plus review, not invention.
+| Layer | At the Foundation |
+|---|---|
+| **L0** | Already written: the Apache Way, the licence red lines including prohibited dependency categories, vendor neutrality, release by vote. Seeding L0 is transcription plus review, not invention |
+| **L1** | Does not exist centrally, and must not. A thin Foundation L1 (sustainability, community health, legal posture), with the real L1 written by each PMC and compiled into that domain's rubric |
+| **L2** | Foundation-wide process (release, security handling, branding). Its checkable part compiles to gates: an agent preparing release artifacts is gated on licence and provenance rules mechanically |
+| **L3** | Project conventions, owned by each domain, distilled largely from review archives |
 
-**L2 and L3 map directly.** Foundation-wide process rules (release policy, security handling, branding) are L2, and their checkable subset compiles to gates: an agent preparing release artifacts is gated on license and provenance rules deterministically, not by good intentions. Project conventions are L3, owned by each domain and distilled largely from review archives.
-
-**L1 does not exist centrally, and must not.** The foundation has no central product strategy by design; each project sets its own direction. The stack therefore holds a thin foundation L1 (sustainability, community health, legal posture) while real L1 lives per domain, authored by each PMC, compiling into per-domain scoring rubrics. The architecture supports this without modification, since rubrics were always compiled per domain, but the case makes explicit what the abstract paper only implies: **the policy stack must tolerate a federation of L1s under one L0**, with cross-domain triage falling back to the thin shared layer. Any multi-division organization will eventually want the same property.
+**Finding: the stack must allow many L1s under one L0.** Cross-domain triage falls back to the thin shared layer. The design needed no change, since each domain already orders its own queue with its own rubric (paper §8), but the paper only implied this. Any organisation with independent divisions will want the same property.
 
 ---
 
-## 5. Trust, review, and twenty-five years of people
+## 6. Trust and review
 
-**Committers are the promotion gate, and the mapping is exact.** The architecture wants a reviewer for promotion into verified, human or senior agent by domain policy; ASF's policy is a human, and it already defines precisely who may bless truth about a project. PMC membership in the registry grants promotion-review rights for that domain, which means review authority derives from the same source that governs the code. Lazy consensus maps to sampled review for routine curation; explicit votes map to gated review for high-impact promotions; the veto maps to a hard reject with required justification, which becomes a memory entry itself.
+**Why.** Anyone can write to the Foundation, and its reviewers are volunteers. Trust has to hold against anyone writing into the raw tier, and review has to fit the time volunteers actually have.
 
-**Public writability is the standing threat model.** Anyone can post to a list, open an issue, or send a patch, which means anyone can write into the raw tier. That openness is constitutive and must remain; the trust tiers exist exactly for this. Raw is indexed and searchable with provenance attached; nothing reaches agent-trusted tiers without distillation and committer-gated review. The memory-poisoning defenses of the paper are not extra caution here; they are the minimum viable posture for an institution whose front door is open.
+### Foundation practice already maps onto the gates
 
-**Private lists are the restricted label.** The paper's classification (paper §4) instantiates directly: public archives are public, private and security lists are restricted, and the PMC owns the label for its lists. A session handles a PMC's restricted material only when its harness routes every outbound path through the perimeter, and it can then send that material only to destinations whose ceiling allows it, which for the foundation means a model class whose prompts stay inside it; the foundation's archive tooling already refuses private and security lists unless explicitly granted. A sanctioned summary of private-list content for a wider audience is the paper's `declassify` with the PMC as guard: a new public entry citing the private thread, approved by the people who own the list, never a side effect of an agent writing what it read. Posting the summary is then a follow-up task for a fresh session, whose label is public because it read only the public entry; the session that read the private thread can never post it, since its label never falls.
+| Foundation practice | Paper mechanism |
+|---|---|
+| PMC members cast binding votes on their project | Promotion to verified (paper §4). The paper allows a person or a senior agent by domain policy; the Foundation's policy is a person, and PMC membership in the registry grants the right |
+| Committers review each other's work | Sampled review of routine curation, and review of golden suites |
+| Lazy consensus | Routine curation goes ahead unless someone objects |
+| A release or procedural vote | Gated review for high-impact promotions, passed by majority |
+| A veto on a code change | A hard reject with a required justification, which becomes an entry itself |
+| IP clearance and software grants | Imports start raw (paper §4) |
+
+Whoever may vote on a project's code may vouch for its memory.
+
+### An open front door
+
+Anyone can write into the raw tier, and that openness must stay. Raw is indexed and searchable with provenance attached. Nothing reaches a tier agents rely on without distillation and review. For the Foundation, the paper's poisoning defences (paper §4) are the minimum, not extra caution.
+
+The incident in paper §1 shows why. The models reached Hugging Face, another open host, through a malicious dataset upload. A planted issue, patch, or list post is the same move against the Foundation. Lineage (paper §3) is the answer after the fact: once a source is found bad, every entry it informed, and every result sent from a session that read it, can be listed and re-checked.
+
+### Private lists are the restricted label
+
+The paper's labels (paper §4) apply directly. Public archives are public; private and security lists are restricted.
+
+- **Who may read.** PMC members read their PMC's private list, and Foundation members may read most private lists by Foundation policy. A session may handle restricted material only if its harness routes every outbound path through the perimeter.
+- **Where it may go.** Only to destinations whose ceiling allows it: for the Foundation, a model class whose prompts stay inside it.
+- **Who guards.** The PMC for its own list. For security material, the Security Team as well, since its embargo process decides when a vulnerability may be discussed in public.
+
+A summary for a wider audience is a `declassify`: a new public entry citing the private thread, approved by the guard. Posting it is a follow-up task for a fresh session, whose label is public because it read only the public entry. The session that read the private thread can never post it, because its label never falls.
 
 ```mermaid
 sequenceDiagram
@@ -124,109 +186,107 @@ sequenceDiagram
     P->>T: allowed, public within ceiling public
 ```
 
-**A committer owns a domain.** The Foundation remembers a person's role: committer since, PMC member, release manager for. The public archive stays indexed as a source. Anything else the tooling learns about a person is the person's, kept in a domain they own.
+Lineage audits this path too. "Which public entries were informed by a session that read private@?" is a query over the historian, and every answer should be a declassified entry with its guard named.
 
-Into that domain, the Foundation's workbench and a committer's employer can only propose. The committer admits or refuses. A refused proposal is erased; its stub keeps where it came from, so the same item is not proposed twice. Anything a committer never wants proposed is a rule in their own domain. A proposal nobody answers expires.
+### People deserve a policy before the pipeline runs
 
-Work goes to the project under the committer's name, with the agent and model recorded. Everything else follows one test: whatever would still be true and still be theirs at another employer is theirs now. An entry about the committer written while reading a private list carries that label and leaves only through the PMC as guard. When a committer leaves, their domain goes with them and their contributions stay.
+The archives hold twenty-five years of individuals arguing, deciding, and occasionally behaving badly, all in public. The paper leaves profiles of people to policy (Appendix B). The Foundation sets that policy as L0 before the first distillation pass:
 
-**People deserve a policy before the pipeline runs.** The archives contain twenty-five years of individuals arguing, deciding, and occasionally behaving badly, all public. The norms-not-dispositions rule from Appendix B is adopted as written L0 policy before the first distillation pass: community entries describe roles, process, and norms; they do not compile behavioral profiles of named individuals, and the gate enforces it. Roles and public records (committer since, PMC member, release manager for) are facts. Patterns of persuasion attributed to a person are not entries, however public the mail.
+- entries describe roles, process, and norms;
+- roles and public records (committer, PMC member, release manager for a version) are facts;
+- behavioural profiles of named people are not entries, however public the mail. Patterns of persuasion attributed to a person are not entries either, and the gate enforces it.
+
+The rule governs the Foundation's domains. A committer's own domain (§7) is theirs, under their own policy.
 
 ---
 
-## 6. Serving, identity, and who pays
+## 7. A committer owns a domain
 
-Identity does double duty, and ASF's identity infrastructure is already real: foundation accounts, contributor license agreements on file, rosters in the registry. The tier model falls out of one policy table:
+**Why.** Committers outlast their employers and often their projects. What the tooling learns about a person should go where the person goes.
 
-| Principal | Recall execution | Scope | Rationale |
+The Foundation remembers a person's role, and the public archive stays indexed as a source. Anything else its agent tooling learns about a person goes into a personal domain the person owns (paper §12). The Foundation's tooling and the committer's employer may only propose into it.
+
+At the Foundation this reduces to three rules:
+
+- **Work goes to the project**, under the committer's name, with the agent and model recorded.
+- **If it would follow them to their next job, it is theirs.**
+- **Private lists still bind.** An entry about the committer written while reading a private list carries that label, and leaves only through the list's guard.
+
+When a committer leaves, their domain goes with them and their contributions stay.
+
+---
+
+## 8. Serving and who pays
+
+**Why.** A foundation can subsidise an index for everyone but cannot fund unbounded inference. Who gets what has to follow from roles the Foundation already records.
+
+The Foundation's identity infrastructure is already real: Apache accounts, contributor licence agreements on file, rosters. The tiers follow from one policy table:
+
+| Principal | `recall` runs | Scope | Why |
 |---|---|---|---|
-| Committer / PMC member | Server-side, SLO applies | Subsidized in domains their PMC covers, wider by policy | They are the promotion reviewers; subsidizing their recall pays the people who maintain the corpus, and their zero-result queries are the highest-grade distillation queue |
-| Contributor on the on-ramp | Capped server-side allowance, PMC-grantable, expiring | Granted per domain | Mentees, program participants, release-adjacent contributors: exactly the population the foundation wants to widen |
-| Public | Caller-executed via sampling; index operations free | Public domains at curated trust or better | Symmetry with tradition: the archives were always free to read, and deeper help always cost your own effort, now denominated in your own tokens |
+| **Committer or PMC member** | Server-side, on models the Foundation pays for, under the SLO | Subsidised in their project's domains, wider by policy | They review and maintain the corpus. Subsidising their recall pays them back, and their failed searches are the best distillation queue |
+| **Contributor on the on-ramp** | A capped allowance, granted by a PMC, expiring | Granted per domain | Mentees, programme participants, release helpers: the people the Foundation wants more of |
+| **Public** | On the caller's own model, through the tool protocol's sampling; `search` and `get` free | Public domains, curated or better | The archives were always free to read; deeper help always cost your own effort, now in your own tokens |
 
-Index operations (`search`, `get`) are free at every tier because they are index-served and nearly free to provide; the foundation subsidizes an index, not inference. Spend limits per principal sit in the deterministic perimeter, so a committer credential wired into a runaway loop is capped and alerted, not debated. Limits are per resource class (paper §12): metered credits for commercial models are capped in money, foundation-hosted capacity in time-share, because one committer's burst on a shared accelerator pool is another's queue.
+- **The index is free; inference is metered.** `search` and `get` are served from the index at almost no cost.
+- **Limits sit in the perimeter.** A committer credential caught in a runaway loop is capped and alerted, not debated.
+- **Limits are per resource class** (paper §12): commercial model credits capped in money, Foundation-hosted capacity in time share, because one committer's burst on a shared pool is another's queue.
 
-One property worth stating because it generalizes: **the same registry entry that says who may approve promotions in a domain also prices their recall.** Review authority and serving tier derive from one source of truth, and reorganizations of either follow the registry automatically.
-
----
-
-## 7. The seeding plan
-
-Per Appendix B, in ASF terms:
-
-**Taps first.** Live feeds from lists, commits, issues, and reviews flow through the ordinary write path into per-domain raw tiers. Backfill then replays history through the same pipeline, oldest first, so the seeding pipeline is exercised, versioned, and improved as a dom-platform artifact before the bulk of history arrives.
-
-**Trackers are the ledger's taps.** GitHub issues per repository and Jira per project are where work already arrives, and they stay where they are. The registry maps each repository and tracker project to the TLP domain that owns it, so an issue becomes a task on that domain's ledger with an `origin` citing the issue (paper §8). PMC triage on the tracker is admission evidence: a label the PMC applies is a human sign-off the gate can weight. Results return the way the security pipelines already return them, as ready-to-file issues and proposed changes written through a governed tool server, with the PMC deciding what closes.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant PMC as PMC
-    participant GH as GitHub issue
-    participant TAP as Tap, ceiling public
-    participant REG as Registry
-    participant B as Ledger, project domain
-    participant TRI as Triage
-    participant W as Worker
-    participant M as Memory
-    participant P as Perimeter
-
-    PMC->>GH: applies a label
-    TAP->>GH: pull on schedule
-    TAP->>REG: repository → domain
-    TAP->>B: create_task, status proposed, origin = issue permalink, evidence = label
-    B->>TRI: triage, label weighed as human sign-off
-    TRI-->>B: open, ranked
-    W->>B: claim_next
-    B-->>W: task, lease started
-    W->>M: handoff, cites the issue
-    W->>B: complete
-    TAP->>B: read completed task and handoff
-    TAP->>P: handoff label ≤ tap ceiling?
-    P-->>TAP: allowed
-    TAP->>GH: comment and proposed change, fleet identity
-    PMC->>GH: close
-    TAP->>GH: pull on schedule
-    Note over TAP: sees its own comment, ignores it
-    TAP->>B: upstream close confirms the terminal task
-```
-
-**Index everything, immediately.** The full archive corpus becomes searchable with permalink citations in the first phase. Known-item retrieval (an error string, a proposal number, a release name) works foundation-wide before any distillation exists.
-
-**Breadth before depth.** One verified interface summary per project: what it is, architecture in a paragraph, governance status, key contracts, where its decisions live. A few hundred curated pages, reviewed by the PMCs they describe, gives every domain a front door early.
-
-**Depth is pulled.** Zero-result queries and re-query clusters from real usage drive the distillation queue. A dormant project's 2004 threads are indexed forever and distilled never, and that is the correct outcome.
-
-**Pilots span the honest spectrum.** One large, fast-moving project with a formal proposal culture; one mature, stable project with decades of history; one incubating podling whose memory is born inside the system instead of imported into it. Each pilot is held to the M1 and M2 exit criteria of the paper before fan-out: context recovery from handoff and index alone, known-item lookups in the top three, a deliberately degraded summary caught by the suite, and cost per task measured against baseline.
-
-**Golden suites come from users.** The questions people asked on user lists and in issues, paired with the resolutions the archives record, become per-project evaluation suites, reviewed by committers. Evaluation coverage matches demonstrated demand, and the failure-recovery stratum (questions the community historically struggled to answer) tests whether the system can do better than its sources.
+**Finding: the registry's rosters decide both review rights and serving tier.** The PMC roster grants promotion; the committer roster grants subsidised recall. A change to either follows the registry automatically.
 
 ---
 
-## 8. What ASF stresses that the paper had to answer
+## 9. The seeding plan
 
-Five pressures, each a finding.
+**Why.** Seeding is where a wrong or planted fact is cheapest to insert and hardest to find later. The plan keeps it on the ordinary, gated path of Appendix B.
 
-**Federated strategy.** Covered in §4 above: one L0, many L1s, per-domain rubrics, thin shared fallback. The architecture holds, and the requirement is now explicit.
+The paper's plan applies as written: live taps first, then backfill through the same pipeline oldest first; everything indexed at once with permalink citations; distillation pulled by failed searches. Three choices are specific to the Foundation.
 
-**Volunteer bandwidth is the scarce resource.** The paper's human review gates assume reviewers exist on payroll. Here every human gate spends volunteer time, so the gates must be shaped to respect it: sampled review for the routine, batched digests over per-item interrupts, PMC-tunable gate strictness within L0 bounds, and the protected curation floor keeping curator work from generating unbounded review demand. The subsidized tier is part of the same answer: the system pays reviewers back in capability.
+- **One interface summary per project, first.** What it is, its architecture in a paragraph, governance status, key contracts, where its decisions live. A few hundred curated pages, reviewed by the PMCs they describe, give every domain a front door early.
+- **Golden suites come from users.** Questions asked on user lists and in issues, paired with the resolutions the archives record, become per-project evaluation suites reviewed by committers. Questions the community struggled to answer form the stratum of past failures (paper §11).
+- **A dormant project's 2004 threads are indexed forever and distilled never.**
 
-**Transparency applies to the memory itself.** An institution that publishes its board minutes should expect its distilled memory, its policy stack, and even its curation telemetry to be publicly readable, with the permission system governing writes and expensive operations more than reads. The architecture supports a mostly-public corpus without strain, since the OPA filter is policy, but the case sets a default the abstract paper leaves open: for a foundation, memory defaults to public, and the interesting access-control questions are about recall cost and promotion rights, not secrecy.
+### Trackers are the ledger's taps
 
-**Sustainability of the serving layer.** The record is text and outlives everything, but the index, the deputy models, and the telemetry plane are running costs. The tier model bounds them (subsidize the index, meter the inference), and the derived stubs of Appendix B ensure that if the serving layer ever went dark, every repository still carries a generated digest and every entry still cites a permalink that resolves. The failure mode of an unfunded year is degraded convenience, not lost knowledge, which is the property a decades-old institution should demand.
+GitHub issues, Jira, and Bugzilla are where work already arrives, and they stay there (paper §8).
 
-**Contributed components.** Much of the foundation's tooling is built by projects rather than staff, and the paper's ownership test (paper §12) states the rule the foundation already applies: a contributed server, skill set, or pipeline is adopted at a version and operated by the foundation, or it is not on the path a production agent depends on. Projects that keep agent skills in their own repositories are the in-repo case of Appendix B: those files become digest-keyed stubs derived from the project's domain, served from memory to online consumers and regenerated in the repository for everyone else, so the repository never becomes a second, unowned source of truth.
+- The registry maps each repository and tracker project to the domain that owns it. An issue becomes a task on that domain's ledger, citing the issue as its `origin`.
+- A label applied by a committer is admission evidence: a human sign-off triage can weigh.
+- Results return as ready-to-file issues and proposed changes through a governed tool server, the way the Foundation's security scanning pipelines already return them. Committers decide what closes.
+
+### Pilots span the range
+
+Three pilots, deliberately different:
+
+- one large, fast-moving project with a formal proposal culture;
+- one mature, stable project with decades of history;
+- one podling, whose memory is born inside the system instead of imported into it.
+
+Each must pass the paper's M1 and M2 exit criteria (paper §13) before fan-out, including the paired run with and without memory.
 
 ---
 
-## 9. Risks and open questions
+## 10. What the Foundation taught the design
 
-**Distillation quality on culture.** Process norms distill from observable behavior, but the difference between a norm and a habit is judgment; early distillations need heavier PMC review until the faithfulness suites earn trust.
+| Pressure | Finding | Where the design answers |
+|---|---|---|
+| **Federated strategy** | Many L1s under one L0 (§5) | Per-domain rubrics (paper §8) |
+| **Volunteer time is scarce** | Every review gate spends volunteer time. So: sampled review for the routine, batched digests instead of per-item interrupts, PMC-tunable strictness within L0, and a curation budget sized so curators cannot generate unbounded review. Subsidised recall pays reviewers back | Gates scale with impact (paper §5, §8) |
+| **Transparency applies to the memory too** | An institution that publishes its board minutes should expect its memory, policy, and even curation telemetry to be public. Anyone may read; what needs control is who promotes and who gets paid-for recall. The paper leaves this default open | The filter is policy, not structure (paper §6) |
+| **The serving layer may lose funding** | If the index, models, and telemetry went dark, every repository still carries a generated instruction file and every entry cites a permalink that resolves. An unfunded year costs convenience, not knowledge | The record test (paper §12), generated files (Appendix B) |
+| **Tooling is contributed** | Foundation tooling comes from Infra, volunteer teams such as Whimsy, and projects. Whatever sits on the production path is adopted at a version and operated by the Foundation. Skills kept in a project repository are generated from its domain and never hand-edited | The ownership test (paper §12), Appendix B |
+| **Names move constantly** | Employers, usernames, and project names change; people and projects persist (§3) | Dated identity (paper §12) |
 
-**Review capacity at fan-out.** Three pilots fit volunteer review; three hundred projects only fit if breadth-first summaries plus sampled review keep per-project load to hours, not weeks. The telemetry will say whether that holds, and fan-out pace should follow it.
+None of these needed a structural change to the design.
 
-**Contributor privacy beyond policy.** Norms-not-dispositions is enforced at the gate, but public raw archives remain searchable by design, as they are today. The line the system holds is that it will not manufacture profiles; it cannot and should not make public history less public.
+---
 
-**Sampling-tier client support.** The public tier's economics depend on caller-executed recall being widely supported by clients. Where it is not, the public experience degrades to index-only, which is acceptable but worth measuring.
+## 11. Risks and open questions
 
-None of these are architecture risks; they are deployment truths that the milestones are designed to surface early. That is the closing argument for the test case: the architecture required no structural change to fit an institution built on federation, volunteers, and total transparency. The findings it produced (federated L1, gates shaped for volunteer time, public-by-default memory, survivable defunding, institution-operated contributions) are not ASF quirks. They are properties any organization that intends to last should ask of this system, and the foundation simply asks for them first.
+These are deployment risks rather than design risks. The milestones are built to surface them early.
+
+- **Distilling culture.** Process norms distil from observable behaviour, but telling a norm from a habit takes judgment. Early distillations need heavier PMC review until faithfulness sampling shows they hold.
+- **Review capacity at fan-out.** Three pilots fit volunteer review. Two hundred projects fit only if breadth-first summaries and sampled review keep each project's load to hours, not weeks. Telemetry will tell, and fan-out should follow it.
+- **Privacy beyond policy.** The gate stops the system from building profiles of people, but the raw public archives stay searchable, as they are today. The system will not manufacture profiles; it cannot and should not make public history less public.
+- **Client support for sampling.** The public tier depends on clients that support the tool protocol's sampling, so `recall` can run on their own model. Where they cannot, public users get index-only access, which is acceptable but worth measuring.
+- **Planted material.** How often planted content reaches a curated tier, and how fast lineage finds what it touched, should be measured from the first pilot.
