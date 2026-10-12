@@ -51,7 +51,7 @@ Three constraints follow and shape the rest of the design.
 ```mermaid
 flowchart TB
     HUM["Humans<br/>own domains, amend policy,<br/>approve promotions and exceptions"]
-    AGT["Agents, stateless and disposable<br/>workers, orchestrators, archivists, auditors"]
+    AGT["Agents, stateless and disposable<br/>workers, orchestrators, curators, auditors"]
     SRV["Serving layer, rebuildable<br/>retrieval, task ledger, perimeter, telemetry"]
     REC["Record, versioned text<br/>memory, policy, registry, exceptions"]
     EXT["External systems<br/>trackers, archives, tool servers"]
@@ -69,7 +69,7 @@ Everything is partitioned into **domains**. A domain is an area of work with an 
 
 An agent starts empty. It loads a small cached index of its domain (T0) and a digest of the policy that applies to it. It claims a task from the domain's ledger, reads what it needs through the retrieval service, does the work, and writes a handoff note before it ends. The next agent starts from that note, not from a transcript.
 
-In the background, archivists keep the memory tidy, auditors check the archivists, and people (or senior agents, where policy allows) promote what is good enough to rely on.
+In the background, curators keep the memory tidy, auditors check the curators, and people (or senior agents, where policy allows) promote what is good enough to rely on.
 
 ## Roles, and why each exists
 
@@ -82,8 +82,8 @@ In the background, archivists keep the memory tidy, auditors check the archivist
 | **Task ledger** | Agents that message each other duplicate work and scale badly | One queue per domain with leased claims and handoff notes (§8) |
 | **Workers** | Work needs doing by something cheap to start and safe to lose | Stateless agents that claim a task, do it, and write a handoff |
 | **Orchestrators** | Someone has to decide what is worth doing, and split work no single agent can do | Rank tasks against written strategy and decompose large ones (§8) |
-| **Archivist** | Left alone, memory rots: facts go stale, duplicates pile up, summaries drift from their sources | Summarises, merges, verifies, supersedes, and demotes entries, and keeps the reasons for decisions findable (§5) |
-| **Auditors** | A archivist that checks its own work shares its own blind spots | Run on a different model; check summaries against sources, hunt contradictions, watch canary entries (§5) |
+| **Curator** | Left alone, memory rots: facts go stale, duplicates pile up, summaries drift from their sources | Summarises, merges, verifies, supersedes, and demotes entries, and keeps the reasons for decisions findable (§5) |
+| **Auditors** | A curator that checks its own work shares its own blind spots | Run on a different model; check summaries against sources, hunt contradictions, watch canary entries (§5) |
 | **Taps** | Work and knowledge already live in trackers, mailing lists, and repositories | Two-way connectors. The outside system stays canonical for its own items (§8) |
 | **Guards** | Some content must cross to a wider audience, and that must never happen by accident | Approve each declassification and are named in its provenance (§4) |
 | **Recall deputy** | A multi-step lookup costs an expensive model many turns | A cheap model that runs the search, read, and summarise loop under the caller's own permissions (§6) |
@@ -137,7 +137,7 @@ Examples use `dom-a` for the domain under discussion and `dom-b` for a neighbour
 |---|---|---|---|
 | **T0, index** | Current goals, active tasks, standing decisions, pointers, policy digest | Under 2k tokens, enforced | Every agent at start, from cache |
 | **T1, entries** | Curated entries, grouped by project, decision, or subsystem, with stable section anchors | Small | On demand, through retrieval |
-| **T2, historian** | Every event: writes, reads, ledger operations, curation | Unbounded | The index, the ledger, archivists, auditors; rarely agents |
+| **T2, historian** | Every event: writes, reads, ledger operations, curation | Unbounded | The index, the ledger, curators, auditors; rarely agents |
 | **T3, archive** | Demoted and superseded material | Unbounded | Audit only |
 
 Curation never deletes, it demotes. Erasure, below, and transcripts past their retention clock (Appendix B) are the only exceptions. The read path stays small while total memory grows.
@@ -152,7 +152,8 @@ type: decision | fact | convention | method | handoff
 domain: dom-a                 # a permanent ID, never a team name
 author: agent:worker-3 (model: <model-id>) | human:<authority>,<date>:<user-id>   # §12
 created: <timestamp>
-source: [link or citation]
+cites: [entry IDs or links]   # what the author says it drew on; the service records the rest (§3)
+session: <session-id>@<historian position>   # recovers the read set
 confidence: high | medium | low
 trust_tier: raw | curated | verified
 classification: internal      # who may see it (§4)
@@ -166,7 +167,7 @@ Types age differently. **Decisions** record context, options, choice, and ration
 A T0 for one domain:
 
 ```markdown
-# dom-a · T0 · generated <date> by archivist-2
+# dom-a · T0 · generated <date> by curator-2
 ## Now
 - Goal: <objective> (pol-L1-007)
 - Active: task-a-1204 (worker-7) · task-a-1198 (open)
@@ -213,16 +214,24 @@ Engine migrations most often lose the review gate.
 
 **Why.** Many questions are about the past. Who wrote this, and from what? Who has read it since? What did the agent know when it decided? Audit, erasure, declassification review, lineage re-checks, and replay (§11) all need the same answer, so the system keeps one complete, ordered record of what happened.
 
-That record is the event log, called the **historian** after the process historians of industrial control, which keep every event in a plant for audit and root-cause analysis. It holds four kinds of event:
+That record is the event log, called the **historian** after the process historians of industrial control, which keep every event in a plant for audit and root-cause analysis. It holds five kinds of event:
 
 | Event | Carries | Answers |
 |---|---|---|
-| Write | Entry version, author, session, and what it cites, supersedes, or derives from | Where did this come from? |
-| Read | Session, plus the entry versions a search returned or a fetch or `recall` used | Who has seen this, and what did it shape? |
+| Write | Entry version, author, session, historian position, and what it cites or supersedes | Where did this come from? |
+| Read | Session, plus the entry versions a search returned or a fetch or `recall` used | Who has seen this? |
+| Send | Destination, a digest of the content, session, historian position | What left, and what was it made from? |
 | Ledger operation | Task, principal, attempt key | Who did what work, and when? |
-| Curation | Archivist instance, model, the diff | Who changed the collection, and how? |
+| Curation | Curator instance, model, the diff | Who changed the collection, and how? |
 
-**Lineage** is a query over the historian. Follow derivation edges back to find an entry's sources. Follow read edges forward to find everything written by sessions that read it. The edges map onto W3C PROV: an entry version is an entity, a session or task an activity, a principal an agent.
+**Lineage** is a query over these events, along two kinds of edge.
+
+- **Cited** edges are what the author says it drew on. They are precise but may be incomplete, and they explain *why*.
+- **Informed-by** edges are computed by the service, never declared by the agent. A write or send records its session and its position in the historian, so its read set is every read that session made before that point. Reads made on the session's behalf count too: by its `recall` deputy and by helpers it spawned. These edges are complete but coarse, and they are the ones to use when it matters not to miss anything: erasure, a leak, a poisoned source.
+
+The read set does for lineage what the session's current label does for classification (§4): the author cannot tell which part of what it read shaped the text, so the record assumes all of it did. Nothing is copied; the read set is a query over events already kept.
+
+Lineage then answers questions in both directions. Back: what did this entry come from? Forward: everything written or sent by sessions that read it. The edges map onto W3C PROV: an entry version is an entity, a session an activity that *used* what it read and *generated* what it wrote, and a principal an agent.
 
 Each event carries the classification of what it names, so the historian is filtered like any other read. Latencies and counts stay in telemetry, which may be sampled and expire. Events do not expire, except under the retention clocks of Appendix B, and erasure removes an entry's body but not the events that name it.
 
@@ -232,9 +241,9 @@ Each event carries the classification of what it names, so the historian is filt
 
 Demotion is reversible: the content stays in the archive behind a tombstone. Erasure is not, so it escalates like any irreversible action. The body is removed everywhere, and three things remain: a stub with the frontmatter, a record of who erased it, when, and for what class of reason, and a receipt listing every copy covered (log, index, caches, replicas, exports) and any that could not be reached.
 
-How the engine removes a body from append-only history is its own concern: rewrite the segment, or encrypt each body under its own key and destroy the key. Either way the restore drill (§12) must cover it. Erasure propagates: entries that cite the erased one, or were written by sessions that read it, which the historian records, are flagged and re-derived or erased in turn.
+How the engine removes a body from append-only history is its own concern: rewrite the segment, or encrypt each body under its own key and destroy the key. Either way the restore drill (§12) must cover it. Erasure propagates along lineage: entries that cite the erased one or were informed by it are flagged, and sends informed by it are listed in the receipt. Flagged entries are re-derived from what remains, or erased in turn.
 
-A domain's owner may erase. A role named in policy may erase on behalf of the person an entry is about; in that case the stub drops the source and author.
+A domain's owner may erase. A role named in policy may erase on behalf of the person an entry is about; in that case the stub drops the citations and author.
 
 ---
 
@@ -254,7 +263,7 @@ The design never folds trust into one score. Each entry answers four separate qu
 
 | Question | Label | Rule |
 |---|---|---|
-| Where did it come from? | `author`, `source`, `created`, model version | Recorded at write, never edited. Lets a bad source's whole output be found later |
+| Where did it come from? | `author`, `cites`, `session`, `created`, model version | Recorded at write, never edited. With the read set (§3), lets a bad source's whole output be found later |
 | How far has it been checked? | `trust_tier`: raw, curated, verified | Rises only through gates. Sets what the entry may be used for |
 | How sure is the author? | `confidence` | The author's own claim. Informs readers, grants nothing |
 | Who may see it? | `classification` | Rises with what the author read. Falls only through a guard |
@@ -312,11 +321,11 @@ Memory poisoning, a wrong or malicious entry planted so that later agents act on
 
 ---
 
-# 5. The Archivist
+# 5. The Curator
 
 **Why.** Memory left alone rots. Facts go stale, duplicates multiply, summaries drift from what they summarise, and nobody can say any more why a decision was made. A collection needs keeping, and at fleet scale only agents can do it often enough.
 
-Archivists are a standing fleet of cheap-model agents. They:
+Curators are a standing fleet of cheap-model agents. They:
 
 - write and maintain the one- or two-sentence summaries the index serves;
 - verify facts whose review date has passed;
@@ -325,19 +334,19 @@ Archivists are a standing fleet of cheap-model agents. They:
 
 Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Curation is budgeted like any other work, with a protected floor, so it neither starves delivery nor is starved by it.
 
-**Archivist and historian.** The historian (§3) records what happened; the archivist looks after what is kept. A librarian classifies and finds published material. An archivist appraises what to keep, describes it so it can be found, preserves its provenance, and decides what is retired, which is this role's job. Its summaries are finding aids.
+**Curator, historian, steward.** The historian (§3) records what happened; the curator looks after what is kept. "Curator" is the cross-industry name for that work: digital curation is "the management and preservation of digital data/information over the long-term" (Digital Curation Centre), and the work's output here is the curated tier. In data governance the accountable person is the data steward (DAMA 2017), which here is the domain owner; curators work under the owner's policy.
 
-A summary keeps the provenance, tier, and classification of what it summarises. A consolidation that drops where a claim came from would let a raw or restricted claim pass as a curated, public one, so the archivist's outputs follow the derivation rules of §4.
+A summary keeps the provenance, tier, and classification of what it summarises. A consolidation that drops where a claim came from would let a raw or restricted claim pass as a curated, public one, so the curator's outputs follow the derivation rules of §4.
 
-## Containing the Archivist
+## Containing the Curator
 
-The archivist is the most privileged agent in the system. It writes the summaries every search returns first, decides what is demoted and merged, and distils the methods in `dom-platform`. A wrong or compromised archivist could steer the whole fleet without editing a single entry body, at a volume no person can review line by line. So containment is structural:
+The curator is the most privileged agent in the system. It writes the summaries every search returns first, decides what is demoted and merged, and distils the methods in `dom-platform`. A wrong or compromised curator could steer the whole fleet without editing a single entry body, at a volume no person can review line by line. So containment is structural:
 
 - **Every action is a reversible diff** with provenance. Nothing is deleted, so anything buried is still in the archive.
-- **Auditors are independent.** They run on a different base model and prompt lineage, sample summaries against their bodies, hunt contradictions, and share no writable state with archivists.
-- **Telemetry and the historian are out of reach.** Both are written by the retrieval service and ledger, not by archivists, so an archivist cannot hide the signals that would expose it. Demotion rates, summary drift, and skew in which entries searches surface are alerted per archivist instance.
+- **Auditors are independent.** They run on a different base model and prompt lineage, sample summaries against their bodies, hunt contradictions, and share no writable state with curators.
+- **Telemetry and the historian are out of reach.** Both are written by the retrieval service and ledger, not by curators, so a curator cannot hide the signals that would expose it. Demotion rates, summary drift, and skew in which entries searches surface are alerted per curator instance.
 - **The gate scales with impact.** Routine curation is sampled for review. Promotions, boundary changes, tombstone redirects, and `dom-platform` distillation need an approver other than the proposer.
-- **Lineage re-check.** Provenance names the instance and model behind every action, so if an instance, a source, or a model generation turns out bad, everything it wrote can be listed and re-checked. Archivists are rotated like other agents.
+- **Lineage re-check.** Provenance names the instance and model behind every action, so if an instance, a source, or a model generation turns out bad, everything it wrote can be listed and re-checked. Curators are rotated like other agents.
 - **Canary entries.** Each domain holds a few entries with known content; a curation pass that alters one improperly raises an alarm.
 
 Auditors are checked in turn by immutable history, deterministic tests, and sampled human review. There is no further layer of agents.
@@ -356,7 +365,7 @@ BM25 comes first because most agent queries are known-item lookups (names, IDs, 
 
 Each step discloses a little more:
 
-1. `search` returns compact hits: ID, title, the archivist's summary, metadata, a snippet. Ten hits cost roughly 500 to 800 tokens and never touch the document store.
+1. `search` returns compact hits: ID, title, the curator's summary, metadata, a snippet. Ten hits cost roughly 500 to 800 tokens and never touch the document store.
 2. The agent fetches one to three hits, by section where it can (`get(mem-a-0847#decision)`).
 3. A cheap model in the service reranks and expands the query, so one search usually suffices.
 4. Where telemetry shows entry B is usually read after entry A, B's summary is attached to A's fetch; full bodies only at very high confidence. Precision is measured and weak associations are dropped.
@@ -382,7 +391,7 @@ Every pull costs the agent a model turn. So the predictable part (T0 and the pol
 Multi-step lookups go to `recall(question, domain)`. A cheap model inside the service runs the search, read, and summarise loop and returns a cited brief, so the expensive caller spends one turn.
 
 - The deputy runs under the caller's filter, not the service's, so a low-privilege caller cannot launder reads through it.
-- The caller's label rises to the highest classification the deputy read.
+- The caller's label rises to the highest classification the deputy read, and the deputy's reads join the caller's read set (§3).
 - `recall` is the one retrieval operation with real marginal cost, so it is the one that is metered. A deployment runs it on its own models under a recall SLO, or hands the loop back to the caller's model, slower and with no SLO.
 
 ---
@@ -507,7 +516,7 @@ An agent that finds part of its task beyond it finishes what it can as a subtask
 Helpers an agent spawns inside its session are subtasks too, under two limits:
 
 - a helper runs a verified definition the parent selects, never one the parent writes, with a manifest no wider than the parent's;
-- its label starts at the parent's and flows back up, so delegation cannot launder a read.
+- its label starts at the parent's and flows back up, and its reads join the parent's read set, so delegation cannot launder a read.
 
 ## An example
 
@@ -559,7 +568,7 @@ Domains work together the way services do. When `dom-a` needs something `dom-b` 
 1. reads `dom-b`'s **interface summary**, a one-page entry on what the domain owns, its contracts, and how to ask;
 2. files a request task on `dom-b`'s ledger, which `dom-b` triages against its own rubric.
 
-Nobody writes to another domain's memory, and a contract changes only by a reviewed change to the interface summary. When telemetry shows two domains reading each other more than themselves, the archivist proposes a new boundary and people decide.
+Nobody writes to another domain's memory, and a contract changes only by a reviewed change to the interface summary. When telemetry shows two domains reading each other more than themselves, the curator proposes a new boundary and people decide.
 
 The same pattern repeats at every level of the organisation:
 
@@ -611,7 +620,7 @@ Every read and every ledger operation passes through the service, so telemetry a
 
 Retrieval is a published contract, because agents depend on it. Starting targets: search p50 100 ms and p99 500 ms; 99% of handoffs and mid-task decisions searchable within 60 seconds, with a looser published bound for bulk curation; known-item lookups by ID, title, or error string in the top three; `claim_next` p99 one second. In an outage agents run from T0, queue their writes, and take no irreversible action. Appendix C gives the ledger's targets and its behaviour during outages.
 
-Each domain keeps a golden query suite that runs on every change to the indexer, ranker, or summary prompt. A archivist's rewrite of summaries counts as such a change. Ranking changes ship through canary or shadow serving. Alerts are per domain, because rot shows locally long before it moves an average. And telemetry is the archivist's work queue, which is what keeps the corpus healthy in year ten.
+Each domain keeps a golden query suite that runs on every change to the indexer, ranker, or summary prompt. A curator's rewrite of summaries counts as such a change. Ranking changes ship through canary or shadow serving. Alerts are per domain, because rot shows locally long before it moves an average. And telemetry is the curator's work queue, which is what keeps the corpus healthy in year ten.
 
 ---
 
@@ -621,7 +630,7 @@ Each domain keeps a golden query suite that runs on every change to the indexer,
 
 ## The platform is a domain
 
-The harness, meaning system prompts, tool definitions, agent definitions, retrieval settings, the triage rubric, and the methods agents retrieve mid-task, is memory in a domain called `dom-platform`, along with evaluation suites, scorecards, and known model quirks. Archivists curate it like any domain, so the system improves without training anything: a better method for a recurring task helps every agent that draws it. Recent work on self-evolving agents finds the same, that most gains come from the harness rather than the weights (§14).
+The harness, meaning system prompts, tool definitions, agent definitions, retrieval settings, the triage rubric, and the methods agents retrieve mid-task, is memory in a domain called `dom-platform`, along with evaluation suites, scorecards, and known model quirks. Curators curate it like any domain, so the system improves without training anything: a better method for a recurring task helps every agent that draws it. Recent work on self-evolving agents finds the same, that most gains come from the harness rather than the weights (§14).
 
 The harness has two zones with a hard line between them. The **mutable zone** (prompts, tools, settings, methods) is inside the improvement loop. The **perimeter** (OPA policy, permissions, spend limits, data boundaries, the L0 core) is owned by people, sits outside `dom-platform`'s writable scope, and is enforced on every action whatever the harness says.
 
@@ -655,8 +664,8 @@ Shared memory plus self-improvement creates a specific hazard, and the incident 
 1. **The perimeter is outside the loop.** No harness change can grant a permission, edit policy, or raise a limit.
 2. **Retrieved memory is data** (§4). An exploit-primed agent hits the same check a naive one does.
 3. **The safety gate has its own objective**: no increase in privilege, judged by perimeter checks and a red-team suite, not by the task metrics the exploit inflates.
-4. **Quarantine precedes spread.** Raw `dom-platform` entries are reachable only by archivists and auditors, and auditors hunt for methods that describe crossing a boundary.
-5. **Separate roles.** The agent that finds, the archivist that distils, the gate that admits, and the person who sets the perimeter are four different parties. Repeated denials from one agent or lineage alert as probing.
+4. **Quarantine precedes spread.** Raw `dom-platform` entries are reachable only by curators and auditors, and auditors hunt for methods that describe crossing a boundary.
+5. **Separate roles.** The agent that finds, the curator that distils, the gate that admits, and the person who sets the perimeter are four different parties. Repeated denials from one agent or lineage alert as probing.
 
 Self-improvement is therefore permission-monotonic: it makes agents better inside the current perimeter and never widens it. When better work needs a new tool or wider scope, the system recommends an amendment with evidence and a person grants it.
 
@@ -753,7 +762,7 @@ The design follows three rules.
 - **Names are claims with dates.** An author or owner is recorded as an identifier qualified by the authority that issued it and the date the authority held that name, so `human:<authority>,<date>:<user-id>` stays correct after the authority is renamed or merged, or the name passes to someone else. External identities are kept as issuer and subject together. A rename or merger is a new dated assertion, never an edit of old ones.
 - **Who-owns-what is data.** A registry maps current organisational units to the domains they own, and each domain to its repositories and queues. A reorganisation is a one-file change the perimeter picks up at once.
 
-Team splits are handled by co-ownership until the knowledge actually diverges, then an archivist-assisted split with tombstone redirects. Merges are lazy, done only on real convergence. Orphaning is the dangerous case, because orphaned memory decays while agents keep trusting it, so ownership is a checked invariant and an ownerless domain is flagged within days. Acquisitions import into a quarantined low-trust tier and earn promotion through ordinary review (§4).
+Team splits are handled by co-ownership until the knowledge actually diverges, then a curator-assisted split with tombstone redirects. Merges are lazy, done only on real convergence. Orphaning is the dangerous case, because orphaned memory decays while agents keep trusting it, so ownership is a checked invariant and an ownerless domain is flagged within days. Acquisitions import into a quarantined low-trust tier and earn promotion through ordinary review (§4).
 
 ## Personal domains
 
@@ -806,7 +815,7 @@ The build order is a sequence of milestones without dates. Each delivers a capab
 *Exit:* a fresh agent recovers context from a handoff and T0 alone; known-item lookups land in the top three; the pilot set, run paired with and without memory, shows success no worse within a margin fixed beforehand and lower cost per task, with confidence intervals.
 
 **M2: The system sees itself.**
-*Capability:* telemetry and first SLOs; archivist v1 (summaries, review dates, faithfulness sampling); the handoff fast lane; the first two-way tap; golden suite v1; frozen-context replay.
+*Capability:* telemetry and first SLOs; curator v1 (summaries, review dates, faithfulness sampling); the handoff fast lane; the first two-way tap; golden suite v1; frozen-context replay.
 *Exit:* SLOs are met and alert on breach; a deliberately degraded summary is caught before rollout; a tracker item becomes a task and its result returns, and a replayed day of tracker history creates no duplicate; one model or prompt change has been decided by replay.
 
 **M3: Governance holds.**
@@ -840,9 +849,9 @@ As the system grows, revisit the search engine (Postgres to OpenSearch), the his
 
 The design combines recent agent-memory research with decades of systems practice.
 
-**Memory.** Tiered agent memory follows MemGPT's operating-system hierarchy (arXiv:2310.08560), reflection and importance scoring in Generative Agents (arXiv:2304.03442), experience distillation in ExpeL and A-MEM, and Voyager's library of agent-written skills (arXiv:2305.16291). Surveys treat memory as a write, manage, read loop and document the field's shift from message passing to shared substrates (arXiv:2603.07670; arXiv:2512.13564). The write path is event sourcing (Fowler; Kleppmann 2017). Decisions with rationale are Nygard's architecture decision records (2011). Knowledge decay has a long literature in organisational memory (Walsh & Ungson 1991). The archivist follows archival practice: appraisal, description, and respect for provenance (Society of American Archivists, *Dictionary of Archives Terminology*).
+**Memory.** Tiered agent memory follows MemGPT's operating-system hierarchy (arXiv:2310.08560), reflection and importance scoring in Generative Agents (arXiv:2304.03442), experience distillation in ExpeL and A-MEM, and Voyager's library of agent-written skills (arXiv:2305.16291). Surveys treat memory as a write, manage, read loop and document the field's shift from message passing to shared substrates (arXiv:2603.07670; arXiv:2512.13564). The write path is event sourcing (Fowler; Kleppmann 2017). Decisions with rationale are Nygard's architecture decision records (2011). Knowledge decay has a long literature in organisational memory (Walsh & Ungson 1991). The curator follows archival practice: appraisal, description, and respect for provenance (Society of American Curators, *Dictionary of Archives Terminology*).
 
-**Trust.** Trust is not transitive (Christianson & Harbison 1997) and is typed by purpose (Jøsang & Pope 2005); propagation can be computed but is lossy, and distrust needs separate handling (Guha et al. 2004). W3C PROV is the standard vocabulary for the provenance each entry carries and the lineage the historian records. Consolidation that drops source constraints, "authority collapse", is benchmarked in arXiv:2608.01679. Circular reporting, where a claim is corroborated by its own echoes, is why an entry may not count anything derived from it as support. Separation of privilege dates to Saltzer & Schroeder (1975).
+**Trust.** Trust is not transitive (Christianson & Harbison 1997) and is typed by purpose (Jøsang & Pope 2005); propagation can be computed but is lossy, and distrust needs separate handling (Guha et al. 2004). W3C PROV is the standard vocabulary for the provenance each entry carries and the lineage the historian records; its *used* and *generated* relations are the read and write edges. Consolidation that drops source constraints, "authority collapse", is benchmarked in arXiv:2608.01679. Circular reporting, where a claim is corroborated by its own echoes, is why an entry may not count anything derived from it as support. Separation of privilege dates to Saltzer & Schroeder (1975).
 
 **Safety.** The incident in §1 is documented in Hugging Face's disclosure and OpenAI's statement (2026); the agents' message board was described in OpenAI's Black Hat briefing, as reported by Cybersecurity Dive (2026). The other hazards come from reporting on the Samsung leak (CSO Online 2023) and a study of package hallucination (Spracklen et al., USENIX Security 2025). The attacks are indirect prompt injection through retrieved content (Greshake et al., arXiv:2302.12173) and memory poisoning, through ordinary queries (MINJA, arXiv:2503.03704) or through poisoned stores (AgentPoison, arXiv:2407.12784); prompt-injection defences largely miss the latter (arXiv:2606.04329), and OWASP lists memory and context poisoning among the top risks for agentic applications (ASI06, 2025). Governed shared memory for agent fleets names four failure modes (leakage, stale propagation, persistent contradiction, provenance collapse) that the filters, review dates, supersession, and provenance here address (arXiv:2606.24535). Treating retrieved content as data that cannot become control flow is the commitment CaMeL enforces with capabilities (arXiv:2503.18813).
 
@@ -891,9 +900,13 @@ Christianson, B., & Harbison, W. S. (1997). Why Isn't Trust Transitive? *Securit
 
 Cybersecurity Dive (2026). OpenAI Warns Autonomous Hacks Are 'Watershed Moment for Computer Security'. 6 August 2026. https://www.cybersecuritydive.com/news/openai-hugging-face-hack-ai-models-black-hat/827167/
 
+DAMA International (2017). *DAMA-DMBOK: Data Management Body of Knowledge*, 2nd ed. Technics Publications.
+
 Debenedetti, E., et al. (2025). Defeating Prompt Injections by Design (CaMeL). arXiv:2503.18813. https://arxiv.org/abs/2503.18813
 
 Dehghani, Z. (2019). How to Move Beyond a Monolithic Data Lake to a Distributed Data Mesh. https://martinfowler.com/articles/data-monolith-to-mesh.html
+
+Digital Curation Centre. What Is Digital Curation? https://www.dcc.ac.uk/about/digital-curation
 
 Dong, S., He, P., Tang, J., Liu, H., et al. (2025). Memory Injection Attacks on LLM Agents via Query-Only Interaction (MINJA). *NeurIPS 2025*. arXiv:2503.03704. https://arxiv.org/abs/2503.03704
 
@@ -990,7 +1003,6 @@ Sharma, S. (2023). Samsung Bans Staff AI Use over Data Leak Concerns. *CSO Onlin
 
 Smith, R. G. (1980). The Contract Net Protocol: High-Level Communication and Control in a Distributed Problem Solver. *IEEE Transactions on Computers*, C-29(12).
 
-Society of American Archivists. Archivist. *Dictionary of Archives Terminology*. https://dictionary.archivists.org/entry/archivist.html
 
 Spracklen, J., Wijewickrama, R., Sakib, A. H. M. N., Maiti, A., Viswanath, B., & Jadliwala, M. (2025). We Have a Package for You! A Comprehensive Analysis of Package Hallucinations by Code Generating LLMs. *USENIX Security 2025*. https://www.usenix.org/conference/usenixsecurity25/presentation/spracklen
 
@@ -1092,7 +1104,7 @@ A new deployment starts on top of existing knowledge: repositories, tickets, rev
 
 **Order of work.** Domains first, with current owners registered. Then one verified interface summary per domain, so every area can answer "what is this and where do I look". Pilot on two or three deliberately different domains, hold them to M1 and M2, then fan out.
 
-**Knowledge about code lives in memory, not in the repository.** In-repository agent instruction files are memory without the machinery: no provenance, tier, review date, audit, or owner, read whole every session, and unable to span repositories. The boundary: if a commit changes its truth, it belongs in the repository; if understanding changes its truth, it belongs in memory. Where a repository still needs an instruction file, for outside contributors or tools that cannot call the service, the archivist generates one: a small digest of the domain's T0 slice, marked as generated, with its digest in a published list. A fleet harness never mounts stubs. A harness that can reach the service drops current and stale stubs and reads the service instead, and never loads a hand-edited one; a hand edit is rejected in review or harvested back as a raw entry. A foreign harness that loads instruction files on its own needs a load-time hook to apply the list; without one, the stub's shape limits the damage, since it holds pointers, not a second copy of the facts. Skills served through the tool protocol follow the same rule: only verified bundles are loaded, and a changed digest revokes approval.
+**Knowledge about code lives in memory, not in the repository.** In-repository agent instruction files are memory without the machinery: no provenance, tier, review date, audit, or owner, read whole every session, and unable to span repositories. The boundary: if a commit changes its truth, it belongs in the repository; if understanding changes its truth, it belongs in memory. Where a repository still needs an instruction file, for outside contributors or tools that cannot call the service, the curator generates one: a small digest of the domain's T0 slice, marked as generated, with its digest in a published list. A fleet harness never mounts stubs. A harness that can reach the service drops current and stale stubs and reads the service instead, and never loads a hand-edited one; a hand edit is rejected in review or harvested back as a raw entry. A foreign harness that loads instruction files on its own needs a load-time hook to apply the list; without one, the stub's shape limits the damage, since it holds pointers, not a second copy of the facts. Skills served through the tool protocol follow the same rule: only verified bundles are loaded, and a changed digest revokes approval.
 
 **Leaving the system.** `export(domain, max_label)` is a read under the caller's filter: entries at or below the label, with provenance, classification, and supersession. The bundle carries the highest label inside it and goes only to a destination whose ceiling allows that label. Import is the mirror: entries land raw, keep their classification or take the receiving domain's higher default, and are keyed on origin so a second import creates nothing. A personal domain moving between its owner's homes keeps its tiers; everything else earns them again.
 
@@ -1191,11 +1203,11 @@ When the ledger is down, the historian still accepts appends: handoffs and heart
 
 | Failure | Defence |
 |---|---|
-| Lost lineage | Every write, read, ledger operation, and curation action is an event in the historian; derivation and read edges are queryable (§3) |
+| Lost lineage | Every write, read, send, ledger operation, and curation action is an event; informed-by edges are computed by the service, not declared by agents (§3) |
 | Memory poisoning | Provenance; tiers that rise only through gates; imports start raw; content is data; independent auditors (§4, §5) |
 | Leaked secret or unsafe output in memory | Write-time screening; nothing raw is executed or loaded; outbound only within ceilings (§4) |
 | Trust carried along a chain | Derived entries take the weakest input; imports start raw; federation lends no authority (§4) |
-| Wrong or compromised archivist | Reversible diffs; auditors on another model; telemetry out of its reach; approver never the proposer; lineage re-check; canaries (§5) |
+| Wrong or compromised curator | Reversible diffs; auditors on another model; telemetry out of its reach; approver never the proposer; lineage re-check; canaries (§5) |
 | Content leaves its boundary | Labels on entries, tasks, and sessions; ceilings on destinations; writes inherit; down only through a guard (§4) |
 | Exfiltration through a tool | Ceilings and source labels per server; grants per principal and server; label checked per call; denials alert as probing (§4) |
 | Crashed agent holds work | Leases and heartbeats; handoff recovery (§8) |
