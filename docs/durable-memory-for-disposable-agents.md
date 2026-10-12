@@ -6,7 +6,7 @@ Sander Striker · August 2026 · revised October 2026
 
 Written with Claude Fable 5 and Claude Opus 5 (Anthropic).
 
-*Agent fleets doing sustained work need to remember, to coordinate, and to survive the replacement of every part they are built from. Sharing what agents learn is also how one model's mistakes, leaked secrets, and planted instructions reach every other agent. This paper proposes memory as plain text with provenance in a versioned record. Agents read it in small, cheap steps, coordinate through a shared task ledger, and act inside limits they cannot change. Each entry records where it came from, how far it has been checked, and who may see it, and trust never passes along a chain on its own. Memory keeps its place only while it measurably beats running without it, and every component can be replaced.*
+*Agent fleets need shared memory, and shared memory spreads mistakes and leaked secrets as easily as knowledge. This paper designs one that is cheap to read, safe to share, and outlives every model and tool it runs on.*
 
 ---
 
