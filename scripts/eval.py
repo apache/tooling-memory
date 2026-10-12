@@ -35,9 +35,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -152,15 +154,46 @@ def bare_env(env, harness, auth):
 
 
 def run(cmd, cwd, env, timeout):
+    """Run one condition's command, and measure what it cost this host: the wall clock,
+    and the CPU time and peak memory of its process tree as the kernel counted them when
+    it was reaped (`wait4`), the same way for every condition. Under `memory` that is the
+    launcher, the egress and the confined harness; bare, the harness alone."""
     started = time.time()
-    try:
-        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        out, err, code = p.stdout, p.stderr, p.returncode
-    except subprocess.TimeoutExpired as e:
-        # a timed-out run hands its output back as bytes, whatever `text` said
-        text = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
-        out, err, code = text(e.stdout), text(e.stderr) + "\n[timed out]", 124
-    return out, err, code, time.time() - started
+    # a session of its own, so a timeout ends the whole tree, not only its first process
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    got = {}
+    readers = [threading.Thread(target=lambda k=k, f=f: got.__setitem__(k, f.read()))
+               for k, f in (("out", p.stdout), ("err", p.stderr))]
+    for t in readers:
+        t.start()
+    timed_out = threading.Event()
+
+    def kill():
+        timed_out.set()
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # it ended as the clock ran out
+
+    timer = threading.Timer(timeout, kill)
+    timer.start()
+    _, status, ru = os.wait4(p.pid, 0)
+    timer.cancel()
+    # reaped here, so the Popen must not wait for it again
+    p.returncode = os.waitstatus_to_exitcode(status)
+    for t in readers:
+        t.join()
+    text = lambda b: (b or b"").decode("utf-8", "replace")
+    out, err, code = text(got.get("out")), text(got.get("err")), p.returncode
+    if timed_out.is_set():
+        err, code = err + "\n[timed out]", 124
+    secs = time.time() - started
+    # ru_maxrss is KiB on Linux, bytes on macOS
+    rss_kib = ru.ru_maxrss / 1024 if sys.platform == "darwin" else ru.ru_maxrss
+    resources = {"wall_s": round(secs, 1), "cpu_user_s": round(ru.ru_utime, 2),
+                 "cpu_sys_s": round(ru.ru_stime, 2), "peak_mib": round(rss_kib / 1024, 1)}
+    return out, err, code, secs, resources
 
 
 def main():
@@ -219,7 +252,7 @@ def main():
                     if args.provider:
                         cmd += ["--provider", args.provider]
                     cwd = tempfile.mkdtemp(prefix="eval-mem-")
-                    out, err, code, secs = run(cmd, cwd, env, args.timeout)
+                    out, err, code, secs, resources = run(cmd, cwd, env, args.timeout)
                     session = None
                     m = re.search(r"session (sess-[a-z0-9]+)", err)
                     if m:
@@ -241,7 +274,7 @@ def main():
                     # a bare codex speaks to the gateway through its openai provider, which
                     # reads OPENAI_BASE_URL; it still wants the model on its catalog, which a
                     # gateway's is not, so the warning is expected
-                    out, err, code, secs = run(cmd, cwd, bare_env(env, harness, args.auth), args.timeout)
+                    out, err, code, secs, resources = run(cmd, cwd, bare_env(env, harness, args.auth), args.timeout)
                     home = Path.home()
                     transcript = newest([str(home / ".claude" / "projects" / "**" / "*.jsonl"), str(home / ".codex" / "sessions" / "**" / "*.jsonl")], since)
                     session = None
@@ -255,12 +288,13 @@ def main():
                 r = {
                     "task": t["id"], "harness": harness, "condition": cond, "model": args.model,
                     "pass": passed, "exit": code, "seconds": round(secs, 1), "session": session,
-                    "usage": usage, "answer": answer[-600:], "transcript": transcript,
+                    "usage": usage, "resources": resources, "answer": answer[-600:], "transcript": transcript,
                     "stderr": err.strip()[-600:] if code != 0 else "",
                 }
                 results.append(r)
                 tok = f"{usage['input']}+{usage['cache_read']}c in, {usage['output']} out" if usage else "no transcript"
-                print(f"{harness:<10} {cond:<7} {t['id']:<18} {'PASS' if passed else 'FAIL'}  {secs:5.0f}s  {tok}", flush=True)
+                cpu = resources["cpu_user_s"] + resources["cpu_sys_s"]
+                print(f"{harness:<10} {cond:<7} {t['id']:<18} {'PASS' if passed else 'FAIL'}  {secs:5.0f}s  {tok}, cpu {cpu:.1f}s, peak {resources['peak_mib']:.0f} MiB", flush=True)
 
     out_dir = HERE / "evals" / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -270,8 +304,8 @@ def main():
     out_path.write_text(json.dumps({"set": args.set, "root": str(root), "args": vars(args), "results": results}, indent=1))
 
     print()
-    print("| harness | condition | passed | input tokens | cached | output | seconds |")
-    print("|---|---|---|---|---|---|---|")
+    print("| harness | condition | passed | input tokens | cached | output | seconds | cpu s | peak MiB |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for harness in harnesses:
         for cond in conditions:
             rs = [r for r in results if r["harness"] == harness and r["condition"] == cond]
@@ -283,7 +317,9 @@ def main():
             tc = sum(u["cache_read"] for u in us)
             tout = sum(u["output"] for u in us)
             secs = sum(r["seconds"] for r in rs)
-            print(f"| {harness} | {cond} | {ok}/{len(rs)} | {tin} | {tc} | {tout} | {secs:.0f} |")
+            cpu = sum(r["resources"]["cpu_user_s"] + r["resources"]["cpu_sys_s"] for r in rs)
+            peak = max(r["resources"]["peak_mib"] for r in rs)
+            print(f"| {harness} | {cond} | {ok}/{len(rs)} | {tin} | {tc} | {tout} | {secs:.0f} | {cpu:.1f} | {peak:.0f} |")
     print(f"\nwritten {out_path.relative_to(HERE)}")
 
 

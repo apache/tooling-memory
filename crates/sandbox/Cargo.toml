@@ -32,8 +32,10 @@ dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31", features = ["sched", "mount", "user", "fs", "process", "hostname", "signal"] }
 
 [dev-dependencies]

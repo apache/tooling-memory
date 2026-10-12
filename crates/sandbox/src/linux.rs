@@ -9,7 +9,7 @@
 //! No network interface exists inside except loopback. The only way out is the unix
 //! socket bind-mounted from the host, which the relay forwards to.
 
-use crate::{Error, Mount, Plan};
+use crate::{Error, Mount, Plan, Resources};
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::{getgid, getuid, pivot_root, sethostname};
@@ -216,18 +216,15 @@ fn build_root(plan: &Plan, root: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Run the plan: fork, confine the child, exec the relay. Returns the exit code.
+/// Run the plan: fork, confine the child, exec the relay. Returns the exit code and what
+/// the confined tree cost the host.
 ///
 /// # Errors
 ///
 /// When the sandbox cannot be built or the relay cannot be started.
-pub fn run(plan: &Plan) -> Result<i32, Error> {
-    let (mut cmd, root) = command(plan)?;
-    let status = cmd
-        .status()
-        .map_err(|e| confine(format!("spawn {}: {e}", plan.argv[0])))?;
-    std::fs::remove_dir_all(&root).ok();
-    Ok(status.code().unwrap_or(1))
+pub fn run(plan: &Plan) -> Result<(i32, Resources), Error> {
+    let (code, _, r) = measured(plan, false)?;
+    Ok((code, r))
 }
 
 /// As [`run`], with the harness's standard output captured; standard error is inherited.
@@ -235,16 +232,16 @@ pub fn run(plan: &Plan) -> Result<i32, Error> {
 /// # Errors
 ///
 /// When the sandbox cannot be built or the relay cannot be started.
-pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>), Error> {
+pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>, Resources), Error> {
+    measured(plan, true)
+}
+
+fn measured(plan: &Plan, capture: bool) -> Result<(i32, Vec<u8>, Resources), Error> {
     let (mut cmd, root) = command(plan)?;
-    let out = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .map_err(|e| confine(format!("spawn {}: {e}", plan.argv[0])))?;
+    let ran = crate::measure::run(&mut cmd, capture)
+        .map_err(|e| confine(format!("spawn {}: {e}", plan.argv[0])));
     std::fs::remove_dir_all(&root).ok();
-    Ok((out.status.code().unwrap_or(1), out.stdout))
+    ran
 }
 
 /// The command that builds the sandbox in `pre_exec` and execs the relay, and the

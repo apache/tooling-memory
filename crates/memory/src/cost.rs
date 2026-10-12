@@ -6,12 +6,20 @@
 //! harness's own login is plan quota, not metered spend, and is shown as tokens beside
 //! the money, never priced. A model the table does not name is shown unpriced rather
 //! than guessed at.
+//!
+//! Tokens are one resource class of the paper's price vector (§12); the host's own
+//! are the others: each run's wall clock, the CPU time and peak memory of the process
+//! tree it confined, and the launcher's own CPU, the egress among it, as the launcher
+//! recorded them, and the time spent waiting on model calls, as the egress timed them.
+//! `[resources]` in the same table prices CPU time and memory held; unpriced, they are
+//! shown in their own units.
 
-use dm_egress::telemetry::{SessionModel, Telemetry, BILLING_PLAN};
+use dm_egress::telemetry::{Run, SessionModel, Telemetry, BILLING_PLAN};
 use dm_server::Memory;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 /// The template `amem init` writes: every rate left for the owner to fill in.
 pub const TEMPLATE: &str = r#"# What a million tokens cost, in US dollars, per model as the provider reports it in
@@ -25,6 +33,14 @@ pub const TEMPLATE: &str = r#"# What a million tokens cost, in US dollars, per m
 # output = 0.0
 # cache_read = 0.0
 # cache_write = 0.0
+#
+# The host's own resources, per run of a harness: CPU time of the process tree and the
+# launcher, in US dollars per CPU-hour, and peak resident memory held for the run's wall
+# clock, in US dollars per GiB-hour. Left out, they are shown unpriced.
+#
+# [resources]
+# cpu_hour = 0.0
+# memory_gib_hour = 0.0
 "#;
 
 /// The rates of one model, in US dollars per million tokens.
@@ -40,11 +56,25 @@ pub struct Rate {
     pub cache_write: f64,
 }
 
+/// What the host's resources cost, in US dollars.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ResourceRates {
+    /// Per hour of CPU time, user and system, the run's tree and the launcher's.
+    #[serde(default)]
+    pub cpu_hour: f64,
+    /// Per GiB of peak resident memory held for an hour of the run's wall clock.
+    #[serde(default)]
+    pub memory_gib_hour: f64,
+}
+
 /// The table.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Prices {
     #[serde(default)]
     pub models: BTreeMap<String, Rate>,
+    /// The host's resources; absent, they are not priced.
+    #[serde(default)]
+    pub resources: Option<ResourceRates>,
 }
 
 impl Prices {
@@ -84,6 +114,17 @@ impl Prices {
             / 1_000_000.0;
         Some(usd)
     }
+
+    /// What a run's host resources cost, when they are priced.
+    #[must_use]
+    pub fn run_cost(&self, r: &Run) -> Option<f64> {
+        let rates = self.resources.as_ref()?;
+        #[allow(clippy::cast_precision_loss)] // milliseconds and KiB, priced
+        let usd = (r.user_ms + r.sys_ms + r.launcher_cpu_ms) as f64 / 3_600_000.0 * rates.cpu_hour
+            + r.max_rss_kib as f64 / 1_048_576.0 * r.wall_ms as f64 / 3_600_000.0
+                * rates.memory_gib_hour;
+        Some(usd)
+    }
 }
 
 /// One session's cost.
@@ -100,6 +141,22 @@ pub struct Session {
     pub calls: u64,
     /// The tasks this session completed: it wrote their closing handoff.
     pub tasks: Vec<String>,
+    /// Runs of a harness under this session.
+    pub runs: u64,
+    /// Their wall clock, summed, in milliseconds.
+    pub wall_ms: u64,
+    /// CPU time of their process trees, user and system, in milliseconds.
+    pub cpu_ms: u64,
+    /// The launcher's own CPU time over them, the egress among it, in milliseconds.
+    pub launcher_cpu_ms: u64,
+    /// The largest resident set one process reached in any of them, in KiB.
+    pub max_rss_kib: u64,
+    /// Whether every run's CPU and memory were counted, not only its wall clock.
+    pub measured: bool,
+    /// Time spent waiting on the model calls the egress saw, in milliseconds.
+    pub call_ms: u64,
+    /// The share of `usd` that is the host's resources.
+    pub resource_usd: f64,
 }
 
 /// One completed task's cost: its session's, shared with the other tasks it completed.
@@ -112,6 +169,11 @@ pub struct TaskCost {
     /// Whether some of its session's tokens were unpriced or plan quota, so the money
     /// is not all of it.
     pub partial: bool,
+    /// Its share of the session's wall clock, in milliseconds.
+    pub wall_ms: u64,
+    /// Its share of the session's CPU time, the trees' and the launcher's, in
+    /// milliseconds.
+    pub cpu_ms: u64,
 }
 
 /// The report.
@@ -132,6 +194,7 @@ fn tokens(u: &SessionModel) -> u64 {
 #[must_use]
 pub fn price(
     rows: &[SessionModel],
+    runs: &[Run],
     prices: &Prices,
     completed: &[(String, String, String)],
 ) -> Report {
@@ -140,15 +203,35 @@ pub fn price(
         let s = by.entry(u.session.clone()).or_insert_with(|| Session {
             session: u.session.clone(),
             first: u.first.clone(),
+            measured: true,
             ..Session::default()
         });
         s.calls += u.calls;
+        s.call_ms += u.call_ms;
         if u.billing == BILLING_PLAN {
             *s.plan.entry(u.model.clone()).or_default() += tokens(u);
         } else if let Some(usd) = prices.cost(u) {
             s.usd += usd;
         } else {
             *s.unpriced.entry(u.model.clone()).or_default() += tokens(u);
+        }
+    }
+    for r in runs {
+        let s = by.entry(r.session.clone()).or_insert_with(|| Session {
+            session: r.session.clone(),
+            first: r.at.clone(),
+            measured: true,
+            ..Session::default()
+        });
+        s.runs += 1;
+        s.wall_ms += r.wall_ms;
+        s.cpu_ms += r.user_ms + r.sys_ms;
+        s.launcher_cpu_ms += r.launcher_cpu_ms;
+        s.max_rss_kib = s.max_rss_kib.max(r.max_rss_kib);
+        s.measured &= r.measured;
+        if let Some(usd) = prices.run_cost(r) {
+            s.resource_usd += usd;
+            s.usd += usd;
         }
     }
     for (task, _, session) in completed {
@@ -161,12 +244,15 @@ pub fn price(
         if let Some(s) = by.get(session) {
             #[allow(clippy::cast_precision_loss)] // a count of tasks
             let share = s.usd / s.tasks.len().max(1) as f64;
+            let n = u64::try_from(s.tasks.len().max(1)).unwrap_or(1);
             tasks.push(TaskCost {
                 task: task.clone(),
                 title: title.clone(),
                 session: session.clone(),
                 usd: share,
                 partial: !s.unpriced.is_empty() || !s.plan.is_empty(),
+                wall_ms: s.wall_ms / n,
+                cpu_ms: (s.cpu_ms + s.launcher_cpu_ms) / n,
             });
         }
     }
@@ -217,9 +303,44 @@ pub async fn report(root: &Path) -> Result<Report, Box<dyn std::error::Error>> {
     let t = Telemetry::open(&root.join("state/telemetry.db"))?;
     Ok(price(
         &t.by_session_model()?,
+        &t.runs()?,
         &Prices::load(root)?,
         &completed(&m).await?,
     ))
+}
+
+/// Milliseconds as whole seconds, for a table.
+fn secs(ms: u64) -> String {
+    format!("{:.1}", Duration::from_millis(ms).as_secs_f64())
+}
+
+/// The sessions' host resources, for those that ran a harness.
+fn resources(s: &mut String, r: &Report) {
+    let ran: Vec<&Session> = r.sessions.iter().filter(|x| x.runs > 0).collect();
+    if ran.is_empty() {
+        return;
+    }
+    s.push_str(
+        "\nhost resources   runs   wall s  cpu s  launcher s  peak MiB  on calls s      usd\n",
+    );
+    for x in ran {
+        s.push_str(&format!(
+            "{:<16} {:>4} {:>8} {:>6} {:>11} {:>9} {:>11} {:>8.4}{}\n",
+            x.session,
+            x.runs,
+            secs(x.wall_ms),
+            secs(x.cpu_ms),
+            secs(x.launcher_cpu_ms),
+            x.max_rss_kib / 1024,
+            secs(x.call_ms),
+            x.resource_usd,
+            if x.measured {
+                ""
+            } else {
+                "  (wall clock only)"
+            }
+        ));
+    }
 }
 
 /// The report as text.
@@ -248,21 +369,24 @@ pub fn render(r: &Report) -> String {
             other.join(", ")
         ));
     }
+    resources(&mut s, r);
     if !r.tasks.is_empty() {
-        s.push_str("\ncompleted task      usd  title\n");
+        s.push_str("\ncompleted task      usd   wall s  cpu s  title\n");
         for t in &r.tasks {
             s.push_str(&format!(
-                "{:<18} {:>6.4}{} {}\n",
+                "{:<18} {:>6.4}{} {:>7} {:>6}  {}\n",
                 t.task,
                 t.usd,
                 if t.partial { "+" } else { " " },
+                secs(t.wall_ms),
+                secs(t.cpu_ms),
                 t.title
             ));
         }
         s.push_str("  + some of that session's tokens were unpriced or plan quota\n");
     }
     s.push_str(&format!(
-        "\ntotal metered spend on priced models: ${:.4}\n",
+        "\ntotal metered spend on priced models and resources: ${:.4}\n",
         r.usd
     ));
     s
@@ -274,6 +398,7 @@ mod tests {
 
     fn row(session: &str, model: &str, billing: &str, input: u64, cache_read: u64) -> SessionModel {
         SessionModel {
+            call_ms: 0,
             session: session.into(),
             destination: "d".into(),
             model: model.into(),
@@ -316,7 +441,7 @@ mod tests {
             ("t2".to_string(), "B".to_string(), "s1".to_string()),
             ("t3".to_string(), "C".to_string(), "s2".to_string()),
         ];
-        let r = price(&rows, &p, &done);
+        let r = price(&rows, &[], &p, &done);
         assert!(
             (r.usd - 2.0).abs() < 1e-9,
             "only the metered, priced session costs money"
@@ -334,5 +459,58 @@ mod tests {
         let s3 = r.sessions.iter().find(|s| s.session == "s3").unwrap();
         assert_eq!(s3.unpriced.get("other"), Some(&1005));
         assert!(render(&r).contains("on a plan"));
+    }
+
+    fn run(session: &str, measured: bool) -> Run {
+        Run {
+            session: session.into(),
+            at: "2026-10-12T00:00:00Z".into(),
+            harness: "claude".into(),
+            runner: "namespaces".into(),
+            task: None,
+            exit: 0,
+            wall_ms: 3_600_000,
+            user_ms: 2_000_000,
+            sys_ms: 1_000_000,
+            max_rss_kib: 1_048_576,
+            measured,
+            launcher_cpu_ms: 600_000,
+        }
+    }
+
+    #[test]
+    fn a_runs_host_resources_are_priced_and_shared_like_its_tokens() {
+        let p: Prices =
+            toml::from_str("[resources]\ncpu_hour = 0.5\nmemory_gib_hour = 0.25\n").unwrap();
+        // an hour of CPU in all, and a GiB held for an hour of wall clock
+        let rows = vec![row("s1", "m", "metered", 10, 0)];
+        let done = vec![
+            ("t1".to_string(), "A".to_string(), "s1".to_string()),
+            ("t2".to_string(), "B".to_string(), "s1".to_string()),
+        ];
+        let r = price(&rows, &[run("s1", true), run("s2", false)], &p, &done);
+        let s1 = r.sessions.iter().find(|s| s.session == "s1").unwrap();
+        assert!((s1.resource_usd - 0.75).abs() < 1e-9, "{s1:?}");
+        assert!(
+            (s1.usd - 0.75).abs() < 1e-9,
+            "the model is unpriced: {s1:?}"
+        );
+        assert_eq!(
+            (s1.runs, s1.cpu_ms, s1.launcher_cpu_ms),
+            (1, 3_000_000, 600_000)
+        );
+        let t1 = r.tasks.iter().find(|t| t.task == "t1").unwrap();
+        assert_eq!((t1.wall_ms, t1.cpu_ms), (1_800_000, 1_800_000), "half each");
+        assert!((t1.usd - 0.375).abs() < 1e-9);
+        let s2 = r.sessions.iter().find(|s| s.session == "s2").unwrap();
+        assert!(!s2.measured, "a run with only its wall clock");
+        let text = render(&r);
+        assert!(text.contains("host resources"), "{text}");
+        assert!(text.contains("(wall clock only)"), "{text}");
+        assert!(text.contains("1024"), "a GiB, in MiB: {text}");
+        // unpriced, the resources are shown and cost nothing
+        let free = price(&rows, &[run("s1", true)], &Prices::default(), &done);
+        assert!(free.usd.abs() < 1e-9);
+        assert_eq!(free.sessions[0].wall_ms, 3_600_000);
     }
 }

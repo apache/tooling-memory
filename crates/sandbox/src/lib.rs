@@ -40,7 +40,10 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod measure;
 pub mod seatbelt;
+
+pub use measure::Resources;
 
 /// What can go wrong preparing or running a sandbox.
 #[derive(Debug, thiserror::Error)]
@@ -1911,13 +1914,14 @@ fn claude_global_config(path: &Path, workdir: &Path) -> Result<(), Error> {
     write(path, &serde_json::to_string_pretty(&v).unwrap_or_default())
 }
 
-/// Run a plan under the backend its layout is for, returning the harness's exit code.
+/// Run a plan under the backend its layout is for, returning the harness's exit code
+/// and what the confined process tree cost the host.
 ///
 /// # Errors
 ///
 /// [`Error::NoBackend`] for a namespaces plan off Linux or a Seatbelt plan off macOS,
 /// or a confinement failure.
-pub fn run(plan: &Plan) -> Result<i32, Error> {
+pub fn run(plan: &Plan) -> Result<(i32, Resources), Error> {
     match plan.layout.backend {
         Backend::Namespaces => {
             #[cfg(target_os = "linux")]
@@ -1948,7 +1952,7 @@ pub fn run(plan: &Plan) -> Result<i32, Error> {
 /// # Errors
 ///
 /// As [`run`].
-pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>), Error> {
+pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>, Resources), Error> {
     match plan.layout.backend {
         Backend::Namespaces => {
             #[cfg(target_os = "linux")]

@@ -395,11 +395,10 @@ fn command(plan: &Plan) -> Result<std::process::Command, Error> {
 ///
 /// When the profile cannot be made or `sandbox-exec` cannot be started.
 #[cfg(target_os = "macos")]
-pub fn run(plan: &Plan) -> Result<i32, Error> {
-    let status = command(plan)?
-        .status()
+pub fn run(plan: &Plan) -> Result<(i32, crate::Resources), Error> {
+    let (code, _, r) = crate::measure::run(&mut command(plan)?, false)
         .map_err(|e| Error::Confine(format!("spawn {SANDBOX_EXEC}: {e}")))?;
-    Ok(status.code().unwrap_or(1))
+    Ok((code, r))
 }
 
 /// As [`run`], with the harness's standard output captured; standard error is inherited.
@@ -408,14 +407,9 @@ pub fn run(plan: &Plan) -> Result<i32, Error> {
 ///
 /// When the profile cannot be made or `sandbox-exec` cannot be started.
 #[cfg(target_os = "macos")]
-pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>), Error> {
-    let out = command(plan)?
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .map_err(|e| Error::Confine(format!("spawn {SANDBOX_EXEC}: {e}")))?;
-    Ok((out.status.code().unwrap_or(1), out.stdout))
+pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>, crate::Resources), Error> {
+    crate::measure::run(&mut command(plan)?, true)
+        .map_err(|e| Error::Confine(format!("spawn {SANDBOX_EXEC}: {e}")))
 }
 
 #[cfg(test)]

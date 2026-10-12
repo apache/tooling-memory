@@ -141,6 +141,27 @@ fn unconfined_launch_wires_the_egress_and_propagates_the_exit_code() {
         .unwrap();
     assert!(usage.status.success());
     assert!(String::from_utf8_lossy(&usage.stdout).contains("no model calls recorded"));
+    the_run_is_kept_with_what_it_cost_the_host(&root);
+}
+
+/// One run, kept with its wall clock and what the kernel counted, and shown by `cost`.
+fn the_run_is_kept_with_what_it_cost_the_host(root: &Path) {
+    let cost = memory()
+        .args(["--root", root.to_str().unwrap(), "cost", "--json"])
+        .output()
+        .unwrap();
+    assert!(cost.status.success());
+    let r: serde_json::Value = serde_json::from_slice(&cost.stdout).unwrap();
+    let s = &r["sessions"][0];
+    assert_eq!(s["runs"], 1, "{r}");
+    assert_eq!(s["measured"], true, "{r}");
+    assert!(s["wall_ms"].as_u64().unwrap() > 0, "{r}");
+    assert!(s["max_rss_kib"].as_u64().unwrap() > 0, "{r}");
+    let text = memory()
+        .args(["--root", root.to_str().unwrap(), "cost"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&text.stdout).contains("host resources"));
 }
 
 #[test]

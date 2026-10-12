@@ -55,12 +55,11 @@ harnesses in two weeks, and it is also why none of it is the production shape.
   digests, flip rate, formats and refusals. What is missing is logprob divergence and
   change-point detection over many runs; the probes run each curation cycle with
   `--drift`, against fixed thresholds.
-- **Costing beyond tokens.** The egress meters tokens, cache reads and writes, and calls
-  per session, destination and model, and `amem cost` prices them. Wall-clock time is
-  measured only by the evaluation, re-enactment and the drift probes; nothing records a
-  session's or a task's duration, a call's latency, CPU time, memory, accelerator time or
-  bytes stored, which the paper's price vector (§12) counts too, and the sandbox sets no
-  CPU or memory limits.
+- **Costing, in part.** Tokens, calls, each call's time, and each run's wall clock, CPU
+  time and peak memory are measured and priced (`amem cost`, `amem usage`, the
+  evaluation). Not yet: a task's own duration from claim to completion, accelerator time,
+  which only the gateway can count, bytes stored, and CPU or memory limits on the
+  sandbox.
 - **Smaller pieces.** The search tool has met only a fake of Brave's API, never the live
   provider.
 - **Platforms and CI.** Confinement on macOS is dry-coded: a Seatbelt profile made from
@@ -107,7 +106,10 @@ These do what the paper says, on one laptop, and each names what replaces it.
   owner by hand (`amem source release`). Production: the same tools as hosted servers on
   the Foundation's gateway, reached through the egress.
 - **Cost** is priced from a table the owner keeps by hand, and a task's share is its
-  session's spend divided evenly among the tasks it completed. Production: the gateway's
+  session's spend, wall clock and CPU divided evenly among the tasks it completed. A
+  run's CPU and memory are counted when it is reaped (`wait4`), which sees a process tree
+  only as far as each level reaps its children, and peak memory is the largest process's,
+  not the tree's sum. Production: the gateway's
   per-key spend, with each call tagged with its task and trace.
 - **The evaluation** is four questions graded by regular expression, under four
   conditions (with this memory, with an empty one, the bare harness, and the bare harness
@@ -155,7 +157,7 @@ otherwise, and the process touches nothing outside it:
 | `grants.toml` | The perimeter's data: domains and their labels, destinations and their ceilings, `[gates]`, `[spend.<destination>]`, `[taps.<name>]` for taps and tools, `platform = "<domain>"`, and `[ledger]` for PostgreSQL |
 | `credentials.env` | API keys, `LLMAO_KEY`, `GH_TOKEN`, as `NAME=value`, mode 600; the environment wins |
 | `profiles.toml` | Named launches: harness, auth, model, subagents |
-| `prices.toml` | USD per million tokens per model, for `amem cost` |
+| `prices.toml` | USD per million tokens per model, and per CPU-hour and GiB-hour under `[resources]`, for `amem cost` |
 | `policy/*.rego` | Optional: replaces the built-in policy |
 | `record/<domain>/` | The entries, Markdown with frontmatter, never edited in place; `.history`, `.erasures`, `.transcripts`, `.contexts` and `.tapes` (re-enactment's, the owner's alone) beside them |
 | `state/` | Operational, and rebuildable but for the event log: `log/<domain>.jsonl`, the event log, the order of record the index is rebuilt from; `index.db`, `ledger.db`, `telemetry.db`; the read, write and decision logs as JSONL; the quarantine; drift, replay and re-enactment runs |
@@ -221,7 +223,7 @@ re-enactment, the event log, the platform domain and the Gofannon bridge so far 
 | Trust tiers | Raw, curated, verified; verified only by a person who did not propose it; review clocks and decay | `promote`, `approve` |
 | The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced once verified, with scoped exceptions); admission, the read filter, the write scan and quarantine, blast-radius gates; every decision logged | `policy show, eval, list, lint`, `quarantine`, `taint` |
 | The librarian | A survey of what needs curation, an independent checker, contradiction hunting, canaries, its own telemetry and alarms, a cycle on a budget | `librarian`, `curate`, `check`, `canary` |
-| The egress | Model calls forwarded and metered, spend limits per destination, decision contexts recorded | `launch`, `usage`, `cost` |
+| The egress | Model calls forwarded, metered and timed, spend limits per destination, decision contexts recorded; each run's wall clock, CPU and peak memory kept beside its tokens | `launch`, `usage`, `cost` |
 | Sources and replay | Transcripts kept in the record and reached by citation, swept on a clock; frozen-context replay on the recorded contexts; re-enactment of a session at its commit against the tape of its memory calls, the tapes on the transcripts' clock unless pinned | `transcript`, `replay`, `reenact run, report, tapes, show, pin, unpin` |
 | The event log | Every entry write through its domain's append-only log, ids and digests only; a materializer builds the index from it and replays the ledger's events | `log show`, `log materialize` |
 | The platform | Agent definitions, templates, eval suites and harness defaults as artifacts in a platform domain, loaded only once a person verified them | `platform list, show`, `golden --platform` |
@@ -248,7 +250,7 @@ amem taint mem-me-xxxxxxxx                 # where a bad entry may have reached
 amem replay <session> --model gemma4-26b   # the same decisions, another model
 amem reenact run <session> --auth gateway --model qwen3.8-27b --runs 3   # the same task again
 amem reenact report <session>              # each harness and model against the tape
-amem cost                                  # spend per session and per completed task
+amem cost                                  # spend, wall clock, CPU and memory per session and task
 amem savings                               # the paper's read-path claims, measured
 amem savings --judge-provider anthropic   # with a small model judging what was "used"
 ```

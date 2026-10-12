@@ -29,6 +29,8 @@ pub struct SessionTotals {
     pub cache_write_tokens: u64,
     /// The first call, RFC 3339.
     pub started: String,
+    /// Time spent waiting on the calls the egress saw, summed, in milliseconds.
+    pub call_ms: u64,
 }
 
 /// What can go wrong recording usage.
@@ -59,8 +61,41 @@ pub struct Totals {
     pub cache_read_tokens: u64,
     /// Summed cache writes.
     pub cache_write_tokens: u64,
+    /// Time spent waiting on these calls, summed, in milliseconds; the egress's own
+    /// calls only, since a harness's report carries no timing.
+    pub call_ms: u64,
 }
 
+/// What one run of a harness cost the host, beside its tokens: the launcher's record of
+/// the process tree it confined, and of its own share, the egress among it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Run {
+    /// The memory session the run was.
+    pub session: String,
+    /// When it ended, RFC 3339; set when recorded.
+    pub at: String,
+    /// The harness.
+    pub harness: String,
+    /// Where it ran: `namespaces`, `image`, `seatbelt`, `unconfined` or `requests`.
+    pub runner: String,
+    /// The task it held, when it held one.
+    pub task: Option<String>,
+    /// Its exit code.
+    pub exit: i32,
+    /// Spawn to exit, in milliseconds.
+    pub wall_ms: u64,
+    /// CPU time of the run's process tree in user mode, in milliseconds.
+    pub user_ms: u64,
+    /// CPU time in the kernel on the tree's behalf, in milliseconds.
+    pub sys_ms: u64,
+    /// The largest resident set one process of the tree reached, in KiB.
+    pub max_rss_kib: u64,
+    /// Whether CPU and memory were counted; a runner that cannot leaves only the wall clock.
+    pub measured: bool,
+    /// The launcher's own CPU time over the run, user and system, in milliseconds: the
+    /// egress, and the memory server where it runs in process.
+    pub launcher_cpu_ms: u64,
+}
 /// The usage log.
 pub struct Telemetry {
     conn: Mutex<Connection>,
@@ -99,6 +134,8 @@ pub struct SessionModel {
     pub cache_write_tokens: u64,
     /// When the session's first call here was made.
     pub first: String,
+    /// Time spent waiting on these calls, summed, in milliseconds.
+    pub call_ms: u64,
 }
 
 const SCHEMA: &str = "
@@ -115,6 +152,22 @@ CREATE TABLE IF NOT EXISTS usage (
     cache_write   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_dest ON usage (destination, model);
+CREATE TABLE IF NOT EXISTS runs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    at               TEXT NOT NULL,
+    session          TEXT NOT NULL,
+    harness          TEXT NOT NULL,
+    runner           TEXT NOT NULL,
+    task             TEXT,
+    exit             INTEGER NOT NULL,
+    wall_ms          INTEGER NOT NULL,
+    user_ms          INTEGER NOT NULL,
+    sys_ms           INTEGER NOT NULL,
+    max_rss_kib      INTEGER NOT NULL,
+    measured         INTEGER NOT NULL,
+    launcher_cpu_ms  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS runs_session ON runs (session);
 ";
 
 /// Where a usage row came from.
@@ -131,6 +184,13 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         .exists([])?;
     if !has_source {
         conn.execute_batch("ALTER TABLE usage ADD COLUMN source TEXT NOT NULL DEFAULT 'egress';")?;
+    }
+    // older rows predate the call's timing; theirs is unknown, not zero
+    let has_latency = conn
+        .prepare("SELECT 1 FROM pragma_table_info('usage') WHERE name = 'latency_ms'")?
+        .exists([])?;
+    if !has_latency {
+        conn.execute_batch("ALTER TABLE usage ADD COLUMN latency_ms INTEGER;")?;
     }
     // older rows predate billing; a harness's own report was a login, the rest metered
     let has_billing = conn
@@ -250,7 +310,8 @@ impl Telemetry {
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT session, destination, COALESCE(model, '?'), billing, source, COUNT(*),
-                    SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), MIN(at)
+                    SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), MIN(at),
+                    SUM(COALESCE(latency_ms, 0))
              FROM usage
              WHERE COALESCE(model, '') NOT LIKE 'http %'
              GROUP BY session, destination, model, billing, source
@@ -272,6 +333,7 @@ impl Telemetry {
                 cache_read_tokens: u(8)?,
                 cache_write_tokens: u(9)?,
                 first: r.get(10)?,
+                call_ms: u(11)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -290,9 +352,12 @@ impl Telemetry {
             .format(&Rfc3339)
             .unwrap_or_default();
         let billing = self.billing(destination, source, usage);
+        let latency = started
+            .and_then(|s| s.elapsed().ok())
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
         lock(&self.conn).execute(
-            "INSERT INTO usage (at, session, destination, model, status, input_tokens, output_tokens, cache_read, cache_write, source, billing)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO usage (at, session, destination, model, status, input_tokens, output_tokens, cache_read, cache_write, source, billing, latency_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 at,
                 session,
@@ -305,6 +370,7 @@ impl Telemetry {
                 i64::try_from(usage.cache_write_tokens).unwrap_or(i64::MAX),
                 source,
                 billing,
+                latency,
             ],
         )?;
         trace(started, session, destination, status, usage, source);
@@ -320,7 +386,7 @@ impl Telemetry {
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT session, COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read),
-                    SUM(cache_write), MIN(at), MAX(source = 'harness')
+                    SUM(cache_write), MIN(at), MAX(source = 'harness'), SUM(COALESCE(latency_ms, 0))
              FROM usage WHERE COALESCE(model, '') NOT LIKE 'http %' AND COALESCE(model, '') != 'tunnel'
              GROUP BY session ORDER BY MIN(at)",
         )?;
@@ -337,6 +403,7 @@ impl Telemetry {
                 cache_write_tokens: u(5)?,
                 started: r.get(6)?,
                 reported: r.get::<_, i64>(7)? != 0,
+                call_ms: u(8)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -352,7 +419,7 @@ impl Telemetry {
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read),
-                    SUM(cache_write), MIN(at), MAX(source = 'harness')
+                    SUM(cache_write), MIN(at), MAX(source = 'harness'), SUM(COALESCE(latency_ms, 0))
              FROM usage WHERE session = ?1 AND COALESCE(model, '') NOT LIKE 'http %'
                AND COALESCE(model, '') != 'tunnel'",
         )?;
@@ -369,6 +436,7 @@ impl Telemetry {
                 cache_write_tokens: u(4)?,
                 started: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 reported: r.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+                call_ms: u(7)?,
             })
         })?;
         Ok((totals.calls > 0).then_some(totals))
@@ -405,7 +473,7 @@ impl Telemetry {
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare(
             "SELECT destination, COALESCE(model, '?'), COUNT(*), SUM(input_tokens), SUM(output_tokens),
-                    SUM(cache_read), SUM(cache_write), source
+                    SUM(cache_read), SUM(cache_write), source, SUM(COALESCE(latency_ms, 0))
              FROM usage GROUP BY destination, model, source
              ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC",
         )?;
@@ -422,6 +490,73 @@ impl Telemetry {
                 output_tokens: u(4)?,
                 cache_read_tokens: u(5)?,
                 cache_write_tokens: u(6)?,
+                call_ms: u(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Keep what a run cost the host; `at` is set to now.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn record_run(&self, run: &Run) -> Result<(), Error> {
+        let at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_default();
+        let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        lock(&self.conn).execute(
+            "INSERT INTO runs (at, session, harness, runner, task, exit, wall_ms, user_ms, sys_ms,
+                               max_rss_kib, measured, launcher_cpu_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                at,
+                run.session,
+                run.harness,
+                run.runner,
+                run.task,
+                run.exit,
+                n(run.wall_ms),
+                n(run.user_ms),
+                n(run.sys_ms),
+                n(run.max_rss_kib),
+                run.measured,
+                n(run.launcher_cpu_ms),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every run kept, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn runs(&self) -> Result<Vec<Run>, Error> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT at, session, harness, runner, task, exit, wall_ms, user_ms, sys_ms,
+                    max_rss_kib, measured, launcher_cpu_ms
+             FROM runs ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let u = |i: usize| -> rusqlite::Result<u64> {
+                Ok(u64::try_from(r.get::<_, i64>(i)?).unwrap_or(0))
+            };
+            Ok(Run {
+                at: r.get(0)?,
+                session: r.get(1)?,
+                harness: r.get(2)?,
+                runner: r.get(3)?,
+                task: r.get(4)?,
+                exit: r.get(5)?,
+                wall_ms: u(6)?,
+                user_ms: u(7)?,
+                sys_ms: u(8)?,
+                max_rss_kib: u(9)?,
+                measured: r.get(10)?,
+                launcher_cpu_ms: u(11)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -513,6 +648,78 @@ mod tests {
         assert_eq!(t.session("s3").unwrap(), None, "no calls yet");
         let all = t.by_session().unwrap();
         assert_eq!(all.iter().find(|x| x.session == "s1"), Some(&one));
+    }
+
+    #[test]
+    fn a_call_is_timed_from_its_start_and_a_run_is_kept_with_its_resources() {
+        let t = Telemetry::in_memory().unwrap();
+        let u = Usage {
+            model: Some("m".into()),
+            input_tokens: 1,
+            ..Usage::default()
+        };
+        let started = SystemTime::now() - std::time::Duration::from_millis(250);
+        t.record(started, "s1", "llmao", 200, &u).unwrap();
+        t.record_reported("s1", "anthropic", &u).unwrap();
+        let one = t.session("s1").unwrap().unwrap();
+        assert!(
+            (250..5_000).contains(&one.call_ms),
+            "timed from its start: {one:?}"
+        );
+        let s = t.summary().unwrap();
+        let reported = s.iter().find(|x| x.source == SOURCE_HARNESS).unwrap();
+        assert_eq!(reported.call_ms, 0, "a harness's report carries no timing");
+        let by = t.by_session_model().unwrap();
+        assert!(by.iter().any(|x| x.call_ms >= 250));
+        assert!(t.runs().unwrap().is_empty());
+        let run = Run {
+            session: "s1".into(),
+            harness: "claude".into(),
+            runner: "namespaces".into(),
+            task: Some("task-a-1".into()),
+            exit: 0,
+            wall_ms: 90_000,
+            user_ms: 12_000,
+            sys_ms: 3_000,
+            max_rss_kib: 400_000,
+            measured: true,
+            launcher_cpu_ms: 2_000,
+            at: String::new(),
+        };
+        t.record_run(&run).unwrap();
+        let kept = t.runs().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].at.is_empty(), "stamped when kept");
+        assert_eq!(
+            Run {
+                at: String::new(),
+                ..kept[0].clone()
+            },
+            run
+        );
+    }
+
+    #[test]
+    fn an_older_log_gains_the_timing_column_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE usage (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
+               session TEXT NOT NULL, destination TEXT NOT NULL, model TEXT,
+               status INTEGER NOT NULL, input_tokens INTEGER NOT NULL,
+               output_tokens INTEGER NOT NULL, cache_read INTEGER NOT NULL,
+               cache_write INTEGER NOT NULL);
+             INSERT INTO usage (at, session, destination, model, status, input_tokens,
+               output_tokens, cache_read, cache_write)
+             VALUES ('2026-10-01T00:00:00Z', 's0', 'anthropic', 'm', 200, 7, 1, 0, 0);",
+        )
+        .unwrap();
+        drop(old);
+        let t = Telemetry::open(&path).unwrap();
+        let s = t.session("s0").unwrap().unwrap();
+        assert_eq!((s.input_tokens, s.call_ms), (7, 0), "unknown, not invented");
+        assert!(t.runs().unwrap().is_empty());
     }
 
     #[test]

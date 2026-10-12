@@ -1955,12 +1955,26 @@ fn print_usage(rows: &[dm_egress::telemetry::Totals]) {
         return;
     }
     println!(
-        "{:<12} {:<28} {:<8} {:>6} {:>10} {:>10} {:>10} {:>10}",
-        "destination", "model", "source", "calls", "input", "output", "cache_rd", "cache_wr"
+        "{:<12} {:<28} {:<8} {:>6} {:>10} {:>10} {:>10} {:>10} {:>9}",
+        "destination",
+        "model",
+        "source",
+        "calls",
+        "input",
+        "output",
+        "cache_rd",
+        "cache_wr",
+        "ms/call"
     );
     for r in rows {
+        // a harness's own report carries no timing: its calls are not averaged in
+        let timed = if r.source == dm_egress::telemetry::SOURCE_HARNESS {
+            "-".to_string()
+        } else {
+            (r.call_ms / r.calls.max(1)).to_string()
+        };
         println!(
-            "{:<12} {:<28} {:<8} {:>6} {:>10} {:>10} {:>10} {:>10}",
+            "{:<12} {:<28} {:<8} {:>6} {:>10} {:>10} {:>10} {:>10} {:>9}",
             r.destination,
             r.model,
             r.source,
@@ -1968,7 +1982,8 @@ fn print_usage(rows: &[dm_egress::telemetry::Totals]) {
             r.input_tokens,
             r.output_tokens,
             r.cache_read_tokens,
-            r.cache_write_tokens
+            r.cache_write_tokens,
+            timed
         );
     }
 }
@@ -2005,7 +2020,7 @@ async fn run_confined(
     env: &[(String, String)],
     capture: bool,
     runner: &Runner,
-) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
+) -> Result<Ran, Box<dyn std::error::Error>> {
     let host_home = home_dir();
     let rootfs = match runner {
         Runner::Image(rootfs) => Some(rootfs.as_path()),
@@ -2047,14 +2062,23 @@ async fn run_confined(
     }
     Ok(tokio::task::spawn_blocking(move || {
         if capture {
-            dm_sandbox::run_captured(&plan)
-                .map(|(code, out)| (code, Some(String::from_utf8_lossy(&out).into_owned())))
+            dm_sandbox::run_captured(&plan).map(|(code, out, r)| {
+                (
+                    code,
+                    Some(String::from_utf8_lossy(&out).into_owned()),
+                    Some(r),
+                )
+            })
         } else {
-            dm_sandbox::run(&plan).map(|code| (code, None))
+            dm_sandbox::run(&plan).map(|(code, r)| (code, None, Some(r)))
         }
     })
     .await??)
 }
+
+/// A run's exit code, its captured output when asked for, and what it cost the host
+/// where the runner could measure it.
+type Ran = (i32, Option<String>, Option<dm_sandbox::Resources>);
 
 /// A loopback address no listener holds now, for a relay on the host's own loopback.
 /// The port is free when asked and taken by the relay a moment later; another process
@@ -3333,6 +3357,19 @@ pub enum Runner {
     Requests(RequestsRunner),
 }
 
+impl Runner {
+    /// The runner's name in a run's record.
+    fn name(&self) -> &'static str {
+        match self {
+            Runner::Namespaces => "namespaces",
+            Runner::Image(_) => "image",
+            Runner::Seatbelt => "seatbelt",
+            Runner::Unconfined(_) => "unconfined",
+            Runner::Requests(_) => "requests",
+        }
+    }
+}
+
 /// The `Requests` runner's state.
 pub struct RequestsRunner {
     /// The shared volume.
@@ -3584,7 +3621,9 @@ impl Session {
             full.extend(self.harness.model_flag(&m));
         }
         let args = full.as_slice();
-        match &self.runner {
+        let started = std::time::Instant::now();
+        let (user, sys) = dm_sandbox::measure::own_cpu_ms();
+        let (code, out, used) = match &self.runner {
             Runner::Unconfined(Some((addr, _))) => run_unconfined(
                 self.harness,
                 self.auth,
@@ -3608,8 +3647,35 @@ impl Session {
                 )
                 .await
             }
-            Runner::Requests(r) => self.run_requested(r, args, &env, capture).await,
+            Runner::Requests(r) => self
+                .run_requested(r, args, &env, capture)
+                .await
+                .map(|(code, out)| (code, out, None)),
+        }?;
+        let (user_after, sys_after) = dm_sandbox::measure::own_cpu_ms();
+        let used = used.unwrap_or_default();
+        let run = dm_egress::telemetry::Run {
+            session: self.p.memory.session_id().to_string(),
+            harness: self.harness.binary().to_string(),
+            runner: self.runner.name().to_string(),
+            task: task.map(str::to_string),
+            exit: code,
+            wall_ms: if used.measured {
+                used.wall_ms
+            } else {
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+            },
+            launcher_cpu_ms: (user_after + sys_after).saturating_sub(user + sys),
+            user_ms: used.user_ms,
+            sys_ms: used.sys_ms,
+            max_rss_kib: used.max_rss_kib,
+            measured: used.measured,
+            at: String::new(),
+        };
+        if let Err(e) = self.p.egress.telemetry().record_run(&run) {
+            eprintln!("memory: the run's resources were not kept: {e}");
         }
+        Ok((code, out))
     }
 
     /// Write a run request for the host and wait for the harness container's exit code.
@@ -3731,7 +3797,7 @@ fn run_unconfined(
     egress_url: &str,
     args: &[String],
     capture: bool,
-) -> Result<(i32, Option<String>), Box<dyn std::error::Error>> {
+) -> Result<Ran, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(home)?;
     let mut cmd = std::process::Command::new(harness.binary());
     cmd.current_dir(workdir);
@@ -3784,18 +3850,12 @@ fn run_unconfined(
         }
     }
     cmd.args(args);
-    if capture {
-        let out = cmd
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .output()?;
-        return Ok((
-            out.status.code().unwrap_or(1),
-            Some(String::from_utf8_lossy(&out.stdout).into_owned()),
-        ));
-    }
-    let status = cmd.status()?;
-    Ok((status.code().unwrap_or(1), None))
+    let (code, out, r) = dm_sandbox::measure::run(&mut cmd, capture)?;
+    Ok((
+        code,
+        capture.then(|| String::from_utf8_lossy(&out).into_owned()),
+        Some(r),
+    ))
 }
 
 /// Inside the sandbox, as pid 1 of the harness's namespace: forward the loopback port to
