@@ -6,7 +6,7 @@ Sander Striker · August 2026 · revised October 2026
 
 Written with Claude Fable 5 and Claude Opus 5 (Anthropic).
 
-*Agent fleets need shared memory, and shared memory spreads mistakes and leaked secrets as easily as knowledge. This paper designs one that is cheap to read, safe to share, and outlives every model and tool it runs on.*
+*Agent fleets need shared memory, and shared memory spreads mistakes and leaked secrets as easily as knowledge. It has to be cheap to read, safe to share, and outlast every model and tool it runs on. This paper proposes how.*
 
 ---
 
