@@ -185,15 +185,15 @@ the comparison once that subagent's task is done, and Claude Code is told the ta
 instead. The ledger folded the first follow-up into the second, which waits for both:
 that's the "invalidated" line. When Claude Code's session ends, the system hands Claude
 Code's original task back to the board (releases it), with what it wrote filed as a
-handoff.
+handoff. It waits there: nobody may claim it while its follow-up is open, so the work
+isn't done twice.
 
 **4.5 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
 
 **4.6 Results come back.** A new Claude Code session claims the follow-up, works it with
-both reports, and completes it. The follow-up is a task of its own. The original
-"Compare two decisions" was released in 4.4 and is still on the board, open to any
-worker, so a worker could claim it and do the comparison again. Nothing closes it when
-its follow-up completes. That's today's design, and an open question.
+both reports, and completes it. Completing the follow-up closes the original "Compare
+two decisions" too, with the same handoff: the follow-up was the rest of its work. The
+last line shows it completed.
 
 **4.7 Telemetry.** Tasks by kind and status. "gate" is the held writes waiting for you;
 "promote" is the approvals to verified.

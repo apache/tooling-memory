@@ -280,7 +280,7 @@ needs no podman where `wslc.exe` builds the image; the local stack does, and
 1. **The read path.** A few hundred entries seeded, a harness working a real task from T0 and a handoff, and the savings measured.
 2. **Curation, and the trust tiers.** A curation cycle, a librarian run whose rewrite lands curated, and a person approving an entry for verified.
 3. **The perimeter.** A write that speaks to agents held in quarantine, taint, policy as memory with a scoped exception, the read filter, and a spend limit refusing a call.
-4. **The task fabric.** The rubric compiled from a strategy, a rescore along the edges, and subagents filed on the board, their reports brought back by a follow-up task; the delegating task goes back to the board and stays open.
+4. **The task fabric.** The rubric compiled from a strategy, a rescore along the edges, and subagents filed on the board, their reports brought back by a follow-up task whose completion closes the task that delegated.
 5. **Watching it.** Traces in a collector, the read metrics, drift probes, transcripts by citation, and replay.
 6. **Memory against no memory.** The same questions to a harness with memory and with an empty one, graded, timed and counted.
 7. **What this is not, yet.** The two lists at the top of this page, read from it.

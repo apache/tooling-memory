@@ -291,6 +291,7 @@ impl Db {
             let task = task_from_row(&locked)?;
             if !claimable(&task, now, manifest)
                 || !deps_complete(&tx, &task.spec.depends_on).await?
+                || awaits_continuation(&tx, &s, &task.id).await?
             {
                 continue;
             }
@@ -323,7 +324,10 @@ impl Db {
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         let task = task_from_row(&row)?;
-        if !claimable(&task, now, manifest) || !deps_complete(&tx, &task.spec.depends_on).await? {
+        if !claimable(&task, now, manifest)
+            || !deps_complete(&tx, &task.spec.depends_on).await?
+            || awaits_continuation(&tx, &s, &task.id).await?
+        {
             return Err(Error::WrongState {
                 id: id.to_string(),
                 status: task.status,
@@ -568,6 +572,21 @@ async fn deps_complete<C: GenericClient>(conn: &C, deps: &[String]) -> Result<bo
         }
     }
     Ok(true)
+}
+
+/// Whether a continuation of the task is still open, in its domain's schema: its work
+/// goes on there, and the continuation's completion closes it.
+async fn awaits_continuation<C: GenericClient>(conn: &C, s: &str, id: &str) -> Result<bool, Error> {
+    Ok(conn
+        .query_opt(
+            &format!(
+                "SELECT 1 FROM {s}.tasks WHERE origin = $1
+                 AND status NOT IN ('completed', 'invalidated') LIMIT 1"
+            ),
+            &[&crate::continues(id)],
+        )
+        .await?
+        .is_some())
 }
 
 /// Drop one domain's projection and replay its events into it.

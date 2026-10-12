@@ -380,6 +380,13 @@ impl RawTask {
     }
 }
 
+/// The `origin` a continuation of `parent` carries: the task that resumes it once the
+/// subagent tasks its run filed are done.
+#[must_use]
+pub fn continues(parent: &str) -> String {
+    format!("continues:{parent}")
+}
+
 /// Whether a manifest may claim `task` now: it is admitted, or claimed under a lease
 /// that has run out, and the manifest carries every requirement. Whether its
 /// dependencies are complete is the backend's question, asked inside the transaction.
@@ -669,6 +676,45 @@ impl Ledger {
             });
         }
         check_holder(&task, holder, now)?;
+        self.append_at(
+            id,
+            now,
+            &Event::Completed {
+                handoff: handoff.to_string(),
+            },
+        )
+        .await?;
+        self.get(id).await
+    }
+
+    /// Close a task its continuation finished: the continuation `by` resumed it and is
+    /// complete with `handoff`, so the task is too, with the same handoff. Only a task
+    /// nobody holds: one released when its run delegated, or whose lease ran out. A
+    /// holder with a live lease finishes it themselves.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]; [`Error::WrongState`] when it is terminal, held under a live
+    /// lease, or `by` is not a completed continuation of it.
+    pub async fn complete_by_continuation(
+        &mut self,
+        id: &str,
+        by: &str,
+        handoff: &str,
+    ) -> Result<Task, Error> {
+        let now = self.now();
+        let task = self.get(id).await?;
+        let continuation = self.get(by).await?;
+        let held = task.status == Status::Claimed && task.lease_until.is_some_and(|t| t >= now);
+        let resumed_it = continuation.spec.origin.as_deref() == Some(continues(id).as_str())
+            && continuation.status == Status::Completed;
+        if task.status.is_terminal() || held || !resumed_it {
+            return Err(Error::WrongState {
+                id: id.to_string(),
+                status: task.status,
+                op: "complete by continuation",
+            });
+        }
         self.append_at(
             id,
             now,
@@ -1005,6 +1051,9 @@ mod tests {
         two_claimers_on_two_connections_get_two_tasks,
         a_domain_claims_only_its_own_queue,
         a_rescore_moves_the_queue_and_keeps_the_filed_priority,
+        a_task_waits_on_its_continuation,
+        a_task_closes_with_its_continuation,
+        a_continuation_given_up_on_gives_its_task_back,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1195,6 +1244,81 @@ mod tests {
         let c = next(&mut l, "s2", mins(5)).await.unwrap();
         assert_eq!(c.task.attempts, 2);
         invalidate_is_terminal(&mut l, &t).await;
+    }
+
+    /// A continuation of `parent`, filed by the run that delegated, waiting on `deps`.
+    fn resume(parent: &Task, deps: &[&Task]) -> TaskSpec {
+        TaskSpec {
+            depends_on: deps.iter().map(|d| d.id.clone()).collect(),
+            origin: Some(continues(&parent.id)),
+            upstream_event: Some(parent.id.clone()),
+            ..spec(&format!("Resume: {}", parent.spec.title))
+        }
+    }
+
+    /// A parent whose run delegated one child, with a continuation waiting on it, and
+    /// was released: (parent, child, continuation).
+    async fn delegated(l: &mut Ledger) -> (Task, Task, Task) {
+        let parent = admitted(l, spec("Compare two decisions")).await;
+        claim(l, &parent.id, "s1", mins(5)).await.unwrap();
+        let child = admitted(l, spec("Summarise one")).await;
+        let cont = admitted(l, resume(&parent, &[&child])).await;
+        l.release(&parent.id, "s1", Some("mem-a-left"))
+            .await
+            .unwrap();
+        (parent, child, cont)
+    }
+
+    async fn a_task_waits_on_its_continuation(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let (parent, child, cont) = delegated(&mut l).await;
+        // back on the board, but nobody's to claim while its work goes on
+        let c = next(&mut l, "s2", mins(5)).await.unwrap();
+        assert_eq!(c.task.id, child.id, "the child, not the parent");
+        assert!(is_wrong_state(
+            &claim(&mut l, &parent.id, "s2", mins(5)).await
+        ));
+        let early = l
+            .complete_by_continuation(&parent.id, &cont.id, "mem-a-h")
+            .await;
+        assert!(
+            is_wrong_state(&early),
+            "not before the continuation is complete"
+        );
+    }
+
+    async fn a_task_closes_with_its_continuation(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let (parent, child, cont) = delegated(&mut l).await;
+        claim(&mut l, &child.id, "s2", mins(5)).await.unwrap();
+        l.complete(&child.id, "s2", "mem-a-child").await.unwrap();
+        claim(&mut l, &cont.id, "s3", mins(5)).await.unwrap();
+        l.complete(&cont.id, "s3", "mem-a-done").await.unwrap();
+        let by_child = l
+            .complete_by_continuation(&parent.id, &child.id, "mem-a-h")
+            .await;
+        assert!(is_wrong_state(&by_child), "only by a continuation of it");
+        let closed = l
+            .complete_by_continuation(&parent.id, &cont.id, "mem-a-done")
+            .await
+            .unwrap();
+        assert_eq!(closed.status, Status::Completed);
+        assert_eq!(closed.handoff.as_deref(), Some("mem-a-done"));
+        let twice = l
+            .complete_by_continuation(&parent.id, &cont.id, "mem-a-done")
+            .await;
+        assert!(is_wrong_state(&twice));
+    }
+
+    async fn a_continuation_given_up_on_gives_its_task_back(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let parent = admitted(&mut l, spec("Compare again")).await;
+        let dead = admitted(&mut l, resume(&parent, &[])).await;
+        assert!(is_wrong_state(
+            &claim(&mut l, &parent.id, "s1", mins(5)).await
+        ));
+        l.invalidate(&dead.id, "a dead end", None).await.unwrap();
+        claim(&mut l, &parent.id, "s1", mins(5)).await.unwrap();
     }
 
     async fn invalidate_is_terminal(l: &mut Ledger, t: &Task) {

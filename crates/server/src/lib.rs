@@ -1703,7 +1703,7 @@ impl Memory {
             ),
             requirements: parent.spec.requirements.clone(),
             depends_on: ids.clone(),
-            origin: Some(format!("continues:{}", parent.id)),
+            origin: Some(dm_ledger::continues(&parent.id)),
             upstream_event: Some(dm_core::digest(&ids.join(","))[..16].to_string()),
             created_by: self.author.clone(),
             classification: parent.spec.classification.max(self.label()),
@@ -1725,7 +1725,7 @@ impl Memory {
     ) -> Result<(Vec<String>, Vec<String>), Error> {
         let mut ids: Vec<String> = Vec::new();
         let mut folded = Vec::new();
-        let marker = format!("continues:{}", parent.id);
+        let marker = dm_ledger::continues(&parent.id);
         for t in l.filed_from(&parent.id).await? {
             if t.spec.origin.as_deref() == Some(marker.as_str()) && !t.status.is_terminal() {
                 ids.extend(t.spec.depends_on.iter().cloned());
@@ -1903,12 +1903,23 @@ impl Memory {
         if self.store.get(&task.spec.domain, handoff).await?.is_none() {
             return Err(Error::NotFound(format!("handoff {handoff}")));
         }
-        Ok(self
-            .ledger
-            .lock()
-            .await
-            .complete(id, &self.author, handoff)
-            .await?)
+        let mut l = self.ledger.lock().await;
+        let done = l.complete(id, &self.author, handoff).await?;
+        // a continuation finishes the task it resumed, and that one the task it resumed in
+        // turn: up the chain, while each is open and nobody holds it
+        let mut by = done.clone();
+        while let Some(parent) = by
+            .spec
+            .origin
+            .as_deref()
+            .and_then(|o| o.strip_prefix("continues:"))
+        {
+            let Ok(closed) = l.complete_by_continuation(parent, &by.id, handoff).await else {
+                break;
+            };
+            by = closed;
+        }
+        Ok(done)
     }
 
     /// Give a task back to the pool.
@@ -3697,6 +3708,80 @@ mod tests {
             more.continuation.unwrap().spec.title,
             "Resume: Ship the import"
         );
+    }
+
+    #[tokio::test]
+    async fn a_continuation_completing_closes_the_task_it_resumed_up_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let handoff = |text: &'static str| {
+            let m = &m;
+            async move {
+                m.write(WriteRequest {
+                    entry_type: EntryType::Handoff,
+                    ..req(text)
+                })
+                .await
+                .unwrap()
+                .id
+            }
+        };
+        let root = m
+            .create_task(spec("Compare two decisions"))
+            .await
+            .unwrap()
+            .task;
+        m.admit(&root.id).await.unwrap();
+        m.claim(&root.id, Duration::minutes(30)).await.unwrap();
+        let f = m
+            .fan_out(&root.id, &[("DR-19".into(), "Summarise DR-19.".into())])
+            .await
+            .unwrap();
+        let left = handoff("Delegated; the comparison waits on the summaries.\n").await;
+        m.release(&root.id, Some(&left)).await.unwrap();
+        // the root waits on its continuation: the child is what a worker gets
+        let c = m
+            .claim_next(None, Duration::minutes(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.task.id, f.children[0].id);
+        assert!(m.claim(&root.id, Duration::minutes(30)).await.is_err());
+        m.complete(&c.task.id, &handoff("DR-19 is proposed.\n").await)
+            .await
+            .unwrap();
+        // the continuation delegates once more, and stops
+        let first = f.continuation.unwrap();
+        m.claim(&first.id, Duration::minutes(30)).await.unwrap();
+        let g = m
+            .fan_out(&first.id, &[("DR-22".into(), "Summarise DR-22.".into())])
+            .await
+            .unwrap();
+        m.release(&first.id, None).await.unwrap();
+        let c = m
+            .claim_next(None, Duration::minutes(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.task.id, g.children[0].id, "not the waiting continuation");
+        m.complete(&c.task.id, &handoff("DR-22 is decided.\n").await)
+            .await
+            .unwrap();
+        // the last continuation's completion closes the one it resumed, and the root
+        let last = g.continuation.unwrap();
+        m.claim(&last.id, Duration::minutes(30)).await.unwrap();
+        let done = handoff("DR-19 is open where DR-22 is decided.\n").await;
+        m.complete(&last.id, &done).await.unwrap();
+        for id in [&first.id, &root.id] {
+            let t = m.get_task(id).await.unwrap();
+            assert_eq!(t.status, Status::Completed, "{id}");
+            assert_eq!(t.handoff.as_deref(), Some(done.as_str()), "{id}");
+        }
+        assert!(m
+            .claim_next(None, Duration::minutes(30))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

@@ -164,7 +164,10 @@ impl Db {
             rows.map(|r| r?).collect::<Result<_, _>>()?
         };
         for task in candidates {
-            if !claimable(&task, now, manifest) || !deps_complete(&tx, &task.spec.depends_on)? {
+            if !claimable(&task, now, manifest)
+                || !deps_complete(&tx, &task.spec.depends_on)?
+                || awaits_continuation(&tx, &task)?
+            {
                 continue;
             }
             apply(
@@ -193,7 +196,10 @@ impl Db {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let task = get_in(&tx, id)?;
-        if !claimable(&task, now, manifest) || !deps_complete(&tx, &task.spec.depends_on)? {
+        if !claimable(&task, now, manifest)
+            || !deps_complete(&tx, &task.spec.depends_on)?
+            || awaits_continuation(&tx, &task)?
+        {
             return Err(Error::WrongState {
                 id: id.to_string(),
                 status: task.status,
@@ -317,6 +323,20 @@ fn deps_complete(conn: &Connection, deps: &[String]) -> Result<bool, Error> {
         }
     }
     Ok(true)
+}
+
+/// Whether a continuation of `task` is still open: its work goes on there, and the
+/// continuation's completion closes it, so it is nobody's to claim meanwhile.
+fn awaits_continuation(conn: &Connection, task: &Task) -> Result<bool, Error> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM tasks WHERE domain = ?1 AND origin = ?2
+             AND status NOT IN ('completed', 'invalidated') LIMIT 1",
+            params![task.spec.domain, crate::continues(&task.id)],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Append the event and project it, in the caller's transaction.
