@@ -230,7 +230,7 @@ The Foundation's identity infrastructure is already real: Apache accounts, contr
 
 - **The index is free; inference is metered.** `search` and `get` are served from the index at almost no cost.
 - **Limits sit in the perimeter.** A committer credential caught in a runaway loop hits its cap and raises an alert automatically.
-- **Limits are per resource class** (paper §12): commercial model credits capped in money, Foundation-hosted capacity in time share, because one committer's burst on a shared pool is another's queue.
+- **Limits cover spend and throughput** (paper §12). Commercial models are capped in money and in a share of the Foundation's rate limits with each vendor; Foundation-hosted capacity is capped in time share. Both are shared pools: one committer's burst is another's queue.
 
 **Finding: the registry's rosters decide both review rights and serving tier.** The PMC roster grants promotion; the committer roster grants subsidised recall. A change to either follows the registry automatically.
 

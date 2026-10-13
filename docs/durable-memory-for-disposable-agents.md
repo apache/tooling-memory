@@ -382,7 +382,7 @@ Each step discloses a little more:
 
 The policy engine is OPA, the Open Policy Agent, run beside the service with policy and the domain registry synced from the record. Once per session, the service asks under what conditions this principal may read, gets back a residual policy, and compiles it into a filter the search engine applies. Unauthorised entries are never scored or counted, so result counts cannot leak their existence. The filter also carries the raw-reach rules of §4. Prefetch and analytics use the same filter; a separate unfiltered path would bypass it.
 
-Because the registry is data, a reorganisation is a data update. Exceptions are data too, so expiry is a timestamp comparison. Spend limits are set per domain and per principal in each resource class (§12). Every allow and deny is logged with the policy version that produced it. OPA covers what can be checked mechanically: access, labels, spend, irreversibility. Judgment is never encoded in it.
+Because the registry is data, a reorganisation is a data update. Exceptions are data too, so expiry is a timestamp comparison. Spend and throughput limits are set per domain and per principal in each resource class (§12). Every allow and deny is logged with the policy version that produced it. OPA covers what can be checked mechanically: access, labels, spend, irreversibility. Judgment is never encoded in it.
 
 ## One server per session
 
@@ -808,9 +808,12 @@ Why not go further and fix the economics on input tokens and turns? They look li
 - **The price moves fast.** The price of a fixed level of capability has fallen roughly tenfold a year, faster for some tasks (Appenzeller 2024; Epoch AI 2025). Settings tuned to today's price are wrong within a year; settings recomputed from a price vector are not.
 - **A budget is a target.** Budget agents by tokens or turns and they learn to read less, whether or not the task gets done. When a measure becomes a target it stops being a good measure (Strathern 1997, after Goodhart). Vendors of agents are moving the same way, pricing per resolved outcome (Intercom 2025).
 
-Where the physics is real, on a self-hosted accelerator pool, the scarce quantity is throughput. Metered API tokens are limited only by money. A shared pool is limited by capacity per unit of time, and one principal's burst is another's queue.
+The physics that is real is throughput. Every resource class is limited by capacity per unit of time; what differs is who holds the queue.
 
-One currency cannot express a fair share of a pool at peak. So the perimeter sets limits per resource class in native units (money for metered classes, throughput or time share for pooled ones) per domain and per principal, and the price vector converts everything to cost for reporting. The system records tokens as measurements and prices them by configuration. The unit the system answers for is the completed task.
+- **A vendor's API** is someone else's accelerator pool. Money buys a higher rate limit or reserved throughput, but not more capacity than the vendor has. At peak the vendor throttles, queues, or quietly serves a cheaper variant (§11). The institution's rate limit is a shared pool of its own: one principal's burst can use up everyone's quota.
+- **A self-hosted pool** puts the queue in the institution's hands, at a fixed capacity it cannot buy more of at short notice.
+
+One currency cannot express a fair share of a pool at peak. So the perimeter sets two limits per resource class, per domain and per principal: spend, in money, and a share of throughput, as a rate or a time share. Triage treats a saturated class like any other constraint (§8): urgent work keeps its share, deferrable work waits, and curation keeps its protected floor (§5). The price vector converts everything to cost for reporting. The system records tokens as measurements and prices them by configuration; the unit it answers for is the completed task.
 
 ---
 
@@ -1228,7 +1231,7 @@ When the ledger is down, the historian still accepts appends: handoffs and heart
 | Stated and enforced policy drift | Cross-citation between L2 entries and OPA rules (§7) |
 | Exceptions that never end | Default expiry; audit of expired-but-relied-upon exceptions (§7) |
 | Reorganisation breaks access or provenance | Opaque keys; dated authority on identifiers; registry as data (§12) |
-| Runaway spend | Limits per resource class in native units; cost-per-task alerts (§12) |
+| Runaway spend or a starved pool | Spend and throughput limits per resource class, per domain and principal; deferrable work waits at saturation; cost-per-task alerts (§12) |
 | Privilege steering through task requirements | Scaled admission; creators may not require what they cannot hold; specs are data (§8) |
 | Exploit spread through self-improvement | Perimeter outside the loop; safety gate on privilege; raw quarantine; separate roles (§10) |
 | Silent vendor change | Probes, change-point detection, attribution by provenance, distillation freeze (§11) |
