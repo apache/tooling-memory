@@ -189,14 +189,16 @@ A session that may touch several domains sees one T0 made of their slices, under
 ```mermaid
 flowchart LR
     A1["Agents and taps"] -->|append, no lock| LOG["Historian (T2)<br/>append-only, partitioned by domain"]
-    LOG -->|"fast lane: handoffs, mid-task decisions"| IX["Search index"]
-    LOG -->|projection| BRD["Task ledger"]
-    LOG -->|batched| MAT["Materializer<br/>one writer per domain"]
+    LOG --> SCR{"Screen"}
+    SCR -->|fails| QUA["Quarantined: kept in the historian,<br/>highest label, read by security only"]
+    SCR -->|"passed, fast lane: handoffs, mid-task decisions"| IX["Search index"]
+    SCR -->|passed, projection| BRD["Task ledger"]
+    SCR -->|passed, batched| MAT["Materializer<br/>one writer per domain"]
     MAT --> REC["Record: curated entries,<br/>decisions, finished tasks"]
     REC -->|review gate, human pace| VER["Verified entries, policy"]
 ```
 
-Agents append to the historian; appends do not contend. The index reads the historian directly, so a handoff is searchable within a minute even if the record lags. One materializer per domain is the only writer to the record, which gets coarse, reviewable versions. Promotion to verified, and every policy change, passes a human-paced review gate.
+Agents append to the historian; appends do not contend. Each event is then screened (§4), and the index, ledger, materializer, and taps read only events that passed. The index reads them straight from the historian, so a handoff is searchable within a minute even if the record lags. One materializer per domain is the only writer to the record, which gets coarse, reviewable versions. Promotion to verified, and every policy change, passes a human-paced review gate.
 
 The paper does not choose the engine behind the record. Version control, a versioned object store, or a database will do, provided it gives seven guarantees the rest of the design relies on:
 
@@ -283,7 +285,15 @@ If A trusts B and B trusts C, A has not thereby agreed to trust C. The design ap
 
 ## Promotion
 
-New writes are raw and searchable with their tier visible, because the next agent needs the handoff written a minute ago. Curation lifts entries to curated. A principal's policy may require a higher tier than raw for what it reads in a given domain.
+New writes are raw, and curation lifts them to curated. Raw entries are searchable with their tier visible, because the next agent needs the handoff written a minute ago. But in an open institution a stranger can write into the raw tier through a tap within seconds, so how far a raw entry reaches depends on where it came from:
+
+| Raw entry | Visible to |
+|---|---|
+| Handoffs and decisions in the same task chain: the task, its parent, children, and dependents | The sessions working that chain, at once. This is what the fast lane is for |
+| Other entries written by the fleet's own sessions in the domain | Sessions whose policy admits raw in the domain |
+| Content from external authors, arriving through a tap | Triage, and the session working the task it is the origin of. Everywhere else, only once curated |
+
+Curators and auditors read raw as their work requires. The write's session tells which case applies. Domain policy may widen or narrow these defaults, and a principal's policy may require curated or better for what it reads.
 
 Promotion to verified passes a review gate. A person approves it, or a senior agent where domain policy allows; the proposer can never approve its own. A wrong fact written once and trusted forever is the largest long-term risk this system carries, and this gate is the main defence against it.
 
@@ -311,7 +321,7 @@ Content crosses downward only through `declassify`: a proposal for a new, lower-
 
 Model output gets three further rules, because of the hazards in §1.
 
-- **Writes are screened.** The write path scans for secrets and credentials and blocks them by policy (L0, §7); an entry that fails is quarantined.
+- **Writes are screened before anything reads them.** Each write is appended to the historian, then scanned for secrets, credentials, and whatever else L0 names (§7). Only events that pass reach the index, ledger, materializer, or taps. A failing event stays in the historian, so the attempt and what the session had read before it are on record, but it is quarantined: raised to the highest classification, readable only by the security role named in policy, and excluded from everything downstream. The exposed secret is rotated, and the body erased under the rules of §3.
 - **Nothing raw runs.** Code, tool definitions, and agent configuration are loaded only from verified entries in `dom-platform` (§10), and only through their gates. A package or URL named in an entry is a claim like any other.
 - **Nothing leaves by default.** Results go out only through taps and tool servers, each with a ceiling, and the fleet only proposes: a tracker's owner closes the issue, a committer merges the change (§8).
 
@@ -372,7 +382,7 @@ Each step discloses a little more:
 
 ## Access control
 
-The policy engine is OPA, the Open Policy Agent, run beside the service with policy and the domain registry synced from the record. Once per session, the service asks under what conditions this principal may read, gets back a residual policy, and compiles it into a filter the search engine applies. Unauthorised entries are never scored or counted, so result counts cannot leak their existence. Prefetch and analytics use the same filter; a separate unfiltered path would bypass it.
+The policy engine is OPA, the Open Policy Agent, run beside the service with policy and the domain registry synced from the record. Once per session, the service asks under what conditions this principal may read, gets back a residual policy, and compiles it into a filter the search engine applies. Unauthorised entries are never scored or counted, so result counts cannot leak their existence. The filter also carries the raw-reach rules of §4. Prefetch and analytics use the same filter; a separate unfiltered path would bypass it.
 
 Because the registry is data, a reorganisation is a data update. Exceptions are data too, so expiry is a timestamp comparison. Spend limits are set per domain and per principal in each resource class (§12). Every allow and deny is logged with the policy version that produced it. OPA covers what can be checked mechanically: access, labels, spend, irreversibility. Judgment is never encoded in it.
 
@@ -618,7 +628,7 @@ Every read and every ledger operation passes through the service, so telemetry a
 | Denials by domain | A spike means an attack, a misconfiguration, or a registry behind a reorg |
 | Unmatched or invalidated tasks | Capability gaps, noisy taps, stale backlogs |
 
-Retrieval is a published contract, because agents depend on it. Starting targets: search p50 100 ms and p99 500 ms; 99% of handoffs and mid-task decisions searchable within 60 seconds, with a looser published bound for bulk curation; known-item lookups by ID, title, or error string in the top three; `claim_next` p99 one second. In an outage agents run from T0, queue their writes, and take no irreversible action. Appendix C gives the ledger's targets and its behaviour during outages.
+Retrieval is a published contract, because agents depend on it. Starting targets: search p50 100 ms and p99 500 ms; 99% of handoffs and mid-task decisions searchable within 60 seconds, screening included, with a looser published bound for bulk curation; known-item lookups by ID, title, or error string in the top three; `claim_next` p99 one second. In an outage agents run from T0, queue their writes, and take no irreversible action. Appendix C gives the ledger's targets and its behaviour during outages.
 
 Each domain keeps a golden query suite that runs on every change to the indexer, ranker, or summary prompt. A curator's rewrite of summaries counts as such a change. Ranking changes ship through canary or shadow serving. Alerts are per domain, because rot shows locally long before it moves an average. And telemetry is the curator's work queue, which is what keeps the corpus healthy in year ten.
 
@@ -1041,7 +1051,7 @@ Signatures are indicative. Schemas: entries in §3, policies in §7, tasks in Ap
 search(query, domain?, filters?)   → [{id, title, summary, meta, snippet}]
 get(id | id#anchor)                → {body, related: [{id, summary, p}]}
 recall(question, domain?)          → {brief, citations: [id]}   # cheap model, caller's filter
-write(entry)                       → {id}    # log append; fast lane for handoffs
+write(entry)                       → {id}    # historian append, screened before indexing; fast lane for handoffs
 ```
 
 **Tasks (§8, Appendix C)**
@@ -1205,7 +1215,8 @@ When the ledger is down, the historian still accepts appends: handoffs and heart
 |---|---|
 | Lost lineage | Every write, read, send, ledger operation, and curation action is an event; informed-by edges are computed by the service, not declared by agents (§3) |
 | Memory poisoning | Provenance; tiers that rise only through gates; imports start raw; content is data; independent auditors (§4, §5) |
-| Leaked secret or unsafe output in memory | Write-time screening; nothing raw is executed or loaded; outbound only within ceilings (§4) |
+| Leaked secret or unsafe output in memory | Screening before anything downstream reads it; failures quarantined, rotated, and erased; nothing raw is executed or loaded; outbound only within ceilings (§3, §4) |
+| Planted external content read before review | Raw from a tap reaches only the task it started until curated (§4) |
 | Trust carried along a chain | Derived entries take the weakest input; imports start raw; federation lends no authority (§4) |
 | Wrong or compromised curator | Reversible diffs; auditors on another model; telemetry out of its reach; approver never the proposer; lineage re-check; canaries (§5) |
 | Content leaves its boundary | Labels on entries, tasks, and sessions; ceilings on destinations; writes inherit; down only through a guard (§4) |

@@ -145,7 +145,7 @@ The people who vote on a project's code are the ones who vouch for its memory.
 
 ### An open front door
 
-Anyone can write into the raw tier, and that openness must stay. Raw is indexed and searchable with provenance attached. Nothing reaches a tier agents rely on without distillation and review. For the Foundation, the paper's poisoning defences (paper §4) are the minimum.
+Anyone can write into the raw tier, and that openness must stay. Raw from a tap reaches only the task it started until a curator has looked at it (paper §4), so a planted issue or post is not searchable across the project the moment it lands. Nothing reaches a tier agents rely on without distillation and review. For the Foundation, the paper's poisoning defences (paper §4) are the minimum.
 
 The incident in paper §1 shows why. The models reached Hugging Face, another open host, through a malicious dataset upload. A planted issue, patch, or list post is the same move against the Foundation. Lineage (paper §3) is the answer after the fact: once a source is found bad, every entry it informed, and every result sent from a session that read it, can be listed and re-checked.
 
