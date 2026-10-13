@@ -42,7 +42,7 @@ Three constraints follow and shape the rest of the design.
 
 **The system must outlive its parts.** Over decades every model, tool, and vendor is replaced, and the organisation is redrawn many times. So everything of lasting value lives in plain-text data with provenance. Services and agents around it can be rebuilt or replaced without loss.
 
-**How to read this paper.** §2 describes the whole design in two pages. §3 to §12 take one part each and add detail, always starting from why the part exists. §13 gives the build order, §14 the related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, and the failure modes. A companion case study, *Seeding a Foundation*, applies the design to the Apache Software Foundation.
+**How to read this paper.** §2 describes the whole design in two pages. §3 to §12 take one part each and add detail, always starting from why the part exists. §13 gives the build order, §14 the related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, and the rules in full detail. A companion case study, *Seeding a Foundation*, applies the design to the Apache Software Foundation.
 
 ---
 
@@ -297,30 +297,36 @@ Promotion to verified passes a review gate. A person approves it, or a senior ag
 
 ## Labels and flow
 
-Access control says who may read an entry. It does not say where the content may go next, and an agent is a channel: what it reads shapes what it writes and sends. So classifications come from one small ordered set (for example public, internal, restricted), and three things carry them.
+**An example first.** An agent reads a thread on a private security list, then tries to post a summary to a public issue tracker. The post is refused, because the session has read restricted material and the tracker takes only public content. To publish, the agent proposes a public version, a guard approves it, and a fresh session that has read only the public version posts it.
 
-- **Entries and tasks** carry a `classification`.
-- **Destinations**, every model class and tool server an agent can send to, carry a **ceiling**: the highest classification they may receive.
-- **Sessions** carry a **handling** level, the most they may read, set by policy for the principal and attested by the harness, and a **current label** that starts low and rises to the highest classification read. It never falls within the session. A harness may attest handling above public only if every outbound path it has goes through the perimeter; otherwise the outbound check below could be bypassed.
+```mermaid
+flowchart LR
+    E["Entry<br/>classification"] -->|"read: classification ≤ handling"| S["Session<br/>label rises with each read"]
+    S -->|"write: new entry gets at least the label"| N["New entry"]
+    S -->|"send: label ≤ ceiling"| D["Destination<br/>ceiling"]
+    N -.->|"declassify, a guard approves"| L["Lower-label version"]
+```
 
-The perimeter enforces three rules:
+Access control says who may read an entry. Labels say where its content may go next, because an agent is a channel: what it reads shapes what it writes and sends. Classifications come from one small ordered set, for example public, internal, restricted.
 
-- **Read:** `classification ≤ handling`, compiled into the search filter, so a session never sees hits, counts, or summaries above its handling.
-- **Write:** an entry carries at least the session's current label, because the author cannot tell which part of what it read shaped the text.
-- **Send:** an outbound call needs `current label ≤ ceiling`, checked per call.
+- **Entries and tasks** carry a classification.
+- **Destinations** (model classes, tool servers, taps) carry a **ceiling**: the most they may receive.
+- **Sessions** carry a **handling** level, the most they may read, and a **current label** that starts at the lowest level and rises to the highest classification read. The label never falls within a session.
 
-So a session that has read restricted material cannot post to a public tracker for the rest of that session.
+The perimeter enforces one rule for each direction:
 
-Tool servers are sources as well as destinations. Each is registered with its ceiling and with the highest classification of what it reads, and a call raises the session's label like any read. Grants are per principal and per server, and a server that reads restricted sources is never the same grant as one whose ceiling is public; a deployment that needs that crossing builds it as a `declassify`. Repeated ceiling denials from one principal alert as probing.
+- **Read** only what is within handling. The check is compiled into the search filter (§6), so hits, counts, and summaries above it never appear.
+- **Write** entries at the current label or higher, because the author cannot tell which part of what it read shaped the text.
+- **Send** only where the current label is within the destination's ceiling, checked on every call.
 
-Content crosses downward only through `declassify`: a proposal for a new, lower-labelled entry that cites the original. The proposal keeps the higher label until a guard named in policy approves it, by default the domain's owner and a person for the widest crossings, and the guard is recorded in the result's provenance. The cost of this design is over-classification. Its remedies are a small label set, short sessions, and a declassification path cheap enough to use.
+Content moves to a lower label only through `declassify`, and a guard named in policy approves each one. The price is over-classification. The remedies are a small label set, short sessions, and a declassification path cheap enough to use. Appendix E gives the rules in detail: who may attest handling, tool servers that are also sources, grants, and who guards which crossing.
 
 ## Model output in particular
 
 Model output gets three further rules, because of the hazards in §1.
 
-- **Writes are screened before anything reads them.** Each write is appended to the historian, then scanned for secrets, credentials, and whatever else L0 names (§7). Only events that pass reach the index, ledger, materializer, or taps. A failing event stays in the historian, so the attempt and what the session had read before it are on record, but it is quarantined: raised to the highest classification, readable only by the security role named in policy, and excluded from everything downstream. The exposed secret is rotated, and the body erased under the rules of §3.
-- **Nothing raw runs.** Code, tool definitions, and agent configuration are loaded only from verified entries in `dom-platform` (§10), and only through their gates. A package or URL named in an entry is a claim like any other.
+- **Writes are screened before anything reads them.** A write that carries a secret or credential, or anything else L0 forbids (§7), is quarantined: kept in the historian as evidence, hidden from everything else, and the secret rotated (Appendix E).
+- **Nothing raw runs.** Code, tool definitions, and agent configuration load only from verified entries in `dom-platform`, through their gates (§10). A package or URL named in an entry is a claim like any other.
 - **Nothing leaves by default.** Results go out only through taps and tool servers, each with a ceiling, and the fleet only proposes: a tracker's owner closes the issue, a committer merges the change (§8).
 
 ## Poisoning
@@ -380,7 +386,9 @@ Each step discloses a little more:
 
 ## Access control
 
-The policy engine is OPA, the Open Policy Agent, run beside the service with policy and the domain registry synced from the record. Once per session, the service asks under what conditions this principal may read, gets back a residual policy, and compiles it into a filter the search engine applies. Unauthorised entries are never scored or counted, so result counts cannot leak their existence. The filter also carries the raw-reach rules of §4. Prefetch and analytics use the same filter; a separate unfiltered path would bypass it.
+The policy engine is OPA, the Open Policy Agent. It runs beside the service, with policy and the registry synced from the record.
+
+Checking each result after a search would be slow, and result counts would still reveal what the reader may not see. So once per session the service asks OPA under what conditions this principal may read. OPA answers with a residual policy, which the service compiles into a filter the search engine applies to every query. Unauthorised entries are never scored or counted. The same filter carries the raw-reach rules of §4, and prefetch and analytics use it too; a separate unfiltered path would bypass it.
 
 Because the registry is data, a reorganisation is a data update. Exceptions are data too, so expiry is a timestamp comparison. Spend and throughput limits are set per domain and per principal in each resource class (§12). Every allow and deny is logged with the policy version that produced it. OPA covers what can be checked mechanically: access, labels, spend, irreversibility. Judgment is never encoded in it.
 
@@ -739,12 +747,7 @@ Vendors update weights behind stable model names, serve quantised variants under
 | Refusal-boundary and format probes | Safety-filter changes |
 | Fleet metrics (§9) | Anything with real impact, slowest to show |
 
-Change-point detection separates a lasting step (a model swap) from an intermittent pattern that tracks load (quantisation at peak). Every alarm must clear a noise floor built from several seeds and rotating paraphrases, because sampling at temperature zero is not deterministic on distributed back ends. Two cheap signals help:
-
-- where a vendor offers dated snapshots, probing the alias against the snapshot isolates a repoint directly;
-- a deployment using several vendors gets a differential signal for free.
-
-Replay quantifies confirmed drift. Then the model is pinned or failed over, and the event is recorded and escalated.
+Appendix E gives the detection and response in detail.
 
 One interlock matters most. If the model drifts while the §10 loop is evaluating a candidate, the loop could credit the drift to the candidate. Detected drift therefore freezes distillation for the affected window and quarantines any candidate whose evaluation spanned it.
 
@@ -800,7 +803,9 @@ Two tests apply to every component. The **record test**: if this goes dark, is a
 
 ## Prices, and why not build in the token
 
-Telemetry records raw quantities per resource class: input, cached, and output tokens, requests, accelerator time, compute time, bytes stored. A versioned price vector in the policy layer turns them into cost, and the efficiency measure is cost per completed task. The settings derived from cost (T0 size, disclosure depth, prefetch, the curation budget, triage weights) are recomputed when the vector changes and checked by replay before use. The structure (record, provenance, trust, domains, policy, perimeter) rests on correctness and auditability and does not move with prices.
+The design keeps prices out of its structure. Telemetry records raw quantities per resource class: tokens (input, cached, output), requests, accelerator time, compute time, and bytes stored. A versioned price vector, kept with policy, turns them into cost. The efficiency measure is cost per completed task.
+
+When the price vector changes, the settings that depend on cost are recomputed and checked by replay before use: T0 size, disclosure depth, prefetch, the curation budget, and triage weights. The structure itself (record, provenance, trust, domains, policy, perimeter) rests on correctness and auditability, and prices never move it.
 
 Why not go further and fix the economics on input tokens and turns? They look like physics, and partly they are: compute scales with what a model reads, and each turn re-reads the context unless it is cached. Three things argue against building the design on them.
 
@@ -821,27 +826,51 @@ One currency cannot express a fair share of a pool at peak. So the perimeter set
 
 The build order is a sequence of milestones without dates. Each delivers a capability, names the evidence that proves it, and gates the next. Each is useful on its own. A deployment can stop at M3 and hold a coherent system; one that stops earlier should hold material at a single classification, since labels and ceilings arrive in M3.
 
-**M1: Memory works.**
-*Capability:* the record with the entry schema; Postgres full-text retrieval with summaries first; T0; one domain's task ledger with leases and handoffs; per-task cost accounting; the evaluation provisions of §11 and a fixed pilot task set.
-*Exit:* a fresh agent recovers context from a handoff and T0 alone; known-item lookups land in the top three; the pilot set, run paired with and without memory, shows success no worse within a margin fixed beforehand and lower cost per task, with confidence intervals.
+### M1: Memory works
 
-**M2: The system sees itself.**
-*Capability:* telemetry and first SLOs; curator v1 (summaries, review dates, faithfulness sampling); the handoff fast lane; the first two-way tap; golden suite v1; frozen-context replay.
-*Exit:* SLOs are met and alert on breach; a deliberately degraded summary is caught before rollout; a tracker item becomes a task and its result returns, and a replayed day of tracker history creates no duplicate; one model or prompt change has been decided by replay.
+- **Delivers:** the record and entry schema · full-text retrieval, summaries first · T0 · one domain's ledger with leases and handoffs · per-task cost accounting · the evaluation provisions of §11 and a fixed pilot task set.
+- **Proven when:**
+  - a fresh agent recovers context from a handoff and T0 alone;
+  - known-item lookups land in the top three;
+  - the pilot set, run paired with and without memory, shows success no worse (within a margin fixed beforehand) and cost per task lower, with confidence intervals.
 
-**M3: Governance holds.**
-*Capability:* OPA with compiled filters; the registry; policy L0 to L2; the policy gate; exceptions; labels, ceilings, and `declassify`.
-*Exit:* a red-team read across a domain boundary is denied at the index; a simulated reorganisation is a registry-only change; an exception is filed, approved, used, and expired end to end.
+### M2: The system sees itself
 
-**M4: Many domains.**
-*Capability:* federation with interface summaries; portfolio orchestration; prefetch; canary serving; the vendor-drift probes.
-*Exit:* a cross-domain request completes through ledgers and summaries alone; prefetch precision clears its bar; a model swapped behind a fixed name is detected and attributed within the published bound.
+- **Delivers:** telemetry and first SLOs · curator v1 (summaries, review dates, faithfulness sampling) · the handoff fast lane · the first two-way tap · golden suite v1 · frozen-context replay.
+- **Proven when:**
+  - SLOs are met, and breaches alert;
+  - a deliberately degraded summary is caught before rollout;
+  - a tracker item becomes a task and its result returns, and replaying a day of tracker history creates no duplicate;
+  - one model or prompt change has been decided by replay.
 
-**M5: Self-improvement, gated.**
-*Capability:* the full loop of §10; live re-execution and the standing memory holdout; the import pipeline; the restore drill.
-*Exit:* a distilled harness change passes all gates and lowers cost per task on held-out work; a planted privilege-widening candidate is quarantined; the memory holdout reports per domain; the serving layer has been rebuilt from snapshots alone.
+### M3: Governance holds
 
-**A reference implementation for one person.** The smallest deployment is a personal domain, and one should exist as a reference. It is a single process on the person's machine:
+- **Delivers:** OPA with compiled filters · the registry · policy L0 to L2 · the policy gate · exceptions · labels, ceilings, and `declassify`.
+- **Proven when:**
+  - a red-team read across a domain boundary is denied at the index;
+  - a simulated reorganisation needs only a registry change;
+  - an exception is filed, approved, used, and expired, end to end.
+
+### M4: Many domains
+
+- **Delivers:** federation with interface summaries · portfolio orchestration · prefetch · canary serving · the vendor-drift probes.
+- **Proven when:**
+  - a cross-domain request completes through ledgers and summaries alone;
+  - prefetch precision clears its bar;
+  - a model swapped behind a fixed name is detected and attributed within the published bound.
+
+### M5: Self-improvement, gated
+
+- **Delivers:** the full loop of §10 · live re-execution and the standing memory holdout · the import pipeline · the restore drill.
+- **Proven when:**
+  - a distilled harness change passes all gates and lowers cost per task on held-out work;
+  - a planted privilege-widening candidate is quarantined;
+  - the memory holdout reports per domain;
+  - the serving layer has been rebuilt from snapshots alone.
+
+### A reference implementation for one person
+
+The smallest deployment is a personal domain, and one should exist as a reference. It is a single process on the person's machine:
 
 - the record in a local versioned store;
 - index and ledger in an embedded database;
@@ -1221,7 +1250,7 @@ When the ledger is down, the historian still accepts appends: handoffs and heart
 | Trust carried along a chain | Derived entries take the weakest input; imports start raw; federation lends no authority (§4) |
 | Wrong or compromised curator | Reversible diffs; auditors on another model; telemetry out of its reach; approver never the proposer; lineage re-check; canaries (§5) |
 | Content leaves its boundary | Labels on entries, tasks, and sessions; ceilings on destinations; writes inherit; down only through a guard (§4) |
-| Exfiltration through a tool | Ceilings and source labels per server; grants per principal and server; label checked per call; denials alert as probing (§4) |
+| Exfiltration through a tool | Ceilings and source labels per server; grants per principal and server; label checked per call; denials alert as probing (§4, Appendix E) |
 | Crashed agent holds work | Leases and heartbeats; handoff recovery (§8) |
 | Ledger outage or partition | Unrenewable lease treated as lost at expiry on both sides; work ends in a handoff (Appendix C) |
 | Retrieval outage | T0-only mode, queued writes, no irreversible actions (§9) |
@@ -1238,3 +1267,35 @@ When the ledger is down, the historian still accepts appends: handoffs and heart
 | Erasure against append-only history | Engine-level removal; stub, record, and receipt; derivations re-derived (§3) |
 | Institution keeps a person's memory | Personal domain under the owner's grants; views dropped with receipts (§12) |
 | A contributed component's authors leave | Ownership test: on-path components are institution-operated (§12) |
+
+---
+
+# Appendix E: Rules in Detail
+
+The main text gives each rule at the level needed to follow the design. This appendix gives the detail an implementer needs.
+
+### Labels (§4)
+
+- **Attesting handling.** A session's handling is set by policy for its principal and attested by its harness. A harness may attest handling above public only if every outbound path it has goes through the perimeter. Otherwise the send check could be bypassed.
+- **Tool servers are sources too.** Each is registered with its ceiling and with the highest classification of what it reads. A call raises the session's label like any read.
+- **Grants.** Grants are per principal and per server. A server that reads restricted sources is never the same grant as one whose ceiling is public; a deployment that needs that crossing builds it as a `declassify`.
+- **Probing.** Repeated ceiling denials from one principal alert as probing.
+- **Declassification.** A `declassify` proposes a new, lower-labelled entry that cites the original. The proposal keeps the higher label until the guard approves. The guard is the domain's owner by default, and a person for the widest crossings. The result names the guard in its provenance, so every crossing can be listed.
+- **Delegation and recall.** A helper's label starts at its parent's and flows back up. A `recall` raises the caller's label to the highest classification its deputy read.
+
+### Screening and quarantine (§3, §4)
+
+- Every write is appended to the historian, then screened for secrets, credentials, and whatever else L0 names.
+- The index, ledger, materializer, and taps read only events that passed.
+- A failing event stays in the historian, so the attempt, and what the session had read before it, are on record.
+- It is quarantined: raised to the highest classification, readable only by the security role named in policy, and excluded from everything downstream.
+- The exposed secret is rotated, and the event's body erased under the rules of §3. The stub and its lineage remain.
+
+### Vendor drift (§11)
+
+Change-point detection separates a lasting step (a model swap) from an intermittent pattern that tracks load (quantisation at peak). Every alarm must clear a noise floor built from several seeds and rotating paraphrases, because sampling at temperature zero is not deterministic on distributed back ends. Two cheap signals help:
+
+- where a vendor offers dated snapshots, probing the alias against the snapshot isolates a repoint directly;
+- a deployment using several vendors gets a differential signal for free.
+
+Replay quantifies confirmed drift. Then the model is pinned or failed over, and the event is recorded and escalated.
