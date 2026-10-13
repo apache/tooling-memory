@@ -42,7 +42,7 @@ Three constraints follow and shape the rest of the design.
 
 **The system must outlive its parts.** Over decades every model, tool, and vendor is replaced, and the organisation is redrawn many times. So everything of lasting value lives in plain-text data with provenance. Services and agents around it can be rebuilt or replaced without loss.
 
-**How to read this paper.** §2 describes the whole design in two pages. §3 to §12 take one part each and add detail, always starting from why the part exists. §13 gives the build order, §14 the related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full detail, and a glossary. A companion case study, *Seeding a Foundation*, applies the design to the Apache Software Foundation.
+**How to read this paper.** §2 describes the whole design in two pages. §3 to §12 take one part each and add detail, always starting from why the part exists. §13 covers related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full detail, and a glossary. A companion case study, *Seeding a Foundation*, applies the design to the Apache Software Foundation.
 
 ---
 
@@ -336,7 +336,7 @@ Model output gets three further rules, because of the hazards in §1.
 
 ## Poisoning
 
-Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it (§14). Everything above is the defence, together with the independent auditors of §5.
+Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it ([§13](#13-related-work)). Everything above is the defence, together with the independent auditors of §5.
 
 ---
 
@@ -674,7 +674,7 @@ Each domain keeps a golden query suite that runs on every change to the indexer,
 
 ## The platform is a domain
 
-The harness, meaning system prompts, tool definitions, agent definitions, retrieval settings, the triage rubric, and the methods agents retrieve mid-task, is memory in a domain called `dom-platform`, along with evaluation suites, scorecards, and known model quirks. Curators curate it like any domain, so the system improves without training anything: a better method for a recurring task helps every agent that draws it. Recent work on self-evolving agents finds the same, that most gains come from improving the harness, without retraining (§14).
+The harness, meaning system prompts, tool definitions, agent definitions, retrieval settings, the triage rubric, and the methods agents retrieve mid-task, is memory in a domain called `dom-platform`, along with evaluation suites, scorecards, and known model quirks. Curators curate it like any domain, so the system improves without training anything: a better method for a recurring task helps every agent that draws it. Recent work on self-evolving agents finds the same, that most gains come from improving the harness, without retraining ([§13](#13-related-work)).
 
 The harness has two zones with a hard line between them. The **mutable zone** (prompts, tools, settings, methods) is inside the improvement loop. The **perimeter** (OPA policy, permissions, spend limits, data boundaries, the L0 core) is owned by people, sits outside `dom-platform`'s writable scope, and is enforced on every action whatever the harness says.
 
@@ -767,7 +767,7 @@ Arms are scored on task success and on cost per task, paired by task across seed
 
 The no-memory baseline must be honest: it keeps everything an agent would have without this system, including tracker history. Entries written after the task's snapshot are excluded from the full arm.
 
-The answer is per domain, and it moves. Memory may pay where decisions are long-lived and not where tasks are throwaway, and larger context windows or cheaper reads can erode its margin. So the comparison runs first on a fixed pilot set (§13, M1), and later as a standing holdout: a small sample of completed tasks re-run without memory on a published cadence.
+The answer is per domain, and it moves. Memory may pay where decisions are long-lived and not where tasks are throwaway, and larger context windows or cheaper reads can erode its margin. So the comparison runs first on a fixed pilot set, and later as a standing holdout: a small sample of completed tasks re-run without memory on a published cadence.
 
 ## Vendor changes nobody announced
 
@@ -870,107 +870,35 @@ When a class saturates, triage treats it like any other constraint (§8): urgent
 
 ---
 
-# 13. Build Order
-
-The build order is a sequence of milestones without dates. Each delivers a capability, names the evidence that proves it, and gates the next. Each is useful on its own. A deployment can stop at M3 and hold a coherent system; one that stops earlier should hold material at a single classification, since labels and ceilings arrive in M3.
-
-### M1: Memory works
-
-- **Delivers:** the record and entry schema · full-text retrieval, summaries first · T0 · one domain's ledger with leases and handoffs · per-task cost accounting · the evaluation provisions of §11 and a fixed pilot task set.
-- **Proven when:**
-  - a fresh agent recovers context from a handoff and T0 alone;
-  - known-item lookups land in the top three;
-  - the pilot set, run paired with and without memory, shows success no worse (within a margin fixed beforehand) and cost per task lower, with confidence intervals.
-
-### M2: The system sees itself
-
-- **Delivers:** telemetry and first SLOs · curator v1 (summaries, review dates, faithfulness sampling) · the handoff fast lane · the first two-way tap · golden suite v1 · frozen-context replay.
-- **Proven when:**
-  - SLOs are met, and breaches alert;
-  - a deliberately degraded summary is caught before rollout;
-  - a tracker item becomes a task and its result returns, and replaying a day of tracker history creates no duplicate;
-  - one model or prompt change has been decided by replay.
-
-### M3: Governance holds
-
-- **Delivers:** OPA with compiled filters · the registry · policy L0 to L2 · the policy gate · exceptions · labels, ceilings, and `declassify`.
-- **Proven when:**
-  - a red-team read across a domain boundary is denied at the index;
-  - a simulated reorganisation needs only a registry change;
-  - an exception is filed, approved, used, and expired, end to end.
-
-### M4: Many domains
-
-- **Delivers:** federation with interface summaries · portfolio orchestration · prefetch · canary serving · the vendor-drift probes.
-- **Proven when:**
-  - a cross-domain request completes through ledgers and summaries alone;
-  - prefetch precision clears its bar;
-  - a model swapped behind a fixed name is detected and attributed within the published bound.
-
-### M5: Self-improvement, gated
-
-- **Delivers:** the full loop of §10 · live re-execution and the standing memory holdout · the import pipeline · the restore drill.
-- **Proven when:**
-  - a distilled harness change passes all gates and lowers cost per task on held-out work;
-  - a planted privilege-widening candidate is quarantined;
-  - the memory holdout reports per domain;
-  - the serving layer has been rebuilt from snapshots alone.
-
-### A reference implementation for one person
-
-The smallest deployment is a personal domain, and one should exist as a reference. It is a single process on the person's machine:
-
-- the record in a local versioned store;
-- index and ledger in an embedded database;
-- grants in a policy file the person edits;
-- the Appendix A surface as one memory server;
-- taps that import what the person's harnesses export;
-- `export` and `erase` working end to end.
-
-Its review gate is the owner. It doubles as the conformance check for the surface, and lets people use the design before their institution builds anything.
-
-As the system grows, revisit the search engine (Postgres to OpenSearch), the historian's store (files to Kafka), the record engine if write rates strain it, and the domain boundaries, on evidence.
-
----
-
-# 14. Related Work
+# 13. Related Work
 
 The design combines recent agent-memory research with decades of systems practice.
 
-**Memory.** Tiered agent memory follows MemGPT's operating-system hierarchy [[18]](#ref-18), reflection and importance scoring in Generative Agents [[19]](#ref-19), experience distillation in ExpeL [[20]](#ref-20) and A-Mem [[21]](#ref-21), and Voyager's library of agent-written skills [[22]](#ref-22). Surveys treat memory as a write, manage, read loop and document the field's shift from message passing to shared substrates [[23]](#ref-23), [[24]](#ref-24). The write path is event sourcing [[25]](#ref-25), [[26]](#ref-26). Decisions with rationale are Nygard's architecture decision records [[27]](#ref-27). Knowledge decay has a long literature in organisational memory [[28]](#ref-28).
+| Area | Builds on |
+|---|---|
+| **Memory** | Operating-system tiers (MemGPT [[18]](#ref-18)); reflection (Generative Agents [[19]](#ref-19)); experience distillation (ExpeL [[20]](#ref-20), A-Mem [[21]](#ref-21)); agent-written skills (Voyager [[22]](#ref-22)); memory as a write, manage, read loop on shared substrates [[23]](#ref-23), [[24]](#ref-24); event sourcing [[25]](#ref-25), [[26]](#ref-26); decision records [[27]](#ref-27); organisational memory [[28]](#ref-28) |
+| **Trust** | Not transitive [[6]](#ref-6); typed by purpose [[7]](#ref-7); lossy propagation, separate distrust [[29]](#ref-29); provenance and lineage in W3C PROV [[30]](#ref-30); authority collapse [[8]](#ref-8); separation of privilege [[31]](#ref-31) |
+| **Safety** | Indirect prompt injection [[32]](#ref-32); memory poisoning through queries (MINJA [[33]](#ref-33)) and stores (AgentPoison [[34]](#ref-34)), largely missed by injection defences [[35]](#ref-35); OWASP's agentic top risks [[36]](#ref-36); failure modes of governed shared memory [[37]](#ref-37); retrieved content as data, never control flow (CaMeL [[38]](#ref-38)) |
+| **Retrieval and access** | Authorisation compiled into the query (OPA [[39]](#ref-39), Zanzibar [[40]](#ref-40)); the Model Context Protocol as today's binding [[41]](#ref-41) |
+| **Policy** | Written, layered values (Constitutional AI [[42]](#ref-42)); specification gaming, which the safety gate exists for [[43]](#ref-43), [[44]](#ref-44) |
+| **Coordination** | Blackboards (Hearsay-II [[45]](#ref-45)) and tuple spaces (Linda [[46]](#ref-46)); stigmergy [[47]](#ref-47), [[48]](#ref-48); leases [[49]](#ref-49); bounded contexts [[50]](#ref-50) and data mesh [[51]](#ref-51); hierarchical task networks [[52]](#ref-52); critical-path priority [[53]](#ref-53); the contract net, without the bidding [[54]](#ref-54) |
+| **Measurement and evaluation** | SRE [[55]](#ref-55); token cost as an axis (Mem0 [[56]](#ref-56), LoCoMo [[57]](#ref-57)); long-horizon benchmarks (LongMemEval [[58]](#ref-58)); silent vendor drift [[59]](#ref-59); NIST AI RMF [[60]](#ref-60) and ISO/IEC 42001 [[61]](#ref-61); OpenTelemetry [[62]](#ref-62) and Inspect [[63]](#ref-63) as carriers; the paired noise-floor protocol [[64]](#ref-64) |
+| **Seeding** | Co-change coupling [[65]](#ref-65); fixes linked to their causes [[66]](#ref-66) |
+| **Self-improvement** | Self-evolving harnesses (SEAGym [[67]](#ref-67)); offline distillation, online retrieval (EvolveR [[68]](#ref-68)); gated archives (Darwin Gödel Machine [[69]](#ref-69)); co-evolving evaluators [[70]](#ref-70); agents designed as code [[71]](#ref-71). This design adds human review, a manifest check, and a perimeter outside the loop |
+| **Long timescales** | Dated authorities (RFC 4151 [[11]](#ref-11)); names never reassigned (RFC 8141 [[72]](#ref-72)); stable internal IDs (SCIM [[73]](#ref-73)); issuer and subject (OpenID Connect [[12]](#ref-12)); identifiers free of organisational names [[13]](#ref-13) |
 
-**Trust.** Trust is not transitive [[6]](#ref-6) and is typed by purpose [[7]](#ref-7); propagation can be computed but is lossy, and distrust needs separate handling [[29]](#ref-29). W3C PROV [[30]](#ref-30) is the standard vocabulary for the provenance each entry carries and the lineage the historian records: an entry version is an entity, a session an activity that *used* what it read and *generated* what it wrote, and a principal an agent. Consolidation that drops source constraints, "authority collapse", is benchmarked by Zhan et al. [[8]](#ref-8). Circular reporting, where a claim is corroborated by its own echoes, is why an entry may not count anything derived from it as support. Separation of privilege dates to Saltzer and Schroeder [[31]](#ref-31).
+**Organisational cybernetics.** The design supplies each function of Beer's Viable System Model [[74]](#ref-74), [[75]](#ref-75):
 
-**Safety.** The incident in §1 is documented in Hugging Face's disclosure [[1]](#ref-1) and OpenAI's statement [[2]](#ref-2); the agents' message board was described in OpenAI's Black Hat briefing, as reported by Cybersecurity Dive [[3]](#ref-3). The other hazards come from reporting on the Samsung leak [[4]](#ref-4) and a study of package hallucination [[5]](#ref-5). The attacks are indirect prompt injection through retrieved content [[32]](#ref-32) and memory poisoning, through ordinary queries (MINJA [[33]](#ref-33)) or through poisoned stores (AgentPoison [[34]](#ref-34)). Prompt-injection defences largely miss memory poisoning [[35]](#ref-35), and OWASP lists memory and context poisoning among the top risks for agentic applications [[36]](#ref-36). Governed shared memory for agent fleets names four failure modes (leakage, stale propagation, persistent contradiction, provenance collapse) that the filters, review dates, supersession, and provenance here address [[37]](#ref-37). Treating retrieved content as data that cannot become control flow is the commitment CaMeL enforces with capabilities [[38]](#ref-38).
-
-**Retrieval and access.** Summaries-first disclosure is result-snippet design on a token budget. Compiling authorisation into the query follows OPA's partial evaluation [[39]](#ref-39) and Google's Zanzibar [[40]](#ref-40). The Model Context Protocol [[41]](#ref-41) is the present tool-protocol binding around the operation surface.
-
-**Policy.** Written, layered values that a model consults resemble Constitutional AI [[42]](#ref-42); the stack here is authored by the institution, layered with precedence, and backed by a deterministic perimeter. The failure the safety gate exists for is specification gaming [[43]](#ref-43), [[44]](#ref-44).
-
-**Coordination.** A shared workspace is the blackboard architecture of Hearsay-II [[45]](#ref-45) and Linda's tuple space [[46]](#ref-46); the biological analogue is stigmergy [[47]](#ref-47), [[48]](#ref-48). Leases come from Gray and Cheriton [[49]](#ref-49). Domains with published interfaces are bounded contexts [[50]](#ref-50) and data mesh [[51]](#ref-51). Decomposition follows hierarchical task networks [[52]](#ref-52), priority along dependencies is critical-path scheduling [[53]](#ref-53), and capability matching is the contract net [[54]](#ref-54) without the bidding.
-
-**Measurement and evaluation.** The observability plane is SRE practice [[55]](#ref-55). Token cost as an evaluation axis follows Mem0 [[56]](#ref-56) and LoCoMo [[57]](#ref-57); LongMemEval [[58]](#ref-58) benchmarks the long-horizon abilities curation supports. Silent vendor drift is documented by Chen, Zaharia, and Zou [[59]](#ref-59). Building evaluation in follows the NIST AI RMF's Measure function [[60]](#ref-60) and ISO/IEC 42001 clause 9 [[61]](#ref-61); OpenTelemetry's generative-AI conventions [[62]](#ref-62) and the UK AI Security Institute's Inspect [[63]](#ref-63) are present carriers for the evidence. The paired noise-floor protocol follows [[64]](#ref-64).
-
-**Seeding.** The source mappings draw on mining-software-repositories research: co-change coupling from version histories [[65]](#ref-65) and fixes linked to the changes that caused them [[66]](#ref-66).
-
-**Self-improvement.** Related work locates self-evolution in the harness (SEAGym [[67]](#ref-67)), distils offline and retrieves online (EvolveR [[68]](#ref-68)), archives candidates behind gated admission (the Darwin Gödel Machine [[69]](#ref-69)), shows that evaluators must co-evolve to resist gaming [[70]](#ref-70), and has a meta-agent design agents as code [[71]](#ref-71). This design adds human review, a manifest check, and a perimeter outside the loop.
-
-**Long timescales.** Dated authorities for identifiers come from RFC 4151 [[11]](#ref-11); names never reassigned from RFC 8141 [[72]](#ref-72); stable, non-reassignable IDs separate from external ones from SCIM [[73]](#ref-73); issuer-and-subject pairs from OpenID Connect Core [[12]](#ref-12); and identifiers free of organisational names from Berners-Lee [[13]](#ref-13).
-
-**Organisational cybernetics.** Beer's Viable System Model [[74]](#ref-74), [[75]](#ref-75) names the functions any organisation needs to stay viable. Read through it, the design supplies each one:
-
-| VSM | Function | In this design |
+| VSM | Function | Here |
 |---|---|---|
-| System 1 | Operations | Domains and the agents working their tasks |
-| System 2 | Coordination that damps oscillation between units | The [task ledger](#a-tasks-life): leases, ownership, coordination through shared state |
-| System 3 | Control of resources | Orchestrators, triage, and the perimeter's spend and throughput limits |
-| System 3* | Audit | [Auditors](#auditors), canary entries, sampled human review |
-| System 4 | Watching outside and ahead | [Measurement](#9-measurement), evaluation suites, vendor-drift detection |
-| System 5 | Identity and ethos | The [policy stack](#7-the-policy-stack), amended only by people |
+| System 1 | Operations | Domains and their agents |
+| System 2 | Coordination | The [task ledger](#a-tasks-life) |
+| System 3 | Resource control | Orchestrators, triage, spend and throughput limits |
+| System 3* | Audit | [Auditors](#auditors), canary entries, sampled review |
+| System 4 | Outside and ahead | [Measurement](#9-measurement), evaluation, drift detection |
+| System 5 | Identity | The [policy stack](#7-the-policy-stack), amended only by people |
 
-The model's recursion holds too: the same pattern repeats from feature to institution ([Across domains](#across-domains)). Capability gaps, canary alarms, and drift freezes bypass the hierarchy, as Beer's algedonic signals do.
-
-Ashby's law of requisite variety [[76]](#ref-76) names what summaries-first serving and compiled filters do: they cut what reaches each agent to what it can absorb, while the policy digest carries governance into every decision. The curation loop, closed on its own telemetry, is feedback control in Wiener's sense [[77]](#ref-77). It keeps the corpus healthy in year ten without heroics.
+The pattern recurs from feature to institution ([Across domains](#across-domains)), and capability gaps, canary alarms, and drift freezes are its algedonic signals. Summaries-first serving and compiled filters attenuate variety to what each agent can absorb (Ashby [[76]](#ref-76)). The curation loop is feedback control closed on its own telemetry (Wiener [[77]](#ref-77)).
 
 **Less covered elsewhere**, and answered here from first principles: organisational change over decades, resilience to model churn, layered policy with expiring exceptions, and human legibility as the final backstop.
 
@@ -1226,7 +1154,7 @@ A new deployment starts on top of existing knowledge: repositories, tickets, rev
 | Documentation, wikis | Interface summaries |
 | Rosters, versions | Facts with short review dates |
 
-**Order of work.** Domains first, with current owners registered. Then one verified interface summary per domain, so every area can answer "what is this and where do I look". Pilot on two or three deliberately different domains, hold them to M1 and M2, then fan out.
+**Order of work.** Domains first, with current owners registered. Then one verified interface summary per domain, so every area can answer "what is this and where do I look". Pilot on two or three deliberately different domains, show that memory pays on each ([§11](#11-evaluating-change)), then fan out.
 
 **Knowledge about code lives in memory, not in the repository.** In-repository agent instruction files are memory without the machinery: no provenance, tier, review date, audit, or owner, read whole every session, and unable to span repositories. The boundary: if a commit changes its truth, it belongs in the repository; if understanding changes its truth, it belongs in memory. Where a repository still needs an instruction file, for outside contributors or tools that cannot call the service, the curator generates one: a small digest of the domain's T0 slice, marked as generated, with its digest in a published list. A fleet harness never mounts stubs. A harness that can reach the service drops current and stale stubs and reads the service instead, and never loads a hand-edited one; a hand edit is rejected in review or harvested back as a raw entry. A foreign harness that loads instruction files on its own needs a load-time hook to apply the list; without one, the stub's shape limits the damage, since it holds pointers, not a second copy of the facts. Skills served through the tool protocol follow the same rule: only verified bundles are loaded, and a changed digest revokes approval. A copy of a skill kept in a repository is a generated stub like any other.
 

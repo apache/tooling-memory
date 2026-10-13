@@ -262,7 +262,7 @@ Three pilots, deliberately different:
 - one mature, stable project with decades of history;
 - one podling, whose memory is born inside the system instead of imported into it.
 
-Each must pass the paper's M1 and M2 exit criteria ([paper §13](durable-memory-for-disposable-agents.md#13-build-order)) before fan-out, including the paired run with and without memory.
+Before fan-out, each must show that memory pays on its own tasks, in a paired run with and without memory ([paper §11](durable-memory-for-disposable-agents.md#11-evaluating-change)).
 
 ---
 
@@ -283,7 +283,7 @@ None of these needed a structural change to the design.
 
 ## 11. Risks and open questions
 
-These are deployment risks. The milestones are built to surface them early.
+These are deployment risks. The pilots are chosen to surface them early.
 
 - **Distilling culture.** Process norms distil from observable behaviour, but telling a norm from a habit takes judgment. Early distillations need heavier PMC review until faithfulness sampling shows they hold.
 - **Review capacity at fan-out.** Three pilots fit volunteer review. Two hundred projects fit only if breadth-first summaries and sampled review keep each project's load to a few hours. Telemetry will tell, and fan-out should follow it.
