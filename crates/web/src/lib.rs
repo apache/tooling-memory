@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 pub mod access;
+pub mod companion;
 mod pages;
 pub mod state;
 
@@ -211,6 +212,8 @@ struct App {
     sessions: Arc<Mutex<BTreeMap<String, Arc<Session>>>>,
     /// Bundle exports run one at a time: each replaces a directory by renaming.
     exports: Arc<tokio::sync::Mutex<()>>,
+    /// The browser extension beside the page, when one is connected.
+    companion: Arc<companion::Companion>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1232,9 +1235,13 @@ pub fn router(config: Config) -> Result<Router, Error> {
         memory,
         sessions: Arc::new(Mutex::new(BTreeMap::new())),
         exports: Arc::new(tokio::sync::Mutex::new(())),
+        companion: Arc::new(companion::Companion::default()),
     };
     Ok(Router::new()
         .route("/", get(index))
+        .route(companion::WS_PATH, get(companion::ws))
+        .route(companion::STATUS_PATH, get(companion::status))
+        .route(companion::FETCH_PATH, post(companion::fetch))
         .route("/amem.js", get(amem_js))
         .route("/tokens.css", get(tokens_css))
         // the pages by file name too: a hosted copy has only files, and the pages link
@@ -1859,6 +1866,67 @@ mod tests {
     async fn get_json(addr: std::net::SocketAddr, path: &str) -> (u16, Value) {
         let (status, body) = http(addr, "GET", path, None).await;
         (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+
+    /// A request with a browser's key rather than the token.
+    async fn as_browser(
+        addr: std::net::SocketAddr,
+        key: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        let status = out.split(' ').nth(1).unwrap().parse().unwrap();
+        (status, out.split_once("\r\n\r\n").unwrap().1.to_string())
+    }
+
+    #[tokio::test]
+    async fn the_companion_is_asked_with_the_token_and_shown_to_a_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        // a paired page sees whether a companion is there, and there is none
+        let (_, pairing) = http(addr, "POST", "/api/pair", None).await;
+        let code = serde_json::from_str::<Value>(&pairing).unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, redeemed) = http(
+            addr,
+            "POST",
+            "/api/pair/redeem",
+            Some(&json!({"code": code}).to_string()),
+        )
+        .await;
+        assert_eq!(status, 200, "{redeemed}");
+        let key = serde_json::from_str::<Value>(&redeemed).unwrap()["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) = as_browser(addr, &key, "GET", companion::STATUS_PATH, "").await;
+        assert_eq!(status, 200, "{body}");
+        let shown: companion::Status = serde_json::from_str(&body).unwrap();
+        assert_eq!(shown, companion::Status::default());
+        // a fetch with the browser's cookies is the launcher's to ask, with the token:
+        // a page's key is refused before anything is looked at
+        let ask = json!({"url": "https://a.example/", "hosts": ["a.example"]}).to_string();
+        let (status, _) = as_browser(addr, &key, "POST", companion::FETCH_PATH, &ask).await;
+        assert_eq!(status, 401);
+        // with the token and no companion connected: unavailable, and said so
+        let (status, body) = http(addr, "POST", companion::FETCH_PATH, Some(&ask)).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("no companion is connected"), "{body}");
+        // the socket wants a key too
+        let (status, _) = as_browser(addr, "not-a-key", "GET", companion::WS_PATH, "").await;
+        assert_eq!(status, 401);
     }
 
     #[tokio::test]

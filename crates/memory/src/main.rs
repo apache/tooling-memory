@@ -9,6 +9,7 @@
 //! passes them inside.
 
 mod board;
+mod browser;
 mod canary;
 mod checker;
 mod cost;

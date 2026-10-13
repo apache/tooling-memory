@@ -44,8 +44,8 @@ fn installed(root: &Path, name: &str) -> Option<PathBuf> {
         .filter(|p| p.is_file())
 }
 
-/// The tools this root serves: granted as tools, run here (not hosted on), and either
-/// installed as a component or native to this binary.
+/// The tools this root serves: granted as tools, run here (not hosted on, and not the
+/// owner's browser's), and either installed as a component or native to this binary.
 fn served(s: &Served) -> Vec<(&String, &TapGrant)> {
     s.grants
         .taps
@@ -53,6 +53,7 @@ fn served(s: &Served) -> Vec<(&String, &TapGrant)> {
         .filter(|(name, g)| {
             g.tool
                 && g.hosted.is_none()
+                && !g.browser
                 && (installed(&s.root, name).is_some() || dm_taps::fetch::is_native(name))
         })
         .collect()

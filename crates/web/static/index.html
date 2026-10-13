@@ -231,6 +231,25 @@ for (const b of document.querySelectorAll('[data-copy]')) {
 // what a page says when it has no key; a hosted copy also says where amem has to run
 let unreach = '';
 const unpairedWhy = () => { if (unreach) return unreach; const w = amem.unpaired(); return amem.hosted && !/own machine/.test(w) ? `${w} This copy of the pages runs in your browser and talks to amem on your own machine: run amem there, and it opens this page paired.` : w; };
+// ---- the companion: the extension beside this page, when the server has it ----
+let companion = null; // the server's word: {connected, version}
+function companionWord() {
+  if (!companion) return [];
+  const c = el('span', 'am-id', companion.connected ? `companion ${companion.version || ''}`.trim() : 'no companion');
+  c.title = companion.connected
+    ? 'The amem companion extension is connected: a session whose fetch grant says browser = true fetches with this browser\'s logins.'
+    : 'No companion extension is connected. Install crates/web/companion unpacked to let a session fetch with this browser\'s logins.';
+  return [' · ', c];
+}
+async function refreshCompanion() {
+  const r = await amem.fetch('/api/companion').catch(() => null);
+  if (!r || !r.ok) return;
+  const now = await r.json();
+  const changed = !companion || companion.connected !== now.connected || companion.version !== now.version;
+  companion = now;
+  if (changed && paired) showPairing();
+}
+
 // ---- pairing ----
 let paired = false;
 function showPairing() {
@@ -239,7 +258,7 @@ function showPairing() {
     let host = amem.server() || location.origin;
     try { host = new URL(host).host; } catch (_) { /* as it is */ }
     const id = el('span', 'am-id', host);
-    end.replaceChildren('Paired with ', id);
+    end.replaceChildren('Paired with ', id, ...companionWord());
     $('unpaired').hidden = true;
     return;
   }
@@ -315,6 +334,8 @@ async function load() {
   loadDoctor(false);
   refresh();
   setInterval(refresh, 3000);
+  refreshCompanion();
+  setInterval(refreshCompanion, 5000);
 }
 
 async function loadProfiles() {

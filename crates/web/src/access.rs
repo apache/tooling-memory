@@ -220,6 +220,14 @@ fn origin_allowed(access: &Access, origin: &str, host: &str) -> bool {
     origin == format!("http://{host}") || access.origins.iter().any(|o| o == origin)
 }
 
+/// Whether an `Origin` is a browser extension's on the companion's socket: the
+/// companion is software the owner installed, not a page, and it offers a key as a page
+/// does; it is let in there and nowhere else.
+fn companion_origin(path: &str, origin: &str) -> bool {
+    path == crate::companion::WS_PATH
+        && (origin.starts_with("chrome-extension://") || origin.starts_with("moz-extension://"))
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -277,7 +285,9 @@ fn needs(path: &str) -> Needs {
         || path.starts_with("/reader/")
     {
         Needs::Nothing
-    } else if path == "/api/pair" {
+    } else if path == "/api/pair" || path == crate::companion::FETCH_PATH {
+        // a fetch through the companion goes out with the browser's cookies: the
+        // launcher asks for it with the token, and no page can
         Needs::Token
     } else {
         Needs::Key
@@ -318,13 +328,16 @@ pub async fn gate(State(access): State<Access>, req: Request, next: Next) -> Res
     // a hosted page the operator allowed: its calls are cross-origin
     let mut foreign = None;
     if let Some(origin) = headers.get(header::ORIGIN) {
-        let ok = origin
-            .to_str()
-            .is_ok_and(|o| origin_allowed(&access, o, host));
+        let ok = origin.to_str().is_ok_and(|o| {
+            origin_allowed(&access, o, host) || companion_origin(req.uri().path(), o)
+        });
         if !ok {
             return refuse(StatusCode::FORBIDDEN, "a page from another origin");
         }
-        if origin.to_str().is_ok_and(|o| o != format!("http://{host}")) {
+        if origin
+            .to_str()
+            .is_ok_and(|o| o != format!("http://{host}") && !companion_origin(req.uri().path(), o))
+        {
             foreign = Some(origin.clone());
         }
     }
@@ -428,6 +441,13 @@ mod tests {
             "127.0.0.1:4200"
         ));
         assert!(!origin_allowed(&a, "null", "127.0.0.1:4200"));
+        // an extension's origin is let in on the companion's socket, nowhere else
+        let ext = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+        assert!(companion_origin("/ws/companion", ext));
+        assert!(companion_origin("/ws/companion", "moz-extension://x"));
+        assert!(!companion_origin("/api/sessions", ext));
+        assert!(!companion_origin("/ws/companion", "https://amem.example"));
+        assert!(!origin_allowed(&a, ext, "127.0.0.1:4200"));
         assert!(!origin_allowed(
             &a,
             "https://amem.example.evil",
@@ -519,6 +539,9 @@ mod tests {
         assert_eq!(needs("/"), Needs::Nothing);
         assert_eq!(needs("/api/pair/redeem"), Needs::Nothing);
         assert_eq!(needs("/api/pair"), Needs::Token);
+        assert_eq!(needs("/api/companion/fetch"), Needs::Token);
+        assert_eq!(needs("/api/companion"), Needs::Key);
+        assert_eq!(needs("/ws/companion"), Needs::Key);
         assert_eq!(needs("/api/sessions"), Needs::Key);
         assert_eq!(needs("/ws/abc"), Needs::Key);
         assert_eq!(needs("/bundle/d/l/manifest.yaml"), Needs::Key);

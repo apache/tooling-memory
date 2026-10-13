@@ -25,6 +25,14 @@ pub struct Running {
     addr: SocketAddr,
 }
 
+impl Running {
+    /// The address it was dialled at, for asking it more under the token.
+    #[must_use]
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
 /// What a pairing gives: the code for the browser, and where sessions start.
 #[derive(Debug)]
 pub struct Pairing {

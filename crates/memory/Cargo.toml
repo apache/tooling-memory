@@ -11,6 +11,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 dm-client = { version = "0.1.0", path = "../client" }
 dm-core = { version = "0.1.0", path = "../core" }
 dm-egress = { version = "0.1.0", path = "../egress" }
+dm-fetch = { version = "0.1.0", path = "../fetch" }
 dm-index = { version = "0.1.0", path = "../index" }
 dm-ledger = { version = "0.1.0", path = "../ledger" }
 dm-mount = { version = "0.1.0", path = "../mount" }
@@ -33,5 +34,7 @@ workspace = true
 
 [dev-dependencies]
 dm-ledger = { version = "0.1.0", path = "../ledger", features = ["pg-test"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = "0.30"
 tempfile = "3.27.0"
 tokio-postgres = "0.7.18"

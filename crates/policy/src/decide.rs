@@ -990,6 +990,7 @@ mod tests {
                 results: None,
                 fresh: false,
                 hosted: None,
+                browser: false,
             },
         );
         g

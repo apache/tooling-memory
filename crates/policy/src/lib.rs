@@ -189,6 +189,14 @@ pub struct TapGrant {
     /// `https`, or `http` to this machine's loopback for development.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted: Option<String>,
+    /// A tool the owner's own browser runs: fetch, made by the companion extension
+    /// beside the web launcher's page with the browser's own cookies, so a page the
+    /// owner is signed in to answers as it would to them. The browser is a host of the
+    /// tool as a tool server is, not a way around the grant: the policy decides the URL
+    /// before the browser is asked and the URL that answered before anything is kept,
+    /// and the hosts the session may reach go with every ask.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub browser: bool,
 }
 
 /// Hosts a tool may reach at a higher label than its own ceiling.
@@ -323,6 +331,18 @@ impl Grants {
                 if !t.tool || !(url.starts_with("https://") || local) {
                     return Err(Error::Invalid(format!(
                         "[taps.{name}] hosted = {url:?}: a hosted tool is a tool, served over https or on this machine's loopback"
+                    )));
+                }
+            }
+            if t.browser {
+                if !t.tool || name != "fetch" {
+                    return Err(Error::Invalid(format!(
+                        "[taps.{name}] browser = true: the browser runs fetch, granted as a tool"
+                    )));
+                }
+                if t.hosted.is_some() {
+                    return Err(Error::Invalid(format!(
+                        "[taps.{name}]: browser = true or hosted = \"...\"; a tool has one host"
                     )));
                 }
             }
@@ -495,6 +515,36 @@ ceiling = "public"
             !starter.render().unwrap().contains("[taps"),
             "no section until one is granted"
         );
+    }
+
+    #[test]
+    fn a_browser_grant_is_fetch_as_a_tool_with_no_other_host() {
+        let base = "owner = \"human:x:y\"\n[domains.dom-y]\n";
+        let g = Grants::parse(&format!(
+            "{base}[taps.fetch]\ndomain = \"dom-y\"\nceiling = \"public\"\ntool = true\nbrowser = true\n"
+        ))
+        .unwrap();
+        assert!(g.taps["fetch"].browser);
+        assert!(g.render().unwrap().contains("browser = true"));
+        for (grant, why) in [
+            (
+                "[taps.search]\ndomain = \"dom-y\"\nceiling = \"public\"\ntool = true\nbrowser = true\n",
+                "the browser runs fetch",
+            ),
+            (
+                "[taps.fetch]\ndomain = \"dom-y\"\nceiling = \"public\"\nbrowser = true\n",
+                "granted as a tool",
+            ),
+            (
+                "[taps.fetch]\ndomain = \"dom-y\"\nceiling = \"public\"\ntool = true\nbrowser = true\nhosted = \"https://t.example/mcp\"\n",
+                "one host",
+            ),
+        ] {
+            let e = Grants::parse(&format!("{base}{grant}"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(why), "{grant}: {e}");
+        }
     }
 
     #[test]

@@ -107,7 +107,8 @@ pub async fn run(
 /// The tool taps installed under the root, as the memory server calls them: each call
 /// loads the tool's component and its grant, and runs it with the credential the grant
 /// names, every request it makes decided by the policy. A tool whose grant names a
-/// tool server is called there instead, through the egress.
+/// tool server is called there instead, through the egress; one whose grant says
+/// `browser` is fetched by the owner's browser through the web launcher.
 pub struct TapTools {
     root: std::path::PathBuf,
     /// The egress hosted calls leave through: the launcher's, or one made here on the
@@ -186,6 +187,10 @@ impl dm_server::sources::Tools for TapTools {
         };
         Box::pin(async move {
             let grant = grant.ok_or_else(|| format!("grants.toml has no [taps.{tool}]"))?;
+            // the owner's browser: it fetches, this side decides before and after
+            if grant.browser {
+                return crate::browser::call(memory, &tool, &config, &args).await;
+            }
             if let Some(egress) = egress {
                 return crate::hosted::call(&egress?, memory, &tool, &config, &args).await;
             }

@@ -186,6 +186,14 @@ nothing past its static pages without a key. `amem doctor` names which credentia
 found where, never their values. `LLMAO_KEY` alone points at a local LiteLLM on port 4000;
 a PAT for the Foundation's gateway wants `LLMAO_URL=https://llm.apache.org` beside it.
 
+The page has a companion: a browser extension in `crates/web/companion` (Chrome, load it
+unpacked from `chrome://extensions`) that fetches for a session with the browser's own
+logins. A `[taps.fetch]` grant with `browser = true` sends that tool's fetches there, so a
+page you are signed in to answers the session as it would answer you, and no credential
+goes into a grant. The policy still decides every URL before the browser is asked and
+every URL that answered before anything is kept; the page shows whether the companion is
+connected. It works only while `amem` runs with the page open in that browser.
+
 A profile names the flags of a launch, so the name is the whole command. Every harness
 is one, `amem claude`, and `profiles.toml` adds more:
 
@@ -326,7 +334,7 @@ run by hand.
 | `crates/taps` | Taps as WASI components, with exactly the access their grant allows; the native fetch behind the same gate |
 | `crates/fetch` | What fetch does with a page, shared by its component and the native fetch: the URL split, redirects resolved, HTML made text, the answer shaped |
 | `crates/reader` | The core crate for the browser reader, compiled to WebAssembly |
-| `crates/web` | The web launcher: sessions in pseudo-terminals, a reading pane, the board |
+| `crates/web` | The web launcher: sessions in pseudo-terminals, a reading pane, the board, and the companion extension that fetches with the browser's logins |
 | `crates/wslc-api` | The WSL containers C API, bound by hand, Windows only |
 | `crates/memory` | The binary, `amem`: the launcher, the librarian, the CLI |
 | `taps/` | The taps: GitHub issues and comments, fetch, search and Gofannon |

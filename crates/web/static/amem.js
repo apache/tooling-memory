@@ -60,6 +60,25 @@
   amem.ready = pairFromAddress().catch((e) => { amem.pairError = String(e); });
   amem.paired = () => !!(amem.server() && get(STORE));
 
+  // the companion: an extension beside this page that fetches for a session with this
+  // browser's own logins (crates/web/companion). Its content script runs in this window;
+  // a paired page posts it the server and the key, and nothing else, to its own origin,
+  // and says so again whenever the extension says hello. Nothing is posted unpaired.
+  const COMPANION = 'amem-companion';
+  amem.companion = null;
+  function offerCompanion() {
+    const k = get(STORE);
+    const server = amem.server();
+    if (!k || !server) return;
+    window.postMessage({ type: `${COMPANION}-pair`, server, key: k }, location.origin);
+  }
+  window.addEventListener('message', (e) => {
+    if (e.origin !== location.origin || !e.data || e.data.type !== `${COMPANION}-hello`) return;
+    amem.companion = e.data.version || 'installed';
+    offerCompanion();
+  });
+  amem.ready.then(offerCompanion);
+
   // `/api/...` is on the server; anything else is as written and carries no key
   amem.url = (path) => (path.startsWith('/') && amem.server() ? amem.server() + path : path);
   amem.fetch = async (path, opts = {}) => {

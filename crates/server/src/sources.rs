@@ -32,6 +32,10 @@ pub const OBSERVED_BY_TAP: &str = "tap";
 /// hosts the session may reach, and reported where it went; the memory server checked
 /// each of those against the policy before keeping what came back.
 pub const OBSERVED_BY_TOOL_SERVER: &str = "tool-server";
+/// A source the owner's browser fetched for this session, through the web launcher's
+/// companion extension, with the browser's own cookies: the policy here decided the URL
+/// before the browser was asked and the URL that answered before the answer was kept.
+pub const OBSERVED_BY_BROWSER: &str = "browser";
 
 /// What a tool answered, and every URL it was let reach to answer it, in order: the
 /// requests the tap host allowed, or the ones a tool server reported and the policy
@@ -251,7 +255,9 @@ impl Memory {
             author: self.author.clone(),
             kept_at: now,
             retain_until: now + Duration::days(i64::from(days)),
-            observed_by: if grant.hosted.is_some() {
+            observed_by: if grant.browser {
+                OBSERVED_BY_BROWSER
+            } else if grant.hosted.is_some() {
                 OBSERVED_BY_TOOL_SERVER
             } else {
                 OBSERVED_BY_TAP
