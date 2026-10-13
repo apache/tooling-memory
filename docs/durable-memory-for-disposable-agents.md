@@ -253,11 +253,9 @@ A domain's owner may erase. A role named in policy may erase on behalf of the pe
 
 **Why.** Shared memory is a channel from every agent to every other agent, over years. Whatever passes through it unchecked (a wrong fact, a leaked secret, a planted instruction, an exploit one agent stumbled on) reaches the whole fleet. Trust is also the part of knowledge systems that tends to come apart, because it has several dimensions and breaks when chained.
 
-Three findings from security and knowledge-system research shape this section.
-
 - **Trust is not transitive.** Assuming it is silently widens what every party trusts (Christianson & Harbison 1997).
 - **Trust is typed.** Trusting a source to recommend others differs from trusting its own work, and a chain holds only when each link is of the right kind (Jøsang & Pope 2005).
-- **Summaries launder authority.** Consolidating memory keeps a claim but tends to drop the constraints on where it came from and how it may be used. This happened in 48 of 49 tested configurations; storing an authority label with the claim removed the unauthorised actions that followed (arXiv:2608.01679).
+- **Summaries launder authority.** Consolidating memory tends to keep a claim but drop where it came from and how it may be used. Keeping those labels with the claim prevents the misuse that follows (arXiv:2608.01679).
 
 ## Four questions, four labels
 
