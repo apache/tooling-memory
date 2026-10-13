@@ -509,3 +509,85 @@ async fn a_session_above_the_ceiling_starts_no_gofannon_run() {
     );
     assert!(seen.paths().is_empty(), "{:?}", seen.paths());
 }
+
+/// The native fetch, as the tool server runs it without a component: the same page,
+/// the same refusal, the same answer shape, and where it went said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_native_fetch_answers_as_the_component_does_behind_the_same_gate() {
+    let (port, seen) = fake_site().await;
+    let grant = TapGrant {
+        domain: "dom-me".into(),
+        hosts: vec!["127.0.0.1".into()],
+        ceiling: Label::Public,
+        tool: true,
+        loopback: true,
+        credential: Some("FETCH_KEY".into()),
+        ..TapGrant::default()
+    };
+    let gate = Arc::new(dm_taps::tool::HostGate {
+        granted: grant.hosts.clone(),
+        caller: vec!["127.0.0.1".into()],
+        methods: Vec::new(),
+        loopback: true,
+    });
+    let call = |args: String, config: &'static str| {
+        let gate = gate.clone();
+        let grant = grant.clone();
+        async move {
+            dm_taps::fetch::call(
+                gate,
+                dm_taps::tool::Call {
+                    tool: "fetch",
+                    grant: &grant,
+                    credential: Some("fetch-key-1"),
+                    config,
+                    args: &args,
+                },
+                dm_taps::Limits::default(),
+            )
+            .await
+        }
+    };
+    let page = format!("http://127.0.0.1:{port}/page");
+    let done = call(fetch_args(port, "/page").to_string(), "")
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&done.answer).unwrap();
+    assert_eq!(v["title"], "The import");
+    assert!(v["text"].as_str().unwrap().contains("zanzibar pass"), "{v}");
+    assert_eq!(v["truncated"], false);
+    assert_eq!(done.reached, vec![page.clone()]);
+    // the credential went on after the decision, as the host puts it on a component's
+    assert_eq!(seen.header("authorization"), ["Bearer fetch-key-1"]);
+    // a cap cuts the body and says so
+    let cut = call(
+        fetch_args(port, "/page").to_string(),
+        r#"{"max_bytes": 60}"#,
+    )
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&cut.answer).unwrap();
+    assert_eq!(v["truncated"], true);
+    // a redirect to a name the gate does not hold is refused before it leaves
+    let err = call(fetch_args(port, "/away").to_string(), "")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, dm_taps::Error::Refused(why, _) if why.contains("localhost")),
+        "{err}"
+    );
+    assert_eq!(seen.paths(), ["/page", "/page", "/away"]);
+    // and the tool's own failures are the component's
+    let err = call(fetch_args(port, "/missing").to_string(), "")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, dm_taps::Error::Tap(m) if m.starts_with("HTTP 404 from")),
+        "{err}"
+    );
+    let err = call(json!({"url": "ftp://127.0.0.1/x"}).to_string(), "")
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, dm_taps::Error::Tap(m) if m.contains("http and https only")));
+    assert!(dm_taps::fetch::is_native("fetch") && !dm_taps::fetch::is_native("search"));
+}

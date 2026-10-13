@@ -177,6 +177,50 @@ impl Gate for HostGate {
     }
 }
 
+/// Ask `gate` about one request a tool wants to make: the host resolved once, the
+/// policy's input made of the request, and, when it may go, the addresses it connects
+/// to and the URL it is recorded as reaching. A refusal says which host and why.
+///
+/// # Errors
+///
+/// The gate's reason.
+pub(crate) async fn admit(
+    gate: &dyn Gate,
+    tool: &str,
+    method: &str,
+    uri: &http::Uri,
+    hop: u32,
+) -> Result<(Vec<SocketAddr>, String), String> {
+    let scheme = uri.scheme_str().unwrap_or("https").to_ascii_lowercase();
+    let host = uri
+        .host()
+        .unwrap_or_default()
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    let port = uri.port_u16();
+    let default_port = if scheme == "http" { 80 } else { 443 };
+    let (addrs, private_address, loopback_address) =
+        resolves(&host, port.unwrap_or(default_port)).await;
+    let path = uri
+        .path_and_query()
+        .map_or_else(|| "/".to_string(), |p| p.as_str().to_string());
+    let ask = FetchInput {
+        tool: tool.to_string(),
+        method: method.to_string(),
+        scheme: scheme.clone(),
+        host: host.clone(),
+        port,
+        path: path.clone(),
+        private_address,
+        loopback_address,
+        label: dm_core::Label::Public,
+        hop,
+    };
+    gate.decide(ask).map_err(|why| format!("{host}: {why}"))?;
+    let port = port.map(|p| format!(":{p}")).unwrap_or_default();
+    Ok((addrs, format!("{scheme}://{host}{port}{path}")))
+}
+
 /// The outbound hook for a tool: the gate decides, then the credential goes on.
 struct Hooks {
     tool: String,
@@ -202,43 +246,23 @@ impl WasiHttpHooks for Hooks {
         let hop = self.hop.fetch_add(1, Ordering::Relaxed);
         Box::new(async move {
             let uri = request.uri().clone();
-            let scheme = uri.scheme_str().unwrap_or("https").to_ascii_lowercase();
-            let host = uri
-                .host()
-                .unwrap_or_default()
-                .trim_matches(['[', ']'])
-                .to_ascii_lowercase();
-            let port = uri.port_u16();
-            let default_port = if scheme == "http" { 80 } else { 443 };
-            let (addrs, private_address, loopback_address) =
-                resolves(&host, port.unwrap_or(default_port)).await;
-            let path = uri
-                .path_and_query()
-                .map_or_else(|| "/".to_string(), |p| p.as_str().to_string());
-            let ask = FetchInput {
-                tool,
-                method: request.method().as_str().to_string(),
-                scheme: scheme.clone(),
-                host: host.clone(),
-                port,
-                path: path.clone(),
-                private_address,
-                loopback_address,
-                label: dm_core::Label::Public,
-                hop,
+            let method = request.method().as_str().to_string();
+            let addrs = match admit(gate.as_ref(), &tool, &method, &uri, hop).await {
+                Ok((addrs, url)) => {
+                    reached
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(url);
+                    addrs
+                }
+                Err(why) => {
+                    refused
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(why);
+                    return Err(HttpError::HttpRequestDenied);
+                }
             };
-            if let Err(why) = gate.decide(ask) {
-                refused
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(format!("{host}: {why}"));
-                return Err(HttpError::HttpRequestDenied);
-            }
-            let port = port.map(|p| format!(":{p}")).unwrap_or_default();
-            reached
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(format!("{scheme}://{host}{port}{path}"));
             if let Some((name, value)) = credential {
                 request.headers_mut().insert(name, value);
             }
@@ -276,7 +300,7 @@ impl WasiHttpView for State {
 
 /// The header a grant's credential goes in, and its value: `Authorization: Bearer`
 /// unless the grant names another header, which gets the value as it is.
-fn credential_header(
+pub(crate) fn credential_header(
     grant: &TapGrant,
     credential: Option<&str>,
 ) -> Result<Option<(http::HeaderName, http::HeaderValue)>, Error> {

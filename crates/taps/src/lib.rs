@@ -28,6 +28,7 @@ use wasmtime_wasi_http::{
 #[allow(missing_docs)] // generated from wit/tap.wit, which carries the documentation
 mod bindings;
 
+pub mod fetch;
 pub mod pinned;
 pub mod tool;
 

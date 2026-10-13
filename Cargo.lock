@@ -910,6 +910,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-fetch"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dm-index"
 version = "0.1.0"
 dependencies = [
@@ -1035,6 +1043,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "dm-core",
+ "dm-fetch",
  "dm-ledger",
  "dm-policy",
  "dm-server",

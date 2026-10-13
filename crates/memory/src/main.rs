@@ -945,7 +945,8 @@ enum Command {
         args: String,
     },
     /// Serve this root's tools over MCP's streamable HTTP, for launchers elsewhere to
-    /// call instead of carrying the components (`hosted = "<url>"` in their grant). Each
+    /// call instead of carrying the components (`hosted = "<url>"` in their grant): the
+    /// components installed here, and fetch natively when none is installed as it. Each
     /// request a tool makes goes only to a host both this root's grant and the calling
     /// session name, and the answer says every URL it reached. Off loopback it wants a
     /// bearer token.

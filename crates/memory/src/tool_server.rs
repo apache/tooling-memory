@@ -1,7 +1,10 @@
 //! `amem tool-server` (PLAN M19): the tools of a root served over MCP's streamable
 //! HTTP, so launchers elsewhere call them instead of carrying the components. The same
 //! WASI component runs here as in a launcher, under this root's grant and with the
-//! credential this host holds; what differs is who decides each request it makes.
+//! credential this host holds, or, for a tool this project writes and trusts, fetch
+//! today, the binary's own native code behind the same gate when no component is
+//! installed under the name ([`dm_taps::fetch`]); what differs is who decides each
+//! request it makes.
 //! There is no calling session here, so the call names the hosts its session may
 //! reach, and a request goes only to a host both that list and this root's grant name
 //! (`dm_taps::tool::HostGate`): a caller narrows what the server may reach, never
@@ -34,7 +37,15 @@ struct Served {
     token: Option<String>,
 }
 
-/// The tools this root serves: granted as tools, run here (not hosted on), installed.
+/// The component installed under the root as `name`, if one is.
+fn installed(root: &Path, name: &str) -> Option<PathBuf> {
+    crate::taps::component_path(root, name)
+        .ok()
+        .filter(|p| p.is_file())
+}
+
+/// The tools this root serves: granted as tools, run here (not hosted on), and either
+/// installed as a component or native to this binary.
 fn served(s: &Served) -> Vec<(&String, &TapGrant)> {
     s.grants
         .taps
@@ -42,7 +53,7 @@ fn served(s: &Served) -> Vec<(&String, &TapGrant)> {
         .filter(|(name, g)| {
             g.tool
                 && g.hosted.is_none()
-                && crate::taps::component_path(&s.root, name).is_ok_and(|p| p.is_file())
+                && (installed(&s.root, name).is_some() || dm_taps::fetch::is_native(name))
         })
         .collect()
 }
@@ -149,9 +160,6 @@ async fn call(s: &Served, id: &Value, params: &Value) -> Response {
         .credential
         .as_deref()
         .and_then(|var| crate::present(std::env::var(var).ok()));
-    let Ok(path) = crate::taps::component_path(&s.root, name) else {
-        return tool_error(id, &format!("no component installed as {name}"));
-    };
     let c = dm_taps::tool::Call {
         tool: name,
         grant,
@@ -159,7 +167,13 @@ async fn call(s: &Served, id: &Value, params: &Value) -> Response {
         config: &config,
         args: &args,
     };
-    match dm_taps::tool::call_gated(Arc::new(gate), &path, c, LIMITS).await {
+    let gate = Arc::new(gate);
+    // a component installed under the name runs; without one, the binary's own fetch
+    let done = match installed(&s.root, name) {
+        Some(path) => dm_taps::tool::call_gated(gate, &path, c, LIMITS).await,
+        None => dm_taps::fetch::call(gate, c, LIMITS).await,
+    };
+    match done {
         Ok(done) => {
             let answer =
                 serde_json::from_str::<Value>(&done.answer).unwrap_or(Value::String(done.answer));
@@ -207,7 +221,13 @@ pub async fn serve(root: &Path, listen: &str, token_env: Option<&str>) -> Fallib
         grants,
         token,
     });
-    let names: Vec<String> = served(&s).iter().map(|(n, _)| (*n).clone()).collect();
+    let names: Vec<String> = served(&s)
+        .iter()
+        .map(|(n, _)| match installed(root, n) {
+            Some(_) => (*n).clone(),
+            None => format!("{n} (native)"),
+        })
+        .collect();
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!(
         "tool-server: serving {} at http://{}/mcp",

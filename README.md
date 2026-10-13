@@ -103,10 +103,11 @@ These do what the paper says, on one laptop, and each names what replaces it.
   and so are the citations that keep a tool's source past its clock.
 - **Tools** fetch and search from the launcher's own machine, one compiled component per
   call, connecting to the address the policy checked, or from a tool server
-  (`amem tool-server`) that runs the same components for launchers elsewhere, called
-  through the egress like a model call: held to the tool's ceiling, metered and timed
-  under the tool's name, the server's bearer put on there. Every source says where it
-  was fetched from. A held answer is released by the owner by hand
+  (`amem tool-server`) that runs the same components for launchers elsewhere, or fetch
+  natively when no component is installed, behind the same gate; called through the
+  egress like a model call: held to the tool's ceiling, metered and timed under the
+  tool's name, the server's bearer put on there. Every source says where it was fetched
+  from. A held answer is released by the owner by hand
   (`amem source release`). Production: the tool servers registered in the Foundation's
   gateway, found by name rather than by URL.
 - **Cost** is priced from a table the owner keeps by hand, and a task's share is its
@@ -321,7 +322,8 @@ run by hand.
 | `crates/sandbox` | Confinement in Linux namespaces, and a Seatbelt profile for macOS |
 | `crates/client` | A typed MCP client for the ledger and the record, used by the launcher and an orchestrator |
 | `crates/otel` | OpenTelemetry traces over OTLP |
-| `crates/taps` | Taps as WASI components, with exactly the access their grant allows |
+| `crates/taps` | Taps as WASI components, with exactly the access their grant allows; the native fetch behind the same gate |
+| `crates/fetch` | What fetch does with a page, shared by its component and the native fetch: the URL split, redirects resolved, HTML made text, the answer shaped |
 | `crates/reader` | The core crate for the browser reader, compiled to WebAssembly |
 | `crates/web` | The web launcher: sessions in pseudo-terminals, a reading pane, the board |
 | `crates/wslc-api` | The WSL containers C API, bound by hand, Windows only |

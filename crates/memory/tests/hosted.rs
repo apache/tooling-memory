@@ -130,18 +130,21 @@ impl Drop for ToolServer {
     }
 }
 
-fn tool_server(dir: &Path, token: &str) -> ToolServer {
+/// A tool server serving fetch: the component when `component`, else the binary's own.
+fn tool_server(dir: &Path, token: &str, component: bool) -> ToolServer {
     let root = dir.join("served");
     init(
         &root,
         "dom-ts",
         "[taps.fetch]\ndomain = \"dom-ts\"\ntool = true\nceiling = \"public\"\nhosts = [\"127.0.0.1\"]\nloopback = true\n",
     );
-    ok(&amem(&root)
-        .args(["tap", "install", "fetch"])
-        .arg(fetch_component())
-        .output()
-        .unwrap());
+    if component {
+        ok(&amem(&root)
+            .args(["tap", "install", "fetch"])
+            .arg(fetch_component())
+            .output()
+            .unwrap());
+    }
     let mut child = amem(&root)
         .args([
             "tool-server",
@@ -186,7 +189,7 @@ fn fetch(root: &Path, url: &str, token: &str) -> Output {
 fn a_hosted_tool_answers_through_the_server_and_says_where_it_went() {
     let dir = tempfile::tempdir().unwrap();
     let site_port = serve(site);
-    let server = tool_server(dir.path(), "s3cret");
+    let server = tool_server(dir.path(), "s3cret", true);
     let page = format!("http://127.0.0.1:{site_port}/page");
 
     let root = launcher(dir.path(), "near", &server.url, "[\"127.0.0.1\"]");
@@ -238,6 +241,47 @@ fn a_hosted_tool_answers_through_the_server_and_says_where_it_went() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
     assert!(err.contains("localhost"), "{err}");
+}
+
+#[test]
+fn a_tool_server_without_the_component_fetches_natively_behind_the_same_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let site_port = serve(site);
+    let server = tool_server(dir.path(), "s3cret", false);
+    assert!(!dir.path().join("served/taps/fetch.wasm").exists());
+    let page = format!("http://127.0.0.1:{site_port}/page");
+    let root = launcher(dir.path(), "near", &server.url, "[\"127.0.0.1\"]");
+    let answer: serde_json::Value =
+        serde_json::from_str(&ok(&fetch(&root, &page, "s3cret"))).unwrap();
+    assert_eq!(answer["title"], "", "{answer}");
+    assert!(
+        answer["text"].as_str().unwrap().contains("72 hours"),
+        "{answer}"
+    );
+    assert_eq!(answer["final_url"], page, "{answer}");
+    assert_eq!(answer["observed_by"], "tool-server", "{answer}");
+    assert_eq!(answer["reached"], serde_json::json!([page]), "{answer}");
+    // the redirect off the server's grant is refused there, as with the component
+    let out = fetch(
+        &root,
+        &format!("http://127.0.0.1:{site_port}/away"),
+        "s3cret",
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("localhost") && err.contains("refused"),
+        "{err}"
+    );
+    // and a session whose hosts leave the page out sends nothing
+    let far = launcher(dir.path(), "far", &server.url, "[\"*.apache.org\"]");
+    let out = fetch(&far, &page, "s3cret");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("calling session"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// An MCP endpoint that answers every call with a reply naming `reached`.
