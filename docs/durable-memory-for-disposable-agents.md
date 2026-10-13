@@ -4,7 +4,7 @@
 
 Sander Striker · August 2026 · revised October 2026
 
-Written with Claude Fable 5 and Claude Opus 5 (Anthropic).
+Written with Claude Fable 5, Claude Opus 5 (Anthropic), and Codex (OpenAI).
 
 *Agent fleets need shared memory, and shared memory spreads mistakes and leaked secrets as easily as knowledge. It has to be cheap to read, safe to share, and outlast every model and tool it runs on. This paper proposes how.*
 
@@ -60,7 +60,7 @@ flowchart TB
     AGT -->|"search, get, write, claim"| SRV
     SRV -->|"indexes and compiles from"| REC
     HUM -->|"policy and approvals"| REC
-    SRV -.->|"telemetry directs curation"| AGT
+    SRV -.->|"telemetry feeds curator work queue"| AGT
     EXT -->|"taps: items in"| SRV
     SRV -->|"results out, within the destination's ceiling"| EXT
 ```
@@ -129,7 +129,7 @@ Examples use `dom-a` for the domain under discussion and `dom-b` for a neighbour
 
 **Why.** An agent needs to know, at the start of a task, what matters now, what is already settled, and where to look for the rest, without reading everything. And the institution needs that knowledge to survive the agent, the model, and the tooling.
 
-## Tiers
+## Storage tiers
 
 | Tier | Contents | Size | Read by |
 |---|---|---|---|
@@ -138,7 +138,7 @@ Examples use `dom-a` for the domain under discussion and `dom-b` for a neighbour
 | **T2, historian** | Every event: writes, reads, ledger operations, curation | Unbounded | The index, the ledger, curators, auditors; rarely agents |
 | **T3, archive** | Demoted and superseded material | Unbounded | Audit only |
 
-These are storage tiers. Trust tiers (raw, curated, verified) are separate and say how far an entry has been checked (§4). Curation moves entries toward the archive and deletes nothing. The only deletions are erasure, below, and transcripts past their retention clock (Appendix B). The read path stays small while total memory grows.
+These are storage tiers. Trust tiers (raw, curated, verified) are separate and say how far an entry has been checked (§4). Curation moves entries toward the archive and deletes nothing. Erasure is the exception described below; transcripts are also deleted when their retention clock expires (Appendix B). The read path stays small while total memory grows.
 
 ## Entries
 
@@ -240,7 +240,7 @@ That record is the event log, called the **historian** after the process histori
 
 The author cannot tell which part of what it read shaped the text, so lineage assumes all of it did, just as labels do (§4). Nothing is copied: the read set is a query over events already kept, back to an entry's sources or forward to everything that came from it.
 
-Each event carries the classification of what it names, so the historian is filtered like any other read. Latencies and counts stay in telemetry, which may be sampled and expire. Events are kept, except under the retention clocks of Appendix B. Erasure removes an entry's body and leaves the events that name it.
+Each event carries the classification of what it names, so the historian is filtered like any other read. Latencies and counts stay in telemetry, which may be sampled and expire. Events are kept except where a retention clock applies (Appendix B), so the historian is complete within those clocks. Erasure removes an entry's body and leaves the events that name it.
 
 ## Erasure
 
@@ -248,7 +248,7 @@ Each event carries the classification of what it names, so the historian is filt
 
 Demotion is reversible: the content stays in the archive behind a tombstone. Erasure is not, so it escalates like any irreversible action. The body is removed everywhere, and three things remain: a stub with the frontmatter, a record of who erased it, when, and for what class of reason, and a receipt listing every copy covered (log, index, caches, replicas, exports) and any that could not be reached.
 
-How the engine removes a body from append-only history is its own concern: rewrite the segment, or encrypt each body under its own key and destroy the key. Either way the restore drill (§12) must cover it. Erasure propagates along lineage. The historian flags entries that cite the erased one or were informed by it, and the receipt lists the sends it informed. Flagged entries are re-derived from what remains, or erased in turn.
+How the engine removes a body from append-only history is its own concern: rewrite the segment, or encrypt each body under its own key and destroy the key. Snapshots and backups must keep the erasure too: restoring one must never bring an erased body back, and no backup may hold a usable copy of a destroyed key. The restore drill (§12) must show this. Erasure propagates along lineage. The historian flags entries that cite the erased one or were informed by it, and the receipt lists the sends it informed. Flagged entries are re-derived from what remains, or erased in turn.
 
 A domain's owner may erase. A role named in policy may erase on behalf of the person an entry is about; in that case the stub drops the citations and author.
 
@@ -296,7 +296,7 @@ New writes are raw, and curation lifts them to curated. Raw entries are searchab
 | Other entries written by the fleet's own sessions in the domain | Sessions whose policy admits raw in the domain |
 | Content from external authors, arriving through a tap | Triage, and the session working the task created from it. Everywhere else, only once curated |
 
-Curators and auditors read raw as their work requires. Policy can adjust the defaults (Appendix E).
+Curators and auditors read raw as their work requires. Policy can adjust the defaults (Appendix E). Classification still applies in every case: raw reach decides which raw entries a session may see, and handling still caps how high it may read.
 
 Promotion to verified passes a review gate. A person approves it, or a senior agent where domain policy allows; the proposer can never approve its own. A wrong fact written once and trusted forever is the largest long-term risk this system carries, and this gate is the main defence against it.
 
@@ -312,7 +312,7 @@ flowchart LR
     N -.->|"declassify, a guard approves"| L["Lower-label version"]
 ```
 
-Access control says who may read an entry. Labels say where its content may go next, because an agent is a channel: what it reads shapes what it writes and sends. Classifications come from one small ordered set, for example public, internal, restricted.
+Access control says who may read an entry. Labels say where its content may go next, because an agent is a channel: what it reads shapes what it writes and sends. The rules below assume one small, ordered set of classifications, for example public, internal, restricted, so a session can carry forward the highest it has read. A deployment that needs separate compartments, such as two restricted projects that must not share information, needs a richer label model than one ordered set.
 
 - **Entries and tasks** carry a classification.
 - **Destinations** (model classes, tool servers, taps) carry a **ceiling**: the most they may receive.
@@ -822,7 +822,7 @@ When a grant ends, the institution's views are dropped with receipts. What the p
 
 BM25 needs no model. Embeddings, summaries, and compiled rubrics are derived and rebuildable. Provenance records the model behind every write, so a bad model generation's contributions can be found and re-checked.
 
-Everything authoritative is text in a versioned store. If the policy engine or search engine dies, the policies are text and the index rebuilds elsewhere. If the whole platform dies, a person with a laptop can read the estate in a text editor. A yearly drill proves it: rebuild the serving layer from snapshots of the record alone.
+Everything authoritative is text in a versioned store. If the policy engine or search engine dies, the policies are text and the index rebuilds elsewhere. If the whole platform dies, a person with a laptop can read the estate in a text editor. A yearly drill proves it: rebuild the serving layer from snapshots of the record alone, and check that nothing erased comes back.
 
 Two tests apply to every component. The **record test**: if this goes dark, is anything lost beyond convenience? The **ownership test**: if the people who contributed this stop, does anything on the production path stop? The institution adopts at a version, and operates, whatever sits on the production path; anything else stays off it.
 
@@ -1317,7 +1317,7 @@ When the ledger is down, the historian still accepts appends: handoffs and heart
 | Privilege steering through task requirements | Scaled admission; creators may not require what they cannot hold; specs are data (§8) |
 | Exploit spread through self-improvement | Perimeter outside the loop; safety gate on privilege; raw quarantine; separate roles (§10) |
 | Silent vendor change | Probes, change-point detection, attribution by provenance, distillation freeze (§11) |
-| Erasure against append-only history | Engine-level removal; stub, record, and receipt; derivations re-derived (§3) |
+| Erasure against append-only history | Engine-level removal; stub, record, and receipt; derivations re-derived; restores keep erasures (§3, §12) |
 | Institution keeps a person's memory | Personal domain under the owner's grants; views dropped with receipts (§12) |
 | A contributed component's authors leave | Ownership test: on-path components are institution-operated (§12) |
 
