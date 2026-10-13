@@ -957,6 +957,21 @@ The design combines recent agent-memory research with decades of systems practic
 
 **Long timescales.** Dated authorities for identifiers come from RFC 4151 [[11]](#ref-11); names never reassigned from RFC 8141 [[72]](#ref-72); stable, non-reassignable IDs separate from external ones from SCIM [[73]](#ref-73); issuer-and-subject pairs from OpenID Connect Core [[12]](#ref-12); and identifiers free of organisational names from Berners-Lee [[13]](#ref-13).
 
+**Organisational cybernetics.** Beer's Viable System Model [[74]](#ref-74), [[75]](#ref-75) names the functions any organisation needs to stay viable. Read through it, the design supplies each one:
+
+| VSM | Function | In this design |
+|---|---|---|
+| System 1 | Operations | Domains and the agents working their tasks |
+| System 2 | Coordination that damps oscillation between units | The [task ledger](#a-tasks-life): leases, ownership, coordination through shared state |
+| System 3 | Control of resources | Orchestrators, triage, and the perimeter's spend and throughput limits |
+| System 3* | Audit | [Auditors](#auditors), canary entries, sampled human review |
+| System 4 | Watching outside and ahead | [Measurement](#9-measurement), evaluation suites, vendor-drift detection |
+| System 5 | Identity and ethos | The [policy stack](#7-the-policy-stack), amended only by people |
+
+The model's recursion holds too: the same pattern repeats from feature to institution ([Across domains](#across-domains)). Capability gaps, canary alarms, and drift freezes bypass the hierarchy, as Beer's algedonic signals do.
+
+Ashby's law of requisite variety [[76]](#ref-76) names what summaries-first serving and compiled filters do: they cut what reaches each agent to what it can absorb, while the policy digest carries governance into every decision. The curation loop, closed on its own telemetry, is feedback control in Wiener's sense [[77]](#ref-77). It keeps the corpus healthy in year ten without heroics.
+
 **Less covered elsewhere**, and answered here from first principles: organisational change over decades, resilience to model churn, layered policy with expiring exceptions, and human legibility as the final backstop.
 
 ---
@@ -1110,6 +1125,14 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 <a id="ref-72"></a>[72] Saint-Andre, P., & Klensin, J. (2017). Uniform Resource Names (URNs). RFC 8141. https://www.rfc-editor.org/rfc/rfc8141
 
 <a id="ref-73"></a>[73] Hunt, P., Grizzle, K., Wahlstroem, E., & Mortimore, C. (2015). System for Cross-domain Identity Management: Core Schema. RFC 7643. https://www.rfc-editor.org/rfc/rfc7643
+
+<a id="ref-74"></a>[74] Beer, S. (1972). *Brain of the Firm*. Allen Lane. Second edition, Wiley, 1981. https://www.wiley.com/en-us/Brain+of+the+Firm%2C+2nd+Edition-p-9780471948391
+
+<a id="ref-75"></a>[75] Beer, S. (1979). *The Heart of Enterprise*. Wiley. https://www.wiley.com/en-us/The+Heart+of+Enterprise-p-9780471948377
+
+<a id="ref-76"></a>[76] Ashby, W. R. (1956). *An Introduction to Cybernetics*. Chapman & Hall. https://archive.org/details/introductiontocy00ashb
+
+<a id="ref-77"></a>[77] Wiener, N. (1948). *Cybernetics: Or Control and Communication in the Animal and the Machine*. Technology Press and Wiley. Reissued by MIT Press, 2019. https://doi.org/10.7551/mitpress/11810.001.0001
 
 ---
 
