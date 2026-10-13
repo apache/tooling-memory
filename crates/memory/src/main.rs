@@ -1901,9 +1901,12 @@ async fn prepare_launch(
     if let Some(extra) = extra {
         destinations.insert(extra.name, extra.destination);
     }
-    let egress = Egress::new(
+    // the hosted tools' servers leave through the same egress, as the launcher's own
+    // destinations, never the harness's
+    let egress = Egress::with_tool_servers(
         memory.clone(),
         destinations,
+        hosted::tool_servers(memory.grants())?,
         &root.join("state/telemetry.db"),
     )?;
     // a key or the gateway is the launcher's credential, so the server may spend a
@@ -1916,7 +1919,7 @@ async fn prepare_launch(
         )) as Arc<dyn Deputy>
     });
     deputy.iter().for_each(|d| memory.set_deputy(d));
-    memory.set_tools(taps::TapTools::for_root(root));
+    memory.set_tools(taps::TapTools::with_egress(root, egress.clone()));
     let run_dir = root.join("state/run");
     std::fs::create_dir_all(&run_dir)?;
     Ok(Prepared {

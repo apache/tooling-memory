@@ -104,9 +104,11 @@ These do what the paper says, on one laptop, and each names what replaces it.
 - **Tools** fetch and search from the launcher's own machine, one compiled component per
   call, connecting to the address the policy checked, or from a tool server
   (`amem tool-server`) that runs the same components for launchers elsewhere, called
-  directly rather than through the egress. A held answer is released by the owner by
-  hand (`amem source release`). Production: the tool servers registered in the
-  Foundation's gateway, reached through the egress.
+  through the egress like a model call: held to the tool's ceiling, metered and timed
+  under the tool's name, the server's bearer put on there. Every source says where it
+  was fetched from. A held answer is released by the owner by hand
+  (`amem source release`). Production: the tool servers registered in the Foundation's
+  gateway, found by name rather than by URL.
 - **Cost** is priced from a table the owner keeps by hand, and a task's share is its
   session's spend, wall clock and CPU divided evenly among the tasks it completed. A
   run's CPU and memory are counted when it is reaped (`wait4`), which sees a process tree
@@ -232,7 +234,7 @@ re-enactment, the event log, the platform domain and the Gofannon bridge so far 
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without | `savings`, `golden`, `scripts/eval.py` |
 | Interchange | Bundles at or below a label, erasure with a stub and a receipt, taps as WASI components | `export`, `import`, `erase`, `tap` |
-| Tools | Fetch and search as taps an agent calls mid-turn: every request decided by the policy at the session's label, answers scanned and kept as sources; or hosted, the same components served by a tool server another launcher calls, which reaches only the hosts the calling session may and says where it went | `tool`, `source`, `tool-server`; MCP `fetch`, `web_search` |
+| Tools | Fetch and search as taps an agent calls mid-turn: every request decided by the policy at the session's label, answers scanned and kept as sources; or hosted, the same components served by a tool server another launcher calls through its egress, which reaches only the hosts the calling session may and says where it went, kept on the source | `tool`, `source`, `tool-server`; MCP `fetch`, `web_search` |
 | Gofannon | Its deployed agents as a tool tap on the same terms: listed, run, read back; and a worker that runs one on the ledger's tasks, its result filed as the handoff | `gofannon agents`, `gofannon work`; MCP `gofannon` |
 | Traces | OpenTelemetry spans for model calls, reads, policy decisions and task transitions, to any OTLP collector | `OTEL_EXPORTER_OTLP_ENDPOINT` |
 

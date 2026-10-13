@@ -889,6 +889,7 @@ dependencies = [
  "bytes",
  "dm-core",
  "dm-otel",
+ "dm-policy",
  "dm-server",
  "futures-util",
  "hyper",

@@ -33,8 +33,19 @@ pub const OBSERVED_BY_TAP: &str = "tap";
 /// each of those against the policy before keeping what came back.
 pub const OBSERVED_BY_TOOL_SERVER: &str = "tool-server";
 
+/// What a tool answered, and every URL it was let reach to answer it, in order: the
+/// requests the tap host allowed, or the ones a tool server reported and the policy
+/// here accepted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Answered {
+    /// The tool's JSON.
+    pub answer: String,
+    /// `scheme://host[:port]/path?query` of each request, in order.
+    pub reached: Vec<String>,
+}
+
 /// What a tool's answer future is.
-pub type Answer<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+pub type Answer<'a> = Pin<Box<dyn Future<Output = Result<Answered, String>> + Send + 'a>>;
 
 /// Runs a tool tap. The binary implements it over the WASI host; a test, over a fake.
 pub trait Tools: Send + Sync {
@@ -72,8 +83,13 @@ pub struct Source {
     /// When it runs out, unless a live entry cites it.
     #[serde(with = "time::serde::rfc3339")]
     pub retain_until: OffsetDateTime,
-    /// Who observed it: the tap host.
+    /// Who observed it: the tap host, or a tool server.
     pub observed_by: String,
+    /// Where it was fetched from: every URL reached to answer the call, in order, as
+    /// the tap host allowed them or a tool server reported them and the policy here
+    /// accepted them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reached: Vec<String>,
     /// What the scan found in it, by kind.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<String>,
@@ -134,6 +150,7 @@ fn served(s: &Source, cached: bool) -> Value {
     v["cite_as"] = json!(format!("{CITATION}{}", s.id));
     v["classification"] = json!(s.classification.to_string());
     v["observed_by"] = json!(s.observed_by);
+    v["reached"] = json!(s.reached);
     v["cached"] = json!(cached);
     if s.released.is_some() {
         // the agent is told what the scan found, and that a person let it through
@@ -204,7 +221,7 @@ impl Memory {
             .get()
             .cloned()
             .ok_or_else(|| Error::Denied("this session runs no tools".into()))?;
-        let answer = runner
+        let Answered { answer, reached } = runner
             .call(
                 self.clone(),
                 tool.to_string(),
@@ -240,6 +257,7 @@ impl Memory {
                 OBSERVED_BY_TAP
             }
             .to_string(),
+            reached,
             findings: findings.clone(),
             held,
             released: None,

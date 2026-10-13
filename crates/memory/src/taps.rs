@@ -106,9 +106,13 @@ pub async fn run(
 
 /// The tool taps installed under the root, as the memory server calls them: each call
 /// loads the tool's component and its grant, and runs it with the credential the grant
-/// names, every request it makes decided by the policy.
+/// names, every request it makes decided by the policy. A tool whose grant names a
+/// tool server is called there instead, through the egress.
 pub struct TapTools {
     root: std::path::PathBuf,
+    /// The egress hosted calls leave through: the launcher's, or one made here on the
+    /// first hosted call for a command that has none of its own.
+    egress: std::sync::Mutex<Option<dm_egress::Egress>>,
 }
 
 impl TapTools {
@@ -118,7 +122,44 @@ impl TapTools {
     pub fn for_root(root: &Path) -> Arc<dyn dm_server::sources::Tools> {
         Arc::new(TapTools {
             root: root.to_path_buf(),
+            egress: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The tools under `root` for a launcher, whose hosted calls leave through its
+    /// egress; see [`crate::hosted::tool_servers`] for what that egress carries.
+    #[must_use]
+    pub fn with_egress(
+        root: &Path,
+        egress: dm_egress::Egress,
+    ) -> Arc<dyn dm_server::sources::Tools> {
+        Arc::new(TapTools {
+            root: root.to_path_buf(),
+            egress: std::sync::Mutex::new(Some(egress)),
+        })
+    }
+
+    /// The egress for a hosted call: the one given, else one over this root's tool
+    /// servers and telemetry, made once.
+    fn egress(&self, memory: &Arc<Memory>) -> Result<dm_egress::Egress, String> {
+        let mut slot = self
+            .egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(e) = slot.as_ref() {
+            return Ok(e.clone());
+        }
+        let state = self.root.join("state");
+        std::fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
+        let e = dm_egress::Egress::with_tool_servers(
+            memory.clone(),
+            std::collections::HashMap::new(),
+            crate::hosted::tool_servers(memory.grants())?,
+            &state.join("telemetry.db"),
+        )
+        .map_err(|e| e.to_string())?;
+        *slot = Some(e.clone());
+        Ok(e)
     }
 }
 
@@ -137,29 +178,21 @@ impl dm_server::sources::Tools for TapTools {
         args: String,
     ) -> dm_server::sources::Answer<'static> {
         let root = self.root.clone();
+        let grant = memory.grants().taps.get(&tool).cloned();
+        // hosted elsewhere: the tool server runs it, this side decides what it reached
+        let egress = match &grant {
+            Some(g) if g.hosted.is_some() => Some(self.egress(&memory)),
+            _ => None,
+        };
         Box::pin(async move {
-            let grant = memory
-                .grants()
-                .taps
-                .get(&tool)
-                .cloned()
-                .ok_or_else(|| format!("grants.toml has no [taps.{tool}]"))?;
+            let grant = grant.ok_or_else(|| format!("grants.toml has no [taps.{tool}]"))?;
+            if let Some(egress) = egress {
+                return crate::hosted::call(&egress?, memory, &tool, &config, &args).await;
+            }
             let credential = grant
                 .credential
                 .as_deref()
                 .and_then(|var| crate::present(std::env::var(var).ok()));
-            // hosted elsewhere: the tool server runs it, this side decides what it reached
-            if let Some(url) = &grant.hosted {
-                return crate::hosted::call(
-                    memory,
-                    url,
-                    credential.as_deref(),
-                    &tool,
-                    &config,
-                    &args,
-                )
-                .await;
-            }
             let path = component_path(&root, &tool).map_err(|e| e.to_string())?;
             if !path.is_file() {
                 return Err(format!(

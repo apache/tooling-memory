@@ -189,14 +189,36 @@ pub enum Error {
     /// A direct call the upstream did not answer with success.
     #[error("{0}")]
     Upstream(String),
+    /// A tool server named for a tool the grants do not host.
+    #[error("{0} is not a hosted tool in grants.toml; a tool server is reached only for [taps.{0}] hosted = \"...\"")]
+    NotHosted(String),
 }
 
 struct Inner {
     memory: Arc<Memory>,
     destinations: HashMap<String, Destination>,
+    /// Tool servers, by the tool's name in the grants: called by the launcher itself
+    /// for a hosted tool ([`Egress::post`]), never forwarded for the harness, which
+    /// reaches a tool only through the memory server.
+    tools: HashMap<String, Destination>,
     client: reqwest::Client,
     telemetry: Telemetry,
 }
+
+/// What a tool server answered one request with.
+#[derive(Clone, Debug)]
+pub struct Relayed {
+    /// The status.
+    pub status: u16,
+    /// The response headers.
+    pub headers: HeaderMap,
+    /// The body, as text.
+    pub body: String,
+}
+
+/// The model a tool server's call is recorded under in the usage log: no tokens, a
+/// status and a latency.
+pub const TOOL_MODEL: &str = "tool";
 
 /// The egress, ready to be served.
 #[derive(Clone)]
@@ -224,10 +246,36 @@ impl Egress {
         destinations: HashMap<String, Destination>,
         telemetry_path: &FsPath,
     ) -> Result<Egress, Error> {
+        Egress::with_tool_servers(memory, destinations, HashMap::new(), telemetry_path)
+    }
+
+    /// As [`Egress::new`], with the tool servers the launcher calls for its hosted
+    /// tools, by tool name: each must be a hosted tool in the grants, whose ceiling is
+    /// what the label is checked against.
+    ///
+    /// # Errors
+    ///
+    /// As [`Egress::new`], or a tool server for a tool the grants do not host.
+    pub fn with_tool_servers(
+        memory: Arc<Memory>,
+        destinations: HashMap<String, Destination>,
+        tools: HashMap<String, Destination>,
+        telemetry_path: &FsPath,
+    ) -> Result<Egress, Error> {
         install_crypto();
         for name in destinations.keys() {
             if memory.grants().ceiling(name).is_none() {
                 return Err(Error::NoCeiling(name.clone()));
+            }
+        }
+        for name in tools.keys() {
+            let hosted = memory
+                .grants()
+                .taps
+                .get(name)
+                .is_some_and(|t| t.hosted.is_some());
+            if !hosted {
+                return Err(Error::NotHosted(name.clone()));
             }
         }
         let client = reqwest::Client::builder()
@@ -247,9 +295,86 @@ impl Egress {
             inner: Arc::new(Inner {
                 memory,
                 destinations,
+                tools,
                 client,
                 telemetry,
             }),
+        })
+    }
+
+    /// One request to a tool server, from the launcher itself for a hosted tool: the
+    /// session's label is checked against the tool's ceiling before anything leaves,
+    /// the server's credential goes on here, and the call is recorded with its status
+    /// and latency like a model call, under [`TOOL_MODEL`]. The answer comes back
+    /// whatever its status; the caller reads it.
+    ///
+    /// # Errors
+    ///
+    /// A tool this egress has no server for, a session above the tool's ceiling, or a
+    /// server that does not answer.
+    pub async fn post(
+        &self,
+        tool: &str,
+        path: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<Relayed, Error> {
+        let inner = &self.inner;
+        let dest = inner
+            .tools
+            .get(tool)
+            .ok_or_else(|| Error::Refused(tool.to_string()))?;
+        let ceiling = inner
+            .memory
+            .grants()
+            .taps
+            .get(tool)
+            .map_or(Label::Public, |t| t.ceiling);
+        let label = inner.memory.label();
+        if label > ceiling {
+            return Err(Error::Refused(format!(
+                "{tool}: this session has read {label} material and the tool accepts at most {ceiling}"
+            )));
+        }
+        let rest = path.trim_start_matches('/');
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{tool}/{rest}"))
+            .body(Body::empty())
+            .map_err(|e| Error::Upstream(e.to_string()))?;
+        *req.headers_mut() = headers;
+        let started = std::time::SystemTime::now();
+        let sent = upstream_request(inner, dest, rest, req, Some(body))
+            .send()
+            .await;
+        let usage = Usage {
+            model: Some(TOOL_MODEL.into()),
+            ..Usage::default()
+        };
+        let resp = match sent {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = inner
+                    .telemetry
+                    .record(started, inner.memory.session_id(), tool, 0, &usage);
+                return Err(Error::Upstream(format!(
+                    "the tool server for {tool} did not answer: {e}"
+                )));
+            }
+        };
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| Error::Upstream(e.to_string()))?;
+        let _ = inner
+            .telemetry
+            .record(started, inner.memory.session_id(), tool, status, &usage);
+        Ok(Relayed {
+            status,
+            headers,
+            body,
         })
     }
 
@@ -1982,5 +2107,178 @@ mod tests {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("fresh session"));
+    }
+
+    /// A root whose `fetch` is hosted at `url`, with the tool's ceiling at `ceiling`.
+    fn with_hosted_fetch(root: &FsPath, url: &str, ceiling: Label) -> Memory {
+        Memory::init(root, "human:test:me", "dom-me").unwrap();
+        let path = root.join(dm_server::GRANTS_FILE);
+        let mut g = dm_policy::Grants::load(&path).unwrap();
+        g.taps.insert(
+            "fetch".into(),
+            dm_policy::TapGrant {
+                domain: "dom-me".into(),
+                tool: true,
+                ceiling,
+                hosts: vec!["127.0.0.1".into()],
+                hosted: Some(url.into()),
+                ..dm_policy::TapGrant::default()
+            },
+        );
+        std::fs::write(&path, g.render().unwrap()).unwrap();
+        Memory::open(root).unwrap()
+    }
+
+    /// A tool server on loopback that answers with what it was sent, the bearer it saw
+    /// and the session header, and names a session of its own.
+    async fn echoing_tool_server() -> std::net::SocketAddr {
+        // a tool server that answers with what it was sent and the bearer it saw
+        let fake = Router::new().route(
+            "/mcp",
+            any(|req: Request| async move {
+                let (parts, body) = req.into_parts();
+                let bearer = parts
+                    .headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string();
+                let session = parts
+                    .headers
+                    .get("mcp-session-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string();
+                let b = to_bytes(body, 1 << 20).await.unwrap();
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/json".to_string()),
+                        (HeaderName::from_static("mcp-session-id"), "s-1".to_string()),
+                    ],
+                    format!(
+                        "{{\"saw\":{:?},\"bearer\":{bearer:?},\"session\":{session:?}}}",
+                        String::from_utf8_lossy(&b)
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_tool_server_is_called_by_the_launcher_with_its_credential_and_recorded() {
+        let addr = echoing_tool_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{addr}/mcp");
+        let m = Arc::new(with_hosted_fetch(
+            &dir.path().join("m"),
+            &url,
+            Label::Public,
+        ));
+        let mut tools = HashMap::new();
+        tools.insert(
+            "fetch".to_string(),
+            Destination::forward(
+                format!("http://{addr}"),
+                Auth::Inject {
+                    header: header::AUTHORIZATION,
+                    value: "Bearer ts-secret".into(),
+                },
+            ),
+        );
+        let e =
+            Egress::with_tool_servers(m.clone(), HashMap::new(), tools, &dir.path().join("t.db"))
+                .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-session-id", HeaderValue::from_static("s-0"));
+        // a credential the caller sends is stripped; the server's own goes on
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer mine"),
+        );
+        let r = e
+            .post("fetch", "/mcp", headers, Bytes::from_static(b"{\"id\":1}"))
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.headers["mcp-session-id"], "s-1");
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["saw"], "{\"id\":1}");
+        assert_eq!(v["bearer"], "Bearer ts-secret");
+        assert_eq!(v["session"], "s-0");
+        // recorded as a call to the tool, with no tokens and a latency
+        let rows = e.telemetry().summary().unwrap();
+        let row = rows.iter().find(|t| t.destination == "fetch").unwrap();
+        assert_eq!(row.model, TOOL_MODEL);
+        assert_eq!((row.calls, row.input_tokens), (1, 0));
+        // a tool this egress has no server for, and one the harness asks for by path
+        assert!(matches!(
+            e.post("search", "/mcp", HeaderMap::new(), Bytes::new())
+                .await,
+            Err(Error::Refused(_))
+        ));
+        let r = e
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/fetch/mcp")
+                    .method("POST")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_tool_server_is_held_to_the_tool_s_ceiling_and_must_be_a_hosted_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = with_hosted_fetch(
+            &dir.path().join("m"),
+            "http://127.0.0.1:1/mcp",
+            Label::Public,
+        );
+        m.write(dm_server::WriteRequest {
+            classification: Some(Label::Internal),
+            body: "the internal thing".into(),
+            ..dm_server::WriteRequest::default()
+        })
+        .await
+        .unwrap();
+        m.search("internal", None, 10).await.unwrap();
+        assert_eq!(m.label(), Label::Internal);
+        let server = || {
+            let mut tools = HashMap::new();
+            tools.insert(
+                "fetch".to_string(),
+                Destination::forward("http://127.0.0.1:1", Auth::PassThrough),
+            );
+            tools
+        };
+        let e = Egress::with_tool_servers(
+            Arc::new(m),
+            HashMap::new(),
+            server(),
+            &dir.path().join("t.db"),
+        )
+        .unwrap();
+        let err = e
+            .post("fetch", "/mcp", HeaderMap::new(), Bytes::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("accepts at most public"), "{err}");
+        // and nothing was recorded, since nothing left
+        assert!(e.telemetry().summary().unwrap().is_empty());
+        // a tool server for a tool the grants do not host is refused at build time
+        let plain =
+            Arc::new(Memory::init(&dir.path().join("p"), "human:test:me", "dom-me").unwrap());
+        assert!(matches!(
+            Egress::with_tool_servers(plain, HashMap::new(), server(), &dir.path().join("t2.db")),
+            Err(Error::NotHosted(_))
+        ));
     }
 }

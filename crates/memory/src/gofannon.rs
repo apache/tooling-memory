@@ -246,7 +246,7 @@ async fn settle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dm_server::sources::{Answer, Tools};
+    use dm_server::sources::{Answer, Answered, Tools};
     use std::sync::Mutex;
 
     /// A scripted Gofannon behind the tool: a run that is running once, then done, or a
@@ -271,12 +271,22 @@ mod tests {
                 c.len()
             };
             let refuse = self.refuse;
+            let answered = |v: Value| {
+                Ok(Answered {
+                    answer: v.to_string(),
+                    reached: vec!["https://gofannon.example/runs".into()],
+                })
+            };
             Box::pin(async move {
                 match args["op"].as_str() {
-                    Some("start") if refuse => Err("127.0.0.1: not a host the gofannon tool is granted".into()),
-                    Some("start") => Ok(json!({"run_id": "run-1"}).to_string()),
-                    _ if n == 2 => Ok(json!({"run_id": "run-1", "status": "running"}).to_string()),
-                    _ => Ok(json!({"run_id": "run-1", "status": "completed", "result": {"label": "bug"}}).to_string()),
+                    Some("start") if refuse => {
+                        Err("127.0.0.1: not a host the gofannon tool is granted".into())
+                    }
+                    Some("start") => answered(json!({"run_id": "run-1"})),
+                    _ if n == 2 => answered(json!({"run_id": "run-1", "status": "running"})),
+                    _ => answered(
+                        json!({"run_id": "run-1", "status": "completed", "result": {"label": "bug"}}),
+                    ),
                 }
             })
         }

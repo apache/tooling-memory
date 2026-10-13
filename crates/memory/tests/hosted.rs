@@ -194,8 +194,24 @@ fn a_hosted_tool_answers_through_the_server_and_says_where_it_went() {
         serde_json::from_str(&ok(&fetch(&root, &page, "s3cret"))).unwrap();
     assert!(answer.to_string().contains("72 hours"), "{answer}");
     assert_eq!(answer["observed_by"], "tool-server", "{answer}");
+    // where it was fetched from is served with it and kept on the source
+    assert_eq!(answer["reached"], serde_json::json!([page]), "{answer}");
+    let id = answer["source"].as_str().unwrap();
+    let kept: serde_json::Value = serde_json::from_str(&ok(&amem(&root)
+        .args(["source", "show", id])
+        .output()
+        .unwrap()))
+    .unwrap();
+    assert_eq!(kept["reached"], serde_json::json!([page]), "{kept}");
     // no component here: the launcher carried no runtime for it
     assert!(!root.join("taps/fetch.wasm").exists());
+    // the call left through the egress: metered under the tool, no tokens, timed
+    let usage = ok(&amem(&root).arg("usage").output().unwrap());
+    let row = usage
+        .lines()
+        .find(|l| l.starts_with("fetch "))
+        .unwrap_or_else(|| panic!("no fetch row in:\n{usage}"));
+    assert!(row.contains(" tool "), "{row}");
 
     // without the server's token, nothing is fetched
     let out = fetch(&root, &format!("{page}?again"), "wrong");

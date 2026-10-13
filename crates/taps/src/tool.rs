@@ -20,6 +20,7 @@
 use crate::{engine, Error, Limits, EPOCH_TICK};
 use dm_policy::decide::FetchInput;
 use dm_policy::TapGrant;
+pub use dm_server::sources::Answered;
 use dm_server::Memory;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -310,7 +311,8 @@ pub struct Call<'a> {
     pub args: &'a str,
 }
 
-/// Call a tool once for the session `memory` is; the answer is the tool's JSON.
+/// Call a tool once for the session `memory` is: the tool's JSON, and every URL the
+/// policy let it reach.
 ///
 /// # Errors
 ///
@@ -321,21 +323,8 @@ pub async fn call(
     component: &Path,
     c: Call<'_>,
     limits: Limits,
-) -> Result<String, Error> {
-    Ok(
-        call_gated(Arc::new(PolicyGate(memory)), component, c, limits)
-            .await?
-            .answer,
-    )
-}
-
-/// What a tool answered, and every URL it was let reach to answer it, in order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Answered {
-    /// The tool's JSON.
-    pub answer: String,
-    /// `scheme://host[:port]/path?query` of each request the gate allowed.
-    pub reached: Vec<String>,
+) -> Result<Answered, Error> {
+    call_gated(Arc::new(PolicyGate(memory)), component, c, limits).await
 }
 
 /// Call a tool once with `gate` deciding each request it makes.

@@ -29,6 +29,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 workspace = true
 
 [dev-dependencies]
+dm-policy = { version = "0.1.0", path = "../policy" }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 tempfile = "3.27.0"
