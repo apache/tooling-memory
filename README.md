@@ -320,6 +320,7 @@ run by hand.
 | `crates/server` | The MCP surface, prefetch, transcripts and contexts, the event log, tapes, the platform and sources |
 | `crates/egress` | The way out: forwarding, metering, spend limits, recorded contexts |
 | `crates/sandbox` | Confinement in Linux namespaces, and a Seatbelt profile for macOS |
+| `crates/mount` | The projection as a live mount: the record as files the memory server itself serves, every open of an entry a `get`, where the host has FUSE |
 | `crates/client` | A typed MCP client for the ledger and the record, used by the launcher and an orchestrator |
 | `crates/otel` | OpenTelemetry traces over OTLP |
 | `crates/taps` | Taps as WASI components, with exactly the access their grant allows; the native fetch behind the same gate |

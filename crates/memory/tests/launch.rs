@@ -1034,3 +1034,62 @@ fn a_kept_tree_is_the_commit_and_repeated_runs_are_not_a_subscription_s() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("API key or the gateway"));
 }
+
+/// The projection as a live mount: a shell `cat` inside the sandbox, which no hook
+/// sees, is a `get` the memory serves and logs. Where this host has no FUSE the launch
+/// says the projection is a render, and the test says it skipped the rest.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_read_inside_the_sandbox_is_a_get_the_memory_serves() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let written = cli(
+        &root,
+        &[
+            "write",
+            "--title",
+            "The vault",
+            "--body",
+            "The signing key lives in the vault.",
+        ],
+    );
+    let id = written["id"].as_str().unwrap().to_string();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_harness(
+        &work,
+        &format!(
+            "{{ cat /memory/dom-me/{id}.md; echo \"write=$(echo x 2>/dev/null > /memory/dom-me/new.md && echo ok || echo refused)\"; }} > ./fake-claude.out 2>&1\nexit 0"
+        ),
+    );
+
+    let out = launch(&root, &bins, &work, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let text = read_out(&work);
+    assert!(
+        text.contains("The signing key lives in the vault."),
+        "the entry is read as a file: {text}"
+    );
+    assert!(text.contains("write=refused"), "{text}");
+    let reads = dm_server::reads::all(&root).unwrap();
+    let gets: Vec<_> = reads.iter().filter(|r| r.tool == "get").collect();
+    if stderr.contains("is a render:") {
+        eprintln!("skipping the rest: {stderr}");
+        assert!(gets.is_empty(), "no hook, no mount, no get: {gets:?}");
+        return;
+    }
+    assert!(stderr.contains("is a live mount"), "{stderr}");
+    // the fake harness has no hooks: only the mount could have made this get
+    assert_eq!(gets.len(), 1, "{reads:?}");
+    assert_eq!(gets[0].ids, vec![id]);
+    // and the mountpoint went with the session
+    let left = std::fs::read_dir(root.join("state/mount/claude"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0, "a mountpoint outlived its session");
+}

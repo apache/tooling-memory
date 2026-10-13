@@ -1,0 +1,23 @@
+[package]
+name = "dm-mount"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The projection as a live mount: the record as files the memory server itself serves, every open of an entry a get"
+
+[dependencies]
+dm-server = { version = "0.1.0", path = "../server" }
+serde_json = "1"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18.0", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

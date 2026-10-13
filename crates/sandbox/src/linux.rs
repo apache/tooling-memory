@@ -75,12 +75,40 @@ fn bind(m: &Mount, root: &Path) -> Result<(), Error> {
             None::<&str>,
             &target,
             None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_NOSUID,
+            MsFlags::MS_BIND
+                | MsFlags::MS_REMOUNT
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_NOSUID
+                | kept_flags(&target),
             None::<&str>,
         )
         .map_err(|e| confine(format!("remount ro {}: {e}", target.display())))?;
     }
     Ok(())
+}
+
+/// The restricting flags a mount already carries, to carry into its read-only remount.
+/// A mount made outside the user namespace, a FUSE mount the launcher serves say, has
+/// its `nodev`, `noatime` and the like locked by the kernel: a remount that leaves one
+/// out asks to lift it and is refused, so they are read back and kept.
+fn kept_flags(target: &Path) -> MsFlags {
+    use nix::sys::statvfs::{statvfs, FsFlags};
+    let Ok(st) = statvfs(target) else {
+        return MsFlags::empty();
+    };
+    let have = st.flags();
+    let pairs = [
+        (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
+        (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
+        (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
+        (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
+        (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
+        (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
+    ];
+    pairs
+        .into_iter()
+        .filter(|(st, _)| have.contains(*st))
+        .fold(MsFlags::empty(), |acc, (_, ms)| acc | ms)
 }
 
 fn tmpfs(path: &Path, opts: &str) -> Result<(), Error> {

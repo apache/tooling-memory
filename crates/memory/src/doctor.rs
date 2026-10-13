@@ -329,6 +329,28 @@ fn on_path(binary: &str) -> bool {
                 .any(|x| image::on_path(&format!("{binary}{x}"))))
 }
 
+/// How the projection reaches the sandbox: served live where the host has FUSE, rendered
+/// where not. Only where a backend of this host mounts it.
+fn projection(backend: Backend, checks: &mut Vec<Check>) {
+    if !matches!(backend, Backend::Namespaces | Backend::Image) {
+        return;
+    }
+    checks.push(match dm_mount::availability() {
+        Ok(()) => check(
+            "backend",
+            "projection",
+            Status::Pass,
+            "a live mount: every open of an entry in the sandbox is a get the memory serves",
+        ),
+        Err(why) => check(
+            "backend",
+            "projection",
+            Status::Warn,
+            format!("a render, with the hook turning reads into gets: {why}"),
+        ),
+    });
+}
+
 async fn harnesses(root: &Path, checks: &mut Vec<Check>, found: &mut Found) {
     // the backend auto picks depends on the harness, since an unpacked image may lack
     // one; the summary line speaks for Claude Code, the loop below asks per harness
@@ -356,6 +378,7 @@ async fn harnesses(root: &Path, checks: &mut Vec<Check>, found: &mut Found) {
         Status::Pass
     };
     checks.push(check("backend", "auto", status, backend_detail));
+    projection(backend, checks);
     let list: Vec<Harness> = Harness::ALL
         .into_iter()
         .filter(|h| *h != Harness::Command)

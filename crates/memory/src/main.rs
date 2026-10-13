@@ -2050,6 +2050,11 @@ async fn run_confined(
     };
     let memory_binary = std::env::current_exe()?;
     p.memory.project_into(&p.projection).await?;
+    // the render is mounted live where the host can serve it, as files otherwise
+    let live = live_mount(p, harness);
+    let projection = live
+        .as_ref()
+        .map_or(p.projection.as_path(), dm_mount::Mounted::at);
     let req = dm_sandbox::Request {
         harness,
         auth,
@@ -2066,7 +2071,7 @@ async fn run_confined(
         image: false,
         workdir_inside: None,
         rootfs,
-        projection: Some(&p.projection),
+        projection: Some(projection),
     };
     let mut plan = match runner {
         // no network namespace: the relay takes a loopback port of its own on the host's
@@ -2079,10 +2084,14 @@ async fn run_confined(
     // the hook frees a recall page of this session only
     plan.env
         .insert("MEMORY_SESSION".into(), p.memory.session_id().to_string());
+    if live.is_some() {
+        // the mount's open is the get; the hook keeps its refusals and makes no second one
+        plan.env.insert("MEMORY_PROJECTION_LIVE".into(), "1".into());
+    }
     if std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
         eprintln!("launch debug: argv {:?}", plan.argv);
     }
-    Ok(tokio::task::spawn_blocking(move || {
+    let ran = tokio::task::spawn_blocking(move || {
         if capture {
             dm_sandbox::run_captured(&plan).map(|(code, out, r)| {
                 (
@@ -2095,7 +2104,37 @@ async fn run_confined(
             dm_sandbox::run(&plan).map(|(code, r)| (code, None, Some(r)))
         }
     })
-    .await??)
+    .await?;
+    // unmounted once the sandbox has gone, before the render it was served over
+    drop(live);
+    Ok(ran?)
+}
+
+/// The session's render served as a live mount, where this host can: every open of an
+/// entry inside is then a `get` the memory serves, whatever tool made it, and the hook
+/// is told it need not make one. Where it cannot, the render is mounted as files, as
+/// before, and the launch says why. Mounts killed launchers left under the harness's
+/// mount directory are cleared first.
+fn live_mount(p: &Prepared, harness: Harness) -> Option<dm_mount::Mounted> {
+    let base = p.root.join(dm_mount::MOUNTS).join(harness.binary());
+    dm_mount::sweep(&base);
+    let at = base.join(p.projection.file_name().unwrap_or_default());
+    match dm_mount::mount(p.memory.clone(), &p.projection, &at) {
+        Ok(m) => {
+            eprintln!(
+                "memory: the projection at {} is a live mount: every open of an entry is a get",
+                dm_sandbox::INSIDE_PROJECTION
+            );
+            Some(m)
+        }
+        Err(e) => {
+            eprintln!(
+                "memory: the projection at {} is a render: {e}",
+                dm_sandbox::INSIDE_PROJECTION
+            );
+            None
+        }
+    }
 }
 
 /// A run's exit code, its captured output when asked for, and what it cost the host

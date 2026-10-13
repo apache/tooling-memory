@@ -428,13 +428,16 @@ const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The PreToolUse hook against `projection`, reaching the memory server at `url` and
 /// waiting `wait` for it. No projection, nothing to decide. A projection with no
 /// server, a server that does not answer in time, or one that refuses are all
-/// refusals: the hook fails closed.
+/// refusals: the hook fails closed. A `live` projection is a mount the server serves,
+/// where the open itself is the get: the hook keeps its refusals of searches and
+/// writes and makes no get of its own, so a read is counted once.
 async fn pre_tool_with(
     input: &HookInput,
     projection: Option<&Path>,
     session: &str,
     url: Option<&str>,
     wait: std::time::Duration,
+    live: bool,
 ) -> Decision {
     let Some(projection) = projection else {
         return Decision::Allow;
@@ -449,6 +452,9 @@ async fn pre_tool_with(
     let Some(id) = wanted else {
         return d;
     };
+    if live {
+        return d;
+    }
     let refused = |why: String| decide(&tool, &tool_input, projection, session, |_| Err(why));
     let Some(url) = url else {
         return refused(
@@ -468,6 +474,7 @@ async fn pre_tool_with(
 /// that would spawn or orchestrate subagents is filed on the task board instead.
 async fn pre_tool(input: &HookInput) -> Decision {
     let projection = std::env::var_os("MEMORY_PROJECTION").map(PathBuf::from);
+    let live = std::env::var_os("MEMORY_PROJECTION_LIVE").is_some();
     let session = std::env::var("MEMORY_SESSION").unwrap_or_default();
     let url = std::env::var("MEMORY_MCP_URL").ok();
     if std::env::var("MEMORY_SUBAGENTS").is_ok_and(|v| v == "board") {
@@ -476,7 +483,15 @@ async fn pre_tool(input: &HookInput) -> Decision {
             return delegate(&tool, &tool_input, &session, url.as_deref(), WAIT).await;
         }
     }
-    pre_tool_with(input, projection.as_deref(), &session, url.as_deref(), WAIT).await
+    pre_tool_with(
+        input,
+        projection.as_deref(),
+        &session,
+        url.as_deref(),
+        WAIT,
+        live,
+    )
+    .await
 }
 
 /// File what a subagent call asks for as tasks, and refuse the call with their ids.
@@ -2193,13 +2208,13 @@ not json
         let entry = read_input("/memory/dom-me/mem-me-abc1.md");
         let wait = std::time::Duration::from_millis(200);
         assert_eq!(
-            pre_tool_with(&entry, None, SID, None, wait).await,
+            pre_tool_with(&entry, None, SID, None, wait, false).await,
             Decision::Allow,
             "no projection, nothing to decide"
         );
         assert!(
             matches!(
-                pre_tool_with(&entry, Some(view), SID, None, wait).await,
+                pre_tool_with(&entry, Some(view), SID, None, wait, false).await,
                 Decision::Deny(_)
             ),
             "a projection with no server address is refused, not let through"
@@ -2210,7 +2225,8 @@ not json
                 Some(view),
                 SID,
                 None,
-                wait
+                wait,
+                false
             )
             .await,
             Decision::Allow,
@@ -2228,12 +2244,44 @@ not json
             }
         });
         let started = std::time::Instant::now();
-        let d = pre_tool_with(&entry, Some(view), SID, Some(&url), wait).await;
+        let d = pre_tool_with(&entry, Some(view), SID, Some(&url), wait, false).await;
         hold.abort();
         assert!(
             matches!(&d, Decision::Deny(why) if why.contains("did not answer")),
             "{d:?}"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn over_a_live_mount_the_hook_makes_no_get_and_keeps_its_refusals() {
+        let view = Path::new("/memory");
+        let wait = std::time::Duration::from_millis(200);
+        // no server address: over a render that is a refusal, over a mount the open is
+        // the get and the read goes through
+        let entry = read_input("/memory/dom-me/mem-me-abc1.md");
+        assert_eq!(
+            pre_tool_with(&entry, Some(view), SID, None, wait, true).await,
+            Decision::Allow
+        );
+        let grep: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Grep","tool_input":{"pattern":"key","path":"/memory"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                pre_tool_with(&grep, Some(view), SID, None, wait, true).await,
+                Decision::Deny(_)
+            ),
+            "a search over the whole projection is refused, mount or render"
+        );
+        let stray = read_input("/memory/dom-me/notes.txt");
+        assert!(
+            matches!(
+                pre_tool_with(&stray, Some(view), SID, None, wait, true).await,
+                Decision::Deny(_)
+            ),
+            "a name that is not an entry's is refused, mount or render"
+        );
     }
 }
