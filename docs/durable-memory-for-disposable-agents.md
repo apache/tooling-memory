@@ -90,8 +90,8 @@ In the background, curators keep the memory tidy, auditors check the curators, a
 | **[Workers](#the-agents-life)** | Work needs doing by something cheap to start and safe to lose | Claim a task, do it, write a handoff |
 | **[Orchestrators](#decomposition)** | Someone has to decide what is worth doing, and split work too big for one agent | Rank tasks against written strategy, and split them (§8) |
 | **[Curators](#5-the-curator)** | Left alone, memory rots | Summarise, merge, verify, and retire entries (§5) |
-| **[Auditors](#containing-the-curator)** | A curator that checks its own work shares its own blind spots | Check the curators, on a different model (§5) |
-| **[Recall deputy](#turns-cost-more-than-transport)** | A multi-step lookup costs an expensive model many turns | Does the lookup on a cheap model, with the caller's permissions (§6) |
+| **[Auditors](#auditors)** | A curator that checks its own work shares its own blind spots | Check the curators, on a different model (§5) |
+| **[Recall deputy](#the-recall-deputy)** | A multi-step lookup costs an expensive model many turns | Does the lookup on a cheap model, with the caller's permissions (§6) |
 
 **Where the system meets the world**
 
@@ -362,11 +362,23 @@ A summary keeps the provenance, tier, and classification of what it summarises. 
 The curator is the most privileged agent in the system. It writes the summaries every search returns first, decides what is demoted and merged, and distils the methods in `dom-platform`. A wrong or compromised curator could steer the whole fleet without editing a single entry body, at a volume no person can review line by line. So containment is structural:
 
 - **Every action is a reversible diff** with provenance. Nothing is deleted, so anything buried is still in the archive.
-- **Auditors are independent.** They run on a different base model and prompt lineage, sample summaries against their bodies, hunt contradictions, and share no writable state with curators.
+- **Independent auditors check the work** ([Auditors](#auditors), below).
 - **Telemetry and the historian are out of reach.** The retrieval service and ledger write both, and curators have no write access, so a curator cannot hide the signals that would expose it. The service alerts, per curator instance, on demotion rates, summary drift, and skew in which entries searches surface.
 - **The gate scales with impact.** Routine curation is sampled for review. For promotions, boundary changes, tombstone redirects, and `dom-platform` distillation, a second party must approve.
 - **Lineage re-check.** Provenance names the instance and model behind every action, so if an instance, a source, or a model generation turns out bad, everything it wrote can be listed and re-checked. Curators are rotated like other agents.
 - **Canary entries.** Each domain holds a few entries with known content; a curation pass that alters one improperly raises an alarm.
+
+## Auditors
+
+**Why.** A curator that checks its own work shares its own blind spots, and a curator that is wrong or compromised could steer every search without anyone noticing. Someone independent has to check.
+
+Auditors are agents whose only job is checking curators. They:
+
+- run on a different base model and prompt lineage, so they do not share the curators' blind spots;
+- sample summaries against the entries they summarise;
+- hunt contradictions between entries;
+- watch the canary entries;
+- share no writable state with curators.
 
 Immutable history, deterministic tests, and sampled human review check the auditors in turn, with no further layer of agents.
 
@@ -417,7 +429,11 @@ The operations in Appendix A are the durable contract; protocols are adapters (t
 
 Every pull costs the agent a model turn. So the predictable part (T0 and the policy digest) arrives as a cached prefix. Pulls are dense: summaries first, prefetch attached, several queries per call. Where a harness works best with files, the service renders a scoped, read-only file view instead of mounting anything.
 
-Multi-step lookups go to `recall(question, domain)`. A cheap model inside the service runs the search, read, and summarise loop and returns a cited brief, so the expensive caller spends one turn.
+## The recall deputy
+
+**Why.** A question that needs several searches and reads would cost the expensive model one turn for each.
+
+So multi-step lookups go to `recall(question, domain)`. A cheap model inside the service runs the search, read, and summarise loop and returns a cited brief, so the expensive caller spends one turn.
 
 - The deputy runs under the caller's own filter, so a low-privilege caller cannot launder reads through it.
 - The caller's label rises to the highest classification the deputy read, and the deputy's reads join the caller's read set (§3).
@@ -961,13 +977,13 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-6"></a>[6] Christianson, B., & Harbison, W. S. (1997). Why Isn't Trust Transitive? *Security Protocols 1996*, LNCS 1189. Springer. https://doi.org/10.1007/3-540-62494-5_16
 
-<a id="ref-7"></a>[7] Jøsang, A., & Pope, S. (2005). Semantic Constraints for Trust Transitivity. *APCCM 2005*, CRPIT 43.
+<a id="ref-7"></a>[7] Jøsang, A., & Pope, S. (2005). Semantic Constraints for Trust Transitivity. *APCCM 2005*, CRPIT 43, 59–68. https://crpit.scem.westernsydney.edu.au/confpapers/CRPITV43Josang.pdf
 
 <a id="ref-8"></a>[8] Zhan, Q., Zhang, R., Guo, S., Zhao, L., & Liu, Z. (2026). When Memory Becomes Authority: Benchmarking Authority Collapse at the Memory Consolidation Boundary. arXiv:2608.01679. https://arxiv.org/abs/2608.01679
 
 <a id="ref-9"></a>[9] Digital Curation Centre. What Is Digital Curation? https://www.dcc.ac.uk/about/digital-curation
 
-<a id="ref-10"></a>[10] DAMA International (2017). *DAMA-DMBOK: Data Management Body of Knowledge*, 2nd ed. Technics Publications.
+<a id="ref-10"></a>[10] DAMA International (2017). *DAMA-DMBOK: Data Management Body of Knowledge*, 2nd ed. Technics Publications. https://www.dama.org/cpages/body-of-knowledge
 
 <a id="ref-11"></a>[11] Kindberg, T., & Hawke, S. (2005). The 'tag' URI Scheme. RFC 4151. https://www.rfc-editor.org/rfc/rfc4151
 
@@ -977,11 +993,11 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-14"></a>[14] Appenzeller, G. (2024). Welcome to LLMflation: LLM Inference Cost Is Going Down Fast. Andreessen Horowitz. https://a16z.com/llmflation-llm-inference-cost/
 
-<a id="ref-15"></a>[15] Epoch AI (2025). LLM Inference Price Trends. https://epoch.ai/data-insights/llm-inference-price-trends
+<a id="ref-15"></a>[15] Cottier, B., Snodin, B., Owen, D., & Adamczewski, T. (2025). LLM Inference Prices Have Fallen Rapidly but Unequally across Tasks. Epoch AI. https://epoch.ai/data-insights/llm-inference-price-trends (accessed 13 October 2026).
 
-<a id="ref-16"></a>[16] Strathern, M. (1997). 'Improving Ratings': Audit in the British University System. *European Review*, 5(3).
+<a id="ref-16"></a>[16] Strathern, M. (1997). “Improving ratings”: Audit in the British University system. *European Review*, 5(3), 305–321. https://doi.org/10.1002/%28SICI%291234-981X%28199707%295%3A3%3C305%3A%3AAID-EURO184%3E3.0.CO%3B2-4
 
-<a id="ref-17"></a>[17] Intercom (2025). Fin pricing: per resolution. https://www.intercom.com/learning-center/intercom-pricing
+<a id="ref-17"></a>[17] O'Reilly, A. (2025). Pricing AI Agents: What Does “Value-Based Pricing” Really Mean for AI? The Intercom Blog, 28 April 2025. https://www.intercom.com/blog/pricing-ai-agents
 
 <a id="ref-18"></a>[18] Packer, C., et al. (2023). MemGPT: Towards LLMs as Operating Systems. arXiv:2310.08560. https://arxiv.org/abs/2310.08560
 
@@ -1003,7 +1019,7 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-27"></a>[27] Nygard, M. (2011). Documenting Architecture Decisions. https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions
 
-<a id="ref-28"></a>[28] Walsh, J. P., & Ungson, G. R. (1991). Organizational Memory. *Academy of Management Review*, 16(1).
+<a id="ref-28"></a>[28] Walsh, J. P., & Ungson, G. R. (1991). Organizational Memory. *Academy of Management Review*, 16(1), 57–91. https://doi.org/10.5465/amr.1991.4278992
 
 <a id="ref-29"></a>[29] Guha, R., Kumar, R., Raghavan, P., & Tomkins, A. (2004). Propagation of Trust and Distrust. *WWW 2004*. https://archives.iw3c2.org/www2004/proceedings/docs/1p403.pdf
 
@@ -1013,11 +1029,11 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-32"></a>[32] Greshake, K., Abdelnabi, S., Mishra, S., Endres, C., Holz, T., & Fritz, M. (2023). Not What You've Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection. arXiv:2302.12173. https://arxiv.org/abs/2302.12173
 
-<a id="ref-33"></a>[33] Dong, S., He, P., Tang, J., Liu, H., et al. (2025). Memory Injection Attacks on LLM Agents via Query-Only Interaction (MINJA). *NeurIPS 2025*. arXiv:2503.03704. https://arxiv.org/abs/2503.03704
+<a id="ref-33"></a>[33] Dong, S., Xu, S., He, P., Li, Y., et al. (2025). Memory Injection Attacks on LLM Agents via Query-Only Interaction (MINJA). *NeurIPS 2025*. arXiv:2503.03704. https://arxiv.org/abs/2503.03704
 
 <a id="ref-34"></a>[34] Chen, Z., Xiang, Z., Xiao, C., Song, D., & Li, B. (2024). AgentPoison: Red-teaming LLM Agents via Poisoning Memory or Knowledge Bases. *NeurIPS 2024*. arXiv:2407.12784. https://arxiv.org/abs/2407.12784
 
-<a id="ref-35"></a>[35] *Memory Poisoning Evades Prompt-Injection Defenses: A Systematic Study* (2026). arXiv:2606.04329. https://arxiv.org/abs/2606.04329
+<a id="ref-35"></a>[35] Dash, P., et al. (2026). *From Untrusted Input to Trusted Memory: A Systematic Study of Memory Poisoning Attacks in LLM Agents*. arXiv:2606.04329. https://arxiv.org/abs/2606.04329
 
 <a id="ref-36"></a>[36] OWASP GenAI Security Project (2025). OWASP Top 10 for Agentic Applications. https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/
 
@@ -1025,11 +1041,11 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-38"></a>[38] Debenedetti, E., et al. (2025). Defeating Prompt Injections by Design (CaMeL). arXiv:2503.18813. https://arxiv.org/abs/2503.18813
 
-<a id="ref-39"></a>[39] Open Policy Agent (2024). Documentation. https://www.openpolicyagent.org
+<a id="ref-39"></a>[39] Open Policy Agent. Evaluating a Data Filter Policy (partial evaluation documentation). https://www.openpolicyagent.org/docs/filtering/partial-evaluation
 
 <a id="ref-40"></a>[40] Pang, R., et al. (2019). Zanzibar: Google's Consistent, Global Authorization System. *USENIX ATC 2019*. https://www.usenix.org/conference/atc19/presentation/pang
 
-<a id="ref-41"></a>[41] Model Context Protocol (2024). Specification. https://modelcontextprotocol.io
+<a id="ref-41"></a>[41] Model Context Protocol (2025). Specification, version 2025-11-25. https://modelcontextprotocol.io/specification/2025-11-25
 
 <a id="ref-42"></a>[42] Bai, Y., et al. (2022). Constitutional AI: Harmlessness from AI Feedback. arXiv:2212.08073. https://arxiv.org/abs/2212.08073
 
@@ -1037,25 +1053,25 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-44"></a>[44] Krakovna, V., et al. (2020). Specification Gaming: The Flip Side of AI Ingenuity. DeepMind. https://deepmind.google/discover/blog/specification-gaming-the-flip-side-of-ai-ingenuity/
 
-<a id="ref-45"></a>[45] Erman, L. D., Hayes-Roth, F., Lesser, V. R., & Reddy, D. R. (1980). The Hearsay-II Speech-Understanding System. *ACM Computing Surveys*, 12(2).
+<a id="ref-45"></a>[45] Erman, L. D., Hayes-Roth, F., Lesser, V. R., & Reddy, D. R. (1980). The Hearsay-II Speech-Understanding System: Integrating Knowledge to Resolve Uncertainty. *ACM Computing Surveys*, 12(2), 213–253. https://doi.org/10.1145/356810.356816
 
-<a id="ref-46"></a>[46] Gelernter, D. (1985). Generative Communication in Linda. *ACM TOPLAS*, 7(1).
+<a id="ref-46"></a>[46] Gelernter, D. (1985). Generative Communication in Linda. *ACM Transactions on Programming Languages and Systems*, 7(1), 80–112. https://doi.org/10.1145/2363.2433
 
-<a id="ref-47"></a>[47] Grassé, P.-P. (1959). La reconstruction du nid et les coordinations interindividuelles. *Insectes Sociaux*, 6.
+<a id="ref-47"></a>[47] Grassé, P.-P. (1959). La reconstruction du nid et les coordinations interindividuelles chez *Bellicositermes natalensis* et *Cubitermes* sp.; la théorie de la stigmergie: essai d'interprétation du comportement des termites constructeurs. *Insectes Sociaux*, 6(1), 41–80. https://doi.org/10.1007/BF02223791
 
-<a id="ref-48"></a>[48] Heylighen, F. (2016). Stigmergy as a Universal Coordination Mechanism. *Cognitive Systems Research*, 38.
+<a id="ref-48"></a>[48] Heylighen, F. (2016). Stigmergy as a Universal Coordination Mechanism I: Definition and Components. *Cognitive Systems Research*, 38, 4–13. https://doi.org/10.1016/j.cogsys.2015.12.002
 
-<a id="ref-49"></a>[49] Gray, C., & Cheriton, D. (1989). Leases: An Efficient Fault-Tolerant Mechanism for Distributed File Cache Consistency. *SOSP '89*.
+<a id="ref-49"></a>[49] Gray, C., & Cheriton, D. (1989). Leases: An Efficient Fault-Tolerant Mechanism for Distributed File Cache Consistency. *SOSP '89*. https://doi.org/10.1145/74850.74870
 
-<a id="ref-50"></a>[50] Evans, E. (2003). *Domain-Driven Design: Tackling Complexity in the Heart of Software*. Addison-Wesley.
+<a id="ref-50"></a>[50] Evans, E. (2003). *Domain-Driven Design: Tackling Complexity in the Heart of Software*. Addison-Wesley. https://www.domainlanguage.com/ddd/
 
 <a id="ref-51"></a>[51] Dehghani, Z. (2019). How to Move Beyond a Monolithic Data Lake to a Distributed Data Mesh. https://martinfowler.com/articles/data-monolith-to-mesh.html
 
-<a id="ref-52"></a>[52] Erol, K., Hendler, J., & Nau, D. S. (1994). HTN Planning: Complexity and Expressivity. *AAAI-94*.
+<a id="ref-52"></a>[52] Erol, K., Hendler, J., & Nau, D. S. (1994). HTN Planning: Complexity and Expressivity. *AAAI-94*. https://cdn.aaai.org/AAAI/1994/AAAI94-173.pdf
 
-<a id="ref-53"></a>[53] Kelley, J. E., & Walker, M. R. (1959). Critical-Path Planning and Scheduling. *Eastern Joint Computer Conference*.
+<a id="ref-53"></a>[53] Kelley, J. E., & Walker, M. R. (1959). Critical-Path Planning and Scheduling. In *Proceedings of the Eastern Joint Computer Conference*, 160–173. https://doi.org/10.1145/1460299.1460318
 
-<a id="ref-54"></a>[54] Smith, R. G. (1980). The Contract Net Protocol: High-Level Communication and Control in a Distributed Problem Solver. *IEEE Transactions on Computers*, C-29(12).
+<a id="ref-54"></a>[54] Smith, R. G. (1980). The Contract Net Protocol: High-Level Communication and Control in a Distributed Problem Solver. *IEEE Transactions on Computers*, C-29(12), 1104–1113. https://doi.org/10.1109/TC.1980.1675516
 
 <a id="ref-55"></a>[55] Beyer, B., Jones, C., Petoff, J., & Murphy, N. R. (2016). *Site Reliability Engineering*. O'Reilly. https://sre.google/sre-book/table-of-contents/
 
@@ -1069,25 +1085,25 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-60"></a>[60] National Institute of Standards and Technology (2023). *Artificial Intelligence Risk Management Framework (AI RMF 1.0)*. NIST AI 100-1. https://doi.org/10.6028/NIST.AI.100-1
 
-<a id="ref-61"></a>[61] ISO/IEC 42001:2023. *Information Technology, Artificial Intelligence, Management System*. https://www.iso.org/standard/81230.html
+<a id="ref-61"></a>[61] ISO/IEC (2023). *ISO/IEC 42001:2023 Information technology — Artificial intelligence — Management system*. https://www.iso.org/standard/81230.html
 
-<a id="ref-62"></a>[62] OpenTelemetry (2026). Semantic Conventions for Generative AI Systems. https://opentelemetry.io/docs/specs/semconv/gen-ai/
+<a id="ref-62"></a>[62] OpenTelemetry. *Generative AI semantic conventions*. https://opentelemetry.io/docs/specs/semconv/gen-ai/ (accessed 13 October 2026).
 
-<a id="ref-63"></a>[63] UK AI Security Institute (2024). Inspect: An Open-Source Framework for Large Language Model Evaluations. https://inspect.aisi.org.uk
+<a id="ref-63"></a>[63] UK AI Security Institute (2024). Inspect AI: Framework for Large Language Model Evaluations. Released May 2024. https://inspect.aisi.org.uk
 
 <a id="ref-64"></a>[64] *How Much Coordination Gain Is Real? A Paired Noise-Floor Protocol for Multi-Agent Benchmarks* (2026). arXiv:2606.20695. https://arxiv.org/abs/2606.20695
 
-<a id="ref-65"></a>[65] Zimmermann, T., Weissgerber, P., Diehl, S., & Zeller, A. (2004). Mining Version Histories to Guide Software Changes. *ICSE 2004*.
+<a id="ref-65"></a>[65] Zimmermann, T., Weissgerber, P., Diehl, S., & Zeller, A. (2004). Mining Version Histories to Guide Software Changes. *ICSE 2004*. https://doi.org/10.1109/ICSE.2004.1317478
 
-<a id="ref-66"></a>[66] Śliwerski, J., Zimmermann, T., & Zeller, A. (2005). When Do Changes Induce Fixes? *MSR 2005*.
+<a id="ref-66"></a>[66] Śliwerski, J., Zimmermann, T., & Zeller, A. (2005). When Do Changes Induce Fixes? *MSR 2005*. https://doi.org/10.1145/1083142.1083147
 
-<a id="ref-67"></a>[67] *SEAGym: Self-Evolving Agents in the Harness* (2026). arXiv:2606.17546. https://arxiv.org/abs/2606.17546
+<a id="ref-67"></a>[67] Zheng, C., et al. (2026). *SEAGym: An Evaluation Environment for Self-Evolving LLM Agents*. arXiv:2606.17546. https://arxiv.org/abs/2606.17546
 
-<a id="ref-68"></a>[68] *EvolveR: Experience-Driven Agent Lifecycle with Offline Distillation and Online Retrieval* (2025). arXiv:2510.16079. https://arxiv.org/abs/2510.16079
+<a id="ref-68"></a>[68] Wu, R., et al. (2025). *EvolveR: Self-Evolving LLM Agents through an Experience-Driven Lifecycle*. arXiv:2510.16079. https://arxiv.org/abs/2510.16079
 
 <a id="ref-69"></a>[69] Zhang, J., Hu, S., et al. (2025). The Darwin Gödel Machine: Open-Ended Evolution of Self-Improving Agents. arXiv:2505.22954. https://arxiv.org/abs/2505.22954
 
-<a id="ref-70"></a>[70] *The Red Queen Gödel Machine: Co-Evolving Agents and Evaluators* (2026). arXiv:2606.26294. https://arxiv.org/abs/2606.26294
+<a id="ref-70"></a>[70] Iacob, A., et al. (2026). *The Red Queen Gödel Machine: Co-Evolving Agents and Their Evaluators*. arXiv:2606.26294. https://arxiv.org/abs/2606.26294
 
 <a id="ref-71"></a>[71] Hu, S., Lu, C., & Clune, J. (2024). Automated Design of Agentic Systems. arXiv:2408.08435. https://arxiv.org/abs/2408.08435
 
