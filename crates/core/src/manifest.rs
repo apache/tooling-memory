@@ -158,7 +158,7 @@ impl Manifest {
     /// Only if [`Manifest`] stops being serialisable, which a test guards.
     #[must_use]
     pub fn to_yaml(&self) -> String {
-        serde_yaml::to_string(self).expect("manifest serialises")
+        serde_norway::to_string(self).expect("manifest serialises")
     }
 
     /// Parse from YAML.
@@ -167,7 +167,7 @@ impl Manifest {
     ///
     /// [`crate::Error::Yaml`] when the text does not fit [`Manifest`].
     pub fn from_yaml(s: &str) -> Result<Manifest, crate::Error> {
-        Ok(serde_yaml::from_str(s)?)
+        Ok(serde_norway::from_str(s)?)
     }
 }
 

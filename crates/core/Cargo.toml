@@ -9,7 +9,7 @@ repository.workspace = true
 hex = "0.4.3"
 rand = "0.10.3"
 serde = { workspace = true, features = ["derive"] }
-serde_yaml = "0.9.34"
+serde_norway = "0.9.42"
 sha2 = "0.11.0"
 thiserror.workspace = true
 time = { version = "0.3.55", features = ["serde-well-known", "formatting", "parsing", "macros"] }

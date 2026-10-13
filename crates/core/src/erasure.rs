@@ -138,7 +138,7 @@ impl Receipt {
     /// Only if the receipt stops being serialisable, which the round-trip test guards.
     #[must_use]
     pub fn to_yaml(&self) -> String {
-        serde_yaml::to_string(self).expect("a receipt serialises")
+        serde_norway::to_string(self).expect("a receipt serialises")
     }
 
     /// A receipt read back.
@@ -147,7 +147,7 @@ impl Receipt {
     ///
     /// [`crate::Error::Yaml`] when the text is not a receipt.
     pub fn from_yaml(text: &str) -> Result<Receipt, crate::Error> {
-        Ok(serde_yaml::from_str(text)?)
+        Ok(serde_norway::from_str(text)?)
     }
 }
 

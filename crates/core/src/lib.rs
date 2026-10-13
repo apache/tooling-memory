@@ -229,7 +229,7 @@ pub enum Error {
     NoFrontmatter,
     /// The frontmatter is not valid YAML, or does not fit [`Frontmatter`].
     #[error("frontmatter: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_norway::Error),
     /// A value is well-formed but not allowed.
     #[error("invalid: {0}")]
     Invalid(String),
@@ -269,7 +269,7 @@ impl Entry {
         if in_front {
             return Err(Error::NoFrontmatter);
         }
-        let front: Frontmatter = serde_yaml::from_str(&yaml)?;
+        let front: Frontmatter = serde_norway::from_str(&yaml)?;
         if front.id.is_empty() || front.domain.is_empty() {
             return Err(Error::Invalid("id and domain are required".into()));
         }
@@ -283,7 +283,7 @@ impl Entry {
     ///
     /// Only if [`Frontmatter`] stops being serialisable, which a test guards.
     pub fn render(&self) -> String {
-        let yaml = serde_yaml::to_string(&self.front).expect("frontmatter serialises");
+        let yaml = serde_norway::to_string(&self.front).expect("frontmatter serialises");
         let mut out = String::with_capacity(yaml.len() + self.body.len() + 16);
         out.push_str(FENCE);
         out.push('\n');

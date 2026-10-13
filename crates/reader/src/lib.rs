@@ -77,7 +77,7 @@ pub fn parse_entry(text: &str) -> String {
 #[wasm_bindgen]
 #[must_use]
 pub fn parse_manifest(yaml: &str) -> String {
-    match serde_yaml::from_str::<Manifest>(yaml) {
+    match serde_norway::from_str::<Manifest>(yaml) {
         Ok(m) if m.format == dm_core::manifest::FORMAT => match m.consistent() {
             Ok(()) => serde_json::to_string(&m).unwrap_or_else(|err| error(&err.to_string())),
             Err(e) => error(&e.to_string()),
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn a_manifest_parses_and_a_foreign_format_is_refused() {
         let m = Manifest::new("dom-me", "memory test", Label::Internal);
-        let yaml = serde_yaml::to_string(&m).unwrap();
+        let yaml = serde_norway::to_string(&m).unwrap();
         let v: serde_json::Value = serde_json::from_str(&parse_manifest(&yaml)).unwrap();
         assert_eq!(v["domain"], "dom-me");
         assert_eq!(v["max_label"], "internal");
