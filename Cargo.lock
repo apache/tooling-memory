@@ -56,7 +56,6 @@ dependencies = [
  "dm-taps",
  "dm-web",
  "dm-wslc-api",
- "reqwest 0.13.1",
  "serde",
  "serde_json",
  "tempfile",
