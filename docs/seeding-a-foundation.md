@@ -23,17 +23,17 @@ The Foundation is a hard case for this design, which makes it a useful one.
 | **Constant churn** | Projects incubate, graduate, split, merge, and retire. Committers come and go over decades, and employers change while hats stay. The registry and the paper's churn rules are exercised all the time |
 | **No central direction** | The Foundation does not set what projects build. Strategy is federated, which stresses the policy stack in a way a company would not |
 
-Each section below tests one part of the paper. §10 collects what the Foundation taught the design.
+Each section below tests one part of the paper. [§10](#10-what-the-foundation-taught-the-design) collects what the Foundation taught the design.
 
 ---
 
 ## 2. Domains and the project lifecycle
 
-**Why.** Memory, policy, and access are organised by domain (paper §2), so the domain map decides everything that follows.
+**Why.** Memory, policy, and access are organised by domain ([paper §2](durable-memory-for-disposable-agents.md#2-the-design-at-a-glance)), so the domain map decides everything that follows.
 
 The Foundation already partitions work by project: **one domain per top-level project**, keyed by a permanent ID. The PMC and the project's name are attributes of the domain, so either can change. Foundation-level domains sit alongside: governance, infrastructure, legal, security, brand, and the Incubator.
 
-Each domain has a steward in the paper's sense (paper §5), the party that answers for it and under whose policy curators work. The registry records who that is:
+Each domain has a steward in the paper's sense ([paper §5](durable-memory-for-disposable-agents.md#5-the-curator)), the party that answers for it and under whose policy curators work. The registry records who that is:
 
 | Domain | Steward |
 |---|---|
@@ -65,11 +65,11 @@ stateDiagram-v2
 | Lifecycle event | Becomes |
 |---|---|
 | **Import** | The Incubator already practises the paper's quarantined import: IP clearance and software grants bring donated code and history in at low trust, and promotion follows review. The design adds only a memory of the process |
-| **Rename** | Usually during incubation, after the podling name search. The domain ID stays; the new name is a dated assertion (paper §12) |
+| **Rename** | Usually during incubation, after the podling name search. The domain ID stays; the new name is a dated assertion ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)) |
 | **Graduation** | A registry update. The new PMC takes over a domain that already exists, seeded during incubation at raw and curated. Verified waits for the PMC that graduation creates |
 | **Split** | In 2021 Solr left Lucene to become its own top-level project: the paper's domain split, done by hand. Here it is a curator-assisted split with tombstone redirects, and the shared history stays as entries both domains cite |
 | **Merge** | The reverse, done lazily and only on real convergence, as when Lucene and Solr merged their development in 2010 |
-| **Orphaning** | The case the paper calls dangerous (paper §12). Today the board catches it through missed or thin quarterly reports. The ownership invariant flags the domain within days instead |
+| **Orphaning** | The case the paper calls dangerous ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)). Today the board catches it through missed or thin quarterly reports. The ownership invariant flags the domain within days instead |
 | **Retirement** | The Attic already is an archive tier. The domain demotes: still indexed and citable, no longer curated, and its interface summary marked so agents stop treating its facts as live |
 
 ---
@@ -78,7 +78,7 @@ stateDiagram-v2
 
 **Why.** Twenty-five years of provenance is only useful if it still points at the right person. At the Foundation, the names around a person change far more often than the person.
 
-The paper's rule is opaque permanent keys plus dated names (paper §12, after RFC 4151). At the Foundation:
+The paper's rule is opaque permanent keys plus dated names ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales), after RFC 4151). At the Foundation:
 
 - **Committers are keyed by Apache ID**, as `human:apache.org,<date>:<apache-id>`. The dated authority costs nothing and still holds if the Foundation's naming ever changes.
 - **Everyone else is keyed by issuer and subject.** Most authors in the archives (list posters, issue reporters, patch senders) have no Apache ID. A GitHub author is keyed by GitHub's numeric user ID, which survives renames; a Jira or Bugzilla author by that tracker's account; a list poster by the address and the date it was seen. When the person later gets an Apache ID, a dated assertion links the two.
@@ -92,9 +92,9 @@ The paper's rule is opaque permanent keys plus dated names (paper §12, after RF
 
 **Why.** Twenty-five years of archives can seed far more than any new deployment could write. The question is which sources yield which kind of entry, and which can be cited for decades.
 
-The paper's source table (Appendix B) applies row by row. The Foundation's archive discipline supplies what seeding needs most: **stable citations**. Mailing-list permalinks and message IDs are durable, so entries cite originals that will still resolve in twenty years.
+The paper's source table ([Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding)) applies row by row. The Foundation's archive discipline supplies what seeding needs most: **stable citations**. Mailing-list permalinks and message IDs are durable, so entries cite originals that will still resolve in twenty years.
 
-The archives stay the original record. The memory holds distilled entries that link back, and its historian (paper §3) records what the fleet did with them.
+The archives stay the original record. The memory holds distilled entries that link back, and its historian ([paper §3](durable-memory-for-disposable-agents.md#3-memory)) records what the fleet did with them.
 
 | Foundation source | Entry type | Notes |
 |---|---|---|
@@ -122,7 +122,7 @@ The archives stay the original record. The memory holds distilled entries that l
 | **L2** | Foundation-wide process (release, security handling, branding). Its checkable part compiles to gates: an agent preparing release artifacts is gated on licence and provenance rules mechanically |
 | **L3** | Project conventions, owned by each domain, distilled largely from review archives |
 
-**Finding: the stack must allow many L1s under one L0.** Cross-domain triage falls back to the thin shared layer. The design needed no change, since each domain already orders its own queue with its own rubric (paper §8), but the paper only implied this. Any organisation with independent divisions will want the same property.
+**Finding: the stack must allow many L1s under one L0.** Cross-domain triage falls back to the thin shared layer. The design needed no change, since each domain already orders its own queue with its own rubric ([paper §8](durable-memory-for-disposable-agents.md#8-coordination)), but the paper only implied this. Any organisation with independent divisions will want the same property.
 
 ---
 
@@ -134,24 +134,24 @@ The archives stay the original record. The memory holds distilled entries that l
 
 | Foundation practice | Paper mechanism |
 |---|---|
-| PMC members cast binding votes on their project | Promotion to verified (paper §4). The paper allows a person or a senior agent by domain policy; the Foundation's policy is a person, and PMC membership in the registry grants the right |
+| PMC members cast binding votes on their project | Promotion to verified ([paper §4](durable-memory-for-disposable-agents.md#4-trust-and-handling)). The paper allows a person or a senior agent by domain policy; the Foundation's policy is a person, and PMC membership in the registry grants the right |
 | Committers review each other's work | Sampled review of routine curation, and review of golden suites |
 | Lazy consensus | Routine curation goes ahead unless someone objects |
 | A release or procedural vote | Gated review for high-impact promotions, passed by majority |
 | A veto on a code change | A hard reject with a required justification, which becomes an entry itself |
-| IP clearance and software grants | Imports start raw (paper §4) |
+| IP clearance and software grants | Imports start raw ([paper §4](durable-memory-for-disposable-agents.md#4-trust-and-handling)) |
 
 The people who vote on a project's code are the ones who vouch for its memory.
 
 ### An open front door
 
-Anyone can write into the raw tier, and that openness must stay. Raw from a tap reaches only the task it started until a curator has looked at it (paper §4), so a planted issue or post is not searchable across the project the moment it lands. Nothing reaches a tier agents rely on without distillation and review. For the Foundation, the paper's poisoning defences (paper §4) are the minimum.
+Anyone can write into the raw tier, and that openness must stay. Raw from a tap reaches only the task it started until a curator has looked at it ([paper §4](durable-memory-for-disposable-agents.md#4-trust-and-handling)), so a planted issue or post is not searchable across the project the moment it lands. Nothing reaches a tier agents rely on without distillation and review. For the Foundation, the paper's poisoning defences ([paper §4](durable-memory-for-disposable-agents.md#4-trust-and-handling)) are the minimum.
 
-The incident in paper §1 shows why. The models reached Hugging Face, another open host, through a malicious dataset upload. A planted issue, patch, or list post is the same move against the Foundation. Lineage (paper §3) is the answer after the fact: once a source is found bad, every entry it informed, and every result sent from a session that read it, can be listed and re-checked.
+The incident in [paper §1](durable-memory-for-disposable-agents.md#1-why) shows why. The models reached Hugging Face, another open host, through a malicious dataset upload. A planted issue, patch, or list post is the same move against the Foundation. Lineage ([paper §3](durable-memory-for-disposable-agents.md#3-memory)) is the answer after the fact: once a source is found bad, every entry it informed, and every result sent from a session that read it, can be listed and re-checked.
 
 ### Private lists are the restricted label
 
-The paper's labels (paper §4) apply directly. Public archives are public; private and security lists are restricted.
+The paper's labels ([paper §4](durable-memory-for-disposable-agents.md#4-trust-and-handling)) apply directly. Public archives are public; private and security lists are restricted.
 
 - **Who may read.** PMC members read their PMC's private list, and Foundation members may read most private lists by Foundation policy. A session may handle restricted material only if its harness routes every outbound path through the perimeter.
 - **Where it may go.** Only to destinations whose ceiling allows it: for the Foundation, a model class whose prompts stay inside it.
@@ -190,13 +190,13 @@ Lineage audits this path too. "Which public entries were informed by a session t
 
 ### People deserve a policy before the pipeline runs
 
-The archives hold twenty-five years of individuals arguing, deciding, and occasionally behaving badly, all in public. The paper leaves profiles of people to policy (Appendix B). The Foundation sets that policy as L0 before the first distillation pass:
+The archives hold twenty-five years of individuals arguing, deciding, and occasionally behaving badly, all in public. The paper leaves profiles of people to policy ([Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding)). The Foundation sets that policy as L0 before the first distillation pass:
 
 - entries describe roles, process, and norms;
 - roles and public records (committer, PMC member, release manager for a version) are facts;
 - behavioural profiles of named people are not entries, however public the mail. Patterns of persuasion attributed to a person are not entries either, and the gate enforces it.
 
-The rule governs the Foundation's domains. A committer's own domain (§7) is theirs, under their own policy.
+The rule governs the Foundation's domains. A committer's own domain ([§7](#7-a-committer-owns-a-domain)) is theirs, under their own policy.
 
 ---
 
@@ -204,7 +204,7 @@ The rule governs the Foundation's domains. A committer's own domain (§7) is the
 
 **Why.** Committers outlast their employers and often their projects. What the tooling learns about a person should go where the person goes.
 
-The Foundation remembers a person's role, and the public archive stays indexed as a source. Anything else its agent tooling learns about a person goes into a personal domain the person owns (paper §12). The Foundation's tooling and the committer's employer may only propose into it.
+The Foundation remembers a person's role, and the public archive stays indexed as a source. Anything else its agent tooling learns about a person goes into a personal domain the person owns ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)). The Foundation's tooling and the committer's employer may only propose into it.
 
 At the Foundation this reduces to three rules:
 
@@ -230,7 +230,7 @@ The Foundation's identity infrastructure is already real: Apache accounts, contr
 
 - **The index is free; inference is metered.** `search` and `get` are served from the index at almost no cost.
 - **Limits sit in the perimeter.** A committer credential caught in a runaway loop hits its cap and raises an alert automatically.
-- **Limits cover spend and throughput** (paper §12). Commercial models are capped in money and in a share of the Foundation's rate limits with each vendor; Foundation-hosted capacity is capped in time share. Both are shared pools: one committer's burst is another's queue.
+- **Limits cover spend and throughput** ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)). Commercial models are capped in money and in a share of the Foundation's rate limits with each vendor; Foundation-hosted capacity is capped in time share. Both are shared pools: one committer's burst is another's queue.
 
 **Finding: the registry's rosters decide both review rights and serving tier.** The PMC roster grants promotion; the committer roster grants subsidised recall. A change to either follows the registry automatically.
 
@@ -238,17 +238,17 @@ The Foundation's identity infrastructure is already real: Apache accounts, contr
 
 ## 9. The seeding plan
 
-**Why.** Seeding is where a wrong or planted fact is cheapest to insert and hardest to find later. The plan keeps it on the ordinary, gated path of Appendix B.
+**Why.** Seeding is where a wrong or planted fact is cheapest to insert and hardest to find later. The plan keeps it on the ordinary, gated path of [Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding).
 
 The paper's plan applies as written: live taps first, then backfill through the same pipeline oldest first; everything indexed at once with permalink citations; distillation pulled by failed searches. Three choices are specific to the Foundation.
 
 - **One interface summary per project, first.** What it is, its architecture in a paragraph, governance status, key contracts, where its decisions live. A few hundred curated pages, reviewed by the PMCs they describe, give every domain a front door early.
-- **Golden suites come from users.** Questions asked on user lists and in issues, paired with the resolutions the archives record, become per-project evaluation suites, and committers review them. Questions the community struggled to answer form the stratum of past failures (paper §11).
+- **Golden suites come from users.** Questions asked on user lists and in issues, paired with the resolutions the archives record, become per-project evaluation suites, and committers review them. Questions the community struggled to answer form the stratum of past failures ([paper §11](durable-memory-for-disposable-agents.md#11-evaluating-change)).
 - **A dormant project's 2004 threads are indexed forever and distilled never.**
 
 ### Trackers are the ledger's taps
 
-GitHub issues, Jira, and Bugzilla are where work already arrives, and they stay there (paper §8).
+GitHub issues, Jira, and Bugzilla are where work already arrives, and they stay there ([paper §8](durable-memory-for-disposable-agents.md#8-coordination)).
 
 - The registry maps each repository and tracker project to the domain that owns it. An issue becomes a task on that domain's ledger, citing the issue as its `origin`.
 - A label applied by a committer is admission evidence: a human sign-off triage can weigh.
@@ -262,7 +262,7 @@ Three pilots, deliberately different:
 - one mature, stable project with decades of history;
 - one podling, whose memory is born inside the system instead of imported into it.
 
-Each must pass the paper's M1 and M2 exit criteria (paper §13) before fan-out, including the paired run with and without memory.
+Each must pass the paper's M1 and M2 exit criteria ([paper §13](durable-memory-for-disposable-agents.md#13-build-order)) before fan-out, including the paired run with and without memory.
 
 ---
 
@@ -270,12 +270,12 @@ Each must pass the paper's M1 and M2 exit criteria (paper §13) before fan-out, 
 
 | Pressure | Finding | Where the design answers |
 |---|---|---|
-| **Federated strategy** | Many L1s under one L0 (§5) | Per-domain rubrics (paper §8) |
-| **Volunteer time is scarce** | Every review gate spends volunteer time. So: sampled review for the routine, batched digests instead of per-item interrupts, PMC-tunable strictness within L0, and a curation budget sized so curators cannot generate unbounded review. Subsidised recall pays reviewers back | Gates scale with impact (paper §5, §8) |
-| **Transparency applies to the memory too** | An institution that publishes its board minutes should expect its memory, policy, and even curation telemetry to be public. Anyone may read; what needs control is who promotes and who gets paid-for recall. The paper leaves this default open | The read filter is a policy setting (paper §6) |
-| **The serving layer may lose funding** | If the index, models, and telemetry went dark, every repository still carries a generated instruction file and every entry cites a permalink that resolves. An unfunded year loses convenience; the knowledge survives | The record test (paper §12), generated files (Appendix B) |
-| **Tooling is contributed** | Foundation tooling comes from Infra, volunteer teams such as Whimsy, and projects. The Foundation adopts at a version, and operates, whatever sits on the production path. Skills kept in a project repository are generated from its domain and never hand-edited | The ownership test (paper §12), Appendix B |
-| **Names move constantly** | Employers, usernames, and project names change; people and projects persist (§3) | Dated identity (paper §12) |
+| **Federated strategy** | Many L1s under one L0 ([§5](#5-a-policy-stack-for-a-federation)) | Per-domain rubrics ([paper §8](durable-memory-for-disposable-agents.md#8-coordination)) |
+| **Volunteer time is scarce** | Every review gate spends volunteer time. So: sampled review for the routine, batched digests instead of per-item interrupts, PMC-tunable strictness within L0, and a curation budget sized so curators cannot generate unbounded review. Subsidised recall pays reviewers back | Gates scale with impact (paper [§5](durable-memory-for-disposable-agents.md#5-the-curator), [§8](durable-memory-for-disposable-agents.md#8-coordination)) |
+| **Transparency applies to the memory too** | An institution that publishes its board minutes should expect its memory, policy, and even curation telemetry to be public. Anyone may read; what needs control is who promotes and who gets paid-for recall. The paper leaves this default open | The read filter is a policy setting ([paper §6](durable-memory-for-disposable-agents.md#6-retrieval-and-serving)) |
+| **The serving layer may lose funding** | If the index, models, and telemetry went dark, every repository still carries a generated instruction file and every entry cites a permalink that resolves. An unfunded year loses convenience; the knowledge survives | The record test ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)), generated files ([Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding)) |
+| **Tooling is contributed** | Foundation tooling comes from Infra, volunteer teams such as Whimsy, and projects. The Foundation adopts at a version, and operates, whatever sits on the production path. Skills kept in a project repository are generated from its domain and never hand-edited | The ownership test ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)), [Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding) |
+| **Names move constantly** | Employers, usernames, and project names change; people and projects persist ([§3](#3-people-and-names)) | Dated identity ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)) |
 
 None of these needed a structural change to the design.
 
