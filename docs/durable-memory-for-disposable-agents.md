@@ -793,7 +793,7 @@ One interlock matters most. If the model drifts while the §10 loop is evaluatin
 
 ## Identity when the organisation changes
 
-Organisations rename, split, merge, and hand names to new owners. People change teams, employers, and roles, and accounts get reused. A record that keys anything on a name breaks every time, and the break is silent: old provenance starts pointing at the wrong party.
+**Why.** Organisations rename, split, merge, and hand names to new owners. People change teams, employers, and roles, and accounts get reused. A record that keys anything on a name breaks every time, and the break is silent: old provenance starts pointing at the wrong party.
 
 This is a known problem with a known answer.
 
@@ -836,19 +836,23 @@ When a grant ends, the institution's views are dropped with receipts. What the p
 
 ## Models and tools
 
+**Why.** Models are replaced every few months, and tools are rewritten, change hands, or stop being maintained. Whatever the record depends on, it can only last as long as that does.
+
 BM25 needs no model. Embeddings, summaries, and compiled rubrics are derived and rebuildable. Provenance records the model behind every write, so a bad model generation's contributions can be found and re-checked.
 
 Everything authoritative is text in a versioned store. If the policy engine or search engine dies, the policies are text and the index rebuilds elsewhere. If the whole platform dies, a person with a laptop can read the estate in a text editor. A yearly drill proves it: rebuild the serving layer from snapshots of the record alone, and check that nothing erased comes back.
 
 Two tests apply to every component. The **record test**: if this goes dark, is anything lost beyond convenience? The **ownership test**: if the people who contributed this stop, does anything on the production path stop? The institution adopts at a version, and operates, whatever sits on the production path; anything else stays off it.
 
-## Prices, and why not build in the token
+## Cost and throughput
+
+**Why.** The price of model work falls fast and changes shape, and capacity runs short at peak whatever the price. A design tuned to today's prices is wrong within a year, and a money budget alone still lets one burst starve everyone else.
 
 The design keeps prices out of its structure. Telemetry records raw quantities per resource class: tokens (input, cached, output), requests, accelerator time, compute time, and bytes stored. A versioned price vector, kept with policy, turns them into cost. The efficiency measure is cost per completed task.
 
 When the price vector changes, the settings that depend on cost are recomputed and checked by replay before use: T0 size, disclosure depth, prefetch, the curation budget, and triage weights. The structure itself (record, provenance, trust, domains, policy, perimeter) rests on correctness and auditability, and prices never move it.
 
-Why not go further and fix the economics on input tokens and turns? They look like physics, and partly they are: compute scales with what a model reads, and each turn re-reads the context unless it is cached. Three things argue against building the design on them.
+**Why not budget in tokens and turns?** They look like physics, and partly they are: compute scales with what a model reads, and each turn re-reads the context unless it is cached. Three things argue against building the design on them.
 
 - **Price has already left the physics.** Providers charge cached input at a tenth of fresh input or less, and output at several times input, so the same token costs different amounts depending on how it is read and produced. A design tuned to input tokens optimises the wrong quantity as soon as caching changes.
 - **The price moves fast.** The price of a fixed level of capability has fallen roughly tenfold a year, faster for some tasks [[14]](#ref-14), [[15]](#ref-15). Settings tuned to today's price are wrong within a year; settings recomputed from a price vector are not.
