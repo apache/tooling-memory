@@ -852,7 +852,7 @@ The design keeps prices out of its structure. Telemetry records raw quantities p
 
 When the price vector changes, the settings that depend on cost are recomputed and checked by replay before use: T0 size, disclosure depth, prefetch, the curation budget, and triage weights. The structure itself (record, provenance, trust, domains, policy, perimeter) rests on correctness and auditability, and prices never move it.
 
-**Why not budget in tokens and turns?** They look like physics, and partly they are: compute scales with what a model reads, and each turn re-reads the context unless it is cached. Three things argue against building the design on them.
+**Why not budget in number of tokens and turns?** They look like physics, and partly they are: compute scales with what a model reads, and each turn re-reads the context unless it is cached. Three things argue against building the design on them.
 
 - **Price has already left the physics.** Providers charge cached input at a tenth of fresh input or less, and output at several times input, so the same token costs different amounts depending on how it is read and produced. A design tuned to input tokens optimises the wrong quantity as soon as caching changes.
 - **The price moves fast.** The price of a fixed level of capability has fallen roughly tenfold a year, faster for some tasks [[14]](#ref-14), [[15]](#ref-15). Settings tuned to today's price are wrong within a year; settings recomputed from a price vector are not.
