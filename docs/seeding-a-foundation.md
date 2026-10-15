@@ -33,7 +33,7 @@ Each section below tests one part of [the paper](durable-memory-for-disposable-a
 
 **Why.** Memory, policy, and access are organised by domain ([paper §2](durable-memory-for-disposable-agents.md#2-the-design-at-a-glance)), so the domain map decides everything that follows.
 
-The Foundation already partitions work by project. The map starts with **one domain per top-level project or podling**, keyed by a permanent ID. The responsible committee and the project's name are attributes of the domain, so either can change. Foundation-level domains sit alongside: governance, infrastructure, legal, security, brand, and the Incubator.
+The Foundation already partitions work by project. The map starts with **one domain per top-level project or podling**, keyed by a permanent ID. The responsible committee and the project's name are attributes of the domain, so either can change. Foundation-level domains sit alongside: governance, infrastructure, tooling, legal, security, brand, and the Incubator.
 
 Each domain has a steward in [the paper's](durable-memory-for-disposable-agents.md) sense ([paper §5](durable-memory-for-disposable-agents.md#5-the-curator)), the party that answers for it and under whose policy curators work. The registry records who that is:
 
@@ -41,7 +41,7 @@ Each domain has a steward in [the paper's](durable-memory-for-disposable-agents.
 |---|---|
 | A top-level project | Its PMC (project management committee) |
 | A podling | Its podling PMC, under the Incubator PMC's oversight |
-| Infrastructure, legal, security, brand | The responsible officer and team |
+| Infrastructure, tooling, legal, security, brand | The responsible officer and team |
 | Governance | The board |
 
 ASF governance decides each stage of a project's life; the registry records the decision:
@@ -130,7 +130,7 @@ Backfill records both when a source was written and when it was imported, so a r
 
 **Finding: the stack must allow many L1s under one L0.** Each domain orders its own queue ([paper §8](durable-memory-for-disposable-agents.md#8-coordination)). Shared priorities can rank requests for common resources, but cannot commit another project's volunteers. A cross-project task needs each affected owner to accept it, a recorded commitment, and an escalation path.
 
-Each pilot also names a horizon scanner ([paper §7](durable-memory-for-disposable-agents.md#keeping-strategy-in-touch-with-the-world)), with time set aside to bring evidence from users and neighbouring projects into the community's discussions. The PMC records any resulting change to the rubric and when to check it. Foundation-wide resource conflicts go to the responsible officer or the board. These are the exchanges [the paper's](durable-memory-for-disposable-agents.md) [Viable System Model discussion](durable-memory-for-disposable-agents.md#13-related-work) says people must carry out.
+Each pilot also names a horizon scanner ([paper §7](durable-memory-for-disposable-agents.md#keeping-strategy-in-touch-with-the-world)), with time set aside to bring evidence from users and neighbouring projects into the community's discussions. The steward (a PMC, or the responsible officer for Foundation work) records any resulting change to the rubric and when to check it. Foundation-wide resource conflicts go to the responsible officer or the board. These are the exchanges [the paper's](durable-memory-for-disposable-agents.md) [Viable System Model discussion](durable-memory-for-disposable-agents.md#13-related-work) says people must carry out.
 
 ---
 
@@ -259,7 +259,7 @@ Start with current domain owners, approved source access, and a review budget. T
 
 Everything is indexed ahead of distillation, within the raw-reach limits of [§6](#6-trust-and-review), and failed searches decide what to distil next. Three choices are specific to the Foundation.
 
-- **One interface summary per pilot project, first.** What it is, its architecture in a paragraph, governance status, key contracts, where its decisions live. Its reviewers verify it, as [Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding) requires, before agents rely on it. More domains follow only after the pilots pass.
+- **One interface summary per pilot domain, first.** What it is, its architecture in a paragraph, governance status, key contracts, where its decisions live. Its reviewers verify it, as [Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding) requires, before agents rely on it. More domains follow only after the pilots pass.
 - **Golden suites come from users.** Questions asked on user lists and in issues, paired with the resolutions the archives record, become per-project evaluation suites, and committers review them. Questions the community struggled to answer form the stratum of past failures ([paper §11](durable-memory-for-disposable-agents.md#11-evaluating-change)).
 - **A dormant project's 2004 threads stay indexed and undistilled** until a real question needs them, under their retention policy.
 
@@ -273,11 +273,12 @@ GitHub issues, Jira, and Bugzilla are where work already arrives, and they stay 
 
 ### Pilots span the range
 
-Three pilots, deliberately different:
+Four pilots, deliberately different:
 
 - one large, fast-moving project with a formal proposal culture;
 - one mature, stable project with decades of history;
-- one podling, to test stewardship in incubation and the handover at graduation; its earlier history arrives through the ordinary import path.
+- one podling, to test stewardship in incubation and the handover at graduation; its earlier history arrives through the ordinary import path;
+- the Foundation's [Tooling initiative](https://tooling.apache.org/), which the Foundation supports directly instead of through a PMC. Its [core team of paid contractors works with volunteers](https://tooling.apache.org/team.html), and its products, such as Apache Trusted Releases, serve every PMC and podling. It tests a Foundation-level domain under an officer, review by paid staff and volunteers together, and a queue of requests from many projects.
 
 Before expanding, each pilot must show that memory pays on its own tasks, in paired runs with and without memory ([paper §11](durable-memory-for-disposable-agents.md#11-evaluating-change)). Success criteria and margins are fixed before the runs, both arms keep ordinary repository and tracker access, and evaluation questions are held out of curation, so a stored answer cannot pass for useful memory.
 
@@ -286,7 +287,7 @@ The pilot scorecard covers more than model tokens:
 | Check | Evidence required before expansion |
 |---|---|
 | **Useful answers** | Task success and cost per successful task, counting curation, infrastructure, and reviewer time; wrong answers and omitted dissent inspected |
-| **Volunteer capacity** | Review hours, queue age, and escalation response stay within limits the project agreed. Intake drops or promotions pause when review falls behind |
+| **Review capacity** | Review hours, queue age, and escalation response stay within limits the steward agreed. Intake drops or promotions pause when review falls behind |
 | **Trust and access** | Planted instructions, mistaken identity links, expired grants, roster revocation, and private metadata in public summaries all tested; an unresolved failure blocks expansion |
 | **Recovery** | A rebuild from a recovery bundle recovers pending tasks, rejects old claims, reconciles uncertain sends, and keeps later erasures erased |
 | **Local direction** | A strategy review changes the rubric in response to users; cross-project commitments have accepting owners and an escalation path |
@@ -303,7 +304,7 @@ Pilots start with public material. Restricted sources follow only after their ow
 | **Volunteer time is scarce** | Every review gate spends volunteer time. So: sampled review for the routine, batched digests, PMC-set strictness within shared policy, and curation intake sized to the review time available. The pilots measure whether subsidised recall pays reviewers back | Gates scale with impact (paper [§5](durable-memory-for-disposable-agents.md#5-the-curator), [§8](durable-memory-for-disposable-agents.md#8-coordination)) |
 | **Transparency applies to the memory too** | An institution that publishes its board minutes should expect its memory and policy to be public too. Query text, private-source citations, and individual usage are the exceptions, so telemetry gets its own access and retention rules | The read filter applies to every view ([paper §6](durable-memory-for-disposable-agents.md#6-retrieval-and-serving)) |
 | **The serving layer may lose funding** | The knowledge survives if someone keeps readable recovery bundles and the erasure journal, and entries still cite permalinks. Generated instruction stubs hold only pointers. An unfunded year loses freshness and review | The record test and the recovery drill ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)) |
-| **Tooling is contributed** | Foundation tooling comes from Infra, volunteer teams such as Whimsy, and projects. Each production component gets an operator and an adopted version, and generated skill pointers are checked against approved bundles at load time | The ownership test ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)), [Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding) |
+| **Tooling is contributed** | Foundation tooling comes from Infra, the Tooling initiative, volunteer teams such as Whimsy, and projects. Each production component gets an operator and an adopted version, and generated skill pointers are checked against approved bundles at load time | The ownership test ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)), [Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding) |
 | **Names move constantly** | Employers, usernames, and project names change; people and projects persist ([§3](#3-people-and-names)) | Dated identity ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)) |
 
 None of these needed a structural change to the design. Whether the result is affordable and workable is for the pilots to show.
@@ -315,7 +316,7 @@ None of these needed a structural change to the design. Whether the result is af
 These are deployment risks. The pilots are chosen to surface them early.
 
 - **Distilling culture.** Process norms distil from observable behaviour, but telling a norm from a habit takes judgment. Early distillations need heavier PMC review until faithfulness sampling shows they hold.
-- **Review capacity at scale.** Even three pilots need volunteers who have agreed to the work. Measure review time and decision delay before estimating capacity for more, and watch that sampling does not hide a growing backlog.
+- **Review capacity at scale.** Even four pilots need reviewers who have agreed to the work, and at three of them the reviewers are volunteers. Measure review time and decision delay before estimating capacity for more, and watch that sampling does not hide a growing backlog.
 - **Privacy beyond policy.** Aggregation changes what can be inferred from public archives. Test entries and generated answers for prohibited profiling, offer a route to correction and erasure, and keep sensitive queries out of public telemetry. Gates will miss some violations.
 - **Client support for sampling.** [MCP sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling) is a capability the client negotiates, and the client controls model access and approval. Where a client lacks it, public users get `search` and `get` and run the loop themselves. Measure usability and cost across clients.
 - **Planted material.** How often planted content reaches a curated tier, and how fast lineage finds what it touched, should be measured from the first pilot.
