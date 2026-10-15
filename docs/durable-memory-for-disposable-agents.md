@@ -42,7 +42,7 @@ Three constraints follow and shape the rest of the design.
 
 **The system must outlive its parts.** Over decades every model, tool, and vendor is replaced, and the organisation is redrawn many times. So everything of lasting value lives in plain-text data with provenance. Services and agents around it can be rebuilt or replaced without loss.
 
-**How to read this paper.** [§2](#2-the-design-at-a-glance) gives an overview. [§3](#3-memory) to [§12](#12-surviving-long-timescales) take one part each and add detail, always starting from why it exists. [§13](#13-related-work) places the design in related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full, and a glossary. A companion case study, *Seeding a Foundation*, applies the design to the Apache Software Foundation.
+**How to read this paper.** [§2](#2-the-design-at-a-glance) describes the whole design in two pages. [§3](#3-memory) to [§12](#12-surviving-long-timescales) take one part each and add detail, always starting from why it exists. [§13](#13-related-work) places the design in related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full, and a glossary. A companion case study, [*Seeding a Foundation*](seeding-a-foundation.md), applies the design to the Apache Software Foundation.
 
 ---
 
@@ -118,7 +118,7 @@ When a question is not answered below, reason from these.
 10. **Everything stays human-legible.** People are the only continuity at decade scale.
 11. **Evaluation is built in.** Everything a later replay needs is recorded while the task runs, and every layer, memory included, can be switched off to compare against running without it.
 
-The components are deliberately common: Markdown in a versioned store, lexical search, Open Policy Agent, OpenTelemetry. Over decades, unusual dependencies become liabilities. Vector search is allowed only as a derived layer.
+The components are deliberately common: Markdown in a versioned store, BM25 search (Lucene-family or Postgres), Open Policy Agent, OpenTelemetry. Over decades, unusual dependencies become liabilities. Vector search is allowed only as a derived layer.
 
 Terms are explained where first used; [Appendix F](#appendix-f-glossary) collects them.
 
@@ -942,18 +942,18 @@ The design combines recent agent-memory research with decades of systems practic
 | **Self-improvement** | Self-evolving harnesses (SEAGym [[67]](#ref-67)); offline distillation, online retrieval (EvolveR [[68]](#ref-68)); gated archives (Darwin Gödel Machine [[69]](#ref-69)); co-evolving evaluators [[70]](#ref-70); agents designed as code [[71]](#ref-71). This design adds human review, a manifest check, and a perimeter outside the loop |
 | **Long timescales** | Dated authorities (RFC 4151 [[11]](#ref-11)); names never reassigned (RFC 8141 [[72]](#ref-72)); stable internal IDs (SCIM [[73]](#ref-73)); issuer and subject (OpenID Connect [[12]](#ref-12)); identifiers free of organisational names [[13]](#ref-13) |
 
-**Organisational cybernetics.** Beer's Viable System Model [[74]](#ref-74), [[75]](#ref-75) names the functions an organisation needs to stay viable, and stresses the exchange between them and adaptation to a changing environment [[76]](#ref-76). The design supports these functions; each deployment must assign responsibility and test whether the exchanges work:
+**Organisational cybernetics.** Beer's Viable System Model [[74]](#ref-74), [[75]](#ref-75) names the functions an organisation needs to stay viable, and stresses the exchange between them and adaptation to a changing environment [[76]](#ref-76). It is a useful check on the design, and it shows where the design stops. The design supplies mechanisms; most of what makes an organisation viable comes from people the deployment appoints:
 
-| VSM | Function | Here |
-|---|---|---|
-| System 1 | Operations | [Operational units](#local-responsibility) and their workers |
-| System 2 | Coordination | The [task ledger](#a-tasks-life), capacity commitments, arbitration |
-| System 3 | Resources, here and now | Orchestrators and owners, within spend and throughput limits |
-| System 3* | Audit | [Auditors](#auditors) check curation; owners arrange wider checks on operational decisions and outcomes |
-| System 4 | Outside and ahead | The [horizon scanner](#keeping-strategy-in-touch-with-the-world) and strategy review |
-| System 5 | Identity | The [policy stack](#7-the-policy-stack), amended only by people |
+| VSM | Function | The design provides | The deployment supplies |
+|---|---|---|---|
+| System 1 | Operations | Domains, workers, handoffs | [Operational units](#local-responsibility) with accountable owners |
+| System 2 | Coordination | The [task ledger](#a-tasks-life), leases, capacity commitments | Arbiters for shared resources |
+| System 3 | Resources, here and now | Triage, spend and throughput limits | Owners who allocate budgets |
+| System 3* | Audit | [Auditors](#auditors) of curation, canary entries | Checks on operational decisions and outcomes |
+| System 4 | Outside and ahead | Vendor-drift probes; a record of proposals and outcomes | A [horizon scanner](#keeping-strategy-in-touch-with-the-world) and a strategy review |
+| System 5 | Identity | A versioned [policy stack](#7-the-policy-stack) | People who decide purpose and amend policy |
 
-Each operational unit needs the responsibilities and exchanges covered, at its own scale ([Local responsibility](#local-responsibility)); a hierarchy of queues alone does not establish viability. Capability gaps, canary alarms, and missed escalation bounds trigger warnings that reach someone able to act ([§9](#9-measurement)). Summaries and compiled filters reduce what reaches each reader (Ashby [[77]](#ref-77)); review capacity and response times must also be checked. The curation loop is feedback control on its own telemetry (Wiener [[78]](#ref-78)); the horizon scanner supplies what that loop cannot see.
+Beer's test is viability, and that depends on how well these functions exchange information, within every unit and at every level that contains one. The design can make those exchanges visible and measurable ([§9](#9-measurement)); people have to carry them out. Summaries and compiled filters reduce what each reader must absorb (Ashby [[77]](#ref-77)), and escalation bounds check that enough capacity to respond remains. Telemetry gives curation its feedback loop (Wiener [[78]](#ref-78)); the horizon scanner brings what that loop cannot see.
 
 **Less covered elsewhere**, and answered here from first principles: organisational change over decades, resilience to model churn, layered policy with expiring exceptions, and human legibility as the final backstop.
 
