@@ -1,12 +1,12 @@
 # Seeding a Foundation
 
-### The Apache Software Foundation as a test case for Durable Memory for Disposable Agents
+### The Apache Software Foundation as a test case for [Durable Memory for Disposable Agents](durable-memory-for-disposable-agents.md)
 
 Sander Striker · August 2026 · revised October 2026
 
 Written with Claude Fable 5 and Claude Opus 5 (Anthropic).
 
-*The Apache Software Foundation is a hard case for shared agent memory: more than two hundred projects, a quarter century of public archives, and a front door anyone can walk through. This case study maps the companion paper onto it, in enough detail to plan a deployment, and records what the Foundation taught the design.*
+*The Apache Software Foundation is a hard case for shared agent memory: more than two hundred projects, a quarter century of public archives, and a front door anyone can walk through. This case study maps the [companion paper](durable-memory-for-disposable-agents.md) onto it, in enough detail to plan a deployment, and records what the Foundation taught the design.*
 
 ---
 
@@ -16,14 +16,14 @@ The Foundation is a hard case for this design, which makes it a useful one.
 
 | Stress | Why it is hard |
 |---|---|
-| **Scale and age** | More than two hundred top-level projects and some thirty podlings in the Incubator, each with its own code, community, and conventions, and archives going back to the 1990s. No one can distil all of it, so the paper's two speeds (index everything, distil on demand) are not optional |
+| **Scale and age** | More than two hundred top-level projects and some thirty podlings in the Incubator, each with its own code, community, and conventions, and archives going back to the 1990s. No one can distil all of it, so the paper's two speeds (index everything, distil on demand; [paper Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding)) are not optional |
 | **Governance matters as much as code** | The Apache Way (merit, community over code, vendor neutrality, consensus) is what the Foundation exists to protect. A memory that captures code but garbles governance has failed |
 | **Radical transparency** | Nearly everything is public: lists, issues, reviews, board minutes, rosters. The hard question is what to distil from material that is public but personal |
 | **Open front door** | Anyone can post to a list, open an issue, or send a patch, so anyone can write into the raw tier |
-| **Constant churn** | Projects incubate, graduate, split, merge, and retire. Committers come and go over decades, and employers change while hats stay. The registry and the paper's churn rules are exercised all the time |
+| **Constant churn** | Projects incubate, graduate, split, merge, and retire. Committers come and go over decades, and employers change while hats stay. The registry and the paper's churn rules ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)) are exercised all the time |
 | **No central direction** | The Foundation does not set what projects build. Strategy is federated, which stresses the policy stack in a way a company would not |
 
-Each section below tests one part of the paper. [§10](#10-what-the-foundation-taught-the-design) collects what the Foundation taught the design.
+Each section below tests one part of [the paper](durable-memory-for-disposable-agents.md). [§10](#10-what-the-foundation-taught-the-design) collects what the Foundation taught the design.
 
 ---
 
@@ -64,10 +64,10 @@ stateDiagram-v2
 
 | Lifecycle event | Becomes |
 |---|---|
-| **Import** | The Incubator already practises the paper's quarantined import: IP clearance and software grants bring donated code and history in at low trust, and promotion follows review. The design adds only a memory of the process |
+| **Import** | The Incubator already practises the paper's quarantined import ([paper §12](durable-memory-for-disposable-agents.md#identity-when-the-organisation-changes)): IP clearance and software grants bring donated code and history in at low trust, and promotion follows review. The design adds only a memory of the process |
 | **Rename** | Usually during incubation, after the podling name search. The domain ID stays; the new name is a dated assertion ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)) |
 | **Graduation** | A registry update. The new PMC takes over a domain that already exists, seeded during incubation at raw and curated. Verified waits for the PMC that graduation creates |
-| **Split** | In 2021 Solr left Lucene to become its own top-level project: the paper's domain split, done by hand. Here it is a curator-assisted split with tombstone redirects, and the shared history stays as entries both domains cite |
+| **Split** | In 2021 Solr left Lucene to become its own top-level project: the paper's domain split ([paper §12](durable-memory-for-disposable-agents.md#identity-when-the-organisation-changes)), done by hand. Here it is a curator-assisted split with tombstone redirects, and the shared history stays as entries both domains cite |
 | **Merge** | The reverse, done lazily and only on real convergence, as when Lucene and Solr merged their development in 2010 |
 | **Orphaning** | The case the paper calls dangerous ([paper §12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales)). Today the board catches it through missed or thin quarterly reports. The ownership invariant flags the domain within days instead |
 | **Retirement** | The Attic already is an archive tier. The domain demotes: still indexed and citable, no longer curated, and its interface summary marked so agents stop treating its facts as live |
@@ -113,7 +113,7 @@ The archives stay the original record. The memory holds distilled entries that l
 
 ## 5. A policy stack for a federation
 
-**Why.** The paper's policy stack assumes one strategy layer. The Foundation has none at the centre, on purpose.
+**Why.** The paper's policy stack ([paper §7](durable-memory-for-disposable-agents.md#7-the-policy-stack)) assumes one strategy layer. The Foundation has none at the centre, on purpose.
 
 | Layer | At the Foundation |
 |---|---|
@@ -240,7 +240,7 @@ The Foundation's identity infrastructure is already real: Apache accounts, contr
 
 **Why.** Seeding is where a wrong or planted fact is cheapest to insert and hardest to find later. The plan keeps it on the ordinary, gated path of [Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding).
 
-The paper's plan applies as written: live taps first, then backfill through the same pipeline oldest first; everything indexed at once with permalink citations; distillation pulled by failed searches. Three choices are specific to the Foundation.
+The paper's plan ([Appendix B](durable-memory-for-disposable-agents.md#appendix-b-seeding)) applies as written: live taps first, then backfill through the same pipeline oldest first; everything indexed at once with permalink citations; distillation pulled by failed searches. Three choices are specific to the Foundation.
 
 - **One interface summary per project, first.** What it is, its architecture in a paragraph, governance status, key contracts, where its decisions live. A few hundred curated pages, reviewed by the PMCs they describe, give every domain a front door early.
 - **Golden suites come from users.** Questions asked on user lists and in issues, paired with the resolutions the archives record, become per-project evaluation suites, and committers review them. Questions the community struggled to answer form the stratum of past failures ([paper §11](durable-memory-for-disposable-agents.md#11-evaluating-change)).
