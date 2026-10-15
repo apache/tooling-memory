@@ -4,7 +4,7 @@
 
 Sander Striker · August 2026 · revised October 2026
 
-Written with Claude Fable 5, Claude Opus 5 (Anthropic), and GPT-6-Astra (OpenAI).
+Written with Claude Fable 5, Claude Opus 5 (Anthropic), and GPT-6 Astra (OpenAI).
 
 *Agent fleets need shared memory, and shared memory spreads mistakes and leaked secrets as easily as knowledge. It has to be cheap to read, safe to share, and outlast every model and tool it runs on. This paper proposes how.*
 
@@ -42,7 +42,7 @@ Three constraints follow and shape the rest of the design.
 
 **The system must outlive its parts.** Over decades every model, tool, and vendor is replaced, and the organisation is redrawn many times. So everything of lasting value lives in plain-text data with provenance. Services and agents around it can be rebuilt or replaced without loss.
 
-**How to read this paper.** [§2](#2-the-design-at-a-glance) describes the whole design in two pages. [§3](#3-memory) to [§12](#12-surviving-long-timescales) take one part each and add detail, always starting from why it exists. [§13](#13-related-work) places the design in related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full, and a glossary. A companion case study, [*Seeding a Foundation*](seeding-a-foundation.md), applies the design to the Apache Software Foundation.
+**How to read this paper.** [§2](#2-the-design-at-a-glance) gives an overview. [§3](#3-memory) to [§12](#12-surviving-long-timescales) take one part each and add detail, always starting from why it exists. [§13](#13-related-work) places the design in related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full, and a glossary. A companion case study, *Seeding a Foundation*, applies the design to the Apache Software Foundation.
 
 ---
 
@@ -65,7 +65,7 @@ flowchart TB
     SRV -->|"results out, within the destination's ceiling"| EXT
 ```
 
-Everything is partitioned into **domains**. A domain is an area of work with an owner, such as a product area, a project, or a person's own notes. Memory, tasks, policy, and access are all organised by domain. Domains serve **operational units**: the teams, of people and agents, accountable for a continuing area of work ([§8](#local-responsibility)).
+Everything is partitioned into **domains**. A domain is an area of work with an owner, such as a product area, a project, or a person's own notes. Memory, tasks, policy, and access are all organised by domain. Domains can serve **operational units**: the teams, of people and agents, accountable for a continuing area of work ([§8](#local-responsibility)).
 
 An agent is a model run by a **harness**, the program that gives it prompts, tools, and settings. An agent starts empty. It loads a small cached index of its domain (T0) and a digest of the policy that applies to it. It claims a task from the domain's ledger, reads what it needs through the retrieval service, does the work, and writes a handoff note before it ends. The next agent starts from that note.
 
@@ -118,7 +118,7 @@ When a question is not answered below, reason from these.
 10. **Everything stays human-legible.** People are the only continuity at decade scale.
 11. **Evaluation is built in.** Everything a later replay needs is recorded while the task runs, and every layer, memory included, can be switched off to compare against running without it.
 
-The components are deliberately common: Markdown in a versioned store, BM25 search (Lucene-family or Postgres), Open Policy Agent, OpenTelemetry. Over decades, unusual dependencies become liabilities. Vector search is allowed only as a derived layer.
+The components are deliberately common: Markdown in a versioned store, lexical search, Open Policy Agent, OpenTelemetry. Over decades, unusual dependencies become liabilities. Vector search is allowed only as a derived layer.
 
 Terms are explained where first used; [Appendix F](#appendix-f-glossary) collects them.
 
@@ -942,18 +942,18 @@ The design combines recent agent-memory research with decades of systems practic
 | **Self-improvement** | Self-evolving harnesses (SEAGym [[67]](#ref-67)); offline distillation, online retrieval (EvolveR [[68]](#ref-68)); gated archives (Darwin Gödel Machine [[69]](#ref-69)); co-evolving evaluators [[70]](#ref-70); agents designed as code [[71]](#ref-71). This design adds human review, a manifest check, and a perimeter outside the loop |
 | **Long timescales** | Dated authorities (RFC 4151 [[11]](#ref-11)); names never reassigned (RFC 8141 [[72]](#ref-72)); stable internal IDs (SCIM [[73]](#ref-73)); issuer and subject (OpenID Connect [[12]](#ref-12)); identifiers free of organisational names [[13]](#ref-13) |
 
-**Organisational cybernetics.** Beer's Viable System Model [[74]](#ref-74), [[75]](#ref-75) names the functions an organisation needs to stay viable, and stresses the exchange between them and adaptation to a changing environment [[76]](#ref-76). The design supplies the mechanisms; a deployment must assign the people:
+**Organisational cybernetics.** Beer's Viable System Model [[74]](#ref-74), [[75]](#ref-75) names the functions an organisation needs to stay viable, and stresses the exchange between them and adaptation to a changing environment [[76]](#ref-76). The design supports these functions; each deployment must assign responsibility and test whether the exchanges work:
 
 | VSM | Function | Here |
 |---|---|---|
 | System 1 | Operations | [Operational units](#local-responsibility) and their workers |
 | System 2 | Coordination | The [task ledger](#a-tasks-life), capacity commitments, arbitration |
 | System 3 | Resources, here and now | Orchestrators and owners, within spend and throughput limits |
-| System 3* | Audit | [Auditors](#auditors), canary entries, sampled review |
+| System 3* | Audit | [Auditors](#auditors) check curation; owners arrange wider checks on operational decisions and outcomes |
 | System 4 | Outside and ahead | The [horizon scanner](#keeping-strategy-in-touch-with-the-world) and strategy review |
 | System 5 | Identity | The [policy stack](#7-the-policy-stack), amended only by people |
 
-The pattern recurs from feature to institution ([Across domains](#across-domains)), and capability gaps, canary alarms, and missed escalation bounds are its algedonic signals. Summaries and compiled filters cut what reaches each reader to what it can absorb (Ashby [[77]](#ref-77)), and escalation bounds check that enough capacity to respond remains. The curation loop is feedback control on its own telemetry (Wiener [[78]](#ref-78)); the horizon scanner supplies what that loop cannot see.
+Each operational unit needs the responsibilities and exchanges covered, at its own scale ([Local responsibility](#local-responsibility)); a hierarchy of queues alone does not establish viability. Capability gaps, canary alarms, and missed escalation bounds trigger warnings that reach someone able to act ([§9](#9-measurement)). Summaries and compiled filters reduce what reaches each reader (Ashby [[77]](#ref-77)); review capacity and response times must also be checked. The curation loop is feedback control on its own telemetry (Wiener [[78]](#ref-78)); the horizon scanner supplies what that loop cannot see.
 
 **Less covered elsewhere**, and answered here from first principles: organisational change over decades, resilience to model churn, layered policy with expiring exceptions, and human legibility as the final backstop.
 
