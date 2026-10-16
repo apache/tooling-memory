@@ -191,8 +191,12 @@ unpacked from `chrome://extensions`) that fetches for a session with the browser
 logins. A `[taps.fetch]` grant with `browser = true` sends that tool's fetches there, so a
 page you are signed in to answers the session as it would answer you, and no credential
 goes into a grant. The policy still decides every URL before the browser is asked and
-every URL that answered before anything is kept; the page shows whether the companion is
-connected. It works only while `amem` runs with the page open in that browser.
+every URL that answered before anything is kept, and the extension holds its requests to
+the session's hosts with the browser's own request rules, so a redirect elsewhere is
+stopped before it is made. A fetch with `render` opens the page in a tab instead and
+reads it as its scripts built it, for a page that is empty without them; the page shows
+whether the companion is connected. It works only while `amem` runs with the page open in
+that browser.
 
 A profile names the flags of a launch, so the name is the whole command. Every harness
 is one, `amem claude`, and `profiles.toml` adds more:

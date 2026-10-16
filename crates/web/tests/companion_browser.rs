@@ -36,8 +36,37 @@ async fn serve(app: Router) -> SocketAddr {
     addr
 }
 
+/// Requests the site answered under the name `localhost`, where a redirect and a page's
+/// script send the browser: a request the companion must stop before it is made.
+static ELSEWHERE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn who(headers: &HeaderMap) -> String {
+    let cookie = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    cookie
+        .split(';')
+        .map(str::trim)
+        .find_map(|c| c.strip_prefix("session="))
+        .unwrap_or("nobody")
+        .to_string()
+}
+
+fn port_of(headers: &HeaderMap) -> String {
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if host.starts_with("localhost") {
+        ELSEWHERE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    host.rsplit(':').next().unwrap_or("80").to_string()
+}
+
 /// A site with a sign-in that sets a cookie and sends the browser on to `next`, a page
-/// that says who is signed in, and a redirect to the same server under another name.
+/// that says who is signed in, a page that says so only once its script has run, a
+/// redirect to the same server under another name, and a page whose script goes there.
 async fn site() -> SocketAddr {
     async fn login(
         axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -48,32 +77,40 @@ async fn site() -> SocketAddr {
         )
     }
     async fn page(headers: HeaderMap) -> Html<String> {
-        let cookie = headers
-            .get("cookie")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        let who = cookie
-            .split(';')
-            .map(str::trim)
-            .find_map(|c| c.strip_prefix("session="))
-            .unwrap_or("nobody");
+        let who = who(&headers);
+        port_of(&headers);
         Html(format!(
             "<html><head><title>Account</title></head><body><p>Signed in as {who}.</p></body></html>"
         ))
     }
+    // the page is a shell until its script runs, which only a browser does
+    async fn app(headers: HeaderMap) -> Html<String> {
+        let who = who(&headers);
+        Html(format!(
+            "<html><head><title>Shell</title></head><body><p id=\"out\">loading</p>\
+             <script>setTimeout(function () {{ document.title = 'Built'; \
+             document.getElementById('out').textContent = 'Built by script for {who}.'; }}, 200);</script>\
+             </body></html>"
+        ))
+    }
     async fn away(headers: HeaderMap) -> Redirect {
-        let host = headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        let port = host.rsplit(':').next().unwrap_or("80");
+        let port = port_of(&headers);
         Redirect::temporary(&format!("http://localhost:{port}/page"))
+    }
+    async fn leave(headers: HeaderMap) -> Html<String> {
+        let port = port_of(&headers);
+        Html(format!(
+            "<html><head><title>Leaving</title></head><body>\
+             <script>location.href = 'http://localhost:{port}/page';</script></body></html>"
+        ))
     }
     serve(
         Router::new()
             .route("/login", get(login))
             .route("/page", get(page))
-            .route("/away", get(away)),
+            .route("/app", get(app))
+            .route("/away", get(away))
+            .route("/leave", get(leave)),
     )
     .await
 }
@@ -160,6 +197,27 @@ async fn ask(addr: SocketAddr, url: &str, hosts: &[&str]) -> Value {
     let (status, body) = http(addr, "POST", dm_web::companion::FETCH_PATH, &body).await;
     assert_eq!(status, 200, "{body}");
     serde_json::from_str(&body).unwrap()
+}
+
+/// An ask to render: the page opened in a tab and read as its scripts built it.
+async fn render(addr: SocketAddr, url: &str, hosts: &[&str]) -> Value {
+    let body =
+        json!({"url": url, "hosts": hosts, "max_bytes": 100_000, "render": true}).to_string();
+    let (status, body) = http(addr, "POST", dm_web::companion::FETCH_PATH, &body).await;
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// The extension's version, as its manifest says.
+fn version() -> String {
+    let manifest = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("companion/manifest.json"),
+    )
+    .unwrap();
+    serde_json::from_str::<Value>(&manifest).unwrap()["version"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 /// Chrome, stopped when the test is done with it.
@@ -253,7 +311,7 @@ async fn connected(web: SocketAddr, chrome: &Browser) {
         assert_eq!(status, 200, "{body}");
         let shown: Value = serde_json::from_str(&body).unwrap();
         // the socket is up before the hello that names the version lands: wait for both
-        if shown["connected"] == true && shown["version"] == "0.1.0" {
+        if shown["connected"] == true && shown["version"] == version() {
             return;
         }
         assert!(
@@ -263,6 +321,46 @@ async fn connected(web: SocketAddr, chrome: &Browser) {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// Rendered: a page that is a shell until its script runs is opened in a tab, signed in,
+/// and read as built; a page whose script leaves the hosts is stopped at the navigation.
+async fn rendered(web: SocketAddr, site: SocketAddr, chrome: &Browser) {
+    // rendered: the page is opened in a tab, signed in, and read once its script built it
+    let app = format!("http://127.0.0.1:{}/app", site.port());
+    let built = render(web, &app, &["127.0.0.1"]).await;
+    assert_eq!(built["status"], 200, "{built}\n{}", chrome.log());
+    assert_eq!(built["final_url"], app, "{built}");
+    assert_eq!(built["rendered"], true, "{built}");
+    let body = built["body"].as_str().unwrap();
+    assert!(
+        body.contains("Built by script for owner-42.") && body.contains("<title>Built</title>"),
+        "the page was not read as its script built it: {built}"
+    );
+    assert!(built["content_type"]
+        .as_str()
+        .unwrap()
+        .starts_with("text/html"));
+
+    // a rendered page whose script leaves the hosts is stopped at the navigation
+    let left = render(
+        web,
+        &format!("http://127.0.0.1:{}/leave", site.port()),
+        &["127.0.0.1"],
+    )
+    .await;
+    let why = left["error"].as_str().unwrap();
+    assert!(
+        why.contains("may not reach") && why.contains("stopped before it was fetched"),
+        "{left}\n{}",
+        chrome.log()
+    );
+    assert!(left.get("body").is_none(), "{left}");
+    assert_eq!(
+        ELSEWHERE.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the tab left the hosts"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -319,16 +417,19 @@ async fn the_companion_fetches_with_the_browser_s_cookies_and_only_where_the_ask
         "{refused}"
     );
 
-    // a redirect to a host off them is reported and not read
+    // a redirect to a host off them is stopped before it is made: the site never hears
+    // the request, and the refusal says where it was going
     let away = ask(
         web,
         &format!("http://127.0.0.1:{}/away", site.port()),
         &["127.0.0.1"],
     )
     .await;
+    let why = away["error"].as_str().unwrap();
     assert!(
-        away["error"].as_str().unwrap().contains("may not reach"),
-        "{away}"
+        why.contains("may not reach") && why.contains("stopped before it was fetched"),
+        "{away}\n{}",
+        chrome.log()
     );
     assert!(
         away["final_url"]
@@ -338,6 +439,13 @@ async fn the_companion_fetches_with_the_browser_s_cookies_and_only_where_the_ask
         "{away}"
     );
     assert!(away.get("body").is_none(), "{away}");
+    assert_eq!(
+        ELSEWHERE.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the redirect was followed"
+    );
+
+    rendered(web, site, &chrome).await;
 
     // the cap holds
     let capped = {

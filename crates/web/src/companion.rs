@@ -8,9 +8,12 @@
 //! handed it over the window. The launcher asks for a fetch at [`FETCH_PATH`] with the
 //! token, which no page holds: a page's key cannot drive the browser's cookies anywhere.
 //! The ask carries the URL, which the memory server has already decided by its policy,
-//! and the hosts the session may reach, which the extension refuses to go outside; the
-//! answer carries the URL that answered, which the memory server decides again before
-//! anything is kept. The page shows the companion at [`STATUS_PATH`].
+//! and the hosts the session may reach, which the extension holds its requests to with
+//! the browser's own request rules, so a redirect elsewhere is stopped before it is
+//! made; the answer carries the URL that answered, which the memory server decides again
+//! before anything is kept. An ask may say `render`: the page is then opened in a tab
+//! of the browser and read as its scripts built it, the tab held to the same hosts. The
+//! page shows the companion at [`STATUS_PATH`].
 //!
 //! The extension itself is `crates/web/companion`, loaded unpacked from there; one
 //! browser connects at a time, the newest.
@@ -53,6 +56,10 @@ pub struct Ask {
     /// How much of the body to read.
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
+    /// Whether to open the page in a tab and read the document as the page built it,
+    /// rather than fetch its bytes: for a page that is nothing without its scripts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub render: bool,
 }
 
 fn default_max_bytes() -> usize {
@@ -280,7 +287,18 @@ mod tests {
             url: "https://a.example/p".into(),
             hosts: vec!["a.example".into()],
             max_bytes: 10,
+            render: false,
         };
+        // an ask says `render` only when it does; one that does not say is a fetch
+        let plain: Ask = serde_json::from_str(r#"{"url":"https://a.example/p"}"#).unwrap();
+        assert!(!plain.render && plain.max_bytes == 2_000_000);
+        assert!(!serde_json::to_string(&plain).unwrap().contains("render"));
+        let rendered: Ask =
+            serde_json::from_str(r#"{"url":"https://a.example/p","render":true}"#).unwrap();
+        assert!(rendered.render);
+        assert!(serde_json::to_string(&rendered)
+            .unwrap()
+            .contains("\"render\":true"));
         assert_eq!(c.ask(&ask).await, Err(Refusal::NotConnected));
         assert!(!c.status().connected);
 
@@ -309,6 +327,7 @@ mod tests {
             url: "https://a.example/q".into(),
             hosts: vec![],
             max_bytes: 1,
+            render: false,
         };
         let asking = tokio::spawn(async move { c2.ask(&ask2).await });
         let sent: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
@@ -332,6 +351,7 @@ mod tests {
             url: "https://a.example/r".into(),
             hosts: vec![],
             max_bytes: 1,
+            render: false,
         };
         let asking = tokio::spawn(async move { c2.ask(&ask3).await });
         rx.recv().await.unwrap();

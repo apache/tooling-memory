@@ -6,13 +6,19 @@
 //! The browser is the third host of fetch, beside the component and the tool server,
 //! and the guarantees stay where they are: the policy decides the URL at the session's
 //! label before the browser is asked, as the tap host decides a request before it
-//! leaves; the ask carries the hosts the session may reach, which the extension does
-//! not go outside; the URL that answered is decided again before anything is kept;
-//! and the answer is shaped by [`dm_fetch::answer`], the same as the other two hosts',
-//! then scanned and kept as a source observed by `browser`. What the browser does not
-//! give is the path between: the hops of a redirect are the browser's, so the answer
-//! names where it started and where it ended, and the call goes to the web launcher on
-//! loopback, not through the egress, so it is not metered there.
+//! leaves; the ask carries the hosts the session may reach, which the extension holds
+//! its requests to with the browser's own request rules, so a redirect elsewhere is
+//! stopped before it is made and the refusal says where it was going; the URL that
+//! answered is decided again before anything is kept; and the answer is shaped by
+//! [`dm_fetch::answer`], the same as the other two hosts', then scanned and kept as a
+//! source observed by `browser`. The hops between are the browser's, so the answer
+//! names where it started and where it ended, not each step; and the call goes to the
+//! web launcher on loopback, not through the egress, so it is not metered there.
+//!
+//! An argument `render` has the browser open the page in a tab and read the document as
+//! its scripts built it, for a page that is nothing without them; the tab is held to the
+//! same hosts and closed when read. Only the browser renders: the other hosts refuse the
+//! argument in [`crate::taps`].
 //!
 //! The way in is the running web launcher over this root, found as `amem` finds it,
 //! by `state/web.json` and the nonce it must answer under the token; the ask is a
@@ -170,7 +176,7 @@ pub async fn call(
         .map_err(|why| format!("request to {}: refused: {why}", args.url))?;
     let hosts = memory.fetch_hosts(tool);
     let (addr, token) = launcher(memory.root()).await?;
-    let ask = json!({ "url": args.url, "hosts": hosts, "max_bytes": config.max_bytes });
+    let ask = json!({ "url": args.url, "hosts": hosts, "max_bytes": config.max_bytes, "render": args.render });
     let (status, body) = post(
         addr,
         dm_web::companion::FETCH_PATH,

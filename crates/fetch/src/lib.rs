@@ -67,6 +67,11 @@ impl Config {
 pub struct Args {
     /// The page.
     pub url: String,
+    /// Whether the page is to be rendered first, opened in the owner's browser and read
+    /// as its scripts built it. Only a fetch the browser runs (`browser = true`) can;
+    /// the other hosts refuse it rather than fetch the bytes and call them rendered.
+    #[serde(default)]
+    pub render: bool,
 }
 
 impl Args {

@@ -164,6 +164,11 @@ impl TapTools {
     }
 }
 
+/// Whether the arguments ask for the page rendered, which only the browser does.
+fn wants_render(args: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(args).is_ok_and(|v| v["render"] == true)
+}
+
 /// How long one tool call may take, and the memory its component may grow to.
 const TOOL_LIMITS: dm_taps::Limits = dm_taps::Limits {
     wall: std::time::Duration::from_secs(60),
@@ -190,6 +195,11 @@ impl dm_server::sources::Tools for TapTools {
             // the owner's browser: it fetches, this side decides before and after
             if grant.browser {
                 return crate::browser::call(memory, &tool, &config, &args).await;
+            }
+            if wants_render(&args) {
+                return Err(format!(
+                    "render: only a fetch the owner's browser runs renders a page; [taps.{tool}] does not say browser = true"
+                ));
             }
             if let Some(egress) = egress {
                 return crate::hosted::call(&egress?, memory, &tool, &config, &args).await;

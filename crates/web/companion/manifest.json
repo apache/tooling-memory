@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "amem companion",
-  "version": "0.1.0",
-  "description": "Fetches pages for an amem session with this browser's own logins, beside the amem page on this machine. Asks come from amem's own launcher; it reaches only the hosts an ask names.",
-  "permissions": ["storage", "alarms", "scripting"],
+  "version": "0.2.0",
+  "description": "Fetches pages for an amem session with this browser's own logins, beside the amem page on this machine. Asks come from amem's own launcher; it reaches only the hosts an ask names, and a redirect elsewhere is stopped before it is made.",
+  "permissions": ["storage", "alarms", "scripting", "tabs", "declarativeNetRequest", "webRequest"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [

@@ -141,6 +141,11 @@ pub struct GetParams {
 pub struct FetchParams {
     /// An https URL.
     pub url: String,
+    /// `true` to have the owner's browser open the page and read it as its scripts
+    /// built it, for a page that is empty without them. Only a fetch the browser runs
+    /// can; leave it out otherwise.
+    #[serde(default)]
+    pub render: Option<bool>,
 }
 
 /// Parameters of `gofannon`.
@@ -592,11 +597,11 @@ impl McpServer {
         description = "Fetch a web page as text, through the memory server: every request, each redirect included, is checked against the policy, the page is scanned and kept as a source, and an answer that carries instructions is held for the owner, not served. Cite what you use as its `cite_as`, `source:<id>`. What you have read from memory limits where you may fetch: a URL carries data out."
     )]
     async fn fetch(&self, p: Parameters<FetchParams>) -> Result<CallToolResult, McpError> {
-        let v = self
-            .memory
-            .use_tool("fetch", json!({ "url": p.0.url }))
-            .await
-            .map_err(mcp_err)?;
+        let mut args = json!({ "url": p.0.url });
+        if p.0.render == Some(true) {
+            args["render"] = json!(true);
+        }
+        let v = self.memory.use_tool("fetch", args).await.map_err(mcp_err)?;
         ok(v)
     }
 

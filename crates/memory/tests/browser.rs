@@ -171,8 +171,12 @@ async fn connected(addr: SocketAddr) -> bool {
 }
 
 async fn fetch(root: &Path, url: &str) -> Output {
+    fetch_with(root, json!({"url": url})).await
+}
+
+async fn fetch_with(root: &Path, args: Value) -> Output {
     let root = root.to_path_buf();
-    let args = json!({"url": url}).to_string();
+    let args = args.to_string();
     tokio::task::spawn_blocking(move || {
         amem(&root).args(["tool", "fetch", &args]).output().unwrap()
     })
@@ -234,18 +238,63 @@ async fn a_browser_fetch_is_decided_before_and_after_and_kept_as_the_browser_s()
     assert_eq!(again["source"], answer["source"]);
     assert_eq!(asks.lock().unwrap().len(), 1);
 
+    // asked rendered, the ask says so, and what comes back is a source of its own
+    let built: Value = serde_json::from_str(&ok(&fetch_with(
+        &root,
+        json!({"url": page, "render": true}),
+    )
+    .await))
+    .unwrap();
+    assert_eq!(built["cached"], false, "{built}");
+    assert_ne!(built["source"], answer["source"]);
+    assert_eq!(asks.lock().unwrap().len(), 2);
+    assert_eq!(asks.lock().unwrap()[1]["render"], true, "{asks:?}");
+
     // a URL off the grant is refused here: the browser never hears of it
     let why = failed(&fetch(&root, "https://other.example/x").await);
     assert!(why.contains("refused"), "{why}");
-    assert_eq!(asks.lock().unwrap().len(), 1, "the browser was asked");
+    assert_eq!(asks.lock().unwrap().len(), 2, "the browser was asked");
 
     // an answer from a host the session may not reach is not believed, and not kept
     let why = failed(&fetch(&root, "http://127.0.0.1:9/away").await);
     assert!(why.contains("may not reach"), "{why}");
-    assert_eq!(asks.lock().unwrap().len(), 2);
+    assert_eq!(asks.lock().unwrap().len(), 3);
     let sources: Value =
         serde_json::from_str(&ok(&amem(&root).args(["source", "list"]).output().unwrap())).unwrap();
     let sources = sources.as_array().unwrap();
-    assert_eq!(sources.len(), 1, "{sources:?}");
-    assert_eq!(sources[0]["id"], answer["source"]);
+    assert_eq!(sources.len(), 2, "{sources:?}");
+    assert!(sources.iter().any(|s| s["id"] == answer["source"]));
+    assert!(sources.iter().any(|s| s["id"] == built["source"]));
+}
+
+/// Only the browser renders: a fetch the launcher or a tool server runs refuses the
+/// argument rather than fetch the bytes and call them rendered.
+#[tokio::test]
+async fn only_the_browser_renders() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("memory");
+    ok(&amem(&root)
+        .args(["init", "--owner", "human:test:me", "--domain", "dom-me"])
+        .output()
+        .unwrap());
+    let mut g = std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("grants.toml"))
+        .unwrap();
+    write!(
+        g,
+        "\n[taps.fetch]\ndomain = \"dom-me\"\ntool = true\nceiling = \"public\"\nhosts = [\"127.0.0.1\"]\nloopback = true\n"
+    )
+    .unwrap();
+    let why = failed(
+        &fetch_with(
+            &root,
+            json!({"url": "http://127.0.0.1:9/page", "render": true}),
+        )
+        .await,
+    );
+    assert!(
+        why.contains("only a fetch the owner's browser runs renders"),
+        "{why}"
+    );
 }
