@@ -287,7 +287,8 @@ record a second domain, the platform's, so run the acts in order on a fresh reco
 act and each step opens with a rule, a number and a sentence on what it shows;
 `TRANSCRIPT=demo.txt` also writes the whole run there as plain text, to read back with
 [docs/demo-narrative.md](docs/demo-narrative.md), the presenter's cues and a handout
-keyed to the step numbers. `DEMO_FROM` is `docs` by default: the record is seeded from `docs/` alone.
+keyed to the step numbers. `DEMO_FROM` is `examples/decisions docs` by default: a small
+fictional decision register, which the demo and the evaluation set ask about, and the papers.
 
 `make demo-ready HARNESS=claude` gets it to a state it can run first: it seeds the
 record when there is none (`RESET=1` starts a demo record over), builds the harness

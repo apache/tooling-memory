@@ -830,7 +830,7 @@ hand it is:
 
 ```sh
 amem --root ~/memory-demo init --owner human:asf:you --domain dom-demo
-scripts/seed-corpus.py --root ~/memory-demo --memory target/release/amem docs
+scripts/seed-corpus.py --root ~/memory-demo --memory target/release/amem examples/decisions docs
 amem --root ~/memory-demo task create "Answer: what did DR-19 decide, and why?" \
   --body "Search the record, open only what you need, answer in a handoff with the entry ids you cite, then complete." --priority 5
 amem --root ~/memory-demo task admit task-demo-xxxxxxxx

@@ -127,7 +127,7 @@ work: build
 # The weekend demo in a record of its own: DEMO_ROOT (default ~/memory-demo) seeded from
 # DEMO_FROM (Markdown directories), one task worked by the harness, the savings measured.
 DEMO_ROOT ?= $(HOME)/memory-demo
-DEMO_FROM ?= docs
+DEMO_FROM ?= examples/decisions docs
 demo: build
 	@test -n "$(HARNESS)" || { echo "HARNESS= is required: claude, codex, gemini, antigravity, qwen, grok, muse, pi, copilot or opencode" >&2; exit 2; }
 	@set -a; [ -f $(LOCAL_ENV) ] && . ./$(LOCAL_ENV); set +a; \
