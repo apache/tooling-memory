@@ -1,6 +1,6 @@
-# The harness image: built and published when its inputs change, and weekly regardless so
-# base-image and apt security updates are taken; pins are bumped by a daily check that
-# opens a pull request. Never on a run: `memory launch` uses the tag it is given.
+# The harness image: built when its inputs change, to show the Dockerfile still builds, and
+# never published; machines build their own with `make image`. Pins are bumped by a daily
+# check that opens a pull request. Never on a run: `memory launch` uses the tag it is given.
 name: image
 
 on:
@@ -8,20 +8,18 @@ on:
     branches: [main]
     paths: ["images/harness/**", "crates/**", "Cargo.*", ".github/workflows/image.yml"]
   schedule:
-    - cron: "17 4 * * 1"   # weekly rebuild, Monday 04:17 UTC: base image and apt updates
     - cron: "41 5 * * *"   # daily pin check
   workflow_dispatch:
 
 permissions:
   contents: write
-  packages: write
   pull-requests: write
 
 jobs:
   # Daily: bump the pins and open (or update) a pull request. CI runs on it like any PR
   # once a person approves the workflow run, since it is opened with the workflow token.
   bump:
-    if: github.event_name == 'schedule' && github.event.schedule == '41 5 * * *'
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,13 +45,13 @@ jobs:
           git push -f origin bot/harness-pins
           gh pr create --fill --base main --head bot/harness-pins \
             --title "image: bump harness pins" \
-            --body "$(printf 'Daily pin check.\n\n%s\n\nMerging builds and publishes the image.' "${{ steps.bump.outputs.changes }}")" \
+            --body "$(printf 'Daily pin check.\n\n%s' "${{ steps.bump.outputs.changes }}")" \
             || gh pr edit bot/harness-pins --body "$(printf 'Daily pin check.\n\n%s' "${{ steps.bump.outputs.changes }}")"
 
-  # On a change to the inputs, and weekly: build with the release binary and publish to
-  # GHCR, tagged by commit and as latest. The digest is what machines should run.
+  # On a change to the inputs: build with the release binary, to show the image still
+  # builds. Nothing is pushed.
   build:
-    if: github.event_name != 'schedule' || github.event.schedule == '17 4 * * 1'
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -63,15 +61,5 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build the memory binary
         run: cargo build --release --locked -p amem && cp target/release/amem images/harness/memory
-      - name: Log in to GHCR
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Build and publish
-        run: |
-          repo="ghcr.io/${{ github.repository }}/harness"
-          docker build --pull -t "$repo:${{ github.sha }}" -t "$repo:latest" images/harness
-          docker push "$repo:${{ github.sha }}"
-          docker push "$repo:latest"
-          docker inspect --format='{{index .RepoDigests 0}}' "$repo:latest" | tee images/harness/digest
-      - name: Summarise
-        run: |
-          { echo "## Harness image"; echo; echo '```'; cat images/harness/digest; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the image
+        run: docker build --pull -t harness:${{ github.sha }} images/harness
