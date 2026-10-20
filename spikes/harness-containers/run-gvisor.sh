@@ -47,6 +47,6 @@ c["mounts"] += [
 json.dump(c, open(path, "w"), indent=1)
 EOF
 # shellcheck disable=SC2086 # RUNSC_FLAGS is a list of flags
-"$runsc" --rootless --network=none --host-uds=open --ignore-cgroups --root="$FIX/state" $RUNSC_FLAGS \
+"$runsc" --rootless --network=none --host-uds=open --ignore-cgroups --root="$FIX/state" ${RUNSC_FLAGS:-} \
     run --bundle "$FIX/bundle" "contract-$$"
 echo "exit=$?"

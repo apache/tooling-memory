@@ -34,9 +34,9 @@ surfaced on the way:
 | Fix | Add `.github/dependabot.yml` | None exists; see the image section |
 | Adopt | `seccompiler` (Apache-2.0 OR BSD-3) and `landlock` (MIT OR Apache-2.0) in `crates/sandbox`, with Codex's seccomp rule set as the reference | The first fix, as libraries, from the rule set three harnesses already use |
 | Adopt | gVisor as an optional hardened Linux backend | Passed every check here, rootless, no KVM, no daemon; the Node harnesses run under it |
-| Adopt | An npm lockfile and a digest-pinned base for `images/harness`, bumped by Dependabot | Pins what the harnesses pull in, which floats today, and retires `scripts/bump-harness-versions.sh` |
+| Adopt | An npm lockfile and a digest-pinned base for `images/harness`, bumped by Dependabot | Built here at no cost in size or time; pins what the harnesses pull in and the base, and retires `scripts/bump-harness-versions.sh`. pi needs a lock of its own |
 | Spike further | microsandbox, as one backend for Linux, macOS and Windows | The only candidate that could; see its section for what held here and what did not |
-| Target | kubernetes-sigs/agent-sandbox and Agent Substrate for the institutional shape | Where a fleet would launch the harness; neither replaces the laptop launcher |
+| Target | kubernetes-sigs/agent-sandbox for the institutional shape, Agent Substrate later | On kind, the egress as a sidecar and our backend inside the harness container, under a seccomp profile that allows `unshare`, passed every check; neither replaces the laptop launcher |
 
 ## The contract any replacement has to hold
 
@@ -90,6 +90,23 @@ the marker invisible). Linux on WSL2, kernel 6.18.40, x86_64.
 The harness smoke test, `harness-smoke.sh`, runs Claude Code 2.1.296, Codex 0.162.1 and Gemini
 CLI 0.63.0 from one Node rootfs: all three start under podman and under gVisor, and Claude
 Code's calls reach the stand-in egress through a loopback relay under both.
+
+What gVisor costs, from `bench-compare.sh` on the same rootfs, median of three interleaved
+rounds on a quiet machine, runc in milliseconds and gVisor as a multiple of it:
+
+| Task | runc | gVisor | gVisor, mounts cached |
+|---|---|---|---|
+| Node start, 20 times | 666 ms | 3.2x | 3.1x |
+| `claude --version`, 5 times | 74 ms | 3.7x | 3.5x |
+| 10,000 small files written, read and removed in the working tree | 899 ms | 6.2x | 6.1x |
+| the same in `/tmp` | 425 ms | 3.2x | 3.2x |
+| copy a `node_modules` tree in `/tmp` | 138 ms | 2.1x | 2.0x |
+| a CPU loop in Node | 1,283 ms | 1.1x | 1.1x |
+
+Caching the mounts (`--file-access-mounts=exclusive`, safe only if nothing on the host edits
+the tree during the session) changes nothing, so the cost is the syscall interception of the
+`systrap` platform, not revalidation. What that adds to a real session, most of which is
+spent waiting on the model, was not measured. gVisor's `kvm` platform, which intercepts more cheaply, was not measured.
 
 ## Three gaps in our own code
 
@@ -180,12 +197,31 @@ did. It is beta ("expect breaking changes"), keeps state in a SQLite database un
 
 | Option | Licence | Verdict | Why |
 |---|---|---|---|
-| Keep the Dockerfile; add `package.json` and `package-lock.json` for the harnesses, `npm ci`; `FROM ubuntu:24.04@sha256:...`; Dependabot for npm, docker and github-actions | Dependabot MIT | **adopt** | Today only the harnesses' own versions are pinned and everything they pull in floats; the lockfile pins it with integrity hashes. Retires `bump-harness-versions.sh`. Muse Code stays a script step |
-| numtide/llm-agents.nix with nix2container | MIT; Apache-2.0 | **spike** | The only source packaging all nine of our harnesses, hash-pinned, bumped daily, one `flake.lock`; Nix itself is LGPL-2.1 and would enter the build |
+| Keep the Dockerfile; add `package.json` and `package-lock.json` for the harnesses, `npm ci`; `FROM ubuntu:24.04@sha256:...`; Dependabot for npm, docker and github-actions | Dependabot MIT | **adopt** | Built: same size and build time as today, every package pinned with an integrity hash, and the base by digest. Retires `bump-harness-versions.sh`. pi needs a lock of its own, and Muse Code stays a script step |
+| numtide/llm-agents.nix with nix2container | MIT; Apache-2.0 | **learn from** | Built: all nine harnesses, reproducible to the image id, Muse Code pinned by hash. But a third larger, ahead of our pins on eight of nine (taking numtide's versions, or overriding each), 281 of 288 store paths from numtide's cache, and Nix itself (LGPL-2.1) in the build |
 | Docker's sandbox kit spec and kits | Apache-2.0 (the `sbx` tool is proprietary) | **borrow** | Per-harness credential and allowlist declarations; their harness versions float |
 | apko and melange (Wolfi) | Apache-2.0 | learn from | Wolfi packages only Codex and Node of our set |
 | Dev Container Features and CLI | MIT | reject | The lock pins the feature, not the tool it installs; Anthropic's feature has no version option; no WSL containers driver |
 | Anthropic's Claude Code devcontainer | all rights reserved | out | Also keeps a network and needs `NET_ADMIN` |
+
+All three were built and run through the contract check and the harness smoke under podman
+on 20 October (`spikes/harness-containers/image-lockfile/`, `image-nix/`); each passed as the
+podman baseline does, failing only the vsock check, which is the runtime's, not the image's:
+
+| Image | Build | Size | Pinned | Versions |
+|---|---|---|---|---|
+| today's Dockerfile | 320 s | 3.15 GB | the 7 npm harnesses' own versions; base by tag | our pins |
+| with the lockfile | 313 s | 3.15 GB | 107 lockfile packages, each with an integrity hash; base by digest | our pins |
+| llm-agents.nix, nix2container | 360 s from an empty store, plus 116 s to load; 61 s unchanged | 4.08 GB | the flake lock, every store path by hash | numtide's, newer than ours on eight of nine |
+
+The lockfile closes less than it looks: the seven npm harnesses install only 30 or 31
+packages between them, most shipping as bundles or per-platform binaries, so most lock entries
+are platform variants that never install. The large float is pi, 119 packages through
+`npm -g`, which needs its own lock because it installs with `--ignore-scripts` while Claude
+Code's postinstall has to run. Both npm builds report five install scripts "not covered by
+allowScripts"; they ran under npm 11.19, and whether npm 12 blocks them is to check before
+the next Node bump. The proposed `dependabot.yml` is in the lockfile spike directory, not yet
+in `.github/`.
 
 The repository has GitHub Actions workflows and no `.github/dependabot.yml`. The research
 reports that ASF Infra's Dependabot page requires one for the github-actions ecosystem on every
@@ -239,8 +275,25 @@ One fact shapes this layer: every container in a Kubernetes pod shares one netwo
 so a pod by itself cannot give "harness offline, egress sidecar online". The institutional
 shape holds point 1 only if our Linux backend runs inside the harness container (which needs a
 seccomp profile that allows `unshare`, `hostUsers: false`, or Kata), or if the egress runs in
-its own pod and the harness pod reaches it over TCP behind a deny-all policy. That is the
-decision the sidecar shape has to make.
+its own pod and the harness pod reaches it over TCP behind a deny-all policy.
+
+That was settled on kind (rootless podman, Kubernetes 1.37, agent-sandbox 1.0.7), with the
+contract check run in the harness container
+([spikes/harness-containers/agent-sandbox](../spikes/harness-containers/agent-sandbox/)):
+
+| Layout | Result |
+|---|---|
+| A: harness and egress sidecar in one pod | point 1 fails: the harness reaches the API server, cluster DNS, other pods and the internet |
+| B: the same pod, our namespaces backend inside the harness container, default seccomp | `unshare` refused |
+| B, seccomp Unconfined | the network is cut, but vsock is open, as in our own backend |
+| **B, a Localhost seccomp profile: the runtime default plus `unshare`, `setns`, `clone` and mounting, still refusing `AF_VSOCK`** | **every check passes**, and from a `SandboxTemplate` through a warm pool and a claim too |
+| B, `hostUsers: false` | the pod does not start: the rootless kind node has too few uids; untested |
+| C: the egress in its own pod, the harness pod deny-all but to it | the policy is enforced (kindnet runs kube-network-policies), but the route out is pod-network TCP, not a socket, so point 1 holds only as far as the network plugin does, and the egress Service is reachable from any pod a policy does not stop |
+
+So the institutional shape is B: the egress as a native sidecar with the socket in a shared
+`emptyDir`, our Linux backend inside the harness container, and a seccomp profile that every
+node carries, which is a cluster administrator's step (the Security Profiles Operator, for
+one). kind itself needed no root here, only podman's log driver set to `k8s-file`.
 
 | Candidate | Licence | Verdict | Why |
 |---|---|---|---|
@@ -264,8 +317,7 @@ hosted, orchestration above the harness, or the Polkadot framework.
 - microsandbox's NIC-less mode through the Rust SDK: the probe is built, and needs a session
   with read and write on `/dev/kvm` to run.
 - Apple `container`, the Seatbelt cross-check, and anything else that needs a Mac.
-- kubernetes-sigs/agent-sandbox on kind, to settle which pod layout holds point 1.
-- llm-agents.nix and the lockfile image, built.
+- agent-sandbox with `hostUsers: false`, which needs a node with a larger uid range.
 - A harness's real model call through each box: the smoke test proves the route, not a
   completed answer.
-- gVisor on the `kvm` platform, and its overhead on a long session.
+- gVisor on its `kvm` platform, which needs `/dev/kvm`.

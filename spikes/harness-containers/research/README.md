@@ -13,7 +13,9 @@ licences, versions and stars move.
 | `image-and-egress.md` | the harness image, and the egress beside the box |
 | `platforms.md` | whole agent-sandbox platforms |
 | `substrate-gaps-metering.md` | Agent Substrate, what the four missed, and who meters tokens (the full matrix with evidence per cell) |
+| `agent-sandbox-kind.md` | agent-sandbox on kind: which pod layout holds point 1, with the check's output per layout |
+| `images-built.md` | today's image, the lockfile image and the Nix image, built and measured, with the command behind each number |
 
-`$SCRATCH` stands for the session's scratch directory, where the agents kept downloads and
+`$REPO` is the repository root. `$SCRATCH` stands for the session's scratch directory, where the agents kept downloads and
 probe scripts; it is gone. Where a report says a spike was run, the run that counts is the
 one in the directory above, against `contract-check.py`.

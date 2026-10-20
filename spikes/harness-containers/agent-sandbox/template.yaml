@@ -1,0 +1,75 @@
+# Layout B as a warm pool: a SandboxTemplate carrying the pod of b-localhost, a
+# SandboxWarmPool keeping two pods started, and a SandboxClaim taking one per session.
+# networkPolicy is left to the controller's managed default, which lets the pod reach the
+# public internet and not cluster-internal addresses: the egress sidecar needs the former,
+# and the harness, in its own network namespace, reaches neither.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: harness
+  namespace: as-spike
+spec:
+  podTemplate:
+    metadata:
+      labels: {spike: agent-sandbox, layout: template}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      initContainers:
+      - name: egress            # native sidecar: the stand-in for amem's egress
+        image: docker.io/library/python:3.12-slim
+        imagePullPolicy: Never
+        restartPolicy: Always
+        command: ["python3", "-I", "/opt/egress/egress.py"]
+        env: [{name: EGRESS_SOCKET, value: /run/memory/egress.sock}]
+        volumeMounts:
+        - {name: sock, mountPath: /run/memory}
+        - {name: egress-stub, mountPath: /opt/egress, readOnly: true}
+      containers:
+      - name: harness
+        image: docker.io/library/python:3.12-slim
+        imagePullPolicy: Never
+        command: ["sleep", "infinity"]
+        env: [{name: HOME, value: /home/user}]
+        workingDir: /work
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: [ALL]}
+          seccompProfile: {type: Localhost, localhostProfile: profiles/amem-userns.json}   # from seccomp-userns.py
+        volumeMounts:
+        - {name: sock, mountPath: /run/memory}
+        - {name: home, mountPath: /home/user}
+        - {name: work, mountPath: /work}
+        - {name: tmp, mountPath: /tmp}
+        - {name: memory-bin, mountPath: /opt/memory, readOnly: true}
+        - {name: projection, mountPath: /memory, readOnly: true}
+        - {name: check, mountPath: /opt/check, readOnly: true}
+      volumes:
+      - {name: sock, emptyDir: {}}
+      - {name: home, emptyDir: {}}
+      - {name: work, emptyDir: {}}
+      - {name: tmp, emptyDir: {}}
+      - {name: projection, emptyDir: {}}
+      - {name: memory-bin, configMap: {name: memory-bin, defaultMode: 0555}}
+      - {name: egress-stub, configMap: {name: egress-stub}}
+      - {name: check, configMap: {name: contract-check}}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: harness
+  namespace: as-spike
+spec:
+  replicas: 2
+  sandboxTemplateRef: {name: harness}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata:
+  name: session-1
+  namespace: as-spike
+spec:
+  warmPoolRef: {name: harness}

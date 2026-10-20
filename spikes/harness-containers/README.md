@@ -18,6 +18,9 @@ results compare. Nothing here is built, tested, or shipped by the workspace.
 | `run-microsandbox.sh` | microsandbox's `msb`, a libkrun microVM, the egress mapped to vsock port 5000 |
 | `run-microsandbox-sdk.sh`, `msb-probe/` | the same through microsandbox's Rust SDK, for `disable_network()`, which the CLI cannot express; a standalone crate, outside the workspace |
 | `bench.sh` | runs inside a box with Node: harness-shaped work, timed |
+| `bench-compare.sh` | `bench.sh` under runc, gVisor, and gVisor with cached mounts, interleaved; a table of medians |
+| `agent-sandbox/` | agent-sandbox on kind: three pod layouts, a seccomp profile that allows our backend inside a pod, a warm pool; its own README |
+| `image-lockfile/`, `image-nix/` | the harness image with an npm lockfile and a digest-pinned base, and from llm-agents.nix; each with its own README |
 | `research/` | the per-layer reports the doc was written from, and the brief their agents worked to |
 
 ## Getting the candidates
@@ -86,6 +89,17 @@ Harness smoke, on one rootfs (node:24-slim with Claude Code 2.1.296, Codex 0.162
 CLI 0.63.0): all three start under podman and under gVisor, and Claude Code's calls reach
 the stand-in egress through the loopback relay under both (7 and 6 calls in 20 seconds; it
 retries the stand-in's 401, so the run ends on the timeout).
+
+Overhead, `bench-compare.sh`, median of three interleaved rounds, 20 October:
+
+| Task | runc | gVisor | gVisor, mounts cached |
+|---|---|---|---|
+| Node start, 20 times | 666 ms | 3.2x | 3.1x |
+| `claude --version`, 5 times | 74 ms | 3.7x | 3.5x |
+| 10,000 small files written, read and removed in the working tree | 899 ms | 6.2x | 6.1x |
+| the same in `/tmp` | 425 ms | 3.2x | 3.2x |
+| copy a `node_modules` tree in `/tmp` | 138 ms | 2.1x | 2.0x |
+| a CPU loop in Node | 1,283 ms | 1.1x | 1.1x |
 
 gVisor rootless maps the caller to root inside and refuses a uid mapping of its own: with
 no user namespace in the spec it says the mappings need one, and with one it cannot fork its

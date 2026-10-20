@@ -1,0 +1,77 @@
+# Layout C: the egress in a pod of its own behind a Service, the harness in another pod
+# with a NetworkPolicy that denies everything except TCP to the egress. The harness gets
+# no unix socket here; its route out is TCP to the Service. The policy is in
+# layout-c-policy.yaml so run.sh can probe before and after it applies.
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: c-egress
+  namespace: as-spike
+spec:
+  podTemplate:
+    metadata:
+      labels: {spike: agent-sandbox, role: egress}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      containers:
+      - name: egress
+        image: docker.io/library/python:3.12-slim
+        imagePullPolicy: Never
+        command: ["python3", "-I", "/opt/egress/egress.py"]
+        env: [{name: EGRESS_PORT, value: "8080"}]
+        ports: [{containerPort: 8080}]
+        volumeMounts:
+        - {name: egress-stub, mountPath: /opt/egress, readOnly: true}
+      volumes:
+      - {name: egress-stub, configMap: {name: egress-stub}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: c-egress
+  namespace: as-spike
+spec:
+  selector: {role: egress}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: c-harness
+  namespace: as-spike
+spec:
+  podTemplate:
+    metadata:
+      labels: {spike: agent-sandbox, role: harness}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      containers:
+      - name: harness
+        image: docker.io/library/python:3.12-slim
+        imagePullPolicy: Never
+        command: ["sleep", "infinity"]
+        env: [{name: HOME, value: /home/user}]
+        workingDir: /work
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: [ALL]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: home, mountPath: /home/user}
+        - {name: work, mountPath: /work}
+        - {name: tmp, mountPath: /tmp}
+        - {name: memory-bin, mountPath: /opt/memory, readOnly: true}
+        - {name: projection, mountPath: /memory, readOnly: true}
+        - {name: check, mountPath: /opt/check, readOnly: true}
+      volumes:
+      - {name: home, emptyDir: {}}
+      - {name: work, emptyDir: {}}
+      - {name: tmp, emptyDir: {}}
+      - {name: projection, emptyDir: {}}
+      - {name: memory-bin, configMap: {name: memory-bin, defaultMode: 0555}}
+      - {name: check, configMap: {name: contract-check}}

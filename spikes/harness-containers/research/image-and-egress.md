@@ -506,7 +506,7 @@ All under `~/spikes`, no root. The machine has podman and /dev/kvm, no Docker, n
 
 ```sh
 mkdir -p ~/spikes/lock && cd ~/spikes/lock
-cp -r /home/striker/clones/durable-memory-harness-containers/images/harness/. .
+cp -r $REPO/images/harness/. .
 cat > package.json <<'EOF'
 { "private": true, "dependencies": {
   "@anthropic-ai/claude-code": "2.1.296", "@openai/codex": "0.162.1",
@@ -521,7 +521,7 @@ podman image inspect --format '{{.Digest}}' docker.io/library/ubuntu:24.04 \
 # edit Dockerfile: FROM ubuntu:24.04@sha256:<digest>; replace the npm -g RUN with
 #   COPY package.json package-lock.json /opt/harness/
 #   RUN cd /opt/harness && npm ci --no-fund --no-audit && ln -s /opt/harness/node_modules/.bin/* /usr/local/bin/
-cp /home/striker/clones/durable-memory-harness-containers/target/release/memory . 2>/dev/null || true
+cp $REPO/target/release/memory . 2>/dev/null || true
 podman build -t harness-lock:spike .
 ```
 

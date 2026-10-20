@@ -1,0 +1,57 @@
+# Shared by every layout: the namespace, a stand-in egress, and a stand-in memory binary.
+# run.sh adds the `contract-check` ConfigMap from ../contract-check.py.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: as-spike
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: egress-stub
+  namespace: as-spike
+data:
+  # Answers any request with 200. Serves the unix socket at EGRESS_SOCKET when set, and
+  # TCP on EGRESS_PORT when set (layout C, where the harness is in another pod).
+  egress.py: |
+    import http.server, os, socketserver, threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"egress stand-in\n"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def address_string(self):
+            return "unix" if not isinstance(self.client_address, tuple) else self.client_address[0]
+
+    class Unix(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+    servers = []
+    path = os.environ.get("EGRESS_SOCKET")
+    if path:
+        if os.path.exists(path):
+            os.unlink(path)
+        servers.append(Unix(path, Handler))
+        os.chmod(path, 0o777)
+    port = os.environ.get("EGRESS_PORT")
+    if port:
+        servers.append(http.server.ThreadingHTTPServer(("0.0.0.0", int(port)), Handler))
+    for s in servers[1:]:
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    print("egress stand-in serving", path, port, flush=True)
+    servers[0].serve_forever()
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: memory-bin
+  namespace: as-spike
+data:
+  # Stands in for the memory binary at /opt/memory/memory: present, executable, read-only.
+  memory: |
+    #!/bin/sh
+    echo memory stand-in
