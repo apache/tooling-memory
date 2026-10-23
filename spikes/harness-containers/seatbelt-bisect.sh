@@ -1,6 +1,7 @@
 #!/bin/sh
-# macOS only: which permission our Seatbelt profile lacks for the relay, the first thing
-# `amem launch` runs inside it. Rebuilds the profile's shape (crates/sandbox/src/seatbelt.rs:
+# macOS only: which permission our Seatbelt profile lacked for the relay, the first thing
+# `amem launch` runs inside it. Kept as the record of how the missing grant was found: it
+# rebuilds the profile as it was before 609304d, which added it. Rebuilds the profile's shape (crates/sandbox/src/seatbelt.rs:
 # the header, the four services, the devices, the system read-only, the metadata of each
 # directory above a grant, the memory binary read-only, a working directory read-write,
 # loopback on the relay's port), then runs `amem relay ... -- /usr/bin/true` under it, and

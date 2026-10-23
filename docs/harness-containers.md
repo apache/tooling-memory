@@ -33,7 +33,7 @@ surfaced on the way:
 | Fix | Make the read-only system bind recursive (`mount_setattr` with `AT_RECURSIVE`) | Submounts under `/usr` stay writable inside our sandbox today; only file ownership holds them. Measured, below |
 | Fix | Port-restrict the CONNECT tunnel and check the resolved address before dialling | `crates/egress/src/lib.rs:756-771` dials any port on an allowed name, wherever it resolves |
 | Fix | Add `.github/dependabot.yml` | None exists; see the image section |
-| Fix | Let the Seatbelt profile read the root directory, `(allow file-read-data (literal "/"))`, and make the macOS CI job compile again | On macOS 26.6 every process under our profile aborts at start, `/usr/bin/true` included, so the Seatbelt backend runs nothing. Measured on GitHub's runner, below |
+| Fixed here | The Seatbelt profile now lists the root directory and reads the system's tool selections (`609304d`, `535e356`). Still to fix: the macOS CI job does not compile | On macOS 26.6 every process under the old profile aborted at start, `/usr/bin/true` included. With the fix, the contract check passes every check under Seatbelt on GitHub's runner, below |
 | Fix | Fail the launch when the egress socket cannot be bound, and say why | A root whose socket path passes 108 bytes launches anyway and fails on a bind mount instead. Measured, below |
 | Adopt | `seccompiler` (Apache-2.0 OR BSD-3) and `landlock` (MIT OR Apache-2.0) in `crates/sandbox`, with Codex's seccomp rule set as the reference | The first fix, as libraries, from the rule set three harnesses already use |
 | Adopt | gVisor as an optional hardened Linux backend | Passed every check here, rootless, no KVM, no daemon; the Node harnesses run under it, and a real Claude Code call completed through it |
@@ -94,6 +94,7 @@ row below is from the corrected check, run on 23 October.
 | fcage without the rule | no vsock |
 | gVisor `release-20261012.0`, rootless, systrap | none |
 | gVisor, the same, on its `kvm` platform | none |
+| **ours**, Seatbelt, macOS 26.6 on GitHub's runner, with the fix below | none; the interfaces are reported, not checked, since Seatbelt denies their use rather than removing them |
 | microsandbox 0.7.8, `msb run --net none` | only loopback: the guest keeps `eth0` and `dummy0`, denied by policy rather than absent; the system is a read-write mount |
 | microsandbox 0.7.8, Rust SDK, `disable_network()` | only loopback, on the name alone: the guest has no network device, and `dummy0`, its kernel's discard device, is down with no address and no route; the system is a read-write mount |
 
@@ -212,8 +213,23 @@ in two places (`crates/sandbox/src/measure.rs:73`, the `wait` function, and the 
 `fn io` in `crates/mount/src/lib.rs:57` is dead code on macOS, an error under `-D warnings`.
 So those tests did not run.
 
-The fix: the grant, the macOS job compiling again, and a test that launches through the relay
-rather than `/bin/cat` alone. Each belongs on a branch of its own.
+**Fixed on this branch.** `609304d` adds the grant, with a unit test for the rule and a macOS
+test that `/usr/bin/true` starts and a shell returns its own code. On `60677f6`, without the
+grant, that test and the two older macOS tests failed in the macOS job (`left: 1, right: 0`).
+With the grant they pass.
+
+The contract check then ran under our backend for the first time. It passed every check but
+the host marker: the sandbox refused the `stat` with EPERM, which on macOS is the
+confinement, and the check now reads it so. `535e356` grants `/private/var/select` with the
+system. Without it every shell printed `Error opening /private/var/select/sh`, and Python's
+shim printed an `xcode-select` error.
+
+Two things remain:
+- **The developer-tools shims still warn.** `/usr/bin/python3` reads
+  `/private/var/db/xcode_select_link` and the active Xcode under `/Applications`, whose path
+  differs from one machine to the next. It prints an `xcode-select` warning and runs.
+- **The CI macOS job still does not compile.** It is the `crates/mount` dead code, for a branch
+  of its own. Until it compiles, the spikes workflow runs this backend's tests on a Mac.
 
 ## Embeddable confinement
 
@@ -429,8 +445,6 @@ hosted, orchestration above the harness, or the Polkadot framework.
 
 - Apple `container`, and anything else that needs a Mac's virtualization.
 - gVisor's `kvm` platform on bare metal; here it ran nested under Hyper-V.
-- The contract check under our Seatbelt backend, which waits on the fix above; the macOS job
-  in `.github/workflows/harness-spikes.yml` fails until then.
 - agent-sandbox with `hostUsers: false` on a rootful node (kind under Docker) and gVisor's
   `kvm` platform nested on the runner's VM, the workflow's two Linux jobs. These had not
   started when this was written: GitHub's runner queue held them.

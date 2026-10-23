@@ -14,7 +14,7 @@ results compare. Nothing here is built, tested, or shipped by the workspace.
 | `run-amem.sh` | the baseline: our own Linux backend, `amem launch --harness command` |
 | `run-seatbelt.sh` | our Seatbelt backend on macOS, `amem launch --harness command` with the real egress, the check told each host path; on Linux it runs the namespaces backend |
 | `seatbelt-steps.sh` | where a launch under Seatbelt stops: `amem launch` with commands of growing reach, one exit code each |
-| `seatbelt-bisect.sh` | macOS only: our profile's shape rebuilt, the relay run under it with one permission class added at a time, each exit or signal printed |
+| `seatbelt-bisect.sh` | macOS only: the profile's shape before the fix rebuilt, the relay run under it with one permission class added at a time, each exit or signal printed; how the missing grant was found, kept as the record |
 | `run-podman.sh` | rootless podman, `--network none` |
 | `run-nsjail.sh` | nsjail, with a seccomp rule refusing vsock and io_uring |
 | `run-fcage.sh` | ferroday-cage's `fcage`, with the same rule |
@@ -81,8 +81,10 @@ log is in the run's summary and its artifacts.
 
 The first macOS runs (23 October) found our Seatbelt profile aborting every process at
 start, `/usr/bin/true` included. `seatbelt-bisect.sh` traced it to the profile refusing
-`file-read-data` on `/`; granting that alone lets the relay start and run a shell. The
-fix belongs in `crates/sandbox`; until it lands, the macOS job fails. See the doc's fifth gap.
+`file-read-data` on `/`; granting that alone let the relay start and run a shell. The fix
+is in `crates/sandbox` on this branch, and the macOS job now also runs the backend's own
+tests, which only a Mac compiles. With it, the contract check passes every check under
+Seatbelt. See the doc's fifth gap.
 
 ## Running
 

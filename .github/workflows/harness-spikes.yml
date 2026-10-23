@@ -51,9 +51,6 @@ jobs:
       - name: where a launch stops, step by step
         if: always()
         run: spikes/harness-containers/seatbelt-steps.sh 2>&1 | tee steps.log
-      - name: which permission the relay lacks
-        if: always()
-        run: spikes/harness-containers/seatbelt-bisect.sh 2>&1 | tee bisect.log
       - name: crash reports from the run
         if: always()
         run: |
@@ -81,9 +78,6 @@ jobs:
             echo '```text'
             cat steps.log
             echo '```'
-            echo '```text'
-            grep '^BISECT\|^        ' bisect.log
-            echo '```'
             echo "Crash reports since the check: $(ls crashes | wc -l)"
             echo "Sandbox denials naming the check's processes: $(wc -l < denials-ours.log); all reports are in the artifact."
             echo '```text'
@@ -98,7 +92,6 @@ jobs:
             sandbox-tests.log
             seatbelt.log
             steps.log
-            bisect.log
             crashes/
             denials.log
             denials-ours.log
