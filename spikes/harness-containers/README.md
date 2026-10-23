@@ -9,6 +9,7 @@ results compare. Nothing here is built, tested, or shipped by the workspace.
 | `contract-check.py` | runs inside a box; one line per assertion of contract points 1 and 2, exit 1 if any failed |
 | `fixture.sh` | the host side: a scratch tree at the launcher's layout, a stand-in egress on a unix socket, a marker in a host home that must stay invisible |
 | `harness-smoke.sh` | runs inside a box with Node: three harnesses start, and Claude Code's calls reach the egress through a loopback relay |
+| `harness-call.sh` | runs inside a box: one real Claude Code call through a loopback relay (Python where the image has it, else Node; vsock where `CHECK_SOCKET` says so), with `fixture.sh`'s `UPSTREAM` and `LOGIN` set |
 | `run-host.sh` | the control: the check unconfined on the host, where it must fail |
 | `run-amem.sh` | the baseline: our own Linux backend, `amem launch --harness command` |
 | `run-podman.sh` | rootless podman, `--network none` |
@@ -18,15 +19,16 @@ results compare. Nothing here is built, tested, or shipped by the workspace.
 | `run-microsandbox.sh` | microsandbox's `msb`, a libkrun microVM, the egress mapped to vsock port 5000 |
 | `run-microsandbox-sdk.sh`, `msb-probe/` | the same through microsandbox's Rust SDK, for `disable_network()`, which the CLI cannot express; a standalone crate, outside the workspace |
 | `bench.sh` | runs inside a box with Node: harness-shaped work, timed |
-| `bench-compare.sh` | `bench.sh` under runc, gVisor, and gVisor with cached mounts, interleaved; a table of medians |
+| `bench-compare.sh` | `bench.sh` under runc, gVisor, gVisor with cached mounts, and gVisor's `kvm` platform where `/dev/kvm` is open, interleaved; a table of medians |
 | `agent-sandbox/` | agent-sandbox on kind: three pod layouts, a seccomp profile that allows our backend inside a pod, a warm pool; its own README |
 | `image-lockfile/`, `image-nix/` | the harness image with an npm lockfile and a digest-pinned base, and from llm-agents.nix; each with its own README |
 | `research/` | the per-layer reports the doc was written from, and the brief their agents worked to |
 
 ## Getting the candidates
 
-None needs root, except that microsandbox needs read and write on `/dev/kvm`. Put each
-download in an empty directory of its own.
+None needs root, except that microsandbox and gVisor's `kvm` platform need read and write on
+`/dev/kvm`: membership of the `kvm` group (`sudo usermod -aG kvm $USER`), picked up without a
+new login by `sg kvm -c '...'`. Put each download in an empty directory of its own.
 
 ```sh
 # gVisor: the release tarball; runsc needs the sidecars that unpack beside it
@@ -34,7 +36,8 @@ gh release download release-20261012.0 -R google/gvisor -p gvisor-x86_64.tar.bz2
 grep x86_64.tar.bz2 SHA256SUMS | sha256sum -c && mkdir x && tar -xjf gvisor-x86_64.tar.bz2 -C x
 export RUNSC=$PWD/x/runsc
 
-# microsandbox: msb and libkrunfw, laid out as its installer lays them out
+# microsandbox: msb and libkrunfw, laid out as its installer lays them out. MSB_HOME's path
+# goes into a unix socket path, which must stay under 108 bytes: link it from somewhere short
 gh release download v0.7.8 -R superradcompany/microsandbox -p microsandbox-linux-x86_64.tar.gz -p checksums.sha256
 grep linux-x86_64.tar.gz checksums.sha256 | sha256sum -c && tar -xzf microsandbox-linux-x86_64.tar.gz
 mkdir -p bin lib && install -m755 msb bin/ && cp libkrunfw.so.* lib/
@@ -56,6 +59,13 @@ export NSJAIL=$PWD/nsjail LD_LIBRARY_PATH=$PWD
 
 `run-amem.sh` uses `target/debug/amem` (`cargo build -p amem`), or `AMEM`.
 
+The SDK probe builds outside the workspace, into a target directory of its own:
+
+```sh
+(cd msb-probe && CARGO_TARGET_DIR=/some/scratch/msb-target cargo build --release)
+export MSB_PROBE=/some/scratch/msb-target/release/msb-probe
+```
+
 ## Running
 
 `./run-<box>.sh` runs the check. `run-podman.sh` and `run-gvisor.sh` take `ROOTFS`, an
@@ -69,7 +79,18 @@ mkdir rootfs && podman export h | tar -x -C rootfs && podman rm h
 ROOTFS=$PWD/rootfs ./run-gvisor.sh sh /work/harness-smoke.sh
 ```
 
-## Results, 19 and 20 October 2026
+A real call needs a Claude Code login on the host. `fixture.sh` copies its access token, without
+the refresh token, into the box's home, and forwards to the API:
+
+```sh
+UPSTREAM=https://api.anthropic.com LOGIN=$HOME/.claude/.credentials.json \
+    ROOTFS=$PWD/rootfs ./run-podman.sh sh /work/harness-call.sh
+# an image with no Claude Code (microsandbox pulls python:3.12-slim): copy a binary in
+UPSTREAM=... LOGIN=... CLAUDE_BIN=$(readlink -f ~/.local/bin/claude) \
+    ./run-microsandbox-sdk.sh sh /work/harness-call.sh
+```
+
+## Results, 19, 20 and 23 October 2026
 
 Linux on WSL2, kernel 6.18.40, x86_64, podman 4.9.3 with runc. FAIL lines only; every other
 assertion passed.
@@ -84,22 +105,52 @@ assertion passed.
 | fcage 0.5.0, with the rule | none |
 | fcage without the rule (`FCAGE_SECCOMP=`) | no vsock socket |
 | gVisor `release-20261012.0`, rootless, systrap | none; the workload runs as uid 0 inside, see below |
+| the same on `--platform=kvm` | none (and without `/dev/kvm` access it refuses to start: `error opening KVM device file (/dev/kvm): permission denied`) |
+| microsandbox 0.7.8, `msb run --net none` | only loopback (`eth0`, `dummy0`) |
+| microsandbox 0.7.8, SDK `disable_network()` | only loopback (`dummy0`: down, no address, no route; no virtio-net device in the guest) |
 
 Harness smoke, on one rootfs (node:24-slim with Claude Code 2.1.296, Codex 0.162.1, Gemini
 CLI 0.63.0): all three start under podman and under gVisor, and Claude Code's calls reach
 the stand-in egress through the loopback relay under both (7 and 6 calls in 20 seconds; it
 retries the stand-in's 401, so the run ends on the timeout).
 
-Overhead, `bench-compare.sh`, median of three interleaved rounds, 20 October:
+Real call, `harness-call.sh`, 23 October, Claude Code on a subscription login, one word asked:
 
-| Task | runc | gVisor | gVisor, mounts cached |
-|---|---|---|---|
-| Node start, 20 times | 666 ms | 3.2x | 3.1x |
-| `claude --version`, 5 times | 74 ms | 3.7x | 3.5x |
-| 10,000 small files written, read and removed in the working tree | 899 ms | 6.2x | 6.1x |
-| the same in `/tmp` | 425 ms | 3.2x | 3.2x |
-| copy a `node_modules` tree in `/tmp` | 138 ms | 2.1x | 2.0x |
-| a CPU loop in Node | 1,283 ms | 1.1x | 1.1x |
+| Box | Result |
+|---|---|
+| `amem launch --harness claude` (ours, the real egress) | answered; metered 1 call, 2 in, 4 out, 10,182 cache |
+| rootless podman, runc (npm 2.1.296; and the native 2.1.304 in `python:3.12-slim`) | answered, `POST /v1/messages -> 200` |
+| gVisor, systrap and kvm | answered, `POST /v1/messages -> 200` |
+| microsandbox, SDK, no NIC (native 2.1.304 in `python:3.12-slim`) | timed out at 120 s, nothing reached the egress |
+
+microsandbox's vsock route, probed with raw `AF_VSOCK` writes to the stand-in:
+- 16, 24 and 32 KB in one write: answered at once.
+- 48, 64, 128 and 512 KB in one write: no answer in 60 s; the stand-in saw the start of the
+  request and nothing after.
+- 128 KB in 8 or 4 KB writes: answered.
+- 1 MB in 16 KB writes: stalled after 262,080 bytes.
+
+This is superradcompany/microsandbox#1878, open, and not addressed in 0.7.9. Two more things
+the runs needed:
+- microsandbox's `exec` returns only when every holder of the command's output has exited, so
+  `harness-call.sh` stops its relay at the end.
+- `amem launch` with a root whose egress socket path came to 146 bytes failed on the bind
+  mount (`ENOENT`), not on the socket; see the doc's fourth gap.
+
+Overhead, `bench-compare.sh`, median of three interleaved rounds, 23 October:
+
+| Task | runc | gVisor | gVisor, mounts cached | gVisor, kvm platform |
+|---|---|---|---|---|
+| Node start, 20 times | 560 ms | 3.1x | 3.2x | 4.1x |
+| `claude --version`, 5 times | 60 ms | 3.6x | 3.8x | 4.8x |
+| 10,000 small files written, read and removed in the working tree | 776 ms | 5.6x | 5.2x | 4.5x |
+| the same in `/tmp` | 360 ms | 2.9x | 3.1x | 6.2x |
+| copy a `node_modules` tree in `/tmp` | 118 ms | 2.2x | 2.1x | 2.2x |
+| a CPU loop in Node | 1,056 ms | 1.2x | 1.2x | 1.2x |
+
+On 20 October, without the kvm column: runc 666, 74, 899, 425, 138 and 1,283 ms; gVisor 3.2x,
+3.7x, 6.2x, 3.2x, 2.1x, 1.1x; cached 3.1x, 3.5x, 6.1x, 3.2x, 2.0x, 1.1x. The `kvm` platform ran
+nested, WSL2 being a Hyper-V guest.
 
 gVisor rootless maps the caller to root inside and refuses a uid mapping of its own: with
 no user namespace in the spec it says the mappings need one, and with one it cannot fork its

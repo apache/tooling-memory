@@ -133,14 +133,38 @@ Notes, each from a run:
   `permission denied`; adding them fixed it.
 - `hostUsers: false` fails on this node with
   `Failed to create pod sandbox: ... failed to create network namespace for sandbox "...": failed to set effective UID: invalid argument`.
-  The kind node is itself a rootless user namespace with 65,537 ids (`/proc/self/uid_map` in the
-  node: `0 1000 1` and `1 100000 65536`; host `/etc/subuid`: `striker:100000:65536`). The likely cause, inferred from
-  that map and the error rather than traced in the kubelet's code: the pod's user namespace
-  needs a range of ids the node does not have. The root step that would
-  let it run: give the user a larger subordinate range in `/etc/subuid` and `/etc/subgid` (e.g.
-  `usermod --add-subuids` / `--add-subgids` with a range of many times 65,536), `podman system migrate`,
-  recreate the cluster; or run the kind node under rootful podman. Not attempted. Whether
-  `hostUsers: false` alone admits `unshare` under RuntimeDefault was therefore not observed.
+  On 20 October the cause was guessed from the node's 65,537 ids (`/proc/self/uid_map` in the
+  node: `0 1000 1` and `1 100000 65536`). On 23 October the guess was tested and was wrong.
+  With 16,000,000 more subordinate ids on the host (`striker:165536:16000000`, then `podman
+  system migrate` and a new cluster), the node mapped them (`65537 165536 16000000`) and the
+  error was the same. The causes, traced:
+  1. **The kubelet's range.** With no `kubelet` user and no `getsubids` in the node, the kubelet
+     takes its default (`pkg/kubelet/kubelet_pods.go:135-158` at v1.37.0: first id 65,536,
+     length 2^32 - 65,536) and its bitmap allocator picks a block at random. The pods' records
+     in `/var/lib/kubelet/pods/<uid>/userns` held host ids 2,558,984,192 and 1,137,049,600.
+     containerd's `setresuid` to an id the node does not map is the `invalid argument`
+     (`pkg/sys/unshare_linux.go:167` at v2.3.4).
+     Fixed in the node with:
+     ```sh
+     apt-get install uidmap passwd
+     useradd --system --no-create-home --shell /usr/sbin/nologin kubelet
+     echo kubelet:131072:7208960 >> /etc/subuid
+     echo kubelet:131072:7208960 >> /etc/subgid
+     systemctl restart kubelet
+     ```
+     That range is 110 pods of 65,536, which the kubelet requires (`maxPods`), inside the
+     node's map. The kubelet then refused to start over the old records (`id 2558984192 is out
+     of range`) until they were removed. The pods were then given 2,097,152 and 6,488,064.
+  2. **Idmapped mounts.** The sandbox then failed with
+     `failed to prepare idmapped overlay: failed to create idmapped mount: unable to shift GID/UID or set mount attrs for /tmp/ovl-idmapped...: operation not permitted`.
+     The node's `/var`, which holds containerd's store, is a podman volume on the host's ext4
+     (`findmnt -T /var/lib/containerd` in the node: `/dev/sdd[.../volumes/<id>/_data] ext4`).
+     An idmapped mount needs privilege over the filesystem's owning user namespace, the host's
+     initial one, which a rootless node does not hold.
+
+  So `hostUsers: false` needs a rootful node, under rootful podman or on a real cluster. Not
+  attempted: both need root on this host. Whether `hostUsers: false` alone admits `unshare`
+  under RuntimeDefault was therefore not observed.
 
 ## C. Two pods: egress behind a Service, harness under deny-all except the egress
 
@@ -211,7 +235,7 @@ template's managed NetworkPolicy keeping the sidecar off cluster-internal addres
 
 Why not the others: A gives the harness the pod's whole network. B under RuntimeDefault refuses
 `unshare`; B under Unconfined runs but opens AF_VSOCK, a route out on any VM-hosted node.
-`hostUsers: false` could not start on this rootless node, so it is unproven here; it would not
+`hostUsers: false` cannot start on a rootless node (idmapped mounts), so it is unproven here; it would not
 remove the need for a seccomp profile that admits `unshare` unless shown otherwise. C holds only by
 policy enforced outside the pod, changes the contract from a unix socket to pod-network TCP, and
 needs the egress to authenticate callers. Cost of B: a custom seccomp profile on every node (the

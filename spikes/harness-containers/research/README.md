@@ -1,7 +1,7 @@
 # Research behind docs/harness-containers.md
 
 The reports the survey was written from, one per layer, each produced by a research agent
-working to `brief.md` on 19 and 20 October 2026. They carry the per-candidate detail and the
+working to `brief.md` on 19 and 20 October 2026, with `agent-sandbox-kind.md`'s `hostUsers: false` section redone on 23 October. They carry the per-candidate detail and the
 receipts (the `gh api` call behind each licence, the file and line behind each capability)
 that the doc only summarises. They are a record of what was read then, not maintained:
 licences, versions and stars move.
