@@ -13,6 +13,7 @@ results compare. Nothing here is built, tested, or shipped by the workspace.
 | `run-host.sh` | the control: the check unconfined on the host, where it must fail |
 | `run-amem.sh` | the baseline: our own Linux backend, `amem launch --harness command` |
 | `run-seatbelt.sh` | our Seatbelt backend on macOS, `amem launch --harness command` with the real egress, the check told each host path; on Linux it runs the namespaces backend |
+| `seatbelt-steps.sh` | where a launch under Seatbelt stops: `amem launch` with commands of growing reach, one exit code each |
 | `run-podman.sh` | rootless podman, `--network none` |
 | `run-nsjail.sh` | nsjail, with a seccomp rule refusing vsock and io_uring |
 | `run-fcage.sh` | ferroday-cage's `fcage`, with the same rule |

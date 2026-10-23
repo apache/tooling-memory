@@ -45,13 +45,24 @@ jobs:
           sw_vers | tee seatbelt.log
           spikes/harness-containers/run-seatbelt.sh 2>&1 | tee -a seatbelt.log
           grep -qE '^(PASS|FAIL) ' seatbelt.log || { echo "the check printed no results"; exit 1; }
+      - name: where a launch stops, step by step
+        if: always()
+        run: spikes/harness-containers/seatbelt-steps.sh 2>&1 | tee steps.log
+      - name: crash reports from the run
+        if: always()
+        run: |
+          # a process killed on a signal leaves a report rather than a denial
+          mkdir -p crashes
+          find "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports \
+            -newer seatbelt.log -type f 2>/dev/null | while read -r f; do cp "$f" crashes/; done
+          ls -l crashes
       - name: what Seatbelt denied
         if: always()
         run: |
           # every Sandbox report since the job started; the summary counts those naming a
           # process the check runs
           log show --last 30m --style compact --predicate 'sender == "Sandbox"' > denials.log
-          grep -E 'deny\(' denials.log | grep -E '(python3?|sh|amem|memory)\([0-9]+\)' > denials-ours.log || true
+          grep -E 'deny\(' denials.log | grep -E '(python3?|Python|xcrun|sh|bash|amem|memory|sandbox-exec)\([0-9]+\)' > denials-ours.log || true
       - name: summary
         if: always()
         run: |
@@ -60,6 +71,10 @@ jobs:
             echo '```text'
             cat seatbelt.log
             echo '```'
+            echo '```text'
+            cat steps.log
+            echo '```'
+            echo "Crash reports since the check: $(ls crashes | wc -l)"
             echo "Sandbox denials naming the check's processes: $(wc -l < denials-ours.log); all reports are in the artifact."
             echo '```text'
             sort -u denials-ours.log | head -100
@@ -71,6 +86,8 @@ jobs:
           name: seatbelt
           path: |
             seatbelt.log
+            steps.log
+            crashes/
             denials.log
             denials-ours.log
 
