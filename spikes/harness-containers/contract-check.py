@@ -205,4 +205,6 @@ if MARKER:
 if not DARWIN:
     print(f"info  pid 1 is {open('/proc/1/comm').read().strip()}; {len([p for p in os.listdir('/proc') if p.isdigit()])} processes visible")
 print(f"info  uid {os.getuid()}, hostname {socket.gethostname()}")
+# the last line, which a check that stopped partway never prints
+print(f"DONE  {len(results)} checks, {results.count(False)} failed")
 sys.exit(0 if all(results) else 1)

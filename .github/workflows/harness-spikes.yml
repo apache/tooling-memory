@@ -5,15 +5,17 @@ name: Harness spikes
 # agent-sandbox with `hostUsers: false`, and /dev/kvm for gVisor's kvm platform. Nothing here
 # builds or ships anything; each job's log is the result, shown in the run's summary and
 # kept as an artifact. A FAIL line in a log is a finding, not a failed job: the runners
-# exit 0 after printing what the check reported. A log with no check lines at all is a
-# failed job, since then nothing was looked at. Run by hand, and on a pull request that
-# changes the spikes or this file.
+# exit 0 after printing what the check reported. A check that did not finish is a failed
+# job, since then not everything was looked at: each check ends on a DONE line. Run by
+# hand, and on a pull request that changes the spikes, the sandbox crate whose Seatbelt
+# tests run here, or this file.
 
 on:
   workflow_dispatch:
   pull_request:
     paths:
       - spikes/harness-containers/**
+      - crates/sandbox/**
       - .github/workflows/harness-spikes.yml
 
 permissions:
@@ -35,6 +37,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
         with:
           toolchain: stable
@@ -45,9 +49,11 @@ jobs:
       - name: contract check under Seatbelt
         if: always()
         run: |
+          # crash reports are collected from here on; the log's own time moves with each line
+          touch "$RUNNER_TEMP/check-started"
           sw_vers | tee seatbelt.log
           spikes/harness-containers/run-seatbelt.sh 2>&1 | tee -a seatbelt.log
-          grep -qE '^(PASS|FAIL) ' seatbelt.log || { echo "the check printed no results"; exit 1; }
+          grep -q '^DONE ' seatbelt.log || { echo "the check did not finish"; exit 1; }
       - name: where a launch stops, step by step
         if: always()
         run: spikes/harness-containers/seatbelt-steps.sh 2>&1 | tee steps.log
@@ -57,7 +63,7 @@ jobs:
           # a process killed on a signal leaves a report rather than a denial
           mkdir -p crashes
           find "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports \
-            -newer seatbelt.log -type f 2>/dev/null | while read -r f; do cp "$f" crashes/; done
+            -newer "$RUNNER_TEMP/check-started" -type f 2>/dev/null | while read -r f; do cp "$f" crashes/; done
           ls -l crashes
       - name: what Seatbelt denied
         if: always()
@@ -81,7 +87,8 @@ jobs:
             echo "Crash reports since the check: $(ls crashes | wc -l)"
             echo "Sandbox denials naming the check's processes: $(wc -l < denials-ours.log); all reports are in the artifact."
             echo '```text'
-            sort -u denials-ours.log | head -100
+            # sed reads to the end, where head would leave sort to die on a closed pipe
+            sort -u denials-ours.log | sed -n 1,100p
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - if: always()
@@ -107,6 +114,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: kind and kubectl
         run: |
           mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP/bin"
@@ -121,14 +130,14 @@ jobs:
       - name: every layout, hostUsers false among them
         run: |
           ENGINE=docker DOWN=1 spikes/harness-containers/agent-sandbox/run.sh 2>&1 | tee kind.log
-          grep -qE '^(PASS|FAIL) ' kind.log || { echo "the check printed no results"; exit 1; }
+          grep -q '^DONE ' kind.log || { echo "no check finished"; exit 1; }
       - name: summary
         if: always()
         run: |
           {
             echo '### agent-sandbox on rootful kind'
             echo '```text'
-            grep -E '^(### |PASS|FAIL|REACH|BLOCK|exit=|Failed)' kind.log
+            grep -E '^(### |PASS|FAIL|DONE|REACH|BLOCK|exit=|Failed|node )' kind.log || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - if: always()
@@ -148,6 +157,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: open /dev/kvm and unprivileged user namespaces to the runner's user
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
@@ -171,7 +182,7 @@ jobs:
             echo "== $platform" | tee -a gvisor.log
             RUNSC_FLAGS=--platform=$platform spikes/harness-containers/run-gvisor.sh 2>&1 | tee run.log
             cat run.log >> gvisor.log
-            grep -qE '^(PASS|FAIL) ' run.log || { echo "the check on $platform printed no results"; exit 1; }
+            grep -q '^DONE ' run.log || { echo "the check on $platform did not finish"; exit 1; }
           done
       - name: a Node rootfs with the harnesses
         run: |

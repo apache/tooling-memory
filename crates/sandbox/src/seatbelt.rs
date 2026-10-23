@@ -40,8 +40,7 @@ pub const SYSTEM: &[&str] = &[
     "/private/var/db/dyld",
     // zoneinfo, which /etc/localtime points into
     "/private/var/db/timezone",
-    // the links that pick the system's tools: /bin/sh reads `sh` on every start, and the
-    // developer tools' shims, /usr/bin/python3 among them, read `developer_dir`
+    // the links that pick the system's tools: /bin/sh reads `sh` on every start
     "/private/var/select",
 ];
 
@@ -691,6 +690,28 @@ mod tests {
             "{p}"
         );
         assert!(!p.contains("(subpath \"/\")"), "{p}");
+    }
+
+    #[test]
+    fn every_file_rule_names_its_paths_as_literals_and_subpaths() {
+        // the checks on the home and on the root read the paths these two forms name; a
+        // `prefix` or a `regex` would grant past them unseen. The terminals are the one
+        // pattern, and it names devices only.
+        let ttys = r##"(regex #"^/dev/ttys[0-9]+$")"##;
+        let p = profile(&plan()).unwrap();
+        for (ops, body) in rules(&p) {
+            if !ops.contains("file-") {
+                continue;
+            }
+            let filters = body["(allow ".len() + ops.len()..].replace(ttys, "");
+            for form in filters.split('(').skip(1) {
+                let kind = form.split_whitespace().next().unwrap_or("");
+                assert!(
+                    ["literal", "subpath"].contains(&kind),
+                    "{ops} names a path by {kind}:\n{body}"
+                );
+            }
+        }
     }
 
     #[test]

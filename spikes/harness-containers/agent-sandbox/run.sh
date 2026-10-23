@@ -45,7 +45,15 @@ k apply --server-side -f "$work/sandbox-with-extensions.yaml" >/dev/null || exit
 k -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=300s
 
 say "image and seccomp profile into the node"
-"$ENGINE" save -o "$work/image.tar" "$IMAGE" >/dev/null && kind load image-archive "$work/image.tar" --name "$CLUSTER"
+# Docker's containerd store saves a pulled image's index with every platform's manifest
+# but only this one's layers, which the node's import refuses; so it saves one platform.
+platform=
+if [ "$ENGINE" = docker ]; then
+    platform="--platform=$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$IMAGE")"
+fi
+# shellcheck disable=SC2086 # empty for podman, one word for docker
+"$ENGINE" save $platform -o "$work/image.tar" "$IMAGE" >/dev/null &&
+    kind load image-archive "$work/image.tar" --name "$CLUSTER"
 gh api "repos/moby/moby/contents/vendor/github.com/moby/profiles/seccomp/default.json?ref=$MOBY_TAG" \
     -H 'Accept: application/vnd.github.raw' > "$work/default.json" || exit 1
 python3 -I "$here/seccomp-userns.py" "$work/default.json" > "$work/amem-userns.json" || exit 1
@@ -98,6 +106,10 @@ for pod in b-userns b-userns-unconfined; do
         k -n $NS get events --field-selector involvedObject.name=$pod,reason=FailedCreatePodSandBox \
             -o jsonpath='{.items[-1:].message}{"\n"}'
         "$ENGINE" exec "$NODE" cat /proc/self/uid_map
+        # what decides whether runc may mount sysfs in the pod's user namespace: the
+        # kernel, the runtime, and whether the node's own /sys is covered by other mounts
+        "$ENGINE" exec "$NODE" sh -c 'uname -r; containerd --version; runc --version | head -1
+            grep " /sys" /proc/self/mountinfo' | sed 's/^/node  /'
     fi
 done
 

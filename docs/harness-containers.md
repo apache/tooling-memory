@@ -151,6 +151,19 @@ itself a Hyper-V guest, so `kvm` runs nested here, which is the likely reason. O
 it was not measured. What either cost adds to a real session, most of which is spent waiting
 on the model, was not measured.
 
+A second nested reading, from the workflow's `gvisor-kvm` job on GitHub's Ubuntu 26.04 runner
+(an Azure VM, kernel 7.0.0-1017-azure, run `40019093054`), one round each. The contract check
+passed every check on both platforms there. kvm is the slower again:
+
+| Task | runc | gVisor | mounts cached | kvm platform |
+|---|---|---|---|---|
+| Node start, 20 times | 469 ms | 1.9x | 1.9x | 4.6x |
+| `claude --version`, 5 times | 44 ms | 2.6x | 2.6x | 6.6x |
+| 10,000 small files in the working tree | 321 ms | 4.3x | 3.7x | 8.4x |
+| the same in `/tmp` | 309 ms | 2.1x | 2.1x | 6.1x |
+| copy a `node_modules` tree in `/tmp` | 92 ms | 1.7x | 1.7x | 2.2x |
+| a CPU loop in Node | 864 ms | 1.0x | 1.0x | 1.1x |
+
 ## Five gaps in our own code
 
 **vsock.** A network namespace does not cover `AF_VSOCK`. Inside our sandbox a vsock socket
@@ -229,7 +242,8 @@ Two things remain:
   `/private/var/db/xcode_select_link` and the active Xcode under `/Applications`, whose path
   differs from one machine to the next. It prints an `xcode-select` warning and runs.
 - **The CI macOS job still does not compile.** It is the `crates/mount` dead code, for a branch
-  of its own. Until it compiles, the spikes workflow runs this backend's tests on a Mac.
+  of its own. Until it compiles, the spikes workflow runs this backend's tests on a Mac, on
+  a pull request that changes `crates/sandbox` and on one that changes the spikes.
 
 ## Embeddable confinement
 
@@ -398,7 +412,7 @@ contract check run in the harness container
 | B: the same pod, our namespaces backend inside the harness container, default seccomp | `unshare` refused |
 | B, seccomp Unconfined | the network is cut, but vsock is open, as in our own backend |
 | **B, a Localhost seccomp profile: the runtime default plus `unshare`, `setns`, `clone` and mounting, still refusing `AF_VSOCK`** | **every check passes**, and from a `SandboxTemplate` through a warm pool and a claim too |
-| B, `hostUsers: false` | the pod does not start on a rootless node, for two reasons; untested |
+| B, `hostUsers: false` | the pod does not start: on a rootless node for two reasons, and on a rootful one because `runc` may not mount `sysfs` |
 | C: the egress in its own pod, the harness pod deny-all but to it | the policy is enforced (kindnet runs kube-network-policies), but the route out is pod-network TCP, not a socket, so point 1 holds only as far as the network plugin does, and the egress Service is reachable from any pod a policy does not stop |
 
 So the institutional shape is B: the egress as a native sidecar with the socket in a shared
@@ -421,8 +435,24 @@ the node's map fixed it: a `kubelet` user, `getsubids` installed, and `kubelet:1
 on the host's ext4. The rootless node holds no privilege over that filesystem, which an
 idmapped mount needs.
 
-So `hostUsers: false` needs a rootful node. Whether it alone admits `unshare` under the
-default profile is still unseen.
+So `hostUsers: false` needs a rootful node. **On one, it still did not start.** The workflow's
+kind job ran the node under Docker on GitHub's Ubuntu 26.04 runner (run `40019093054`); the
+node's uid map was the whole range, so it was rootful. Both `hostUsers: false` pods failed to
+create their sandbox:
+
+```text
+runc create failed: unable to start container process: error during container init:
+error mounting "sysfs" to rootfs at "/sys": ... flags=MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC:
+operation not permitted
+```
+
+The kernel lets a user namespace mount `sysfs` only when the namespace owns the network
+namespace and the mounter's own `/sys` is not partly covered; which of the two failed is not
+known yet. The runner now prints the node's kernel, containerd, runc and `/sys` mounts when
+the pod fails. The same run's other layouts did not start either: the image did not load into
+the node, since Docker's store saved an index naming platforms it held no layers for. The
+runner saves the one platform now. Whether `hostUsers: false` alone admits `unshare` under
+the default profile is still unseen.
 
 | Candidate | Licence | Verdict | Why |
 |---|---|---|---|
@@ -445,9 +475,8 @@ hosted, orchestration above the harness, or the Polkadot framework.
 
 - Apple `container`, and anything else that needs a Mac's virtualization.
 - gVisor's `kvm` platform on bare metal; here it ran nested under Hyper-V.
-- agent-sandbox with `hostUsers: false` on a rootful node (kind under Docker) and gVisor's
-  `kvm` platform nested on the runner's VM, the workflow's two Linux jobs. These had not
-  started when this was written: GitHub's runner queue held them.
+- agent-sandbox with `hostUsers: false` past the `sysfs` refusal, and every other layout on
+  the rootful node: the next run of the workflow's kind job, with the image loading.
 - A real call through nsjail and fcage. Their builds went with the scratch directory, and they
   bind the socket in exactly as podman does, where the call completed.
 - microsandbox again once #1878 is fixed: `harness-call.sh` through `run-microsandbox-sdk.sh`
