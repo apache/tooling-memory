@@ -69,6 +69,14 @@ const HEADER: &str = r#"(version 1)
 (allow pseudo-tty)
 "#;
 
+/// The root directory's own listing: a process reads it as it starts on macOS 26, and is
+/// aborted when it is refused, `/usr/bin/true` included. The names at the top of the disk
+/// and nothing under them; the metadata rule grants `/` its attributes, not this.
+const ROOT: &str = r#"
+; the root's listing, which every process reads as it starts
+(allow file-read-data (literal "/"))
+"#;
+
 /// Devices: the ones every process writes, the terminal the harness was given, and the
 /// random ones read.
 const DEVICES: &str = r#"
@@ -175,6 +183,7 @@ fn render(grants: &[Grant], relay: &str, host_home: Option<&Path>) -> Result<Str
         .map(|s| format!("(global-name \"{s}\")"))
         .collect();
     rule(&mut out, None, "mach-lookup", &services);
+    out.push_str(ROOT);
     out.push_str(DEVICES);
     let system = SYSTEM
         .iter()
@@ -652,6 +661,21 @@ mod tests {
         let mut bad = plan();
         bad.host_home = Some(PathBuf::from("/usr/home/me"));
         assert!(profile(&bad).unwrap_err().to_string().contains("/usr"));
+    }
+
+    #[test]
+    fn the_root_is_listed_and_nothing_under_it_is_read() {
+        let p = profile(&plan()).unwrap();
+        let root = naming(&p, "/");
+        assert_eq!(
+            root.iter()
+                .filter(|(ops, _)| ops != "file-read-metadata")
+                .map(|(ops, body)| (ops.as_str(), body.as_str()))
+                .collect::<Vec<_>>(),
+            [("file-read-data", "(allow file-read-data (literal \"/\"))")],
+            "{p}"
+        );
+        assert!(!p.contains("(subpath \"/\")"), "{p}");
     }
 
     #[test]
