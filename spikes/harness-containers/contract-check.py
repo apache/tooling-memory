@@ -54,6 +54,29 @@ def writable(directory):
         return False, e.strerror or str(e)
 
 
+def read_only(path):
+    """Whether the box makes `path` read-only, as opposed to its file mode refusing a write,
+    which a check run as a user without write permission would mistake for confinement. On
+    Linux, the mount's flag. On macOS, where Seatbelt denies by profile rather than by
+    mount, a write the sandbox refuses: EPERM, where file mode gives EACCES."""
+    if not DARWIN:
+        try:
+            flags = os.statvfs(path).f_flag
+        except OSError as e:
+            return False, e.strerror or str(e)
+        return bool(flags & os.ST_RDONLY), "mount read-only" if flags & os.ST_RDONLY else "mount read-write"
+    try:
+        if os.path.isdir(path):
+            ok, why = writable(path)
+            if ok:
+                return False, "written"
+            raise PermissionError(1 if "not permitted" in why else 13, why)
+        open(path, "ab").close()
+        return False, "opened for writing"
+    except OSError as e:
+        return e.errno == 1, e.strerror or str(e)
+
+
 def interfaces():
     if DARWIN:
         return sorted(name for _, name in socket.if_nameindex())
@@ -149,16 +172,12 @@ for key in ("home", "work"):
     ok, why = writable(LAYOUT[key])
     check(2, f"{key} writable at {LAYOUT[key]}", ok, why)
 for key in ("projection", "system"):
-    ok, why = writable(LAYOUT[key])
+    ok, why = read_only(LAYOUT[key])
     readable = os.access(LAYOUT[key], os.R_OK)
-    check(2, f"{key} readable, not writable, at {LAYOUT[key]}", readable and not ok, why)
+    check(2, f"{key} readable, read-only, at {LAYOUT[key]}", readable and ok, why)
 mb = LAYOUT["memory_bin"]
-try:
-    open(mb, "ab").close()
-    mb_writable = True
-except OSError:
-    mb_writable = False
-check(2, f"memory binary present, read-only, at {mb}", os.access(mb, os.X_OK) and not mb_writable)
+ok, why = read_only(mb)
+check(2, f"memory binary present, read-only, at {mb}", os.access(mb, os.X_OK) and ok, why)
 # A read-only bind that is not recursive leaves the host's submounts under it writable.
 if not DARWIN:
     system = LAYOUT["system"].rstrip("/") + "/"
@@ -170,7 +189,14 @@ if not DARWIN:
         ]
     check(2, f"no read-write mount under {LAYOUT['system']}", not rw_below, ",".join(rw_below))
 if MARKER:
-    check(2, "host home marker not visible", not os.path.exists(MARKER), MARKER)
+    # only "no such file" is invisible: a refusal means the host's tree is in the box
+    try:
+        os.stat(MARKER)
+        check(2, "host home marker not visible", False, f"{MARKER} found")
+    except FileNotFoundError:
+        check(2, "host home marker not visible", True, MARKER)
+    except OSError as e:
+        check(2, "host home marker not visible", False, f"{MARKER}: {e.strerror or e}")
 
 if not DARWIN:
     print(f"info  pid 1 is {open('/proc/1/comm').read().strip()}; {len([p for p in os.listdir('/proc') if p.isdigit()])} processes visible")

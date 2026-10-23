@@ -1,12 +1,13 @@
 #!/bin/sh
 # Inside a box with Node and the harnesses: harness-shaped work, timed in milliseconds.
 # Start-up (Node, a harness's --version), small-file churn on the bind-mounted working
-# tree and on /tmp, a copy of a large node_modules, and a CPU loop. One line per task.
+# tree and on /tmp, a copy of a large node_modules, and a CPU loop. One line per task: its
+# time, or FAIL where the task did not complete, which a time would hide.
 ms() { echo $(( $(date +%s%N) / 1000000 )); }
 t() {
     name=$1; shift
-    a=$(ms); "$@" > /dev/null 2>&1; b=$(ms)
-    echo "$name $((b - a))"
+    a=$(ms)
+    if "$@" > /dev/null 2>&1; then b=$(ms); echo "$name $((b - a))"; else echo "$name FAIL"; fi
 }
 node_x20() { i=0; while [ $i -lt 20 ]; do node -e 0; i=$((i + 1)); done; }
 claude_x5() { i=0; while [ $i -lt 5 ]; do claude --version; i=$((i + 1)); done; }

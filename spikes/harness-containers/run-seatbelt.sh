@@ -16,6 +16,13 @@ set +e
 # bytes on macOS)
 root=$(mktemp -d /tmp/am.XXXXXX)
 marker="$HOME/.contract-check-marker.$$"
+listener=
+cleanup() {
+    [ -z "$listener" ] || kill "$listener" 2>/dev/null
+    rm -rf "$root" "$root.port" "$marker"
+    fixture_down
+}
+trap cleanup EXIT
 echo secret > "$marker"
 python3 -I -c '
 import socket, sys
@@ -28,12 +35,6 @@ listener=$!
 i=0
 while [ ! -s "$root.port" ] && [ $i -lt 50 ]; do i=$((i + 1)); sleep 0.1; done
 port=$(cat "$root.port")
-cleanup() {
-    kill "$listener" 2>/dev/null
-    rm -rf "$root" "$root.port" "$marker"
-    fixture_down
-}
-trap cleanup EXIT
 work=$(realpath "$FIX/work")
 memory_bin=
 [ "$(uname)" = Darwin ] && memory_bin="export CHECK_MEMORY_BIN='$amem'"

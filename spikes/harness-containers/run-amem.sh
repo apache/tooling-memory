@@ -5,7 +5,6 @@
 here=$(cd "$(dirname "$0")" && pwd)
 amem=${AMEM:-$here/../../target/debug/amem}
 . "$here/fixture.sh"
-trap fixture_down EXIT
 set +e
 "$amem" --root "$FIX/root" init --owner human:spike:me --domain dom-spike >/dev/null
 OPENAI_API_KEY=sk-placeholder "$amem" --root "$FIX/root" launch --harness command --auth key \

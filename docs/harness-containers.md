@@ -31,13 +31,13 @@ surfaced on the way:
 |---|---|---|
 | Fix | Refuse `AF_VSOCK` and `io_uring` with seccomp, set `no_new_privs`, in our Linux backend | The network namespace does not cover vsock; on WSL2 and any VM guest it reaches the host. Measured, below |
 | Fix | Make the read-only system bind recursive (`mount_setattr` with `AT_RECURSIVE`) | Submounts under `/usr` stay writable inside our sandbox today; only file ownership holds them. Measured, below |
-| Fix | Port-restrict the CONNECT tunnel and check the resolved address before dialling | `crates/egress/src/lib.rs:756-768` dials any port on an allowed name, wherever it resolves |
+| Fix | Port-restrict the CONNECT tunnel and check the resolved address before dialling | `crates/egress/src/lib.rs:756-771` dials any port on an allowed name, wherever it resolves |
 | Fix | Add `.github/dependabot.yml` | None exists; see the image section |
 | Fix | Fail the launch when the egress socket cannot be bound, and say why | A root whose socket path passes 108 bytes launches anyway and fails on a bind mount instead. Measured, below |
 | Adopt | `seccompiler` (Apache-2.0 OR BSD-3) and `landlock` (MIT OR Apache-2.0) in `crates/sandbox`, with Codex's seccomp rule set as the reference | The first fix, as libraries, from the rule set three harnesses already use |
 | Adopt | gVisor as an optional hardened Linux backend | Passed every check here, rootless, no KVM, no daemon; the Node harnesses run under it, and a real Claude Code call completed through it |
-| Adopt | An npm lockfile and a digest-pinned base for `images/harness`, bumped by Dependabot | Built here at no cost in size or time; pins what the harnesses pull in and the base, and retires `scripts/bump-harness-versions.sh`. pi needs a lock of its own |
-| Watch | microsandbox, as one backend for Linux, macOS and Windows | The only candidate that could. With no NIC it holds the contract, but its vsock route stalls on a request over 32 KB, so a real call never completes; open upstream as #1878, not fixed in 0.7.9 |
+| Adopt | An npm lockfile and a digest-pinned base for `images/harness`, bumped by Dependabot | Built here at no cost in size or time; pins what the harnesses pull in and the base, and retires the npm half of `scripts/bump-harness-versions.sh`. Node (an `ARG` Dependabot does not bump) and pi still need the script or a lock of their own |
+| Watch | microsandbox, as one backend for Linux, macOS and Windows | The only candidate that could. With no NIC its network holds, but the image's root is a read-write mount, and its vsock route stalls on a request over 32 KB, so a real call never completes; open upstream as #1878, not fixed in 0.7.9 |
 | Target | kubernetes-sigs/agent-sandbox for the institutional shape, Agent Substrate later | On kind, the egress as a sidecar and our backend inside the harness container, under a seccomp profile that allows `unshare`, passed every check; neither replaces the laptop launcher |
 
 ## The contract any replacement has to hold
@@ -77,23 +77,29 @@ no name resolution, no vsock, the egress answers) and point 2 (home and tree wri
 projection, system and memory binary read-only, no writable mount under the read-only system,
 the marker invisible). Linux on WSL2, kernel 6.18.40, x86_64.
 
+"Read-only" is the mount's flag (`statvfs`), and "invisible" is "no such file". The first
+version tried a write instead, and took "exists" as false on any error. The pre-PR review
+showed both passing on an unconfined host, where file mode alone refused the write. Every
+row below is from the corrected check, run on 23 October.
+
 | Box | Failed |
 |---|---|
-| host, unconfined (the control) | 7 of 12, as it must |
+| host, unconfined (the control) | 9 of 12, as it must |
 | **ours**, `amem launch --harness command` | no vsock; a writable mount under `/usr` |
 | rootless podman, runc, `--network none` | no vsock |
-| nsjail, built from master, with a seccomp rule refusing vsock and io_uring | none |
+| nsjail, built from master (`4ff54a6`), with a seccomp rule refusing vsock and io_uring | none |
 | nsjail without the rule | no vsock |
 | ferroday-cage `fcage` 0.5.0, with the same rule | none |
 | fcage without the rule | no vsock |
 | gVisor `release-20261012.0`, rootless, systrap | none |
 | gVisor, the same, on its `kvm` platform | none |
-| microsandbox 0.7.8, `msb run --net none` | only loopback: the guest keeps `eth0` and `dummy0`, denied by policy rather than absent |
-| microsandbox 0.7.8, Rust SDK, `disable_network()` | only loopback, on the name alone: the guest has no network device, and `dummy0`, its kernel's discard device, is down with no address and no route |
+| microsandbox 0.7.8, `msb run --net none` | only loopback: the guest keeps `eth0` and `dummy0`, denied by policy rather than absent; the system is a read-write mount |
+| microsandbox 0.7.8, Rust SDK, `disable_network()` | only loopback, on the name alone: the guest has no network device, and `dummy0`, its kernel's discard device, is down with no address and no route; the system is a read-write mount |
 
 The harness smoke test, `harness-smoke.sh`, runs Claude Code 2.1.296, Codex 0.162.1 and Gemini
 CLI 0.63.0 from one Node rootfs: all three start under podman and under gVisor, and Claude
-Code's calls reach the stand-in egress through a loopback relay under both.
+Code's calls reach the stand-in egress through a loopback relay under both. The stand-in,
+outside the box, logged 7 requests under podman and 6 under gVisor in 20 seconds.
 
 A real call, `harness-call.sh`: Claude Code asked for one word on a subscription login. The
 stand-in egress forwarded to `api.anthropic.com` and logged each request. The box got only the
@@ -163,7 +169,7 @@ writable from the sandbox. podman, nsjail, fcage and gVisor did not show it. `mo
 with `AT_RECURSIVE` and `MOUNT_ATTR_RDONLY` (Linux 5.12) is the fix.
 
 **The CONNECT tunnel.** `connect_or_not_found` takes the port from the request's authority and
-`TcpStream::connect` resolves and dials it (`crates/egress/src/lib.rs:756-768`). An allowed name
+`TcpStream::connect` resolves and dials it (`crates/egress/src/lib.rs:756-771`). An allowed name
 is reachable on any port, and a name that resolves to loopback, a private range or a metadata
 address is dialled. sandbox-runtime, iron-proxy, Smokescreen, Codex's network proxy and
 Envoy's `resolved_address_filter` all guard this. The fix: 443 unless the allowlist entry names
@@ -217,7 +223,7 @@ beside the harness, which is what our WSL containers backend does.
 | Candidate | Licence | Verdict | Why |
 |---|---|---|---|
 | **gVisor** (`runsc`) | Apache-2.0 | **adopt** as an optional Linux backend | Passed every check, rootless, no KVM, no daemon, on both `systrap` and `kvm`; the three harnesses ran under it, and a real call completed. The box runs as uid 0 inside (the caller outside), because rootless `runsc` refuses a uid map of its own; binding the host's `/usr` fails rootless on WSL2, so the root comes from the image; about 100 MB of binaries to pin |
-| **microsandbox** | Apache-2.0; its guest kernel, libkrunfw, is LGPL-2.1 and GPL-2.0 | **watch** | The only candidate for one backend on Linux, macOS and Windows from one image. Holds the contract with no NIC; its vsock route cannot yet carry a real request. See below |
+| **microsandbox** | Apache-2.0; its guest kernel, libkrunfw, is LGPL-2.1 and GPL-2.0 | **watch** | The only candidate for one backend on Linux, macOS and Windows from one image. With no NIC its network holds; its root is writable, and its vsock route cannot yet carry a real request. See below |
 | Apple `container` / Containerization | Apache-2.0 | **spike on a Mac** | `--network none`, and a `-v` mounted host socket is relayed in as a unix socket, so the relay is unchanged; needs macOS 26 on Apple Silicon and an arm64 image (the Dockerfile hard-codes the x64 Node tarball). Read, not run |
 | libkrun (direct) | Apache-2.0 | fallback for microsandbox | The engine under it; a binding crate and our own guest init |
 | runc, podman | Apache-2.0 | **learn from** | Held both points here bar vsock; no isolation gain over our namespaces on Linux |
@@ -238,8 +244,15 @@ which the CLI cannot express.
 
 A Rust probe that uses it, in `spikes/harness-containers/msb-probe/`, booted a guest with no
 network device: its virtio devices are console, block, virtiofs, vsock, balloon and rng, and
-no net. Every check passed but "only loopback", which failed on the name alone: `dummy0`, the
-guest kernel's own discard device, down, with no address and no route.
+no net. "Only loopback" failed on the name alone: `dummy0`, the guest kernel's own discard
+device, down, with no address and no route.
+
+The system is another matter, under the CLI and the SDK alike. The image's root is mounted
+read-write. It is the sandbox's own copy-on-write layer, so the host is not exposed. But a
+harness can change its own `/usr` for the sandbox's life, and point 2 says the system is
+read-only. The first version of the check missed this: uid 1000 cannot write root-owned
+files, and the check took that for a read-only mount. Neither the CLI's help nor the SDK's
+builder offers a read-only root.
 
 The vsock route answered on port 5000 and no other port on the host did. It does not carry a
 large request: past 32 KB in one write, or 256 KB in all, the upload stalls until the host
@@ -251,7 +264,7 @@ no harness completes a call through it. It is beta ("expect breaking changes"), 
 
 | Option | Licence | Verdict | Why |
 |---|---|---|---|
-| Keep the Dockerfile; add `package.json` and `package-lock.json` for the harnesses, `npm ci`; `FROM ubuntu:24.04@sha256:...`; Dependabot for npm, docker and github-actions | Dependabot MIT | **adopt** | Built: same size and build time as today, every package pinned with an integrity hash, and the base by digest. Retires `bump-harness-versions.sh`. pi needs a lock of its own, and Muse Code stays a script step |
+| Keep the Dockerfile; add `package.json` and `package-lock.json` for the harnesses, `npm ci`; `FROM ubuntu:24.04@sha256:...`; Dependabot for npm, docker and github-actions | Dependabot MIT | **adopt** | Built: same size and build time as today, every package pinned with an integrity hash, and the base by digest. Retires the npm half of `bump-harness-versions.sh`; Node's version is an `ARG`, which Dependabot does not bump, so that half stays. pi needs a lock of its own, and Muse Code stays a script step |
 | numtide/llm-agents.nix with nix2container | MIT; Apache-2.0 | **learn from** | Built: all nine harnesses, reproducible to the image id, Muse Code pinned by hash. But a third larger, ahead of our pins on eight of nine (taking numtide's versions, or overriding each), 281 of 288 store paths from numtide's cache, and Nix itself (LGPL-2.1) in the build |
 | Docker's sandbox kit spec and kits | Apache-2.0 (the `sbx` tool is proprietary) | **borrow** | Per-harness credential and allowlist declarations; their harness versions float |
 | apko and melange (Wolfi) | Apache-2.0 | learn from | Wolfi packages only Codex and Node of our set |

@@ -42,6 +42,7 @@ net.createServer(c => {
   const u = net.connect(process.argv[1]);
   c.pipe(u); u.pipe(c);
   u.on("error", () => c.destroy());
+  c.on("error", () => u.destroy());
 }).listen(8080, "127.0.0.1");
 ' "$target" &
 fi

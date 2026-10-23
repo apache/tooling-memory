@@ -6,7 +6,6 @@
 # would need.
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/fixture.sh"
-trap fixture_down EXIT
 set +e
 mkdir -p "$FIX/root"
 (cd "$FIX/root" && ln -s usr/bin bin && ln -s usr/lib lib && ln -s usr/lib64 lib64 && ln -s usr/sbin sbin)

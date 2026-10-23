@@ -1,16 +1,18 @@
 #!/bin/sh
 # Inside a box: does a Node harness start, and do its model calls reach the egress through
 # a loopback relay, as `amem relay` would forward them? The relay here is a few lines of
-# Node that count connections. The stand-in egress answers 401, which Claude Code retries,
-# so the run ends on the timeout; what matters is that the calls arrived.
+# Node that count connections made through to the egress socket; the stand-in egress also
+# logs each request it receives, outside the box. It answers 401, which Claude Code
+# retries, so the run ends on the timeout; what matters is that the calls arrived.
 node -e '
 const net = require("net");
 let n = 0;
 net.createServer(c => {
-  require("fs").writeFileSync(process.env.HOME + "/relay.count", String(++n));
-  const u = net.connect("/run/memory/egress.sock");
+  const u = net.connect("/run/memory/egress.sock", () =>
+    require("fs").writeFileSync(process.env.HOME + "/relay.count", String(++n)));
   c.pipe(u); u.pipe(c);
   u.on("error", () => c.destroy());
+  c.on("error", () => u.destroy());
 }).listen(8080, "127.0.0.1");
 ' &
 sleep 1

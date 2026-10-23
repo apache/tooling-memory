@@ -9,7 +9,6 @@
 # `--file-access-mounts=exclusive`.
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/fixture.sh"
-trap fixture_down EXIT
 set +e
 runsc=${RUNSC:?set RUNSC to the runsc binary}
 rootfs=${ROOTFS:-}

@@ -6,7 +6,6 @@
 # command run inside.
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/fixture.sh"
-trap fixture_down EXIT
 set +e
 [ $# -gt 0 ] || set -- python3 -I /work/contract-check.py
 if [ -n "${ROOTFS:-}" ]; then
@@ -14,7 +13,8 @@ if [ -n "${ROOTFS:-}" ]; then
 else
     set -- "${IMAGE:-docker.io/library/python:3.12-slim}" "$@"
 fi
-podman run --rm --network none --userns keep-id --user 1000:1000 --read-only \
+# the caller is uid 1000 inside whatever it is outside, so the fixture it owns is writable
+podman run --rm --network none --userns keep-id:uid=1000,gid=1000 --user 1000:1000 --read-only \
     ${RUNTIME:+--runtime "$RUNTIME"} \
     -v "$FIX/home:/home/user:rw" \
     -v "$FIX/work:/work:rw" \

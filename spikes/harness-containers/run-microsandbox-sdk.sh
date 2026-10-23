@@ -6,7 +6,6 @@
 # check.
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/fixture.sh"
-trap fixture_down EXIT
 set +e
 [ $# -gt 0 ] || set -- python3 -I /work/contract-check.py
 "${MSB_PROBE:?set MSB_PROBE to the built msb-probe}" "$FIX" \

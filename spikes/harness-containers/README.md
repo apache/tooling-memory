@@ -6,8 +6,8 @@ results compare. Nothing here is built, tested, or shipped by the workspace.
 
 | File | What it is |
 |---|---|
-| `contract-check.py` | runs inside a box; one line per assertion of contract points 1 and 2, exit 1 if any failed |
-| `fixture.sh` | the host side: a scratch tree at the launcher's layout, a stand-in egress on a unix socket, a marker in a host home that must stay invisible |
+| `contract-check.py` | runs inside a box; one line per assertion of contract points 1 and 2, exit 1 if any failed. Read-only is the mount's flag, never a refused write, which file mode alone would give |
+| `fixture.sh` | the host side: a scratch tree at the launcher's layout, a stand-in egress on a unix socket that logs each request, a marker in a host home that must stay invisible. Its EXIT trap, set before anything is copied in, removes the tree on an error or a signal |
 | `harness-smoke.sh` | runs inside a box with Node: three harnesses start, and Claude Code's calls reach the egress through a loopback relay |
 | `harness-call.sh` | runs inside a box: one real Claude Code call through a loopback relay (Python where the image has it, else Node; vsock where `CHECK_SOCKET` says so), with `fixture.sh`'s `UPSTREAM` and `LOGIN` set |
 | `run-host.sh` | the control: the check unconfined on the host, where it must fail |
@@ -19,8 +19,8 @@ results compare. Nothing here is built, tested, or shipped by the workspace.
 | `run-gvisor.sh` | gVisor `runsc --rootless --network=none --host-uds=open` from a generated OCI spec |
 | `run-microsandbox.sh` | microsandbox's `msb`, a libkrun microVM, the egress mapped to vsock port 5000 |
 | `run-microsandbox-sdk.sh`, `msb-probe/` | the same through microsandbox's Rust SDK, for `disable_network()`, which the CLI cannot express; a standalone crate, outside the workspace |
-| `bench.sh` | runs inside a box with Node: harness-shaped work, timed |
-| `bench-compare.sh` | `bench.sh` under runc, gVisor, gVisor with cached mounts, and gVisor's `kvm` platform where `/dev/kvm` is open, interleaved; a table of medians |
+| `bench.sh` | runs inside a box with Node: harness-shaped work, timed, or FAIL where a task did not complete |
+| `bench-compare.sh` | `bench.sh` under runc, gVisor, gVisor with cached mounts, and gVisor's `kvm` platform where `/dev/kvm` is open, interleaved; a table of medians against runc, leaving out a task that failed in any box |
 | `agent-sandbox/` | agent-sandbox on kind: three pod layouts, a seccomp profile that allows our backend inside a pod, a warm pool; its own README |
 | `image-lockfile/`, `image-nix/` | the harness image with an npm lockfile and a digest-pinned base, and from llm-agents.nix; each with its own README |
 | `research/` | the per-layer reports the doc was written from, and the brief their agents worked to |
@@ -104,26 +104,29 @@ UPSTREAM=... LOGIN=... CLAUDE_BIN=$(readlink -f ~/.local/bin/claude) \
 ## Results, 19, 20 and 23 October 2026
 
 Linux on WSL2, kernel 6.18.40, x86_64, podman 4.9.3 with runc. FAIL lines only; every other
-assertion passed.
+assertion passed. Every row is the corrected check (read-only by the mount's flag), rerun on
+23 October; the first version passed `/usr` and the memory binary on file mode alone, even
+unconfined.
 
 | Box | Failed |
 |---|---|
-| host, unconfined (control) | only loopback; no TCP out; no name resolution; no vsock; projection read-only; no rw mount under `/usr`; host marker invisible |
+| host, unconfined (control) | only loopback; no TCP out; no name resolution; no vsock; projection, system and memory binary read-only; no rw mount under `/usr`; host marker invisible |
 | `amem` namespaces (ours) | no vsock socket; no rw mount under `/usr` (`/usr/lib/wsl/lib`, `/usr/lib/modules/...`) |
 | rootless podman, runc | no vsock socket |
-| nsjail, built from master on 19 October, with the rule | none |
+| nsjail, built from master (`4ff54a6`, 2 October), with the rule | none |
 | nsjail without the rule (`NSJAIL_SECCOMP=`) | no vsock socket |
 | fcage 0.5.0, with the rule | none |
 | fcage without the rule (`FCAGE_SECCOMP=`) | no vsock socket |
 | gVisor `release-20261012.0`, rootless, systrap | none; the workload runs as uid 0 inside, see below |
 | the same on `--platform=kvm` | none (and without `/dev/kvm` access it refuses to start: `error opening KVM device file (/dev/kvm): permission denied`) |
-| microsandbox 0.7.8, `msb run --net none` | only loopback (`eth0`, `dummy0`) |
-| microsandbox 0.7.8, SDK `disable_network()` | only loopback (`dummy0`: down, no address, no route; no virtio-net device in the guest) |
+| microsandbox 0.7.8, `msb run --net none` | only loopback (`eth0`, `dummy0`); system read-only (the image's root is a read-write mount) |
+| microsandbox 0.7.8, SDK `disable_network()` | only loopback (`dummy0`: down, no address, no route; no virtio-net device in the guest); system read-only (a read-write mount) |
 
 Harness smoke, on one rootfs (node:24-slim with Claude Code 2.1.296, Codex 0.162.1, Gemini
 CLI 0.63.0): all three start under podman and under gVisor, and Claude Code's calls reach
-the stand-in egress through the loopback relay under both (7 and 6 calls in 20 seconds; it
-retries the stand-in's 401, so the run ends on the timeout).
+the stand-in egress through the loopback relay under both (7 and 6 calls in 20 seconds, each
+also logged by the stand-in outside the box; it retries the stand-in's 401, so the run ends
+on the timeout).
 
 Real call, `harness-call.sh`, 23 October, Claude Code on a subscription login, one word asked:
 

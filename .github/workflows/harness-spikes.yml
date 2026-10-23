@@ -5,7 +5,8 @@ name: Harness spikes
 # agent-sandbox with `hostUsers: false`, and /dev/kvm for gVisor's kvm platform. Nothing here
 # builds or ships anything; each job's log is the result, shown in the run's summary and
 # kept as an artifact. A FAIL line in a log is a finding, not a failed job: the runners
-# exit 0 after printing what the check reported. Run by hand, and on a pull request that
+# exit 0 after printing what the check reported. A log with no check lines at all is a
+# failed job, since then nothing was looked at. Run by hand, and on a pull request that
 # changes the spikes or this file.
 
 on:
@@ -17,6 +18,12 @@ on:
 
 permissions:
   contents: read
+
+# bash rather than the default `bash -e`, for pipefail: a step that pipes into tee fails
+# with what it piped
+defaults:
+  run:
+    shell: bash
 
 jobs:
   # The contract check under our own Seatbelt backend, which is dry-coded and has not run on
@@ -37,9 +44,14 @@ jobs:
         run: |
           sw_vers | tee seatbelt.log
           spikes/harness-containers/run-seatbelt.sh 2>&1 | tee -a seatbelt.log
+          grep -qE '^(PASS|FAIL) ' seatbelt.log || { echo "the check printed no results"; exit 1; }
       - name: what Seatbelt denied
         if: always()
-        run: log show --last 20m --style compact --predicate 'sender == "Sandbox"' | tail -300 > denials.log || true
+        run: |
+          # every Sandbox report since the job started; the summary counts those naming a
+          # process the check runs
+          log show --last 30m --style compact --predicate 'sender == "Sandbox"' > denials.log
+          grep -E 'deny\(' denials.log | grep -E '(python3?|sh|amem|memory)\([0-9]+\)' > denials-ours.log || true
       - name: summary
         if: always()
         run: |
@@ -48,7 +60,10 @@ jobs:
             echo '```text'
             cat seatbelt.log
             echo '```'
-            echo "Sandbox denials logged: $(grep -c -i deny denials.log || true); the full list is in the artifact."
+            echo "Sandbox denials naming the check's processes: $(wc -l < denials-ours.log); all reports are in the artifact."
+            echo '```text'
+            sort -u denials-ours.log | head -100
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -57,6 +72,7 @@ jobs:
           path: |
             seatbelt.log
             denials.log
+            denials-ours.log
 
   # agent-sandbox's layouts on kind with the node under Docker, which is rootful here: on a
   # rootless node `hostUsers: false` cannot start, because containerd's idmapped mounts need
@@ -81,7 +97,9 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - run: docker pull docker.io/library/python:3.12-slim
       - name: every layout, hostUsers false among them
-        run: ENGINE=docker DOWN=1 spikes/harness-containers/agent-sandbox/run.sh 2>&1 | tee kind.log
+        run: |
+          ENGINE=docker DOWN=1 spikes/harness-containers/agent-sandbox/run.sh 2>&1 | tee kind.log
+          grep -qE '^(PASS|FAIL) ' kind.log || { echo "the check printed no results"; exit 1; }
       - name: summary
         if: always()
         run: |
@@ -127,15 +145,21 @@ jobs:
       - name: contract check, systrap then kvm
         run: |
           uname -r | tee gvisor.log
-          spikes/harness-containers/run-gvisor.sh 2>&1 | tee -a gvisor.log
-          RUNSC_FLAGS=--platform=kvm spikes/harness-containers/run-gvisor.sh 2>&1 | tee -a gvisor.log
+          for platform in systrap kvm; do
+            echo "== $platform" | tee -a gvisor.log
+            RUNSC_FLAGS=--platform=$platform spikes/harness-containers/run-gvisor.sh 2>&1 | tee run.log
+            cat run.log >> gvisor.log
+            grep -qE '^(PASS|FAIL) ' run.log || { echo "the check on $platform printed no results"; exit 1; }
+          done
       - name: a Node rootfs with the harnesses
         run: |
           podman run --name h docker.io/library/node:24-slim npm install -g \
             @anthropic-ai/claude-code@2.1.296 @openai/codex@0.162.1 @google/gemini-cli@0.63.0
           mkdir "$RUNNER_TEMP/rootfs" && podman export h | tar -x -C "$RUNNER_TEMP/rootfs" && podman rm h
       - name: overhead against runc
-        run: ROOTFS="$RUNNER_TEMP/rootfs" spikes/harness-containers/bench-compare.sh | tee bench.md
+        run: |
+          ROOTFS="$RUNNER_TEMP/rootfs" spikes/harness-containers/bench-compare.sh | tee bench.md
+          grep -q '^| node_start' bench.md || { echo "no task completed in every box"; exit 1; }
       - name: summary
         if: always()
         run: |
