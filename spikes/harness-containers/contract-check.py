@@ -8,9 +8,14 @@ binary and the projection are read-only, the system is read-only, and a marker f
 the host's home is not visible at its host path.
 
 CHECK_SOCKET may name a vsock address, `vsock:CID:PORT`, for a microVM, whose egress
-crosses as a vsock port rather than a bind-mounted socket. Paths default to the Linux layout (crates/sandbox, `Layout::namespaces`); a backend that
-keeps host paths sets CHECK_* to say where it put each thing. Prints one line per check
-and exits 1 if any failed. Standard library only, so any python3 inside the box will do.
+crosses as a vsock port rather than a bind-mounted socket, or `tcp:HOST:PORT`, the relay's
+loopback port, where the socket's own path is not known inside. Paths default to the Linux
+layout (crates/sandbox, `Layout::namespaces`); a backend that keeps host paths sets CHECK_*
+to say where it put each thing. CHECK_LOOPBACK_OTHER names a port the host listens on at
+127.0.0.1, which must not be reachable. On macOS, where Seatbelt denies the network rather
+than removing it, the interfaces are reported, not checked, and the mount table is not
+read. Prints one line per check and exits 1 if any failed. Standard library only, so any
+python3 inside the box will do.
 """
 
 import os
@@ -26,6 +31,8 @@ LAYOUT = {
     "system": os.environ.get("CHECK_SYSTEM", "/usr"),
 }
 MARKER = os.environ.get("CHECK_HOST_MARKER", "")
+LOOPBACK_OTHER = os.environ.get("CHECK_LOOPBACK_OTHER", "")
+DARWIN = sys.platform == "darwin"
 
 results = []
 
@@ -48,6 +55,8 @@ def writable(directory):
 
 
 def interfaces():
+    if DARWIN:
+        return sorted(name for _, name in socket.if_nameindex())
     try:
         return sorted(os.listdir("/sys/class/net"))
     except OSError:
@@ -77,9 +86,13 @@ def vsock_address(spec):
 
 
 def egress_answers(where):
-    family, address = (
-        (socket.AF_VSOCK, vsock_address(where)) if where.startswith("vsock:") else (socket.AF_UNIX, where)
-    )
+    if where.startswith("vsock:"):
+        family, address = socket.AF_VSOCK, vsock_address(where)
+    elif where.startswith("tcp:"):
+        host, port = where.removeprefix("tcp:").rsplit(":", 1)
+        family, address = socket.AF_INET, (host, int(port))
+    else:
+        family, address = socket.AF_UNIX, where
     try:
         with socket.socket(family, socket.SOCK_STREAM) as s:
             s.settimeout(3)
@@ -93,7 +106,10 @@ def egress_answers(where):
 
 
 ifaces = interfaces()
-check(1, "only loopback", ifaces == ["lo"], ",".join(ifaces))
+if DARWIN:
+    print(f"info  interfaces {','.join(ifaces)}: Seatbelt denies their use, it does not remove them")
+else:
+    check(1, "only loopback", ifaces == ["lo"], ",".join(ifaces))
 ok, why = tcp_out("1.1.1.1", 443)
 check(1, "no TCP to the internet", not ok, why)
 ok, why = resolves("example.com")
@@ -112,6 +128,8 @@ if LAYOUT["socket"].startswith("vsock:"):
         except OSError:
             pass
     check(1, f"vsock reaches only port {port} on cid {cid}", not reached, ",".join(reached))
+elif not hasattr(socket, "AF_VSOCK"):
+    check(1, "no vsock socket", True, "no AF_VSOCK on this platform")
 else:
     # A network namespace does not cover vsock: under a VM (WSL2, a cloud guest) it
     # reaches the hypervisor's host whatever the namespace says, so the box must refuse
@@ -123,6 +141,9 @@ else:
         check(1, "no vsock socket", True, e.strerror or str(e))
 ok, why = egress_answers(LAYOUT["socket"])
 check(1, "the egress socket answers", ok, why)
+if LOOPBACK_OTHER:
+    ok, why = tcp_out("127.0.0.1", int(LOOPBACK_OTHER))
+    check(1, f"no other loopback port ({LOOPBACK_OTHER})", not ok, why)
 
 for key in ("home", "work"):
     ok, why = writable(LAYOUT[key])
@@ -139,17 +160,19 @@ except OSError:
     mb_writable = False
 check(2, f"memory binary present, read-only, at {mb}", os.access(mb, os.X_OK) and not mb_writable)
 # A read-only bind that is not recursive leaves the host's submounts under it writable.
-system = LAYOUT["system"].rstrip("/") + "/"
-with open("/proc/self/mountinfo") as f:
-    rw_below = [
-        fields[4]
-        for fields in (line.split() for line in f)
-        if fields[4].startswith(system) and "rw" in fields[5].split(",")
-    ]
-check(2, f"no read-write mount under {LAYOUT['system']}", not rw_below, ",".join(rw_below))
+if not DARWIN:
+    system = LAYOUT["system"].rstrip("/") + "/"
+    with open("/proc/self/mountinfo") as f:
+        rw_below = [
+            fields[4]
+            for fields in (line.split() for line in f)
+            if fields[4].startswith(system) and "rw" in fields[5].split(",")
+        ]
+    check(2, f"no read-write mount under {LAYOUT['system']}", not rw_below, ",".join(rw_below))
 if MARKER:
     check(2, "host home marker not visible", not os.path.exists(MARKER), MARKER)
 
-print(f"info  pid 1 is {open('/proc/1/comm').read().strip()}; {len([p for p in os.listdir('/proc') if p.isdigit()])} processes visible")
+if not DARWIN:
+    print(f"info  pid 1 is {open('/proc/1/comm').read().strip()}; {len([p for p in os.listdir('/proc') if p.isdigit()])} processes visible")
 print(f"info  uid {os.getuid()}, hostname {socket.gethostname()}")
 sys.exit(0 if all(results) else 1)

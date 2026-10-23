@@ -8,7 +8,7 @@ network is the harness's network unless something separates them.
 
 | File | What it is |
 |---|---|
-| `run.sh` | creates a kind cluster on rootless podman if missing, installs agent-sandbox (release manifests), applies every layout, runs `../contract-check.py` in each harness; `DOWN=1` deletes the cluster |
+| `run.sh` | creates a kind cluster on rootless podman (or rootful Docker, `ENGINE=docker`) if missing, installs agent-sandbox (release manifests), applies every layout, runs `../contract-check.py` in each harness; `DOWN=1` deletes the cluster |
 | `common.yaml` | namespace, a stand-in egress (HTTP on a unix socket and/or TCP), a stand-in memory binary |
 | `layout-a.yaml` | A: egress as a native sidecar and the harness in one Sandbox, the socket in a shared `emptyDir` |
 | `layout-b.yaml` | B: the pod of A, varying the harness's seccomp profile and `hostUsers`, so our namespaces backend can `unshare` inside it |

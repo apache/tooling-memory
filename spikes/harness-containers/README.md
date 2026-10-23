@@ -12,6 +12,7 @@ results compare. Nothing here is built, tested, or shipped by the workspace.
 | `harness-call.sh` | runs inside a box: one real Claude Code call through a loopback relay (Python where the image has it, else Node; vsock where `CHECK_SOCKET` says so), with `fixture.sh`'s `UPSTREAM` and `LOGIN` set |
 | `run-host.sh` | the control: the check unconfined on the host, where it must fail |
 | `run-amem.sh` | the baseline: our own Linux backend, `amem launch --harness command` |
+| `run-seatbelt.sh` | our Seatbelt backend on macOS, `amem launch --harness command` with the real egress, the check told each host path; on Linux it runs the namespaces backend |
 | `run-podman.sh` | rootless podman, `--network none` |
 | `run-nsjail.sh` | nsjail, with a seccomp rule refusing vsock and io_uring |
 | `run-fcage.sh` | ferroday-cage's `fcage`, with the same rule |
@@ -65,6 +66,16 @@ The SDK probe builds outside the workspace, into a target directory of its own:
 (cd msb-probe && CARGO_TARGET_DIR=/some/scratch/msb-target cargo build --release)
 export MSB_PROBE=/some/scratch/msb-target/release/msb-probe
 ```
+
+## In CI
+
+`.github/workflows/harness-spikes.yml` runs what this machine could not: `run-seatbelt.sh` on a
+macOS runner, with Seatbelt's denials from the system log; `agent-sandbox/run.sh` with
+`ENGINE=docker` on an Ubuntu runner, where the node is rootful and `hostUsers: false` can
+start; and `run-gvisor.sh` and `bench-compare.sh` with `/dev/kvm` opened on an Ubuntu runner,
+which is a VM, so kvm is nested there too. By hand (`gh workflow run harness-spikes.yml`, once
+the file is on the default branch), and on a pull request that touches the spikes. Each job's
+log is in the run's summary and its artifacts.
 
 ## Running
 

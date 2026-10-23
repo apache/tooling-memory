@@ -1,11 +1,13 @@
 #!/bin/sh
 # Contract point 1 for a harness pod with the egress beside it, under
-# kubernetes-sigs/agent-sandbox on kind (rootless podman). Creates the cluster if it is
+# kubernetes-sigs/agent-sandbox on kind (rootless podman by default). Creates the cluster if it is
 # missing, installs agent-sandbox, applies each layout, and runs ../contract-check.py in
-# the harness container of each. DOWN=1 deletes the cluster at the end.
+# the harness container of each. DOWN=1 deletes the cluster at the end. ENGINE=docker
+# runs the node under Docker instead: rootful, as on a CI runner, which
+# `hostUsers: false` needs (idmapped mounts).
 #
-# Needs kind, kubectl, podman, gh and python3 on PATH, and the image
-# docker.io/library/python:3.12-slim in podman's store (it is loaded into the node, so
+# Needs kind, kubectl, the engine, gh and python3 on PATH, and the image
+# docker.io/library/python:3.12-slim in the engine's store (it is loaded into the node, so
 # the cluster pulls nothing but its own images).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -18,11 +20,14 @@ NS=as-spike
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-export KIND_EXPERIMENTAL_PROVIDER=podman
-# kind follows the node's log with `podman logs -f`, which podman refuses when its log
-# driver is journald and its event backend is not; k8s-file avoids that.
-printf '[containers]\nlog_driver = "k8s-file"\n' > "$work/containers.conf"
-export CONTAINERS_CONF_OVERRIDE="$work/containers.conf"
+ENGINE=${ENGINE:-podman}
+if [ "$ENGINE" = podman ]; then
+    export KIND_EXPERIMENTAL_PROVIDER=podman
+    # kind follows the node's log with `podman logs -f`, which podman refuses when its log
+    # driver is journald and its event backend is not; k8s-file avoids that.
+    printf '[containers]\nlog_driver = "k8s-file"\n' > "$work/containers.conf"
+    export CONTAINERS_CONF_OVERRIDE="$work/containers.conf"
+fi
 k() { kubectl --context "kind-$CLUSTER" "$@"; }
 x() { pod=$1; shift; k -n $NS exec "$pod" -c harness -- "$@"; }
 say() { printf '\n### %s\n' "$*"; }
@@ -40,12 +45,12 @@ k apply --server-side -f "$work/sandbox-with-extensions.yaml" >/dev/null || exit
 k -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=300s
 
 say "image and seccomp profile into the node"
-podman save -o "$work/image.tar" "$IMAGE" >/dev/null && kind load image-archive "$work/image.tar" --name "$CLUSTER"
+"$ENGINE" save -o "$work/image.tar" "$IMAGE" >/dev/null && kind load image-archive "$work/image.tar" --name "$CLUSTER"
 gh api "repos/moby/moby/contents/vendor/github.com/moby/profiles/seccomp/default.json?ref=$MOBY_TAG" \
     -H 'Accept: application/vnd.github.raw' > "$work/default.json" || exit 1
 python3 -I "$here/seccomp-userns.py" "$work/default.json" > "$work/amem-userns.json" || exit 1
-podman exec "$NODE" mkdir -p /var/lib/kubelet/seccomp/profiles
-podman cp "$work/amem-userns.json" "$NODE:/var/lib/kubelet/seccomp/profiles/amem-userns.json"
+"$ENGINE" exec "$NODE" mkdir -p /var/lib/kubelet/seccomp/profiles
+"$ENGINE" cp "$work/amem-userns.json" "$NODE:/var/lib/kubelet/seccomp/profiles/amem-userns.json"
 
 say "kindnet: is there a NetworkPolicy engine?"
 k -n kube-system logs ds/kindnet | grep -m1 'kube-network-policies' || echo "none found in kindnet's log"
@@ -92,7 +97,7 @@ for pod in b-userns b-userns-unconfined; do
     else
         k -n $NS get events --field-selector involvedObject.name=$pod,reason=FailedCreatePodSandBox \
             -o jsonpath='{.items[-1:].message}{"\n"}'
-        podman exec "$NODE" cat /proc/self/uid_map
+        "$ENGINE" exec "$NODE" cat /proc/self/uid_map
     fi
 done
 

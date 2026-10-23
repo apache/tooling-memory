@@ -386,10 +386,12 @@ hosted, orchestration above the harness, or the Polkadot framework.
 
 ## What was not done
 
-- Apple `container`, the Seatbelt cross-check, and anything else that needs a Mac.
-- agent-sandbox with `hostUsers: false`, which needs a rootful node: rootful podman under
-  kind, or a real cluster.
+- Apple `container`, and anything else that needs a Mac's virtualization.
 - gVisor's `kvm` platform on bare metal; here it ran nested under Hyper-V.
+- Three are in `.github/workflows/harness-spikes.yml`, which runs on GitHub's runners and
+  has not run yet: the contract check under our Seatbelt backend on macOS;
+  agent-sandbox with `hostUsers: false` on a rootful node, kind under Docker; and gVisor's
+  `kvm` platform again, nested on the runner's VM, as a second reading.
 - A real call through nsjail and fcage. Their builds went with the scratch directory, and they
   bind the socket in exactly as podman does, where the call completed.
 - microsandbox again once #1878 is fixed: `harness-call.sh` through `run-microsandbox-sdk.sh`
