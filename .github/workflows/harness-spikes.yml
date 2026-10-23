@@ -65,7 +65,7 @@ jobs:
           # every Sandbox report since the job started; the summary counts those naming a
           # process the check runs
           log show --last 30m --style compact --predicate 'sender == "Sandbox"' > denials.log
-          grep -E 'deny\(' denials.log | grep -E '(python3?|Python|xcrun|sh|bash|amem|memory|sandbox-exec)\([0-9]+\)' > denials-ours.log || true
+          grep -E 'deny\(' denials.log | grep -E '(python3?|Python|xcrun|sh|bash|true|echo|amem|memory|sandbox-exec)\([0-9]+\)' > denials-ours.log || true
       - name: summary
         if: always()
         run: |

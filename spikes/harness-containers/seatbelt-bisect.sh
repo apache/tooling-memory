@@ -74,19 +74,21 @@ try "ours, /usr/bin/true alone" "$base" /usr/bin/true
 try "ours, amem --version" "$base" "$amem" --version
 # shellcheck disable=SC2046
 try "ours, relay" "$base" $(relay)
-for extra in \
-    "(allow file-read-metadata)" \
-    "(allow file-read*)" \
-    "(allow file-map-executable)" \
-    "(allow mach-lookup)" \
-    "(allow ipc-posix-shm*)" \
-    "(allow iokit-open)" \
-    "(allow system-socket)" \
-    "(allow network*)" \
-    "(allow user-preference-read)" \
-    "(allow process-info*)" \
-    "(allow signal)"; do
-    # shellcheck disable=SC2046
-    try "ours + $extra" "$base
-$extra" $(relay)
-done
+# The first run (23 October): only a global `(allow file-read*)` let the relay start; of the
+# Sandbox reports, the only ones naming its processes were `deny(1) file-read-data /` and
+# `deny(1) file-write-data /dev/dtracehelper`. Each alone, then both:
+root='(allow file-read-data (literal "/"))'
+dtrace='(allow file-write-data (literal "/dev/dtracehelper"))'
+# shellcheck disable=SC2046
+try "ours + read of /" "$base
+$root" $(relay)
+# shellcheck disable=SC2046
+try "ours + dtracehelper" "$base
+$dtrace" $(relay)
+# shellcheck disable=SC2046
+try "ours + both" "$base
+$root
+$dtrace" $(relay)
+try "ours + both, relay running sh" "$base
+$root
+$dtrace" "$amem" relay --socket "$work/egress.sock" --listen "127.0.0.1:$port" -- /bin/sh -c 'echo sh ran'
