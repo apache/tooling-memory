@@ -734,6 +734,20 @@ mod on_a_mac {
     }
 
     #[test]
+    fn a_confined_process_starts_and_its_own_exit_code_comes_back() {
+        let inside = tempfile::tempdir().unwrap();
+        let (code, out, _) = run_captured(&plan(inside.path(), &["/usr/bin/true"])).unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+        // a code of its own, which a death by signal, reported as 1, cannot pass for
+        let (code, out, _) = run_captured(&plan(
+            inside.path(),
+            &["/bin/sh", "-c", "echo started; exit 7"],
+        ))
+        .unwrap();
+        assert_eq!((code, out.as_slice()), (7, b"started\n".as_slice()));
+    }
+
+    #[test]
     fn a_confined_cat_reads_inside_the_grant_and_not_outside() {
         let inside = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -741,7 +755,8 @@ mod on_a_mac {
         std::fs::write(outside.path().join("out.txt"), "secret").unwrap();
         let read = |file: &Path| {
             let f = file.display().to_string();
-            run_captured(&plan(inside.path(), &["/bin/cat", &f])).unwrap()
+            let (code, out, _) = run_captured(&plan(inside.path(), &["/bin/cat", &f])).unwrap();
+            (code, out)
         };
         let (code, out) = read(&inside.path().join("in.txt"));
         assert_eq!((code, out.as_slice()), (0, b"granted".as_slice()));

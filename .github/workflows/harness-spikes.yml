@@ -40,7 +40,10 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p amem
+      - name: the Seatbelt backend's own tests, which only a Mac compiles
+        run: cargo test -p dm-sandbox --lib seatbelt 2>&1 | tee sandbox-tests.log
       - name: contract check under Seatbelt
+        if: always()
         run: |
           sw_vers | tee seatbelt.log
           spikes/harness-containers/run-seatbelt.sh 2>&1 | tee -a seatbelt.log
@@ -72,6 +75,7 @@ jobs:
           {
             echo '### Seatbelt (macOS)'
             echo '```text'
+            grep -E '^test |^test result' sandbox-tests.log || true
             cat seatbelt.log
             echo '```'
             echo '```text'
@@ -91,6 +95,7 @@ jobs:
         with:
           name: seatbelt
           path: |
+            sandbox-tests.log
             seatbelt.log
             steps.log
             bisect.log
