@@ -27,6 +27,11 @@ since that grants user namespaces to every unprofiled binary on the machine.
 `amem doctor` reports this under `backend / user namespaces`, and `--unconfined` runs
 without a sandbox meanwhile.
 
+To take the profile off again, remove it rather than reloading: `apparmor_parser -R`
+unloads one, `-r` replaces one, and `systemctl reload apparmor` loads what is in
+`/etc/apparmor.d` without unloading what has left it. Deleting the file alone leaves the
+profile in the kernel and still in force.
+
 ```sh
 make launch HARNESS=claude                    # claude, your own login, confined
 make launch HARNESS=codex                     # codex, your ChatGPT login
