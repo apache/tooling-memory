@@ -321,6 +321,35 @@ server with one defect switched on per run, the guard and docs-only scripts, uns
 CI has not run since a billing failure, so the hook is the gate, and `make verify` is
 run by hand.
 
+Two of those tests reach outside the workspace, and a host can leave either of them
+failing for reasons that have nothing to do with the change in hand.
+
+The PostgreSQL half of the conformance suite starts an embedded server, which on some
+hosts arrives without the `UTC` zone and stops with `invalid value for parameter
+"TimeZone": "UTC"`. `MEMORY_PG_URL` names a server to borrow instead, and each test
+takes a database of its own on it and drops it afterwards:
+
+```sh
+docker run -d --name pg-test -e POSTGRES_PASSWORD=pg -p 55432:5432 postgres:17
+until docker exec pg-test pg_isready -q; do sleep 1; done
+export MEMORY_PG_URL='postgres://postgres:pg@127.0.0.1:55432/postgres'
+```
+
+Pick a port nothing else holds. A host with PostgreSQL clusters of its own has 5432
+taken and often 5433 as well, and the container then fails to bind, sits in `Created`,
+and logs nothing — while the port still answers, so the test reports a server that will
+not authenticate rather than one that is not there.
+
+The companion test loads the extension unpacked, which branded Google Chrome refuses
+(`--load-extension is not allowed in Google Chrome, ignoring`). Chrome is first in the
+search and starts, so it is chosen, and the test then waits out its two minutes rather
+than failing at once. Point `CHROME` at a Chromium; Playwright's will do:
+
+```sh
+npx playwright install chromium        # if there is none already
+export CHROME="$(ls -d ~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome | head -1)"
+```
+
 ## Layout
 
 | Path | What |
