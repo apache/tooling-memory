@@ -24,7 +24,7 @@ ship or require, so bubblewrap counts as out.
 Nothing replaces the wrapper. No project found combines what `crates/egress` does in one
 place: one unix socket as the box's only way out, per-session token metering from streamed
 responses, a label-versus-ceiling check before anything leaves, and memory served over MCP
-on the same socket. Around it, three things are worth taking, and four of our own gaps
+on the same socket. Around it, three things are worth taking, and five of our own gaps
 surfaced on the way:
 
 | Action | What | Why |
@@ -33,6 +33,7 @@ surfaced on the way:
 | Fix | Make the read-only system bind recursive (`mount_setattr` with `AT_RECURSIVE`) | Submounts under `/usr` stay writable inside our sandbox today; only file ownership holds them. Measured, below |
 | Fix | Port-restrict the CONNECT tunnel and check the resolved address before dialling | `crates/egress/src/lib.rs:756-771` dials any port on an allowed name, wherever it resolves |
 | Fix | Add `.github/dependabot.yml` | None exists; see the image section |
+| Fix | Let the Seatbelt profile read the root directory, `(allow file-read-data (literal "/"))`, and make the macOS CI job compile again | On macOS 26.6 every process under our profile aborts at start, `/usr/bin/true` included, so the Seatbelt backend runs nothing. Measured on GitHub's runner, below |
 | Fix | Fail the launch when the egress socket cannot be bound, and say why | A root whose socket path passes 108 bytes launches anyway and fails on a bind mount instead. Measured, below |
 | Adopt | `seccompiler` (Apache-2.0 OR BSD-3) and `landlock` (MIT OR Apache-2.0) in `crates/sandbox`, with Codex's seccomp rule set as the reference | The first fix, as libraries, from the rule set three harnesses already use |
 | Adopt | gVisor as an optional hardened Linux backend | Passed every check here, rootless, no KVM, no daemon; the Node harnesses run under it, and a real Claude Code call completed through it |
@@ -149,7 +150,7 @@ itself a Hyper-V guest, so `kvm` runs nested here, which is the likely reason. O
 it was not measured. What either cost adds to a real session, most of which is spent waiting
 on the model, was not measured.
 
-## Four gaps in our own code
+## Five gaps in our own code
 
 **vsock.** A network namespace does not cover `AF_VSOCK`. Inside our sandbox a vsock socket
 can be created, and on WSL2, or any VM guest with a vsock device, it addresses the hypervisor's
@@ -186,6 +187,33 @@ The cause is in the launcher. It spawns `serve_unix` as a task, waits up to two 
 socket to appear, and goes on whether or not it did (`crates/memory/src/main.rs:3482-3494`).
 The bind error stays in the task. The fix: check the path length before binding, or wait on the
 bind's result rather than on the file.
+
+**A Seatbelt profile under which nothing starts.** Our macOS backend was dry-coded, and this
+was its first run on a Mac: GitHub's `macos-latest`, macOS 26.6.2.
+
+What happened, run by `.github/workflows/harness-spikes.yml`:
+- Every `amem launch` exited 1 without a word, `/usr/bin/true` included (`seatbelt-steps.sh`).
+- Run under `sandbox-exec` directly with the profile's shape rebuilt (`seatbelt-bisect.sh`),
+  `/usr/bin/true`, `amem --version` and the relay each died on SIGABRT.
+- Under `(allow default)` they ran.
+
+The cause, bisected:
+- The only Sandbox reports naming these processes were `deny(1) file-read-data /` and
+  `deny(1) file-write-data /dev/dtracehelper`.
+- Adding `(allow file-read-data (literal "/"))` alone let all three start, and let a shell run
+  through the relay. The `dtracehelper` grant changed nothing.
+- The profile grants `/` its metadata only (`crates/sandbox/src/seatbelt.rs`, the metadata rule
+  of `render`). The process start reads the root directory's listing, and aborts when refused.
+
+Why nothing caught it: the launcher reports a death by signal as exit 1 without saying so,
+in two places (`crates/sandbox/src/measure.rs:73`, the `wait` function, and the relay at
+`crates/memory/src/main.rs:3986`). And the macOS CI job that runs this backend's
+`sandbox-exec` tests failed to compile on the last two runs on `main` (`0eacdb8`, `3ed7b48`):
+`fn io` in `crates/mount/src/lib.rs:57` is dead code on macOS, an error under `-D warnings`.
+So those tests did not run.
+
+The fix: the grant, the macOS job compiling again, and a test that launches through the relay
+rather than `/bin/cat` alone. Each belongs on a branch of its own.
 
 ## Embeddable confinement
 
@@ -401,10 +429,11 @@ hosted, orchestration above the harness, or the Polkadot framework.
 
 - Apple `container`, and anything else that needs a Mac's virtualization.
 - gVisor's `kvm` platform on bare metal; here it ran nested under Hyper-V.
-- Three are in `.github/workflows/harness-spikes.yml`, which runs on GitHub's runners and
-  has not run yet: the contract check under our Seatbelt backend on macOS;
-  agent-sandbox with `hostUsers: false` on a rootful node, kind under Docker; and gVisor's
-  `kvm` platform again, nested on the runner's VM, as a second reading.
+- The contract check under our Seatbelt backend, which waits on the fix above; the macOS job
+  in `.github/workflows/harness-spikes.yml` fails until then.
+- agent-sandbox with `hostUsers: false` on a rootful node (kind under Docker) and gVisor's
+  `kvm` platform nested on the runner's VM, the workflow's two Linux jobs. These had not
+  started when this was written: GitHub's runner queue held them.
 - A real call through nsjail and fcage. Their builds went with the scratch directory, and they
   bind the socket in exactly as podman does, where the call completed.
 - microsandbox again once #1878 is fixed: `harness-call.sh` through `run-microsandbox-sdk.sh`

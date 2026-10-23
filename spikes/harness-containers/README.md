@@ -79,6 +79,11 @@ which is a VM, so kvm is nested there too. By hand (`gh workflow run harness-spi
 the file is on the default branch), and on a pull request that touches the spikes. Each job's
 log is in the run's summary and its artifacts.
 
+The first macOS runs (23 October) found our Seatbelt profile aborting every process at
+start, `/usr/bin/true` included. `seatbelt-bisect.sh` traced it to the profile refusing
+`file-read-data` on `/`; granting that alone lets the relay start and run a shell. The
+fix belongs in `crates/sandbox`; until it lands, the macOS job fails. See the doc's fifth gap.
+
 ## Running
 
 `./run-<box>.sh` runs the check. `run-podman.sh` and `run-gvisor.sh` take `ROOTFS`, an
