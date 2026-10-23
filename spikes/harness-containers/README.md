@@ -14,6 +14,7 @@ results compare. Nothing here is built, tested, or shipped by the workspace.
 | `run-amem.sh` | the baseline: our own Linux backend, `amem launch --harness command` |
 | `run-seatbelt.sh` | our Seatbelt backend on macOS, `amem launch --harness command` with the real egress, the check told each host path; on Linux it runs the namespaces backend |
 | `seatbelt-steps.sh` | where a launch under Seatbelt stops: `amem launch` with commands of growing reach, one exit code each |
+| `seatbelt-bisect.sh` | macOS only: our profile's shape rebuilt, the relay run under it with one permission class added at a time, each exit or signal printed |
 | `run-podman.sh` | rootless podman, `--network none` |
 | `run-nsjail.sh` | nsjail, with a seccomp rule refusing vsock and io_uring |
 | `run-fcage.sh` | ferroday-cage's `fcage`, with the same rule |
