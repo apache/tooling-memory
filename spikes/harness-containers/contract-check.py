@@ -189,14 +189,18 @@ if not DARWIN:
         ]
     check(2, f"no read-write mount under {LAYOUT['system']}", not rw_below, ",".join(rw_below))
 if MARKER:
-    # only "no such file" is invisible: a refusal means the host's tree is in the box
+    # Only "no such file" is invisible where the box is a mount namespace: there a refusal
+    # means the host's tree is in the box, refused by file mode. Under Seatbelt the sandbox
+    # refuses with EPERM before the lookup, which says nothing of whether the file exists;
+    # file mode refuses with EACCES.
     try:
         os.stat(MARKER)
         check(2, "host home marker not visible", False, f"{MARKER} found")
     except FileNotFoundError:
         check(2, "host home marker not visible", True, MARKER)
     except OSError as e:
-        check(2, "host home marker not visible", False, f"{MARKER}: {e.strerror or e}")
+        refused = DARWIN and e.errno == 1
+        check(2, "host home marker not visible", refused, f"{MARKER}: {e.strerror or e}")
 
 if not DARWIN:
     print(f"info  pid 1 is {open('/proc/1/comm').read().strip()}; {len([p for p in os.listdir('/proc') if p.isdigit()])} processes visible")

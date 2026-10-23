@@ -40,6 +40,9 @@ pub const SYSTEM: &[&str] = &[
     "/private/var/db/dyld",
     // zoneinfo, which /etc/localtime points into
     "/private/var/db/timezone",
+    // the links that pick the system's tools: /bin/sh reads `sh` on every start, and the
+    // developer tools' shims, /usr/bin/python3 among them, read `developer_dir`
+    "/private/var/select",
 ];
 
 /// The links at the root through which a path into the system is often named: `/etc`,
@@ -661,6 +664,18 @@ mod tests {
         let mut bad = plan();
         bad.host_home = Some(PathBuf::from("/usr/home/me"));
         assert!(profile(&bad).unwrap_err().to_string().contains("/usr"));
+    }
+
+    #[test]
+    fn the_tool_selections_are_read_with_the_system() {
+        let p = profile(&plan()).unwrap();
+        let select = naming(&p, "/private/var/select");
+        assert_eq!(select.len(), 1, "{p}");
+        assert_eq!(select[0].0, "file-read*", "{p}");
+        assert!(
+            select[0].1.contains("(subpath \"/private/var/select\")"),
+            "{p}"
+        );
     }
 
     #[test]
