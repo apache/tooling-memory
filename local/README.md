@@ -10,6 +10,23 @@ a relay forwards one loopback port to the egress, which serves memory over MCP a
 forwards model calls to the provider or the gateway, checks the session label against the
 destination's ceiling first, and reads token usage out of every response.
 
+On Ubuntu 23.10 and later, install the AppArmor profile first, or no confined launch
+will start:
+
+```sh
+sudo install -m 644 packaging/apparmor/amem /etc/apparmor.d/amem
+sudo apparmor_parser -r /etc/apparmor.d/amem
+```
+
+Those releases set `kernel.apparmor_restrict_unprivileged_userns=1`, which moves a binary
+with no profile of its own into one that has no `CAP_SYS_ADMIN` as soon as it creates a
+user namespace. The namespace appears and everything in it then fails, so the error names
+a mapping or a mount rather than AppArmor. The profile mediates nothing — it exists so
+that amem has one, and grants `userns` — which is narrower than turning the sysctl off,
+since that grants user namespaces to every unprofiled binary on the machine.
+`amem doctor` reports this under `backend / user namespaces`, and `--unconfined` runs
+without a sandbox meanwhile.
+
 ```sh
 make launch HARNESS=claude                    # claude, your own login, confined
 make launch HARNESS=codex                     # codex, your ChatGPT login

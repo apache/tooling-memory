@@ -1,0 +1,58 @@
+# An AppArmor profile that lets amem create user namespaces.
+#
+# WHY THIS IS NEEDED
+#
+# Ubuntu 23.10 and later set kernel.apparmor_restrict_unprivileged_userns=1. That
+# does not block user namespaces outright: it moves a binary with no profile of its
+# own into a stub profile, `unprivileged_userns`, which has no CAP_SYS_ADMIN. So the
+# namespace is created and then everything inside it that needs privilege fails. In
+# the kernel audit log:
+#
+#   apparmor="AUDIT" operation="userns_create" info="Userns create - transitioning
+#     profile" profile="unconfined" target="unprivileged_userns"
+#     execpath="/home/you/.cargo/bin/amem"
+#   apparmor="DENIED" operation="capable" profile="unprivileged_userns"
+#     capability=21 capname="sys_admin"
+#
+# Without a profile, `amem launch` fails at the first mapping:
+#
+#   memory: sandbox: confinement: /proc/self/setgroups: Permission denied
+#   error: confinement: spawn /opt/memory/memory: Invalid argument (os error 22)
+#
+# WHAT THIS GRANTS
+#
+# `flags=(unconfined)` means this profile mediates nothing: amem is as unconstrained
+# as it was before. The profile exists only so that amem HAS one, which keeps the
+# userns transition from happening, and `userns,` is the single permission it adds.
+#
+# This is narrower than the alternative. Setting
+# kernel.apparmor_restrict_unprivileged_userns=0 grants user namespaces to every
+# unprofiled binary on the machine; this grants them to one path.
+#
+# INSTALL
+#
+#   sudo install -m 644 packaging/apparmor/amem /etc/apparmor.d/amem
+#   sudo apparmor_parser -r /etc/apparmor.d/amem
+#
+# Then `amem doctor` should report `backend / user namespaces` as passing.
+#
+# @{HOME} comes from tunables/home, included by tunables/global, and expands to each
+# home directory on the host, so this is not tied to one user. Two profiles because
+# the installed binary and the one `make launch` runs are different files.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+# `cargo install --path crates/memory`, or `make install`
+profile amem @{HOME}/.cargo/bin/amem flags=(unconfined) {
+  userns,
+
+  include if exists <local/amem>
+}
+
+# `cargo build --release`, which is what the Makefile's targets run
+profile amem-build @{HOME}/**/target/{release,debug}/amem flags=(unconfined) {
+  userns,
+
+  include if exists <local/amem>
+}

@@ -329,6 +329,34 @@ fn on_path(binary: &str) -> bool {
                 .any(|x| image::on_path(&format!("{binary}{x}"))))
 }
 
+/// Whether this host lets an unprivileged process enter the user namespace the native
+/// backends build their sandbox in. Probed rather than assumed: on Ubuntu 23.10 and
+/// later the namespace is created and then has no `CAP_SYS_ADMIN`, so without this the
+/// failure lands in the middle of a launch as a bare "Permission denied" that names
+/// neither AppArmor nor user namespaces.
+#[cfg(target_os = "linux")]
+fn user_namespaces(backend: Backend, checks: &mut Vec<Check>) {
+    if !matches!(backend, Backend::Namespaces | Backend::Image) {
+        return;
+    }
+    checks.push(match dm_sandbox::linux::availability() {
+        Ok(()) => check(
+            "backend",
+            "user namespaces",
+            Status::Pass,
+            "an unprivileged user namespace can be created and mapped",
+        ),
+        Err(why) => check("backend", "user namespaces", Status::Fail, why).fix(
+            "sudo install -m 644 packaging/apparmor/amem /etc/apparmor.d/amem && \
+             sudo apparmor_parser -r /etc/apparmor.d/amem; or launch with --unconfined",
+        ),
+    });
+}
+
+/// Nothing to report: the backends that need a user namespace are Linux's.
+#[cfg(not(target_os = "linux"))]
+fn user_namespaces(_backend: Backend, _checks: &mut Vec<Check>) {}
+
 /// How the projection reaches the sandbox: served live where the host has FUSE, rendered
 /// where not. Only where a backend of this host mounts it.
 fn projection(backend: Backend, checks: &mut Vec<Check>) {
@@ -378,6 +406,7 @@ async fn harnesses(root: &Path, checks: &mut Vec<Check>, found: &mut Found) {
         Status::Pass
     };
     checks.push(check("backend", "auto", status, backend_detail));
+    user_namespaces(backend, checks);
     projection(backend, checks);
     let list: Vec<Harness> = Harness::ALL
         .into_iter()
