@@ -47,6 +47,9 @@ Dependabot pull request that does it.
 
 `overrides` in `package.json` raises a transitive package that a harness pins exactly and
 that has a fixed release the harness does not take yet. Dependabot cannot raise those
-itself. Today it holds `sharp` at 0.35.5 (CVE-2026-96889, in the `librsvg` it bundles),
-which `@qwen-code/qwen-code` 0.25.0 and 0.26.0 pin at 0.35.4. Remove an entry when every
-harness that pulls the package in takes the fixed version itself.
+itself. Each entry is scoped to the harness that pins the package, so it changes nothing
+else. Today one entry sets `sharp` to 0.35.5 under `@qwen-code/qwen-code` (CVE-2026-96889,
+in the `librsvg` that `sharp` bundles); qwen-code 0.25.0 and 0.26.0 pin it at 0.35.4. npm
+does not warn when an override applies, so a bump runs `npm ls sharp` and removes the entry
+when the harness pins 0.35.5 or later itself. `images/harness/Dockerfile` installs with
+`npm install -g`, which ignores `overrides`, so the image built today still has 0.35.4.

@@ -12,6 +12,8 @@
     "@xai-official/grok": "1.0.50"
   },
   "overrides": {
-    "sharp": "0.35.5"
+    "@qwen-code/qwen-code": {
+      "sharp": "0.35.5"
+    }
   }
 }
