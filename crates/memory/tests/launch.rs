@@ -248,6 +248,16 @@ fn confined_launch_has_no_network_and_no_host_home() {
     assert!(text.contains("HOME=/home/user"), "{text}");
     assert!(text.contains(&format!("cwd={}", work.display())), "{text}");
     assert!(stderr.contains("confined to"), "{stderr}");
+    let left: Vec<_> = std::fs::read_dir(root.join("state/run"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("egress-"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the session takes its socket away: {left:?}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -384,6 +394,80 @@ fn an_unconfined_launch_needs_no_socket_and_runs_from_a_long_root() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(read_out(&work).contains("mcp=200"), "{}", read_out(&work));
+}
+
+#[test]
+fn an_unconfined_launch_binds_no_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let run = root.join("state/run");
+    let bins = fake_harness(
+        dir.path(),
+        &format!("ls -a '{}' > ./run.ls; exit 0", run.display()),
+    );
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = launch(&root, &bins, &work, &["--unconfined"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let seen = std::fs::read_to_string(work.join("run.ls")).unwrap();
+    assert!(
+        !seen.contains("egress-"),
+        "state/run while the harness ran: {seen}"
+    );
+}
+
+/// `amem inside` with this requests directory, a subscription login in a host home, and
+/// a prompt; the caller answers the requests.
+fn inside(root: &Path, requests: &Path, host_home: &Path) -> std::process::Child {
+    std::fs::create_dir_all(host_home.join(".claude")).unwrap();
+    std::fs::write(host_home.join(".claude/.credentials.json"), "{}").unwrap();
+    memory()
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "inside",
+            "--harness",
+            "claude",
+            "--auth",
+            "subscription",
+        ])
+        .args([
+            "--requests",
+            requests.to_str().unwrap(),
+            "--host-home",
+            host_home.to_str().unwrap(),
+        ])
+        .args(["--prompt", "say the answer", "--no-handoff"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn inside_with_a_requests_directory_too_long_for_its_socket_fails_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let requests = dir.path().join("v".repeat(120));
+    std::fs::create_dir_all(&requests).unwrap();
+    let socket = requests.join("egress.sock");
+
+    let out = inside(&root, &requests, &dir.path().join("host-home"))
+        .wait_with_output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{} bytes", socket.as_os_str().len())),
+        "the error names the socket's length: {stderr}"
+    );
+    assert!(
+        !requests.join("req-0.json").exists(),
+        "no run was asked for"
+    );
 }
 
 #[test]
@@ -676,32 +760,8 @@ fn inside_writes_image_requests_and_reports_done() {
     let root = init_root(dir.path());
     let requests = dir.path().join("volume");
     std::fs::create_dir_all(&requests).unwrap();
-    let host_home = dir.path().join("host-home");
-    std::fs::create_dir_all(host_home.join(".claude")).unwrap();
-    std::fs::write(host_home.join(".claude/.credentials.json"), "{}").unwrap();
 
-    let child = memory()
-        .args([
-            "--root",
-            root.to_str().unwrap(),
-            "inside",
-            "--harness",
-            "claude",
-            "--auth",
-            "subscription",
-        ])
-        .args([
-            "--requests",
-            requests.to_str().unwrap(),
-            "--host-home",
-            host_home.to_str().unwrap(),
-        ])
-        .args(["--prompt", "say the answer", "--no-handoff"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = inside(&root, &requests, &dir.path().join("host-home"));
 
     let req = await_request(&requests.join("req-0.json"));
     check_image_request(&req);
@@ -725,6 +785,10 @@ fn inside_writes_image_requests_and_reports_done() {
             .unwrap()
             .trim(),
         "0"
+    );
+    assert!(
+        !requests.join("egress.sock").exists(),
+        "the session takes its socket away with it"
     );
 }
 

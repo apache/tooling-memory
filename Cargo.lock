@@ -897,6 +897,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
+ "libc",
  "opentelemetry",
  "opentelemetry_sdk",
  "reqwest 0.13.1",

@@ -209,13 +209,10 @@ pub enum Error {
 }
 
 /// `sizeof(sockaddr_un.sun_path)`: the most a unix socket path takes, its closing NUL
-/// included.
+/// included. The field is the struct's last, so its size is what follows its offset.
 #[cfg(unix)]
-pub const SUN_PATH: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
-    108
-} else {
-    104
-};
+pub const SUN_PATH: usize =
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
 
 struct Inner {
     memory: Arc<Memory>,
@@ -528,13 +525,16 @@ impl Egress {
             .with_state(self.clone())
     }
 
-    /// Bind the unix socket the egress serves on, removing a stale one first. A path
-    /// longer than the system takes is refused with its length. Needs a Tokio runtime.
-    /// Unix only; Windows runs the harness unconfined over TCP.
+    /// Bind the unix socket the egress serves on. A path longer than the system takes is
+    /// refused with its length. A socket already at the path is removed when no listener
+    /// holds it, and refused when one does; anything else there is refused and left in
+    /// place. Needs a Tokio runtime. Unix only; Windows runs the harness unconfined over
+    /// TCP.
     ///
     /// # Errors
     ///
-    /// When the path is too long or the socket cannot be bound.
+    /// When the path is too long, something other than a stale socket is there, or the
+    /// socket cannot be bound.
     #[cfg(unix)]
     pub fn bind_unix(path: &FsPath) -> Result<tokio::net::UnixListener, Error> {
         let len = path.as_os_str().len();
@@ -551,9 +551,7 @@ impl Egress {
                 format!("bind {}: {e}", path.display()),
             ))
         };
-        if path.exists() {
-            std::fs::remove_file(path).map_err(named)?;
-        }
+        remove_stale_socket(path).map_err(named)?;
         tokio::net::UnixListener::bind(path).map_err(named)
     }
 
@@ -589,6 +587,34 @@ impl Egress {
     /// When the address cannot be bound or serving fails.
     pub async fn serve_tcp(&self, addr: std::net::SocketAddr) -> Result<(), Error> {
         self.serve(tokio::net::TcpListener::bind(addr).await?).await
+    }
+}
+
+/// Remove a socket no listener holds. Nothing there is fine; a socket a listener answers
+/// on, or anything that is not a socket, is an error and stays.
+#[cfg(unix)]
+fn remove_stale_socket(path: &FsPath) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        other => other?,
+    };
+    if !meta.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "something that is not a socket is there; it is left in place",
+        ));
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(std::io::Error::new(
+            ErrorKind::AddrInUse,
+            "the socket is in use by another launch",
+        )),
+        Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+            std::fs::remove_file(path)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1390,6 +1416,51 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(200), e.serve_unix(&path)).await;
         assert!(serving.is_err(), "still serving: {serving:?}");
         assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_no_listener_holds_is_replaced() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("egress.sock");
+        drop(Egress::bind_unix(&path).unwrap());
+        assert!(path.exists(), "a dropped listener leaves its file behind");
+        let again = Egress::bind_unix(&path).unwrap();
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        again.accept().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_another_listener_holds_is_left_to_it() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("egress.sock");
+        let held = Egress::bind_unix(&path).unwrap();
+        let err = Egress::bind_unix(&path).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("in use by another launch"), "{err}");
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        held.accept().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_that_is_not_a_socket_is_refused_and_left_in_place() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("egress.sock");
+        std::fs::write(&file, "kept").unwrap();
+        let err = Egress::bind_unix(&file).unwrap_err().to_string();
+        assert!(err.contains(&file.display().to_string()), "{err}");
+        assert!(err.contains("not a socket"), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
+
+        let link = d.path().join("link.sock");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let err = Egress::bind_unix(&link).unwrap_err().to_string();
+        assert!(err.contains(&link.display().to_string()), "{err}");
+        assert!(err.contains("not a socket"), "{err}");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
     }
 
     #[tokio::test]
