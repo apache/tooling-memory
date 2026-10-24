@@ -31,6 +31,26 @@ fn system() -> (Vec<Mount>, Vec<(PathBuf, PathBuf)>) {
     (mounts, links)
 }
 
+/// Whether the namespaces sandbox can run here. Where it cannot, a test skips and says
+/// why; on CI, where the sandbox tests must run, it fails instead.
+///
+/// # Panics
+///
+/// On CI, when the sandbox cannot run.
+pub fn confinable() -> bool {
+    match dm_sandbox::linux::availability() {
+        Ok(()) => true,
+        Err(why) => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "the sandbox cannot run here, and on CI the sandbox tests must run: {why}"
+            );
+            eprintln!("skipping: {why}");
+            false
+        }
+    }
+}
+
 /// A plan that runs the ignored test `probe` of this binary inside the sandbox, with
 /// `mounts` after the system's and `env` as the probe's whole environment.
 pub fn plan(probe: &str, mounts: Vec<Mount>, env: BTreeMap<String, String>) -> Plan {

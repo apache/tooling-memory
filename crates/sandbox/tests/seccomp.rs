@@ -160,8 +160,7 @@ fn io_uring_disabled() -> bool {
 
 #[test]
 fn inside_vsock_and_io_uring_are_refused_and_other_sockets_are_not() {
-    if let Err(why) = dm_sandbox::linux::availability() {
-        eprintln!("skipping: {why}");
+    if !common::confinable() {
         return;
     }
     let refused = REFUSED.to_string();
@@ -294,8 +293,7 @@ fn under_filter(probe: &str, nr: libc::c_long, errno: libc::c_int) -> Command {
 
 #[test]
 fn without_seccomp_availability_says_so_and_a_launch_does_not_start() {
-    if let Err(why) = dm_sandbox::linux::availability() {
-        eprintln!("skipping: {why}");
+    if !common::confinable() {
         return;
     }
     let probe = "probe_availability_without_seccomp";
@@ -329,8 +327,7 @@ fn probe_left_open_without_close_range() {
 
 #[test]
 fn without_close_range_a_socket_left_open_is_still_not_inherited() {
-    if let Err(why) = dm_sandbox::linux::availability() {
-        eprintln!("skipping: {why}");
+    if !common::confinable() {
         return;
     }
     let probe = "probe_left_open_without_close_range";
