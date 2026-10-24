@@ -1685,9 +1685,10 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
             .with_tunnels([
                 "oauth2.googleapis.com",
                 // Antigravity's eligibility check, before anything else, on a login:
-                // the account's profile, then its picture
+                // the account's profile, then its picture. The picture's host only:
+                // any Compute Engine VM has a name under googleusercontent.com
                 "www.googleapis.com",
-                ".googleusercontent.com",
+                "lh3.googleusercontent.com",
                 "accounts.google.com",
                 "cloudcode-pa.googleapis.com",
                 "daily-cloudcode-pa.googleapis.com",
@@ -5028,6 +5029,63 @@ mod backend_tests {
                 d.tunnel_hosts.iter().any(|h| h == host),
                 "{host}: {:?}",
                 d.tunnel_hosts
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_s_tunnel_admits_the_hosts_it_names_and_no_name_anyone_can_get() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let memory =
+            Arc::new(Memory::init(&dir.path().join("m"), "human:test:me", "dom-me").unwrap());
+        let destinations: HashMap<String, Destination> =
+            ["github", "chatgpt", "google", "grok", "meta"]
+                .into_iter()
+                .map(|n| (n.to_string(), pass_through_provider(n).unwrap()))
+                .collect();
+        let egress = Egress::new(memory, destinations, &dir.path().join("t.db")).unwrap();
+        // names anyone can get, by renting a VM or publishing a site or a bucket
+        for host in [
+            // a Compute Engine VM's reverse name, which resolves to the VM, 34.117.59.81
+            "81.59.117.34.bc.googleusercontent.com",
+            "someone.appspot.com",
+            "someone-abc123-uc.a.run.app",
+            "us-central1-someone.cloudfunctions.net",
+            "someone.storage.googleapis.com",
+            "someone.github.io",
+            "raw.githubusercontent.com",
+        ] {
+            let r = egress
+                .router()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::CONNECT)
+                        .uri(format!("{host}:443"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "a tunnel to {host}");
+        }
+        let google = pass_through_provider("google").unwrap();
+        // a Google login's token refresh and Cloud Code, and Antigravity's eligibility
+        // check: the account's profile at www.googleapis.com, its picture at lh3
+        for host in [
+            "oauth2.googleapis.com",
+            "accounts.google.com",
+            "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+            "www.googleapis.com",
+            "lh3.googleusercontent.com",
+        ] {
+            assert!(
+                google.tunnel_hosts.iter().any(|h| h == host),
+                "{host}: {:?}",
+                google.tunnel_hosts
             );
         }
     }
