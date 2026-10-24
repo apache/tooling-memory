@@ -24,7 +24,10 @@ impl PgServer {
     /// # Errors
     ///
     /// When `MEMORY_PG_URL` names a server that cannot be reached or will not create a
-    /// database. An embedded server that cannot be set up is a skip, not an error.
+    /// database: a server someone pointed us at and we could not use is worth hearing
+    /// about. An embedded server is the opposite -- one that cannot be set up, will not
+    /// start, or will not create a database is a skip, since nothing asked for it by
+    /// name.
     pub async fn start() -> Result<Option<PgServer>, String> {
         if let Ok(admin) = std::env::var("MEMORY_PG_URL") {
             return PgServer::borrow(&admin).await.map(Some);
@@ -38,9 +41,15 @@ impl PgServer {
             eprintln!("skipped: embedded PostgreSQL did not start: {e}");
             return Ok(None);
         }
-        pg.create_database("ledger")
-            .await
-            .map_err(|e| format!("embedded PostgreSQL will not create a database: {e}"))?;
+        // A skip like the two above it: a server we started that will not give us a
+        // database is a server that cannot be had here, whichever step it refused at.
+        // The PostgreSQL 18.6.1 archive postgresql_embedded downloads ships a trimmed
+        // share/timezone with no `UTC`, and create_database is the first thing to ask
+        // for it, so this is where an unusable embedded server shows up.
+        if let Err(e) = pg.create_database("ledger").await {
+            eprintln!("skipped: embedded PostgreSQL will not create a database: {e}");
+            return Ok(None);
+        }
         let url = pg.settings().url("ledger");
         Ok(Some(PgServer {
             embedded: Some(pg),
