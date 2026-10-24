@@ -21,7 +21,13 @@ const GRANT: &str = "MEMORY_TEST_GRANT";
 /// Where the grant appears inside.
 const INSIDE: &str = "/grant";
 
-/// Run inside the sandbox: try to write at the top of the grant and in the mount below it.
+/// Why a launch cannot make a read-only grant read-only below its submounts, as the
+/// backend says it.
+const NO_MOUNT_SETATTR: &str = "mount_setattr is not available here: it needs Linux 5.12 or \
+                                later, and a seccomp profile that allows it";
+
+/// Run inside the sandbox: try to write at the top of the grant and in the mount below
+/// it, and say whether the mount below is nosuid.
 #[test]
 #[ignore = "the program the read-only test runs inside the sandbox"]
 fn probe_writes() {
@@ -29,6 +35,15 @@ fn probe_writes() {
         let file = Path::new(dir).join("written");
         say(name, std::fs::write(file, b"x"));
     }
+    let sub = CString::new("/grant/sub").unwrap();
+    // SAFETY: a NUL-terminated path and a zeroed statvfs for the kernel to fill.
+    let flags = unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        assert_eq!(libc::statvfs(sub.as_ptr(), &mut st), 0);
+        st.f_flag
+    };
+    let nosuid = u8::from(flags & libc::ST_NOSUID != 0);
+    println!("{}submount_nosuid {nosuid}", common::REPORT);
 }
 
 /// Run by the test below, in a mount namespace of its own where a tmpfs is mounted under
@@ -129,9 +144,112 @@ fn a_mount_under_a_read_only_grant_is_read_only_inside() {
         String::from_utf8_lossy(&out.stderr)
     );
     let refused = libc::EROFS.to_string();
-    let want: BTreeMap<String, String> = [("top", &refused), ("submount", &refused)]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.clone()))
-        .collect();
+    let want: BTreeMap<String, String> = [
+        ("top", refused.as_str()),
+        ("submount", refused.as_str()),
+        ("submount_nosuid", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
     assert_eq!(common::report(&out.stdout), want, "{said}");
+}
+
+/// Run by the test below, under a seccomp filter that answers `mount_setattr` with
+/// `ENOSYS`: say what [`dm_sandbox::linux::availability`] answers, and whether a launch
+/// with read-only grants starts.
+#[test]
+#[ignore = "the host side of the mount_setattr test, under a filter that hides the call"]
+fn probe_availability_without_mount_setattr() {
+    let said = match dm_sandbox::linux::availability() {
+        Ok(()) => "ok".to_string(),
+        Err(why) => why,
+    };
+    println!("{}availability {said}", common::REPORT);
+    let plan = common::plan("probe_writes", Vec::new(), BTreeMap::new());
+    let launch = match dm_sandbox::linux::run_captured(&plan) {
+        Ok(_) => "started",
+        Err(_) => "refused",
+    };
+    println!("{}launch {launch}", common::REPORT);
+}
+
+/// `AUDIT_ARCH_*` of this target, which the filter below checks before the number.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 0xC000_003E;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 0xC000_00B7;
+
+fn bpf(code: u32, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter {
+        code: u16::try_from(code).unwrap(),
+        jt,
+        jf,
+        k,
+    }
+}
+
+/// This binary's [`probe_availability_without_mount_setattr`], under a seccomp filter
+/// that answers `mount_setattr` with `ENOSYS` and allows every other call, as a
+/// container runtime's profile that does not know the call does.
+fn without_mount_setattr() -> Command {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "probe_availability_without_mount_setattr",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    let nr = u32::try_from(libc::SYS_mount_setattr).unwrap();
+    let errno = libc::SECCOMP_RET_ERRNO | u32::try_from(libc::ENOSYS).unwrap();
+    let program = [
+        bpf(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 4, 0, 0),
+        bpf(
+            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            AUDIT_ARCH,
+            0,
+            3,
+        ),
+        bpf(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
+        bpf(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, nr, 0, 1),
+        bpf(libc::BPF_RET | libc::BPF_K, errno, 0, 0),
+        bpf(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW, 0, 0),
+    ];
+    // SAFETY: between fork and exec the child makes two syscalls on a program built
+    // before the fork, and allocates nothing.
+    unsafe {
+        cmd.pre_exec(move || {
+            let prog = libc::sock_fprog {
+                len: program.len() as u16,
+                filter: program.as_ptr().cast_mut(),
+            };
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &prog) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
+#[test]
+fn without_mount_setattr_availability_says_so_and_a_launch_does_not_start() {
+    if let Err(why) = dm_sandbox::linux::availability() {
+        eprintln!("skipping: {why}");
+        return;
+    }
+    let out = without_mount_setattr().output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}{stderr}");
+    let want: BTreeMap<String, String> =
+        [("availability", NO_MOUNT_SETATTR), ("launch", "refused")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+    assert_eq!(common::report(&out.stdout), want, "{said}{stderr}");
+    assert!(stderr.contains(NO_MOUNT_SETATTR), "{stderr}");
 }

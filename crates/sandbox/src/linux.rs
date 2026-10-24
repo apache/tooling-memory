@@ -60,8 +60,33 @@ fn restricted_why() -> String {
     }
 }
 
+/// Why a read-only grant cannot be made read-only below its submounts. A kernel before
+/// Linux 5.12 has no `mount_setattr`, and a container runtime's seccomp profile that does
+/// not know the call answers it with `ENOSYS` as well.
+const NO_MOUNT_SETATTR: &str = "mount_setattr is not available here: it needs Linux 5.12 or \
+                                later, and a seccomp profile that allows it";
+
+/// Whether `mount_setattr` answers here, asked with an empty path and a size below the
+/// first `mount_attr`: arguments it refuses for another reason than `ENOSYS`.
+fn has_mount_setattr() -> bool {
+    // SAFETY: an empty NUL-terminated path, no mount_attr, and a size of zero; the kernel
+    // refuses the call before it reads either pointer.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            -1,
+            c"".as_ptr(),
+            0,
+            std::ptr::null::<libc::mount_attr>(),
+            0,
+        )
+    };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+}
+
 /// Whether this host lets an unprivileged process build the sandbox at all: can it
-/// create a user namespace and map itself into it?
+/// create a user namespace and map itself into it, and make a read-only grant read-only
+/// below its submounts?
 ///
 /// Probed in a child, because the answer is a namespace the asking process would
 /// otherwise be stuck in, and by calling [`enter_user_namespace`] itself rather than a
@@ -75,6 +100,9 @@ fn restricted_why() -> String {
 /// without CAP_SYS_ADMIN is another, and the second is fixed by installing a profile
 /// rather than by giving up on confinement.
 ///
+/// The child also asks for `mount_setattr`, without which every launch fails in
+/// [`read_only_below`].
+///
 /// # Errors
 ///
 /// Why not, in a sentence `amem doctor` and the launch line can carry.
@@ -87,9 +115,15 @@ pub fn availability() -> Result<(), String> {
         return Err(format!("fork: {}", std::io::Error::last_os_error()));
     }
     if pid == 0 {
-        let ok = enter_user_namespace(getuid().as_raw(), getgid().as_raw()).is_ok();
+        let code = if enter_user_namespace(getuid().as_raw(), getgid().as_raw()).is_err() {
+            1
+        } else if has_mount_setattr() {
+            0
+        } else {
+            2
+        };
         // SAFETY: exiting the probe child without running the parent's atexit handlers.
-        unsafe { libc::_exit(i32::from(!ok)) };
+        unsafe { libc::_exit(code) };
     }
     let mut status: libc::c_int = 0;
     // SAFETY: waitpid on our own child with a valid status pointer.
@@ -99,10 +133,10 @@ pub fn availability() -> Result<(), String> {
     if !libc::WIFEXITED(status) {
         return Err("the user-namespace probe did not exit normally".to_string());
     }
-    if libc::WEXITSTATUS(status) == 0 {
-        Ok(())
-    } else {
-        Err(restricted_why())
+    match libc::WEXITSTATUS(status) {
+        0 => Ok(()),
+        2 => Err(NO_MOUNT_SETATTR.to_string()),
+        _ => Err(restricted_why()),
     }
 }
 
@@ -157,8 +191,8 @@ fn bind(m: &Mount, root: &Path) -> Result<(), Error> {
 /// remount reaches the top mount only. `mount_setattr(2)` with `AT_RECURSIVE` sets the
 /// flags on the whole tree at once, a submount another mount hides included.
 ///
-/// A kernel older than Linux 5.12 has no `mount_setattr`, and the launch fails there
-/// rather than leave a submount writable under a read-only grant.
+/// Where `mount_setattr` is not available, [`NO_MOUNT_SETATTR`], the launch fails rather
+/// than leave a submount writable under a read-only grant.
 fn read_only_below(target: &Path) -> Result<(), Error> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(target.as_os_str().as_bytes())
@@ -187,8 +221,7 @@ fn read_only_below(target: &Path) -> Result<(), Error> {
     let e = std::io::Error::last_os_error();
     if e.raw_os_error() == Some(libc::ENOSYS) {
         return Err(confine(format!(
-            "cannot make the mounts under {} read-only: this kernel has no mount_setattr, \
-             which Linux 5.12 added",
+            "cannot make the mounts under {} read-only: {NO_MOUNT_SETATTR}",
             target.display()
         )));
     }
