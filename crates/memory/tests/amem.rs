@@ -3,6 +3,8 @@
 
 // An integration test is test code; a panic here is the failure being reported.
 #![allow(clippy::unwrap_used)]
+// the helpers below serve tests that drive a shell, which are Unix only
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
