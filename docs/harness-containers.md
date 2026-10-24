@@ -446,13 +446,21 @@ error mounting "sysfs" to rootfs at "/sys": ... flags=MS_RDONLY|MS_NOSUID|MS_NOD
 operation not permitted
 ```
 
-The kernel lets a user namespace mount `sysfs` only when the namespace owns the network
-namespace and the mounter's own `/sys` is not partly covered; which of the two failed is not
-known yet. The runner now prints the node's kernel, containerd, runc and `/sys` mounts when
-the pod fails. The same run's other layouts did not start either: the image did not load into
-the node, since Docker's store saved an index naming platforms it held no layers for. The
-runner saves the one platform now. Whether `hostUsers: false` alone admits `unshare` under
-the default profile is still unseen.
+The next run (`40042405694`) printed the node: kernel 7.0.0-1017-azure, containerd 2.3.4,
+runc 1.4.3, and a `/sys` with kind's own files bound over two of its entries,
+`/sys/devices/virtual/dmi/id/product_name` and `product_uuid`. The kernel mounts a fresh
+`sysfs` in a user namespace only when the `sysfs` already visible there is covered by
+nothing but mounts on empty directories (`mnt_already_visible` in `fs/namespace.c`), and these
+two cover files. That is the likely cause; it is reasoning from the kernel's rule, not a run
+without kind's two mounts. It would make `hostUsers: false` unusable on any kind node, while
+a real node, which has no such mounts, is untouched.
+
+The same run started the other layouts, once the runner saved one platform of the image:
+Docker's store had saved an index naming platforms it held no layers for. A and C read as
+they did on the laptop. Every `unshare -U` in B failed writing its uid map, which is Ubuntu's
+AppArmor refusing unprivileged user namespaces on the runner, the setting pull request 3
+addresses for our launcher; the job now turns it off, as on the laptop. Whether `hostUsers: false` alone
+admits `unshare` under the default profile is still unseen.
 
 | Candidate | Licence | Verdict | Why |
 |---|---|---|---|
@@ -475,8 +483,8 @@ hosted, orchestration above the harness, or the Polkadot framework.
 
 - Apple `container`, and anything else that needs a Mac's virtualization.
 - gVisor's `kvm` platform on bare metal; here it ran nested under Hyper-V.
-- agent-sandbox with `hostUsers: false` past the `sysfs` refusal, and every other layout on
-  the rootful node: the next run of the workflow's kind job, with the image loading.
+- agent-sandbox with `hostUsers: false` on a node without kind's two files over `/sys`: a
+  real cluster's node, or kind with them unmounted.
 - A real call through nsjail and fcage. Their builds went with the scratch directory, and they
   bind the socket in exactly as podman does, where the call completed.
 - microsandbox again once #1878 is fixed: `harness-call.sh` through `run-microsandbox-sdk.sh`

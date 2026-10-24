@@ -10,10 +10,11 @@ name: Harness spikes
 # hand, and on a pull request that changes the spikes, the sandbox crate whose Seatbelt
 # tests run here, or this file.
 #
-# The kind job runs on ASF Infra's runners (RunsOn: one EC2 instance per job, the labels
-# tooling-agenda uses) for anything from this repository, and on GitHub's own pool for a
-# pull request from a fork, so code from a fork never runs on a machine of ours. The macOS
-# job needs GitHub's Macs, and the kvm job GitHub's VMs, which offer /dev/kvm.
+# The kind job is to run on ASF Infra's runners (RunsOn: one EC2 instance per job, the
+# labels tooling-agenda uses) for anything from this repository, and on GitHub's own pool
+# for a pull request from a fork, so code from a fork never runs on a machine of ours; see
+# the job. The macOS job needs GitHub's Macs, and the kvm job GitHub's VMs, which offer
+# /dev/kvm.
 
 on:
   workflow_dispatch:
@@ -113,7 +114,10 @@ jobs:
   # privilege over the node's filesystem.
   agent-sandbox-userns:
     name: agent-sandbox, hostUsers false (rootful kind)
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["runs-on={0}","cpu=8","family=c7i","image=ubuntu24-full-x64","tag=infra"]', github.run_id)) || 'ubuntu-latest' }}
+    # ASF Infra's runners have not yet taken a job from this repository: a job with their
+    # labels stayed queued (run 40044203643). Once Infra adds the repository, this becomes
+    #   ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["runs-on={0}","cpu=8","family=c7i","image=ubuntu24-full-x64","tag=infra"]', github.run_id)) || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
       GH_TOKEN: ${{ github.token }}
@@ -132,6 +136,10 @@ jobs:
           echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c && chmod +x kubectl
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - run: docker pull docker.io/library/python:3.12-slim
+      # Ubuntu's AppArmor lets an unprivileged process create a user namespace but not
+      # write its uid map, which is every `unshare -U` in layout B; a node that runs our
+      # backend turns this off, as the WSL2 host had
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: every layout, hostUsers false among them
         run: |
           ENGINE=docker DOWN=1 spikes/harness-containers/agent-sandbox/run.sh 2>&1 | tee kind.log
