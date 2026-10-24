@@ -36,6 +36,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
+mod hello;
 pub mod telemetry;
 pub mod usage;
 
@@ -902,12 +903,12 @@ fn checked(host: &str, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, Box<Re
 }
 
 /// What a `CONNECT` to `authority` tunnels under: the destination whose entry allows
-/// the host on that port, within the session's ceiling, and the checked addresses to
-/// dial. The response that refuses it otherwise.
+/// the host on that port, within the session's ceiling, the host, and the checked
+/// addresses to dial. The response that refuses it otherwise.
 async fn tunnel_for(
     inner: &Inner,
     authority: &str,
-) -> Result<(String, Vec<SocketAddr>), Box<Response>> {
+) -> Result<(String, String, Vec<SocketAddr>), Box<Response>> {
     let refuse = |message: &str| {
         Box::new(error_json(
             StatusCode::FORBIDDEN,
@@ -943,12 +944,17 @@ async fn tunnel_for(
     }
     let entry_host = host_and_port(entry).map_or(entry.as_str(), |(h, _)| h);
     let addrs = tunnel_addresses(inner.network.as_ref(), entry_host, host, port).await?;
-    Ok((name.clone(), addrs))
+    Ok((name.clone(), host.to_string(), addrs))
 }
 
 /// `CONNECT host:port`: open a TCP tunnel when some destination allows the host on that
 /// port, the session's label is within that destination's ceiling, and the host's
 /// addresses are ones a tunnel may reach. Anything else here is a 404.
+///
+/// The 200 goes back before the dial, since a client sends its ClientHello only after
+/// it. That hello is read first and must name the host ([`hello`] says what that does
+/// and does not close); only then is the host dialled and the hello sent on. A refused
+/// hello closes the tunnel with nothing dialled.
 async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) -> Response {
     if req.method() != Method::CONNECT {
         return error_json(StatusCode::NOT_FOUND, "not_found_error", "no such path");
@@ -965,7 +971,7 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    let (name, addrs) = match tunnel_for(&inner, &authority).await {
+    let (name, host, addrs) = match tunnel_for(&inner, &authority).await {
         Ok(found) => found,
         Err(refusal) => return *refusal,
     };
@@ -973,13 +979,26 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
     let session = inner.memory.session_id().to_string();
     let started = std::time::SystemTime::now();
     tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
         let Ok(upgraded) = on_upgrade.await else {
             return;
+        };
+        let mut inbound = hyper_util::rt::TokioIo::new(upgraded);
+        let first = match hello::read_hello(&mut inbound, &host, hello::HELLO_WAIT).await {
+            Ok(first) => first,
+            Err(why) => {
+                eprintln!("egress: tunnel to {host}: {why}; closed before dialling");
+                let _ = inbound.write_all(&hello::REFUSED_ALERT).await;
+                let _ = inbound.shutdown().await;
+                return;
+            }
         };
         let Ok(mut outbound) = inner.network.connect(addrs).await else {
             return;
         };
-        let mut inbound = hyper_util::rt::TokioIo::new(upgraded);
+        if outbound.write_all(&first).await.is_err() {
+            return;
+        }
         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
         let _ = inner.telemetry.record(
             started,
@@ -1440,6 +1459,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::hello::fixtures::rustls_hello;
     use super::*;
     use tower::ServiceExt;
 
@@ -2437,13 +2457,16 @@ mod tests {
         (d, e, addr)
     }
 
-    /// Bytes sent into an open tunnel come back from the echo upstream.
-    async fn echoes(c: &mut tokio::net::TcpStream) {
+    /// A ClientHello for `host` and the bytes after it, sent into an open tunnel, come
+    /// back from the echo upstream untouched.
+    async fn echoes(c: &mut tokio::net::TcpStream, host: &str) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        c.write_all(b"ping").await.unwrap();
-        let mut echo = [0u8; 4];
+        let mut sent = rustls_hello(host, true);
+        sent.extend_from_slice(b"ping");
+        c.write_all(&sent).await.unwrap();
+        let mut echo = vec![0u8; sent.len()];
         c.read_exact(&mut echo).await.unwrap();
-        assert_eq!(&echo, b"ping", "the tunnel reaches the upstream");
+        assert_eq!(echo, sent, "the tunnel reaches the upstream");
     }
 
     #[tokio::test]
@@ -2456,7 +2479,7 @@ mod tests {
         let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
         let (head, mut c) = connect(egress, "upstream.example:443").await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        echoes(&mut c).await;
+        echoes(&mut c, "upstream.example").await;
         assert_eq!(
             net.dialled(),
             vec![vec![first]],
@@ -2509,7 +2532,7 @@ mod tests {
         let (_d, _e, egress) = tunnel_egress("127.0.0.1", &net).await;
         let (head, mut c) = connect(egress, "127.0.0.1").await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        echoes(&mut c).await;
+        echoes(&mut c, "127.0.0.1").await;
         assert_eq!(net.dialled(), vec![vec!["127.0.0.1:443".parse().unwrap()]]);
         // an entry that names another port does not
         let net = FakeNetwork::new(vec![None], upstream);
@@ -2517,6 +2540,79 @@ mod tests {
         let (head, _) = connect(egress, "127.0.0.1").await;
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
         assert_eq!(net.dialled(), Vec::<Vec<SocketAddr>>::new());
+    }
+
+    /// Everything the egress sends back on `c` until it closes the tunnel, or what came
+    /// within five seconds when it does not.
+    async fn until_closed(c: &mut tokio::net::TcpStream) -> (Vec<u8>, bool) {
+        use tokio::io::AsyncReadExt;
+        let mut got = Vec::new();
+        let read = c.read_to_end(&mut got);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .is_ok();
+        (got, closed)
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_forwards_a_client_hello_that_names_the_connect_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (upstream, _) = echo_upstream().await;
+        let answer: SocketAddr = "198.41.0.4:443".parse().unwrap();
+        let net = FakeNetwork::new(vec![Some(vec![answer])], upstream);
+        let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
+        let (head, mut c) = connect(egress, "upstream.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut sent = rustls_hello("upstream.example", true);
+        sent.extend_from_slice(b"and after it");
+        c.write_all(&sent).await.unwrap();
+        let mut echo = vec![0u8; sent.len()];
+        c.read_exact(&mut echo).await.unwrap();
+        assert_eq!(
+            echo, sent,
+            "the hello and what follows reach the upstream intact"
+        );
+        assert_eq!(net.dialled(), vec![vec![answer]]);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_whose_first_bytes_name_another_host_sends_nothing_upstream() {
+        use tokio::io::AsyncWriteExt;
+        let (upstream, peers) = echo_upstream().await;
+        let mut let_through = Vec::new();
+        for (case, first) in [
+            ("another name", rustls_hello("other-tenant.example", true)),
+            ("no name", rustls_hello("upstream.example", false)),
+            (
+                "not TLS",
+                b"GET / HTTP/1.1\r\nHost: other-tenant.example\r\n\r\n".to_vec(),
+            ),
+        ] {
+            let answer = vec!["198.41.0.4:443".parse().unwrap()];
+            let net = FakeNetwork::new(vec![Some(answer)], upstream);
+            let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
+            let (head, mut c) = connect(egress, "upstream.example:443").await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{case}: {head}");
+            c.write_all(&first).await.unwrap();
+            let (got, closed) = until_closed(&mut c).await;
+            let echoed = got.windows(first.len()).any(|w| w == first);
+            if !net.dialled().is_empty() || !closed || echoed {
+                let_through.push(format!(
+                    "{case}: dialled {:?}, closed {closed}, echoed {echoed}",
+                    net.dialled()
+                ));
+            }
+        }
+        assert_eq!(
+            let_through,
+            Vec::<String>::new(),
+            "refused, and let through"
+        );
+        assert_eq!(
+            dialled(upstream, &peers).await,
+            Vec::new(),
+            "the upstream heard nothing"
+        );
     }
 
     #[tokio::test]
@@ -2582,10 +2678,8 @@ mod tests {
                 };
                 seen.lock().unwrap().push(peer);
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 64];
-                    if let Ok(n) = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await {
-                        let _ = tokio::io::AsyncWriteExt::write_all(&mut s, &buf[..n]).await;
-                    }
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
                 });
             }
         });
@@ -2659,13 +2753,9 @@ mod tests {
         let (_d, e) = fixture(Some(("github", Destination::tunnel([entry])))).await;
         let egress = serve(&e).await;
 
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (head, mut c) = connect(egress, &addr.to_string()).await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        c.write_all(b"ping").await.unwrap();
-        let mut echo = [0u8; 4];
-        c.read_exact(&mut echo).await.unwrap();
-        assert_eq!(&echo, b"ping", "bytes flow through the tunnel untouched");
+        echoes(&mut c, "127.0.0.1").await;
 
         // a host no destination allows
         let (head, _) = connect(egress, "evil.example:443").await;
