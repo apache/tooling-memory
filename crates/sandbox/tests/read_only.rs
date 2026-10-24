@@ -129,8 +129,7 @@ fn over_a_submount(grant: &Path, sub: &Path) -> Command {
 
 #[test]
 fn a_mount_under_a_read_only_grant_is_read_only_inside() {
-    if let Err(why) = dm_sandbox::linux::availability() {
-        eprintln!("skipping: {why}");
+    if !common::confinable() {
         return;
     }
     let grant = tempfile::tempdir().unwrap();
@@ -237,8 +236,7 @@ fn without_mount_setattr() -> Command {
 
 #[test]
 fn without_mount_setattr_availability_says_so_and_a_launch_does_not_start() {
-    if let Err(why) = dm_sandbox::linux::availability() {
-        eprintln!("skipping: {why}");
+    if !common::confinable() {
         return;
     }
     let out = without_mount_setattr().output().unwrap();
