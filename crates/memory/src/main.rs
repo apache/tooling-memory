@@ -3392,8 +3392,9 @@ pub struct Session {
     /// The model, in the harness's own flag, after every run's arguments: a flag after
     /// the prompt is where every harness, subcommand or not, accepts one.
     model: Option<String>,
+    /// Serving the egress socket, for every runner but the unconfined one.
     #[cfg(unix)]
-    serve_unix: tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
+    serve_unix: Option<tokio::task::JoinHandle<Result<(), dm_egress::Error>>>,
     /// What the session says about itself to the web launcher that started it.
     #[allow(dead_code)] // kept for its drop, which writes the last word
     status: Option<status::Writer>,
@@ -3479,19 +3480,16 @@ impl Session {
             p.home.clone_from(h);
         }
 
+        // bound here, so a socket that cannot be bound fails the launch with its own error;
+        // the unconfined harness reaches the egress over TCP and needs no socket
         #[cfg(unix)]
-        let serve_unix = {
+        let serve_unix = if matches!(runner, Runner::Unconfined(_)) {
+            None
+        } else {
+            let listener = Egress::bind_unix(&p.socket)?;
             let egress = p.egress.clone();
-            let socket = p.socket.clone();
-            tokio::spawn(async move { egress.serve_unix(&socket).await })
+            Some(tokio::spawn(async move { egress.serve(listener).await }))
         };
-        #[cfg(unix)]
-        for _ in 0..100 {
-            if p.socket.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
         if let Runner::Requests(r) = &runner {
             // the harness container runs as uid 1000 and must reach the socket and leave
             // its exit code beside it; this process is root in the egress container
@@ -3511,11 +3509,10 @@ impl Session {
         if let Runner::Unconfined(slot) = &mut runner {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
-            drop(listener);
             let egress = p.egress.clone();
             *slot = Some((
                 addr,
-                tokio::spawn(async move { egress.serve_tcp(addr).await }),
+                tokio::spawn(async move { egress.serve(listener).await }),
             ));
         }
         announce(&runner, &p, harness, &workdir);
@@ -3815,8 +3812,8 @@ impl Session {
             serve.abort();
         }
         #[cfg(unix)]
-        {
-            self.serve_unix.abort();
+        if let Some(serve) = &self.serve_unix {
+            serve.abort();
             std::fs::remove_file(&self.p.socket).ok();
         }
         if !self.p.metered {
@@ -3942,12 +3939,11 @@ fn relay(
         .enable_all()
         .build()?;
     let socket = socket.to_path_buf();
-    let listen = listen.to_string();
+    // bound before the harness starts, which without it has no way out
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind(listen))
+        .map_err(|e| format!("cannot listen on {listen}: {e}"))?;
     rt.spawn(async move {
-        let Ok(listener) = tokio::net::TcpListener::bind(&listen).await else {
-            eprintln!("relay: cannot listen on {listen}");
-            return;
-        };
         loop {
             let Ok((mut inbound, _)) = listener.accept().await else {
                 continue;

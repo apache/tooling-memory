@@ -330,6 +330,82 @@ fn a_launch_that_fails_after_rendering_leaves_no_render_behind() {
     assert!(left.is_empty(), "a render outlived its session: {left:?}");
 }
 
+/// A root whose egress socket, `state/run/egress-<pid>.sock`, is longer than any system
+/// lets a unix socket path be.
+fn root_too_long_for_its_socket(dir: &Path) -> PathBuf {
+    let deep = dir.join("d".repeat(120));
+    std::fs::create_dir_all(&deep).unwrap();
+    init_root(&deep)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_launch_whose_socket_cannot_be_bound_fails_and_says_why() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = root_too_long_for_its_socket(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_claude(&work);
+
+    let out = launch(&root, &bins, &work, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        !work.join("fake-claude.out").exists(),
+        "the harness did not start: {stderr}"
+    );
+    let prefix = root.join("state/run/egress-").display().to_string();
+    let at = stderr.find(&prefix).expect(&stderr);
+    let end = stderr[at..].find(".sock").expect(&stderr) + ".sock".len();
+    let socket = &stderr[at..at + end];
+    assert!(
+        stderr.contains(&format!("{} bytes", socket.len())),
+        "the error names the socket's length: {stderr}"
+    );
+}
+
+#[test]
+fn an_unconfined_launch_needs_no_socket_and_runs_from_a_long_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = root_too_long_for_its_socket(dir.path());
+    let bins = fake_claude(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = launch(&root, &bins, &work, &["--unconfined"]);
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(read_out(&work).contains("mcp=200"), "{}", read_out(&work));
+}
+
+#[test]
+fn a_relay_that_cannot_listen_does_not_run_the_harness() {
+    let dir = tempfile::tempdir().unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = taken.local_addr().unwrap().to_string();
+    let marker = dir.path().join("ran");
+    let out = memory()
+        .args(["relay", "--socket"])
+        .arg(dir.path().join("egress.sock"))
+        .args(["--listen", &listen, "--", "touch"])
+        .arg(&marker)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(!marker.exists(), "the harness ran without a route out");
+    assert!(stderr.contains(&listen), "{stderr}");
+}
+
 // ---- non-interactive: a prompt, and a task from the ledger ----
 
 /// A fake harness from a shell body. It receives the launcher's arguments; `$*` holds
