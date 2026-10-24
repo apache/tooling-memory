@@ -409,13 +409,14 @@ impl Egress {
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
         let status = resp.status();
+        let to = pointed_to(status, resp.headers());
         let text = resp
             .text()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
         if !status.is_success() {
             return Err(Error::Upstream(format!(
-                "{status} from {destination}/{rest}: {}",
+                "{status} from {destination}/{rest}{to}: {}",
                 text.chars().take(300).collect::<String>()
             )));
         }
@@ -455,6 +456,7 @@ impl Egress {
             .send()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
+        let to = pointed_to(resp.status(), resp.headers());
         let status = resp.status().as_u16();
         let text = resp
             .text()
@@ -486,7 +488,7 @@ impl Egress {
         }
         if !(200..300).contains(&status) {
             return Err(Error::Upstream(format!(
-                "{destination} answered {status}: {text}"
+                "{destination} answered {status}{to}: {text}"
             )));
         }
         Ok(value)
@@ -606,6 +608,19 @@ fn copy_headers(from: &HeaderMap, strip_credentials: bool) -> HeaderMap {
         out.append(name.clone(), value.clone());
     }
     out
+}
+
+/// Where a redirect points, as the end of an error message: ` to ` and its `Location`.
+/// Empty for a status that is not a redirect.
+fn pointed_to(status: StatusCode, headers: &HeaderMap) -> String {
+    if !status.is_redirection() {
+        return String::new();
+    }
+    let to = headers
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("no Location");
+    format!(" to {to}")
 }
 
 /// The upstream URL. When the egress injects the credential, a `key=` query parameter
@@ -1045,28 +1060,14 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    if !status.is_success() && std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
-        // a diagnostic: who refused, and how. The body is read here and not relayed, so
-        // this is for finding out, not for running.
-        let url = upstream.url().to_string();
-        let server = upstream
-            .headers()
-            .get("server")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-            .to_string();
-        let cf = upstream.headers().contains_key("cf-ray");
-        let body = upstream.text().await.unwrap_or_default();
-        eprintln!(
-            "egress debug: {status} from {url} server={server} cloudflare={cf} body={:?}",
-            body.chars().take(300).collect::<String>()
-        );
-        return error_json(
-            status,
-            "upstream_error",
-            &body.chars().take(300).collect::<String>(),
-        );
-    }
+    let upstream = if !status.is_success() && std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
+        match debugged(status, upstream).await {
+            Debugged::Relay(upstream) => upstream,
+            Debugged::Refused(refusal) => return refusal,
+        }
+    } else {
+        upstream
+    };
     let resp_headers = copy_headers(upstream.headers(), false);
     let content_type = upstream
         .headers()
@@ -1091,6 +1092,45 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
     *response.status_mut() = status;
     *response.headers_mut() = resp_headers;
     response
+}
+
+/// What the debug mode does with an upstream's answer that is not a success.
+enum Debugged {
+    /// Relay it as it came: a redirect, which the harness needs whole, `Location` and all.
+    Relay(reqwest::Response),
+    /// Answer with this instead: the start of the upstream's body, read here.
+    Refused(Response),
+}
+
+/// A diagnostic, with `MEMORY_EGRESS_DEBUG` set: who refused, and how, on stderr. A
+/// redirect is logged with where it points and relayed; any other answer's body is read
+/// here and not relayed, so this is for finding out, not for running.
+async fn debugged(status: StatusCode, upstream: reqwest::Response) -> Debugged {
+    let url = upstream.url().to_string();
+    if status.is_redirection() {
+        eprintln!(
+            "egress debug: {status} from {url}{}, relayed",
+            pointed_to(status, upstream.headers())
+        );
+        return Debugged::Relay(upstream);
+    }
+    let server = upstream
+        .headers()
+        .get("server")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let cf = upstream.headers().contains_key("cf-ray");
+    let body = upstream.text().await.unwrap_or_default();
+    eprintln!(
+        "egress debug: {status} from {url} server={server} cloudflare={cf} body={:?}",
+        body.chars().take(300).collect::<String>()
+    );
+    Debugged::Refused(error_json(
+        status,
+        "upstream_error",
+        &body.chars().take(300).collect::<String>(),
+    ))
 }
 
 /// Record the call once its usage is known, when the body has streamed through. A call
@@ -2306,16 +2346,20 @@ mod tests {
         (addr, heard)
     }
 
-    /// An upstream that answers every request with a 307 to `location`.
-    async fn redirecting_upstream(location: String) -> std::net::SocketAddr {
+    /// The redirects an upstream may answer with.
+    const REDIRECTS: [StatusCode; 5] = [
+        StatusCode::MOVED_PERMANENTLY,
+        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
+        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::PERMANENT_REDIRECT,
+    ];
+
+    /// An upstream that answers every request with `status` to `location`.
+    async fn redirecting_upstream(status: StatusCode, location: String) -> std::net::SocketAddr {
         let app = Router::new().fallback(move || {
             let location = location.clone();
-            async move {
-                (
-                    StatusCode::TEMPORARY_REDIRECT,
-                    [(header::LOCATION, location)],
-                )
-            }
+            async move { (status, [(header::LOCATION, location)]) }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2330,51 +2374,74 @@ mod tests {
         }
     }
 
+    /// What the bystander heard since it was last asked, as a leak to report.
+    fn leaked(heard: &Heard, what: String) -> Option<String> {
+        let got = std::mem::take(&mut *heard.lock().unwrap());
+        (!got.is_empty()).then(|| {
+            format!("{what}: the redirect was followed, and the other server heard {got:?}")
+        })
+    }
+
+    /// A direct call's answer to a redirect: an error that names the status and where
+    /// the upstream pointed.
+    fn names_the_redirect<T: std::fmt::Debug>(
+        got: Result<T, Error>,
+        status: StatusCode,
+        location: &str,
+        what: &str,
+    ) {
+        let err = got.unwrap_err().to_string();
+        assert!(
+            err.contains(status.as_str()) && err.contains(location),
+            "{what} {status}: {err}"
+        );
+    }
+
+    async fn forwarded(e: &Egress, name: &str, method: Method) -> Response {
+        e.router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{name}/v1/messages"))
+                    .method(method)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn a_redirect_from_upstream_goes_back_to_the_harness_and_is_not_followed() {
         let (elsewhere, heard) = bystander().await;
         // another host: reqwest strips authorization there, and not these keys
         let location = format!("http://localhost:{}/steal", elsewhere.port());
-        for (name, key) in [("anthropic", "x-api-key"), ("gemini", "x-goog-api-key")] {
-            let upstream = redirecting_upstream(location.clone()).await;
-            let (_d, e) = fixture(Some((
-                name,
-                Destination::forward(format!("http://{upstream}"), injected(key)),
-            )))
-            .await;
-            for method in [Method::POST, Method::GET] {
-                let r = e
-                    .router()
-                    .oneshot(
-                        Request::builder()
-                            .uri(format!("/{name}/v1/messages"))
-                            .method(method.clone())
-                            .header("content-type", "application/json")
-                            .body(Body::from("{}"))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let heard = heard.lock().unwrap().clone();
-                assert!(
-                    heard.is_empty(),
-                    "{method} at {name}: the redirect was followed, and the other server heard {heard:?}"
-                );
-                assert_eq!(
-                    r.status(),
-                    StatusCode::TEMPORARY_REDIRECT,
-                    "{method} at {name}"
-                );
-                assert_eq!(r.headers()[header::LOCATION], location.as_str());
+        let mut leaks = Vec::new();
+        for status in REDIRECTS {
+            let upstream = redirecting_upstream(status, location.clone()).await;
+            for (name, key) in [("anthropic", "x-api-key"), ("gemini", "x-goog-api-key")] {
+                let (_d, e) = fixture(Some((
+                    name,
+                    Destination::forward(format!("http://{upstream}"), injected(key)),
+                )))
+                .await;
+                for method in [Method::POST, Method::GET] {
+                    let r = forwarded(&e, name, method.clone()).await;
+                    let what = format!("{method} {status} at {name}");
+                    if let Some(leak) = leaked(&heard, what.clone()) {
+                        leaks.push(leak);
+                        continue;
+                    }
+                    assert_eq!(r.status(), status, "{what}");
+                    assert_eq!(r.headers()[header::LOCATION], location.as_str(), "{what}");
+                }
             }
         }
+        assert!(leaks.is_empty(), "{leaks:#?}");
     }
 
-    #[tokio::test]
-    async fn the_launcher_s_own_calls_do_not_follow_a_redirect() {
-        let (elsewhere, heard) = bystander().await;
-        let location = format!("http://localhost:{}/steal", elsewhere.port());
-        let upstream = redirecting_upstream(location.clone()).await;
+    /// An egress with `upstream` as a keyed destination and as a tool server.
+    fn launcher_egress(upstream: std::net::SocketAddr) -> (tempfile::TempDir, Egress) {
         let dir = tempfile::tempdir().unwrap();
         let m = Arc::new(with_hosted_fetch(
             &dir.path().join("m"),
@@ -2393,32 +2460,78 @@ mod tests {
         );
         let e =
             Egress::with_tool_servers(m, destinations, tools, &dir.path().join("t.db")).unwrap();
-        let heard_nothing = |call: &str| {
-            let heard = heard.lock().unwrap().clone();
-            assert!(
-                heard.is_empty(),
-                "{call}: the redirect was followed, and the other server heard {heard:?}"
-            );
+        (dir, e)
+    }
+
+    #[tokio::test]
+    async fn the_launcher_s_own_calls_do_not_follow_a_redirect() {
+        let (elsewhere, heard) = bystander().await;
+        let location = format!("http://localhost:{}/steal", elsewhere.port());
+        let mut leaks = Vec::new();
+        for status in REDIRECTS {
+            let upstream = redirecting_upstream(status, location.clone()).await;
+            let (_d, e) = launcher_egress(upstream);
+
+            let listed = e.get("anthropic", "v1/models").await;
+            match leaked(&heard, format!("get {status}")) {
+                Some(leak) => leaks.push(leak),
+                None => names_the_redirect(listed, status, &location, "get"),
+            }
+
+            let called = e
+                .call("anthropic", "v1/messages", &serde_json::json!({}))
+                .await;
+            match leaked(&heard, format!("call {status}")) {
+                Some(leak) => leaks.push(leak),
+                None => names_the_redirect(called, status, &location, "call"),
+            }
+
+            let posted = e
+                .post("fetch", "/mcp", HeaderMap::new(), Bytes::from_static(b"{}"))
+                .await;
+            match leaked(&heard, format!("post {status}")) {
+                Some(leak) => leaks.push(leak),
+                None => {
+                    let posted = posted.unwrap();
+                    assert_eq!(posted.status, status.as_u16(), "post");
+                    assert_eq!(posted.headers[header::LOCATION], location.as_str());
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "{leaks:#?}");
+    }
+
+    #[tokio::test]
+    async fn the_debug_mode_relays_a_redirect_as_it_came() {
+        // the mode is read from the process's environment, so its helper is tested here
+        let to = "https://elsewhere.example/";
+        for status in REDIRECTS {
+            let upstream = axum::http::Response::builder()
+                .status(status)
+                .header(header::LOCATION, to)
+                .body("")
+                .unwrap();
+            match debugged(status, reqwest::Response::from(upstream)).await {
+                Debugged::Relay(r) => {
+                    assert_eq!(r.status(), status);
+                    assert_eq!(r.headers()[header::LOCATION], to);
+                }
+                Debugged::Refused(r) => {
+                    panic!("{status} is answered in debug mode, without its Location: {r:?}")
+                }
+            }
+        }
+        // any other refusal is answered with the start of its body
+        let upstream = axum::http::Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body("down")
+            .unwrap();
+        let got = debugged(StatusCode::BAD_GATEWAY, reqwest::Response::from(upstream)).await;
+        let Debugged::Refused(r) = got else {
+            panic!("a 502 is relayed in debug mode")
         };
-
-        let listed = e.get("anthropic", "v1/models").await;
-        heard_nothing("get");
-        let err = listed.unwrap_err().to_string();
-        assert!(err.contains("307"), "get: {err}");
-
-        let called = e
-            .call("anthropic", "v1/messages", &serde_json::json!({}))
-            .await;
-        heard_nothing("call");
-        let err = called.unwrap_err().to_string();
-        assert!(err.contains("307"), "call: {err}");
-
-        let posted = e
-            .post("fetch", "/mcp", HeaderMap::new(), Bytes::from_static(b"{}"))
-            .await;
-        heard_nothing("post");
-        let posted = posted.unwrap();
-        assert_eq!(posted.status, 307);
-        assert_eq!(posted.headers[header::LOCATION], location.as_str());
+        assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("down"));
     }
 }
