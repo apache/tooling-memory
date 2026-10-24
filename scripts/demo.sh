@@ -5,7 +5,9 @@
 #   scripts/demo.sh <demo-root> <markdown-dir>... 
 #
 # Needs target/release/amem (make build) and a harness login. HARNESS names the harness,
-# with no default, as everywhere else; AUTH defaults to subscription; RECALL_MODEL pins
+# with no default, as everywhere else; AUTH defaults to subscription; MODEL names the
+# model for the session, which a gateway run needs and a subscription run must not have;
+# RECALL_MODEL pins
 # the deputy's model on the gateway, which otherwise takes the smallest one the gateway
 # lists. Rerunning reuses the record and adds another task;
 # the entry the erasure step writes and erases is new each run, so the corpus is kept.
@@ -51,7 +53,10 @@ id=$("$memory" --root "$root" task create "$title" --body "$body" --priority 5 |
 "$memory" --root "$root" task admit "$id" >/dev/null
 say "A $harness session works a task" "Task $id is filed and admitted on the ledger. A $harness session, confined, with memory as its only source, claims it, searches, opens what it needs, writes a cited handoff and completes the task."
 work=$(mktemp -d)
-( cd "$work" && "$memory" --root "$root" work --harness "$harness" --auth "${AUTH:-subscription}" --lease-seconds 300 --task "$id" ) || true
+# A gateway run has to name the model, and pi and OpenCode pick from their providers'
+# lists rather than taking a default; a subscription run must not have one forced on it.
+[ "${AUTH:-subscription}" = gateway ] && MODEL=${MODEL:-qwen3.8-27b}
+( cd "$work" && "$memory" --root "$root" work --harness "$harness" --auth "${AUTH:-subscription}" ${MODEL:+--model "$MODEL"} --lease-seconds 300 --task "$id" ) || true
 say "Erasure" "An entry written in error is erased by the owner: the body leaves every version, the index and what sessions were sent; a stub and a receipt remain, and search no longer finds it."
 gone=$(echo "A note that should never have been written: the demo passphrase is kestrel-91." \
   | "$memory" --root "$root" write --title "Written in error" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')

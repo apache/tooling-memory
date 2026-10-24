@@ -53,7 +53,14 @@ if has transcript; then
   # which cites its turns, and here that is the run that delegated and stopped. Session ids
   # are random, so neither the list's order nor its last entry says which
   s=$(a transcript list | j "' '.join(t['session'] for t in sorted(d, key=lambda t: t['kept_at'], reverse=True) if t['state']=='live' and t['harness']=='${HARNESS:-}')")
-  s=$(for c in $s; do [ -n "$(a transcript show "$c" | j "next(iter(d['cited']), '')")" ] && { echo "$c"; break; }; done)
+  # `continue` rather than a bare test: with no cited turn anywhere, a trailing failed
+  # test makes the substitution exit 1, and `set -e` then ends the whole demo here with
+  # nothing printed -- which is what happens whenever an earlier act left no session
+  # with a cited turn
+  s=$(for c in $s; do
+        [ -n "$(a transcript show "$c" | j "next(iter(d['cited']), '')")" ] || continue
+        echo "$c"; break
+      done)
   [ -n "$s" ] || s=$(a transcript list | j "next((t['session'] for t in sorted(d, key=lambda t: t['kept_at'], reverse=True) if t['state']=='live'), '')")
   if [ -n "$s" ]; then
     turn=$(a transcript show "$s" | j "next(iter(d['cited']), '')")

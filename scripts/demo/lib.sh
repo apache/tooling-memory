@@ -21,3 +21,10 @@ gateway() { [ -n "$LLMAO_KEY" ]; }
 CHECKER_MODEL=${CHECKER_MODEL:-gemma4-26b}
 WORKER_MODEL=${WORKER_MODEL:-qwen3.8-27b}
 WORKER_HARNESS=${WORKER_HARNESS:-codex}
+# A gateway run has to name the model: the gateway serves what it serves, and pi and
+# OpenCode pick from their own providers' lists rather than taking a default ("pi picks a
+# model from its providers' lists, so a run needs --model"). A subscription run must NOT
+# have one forced on it -- a vendor's own model names are not the gateway's -- so this
+# stays empty unless the run is on the gateway or MODEL was set by hand.
+[ "${AUTH:-subscription}" = gateway ] && MODEL=${MODEL:-$WORKER_MODEL}
+MODEL_ARG=${MODEL:+--model $MODEL}

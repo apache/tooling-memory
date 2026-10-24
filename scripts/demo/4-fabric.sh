@@ -43,7 +43,7 @@ if [ -n "${HARNESS:-}" ]; then
   say "Subagents on the board" "A $HARNESS session is asked to delegate. Each subagent it would spawn is filed as a task of its own instead, with a continuation that waits for them, so the work survives the session and any worker can do it. The original task goes back on the board but waits: nobody may claim it while its continuation is open."
   parent=$(a task create "Compare two decisions" --domain dom-demo --priority 20 --body "Use two subagents, one per decision, to summarise DR-19 and DR-22 from the memory record; then combine their answers into a handoff and complete this task." | j "d['id']")
   a task admit "$parent" >/dev/null
-  ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" --lease-seconds 900 --task "$parent" 2>&1 | grep -E '^memory: (claimed|task|board|filed)' ) || true
+  ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" $MODEL_ARG --lease-seconds 900 --task "$parent" 2>&1 | grep -E '^memory: (claimed|task|board|filed)' ) || true
   tree() {
     a task tree "$parent" | j "'\n'.join(f\"  {c['id']}  {(c.get('origin') or '').split(':')[0]:<10} {c['status']:<11} {c['title']}\" for c in d.get('children', []))"
     a task get "$parent" | j "f\"  {d['id']}  original   {d['status']:<11} {d['title']}\" + ('  (waits on its continuation)' if d['status'] == 'admitted' else '  (closed by its continuation, with its handoff)' if d['status'] == 'completed' else '')"
@@ -59,7 +59,7 @@ if [ -n "${HARNESS:-}" ]; then
     open=$(a task tree "$parent" | j "' '.join(c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('task:') and c['status']!='completed')")
     if [ -n "$cont" ] && [ -z "$open" ]; then
       say "Fan-in" "The continuation waited for both; it runs now, with their handoffs in its prompt, and completes with a handoff of its own. Its completion closes the original task it resumed, with the same handoff."
-      ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" --lease-seconds 900 --task "$cont" 2>&1 | grep -E '^memory: (claimed|task)' ) || true
+      ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" $MODEL_ARG --lease-seconds 900 --task "$cont" 2>&1 | grep -E '^memory: (claimed|task)' ) || true
     elif [ -n "$cont" ]; then
       echo "  the continuation $cont still waits for: $open"
     fi
