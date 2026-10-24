@@ -56,6 +56,9 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-wasip2, x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Ubuntu's AppArmor lets an unprivileged process create a user namespace but not map
+      # its uid in it, so no confined test could run; the runner allows it, as a laptop does
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: make check
         # the embedded PostgreSQL for the ledger tests lists its releases through GitHub's
         # API; unauthenticated, a runner's address is soon refused
@@ -164,6 +167,8 @@ jobs:
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-llvm-cov
+      # the confined tests run here too, as in the check job
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: make coverage
         # the embedded PostgreSQL for the ledger tests lists its releases through GitHub's
         # API; unauthenticated, a runner's address is soon refused
