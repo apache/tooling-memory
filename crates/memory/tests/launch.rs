@@ -696,6 +696,79 @@ fn a_prompted_launch_runs_headless_and_insists_on_a_handoff() {
     );
 }
 
+/// A confined prompted run captures the harness's standard output through a pipe, which
+/// holds 64 KiB. A harness that writes more than that finishes, and all of what it wrote
+/// reaches the launcher's own output. Bounded in time: a launch that never returns is
+/// this test failing, and its process group is killed so nothing outlives the test.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_prompted_run_captures_more_than_a_pipe_holds() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_harness(
+        &work,
+        "printf 'begin\\n'; head -c 200000 /dev/zero | tr '\\0' a; printf '\\nend\\n'; exit 0",
+    );
+    let stdout = dir.path().join("stdout");
+    let stderr = dir.path().join("stderr");
+    let mut cmd = memory();
+    cmd.args([
+        "--root",
+        root.to_str().unwrap(),
+        "launch",
+        "--harness",
+        "claude",
+        "--auth",
+        "key",
+    ])
+    .args(["--workdir", work.to_str().unwrap()])
+    .args(["--prompt", "hello", "--no-handoff"])
+    .env("PATH", path_with(&bins))
+    .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+    .stdin(Stdio::null())
+    .stdout(std::fs::File::create(&stdout).unwrap())
+    .stderr(std::fs::File::create(&stderr).unwrap())
+    .process_group(0);
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() > deadline {
+            Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", child.id())])
+                .status()
+                .ok();
+            child.wait().ok();
+            panic!(
+                "the launch had not returned after 90 s, with {} bytes out: {}",
+                std::fs::metadata(&stdout).map(|m| m.len()).unwrap_or(0),
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let err = std::fs::read_to_string(&stderr).unwrap();
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(err.contains("confined to"), "{err}");
+    let out = std::fs::read_to_string(&stdout).unwrap();
+    let want = format!("begin\n{}\nend\n", "a".repeat(200_000));
+    assert!(
+        out.contains(&want),
+        "the harness's output, whole: {} bytes out",
+        out.len()
+    );
+}
+
 // ---- the wslc backend's inside half, driven by a fake host ----
 
 /// `memory inside` writes run requests for the host and waits for exit codes. This fake
