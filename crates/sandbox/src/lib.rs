@@ -415,9 +415,12 @@ impl Layout {
         }
     }
 
-    /// A path under the private home, as the harness sees it.
+    /// A path under the private home, as the harness sees it. The box's paths are Unix
+    /// ones whatever the host, Linux in a container launched from Windows among them, so
+    /// `/` joins them rather than the host's separator.
     fn under_home(&self, rel: &str) -> String {
-        self.home.join(rel).display().to_string()
+        let home = self.home.display().to_string();
+        format!("{}/{rel}", home.trim_end_matches('/'))
     }
 
     /// The shell command that runs the memory's hook for `harness`.
