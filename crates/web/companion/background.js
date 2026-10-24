@@ -230,6 +230,31 @@ async function fetchFor(ask) {
   }
 }
 
+// a tab as it was opened to render in: it shows its own about:blank, and the navigation
+// started in it is pending
+const opening = (t) => t.url === 'about:blank' && Boolean(t.pendingUrl);
+
+// the tabs rendered in, each with whether the navigation started there committed a
+// document: the tab took a URL other than about:blank
+const rendering = new Map(); // tabId -> { committed }
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  const r = rendering.get(tabId);
+  if (r && change.url && change.url !== 'about:blank') r.committed = true;
+});
+
+// why a tab that shows a URL off the hosts is refused. On about:blank with no document of
+// the navigation committed, the page was fetched and answered with no document, a 204 or
+// a download; a commit reported late gets one quiet spell to land. Anywhere else, the
+// page was sent there.
+async function offTab(ask, tabId, url) {
+  const committed = () => (rendering.get(tabId) || {}).committed;
+  if (url === 'about:blank' && !committed()) {
+    await sleep(QUIET_MS);
+    if (!committed()) return { error: `${ask.url} produced no page to read (no document was committed)` };
+  }
+  return offHosts(ask.url, url);
+}
+
 // one ask to render: a tab of this browser, held to the hosts, read when it is built
 async function renderFor(ask) {
   const hosts = ask.hosts || [];
@@ -247,11 +272,26 @@ async function renderFor(ask) {
   frames.delete(tab.id);
   try {
     await sync();
-    await chrome.tabs.update(tab.id, { url: ask.url });
-    // until the page says it is complete; a navigation the rules stopped, or one the
-    // network refused, is the answer as soon as the frame reports it, whatever the tab says
     const deadline = Date.now() + FETCH_TIMEOUT_MS;
     let t;
+    // the navigation starts once the tab's own about:blank has committed: a commit of it
+    // while the navigation is on its way takes the pending URL off the tab, and the tab
+    // then shows about:blank with nothing pending, as it would if the page had gone there
+    for (;;) {
+      t = await chrome.tabs.get(tab.id);
+      if (t.url === 'about:blank' && t.status === 'complete') break;
+      if (Date.now() > deadline) return { error: `${ask.url}: the tab to render it in did not open in ${FETCH_TIMEOUT_MS / 1000} seconds` };
+      await sleep(50);
+    }
+    rendering.set(tab.id, { committed: false });
+    await chrome.tabs.update(tab.id, { url: ask.url });
+    // until the page says it is complete; a navigation the rules stopped, or one the
+    // network refused, is the answer as soon as the frame reports it, whatever the tab says.
+    // Until the navigation started here commits, the tab shows its own about:blank with
+    // that navigation pending: not a place the page was sent to, so it is not judged.
+    // From the first look that shows anything else, every URL the tab shows is judged,
+    // about:blank with them.
+    let shown = false;
     for (;;) {
       await sleep(100);
       t = await chrome.tabs.get(tab.id);
@@ -260,7 +300,8 @@ async function renderFor(ask) {
         if (!allowed(frame.url, hosts)) return offHosts(ask.url, frame.url);
         return { error: `${ask.url}: the browser could not load it: ${frame.error}`, final_url: frame.url };
       }
-      if (!allowed(t.url || '', hosts)) return offHosts(ask.url, t.url || '');
+      shown = shown || !opening(t);
+      if (shown && !allowed(t.url || '', hosts)) return offTab(ask, tab.id, t.url || '');
       if (t.status === 'complete' && t.url && t.url !== 'about:blank') break;
       if (Date.now() > deadline) return { error: `${ask.url}: the page did not finish loading in ${FETCH_TIMEOUT_MS / 1000} seconds` };
     }
@@ -306,6 +347,7 @@ async function renderFor(ask) {
     return { error: `${ask.url}: ${(e && e.message) || e}` };
   } finally {
     chrome.tabs.remove(tab.id).catch(() => {});
+    rendering.delete(tab.id);
     inflight.delete(id);
     sync().catch(() => {});
   }
