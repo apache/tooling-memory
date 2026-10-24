@@ -10,5 +10,8 @@
     "opencode-ai": "1.19.0",
     "@qwen-code/qwen-code": "0.25.0",
     "@xai-official/grok": "1.0.50"
+  },
+  "overrides": {
+    "sharp": "0.35.5"
   }
 }
