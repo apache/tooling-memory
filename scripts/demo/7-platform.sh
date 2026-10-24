@@ -65,7 +65,7 @@ if gateway; then
   say "A task under the definition" "A question filed for $WORKER_HARNESS, launched with no model named: the platform's default model is used, and the verified definition is added to the task's prompt."
   task=$(a task create "What did DR-22 decide about the format memory entries travel in?" --domain dom-demo --priority 30 --body "Answer from the memory record, in two or three sentences, and file the answer as your handoff." | j "d['id']")
   a task admit "$task" >/dev/null
-  ( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --backend namespaces --lease-seconds 900 --task "$task" 2>&1 | grep -E '^memory: (claimed|task|.*confined)' ) || true
+  ( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --lease-seconds 900 --task "$task" 2>&1 | grep -E '^memory: (claimed|task|.*confined)' ) || true
   handoff=$(a task get "$task" | j "d.get('handoff') or ''")
   if [ -n "$handoff" ]; then
     a get "$handoff" 2>/dev/null | grep -q "Checked against the platform definition" \
