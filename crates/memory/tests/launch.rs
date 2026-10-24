@@ -1042,7 +1042,8 @@ fn a_kept_tree_is_the_commit_and_repeated_runs_are_not_a_subscription_s() {
 
 /// The projection as a live mount: a shell `cat` inside the sandbox, which no hook
 /// sees, is a `get` the memory serves and logs. Where this host has no FUSE the launch
-/// says the projection is a render, and the test says it skipped the rest.
+/// says the projection is a render, and the test says it skipped the rest; on CI, which
+/// has FUSE, that is a failure.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_file_read_inside_the_sandbox_is_a_get_the_memory_serves() {

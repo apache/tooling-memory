@@ -57,7 +57,9 @@ jobs:
           targets: wasm32-wasip2, x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Ubuntu's AppArmor lets an unprivileged process create a user namespace but not map
-      # its uid in it, so no confined test could run; the runner allows it, as a laptop does
+      # its uid in it, so no confined test could run. A laptop installs the amem profile in
+      # packaging/apparmor; the tests' own probe is unshare, not amem, so this throwaway VM
+      # turns the restriction off instead
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: make check
         # the embedded PostgreSQL for the ledger tests lists its releases through GitHub's
