@@ -70,8 +70,34 @@ const NO_SECCOMP: &str = "the sandbox cannot install its seccomp filter here: it
                           kernel with seccomp filters, and a seccomp profile that allows \
                           seccomp(2)";
 
+/// Why a read-only grant cannot be made read-only below its submounts. A kernel before
+/// Linux 5.12 has no `mount_setattr`, and a container runtime's seccomp profile that does
+/// not allow the call answers it with `ENOSYS` or `EPERM`.
+const NO_MOUNT_SETATTR: &str = "mount_setattr is not available here: it needs Linux 5.12 or \
+                                later, and a seccomp profile that allows it";
+
+/// Whether `mount_setattr` answers here, asked with an empty path and a size below the
+/// first `mount_attr`: a kernel that has the call refuses that size with `EINVAL` before
+/// it checks anything else, so any other answer is a filter in the way.
+fn has_mount_setattr() -> bool {
+    // SAFETY: an empty NUL-terminated path, no mount_attr, and a size of zero; the kernel
+    // refuses the call before it reads either pointer.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            -1,
+            c"".as_ptr(),
+            0,
+            std::ptr::null::<libc::mount_attr>(),
+            0,
+        )
+    };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
+}
+
 /// Whether this host lets an unprivileged process build the sandbox at all: can it
-/// create a user namespace and map itself into it, and install the seccomp filter?
+/// create a user namespace and map itself into it, make a read-only grant read-only
+/// below its submounts, and install the seccomp filter?
 ///
 /// Probed in a child, because the answer is a namespace the asking process would
 /// otherwise be stuck in, and by calling [`enter_user_namespace`] itself rather than a
@@ -84,6 +110,9 @@ const NO_SECCOMP: &str = "the sandbox cannot install its seccomp filter here: it
 /// namespaces is one thing, Ubuntu's AppArmor moving an unprofiled binary into a profile
 /// without CAP_SYS_ADMIN is another, and the second is fixed by installing a profile
 /// rather than by giving up on confinement.
+///
+/// The child also asks for `mount_setattr`, without which every launch fails in
+/// [`read_only_below`].
 ///
 /// The child also installs the launch's seccomp filter, compiled before the fork as a
 /// launch compiles it.
@@ -103,6 +132,8 @@ pub fn availability() -> Result<(), String> {
     if pid == 0 {
         let code = if enter_user_namespace(getuid().as_raw(), getgid().as_raw()).is_err() {
             1
+        } else if !has_mount_setattr() {
+            2
         } else if seccomp::install(&filter).is_err() {
             3
         } else {
@@ -121,6 +152,7 @@ pub fn availability() -> Result<(), String> {
     }
     match libc::WEXITSTATUS(status) {
         0 => Ok(()),
+        2 => Err(NO_MOUNT_SETATTR.to_string()),
         3 => Err(NO_SECCOMP.to_string()),
         _ => Err(restricted_why()),
     }
@@ -167,8 +199,54 @@ fn bind(m: &Mount, root: &Path) -> Result<(), Error> {
             None::<&str>,
         )
         .map_err(|e| confine(format!("remount ro {}: {e}", target.display())))?;
+        read_only_below(&target)?;
     }
     Ok(())
+}
+
+/// Make every mount under `target` read-only and nosuid as well. A bind with `MS_REC`
+/// copies the source's submounts, `/usr/lib/wsl/lib` under `/usr` on WSL2 say, and the
+/// remount reaches the top mount only. `mount_setattr(2)` with `AT_RECURSIVE` sets the
+/// flags on the whole tree at once, a submount another mount hides included.
+///
+/// Where `mount_setattr` is not available, [`NO_MOUNT_SETATTR`], the launch fails rather
+/// than leave a submount writable under a read-only grant.
+fn read_only_below(target: &Path) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|e| confine(format!("{}: {e}", target.display())))?;
+    let attr = libc::mount_attr {
+        attr_set: libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    // SAFETY: a NUL-terminated path and a mount_attr passed with its own size; the kernel
+    // only reads both.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_RECURSIVE,
+            &attr,
+            std::mem::size_of::<libc::mount_attr>(),
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ENOSYS) {
+        return Err(confine(format!(
+            "cannot make the mounts under {} read-only: {NO_MOUNT_SETATTR}",
+            target.display()
+        )));
+    }
+    Err(confine(format!(
+        "mount_setattr ro {}: {e}",
+        target.display()
+    )))
 }
 
 /// The restricting flags a mount already carries, to carry into its read-only remount.
