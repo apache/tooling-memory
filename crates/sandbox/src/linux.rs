@@ -447,19 +447,21 @@ pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>, Resources), Error> {
 }
 
 fn measured(plan: &Plan, capture: bool) -> Result<(i32, Vec<u8>, Resources), Error> {
-    let (mut cmd, root) = command(plan)?;
+    let scratch = crate::scratch::Scratch::make(&std::env::temp_dir())?;
+    let (mut cmd, _) = command(plan)?;
     let ran = crate::measure::run(&mut cmd, capture)
         .map_err(|e| confine(format!("spawn {}: {e}", plan.argv[0])));
-    std::fs::remove_dir_all(&root).ok();
+    drop(scratch);
     ran
 }
 
 /// The command that builds the sandbox in `pre_exec` and execs the relay, and the
-/// scratch directory it pivots into, for the caller to remove.
+/// scratch directory it pivots into, which the caller holds as a [`crate::scratch::Scratch`].
 fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
-    let root = std::env::temp_dir().join(format!("memory-sandbox-{}", std::process::id()));
+    let root = crate::scratch::dir(&std::env::temp_dir());
+    let launcher = nix::unistd::getpid();
     std::fs::create_dir_all(&root).map_err(|e| confine(format!("{}: {e}", root.display())))?;
 
     let plan2 = plan.clone();
@@ -482,10 +484,15 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
                 enter_user_namespace(uid, gid)?;
                 sethostname(&plan2.hostname).map_err(|e| confine(format!("hostname: {e}")))?;
                 loopback_up()?;
+                // the run ends with the launcher, however the launcher ends
+                die_with_parent(launcher)?;
                 // before build_root: it mounts this namespace's procfs, which must be
                 // made after the fork that enters the namespace and before pivot_root
                 // takes the host's procfs out of view
                 become_pid_one()?;
+                // pid 1, whose parent is outside its namespace and reads as 0: the
+                // namespace, and the harness in it, ends with the intermediate
+                die_with_parent(nix::unistd::Pid::from_raw(0))?;
                 build_root(&plan2, &root2)?;
                 Ok(())
             };
@@ -668,6 +675,19 @@ fn close_from_three() {
     for fd in 3..open_files_limit() {
         // SAFETY: close of a descriptor number; one that is not open fails with EBADF.
         unsafe { libc::close(fd) };
+    }
+}
+
+/// Have the kernel SIGKILL this process when the thread that forked it ends, and fail if
+/// `parent` is no longer its parent: gone before the request took hold. Runs between fork
+/// and exec; the setting outlives the exec.
+fn die_with_parent(parent: nix::unistd::Pid) -> Result<(), Error> {
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|e| confine(format!("parent-death signal: {e}")))?;
+    if nix::unistd::getppid() == parent {
+        Ok(())
+    } else {
+        Err(confine("the launcher has gone"))
     }
 }
 

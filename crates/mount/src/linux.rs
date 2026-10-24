@@ -55,9 +55,16 @@ pub(crate) fn availability() -> Result<(), String> {
 }
 
 /// Whether `at` is a mount whose server is gone: a killed launcher leaves one, and every
-/// call on it fails with "transport endpoint is not connected".
+/// call on it fails with "transport endpoint is not connected". The server is the
+/// launcher, so this is the record of whether its launcher lives. A link at `at` is not
+/// followed, and is not a dead mount.
 fn is_dead(at: &Path) -> bool {
-    std::fs::metadata(at)
+    if std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
+    }
+    // an open, which always reaches the server: the kernel answers a stat from its
+    // cache for as long as the attributes' TTL after the server has gone
+    std::fs::read_dir(at)
         .err()
         .is_some_and(|e| e.raw_os_error() == Some(libc_enotconn()))
 }

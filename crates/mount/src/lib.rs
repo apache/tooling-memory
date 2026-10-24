@@ -202,14 +202,22 @@ pub fn mount(memory: Arc<Memory>, render: &Path, at: &Path) -> Result<Mounted, E
 
 /// Clear what killed launchers left under `base`, a harness's mount directory: a dead
 /// mount is unmounted and its directory removed, an empty directory removed. A mount
-/// another launcher is serving is left alone. Returns the directories cleared.
+/// another launcher is serving is left alone, and a link is never followed. Returns the
+/// directories cleared.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 pub fn sweep(base: &Path) -> Vec<PathBuf> {
     let mut cleared = Vec::new();
+    if is_link(base) {
+        return cleared;
+    }
     let Ok(entries) = std::fs::read_dir(base) else {
         return cleared;
     };
     for entry in entries.flatten() {
+        // the kind as the directory lists it, without a stat of a mountpoint
+        if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue;
+        }
         let path = entry.path();
         #[cfg(target_os = "linux")]
         linux::clear_dead(&path);
@@ -218,6 +226,29 @@ pub fn sweep(base: &Path) -> Vec<PathBuf> {
         }
     }
     cleared
+}
+
+/// [`sweep`] every harness's mount directory under `root`'s [`MOUNTS`], so a launch of
+/// one harness clears what killed launches of another left. Returns the directories
+/// cleared.
+pub fn sweep_root(root: &Path) -> Vec<PathBuf> {
+    let mounts = root.join(MOUNTS);
+    if is_link(&mounts) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&mounts) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .flat_map(|e| sweep(&e.path()))
+        .collect()
+}
+
+/// Whether `path` is a symbolic link, which a sweep does not follow.
+fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 #[cfg(test)]
@@ -272,5 +303,44 @@ mod tests {
             sweep(&dir.path().join("none")).is_empty(),
             "no base, nothing to do"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_reaches_every_harness_and_follows_no_link() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let empty_outside = outside.path().join("empty");
+        std::fs::create_dir(&empty_outside).unwrap();
+        let session_outside = outside.path().join("h/sess-x");
+        std::fs::create_dir_all(&session_outside).unwrap();
+        let mounts = root.path().join(MOUNTS);
+        for harness in ["claude", "codex"] {
+            std::fs::create_dir_all(mounts.join(harness).join("sess-gone")).unwrap();
+        }
+        // links in a harness's directory, and a harness directory that is a link, to
+        // directories outside the root that a followed link would clear
+        std::os::unix::fs::symlink(&empty_outside, mounts.join("claude/sess-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), mounts.join("gemini")).unwrap();
+
+        let mut cleared = sweep_root(root.path());
+        cleared.sort();
+
+        assert_eq!(
+            cleared,
+            vec![
+                mounts.join("claude/sess-gone"),
+                mounts.join("codex/sess-gone")
+            ]
+        );
+        assert!(empty_outside.is_dir(), "a link is not followed");
+        assert!(mounts.join("claude/sess-link").is_symlink());
+        // a root whose mount directory is a link is not swept at all
+        let linked_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(linked_root.path().join("state")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), linked_root.path().join(MOUNTS)).unwrap();
+        assert!(sweep_root(linked_root.path()).is_empty());
+        assert!(empty_outside.is_dir());
+        assert!(session_outside.is_dir());
     }
 }

@@ -39,6 +39,7 @@ mod review;
 mod savings;
 mod sources;
 mod status;
+mod stops;
 mod taps;
 mod tool_server;
 mod transcripts;
@@ -2047,6 +2048,8 @@ async fn run_confined(
     capture: bool,
     runner: &Runner,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
+    // counted until the mount below is gone, so a launcher told to stop waits for it
+    let _in_flight = stops::InFlight::enter()?;
     let host_home = home_dir();
     let rootfs = match runner {
         Runner::Image(rootfs) => Some(rootfs.as_path()),
@@ -2117,11 +2120,11 @@ async fn run_confined(
 /// The session's render served as a live mount, where this host can: every open of an
 /// entry inside is then a `get` the memory serves, whatever tool made it, and the hook
 /// is told it need not make one. Where it cannot, the render is mounted as files, as
-/// before, and the launch says why. Mounts killed launchers left under the harness's
-/// mount directory are cleared first.
+/// before, and the launch says why. Mounts killed launchers left under the root's mount
+/// directory, of any harness, are cleared first.
 fn live_mount(p: &Prepared, harness: Harness) -> Option<dm_mount::Mounted> {
+    dm_mount::sweep_root(&p.root);
     let base = p.root.join(dm_mount::MOUNTS).join(harness.binary());
-    dm_mount::sweep(&base);
     let at = base.join(p.projection.file_name().unwrap_or_default());
     match dm_mount::mount(p.memory.clone(), &p.projection, &at) {
         Ok(m) => {
@@ -2898,6 +2901,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         (None, None) => None,
     };
     let (program, args) = split_program(harness.into(), args);
+    let stops = stops::Stops::listen()?;
     let session = Session::start(
         root,
         harness.into(),
@@ -2912,13 +2916,18 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         RunOptions::new(model, subagents, program, None).empty_memory(empty_memory),
     )
     .await?;
-    let code = match prompt {
-        Some(prompt) => work::prompted(&session, &prompt, &args, no_handoff).await?,
-        None => work::interactive(&session, &args).await?,
-    };
-    if mine_after {
-        session.mine(mine_model.as_deref(), mine_via).await?;
-    }
+    let code = stops
+        .around(async {
+            let code = match prompt {
+                Some(prompt) => work::prompted(&session, &prompt, &args, no_handoff).await?,
+                None => work::interactive(&session, &args).await?,
+            };
+            if mine_after {
+                session.mine(mine_model.as_deref(), mine_via).await?;
+            }
+            Ok(code)
+        })
+        .await?;
     session.finish(code).await;
     std::process::exit(code);
 }
@@ -2974,6 +2983,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
     };
     let workdir = resolve_workdir(root, workdir)?;
     refuse_browser_unconfined(unconfined, backend)?;
+    let stops = stops::Stops::listen()?;
     let session = Session::start(
         root,
         harness.into(),
@@ -3000,7 +3010,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         prefetch: !no_prefetch,
         task,
     };
-    let code = work::run(&session, &options).await?;
+    let code = stops.around(work::run(&session, &options)).await?;
     session.finish(code).await;
     std::process::exit(code);
 }
@@ -3822,14 +3832,15 @@ impl Session {
             self.serve_unix.abort();
             std::fs::remove_file(&self.p.socket).ok();
         }
+        // the render was this session's alone, and goes with it; here as well as in the
+        // guard, since a launch ends in process::exit, which runs no destructors. Before
+        // anything is said, which a terminal that hung up refuses.
+        std::fs::remove_dir_all(&self.p.projection).ok();
         if !self.p.metered {
             record_reported_usage(&self.p);
         }
         report_usage(&self.p.egress);
         transcripts::remove_kept(&self.p.memory, &self.p.home).await;
-        // the render was this session's alone, and goes with it; here as well as in the
-        // guard, since a launch ends in process::exit, which runs no destructors
-        std::fs::remove_dir_all(&self.p.projection).ok();
         if let Runner::Requests(r) = &self.runner {
             std::fs::write(r.dir.join(requests::DONE), code.to_string()).ok();
         }

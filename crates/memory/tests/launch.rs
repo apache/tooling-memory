@@ -769,6 +769,284 @@ fn a_confined_prompted_run_captures_more_than_a_pipe_holds() {
     );
 }
 
+// ---- a launcher told to stop, and one killed ----
+
+/// A confined prompted launch, with its temporary
+/// directory at `tmp`, so the scratch directory it makes is where the test looks. Its
+/// output goes to `<work>.out` and `<work>.err`.
+#[cfg(target_os = "linux")]
+fn start_confined(root: &Path, work: &Path, tmp: &Path) -> std::process::Child {
+    let mut cmd = memory();
+    cmd.args([
+        "--root",
+        root.to_str().unwrap(),
+        "launch",
+        "--harness",
+        "claude",
+        "--auth",
+        "key",
+    ])
+    .args(["--workdir", work.to_str().unwrap()])
+    .args(["--prompt", "hello", "--no-handoff"])
+    .env("PATH", path_with(&work.join("bins")))
+    .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+    .env("TMPDIR", tmp)
+    .stdin(Stdio::null())
+    .stdout(std::fs::File::create(work.with_extension("out")).unwrap())
+    .stderr(std::fs::File::create(work.with_extension("err")).unwrap());
+    cmd.spawn().unwrap()
+}
+
+/// A working tree whose harness says it started, then runs until it is killed.
+#[cfg(target_os = "linux")]
+fn sleeper(dir: &Path, name: &str) -> PathBuf {
+    let work = dir.join(name);
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(&work, "touch ./started\nsleep 300");
+    work
+}
+
+/// A launch whose harness has started and runs until it is killed, and its working tree.
+#[cfg(target_os = "linux")]
+fn running_sleeper(
+    root: &Path,
+    dir: &Path,
+    name: &str,
+    tmp: &Path,
+) -> (std::process::Child, PathBuf) {
+    let work = sleeper(dir, name);
+    let launch = start_confined(root, &work, tmp);
+    assert!(
+        started(&work, 60),
+        "{}",
+        std::fs::read_to_string(work.with_extension("err")).unwrap()
+    );
+    (launch, work)
+}
+
+/// Send `child` the signal named `sig`, as `kill` names it.
+#[cfg(target_os = "linux")]
+fn signal(child: &std::process::Child, sig: &str) {
+    let ok = Command::new("kill")
+        .args([&format!("-{sig}"), &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(ok.success());
+}
+
+/// Wait for `child` to exit, `secs` at most.
+#[cfg(target_os = "linux")]
+fn exited(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if let Some(s) = child.try_wait().unwrap() {
+            return Some(s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    None
+}
+
+/// Wait for the harness in `work` to have started, `secs` at most.
+#[cfg(target_os = "linux")]
+fn started(work: &Path, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if work.join("started").exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+/// The processes whose command line names something under `dir`, as pid and command
+/// line.
+#[cfg(target_os = "linux")]
+fn processes_under(dir: &Path) -> Vec<(String, String)> {
+    let needle = dir.to_string_lossy().into_owned();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|pid| {
+            let c = std::fs::read(Path::new("/proc").join(&pid).join("cmdline")).ok()?;
+            Some((pid, String::from_utf8_lossy(&c).replace('\0', " ")))
+        })
+        .filter(|(_, c)| c.contains(&needle))
+        .collect()
+}
+
+/// The mounts under `dir`, from this process's mount table: no mountpoint is touched,
+/// since one a launcher left may not answer.
+#[cfg(target_os = "linux")]
+fn mounts_under(dir: &Path) -> Vec<String> {
+    let needle = format!("{}/", dir.display());
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .filter(|m| m.starts_with(&needle))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The names in `dir`, listed without a stat of any of them.
+#[cfg(target_os = "linux")]
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Kills, when dropped, every process whose command line names something under its
+/// directory, and lazily unmounts what is left there: a test that fails leaves nothing
+/// running or mounted. A run's harness goes with its relay, pid 1 of its namespace.
+#[cfg(target_os = "linux")]
+struct Reap(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl Drop for Reap {
+    fn drop(&mut self) {
+        for (pid, _) in processes_under(&self.0) {
+            Command::new("kill")
+                .args(["-KILL", &pid])
+                .stderr(Stdio::null())
+                .status()
+                .ok();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for m in mounts_under(&self.0) {
+            Command::new("fusermount3").args(["-uz", &m]).status().ok();
+        }
+    }
+}
+
+/// What a launch leaves: the processes of its run, its mount, its scratch directory,
+/// its socket and its render. A SIGTERM ends the run and removes every one, as a run
+/// that ends of itself does, and the launcher exits as a process the signal ended.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_told_to_stop_ends_its_run_and_leaves_nothing() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let (mut launch, work) = running_sleeper(&root, dir.path(), "work", &tmp);
+    assert!(
+        !mounts_under(&root).is_empty(),
+        "the projection is a live mount"
+    );
+    assert_eq!(names_in(&tmp).len(), 1, "the run has its scratch directory");
+
+    signal(&launch, "TERM");
+    let status = exited(&mut launch, 30);
+
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    // said once, as the stop; the kill that ends the sandbox is not a death to report
+    assert_eq!(err.matches("SIGTERM").count(), 1, "{err}");
+    assert!(!err.contains("killed by"), "{err}");
+    assert_eq!(processes_under(dir.path()), Vec::new());
+    assert_eq!(mounts_under(&root), Vec::<String>::new());
+    assert_eq!(
+        names_in(&tmp),
+        Vec::<String>::new(),
+        "the scratch directory"
+    );
+    assert_eq!(names_in(&root.join("state/run")), Vec::<String>::new());
+    assert_eq!(
+        names_in(&root.join("state/mount/claude")),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        names_in(&root.join("state/projection/claude")),
+        Vec::<String>::new()
+    );
+}
+
+/// SIGKILL cannot be caught: a launcher killed by it leaves its scratch directory and its
+/// mount, with nothing running to serve it. The next launch sweeps both, and what a
+/// killed launcher of long ago left, and keeps what a live launcher holds.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_next_launch_sweeps_what_a_killed_one_left_and_keeps_a_live_one_s() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    // left by a launcher long gone: its pid is no process now
+    let mut gone = Command::new("/bin/sh").args(["-c", ":"]).spawn().unwrap();
+    let gone_pid = gone.id();
+    gone.wait().unwrap();
+    std::fs::create_dir(tmp.join(format!("memory-sandbox-{gone_pid}"))).unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let (mut live, _) = running_sleeper(&root, dir.path(), "live", &tmp);
+    let live_mounts = mounts_under(&root);
+    assert_eq!(live_mounts.len(), 1);
+    let (mut killed, _) = running_sleeper(&root, dir.path(), "killed", &tmp);
+    assert_eq!(mounts_under(&root).len(), 2);
+    signal(&killed, "KILL");
+    killed.wait().unwrap();
+
+    let killed_scratch = format!("memory-sandbox-{}", killed.id());
+    assert!(names_in(&tmp).contains(&killed_scratch));
+    assert_eq!(
+        mounts_under(&root).len(),
+        2,
+        "the killed launch's mount is left"
+    );
+
+    let next_work = dir.path().join("next");
+    std::fs::create_dir_all(&next_work).unwrap();
+    fake_harness(&next_work, "exit 0");
+    let mut next = start_confined(&root, &next_work, &tmp);
+    let status = exited(&mut next, 60);
+    let err = std::fs::read_to_string(next_work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "{err}");
+
+    assert_eq!(
+        names_in(&tmp),
+        vec![format!("memory-sandbox-{}", live.id())],
+        "the killed launch's scratch directory and the old one are swept"
+    );
+    assert_eq!(
+        mounts_under(&root),
+        live_mounts,
+        "the killed launch's mount is swept and the live launch's stays"
+    );
+    let live_session = Path::new(&live_mounts[0]).file_name().unwrap();
+    assert_eq!(
+        names_in(&root.join("state/mount/claude")),
+        vec![live_session.to_string_lossy().into_owned()]
+    );
+    assert!(
+        live.try_wait().unwrap().is_none(),
+        "the live launch runs on"
+    );
+    // and it still ends cleanly
+    signal(&live, "TERM");
+    assert_eq!(exited(&mut live, 30).and_then(|s| s.code()), Some(128 + 15));
+    assert_eq!(mounts_under(&root), Vec::<String>::new());
+    assert_eq!(names_in(&tmp), Vec::<String>::new());
+}
+
 // ---- the wslc backend's inside half, driven by a fake host ----
 
 /// `memory inside` writes run requests for the host and waits for exit codes. This fake

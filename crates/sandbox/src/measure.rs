@@ -44,6 +44,7 @@ pub fn run(cmd: &mut Command, capture: bool) -> std::io::Result<(i32, Vec<u8>, R
         cmd.stdin(Stdio::null()).stdout(Stdio::piped());
     }
     let mut child = cmd.spawn()?;
+    let _stoppable = crate::stop::register(&child);
     let mut out = Vec::new();
     if let Some(mut s) = child.stdout.take() {
         s.read_to_end(&mut out)?;
@@ -56,7 +57,8 @@ pub fn run(cmd: &mut Command, capture: bool) -> std::io::Result<(i32, Vec<u8>, R
 /// The code a process ended with, as a shell gives it: its own exit code, or 128 plus
 /// the number of the signal that killed it. A death by signal is said on standard error,
 /// naming `program`, since the code alone does not tell it from an exit; SIGINT and
-/// SIGPIPE are not, as a shell does not say them.
+/// SIGPIPE are not, as a shell does not say them, nor a SIGKILL once
+/// [`crate::stop::stop`] has sent it.
 #[must_use]
 pub fn exit_code(status: ExitStatus, program: &OsStr) -> i32 {
     #[cfg(not(unix))]
@@ -66,7 +68,8 @@ pub fn exit_code(status: ExitStatus, program: &OsStr) -> i32 {
         use std::io::Write;
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            if is_said(signal) {
+            let stopped = signal == libc::SIGKILL && crate::stop::stopping();
+            if is_said(signal) && !stopped {
                 let core = if status.core_dumped() {
                     ", core dumped"
                 } else {
