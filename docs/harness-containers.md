@@ -152,7 +152,8 @@ it was not measured. What either cost adds to a real session, most of which is s
 on the model, was not measured.
 
 A second nested reading, from the workflow's `gvisor-kvm` job on GitHub's Ubuntu 26.04 runner
-(an Azure VM, kernel 7.0.0-1017-azure, run `40019093054`), one round each. The contract check
+(an Azure VM, kernel 7.0.0-1017-azure, run `40019093054`), the median of three interleaved
+rounds as above. The contract check
 passed every check on both platforms there. kvm is the slower again:
 
 | Task | runc | gVisor | mounts cached | kvm platform |
@@ -411,14 +412,16 @@ contract check run in the harness container
 | A: harness and egress sidecar in one pod | point 1 fails: the harness reaches the API server, cluster DNS, other pods and the internet |
 | B: the same pod, our namespaces backend inside the harness container, default seccomp | `unshare` refused |
 | B, seccomp Unconfined | the network is cut, but vsock is open, as in our own backend |
-| **B, a Localhost seccomp profile: the runtime default plus `unshare`, `setns`, `clone` and mounting, still refusing `AF_VSOCK`** | **every check passes**, and from a `SandboxTemplate` through a warm pool and a claim too |
+| **B, a Localhost seccomp profile: the runtime default plus `unshare`, `setns`, `clone` and mounting, still refusing `AF_VSOCK`** | **every check passes** on the laptop's rootless node, and from a `SandboxTemplate` through a warm pool and a claim too. On the rootful node of GitHub's runner, mounting `/proc` is refused: see below |
 | B, `hostUsers: false` | the pod does not start: on a rootless node for two reasons, and on a rootful one because `runc` may not mount `sysfs` |
 | C: the egress in its own pod, the harness pod deny-all but to it | the policy is enforced (kindnet runs kube-network-policies), but the route out is pod-network TCP, not a socket, so point 1 holds only as far as the network plugin does, and the egress Service is reachable from any pod a policy does not stop |
 
-So the institutional shape is B: the egress as a native sidecar with the socket in a shared
-`emptyDir`, our Linux backend inside the harness container, and a seccomp profile that every
-node carries, which is a cluster administrator's step (the Security Profiles Operator, for
-one). kind itself needed no root here, only podman's log driver set to `k8s-file`.
+So the institutional shape is B, where the node allows it: the egress as a native sidecar
+with the socket in a shared `emptyDir`, our Linux backend inside the harness container, and a
+seccomp profile that every node carries, which is a cluster administrator's step (the
+Security Profiles Operator, for one). kind itself needed no root here, only podman's log
+driver set to `k8s-file`. On the second node tested, B's mount namespace could not mount
+`/proc` (below), so "where the node allows it" is not yet "on any node".
 
 `hostUsers: false` met two walls on the rootless node.
 
@@ -451,16 +454,28 @@ runc 1.4.3, and a `/sys` with kind's own files bound over two of its entries,
 `/sys/devices/virtual/dmi/id/product_name` and `product_uuid`. The kernel mounts a fresh
 `sysfs` in a user namespace only when the `sysfs` already visible there is covered by
 nothing but mounts on empty directories (`mnt_already_visible` in `fs/namespace.c`), and these
-two cover files. That is the likely cause; it is reasoning from the kernel's rule, not a run
-without kind's two mounts. It would make `hostUsers: false` unusable on any kind node, while
-a real node, which has no such mounts, is untouched.
+two cover files. That is one candidate, from the kernel's rule, not from a run without
+kind's two mounts. Another is not ruled out: `sysfs` also needs the mounter to hold the
+user namespace that owns its network namespace, which fails if the pod's network namespace
+was made outside it. If the first is the cause, `hostUsers: false` cannot start on a kind
+node and a real node is untouched; neither is shown.
 
 The same run started the other layouts, once the runner saved one platform of the image:
 Docker's store had saved an index naming platforms it held no layers for. A and C read as
 they did on the laptop. Every `unshare -U` in B failed writing its uid map, which is Ubuntu's
 AppArmor refusing unprivileged user namespaces on the runner, the setting pull request 3
-addresses for our launcher; the job now turns it off, as on the laptop. Whether `hostUsers: false` alone
-admits `unshare` under the default profile is still unseen.
+addresses for our launcher.
+
+With that setting off (run `40045349552`), B ran as far as the laptop's for the network:
+`unshare -Urn` with the Localhost profile passed every check but "only loopback", which a
+run without a mount namespace cannot pass, since `/sys` still shows the pod's interfaces.
+Our backend's full shape, `unshare -Urmnpf --mount-proc`, then failed in every B pod and in
+the warm pool's claim: `unshare: mount /proc failed: Operation not permitted`. On the laptop
+it passed. Two candidates, neither tested: the same kernel rule for `proc`, since the runtime
+covers files under each container's `/proc` (`/proc/kcore` and others); or the runtime's
+AppArmor profile for pods refusing `mount`, which applies on the runner and not under WSL2.
+A pod with `appArmorProfile: Unconfined` would tell them apart. Whether `hostUsers: false`
+alone admits `unshare` under the default profile is still unseen.
 
 | Candidate | Licence | Verdict | Why |
 |---|---|---|---|
@@ -485,6 +500,8 @@ hosted, orchestration above the harness, or the Polkadot framework.
 - gVisor's `kvm` platform on bare metal; here it ran nested under Hyper-V.
 - agent-sandbox with `hostUsers: false` on a node without kind's two files over `/sys`: a
   real cluster's node, or kind with them unmounted.
+- Layout B's full shape on a rootful node with the pod's AppArmor profile `Unconfined`, which
+  says which of the two candidates refuses `/proc`.
 - A real call through nsjail and fcage. Their builds went with the scratch directory, and they
   bind the socket in exactly as podman does, where the call completed.
 - microsandbox again once #1878 is fixed: `harness-call.sh` through `run-microsandbox-sdk.sh`
