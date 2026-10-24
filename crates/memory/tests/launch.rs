@@ -344,6 +344,62 @@ fn fake_harness(dir: &Path, body: &str) -> PathBuf {
     bins
 }
 
+/// How many times `stderr` says that a process died of `signal`, numbered `number`.
+fn deaths_by(stderr: &str, signal: &str, number: i32) -> usize {
+    stderr
+        .lines()
+        .filter(|l| l.contains(&format!("killed by {signal} (signal {number})")))
+        .count()
+}
+
+#[test]
+fn an_unconfined_harness_killed_by_a_signal_exits_128_and_its_number_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), "kill -ABRT $$");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = launch(&root, &bins, &work, &["--unconfined"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 6), "{stderr}");
+    assert_eq!(deaths_by(&stderr, "SIGABRT", 6), 1, "{stderr}");
+}
+
+#[test]
+fn the_relay_reports_a_harness_killed_by_a_signal_as_128_and_its_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = memory()
+        .args(["relay", "--socket"])
+        .arg(dir.path().join("egress.sock"))
+        .args(["--listen", "127.0.0.1:0", "--", "sh", "-c", "kill -KILL $$"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 9), "{stderr}");
+    assert_eq!(deaths_by(&stderr, "SIGKILL", 9), 1, "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_harness_killed_by_a_signal_exits_128_and_its_number_and_says_so_once() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_harness(&work, "kill -ABRT $$");
+
+    let out = launch(&root, &bins, &work, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 6), "{stderr}");
+    assert_eq!(deaths_by(&stderr, "SIGABRT", 6), 1, "{stderr}");
+}
+
 /// Shell that speaks MCP to the egress with curl: initialize, write a handoff, complete
 /// the task named in the prompt.
 const COMPLETES_ITS_TASK: &str = r#"

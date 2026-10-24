@@ -429,12 +429,12 @@ fn become_pid_one() -> Result<(), Error> {
         let r = unsafe { libc::waitpid(pid, &mut status, 0) };
         let code = if r < 0 {
             1
-        } else if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else if libc::WIFSIGNALED(status) {
-            128 + libc::WTERMSIG(status)
         } else {
-            1
+            use std::os::unix::process::ExitStatusExt;
+            crate::measure::exit_code(
+                std::process::ExitStatus::from_raw(status),
+                std::ffi::OsStr::new("the relay"),
+            )
         };
         // SAFETY: exiting the intermediate process without running atexit handlers,
         // which belong to the parent that forked us.
@@ -454,5 +454,5 @@ pub fn spawn_in_pid_namespace(argv: &[OsString]) -> Result<i32, Error> {
         .args(&argv[1..])
         .status()
         .map_err(|e| confine(format!("spawn {}: {e}", argv[0].to_string_lossy())))?;
-    Ok(status.code().unwrap_or(1))
+    Ok(crate::measure::exit_code(status, &argv[0]))
 }

@@ -10,8 +10,9 @@
 //! process of the tree reached, not their sum.
 
 use serde::Serialize;
+use std::ffi::OsStr;
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 /// A run's cost to the host.
@@ -32,7 +33,7 @@ pub struct Resources {
 
 /// Spawn `cmd` and wait for it, measured. With `capture`, standard input is closed and
 /// standard output read and returned; standard error goes where it was going. The exit
-/// code is the process's own, or 1 when a signal ended it.
+/// code is as [`exit_code`] gives it.
 ///
 /// # Errors
 ///
@@ -47,9 +48,67 @@ pub fn run(cmd: &mut Command, capture: bool) -> std::io::Result<(i32, Vec<u8>, R
     if let Some(mut s) = child.stdout.take() {
         s.read_to_end(&mut out)?;
     }
-    let (code, mut r) = wait(child)?;
+    let (code, mut r) = wait(child, cmd.get_program())?;
     r.wall_ms = millis(started.elapsed());
     Ok((code, out, r))
+}
+
+/// The code a process ended with, as a shell gives it: its own exit code, or 128 plus
+/// the number of the signal that killed it. A death by signal is said on standard error,
+/// naming `program`, since the code alone does not tell it from an exit.
+#[must_use]
+pub fn exit_code(
+    status: ExitStatus,
+    #[cfg_attr(not(unix), allow(unused_variables))] program: &OsStr,
+) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let core = if status.core_dumped() {
+                ", core dumped"
+            } else {
+                ""
+            };
+            eprintln!(
+                "memory: {} was killed by {}{core}",
+                program.to_string_lossy(),
+                signal_named(signal)
+            );
+            return 128 + signal;
+        }
+    }
+    status.code().unwrap_or(1)
+}
+
+/// A signal by name and number, as `SIGABRT (signal 6)`; by number alone where it has no
+/// name here.
+#[cfg(unix)]
+fn signal_named(signal: i32) -> String {
+    let name = match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        libc::SIGVTALRM => "SIGVTALRM",
+        libc::SIGPROF => "SIGPROF",
+        libc::SIGSYS => "SIGSYS",
+        _ => return format!("signal {signal}"),
+    };
+    format!("{name} (signal {signal})")
 }
 
 /// This process's own CPU time so far, user and system, in milliseconds: the launcher's
@@ -70,7 +129,8 @@ pub fn own_cpu_ms() -> (u64, u64) {
 }
 
 #[cfg(unix)]
-fn wait(child: Child) -> std::io::Result<(i32, Resources)> {
+fn wait(child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
+    use std::os::unix::process::ExitStatusExt;
     let pid = libc::pid_t::try_from(child.id()).map_err(std::io::Error::other)?;
     let mut status: libc::c_int = 0;
     // SAFETY: rusage is plain data, for which all zeroes is a valid value.
@@ -88,13 +148,8 @@ fn wait(child: Child) -> std::io::Result<(i32, Resources)> {
     }
     // reaped above; dropping the handle does not wait again
     drop(child);
-    let code = if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        1
-    };
     Ok((
-        code,
+        exit_code(ExitStatus::from_raw(status), program),
         Resources {
             wall_ms: 0,
             user_ms: timeval_ms(usage.ru_utime),
@@ -106,9 +161,9 @@ fn wait(child: Child) -> std::io::Result<(i32, Resources)> {
 }
 
 #[cfg(not(unix))]
-fn wait(mut child: Child) -> std::io::Result<(i32, Resources)> {
+fn wait(mut child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
     let status = child.wait()?;
-    Ok((status.code().unwrap_or(1), Resources::default()))
+    Ok((exit_code(status, program), Resources::default()))
 }
 
 fn millis(d: Duration) -> u64 {
@@ -155,13 +210,15 @@ mod tests {
     }
 
     #[test]
-    fn a_signal_is_exit_one_and_the_launcher_has_cpu_of_its_own() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "kill -9 $$"]);
-        let (code, out, r) = run(&mut cmd, false).unwrap();
-        assert_eq!(code, 1);
-        assert!(out.is_empty());
-        assert!(r.measured);
+    fn a_death_by_signal_is_128_and_its_number_and_the_launcher_has_cpu_of_its_own() {
+        for (signal, number) in [("KILL", 9), ("ABRT", 6)] {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", &format!("kill -{signal} $$")]);
+            let (code, out, r) = run(&mut cmd, false).unwrap();
+            assert_eq!(code, 128 + number, "SIG{signal}");
+            assert!(out.is_empty());
+            assert!(r.measured);
+        }
         let (user, sys) = own_cpu_ms();
         assert!(user + sys < u64::MAX);
         assert!(Command::new("/nonexistent/binary").spawn().is_err());
