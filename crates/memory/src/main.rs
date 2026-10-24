@@ -5059,8 +5059,20 @@ mod backend_tests {
     async fn a_google_login_tunnels_to_the_hosts_it_needs_and_not_to_a_vm_s_reverse_name() {
         use axum::http::StatusCode;
         let dir = tempfile::tempdir().unwrap();
-        let memory =
-            Arc::new(Memory::init(&dir.path().join("m"), "human:test:me", "dom-me").unwrap());
+        let memory = Memory::init(&dir.path().join("m"), "human:test:me", "dom-me").unwrap();
+        // reading a restricted entry raises the session's label above google's starter
+        // ceiling, so a host the allowlist admits stops at the ceiling, which names the
+        // destination, before the egress resolves anything
+        memory
+            .write(WriteRequest {
+                classification: Some(Label::Restricted),
+                body: "the restricted thing".into(),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        memory.search("restricted", None, 10).await.unwrap();
+        let memory = Arc::new(memory);
         let destinations: HashMap<String, Destination> =
             ["github", "chatgpt", "google", "grok", "meta"]
                 .into_iter()
@@ -5087,9 +5099,8 @@ mod backend_tests {
             );
         }
         // a Google login's token refresh and Cloud Code, and Antigravity's eligibility
-        // check: the account's profile at www.googleapis.com, its picture at lh3. Past
-        // the allowlist the egress resolves the name and checks its addresses, which
-        // needs a network, so only the allowlist's answer is asserted here
+        // check: the account's profile at www.googleapis.com, its picture at lh3. Each is
+        // admitted by google's entries, and refused only by google's ceiling
         for host in [
             "oauth2.googleapis.com",
             "accounts.google.com",
@@ -5098,9 +5109,10 @@ mod backend_tests {
             "www.googleapis.com",
             "lh3.googleusercontent.com",
         ] {
-            let (_, body) = connect(&egress, host).await;
+            let (status, body) = connect(&egress, host).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "a tunnel to {host}: {body}");
             assert!(
-                !body.contains("no destination allows a tunnel to"),
+                body.contains("and google accepts at most"),
                 "a tunnel to {host}: {body}"
             );
         }
