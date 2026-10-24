@@ -234,6 +234,27 @@ async function fetchFor(ask) {
 // started in it is pending
 const opening = (t) => t.url === 'about:blank' && Boolean(t.pendingUrl);
 
+// the tabs rendered in, each with whether the navigation started there committed a
+// document: the tab took a URL other than about:blank
+const rendering = new Map(); // tabId -> { committed }
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  const r = rendering.get(tabId);
+  if (r && change.url && change.url !== 'about:blank') r.committed = true;
+});
+
+// why a tab that shows a URL off the hosts is refused. On about:blank with no document of
+// the navigation committed, the page was fetched and answered with no document, a 204 or
+// a download; a commit reported late gets one quiet spell to land. Anywhere else, the
+// page was sent there.
+async function offTab(ask, tabId, url) {
+  const committed = () => (rendering.get(tabId) || {}).committed;
+  if (url === 'about:blank' && !committed()) {
+    await sleep(QUIET_MS);
+    if (!committed()) return { error: `${ask.url} produced no page to read (no document was committed)` };
+  }
+  return offHosts(ask.url, url);
+}
+
 // one ask to render: a tab of this browser, held to the hosts, read when it is built
 async function renderFor(ask) {
   const hosts = ask.hosts || [];
@@ -262,6 +283,7 @@ async function renderFor(ask) {
       if (Date.now() > deadline) return { error: `${ask.url}: the tab to render it in did not open in ${FETCH_TIMEOUT_MS / 1000} seconds` };
       await sleep(50);
     }
+    rendering.set(tab.id, { committed: false });
     await chrome.tabs.update(tab.id, { url: ask.url });
     // until the page says it is complete; a navigation the rules stopped, or one the
     // network refused, is the answer as soon as the frame reports it, whatever the tab says.
@@ -279,7 +301,7 @@ async function renderFor(ask) {
         return { error: `${ask.url}: the browser could not load it: ${frame.error}`, final_url: frame.url };
       }
       shown = shown || !opening(t);
-      if (shown && !allowed(t.url || '', hosts)) return offHosts(ask.url, t.url || '');
+      if (shown && !allowed(t.url || '', hosts)) return offTab(ask, tab.id, t.url || '');
       if (t.status === 'complete' && t.url && t.url !== 'about:blank') break;
       if (Date.now() > deadline) return { error: `${ask.url}: the page did not finish loading in ${FETCH_TIMEOUT_MS / 1000} seconds` };
     }
@@ -325,6 +347,7 @@ async function renderFor(ask) {
     return { error: `${ask.url}: ${(e && e.message) || e}` };
   } finally {
     chrome.tabs.remove(tab.id).catch(() => {});
+    rendering.delete(tab.id);
     inflight.delete(id);
     sync().catch(() => {});
   }
