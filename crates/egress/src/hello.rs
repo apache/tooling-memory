@@ -8,41 +8,63 @@
 //! allowed name and ask the front end behind it for another tenant. So the hello must
 //! name the CONNECT host, in the clear, and nothing else: one with another name, with
 //! two, or with none is refused, and so is one that hides its name with Encrypted
-//! Client Hello, whose name in the clear is a decoy. A CONNECT to an address is the one
-//! case where a hello with no name passes, since a client sends none for an address.
+//! Client Hello or one of its drafts, whose name in the clear is a decoy. A CONNECT to
+//! an address is the one case where a hello with no name passes, since a client sends
+//! none for an address.
 //!
-//! What this does not close: the egress cannot see inside TLS. A front end that still
-//! routes on the HTTP Host header inside the session (domain fronting) can be asked for
-//! another tenant under an allowed name, and a shared host serves every path on it to
-//! anyone: any bucket on storage.googleapis.com, any repository on
-//! raw.githubusercontent.com. An entry for a shared host admits all of it. Only the
-//! first ClientHello is read; the front end has routed on it by the time a second one,
-//! after a HelloRetryRequest, could come.
+//! What is checked: the first ClientHello, before the dial, which must end with the
+//! record that carries it; then the upstream's ServerHello, sent on to the client as it
+//! comes, and when that is a HelloRetryRequest, the second ClientHello, after an
+//! optional ChangeCipherSpec, held to the same rule before it goes upstream. Nothing the
+//! client sends after its first hello goes upstream until the ServerHello is read.
+//! After that the bytes are copied both ways unread.
+//!
+//! What is not: the egress cannot see inside TLS. A front end that still routes on the
+//! HTTP Host header inside the session (domain fronting) can be asked for another
+//! tenant under an allowed name, and a shared host serves every path on it to anyone:
+//! any bucket on storage.googleapis.com, any repository on raw.githubusercontent.com.
+//! An entry for a shared host admits all of it. A TLS 1.2 renegotiation sends its
+//! ClientHello inside the session, encrypted, so the name in it is not seen.
 
 use std::net::IpAddr;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
 /// The largest TLS record fragment, 2^14 bytes.
 const RECORD_MAX: usize = 16 * 1024;
 
-/// The most of the client's first bytes the egress holds before it decides: one TLS
-/// record of the largest size and its header. A ClientHello is a few hundred bytes to a
-/// few kilobytes; one that needs more is refused.
+/// The most of one side's bytes the egress holds before it decides on them: one TLS
+/// record of the largest size and its header. A ClientHello or a ServerHello is a few
+/// hundred bytes to a few kilobytes; one that needs more is refused.
 pub(crate) const HELLO_MAX: usize = RECORD_MAX + 5;
 
-/// How long a client has, once the tunnel opens, to send its whole ClientHello.
+/// How long a tunnel has, once it opens, for the client's ClientHello, the upstream's
+/// ServerHello, and after a HelloRetryRequest the second ClientHello, all together.
 pub(crate) const HELLO_WAIT: Duration = Duration::from_secs(10);
 
 /// A fatal TLS alert, `access_denied`, for a client whose hello is refused, so its TLS
 /// library reports a refusal rather than a dropped connection.
 pub(crate) const REFUSED_ALERT: [u8; 7] = [21, 3, 3, 0, 2, 2, 49];
 
+/// The random a ServerHello carries when it is a HelloRetryRequest, RFC 8446 4.1.3:
+/// SHA-256 of "HelloRetryRequest".
+pub(crate) const RETRY_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
+/// The ChangeCipherSpec record a client may send before its second ClientHello; its
+/// third byte, the minor version, may be any.
+const CHANGE_CIPHER_SPEC: [u8; 6] = [20, 3, 3, 0, 1, 1];
+
 const HANDSHAKE: u8 = 22;
 const CLIENT_HELLO: u8 = 1;
+const SERVER_HELLO: u8 = 2;
 const SERVER_NAME: u16 = 0;
 const HOST_NAME: u8 = 0;
-/// Encrypted Client Hello.
+/// Encrypted Client Hello's drafts, from 0xfe00 on, and its final codepoint, 0xfe0d.
+const ECH_DRAFT_FIRST: u16 = 0xfe00;
 const ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
 /// Encrypted SNI, the draft ECH replaced.
 const ENCRYPTED_SERVER_NAME: u16 = 0xffce;
@@ -51,16 +73,20 @@ const NOT_TLS: &str = "the first bytes are not a TLS handshake";
 const NOT_HELLO: &str = "the first handshake message is not a ClientHello";
 const MALFORMED: &str = "the ClientHello is malformed";
 const TOO_LONG: &str = "the ClientHello is longer than one TLS record";
-const HIDDEN: &str = "the ClientHello is encrypted, so the name in the clear is a decoy";
+const AFTER_HELLO: &str = "the ClientHello's record carries more after it";
+const HIDDEN: &str =
+    "the ClientHello uses Encrypted Client Hello (ECH), so the name in the clear is a decoy";
 const TWO_NAMES: &str = "the ClientHello carries two server names";
+const NOT_CCS: &str = "the record before the second ClientHello is not a ChangeCipherSpec";
 
 /// What a tunnel's first bytes say.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     /// Not enough bytes yet to tell.
     More,
-    /// A ClientHello that names the CONNECT host and hides no other name.
-    Allowed,
+    /// A ClientHello that names the CONNECT host and hides no other name, in this many
+    /// bytes: the records that carry it.
+    Allowed(usize),
     /// Anything else, and why.
     Refused(String),
 }
@@ -68,15 +94,15 @@ pub(crate) enum Verdict {
 /// What `first`, a tunnel's first bytes, say about a tunnel to `host`, as the module
 /// docs have it.
 pub(crate) fn verdict(first: &[u8], host: &str) -> Verdict {
-    let hello = match client_hello(first) {
-        Ok(Some(hello)) => hello,
+    let (hello, length) = match client_hello(first) {
+        Ok(Some(found)) => found,
         Ok(None) => return Verdict::More,
         Err(why) => return Verdict::Refused(why.into()),
     };
     match server_name(&hello) {
-        Ok(None) if host.parse::<IpAddr>().is_ok() => Verdict::Allowed,
+        Ok(None) if host.parse::<IpAddr>().is_ok() => Verdict::Allowed(length),
         Ok(None) => Verdict::Refused("the ClientHello names no server".into()),
-        Ok(Some(name)) if same_host(name, host) => Verdict::Allowed,
+        Ok(Some(name)) if same_host(name, host) => Verdict::Allowed(length),
         Ok(Some(name)) => Verdict::Refused(format!(
             "the ClientHello names {:?}, not {host}",
             String::from_utf8_lossy(name)
@@ -85,20 +111,63 @@ pub(crate) fn verdict(first: &[u8], host: &str) -> Verdict {
     }
 }
 
-/// Read a tunnel's first bytes from `client` until [`verdict`] decides for `host`,
-/// within [`HELLO_MAX`] bytes and `wait`. The bytes read, to go upstream first, when
-/// the hello is allowed; why not otherwise.
+/// [`verdict`] on the client's bytes after a HelloRetryRequest: the second ClientHello,
+/// after the ChangeCipherSpec record a client in middlebox compatibility mode sends
+/// first. Any other record before the hello is refused.
+pub(crate) fn second_verdict(first: &[u8], host: &str) -> Verdict {
+    if first.first() != Some(&CHANGE_CIPHER_SPEC[0]) {
+        return verdict(first, host);
+    }
+    let expected = first
+        .iter()
+        .zip(CHANGE_CIPHER_SPEC)
+        .enumerate()
+        .all(|(i, (got, want))| i == 2 || *got == want);
+    if !expected {
+        return Verdict::Refused(NOT_CCS.into());
+    }
+    let Some(hello) = first.get(CHANGE_CIPHER_SPEC.len()..) else {
+        return Verdict::More;
+    };
+    match verdict(hello, host) {
+        Verdict::Allowed(length) => Verdict::Allowed(CHANGE_CIPHER_SPEC.len() + length),
+        other => other,
+    }
+}
+
+/// A ClientHello as read from the client: the bytes that carry it, and any the client
+/// sent after them in the same reads.
+pub(crate) struct Flight {
+    /// The records the hello takes, a ChangeCipherSpec before it included.
+    pub(crate) hello: Vec<u8>,
+    /// What came after them.
+    pub(crate) after: Vec<u8>,
+}
+
+/// Read from `client`, after the bytes `first` already holds, until [`verdict`] (or
+/// [`second_verdict`], after a retry request) decides for `host`, within [`HELLO_MAX`]
+/// bytes and by `deadline`. The hello when it is allowed; why not otherwise.
 pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
     client: &mut R,
     host: &str,
-    wait: Duration,
-) -> Result<Vec<u8>, String> {
+    retry: bool,
+    mut first: Vec<u8>,
+    deadline: Instant,
+) -> Result<Flight, String> {
+    let judge = if retry { second_verdict } else { verdict };
     let read = async {
-        let mut first = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
-            match verdict(&first, host) {
-                Verdict::Allowed => return Ok(first),
+            match judge(&first, host) {
+                Verdict::Allowed(length) => {
+                    let after = first.get(length..).map(<[u8]>::to_vec);
+                    first.truncate(length);
+                    let after = after.unwrap_or_default();
+                    return Ok(Flight {
+                        hello: first,
+                        after,
+                    });
+                }
                 Verdict::Refused(why) => return Err(why),
                 Verdict::More if first.len() >= HELLO_MAX => {
                     return Err(format!("no whole ClientHello in {HELLO_MAX} bytes"))
@@ -113,22 +182,112 @@ pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
             }
         }
     };
-    tokio::time::timeout(wait, read)
+    tokio::time::timeout_at(deadline, read)
         .await
-        .unwrap_or_else(|_| Err(format!("no whole ClientHello within {wait:?}")))
+        .unwrap_or_else(|_| Err("no whole ClientHello in time".into()))
 }
 
-/// The ClientHello at the start of `first`, put together from the TLS records it spans;
-/// `None` while it is incomplete. An error for bytes that do not start a TLS handshake
-/// with a ClientHello.
-fn client_hello(first: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
+/// What an upstream's first bytes say.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// Not enough bytes yet to tell.
+    More,
+    /// A HelloRetryRequest: the client sends a second ClientHello next.
+    Retry,
+    /// Anything that asks for no second hello: a ServerHello, an alert.
+    Other,
+    /// A handshake that could be a retry request and cannot be read, and why.
+    Refused(String),
+}
+
+/// What `seen`, an upstream's first bytes, say about the client's next ones.
+pub(crate) fn answer(seen: &[u8]) -> Answer {
+    match handshake(seen, SERVER_HELLO) {
+        Ok(None) => Answer::More,
+        Ok(Some(found)) if found.message.get(6..38) == Some(&RETRY_RANDOM[..]) => Answer::Retry,
+        Ok(Some(_)) => Answer::Other,
+        Err(why) if why == NOT_TLS || why == NOT_HELLO => Answer::Other,
+        Err(_) => Answer::Refused("the upstream's ServerHello cannot be read".into()),
+    }
+}
+
+/// Read from `upstream` until [`answer`] decides, sending each read on to `client` as
+/// it comes, within [`HELLO_MAX`] bytes and by `deadline`. Whether the upstream asked
+/// for a second ClientHello; why the tunnel stops otherwise.
+pub(crate) async fn read_answer<U, C>(
+    upstream: &mut U,
+    client: &mut C,
+    deadline: Instant,
+) -> Result<bool, String>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
+    let read = async {
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match answer(&seen) {
+                Answer::Retry => return Ok(true),
+                Answer::Other => return Ok(false),
+                Answer::Refused(why) => return Err(why),
+                Answer::More if seen.len() >= HELLO_MAX => {
+                    return Err(format!("no whole ServerHello in {HELLO_MAX} bytes"))
+                }
+                Answer::More => {}
+            }
+            let room = chunk.len().min(HELLO_MAX - seen.len());
+            let n = match upstream.read(&mut chunk[..room]).await {
+                Ok(0) => return Err("the upstream closed before its ServerHello".into()),
+                Ok(n) => n,
+                Err(e) => return Err(format!("reading the ServerHello: {e}")),
+            };
+            client
+                .write_all(&chunk[..n])
+                .await
+                .map_err(|e| format!("sending the ServerHello on: {e}"))?;
+            seen.extend_from_slice(&chunk[..n]);
+        }
+    };
+    tokio::time::timeout_at(deadline, read)
+        .await
+        .unwrap_or_else(|_| Err("no whole ServerHello in time".into()))
+}
+
+/// The ClientHello at the start of `first` and the bytes its records take; `None`
+/// while it is incomplete. An error for bytes that do not start a TLS handshake with a
+/// ClientHello, or whose last record carries more after it.
+fn client_hello(first: &[u8]) -> Result<Option<(Vec<u8>, usize)>, &'static str> {
+    match handshake(first, CLIENT_HELLO)? {
+        None => Ok(None),
+        Some(found) if found.trailing => Err(AFTER_HELLO),
+        Some(found) => Ok(Some((found.message, found.records))),
+    }
+}
+
+/// The first handshake message of a side, as its records carry it.
+struct Handshake {
+    /// The message, its 4-byte header included.
+    message: Vec<u8>,
+    /// The bytes the records that carry it take.
+    records: usize,
+    /// Whether its last record carries more after it.
+    trailing: bool,
+}
+
+/// The handshake message of type `kind` at the start of `bytes`, put together from
+/// the TLS records it spans; `None` while it is incomplete.
+fn handshake(bytes: &[u8], kind: u8) -> Result<Option<Handshake>, &'static str> {
     let mut message = Vec::new();
-    let mut rest = first;
+    let mut rest = bytes;
     loop {
-        if let Some(length) = message_length(&message)? {
+        if let Some(length) = message_length(&message, kind)? {
             if message.len() >= length {
-                message.truncate(length);
-                return Ok(Some(message));
+                return Ok(Some(Handshake {
+                    trailing: message.len() > length,
+                    message,
+                    records: bytes.len() - rest.len(),
+                }));
             }
         }
         let Some((fragment, after)) = next_record(rest)? else {
@@ -139,12 +298,12 @@ fn client_hello(first: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
     }
 }
 
-/// The length of a ClientHello handshake message, its 4-byte header included, once
-/// `message` holds that header; an error when it is not a ClientHello or is too long.
-fn message_length(message: &[u8]) -> Result<Option<usize>, &'static str> {
+/// The length of a handshake message of type `kind`, its 4-byte header included, once
+/// `message` holds that header; an error when it is of another type or too long.
+fn message_length(message: &[u8], kind: u8) -> Result<Option<usize>, &'static str> {
     match message {
         [] => Ok(None),
-        [kind, ..] if *kind != CLIENT_HELLO => Err(NOT_HELLO),
+        [first, ..] if *first != kind => Err(NOT_HELLO),
         [_, a, b, c, ..] => {
             let length = 4 + (usize::from(*a) << 16 | usize::from(*b) << 8 | usize::from(*c));
             if length > RECORD_MAX {
@@ -200,7 +359,7 @@ fn server_name(hello: &[u8]) -> Result<Option<&[u8]>, &'static str> {
         let kind = extensions.u16()?;
         let data = extensions.vec16()?;
         match kind {
-            ENCRYPTED_CLIENT_HELLO | ENCRYPTED_SERVER_NAME => return Err(HIDDEN),
+            ECH_DRAFT_FIRST..=ENCRYPTED_CLIENT_HELLO | ENCRYPTED_SERVER_NAME => return Err(HIDDEN),
             SERVER_NAME if name.is_some() => return Err(TWO_NAMES),
             SERVER_NAME => name = Some(host_name(data)?),
             _ => {}
@@ -340,6 +499,39 @@ pub(crate) mod fixtures {
         (0xfe0d, vec![0, 0, 1, 0, 1, 7, 0, 0, 0, 0])
     }
 
+    /// A ServerHello handshake message with this random and these extensions.
+    pub(crate) fn server_hello(random: [u8; 32], extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut exts = Vec::new();
+        for (kind, data) in extensions {
+            exts.extend_from_slice(&kind.to_be_bytes());
+            exts.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            exts.extend_from_slice(data);
+        }
+        let mut body = vec![3, 3];
+        body.extend_from_slice(&random);
+        body.extend_from_slice(&[0]); // no session id
+        body.extend_from_slice(&[0x13, 0x01, 0]); // the cipher suite, null compression
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let mut message = vec![2];
+        message.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        message.extend_from_slice(&body);
+        message
+    }
+
+    /// What a TLS 1.3 front end that wants another key share answers a ClientHello with:
+    /// a HelloRetryRequest, then a ChangeCipherSpec for middleboxes.
+    pub(crate) fn retry_request() -> Vec<u8> {
+        let versions = (0x2b, vec![3, 4]);
+        let key_share = (0x33, vec![0, 0x1d]);
+        let mut out = records(
+            &server_hello(super::RETRY_RANDOM, &[versions, key_share]),
+            512,
+        );
+        out.extend_from_slice(&[20, 3, 3, 0, 1, 1]);
+        out
+    }
+
     /// `message` in TLS handshake records of at most `size` bytes each.
     pub(crate) fn records(message: &[u8], size: usize) -> Vec<u8> {
         let mut out = Vec::new();
@@ -354,11 +546,16 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{ech, message, records, rustls_hello, sni};
+    use super::fixtures::{ech, message, records, retry_request, rustls_hello, server_hello, sni};
     use super::*;
     use tokio::io::AsyncWriteExt;
 
     const HOST: &str = "upstream.example";
+
+    /// A deadline `wait` from now.
+    fn soon(wait: Duration) -> Instant {
+        Instant::now() + wait
+    }
 
     fn refused(first: &[u8]) -> String {
         match verdict(first, HOST) {
@@ -369,9 +566,10 @@ mod tests {
 
     #[test]
     fn a_hello_that_names_the_connect_host_is_allowed() {
-        assert_eq!(verdict(&rustls_hello(HOST, true), HOST), Verdict::Allowed);
+        let real = rustls_hello(HOST, true);
+        assert_eq!(verdict(&real, HOST), Verdict::Allowed(real.len()));
         let hand = records(&message(&[(10, vec![0, 2, 0, 29]), sni(&[HOST])]), 512);
-        assert_eq!(verdict(&hand, HOST), Verdict::Allowed);
+        assert_eq!(verdict(&hand, HOST), Verdict::Allowed(hand.len()));
     }
 
     #[test]
@@ -383,7 +581,8 @@ mod tests {
             (HOST, "Upstream.example."),
         ] {
             let first = records(&message(&[sni(&[name])]), 512);
-            assert_eq!(verdict(&first, host), Verdict::Allowed, "{name} for {host}");
+            let judged = verdict(&first, host);
+            assert_eq!(judged, Verdict::Allowed(first.len()), "{name} for {host}");
         }
     }
 
@@ -419,11 +618,8 @@ mod tests {
         assert!(why.contains("names no server"), "{why}");
         // rustls, like any client, sends no name for an address
         for ip in ["198.41.0.4", "2001:503:ba3e::2:30"] {
-            assert_eq!(
-                verdict(&rustls_hello(ip, true), ip),
-                Verdict::Allowed,
-                "{ip}"
-            );
+            let real = rustls_hello(ip, true);
+            assert_eq!(verdict(&real, ip), Verdict::Allowed(real.len()), "{ip}");
             let named = records(&message(&[sni(&["other-tenant.example"])]), 512);
             assert!(matches!(verdict(&named, ip), Verdict::Refused(_)), "{ip}");
         }
@@ -439,6 +635,33 @@ mod tests {
             let why = refused(&records(&message(&extensions), 512));
             assert_eq!(why, HIDDEN);
         }
+    }
+
+    #[test]
+    fn a_hello_that_uses_a_draft_of_ech_is_refused_and_the_reason_says_ech() {
+        for kind in [0xfe00, 0xfe08] {
+            let why = refused(&records(&message(&[sni(&[HOST]), (kind, vec![0; 8])]), 512));
+            assert_eq!(why, HIDDEN, "{kind:#x}");
+        }
+        assert!(HIDDEN.contains("Encrypted Client Hello (ECH)"), "{HIDDEN}");
+    }
+
+    #[test]
+    fn a_hello_whose_record_carries_another_handshake_message_is_refused() {
+        // a front end would read the second message, another ClientHello here, as the
+        // client's next one
+        let mut both = message(&[sni(&[HOST])]);
+        both.extend_from_slice(&message(&[sni(&["other-tenant.example"])]));
+        let why = refused(&records(&both, 512));
+        assert!(why.contains("carries more after it"), "{why}");
+        // and in the record that ends the hello, when the hello spans two
+        let hello = message(&[sni(&[HOST])]);
+        let mut first = records(&hello[..20], 512);
+        let mut rest = hello[20..].to_vec();
+        rest.extend_from_slice(&[20, 0, 0, 0]);
+        first.extend_from_slice(&records(&rest, 512));
+        let why = refused(&first);
+        assert!(why.contains("carries more after it"), "{why}");
     }
 
     #[test]
@@ -481,7 +704,7 @@ mod tests {
             for end in 0..first.len() {
                 assert_eq!(verdict(&first[..end], HOST), Verdict::More, "{end}");
             }
-            assert_eq!(verdict(&first, HOST), Verdict::Allowed);
+            assert_eq!(verdict(&first, HOST), Verdict::Allowed(first.len()));
         }
     }
 
@@ -489,21 +712,20 @@ mod tests {
     fn a_hello_over_several_records_is_put_together() {
         let hello = message(&[(10, vec![0, 2, 0, 29]), sni(&[HOST])]);
         for size in [1, 2, 5, 40, hello.len() - 1] {
-            assert_eq!(
-                verdict(&records(&hello, size), HOST),
-                Verdict::Allowed,
-                "{size}"
-            );
+            let first = records(&hello, size);
+            let judged = verdict(&first, HOST);
+            assert_eq!(judged, Verdict::Allowed(first.len()), "{size}");
         }
         let other = message(&[sni(&["other-tenant.example"])]);
         assert!(matches!(
             verdict(&records(&other, 3), HOST),
             Verdict::Refused(_)
         ));
-        // bytes after the hello, such as early data, are the client's to send
+        // bytes after the hello's records, such as early data, are not the hello's
         let mut first = records(&hello, 50);
+        let length = first.len();
         first.extend_from_slice(&[20, 3, 3, 0, 1, 1, 23, 3, 3, 0, 2, 9, 9]);
-        assert_eq!(verdict(&first, HOST), Verdict::Allowed);
+        assert_eq!(verdict(&first, HOST), Verdict::Allowed(length));
     }
 
     #[test]
@@ -578,7 +800,8 @@ mod tests {
                 for end in [changed.len(), changed.len() / 2, at] {
                     let judged = verdict(&changed[..end], HOST);
                     if at >= name_at && changed[at] != hello[at] {
-                        assert_ne!(judged, Verdict::Allowed, "byte {at} to {value}");
+                        let passed = matches!(judged, Verdict::Allowed(_));
+                        assert!(!passed, "byte {at} to {value}");
                     }
                 }
             }
@@ -599,9 +822,16 @@ mod tests {
             // held open: the egress decides on the bytes, not on the close
             std::future::pending::<()>().await;
         });
-        let first = read_hello(&mut egress, HOST, HELLO_WAIT).await.unwrap();
-        assert!(sent.starts_with(&first), "{first:?}");
-        assert!(first.len() >= sent.len() - b"after".len(), "{first:?}");
+        let first = read_hello(&mut egress, HOST, false, Vec::new(), soon(HELLO_WAIT))
+            .await
+            .unwrap();
+        let length = sent.len() - b"after".len();
+        assert_eq!(first.hello, sent[..length], "the hello, whole");
+        assert!(
+            sent[length..].starts_with(&first.after),
+            "{:?}",
+            first.after
+        );
     }
 
     #[tokio::test]
@@ -610,19 +840,139 @@ mod tests {
         let hello = message(&[(21, vec![0; 3000]), sni(&[HOST])]);
         let (mut client, mut egress) = tokio::io::duplex(HELLO_MAX * 8);
         client.write_all(&records(&hello, 1)).await.unwrap();
-        let why = read_hello(&mut egress, HOST, HELLO_WAIT).await.unwrap_err();
+        let why = read_hello(&mut egress, HOST, false, Vec::new(), soon(HELLO_WAIT))
+            .await
+            .err()
+            .unwrap();
         assert!(why.contains(&format!("in {HELLO_MAX} bytes")), "{why}");
         // too slowly: nothing at all, held open
         let (_client, mut egress) = tokio::io::duplex(64);
         let wait = std::time::Duration::from_millis(50);
-        let why = read_hello(&mut egress, HOST, wait).await.unwrap_err();
-        assert!(why.contains("within"), "{why}");
+        let why = read_hello(&mut egress, HOST, false, Vec::new(), soon(wait))
+            .await
+            .err()
+            .unwrap();
+        assert!(why.contains("in time"), "{why}");
         // too little: half a hello, then closed
         let (mut client, mut egress) = tokio::io::duplex(4096);
         let half = rustls_hello(HOST, true);
         client.write_all(&half[..half.len() / 2]).await.unwrap();
         drop(client);
-        let why = read_hello(&mut egress, HOST, HELLO_WAIT).await.unwrap_err();
+        let why = read_hello(&mut egress, HOST, false, Vec::new(), soon(HELLO_WAIT))
+            .await
+            .err()
+            .unwrap();
         assert!(why.contains("closed before"), "{why}");
+    }
+
+    #[test]
+    fn a_second_hello_may_follow_one_change_cipher_spec_and_is_held_to_the_same_rule() {
+        let hello = records(&message(&[sni(&[HOST])]), 512);
+        assert_eq!(second_verdict(&hello, HOST), Verdict::Allowed(hello.len()));
+        for minor in [1, 3] {
+            let mut first = vec![20, 3, minor, 0, 1, 1];
+            first.extend_from_slice(&hello);
+            assert_eq!(second_verdict(&first, HOST), Verdict::Allowed(first.len()));
+            for end in 0..first.len() {
+                assert_eq!(second_verdict(&first[..end], HOST), Verdict::More, "{end}");
+            }
+        }
+        let mut other = vec![20, 3, 3, 0, 1, 1];
+        other.extend_from_slice(&records(&message(&[sni(&["other-tenant.example"])]), 512));
+        assert!(matches!(second_verdict(&other, HOST), Verdict::Refused(_)));
+        // two ChangeCipherSpecs, one of another length, early data, or an alert first
+        for before in [
+            &[20, 3, 3, 0, 1, 1, 20, 3, 3, 0, 1, 1][..],
+            &[20, 3, 3, 0, 2, 1, 1],
+            &[20, 3, 3, 0, 1, 2],
+            &[23, 3, 3, 0, 1, 0],
+            &[21, 3, 3, 0, 2, 1, 0],
+        ] {
+            let mut first = before.to_vec();
+            first.extend_from_slice(&hello);
+            let judged = second_verdict(&first, HOST);
+            assert!(
+                matches!(judged, Verdict::Refused(_)),
+                "{before:?}: {judged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retry_request_is_told_from_any_other_answer() {
+        let retry = retry_request();
+        assert_eq!(answer(&retry), Answer::Retry);
+        for end in 0..retry.len() - 6 {
+            assert_eq!(answer(&retry[..end]), Answer::More, "{end}");
+        }
+        // split over records of every size
+        let message = server_hello(RETRY_RANDOM, &[(0x2b, vec![3, 4])]);
+        for size in [1, 2, 7, 38, message.len() - 1] {
+            assert_eq!(answer(&records(&message, size)), Answer::Retry, "{size}");
+        }
+        // a TLS 1.3 ServerHello, and a TLS 1.2 one followed in its record by more
+        let mut random = RETRY_RANDOM;
+        random[31] ^= 1;
+        let tls13 = records(&server_hello(random, &[(0x2b, vec![3, 4])]), 512);
+        assert_eq!(answer(&tls13), Answer::Other);
+        let mut tls12 = server_hello([0x5a; 32], &[]);
+        tls12.extend_from_slice(&[11, 0, 0, 3, 0, 0, 0]);
+        assert_eq!(answer(&records(&tls12, 512)), Answer::Other);
+        // an alert, or a handshake that starts with something else
+        assert_eq!(answer(&[21, 3, 3, 0, 2, 2, 40]), Answer::Other);
+        assert_eq!(answer(&records(&[11, 0, 0, 0], 512)), Answer::Other);
+        assert_eq!(answer(b"HTTP/1.1 400 Bad Request\r\n"), Answer::Other);
+        // a ServerHello that cannot be read is not taken for a plain one
+        assert!(matches!(answer(&[22, 3, 3, 0, 0]), Answer::Refused(_)));
+        let mut long = vec![22, 3, 3, 0, 4, 2, 0x40, 0, 1];
+        long.extend_from_slice(&[0; 4]);
+        assert!(matches!(answer(&long), Answer::Refused(_)));
+    }
+
+    #[test]
+    fn no_cut_or_change_of_a_retry_request_makes_the_answer_panic() {
+        let retry = retry_request();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..300 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mut changed = retry.clone();
+            let at = (seed % changed.len() as u64) as usize;
+            changed[at] = (seed >> 32) as u8;
+            let _ = answer(&changed[..at.max(1)]);
+            let _ = answer(&changed);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_upstream_s_answer_is_sent_on_as_it_is_read() {
+        let mut sent = retry_request();
+        sent.extend_from_slice(b"more");
+        let (mut upstream, mut from_upstream) = tokio::io::duplex(64);
+        let (mut to_client, mut client) = tokio::io::duplex(4096);
+        let pieces = sent.clone();
+        tokio::spawn(async move {
+            for piece in pieces.chunks(5) {
+                upstream.write_all(piece).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            std::future::pending::<()>().await;
+        });
+        let retry = read_answer(&mut from_upstream, &mut to_client, soon(HELLO_WAIT)).await;
+        assert_eq!(retry, Ok(true));
+        drop(to_client);
+        let mut got = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut got)
+            .await
+            .unwrap();
+        assert!(sent.starts_with(&got), "{got:?}");
+        assert!(got.len() >= retry_request().len() - 6, "the request, whole");
+        // an upstream that says nothing is given up on by the deadline
+        let (_upstream, mut from_upstream) = tokio::io::duplex(64);
+        let (mut to_client, _client) = tokio::io::duplex(64);
+        let wait = Duration::from_millis(50);
+        let why = read_answer(&mut from_upstream, &mut to_client, soon(wait)).await;
+        assert_eq!(why, Err("no whole ServerHello in time".into()));
     }
 }

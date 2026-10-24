@@ -211,6 +211,9 @@ struct Inner {
     telemetry: Telemetry,
     /// How a tunnel's host is resolved and dialled.
     network: Arc<dyn Network>,
+    /// How long a tunnel has for the TLS hellos the egress reads, [`hello::HELLO_WAIT`]
+    /// outside a test.
+    hello_wait: std::time::Duration,
 }
 
 /// How the egress resolves a tunnel's host and dials it: the system's resolver and TCP,
@@ -352,6 +355,7 @@ impl Egress {
                 client,
                 telemetry,
                 network: Arc::new(SystemNetwork),
+                hello_wait: hello::HELLO_WAIT,
             }),
         })
     }
@@ -970,9 +974,8 @@ async fn tunnel_for(
 /// addresses are ones a tunnel may reach. Anything else here is a 404.
 ///
 /// The 200 goes back before the dial, since a client sends its ClientHello only after
-/// it. That hello is read first and must name the host ([`hello`] says what that does
-/// and does not close); only then is the host dialled and the hello sent on. A refused
-/// hello closes the tunnel with nothing dialled.
+/// it. The tunnel is then [`opened`] with its TLS hellos checked, and refused with a TLS
+/// alert and closed when they do not name the host.
 async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) -> Response {
     if req.method() != Method::CONNECT {
         return error_json(StatusCode::NOT_FOUND, "not_found_error", "no such path");
@@ -1002,21 +1005,16 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
             return;
         };
         let mut inbound = hyper_util::rt::TokioIo::new(upgraded);
-        let first = match hello::read_hello(&mut inbound, &host, hello::HELLO_WAIT).await {
-            Ok(first) => first,
-            Err(why) => {
-                eprintln!("egress: tunnel to {host}: {why}; closed before dialling");
+        let mut outbound = match opened(&inner, &mut inbound, &host, addrs).await {
+            Ok(outbound) => outbound,
+            Err(Stop::Refused(why)) => {
+                eprintln!("egress: tunnel to {host}: {why}; closed");
                 let _ = inbound.write_all(&hello::REFUSED_ALERT).await;
                 let _ = inbound.shutdown().await;
                 return;
             }
+            Err(Stop::Ended) => return,
         };
-        let Ok(mut outbound) = inner.network.connect(addrs).await else {
-            return;
-        };
-        if outbound.write_all(&first).await.is_err() {
-            return;
-        }
         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
         let _ = inner.telemetry.record(
             started,
@@ -1030,6 +1028,54 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
         );
     });
     Response::new(Body::empty())
+}
+
+/// Why a tunnel stopped before its bytes were copied both ways.
+enum Stop {
+    /// A hello that does not name the host, or one not read whole within the bounds and
+    /// the wait, and why: the client is told.
+    Refused(String),
+    /// A dial that failed or an upstream that went away: the tunnel just ends.
+    Ended,
+}
+
+/// The upstream end of a tunnel to `host`, dialled at `addrs` once the client's
+/// ClientHello names the host, and, when the upstream answers with a HelloRetryRequest,
+/// once the client's second ClientHello does too. Everything read on the way has been
+/// sent on, so the two ends are ready to be copied both ways; the hellos are read within
+/// the egress's `hello_wait`, all together, from now.
+async fn opened(
+    inner: &Inner,
+    inbound: &mut hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
+    host: &str,
+    addrs: Vec<SocketAddr>,
+) -> Result<tokio::net::TcpStream, Stop> {
+    use tokio::io::AsyncWriteExt;
+    let deadline = tokio::time::Instant::now() + inner.hello_wait;
+    let first = hello::read_hello(inbound, host, false, Vec::new(), deadline)
+        .await
+        .map_err(Stop::Refused)?;
+    let mut outbound = inner
+        .network
+        .connect(addrs)
+        .await
+        .map_err(|_| Stop::Ended)?;
+    let sent = outbound.write_all(&first.hello).await;
+    sent.map_err(|_| Stop::Ended)?;
+    let retry = hello::read_answer(&mut outbound, inbound, deadline)
+        .await
+        .map_err(Stop::Refused)?;
+    let rest = if retry {
+        let second = hello::read_hello(inbound, host, true, first.after, deadline)
+            .await
+            .map_err(|why| Stop::Refused(format!("after a HelloRetryRequest, {why}")))?;
+        [second.hello, second.after].concat()
+    } else {
+        first.after
+    };
+    let sent = outbound.write_all(&rest).await;
+    sent.map_err(|_| Stop::Ended)?;
+    Ok(outbound)
 }
 
 /// The upstream request: the harness's request with hop-by-hop headers dropped, the
@@ -2494,8 +2540,19 @@ mod tests {
         entry: &str,
         network: &Arc<FakeNetwork>,
     ) -> (tempfile::TempDir, Egress, SocketAddr) {
+        waiting_tunnel_egress(entry, network, hello::HELLO_WAIT).await
+    }
+
+    /// [`tunnel_egress`], with `wait` for a tunnel's hellos.
+    async fn waiting_tunnel_egress(
+        entry: &str,
+        network: &Arc<FakeNetwork>,
+        wait: std::time::Duration,
+    ) -> (tempfile::TempDir, Egress, SocketAddr) {
         let (d, mut e) = fixture(Some(("github", Destination::tunnel([entry])))).await;
-        Arc::get_mut(&mut e.inner).unwrap().network = network.clone();
+        let inner = Arc::get_mut(&mut e.inner).unwrap();
+        inner.network = network.clone();
+        inner.hello_wait = wait;
         let addr = serve(&e).await;
         (d, e, addr)
     }
@@ -2639,9 +2696,10 @@ mod tests {
             c.write_all(&first).await.unwrap();
             let (got, closed) = until_closed(&mut c).await;
             let echoed = got.windows(first.len()).any(|w| w == first);
-            if !net.dialled().is_empty() || !closed || echoed {
+            let alerted = got == hello::REFUSED_ALERT;
+            if !net.dialled().is_empty() || !closed || echoed || !alerted {
                 let_through.push(format!(
-                    "{case}: dialled {:?}, closed {closed}, echoed {echoed}",
+                    "{case}: dialled {:?}, closed {closed}, echoed {echoed}, answered {got:?}",
                     net.dialled()
                 ));
             }
@@ -2656,6 +2714,121 @@ mod tests {
             Vec::new(),
             "the upstream heard nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_sent_no_hello_is_closed_when_its_wait_is_up_with_nothing_dialled() {
+        let (upstream, _) = echo_upstream().await;
+        let answer = vec!["198.41.0.4:443".parse().unwrap()];
+        let net = FakeNetwork::new(vec![Some(answer)], upstream);
+        let wait = std::time::Duration::from_millis(300);
+        let (_d, _e, egress) = waiting_tunnel_egress("upstream.example", &net, wait).await;
+        let (head, mut c) = connect(egress, "upstream.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let started = std::time::Instant::now();
+        let (got, closed) = until_closed(&mut c).await;
+        let took = started.elapsed();
+        assert!(closed, "the tunnel is closed");
+        assert!(
+            took + std::time::Duration::from_millis(100) >= wait,
+            "closed after {took:?}, before its wait was up"
+        );
+        assert!(
+            took < wait + std::time::Duration::from_secs(2),
+            "closed after {took:?}, long after its wait of {wait:?}"
+        );
+        assert_eq!(got, hello::REFUSED_ALERT.to_vec(), "the client is refused");
+        assert_eq!(
+            net.dialled(),
+            Vec::<Vec<SocketAddr>>::new(),
+            "nothing is dialled"
+        );
+    }
+
+    /// An upstream standing in for a TLS 1.3 front end that asks for a second hello: it
+    /// reads one ClientHello, answers [`hello::fixtures::retry_request`], and hands over
+    /// all it reads after that once the tunnel closes its side.
+    async fn retrying_upstream() -> (SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut first = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while hello::verdict(&first, "upstream.example") == hello::Verdict::More {
+                let n = s.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0, "the first hello reaches the upstream");
+                first.extend_from_slice(&chunk[..n]);
+            }
+            s.write_all(&hello::fixtures::retry_request())
+                .await
+                .unwrap();
+            let mut after = Vec::new();
+            let _ = s.read_to_end(&mut after).await;
+            let _ = tx.send(after);
+        });
+        (addr, rx)
+    }
+
+    /// A tunnel to upstream.example whose upstream asks for a second hello, and whose
+    /// client sends one naming `name`: what the upstream heard after it asked, and what
+    /// the client got back after the request, and whether the tunnel then closed.
+    async fn retried(name: &str) -> (Vec<u8>, Vec<u8>, bool) {
+        use hello::fixtures::{message, records, retry_request, sni};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (upstream, heard) = retrying_upstream().await;
+        let net = FakeNetwork::new(
+            vec![Some(vec!["198.41.0.4:443".parse().unwrap()])],
+            upstream,
+        );
+        let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
+        let (head, mut c) = connect(egress, "upstream.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        c.write_all(&records(&message(&[sni(&["upstream.example"])]), 512))
+            .await
+            .unwrap();
+        let retry = retry_request();
+        let mut got = vec![0u8; retry.len()];
+        c.read_exact(&mut got).await.unwrap();
+        assert_eq!(
+            got, retry,
+            "the request for a second hello reaches the client"
+        );
+        let mut second = vec![20, 3, 3, 0, 1, 1];
+        second.extend_from_slice(&records(&message(&[sni(&[name])]), 512));
+        c.write_all(&second).await.unwrap();
+        c.shutdown().await.unwrap();
+        let (back, closed) = until_closed(&mut c).await;
+        let heard = tokio::time::timeout(std::time::Duration::from_secs(5), heard)
+            .await
+            .map(Result::unwrap_or_default)
+            .unwrap_or_else(|_| b"the upstream's side never closed".to_vec());
+        (heard, back, closed)
+    }
+
+    #[tokio::test]
+    async fn after_a_retry_request_a_second_hello_that_names_the_host_goes_upstream() {
+        use hello::fixtures::{message, records, sni};
+        let (heard, back, closed) = retried("upstream.example").await;
+        let mut second = vec![20, 3, 3, 0, 1, 1];
+        second.extend_from_slice(&records(&message(&[sni(&["upstream.example"])]), 512));
+        assert_eq!(heard, second, "the second hello reaches the upstream whole");
+        assert_eq!(back, Vec::<u8>::new());
+        assert!(closed, "the tunnel closes when both sides have");
+    }
+
+    #[tokio::test]
+    async fn after_a_retry_request_a_second_hello_that_names_another_host_goes_nowhere() {
+        let (heard, back, closed) = retried("other-tenant.example").await;
+        assert_eq!(
+            heard,
+            Vec::<u8>::new(),
+            "the upstream hears nothing after it asked"
+        );
+        assert_eq!(back, hello::REFUSED_ALERT.to_vec(), "the client is refused");
+        assert!(closed, "the tunnel is closed");
     }
 
     #[tokio::test]
