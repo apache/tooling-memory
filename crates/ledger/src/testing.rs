@@ -6,8 +6,14 @@
 //! the `postgresql_embedded` crate downloads once into `~/.theseus` and stops on drop;
 //! where that cannot be done, the test is skipped with the reason on stderr.
 
-use postgresql_embedded::{PostgreSQL, Settings};
+use postgresql_embedded::{PostgreSQL, Settings, VersionReq};
 use tokio_postgres::NoTls;
+
+/// The release the embedded server is, held exactly rather than the newest: 18.6.1's
+/// archive carries zone data of its own with no `UTC`, the zone a client sets on connect,
+/// so every database it is asked for is refused. 18.6.0's archive carries none and reads
+/// the system's.
+const EMBEDDED_RELEASE: &str = "=18.6.0";
 
 /// A server for one test, with a database of its own.
 pub struct PgServer {
@@ -29,7 +35,11 @@ impl PgServer {
         if let Ok(admin) = std::env::var("MEMORY_PG_URL") {
             return PgServer::borrow(&admin).await.map(Some);
         }
-        let mut pg = PostgreSQL::new(Settings::default());
+        let version = VersionReq::parse(EMBEDDED_RELEASE).map_err(|e| e.to_string())?;
+        let mut pg = PostgreSQL::new(Settings {
+            version,
+            ..Settings::default()
+        });
         if let Err(e) = pg.setup().await {
             eprintln!("skipped: embedded PostgreSQL cannot be set up here: {e}");
             return Ok(None);
