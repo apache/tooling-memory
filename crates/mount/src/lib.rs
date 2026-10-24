@@ -54,6 +54,10 @@ pub enum Error {
     },
 }
 
+// Its one caller is inside `mount`'s Linux arm, so off Linux this is dead code and
+// `-D warnings` makes that an error rather than a warning: the macOS and Windows test
+// jobs fail to compile dm-mount at all.
+#[cfg(target_os = "linux")]
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
     move |source| Error::Io {
         path: path.display().to_string(),
