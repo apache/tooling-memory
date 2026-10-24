@@ -5087,7 +5087,9 @@ mod backend_tests {
             );
         }
         // a Google login's token refresh and Cloud Code, and Antigravity's eligibility
-        // check: the account's profile at www.googleapis.com, its picture at lh3
+        // check: the account's profile at www.googleapis.com, its picture at lh3. Past
+        // the allowlist the egress resolves the name and checks its addresses, which
+        // needs a network, so only the allowlist's answer is asserted here
         for host in [
             "oauth2.googleapis.com",
             "accounts.google.com",
@@ -5096,8 +5098,11 @@ mod backend_tests {
             "www.googleapis.com",
             "lh3.googleusercontent.com",
         ] {
-            let (status, body) = connect(&egress, host).await;
-            assert_eq!(status, StatusCode::OK, "a tunnel to {host}: {body}");
+            let (_, body) = connect(&egress, host).await;
+            assert!(
+                !body.contains("no destination allows a tunnel to"),
+                "a tunnel to {host}: {body}"
+            );
         }
     }
 
