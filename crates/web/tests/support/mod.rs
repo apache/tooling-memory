@@ -8,18 +8,42 @@ use std::path::{Path, PathBuf};
 /// A Chrome or Chromium to drive: `CHROME` in the environment, else where the usual
 /// installs put it, including the Playwright browser directory.
 pub fn chrome() -> PathBuf {
+    find(true)
+}
+
+/// A Chrome or Chromium that loads an unpacked extension: `CHROME` in the environment,
+/// else the same places without Google Chrome's own builds, which ignore
+/// `--load-extension` since version 137. Chromium, Chrome for Testing, Playwright's
+/// Chromium and the container's load it.
+pub fn chrome_for_extensions() -> PathBuf {
+    find(false)
+}
+
+fn find(branded: bool) -> PathBuf {
     if let Some(c) = std::env::var_os("CHROME") {
         return PathBuf::from(c);
     }
-    let mut candidates: Vec<PathBuf> = vec![
-        "/usr/bin/google-chrome".into(),
-        "/usr/bin/google-chrome-stable".into(),
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if branded {
+        candidates.extend([
+            "/usr/bin/google-chrome".into(),
+            "/usr/bin/google-chrome-stable".into(),
+        ]);
+    }
+    candidates.extend([
         "/usr/bin/chromium".into(),
         "/usr/bin/chromium-browser".into(),
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".into(),
-    ];
+        "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+            .into(),
+        "/Applications/Chromium.app/Contents/MacOS/Chromium".into(),
+    ]);
+    if branded {
+        candidates.extend([
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".into(),
+        ]);
+    }
     // Playwright's browsers: where its install put them, its default cache, and the CI
     // image's directory; the layout is chrome-linux64 now and was chrome-linux
     let mut pw: Vec<PathBuf> = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH")
@@ -54,7 +78,7 @@ pub fn chrome() -> PathBuf {
         .into_iter()
         .find(launches)
         .or_else(chrome_in_a_container)
-        .expect("no Chrome or Chromium that starts, and no container runtime that runs; install one, or set CHROME=<path>, for the reader test")
+        .expect("no Chrome or Chromium that starts, and no container runtime that runs; install one, or set CHROME=<path>, for the browser tests (the companion's needs one that loads an extension: Chromium or Chrome for Testing)")
 }
 
 /// The Playwright image's Chrome, through scripts/chrome-container.sh, when a container

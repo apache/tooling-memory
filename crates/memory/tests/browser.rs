@@ -60,7 +60,9 @@ fn init(dir: &Path) -> PathBuf {
         "\n[taps.fetch]\ndomain = \"dom-me\"\ntool = true\nceiling = \"public\"\nhosts = [\"127.0.0.1\", \"docs.example\"]\nloopback = true\nbrowser = true\n"
     )
     .unwrap();
-    root
+    // resolved, as `amem` resolves the root it is given: the launcher's proof names the
+    // root, and on macOS the temporary directory is under /var, a link to /private/var
+    std::fs::canonicalize(root).unwrap()
 }
 
 /// The web launcher over `root`, in this process, as `amem` runs it: its address is

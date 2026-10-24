@@ -3,6 +3,8 @@
 
 // An integration test is test code; a panic here is the failure being reported.
 #![allow(clippy::unwrap_used)]
+// the helpers below serve tests that drive a shell, which are Unix only
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -369,6 +371,9 @@ fn amem_starts_the_launcher_finds_it_again_and_opens_the_browser_on_its_link() {
     // sessions start rather than starting them there quietly
     let elsewhere = h.path("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
+    // the launcher names a tree resolved: on macOS the temporary directory is under
+    // /var, which is a link to /private/var
+    let resolved = std::fs::canonicalize(&elsewhere).unwrap();
     let elsewhere = elsewhere.display().to_string();
     let out = run_again(
         &h,
@@ -378,7 +383,10 @@ fn amem_starts_the_launcher_finds_it_again_and_opens_the_browser_on_its_link() {
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("already running over this root"), "{err}");
-    assert!(err.contains(&format!("not {elsewhere}")), "{err}");
+    assert!(
+        err.contains(&format!("not {}", resolved.display())),
+        "{err}"
+    );
 
     // the same root spelled another way is the same root
     let spelled = format!("{}/../home/./memory", h.path("work").display());

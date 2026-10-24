@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod support;
-use support::chrome;
+use support::chrome_for_extensions;
 
 /// The token the test server is started with; the launcher asks the companion with it.
 const TOKEN: &str = "companion-test-token";
@@ -283,7 +283,7 @@ fn browser(dir: &Path) -> Browser {
         .canonicalize()
         .unwrap();
     let log = dir.join("chrome.log");
-    let child = Command::new(chrome())
+    let child = Command::new(chrome_for_extensions())
         .args([
             "--headless=new",
             "--no-sandbox",

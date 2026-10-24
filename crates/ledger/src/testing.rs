@@ -4,10 +4,44 @@
 //! `MEMORY_PG_URL` names a server to use, and each test gets a database of its own on
 //! it, dropped afterwards. Otherwise an embedded server is started for the test, which
 //! the `postgresql_embedded` crate downloads once into `~/.theseus` and stops on drop;
-//! where that cannot be done, the test is skipped with the reason on stderr.
+//! where that cannot be done, the test is skipped with the reason on stderr. Under CI it
+//! is an error instead: a green run there says the PostgreSQL half ran.
 
-use postgresql_embedded::{PostgreSQL, Settings};
+use postgresql_embedded::{PostgreSQL, Settings, VersionReq, BOOTSTRAP_DATABASE};
+use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
+
+/// The release the embedded server is, held exactly rather than the newest, so a new
+/// archive cannot change what the tests run on. Not 18.6.0, whose Linux build loads
+/// `libxml2.so.2` from the system, and Ubuntu 26.04 has none; 18.6.1 carries its libraries
+/// beside its binaries. 18.6.1's Linux and macOS archives
+/// store zone aliases, `UTC` among them, as tar hard links, which the extractor of
+/// `postgresql_archive` 0.20 skips (theseus-rs/postgresql-embedded#263, fixed in 0.22,
+/// which the reqwest pin in Cargo.toml holds back): see [`create_database`].
+const EMBEDDED_RELEASE: &str = "=18.6.1";
+
+/// The release installed, once in a process. Installing lists every release through
+/// GitHub's API; a setup that finds the release installed asks nothing. Concurrent tests
+/// would otherwise each list them, and be rate-limited into skips.
+static INSTALLED: OnceCell<()> = OnceCell::const_new();
+
+/// The settings every embedded server here starts from.
+fn settings() -> Result<Settings, String> {
+    Ok(Settings {
+        version: VersionReq::parse(EMBEDDED_RELEASE).map_err(|e| e.to_string())?,
+        ..Settings::default()
+    })
+}
+
+/// A server that cannot be had: a skip with the reason on stderr, or under CI, where a
+/// skip would pass unseen, an error.
+fn unavailable(why: String) -> Result<Option<PgServer>, String> {
+    if std::env::var_os("CI").is_some() {
+        return Err(why);
+    }
+    eprintln!("skipped: {why}");
+    Ok(None)
+}
 
 /// A server for one test, with a database of its own.
 pub struct PgServer {
@@ -24,21 +58,30 @@ impl PgServer {
     /// # Errors
     ///
     /// When `MEMORY_PG_URL` names a server that cannot be reached or will not create a
-    /// database. An embedded server that cannot be set up is a skip, not an error.
+    /// database. An embedded server that cannot be set up is a skip, not an error, but
+    /// under CI (`CI` set) it is an error.
     pub async fn start() -> Result<Option<PgServer>, String> {
         if let Ok(admin) = std::env::var("MEMORY_PG_URL") {
             return PgServer::borrow(&admin).await.map(Some);
         }
-        let mut pg = PostgreSQL::new(Settings::default());
+        // a throwaway server installs the release; its temporary data directory goes with it
+        let installed = INSTALLED
+            .get_or_try_init(|| async {
+                let mut first = PostgreSQL::new(settings()?);
+                first.setup().await.map_err(|e| e.to_string())
+            })
+            .await;
+        if let Err(e) = installed {
+            return unavailable(format!("embedded PostgreSQL cannot be installed here: {e}"));
+        }
+        let mut pg = PostgreSQL::new(settings()?);
         if let Err(e) = pg.setup().await {
-            eprintln!("skipped: embedded PostgreSQL cannot be set up here: {e}");
-            return Ok(None);
+            return unavailable(format!("embedded PostgreSQL cannot be set up here: {e}"));
         }
         if let Err(e) = pg.start().await {
-            eprintln!("skipped: embedded PostgreSQL did not start: {e}");
-            return Ok(None);
+            return unavailable(format!("embedded PostgreSQL did not start: {e}"));
         }
-        pg.create_database("ledger")
+        create_database(&pg.settings().url(BOOTSTRAP_DATABASE), "ledger")
             .await
             .map_err(|e| format!("embedded PostgreSQL will not create a database: {e}"))?;
         let url = pg.settings().url("ledger");
@@ -71,6 +114,17 @@ impl PgServer {
             url: with_db(admin, &name),
         })
     }
+}
+
+/// Makes database `name` on the server `admin` names, with tokio-postgres, which sets no
+/// zone on connect. `PostgreSQL::create_database` connects with a client that sets `UTC`,
+/// which the embedded 18.6.1 is installed without, and is refused.
+async fn create_database(admin: &str, name: &str) -> Result<(), tokio_postgres::Error> {
+    let (client, conn) = tokio_postgres::connect(admin, NoTls).await?;
+    tokio::spawn(conn);
+    client
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
 }
 
 fn fresh_name() -> String {

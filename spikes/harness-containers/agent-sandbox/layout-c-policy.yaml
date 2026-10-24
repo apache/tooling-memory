@@ -1,0 +1,17 @@
+# Layout C's policy: the harness pod may open TCP to the egress pod on 8080 and nothing
+# else, DNS included; nothing may connect to it. NetworkPolicy matches after the Service's
+# DNAT, so the rule names the egress pod, and the Service's ClusterIP reaches it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: harness-only-egress
+  namespace: as-spike
+spec:
+  podSelector:
+    matchLabels: {role: harness}
+  policyTypes: [Ingress, Egress]
+  egress:
+  - to:
+    - podSelector:
+        matchLabels: {role: egress}
+    ports: [{protocol: TCP, port: 8080}]

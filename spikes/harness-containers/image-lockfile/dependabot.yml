@@ -1,0 +1,50 @@
+# Proposed .github/dependabot.yml, for when images/harness carries package.json and
+# package-lock.json as this spike directory does. Not active here: Dependabot reads only
+# .github/dependabot.yml.
+#
+# - npm: the harnesses and every transitive package in the lockfile, one grouped pull request,
+#   after a cooldown so a release has a few days to be yanked before it is proposed.
+# - docker: the base image digest in `FROM ubuntu:24.04@sha256:...`. Dependabot refreshes a
+#   digest that is already there; it does not add one to a tag-only reference.
+# - github-actions: ASF Infra requires it for every repository that uses Actions. The
+#   workflows pin actions by commit, which must also be on the ASF allow-list; a bump to a
+#   commit that is not on the list fails that check and waits for the list to catch up.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /images/harness
+    schedule:
+      interval: daily
+      time: "05:41"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 3
+    groups:
+      harnesses:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore"
+      include: scope
+    open-pull-requests-limit: 2
+
+  - package-ecosystem: docker
+    directory: /images/harness
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    commit-message:
+      prefix: "chore"
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

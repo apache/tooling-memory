@@ -1,0 +1,14 @@
+{
+  "name": "durable-memory-harnesses",
+  "private": true,
+  "description": "The npm harnesses in the harness image, at the versions the image carries.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.296",
+    "@openai/codex": "0.162.1",
+    "@google/gemini-cli": "0.63.0",
+    "@github/copilot": "1.0.95",
+    "opencode-ai": "1.19.0",
+    "@qwen-code/qwen-code": "0.25.0",
+    "@xai-official/grok": "1.0.50"
+  }
+}

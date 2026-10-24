@@ -40,6 +40,8 @@ pub const SYSTEM: &[&str] = &[
     "/private/var/db/dyld",
     // zoneinfo, which /etc/localtime points into
     "/private/var/db/timezone",
+    // the links that pick the system's tools: /bin/sh reads `sh` on every start
+    "/private/var/select",
 ];
 
 /// The links at the root through which a path into the system is often named: `/etc`,
@@ -67,6 +69,14 @@ const HEADER: &str = r#"(version 1)
 (allow process-info* (target same-sandbox))
 (allow sysctl-read)
 (allow pseudo-tty)
+"#;
+
+/// The root directory's own listing: a process reads it as it starts on macOS 26, and is
+/// aborted when it is refused, `/usr/bin/true` included. The names at the top of the disk
+/// and nothing under them; the metadata rule grants `/` its attributes, not this.
+const ROOT: &str = r#"
+; the root's listing, which every process reads as it starts
+(allow file-read-data (literal "/"))
 "#;
 
 /// Devices: the ones every process writes, the terminal the harness was given, and the
@@ -175,6 +185,7 @@ fn render(grants: &[Grant], relay: &str, host_home: Option<&Path>) -> Result<Str
         .map(|s| format!("(global-name \"{s}\")"))
         .collect();
     rule(&mut out, None, "mach-lookup", &services);
+    out.push_str(ROOT);
     out.push_str(DEVICES);
     let system = SYSTEM
         .iter()
@@ -471,15 +482,16 @@ mod tests {
     }
 
     /// The profile's rules, as the operations each allows and the rule's text: a rule
-    /// is a line that opens `(allow`, and the indented lines of filters after it.
+    /// is a line that opens `(allow`, at any indent, and the indented lines of filters
+    /// after it.
     fn rules(profile: &str) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         for line in profile.lines() {
-            if let Some(rest) = line.strip_prefix("(allow ") {
+            if let Some(rest) = line.trim_start().strip_prefix("(allow ") {
                 let ops = rest.split('(').next().unwrap_or(rest);
                 let ops = ops.trim().trim_end_matches(')').to_string();
-                out.push((ops, line.to_string()));
-            } else if line.starts_with("    ") {
+                out.push((ops, line.trim_start().to_string()));
+            } else if line.starts_with(' ') {
                 if let Some(last) = out.last_mut() {
                     last.1.push('\n');
                     last.1.push_str(line);
@@ -498,6 +510,33 @@ mod tests {
             .into_iter()
             .filter(|(_, body)| body.contains(&lit) || body.contains(&sub) || body.contains(&sock))
             .collect()
+    }
+
+    /// Whether a rule's operations reach files: `file*`, `file-read*` and the rest.
+    fn reaches_files(ops: &str) -> bool {
+        ops.split_whitespace().any(|o| o.starts_with("file"))
+    }
+
+    /// The filters of a rule as `(form, path)`: `(literal "/x")` is `("literal", "/x")`,
+    /// with the string's escapes undone.
+    fn filters(body: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for form in body.split('(').skip(2) {
+            let kind = form.split_whitespace().next().unwrap_or("").to_string();
+            let mut path = String::new();
+            if let Some(rest) = form.split_once('"').map(|(_, r)| r) {
+                let mut chars = rest.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => path.extend(chars.next()),
+                        '"' => break,
+                        c => path.push(c),
+                    }
+                }
+            }
+            out.push((kind, path));
+        }
+        out
     }
 
     #[test]
@@ -622,17 +661,23 @@ mod tests {
     #[test]
     fn the_host_home_is_never_granted() {
         let p = profile(&plan()).unwrap();
-        // only its metadata, as a directory on the way to the working tree
+        // only its metadata, as a directory on the way to the working tree: no subpath
+        // holds the home, and outside the metadata rule no literal names it or a directory
+        // above it but the root, whose listing is granted. A path is compared as a path,
+        // so `/Users/` is `/Users`.
+        let home = Path::new(HOME);
         for (ops, body) in rules(&p) {
-            for named in [
-                format!("(subpath \"{HOME}\")"),
-                "(subpath \"/Users\")".to_string(),
-                "(subpath \"/\")".to_string(),
-            ] {
-                assert!(!body.contains(&named), "{ops} grants {named}");
+            if !reaches_files(&ops) {
+                continue;
             }
-            if ops != "file-read-metadata" {
-                assert!(!body.contains(&format!("\"{HOME}\"")), "{ops}:\n{body}");
+            for (form, named) in filters(&body) {
+                let named = Path::new(&named);
+                if form == "subpath" {
+                    assert!(!home.starts_with(named), "{ops} grants {named:?}:\n{body}");
+                }
+                if form == "literal" && ops != "file-read-metadata" && named != Path::new("/") {
+                    assert!(!home.starts_with(named), "{ops} names {named:?}:\n{body}");
+                }
             }
         }
         // a grant of the home, or of anything above it, is refused
@@ -652,6 +697,58 @@ mod tests {
         let mut bad = plan();
         bad.host_home = Some(PathBuf::from("/usr/home/me"));
         assert!(profile(&bad).unwrap_err().to_string().contains("/usr"));
+    }
+
+    #[test]
+    fn the_tool_selections_are_read_with_the_system() {
+        let p = profile(&plan()).unwrap();
+        let select = naming(&p, "/private/var/select");
+        assert_eq!(select.len(), 1, "{p}");
+        assert_eq!(select[0].0, "file-read*", "{p}");
+        assert!(
+            select[0].1.contains("(subpath \"/private/var/select\")"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn the_root_is_listed_and_nothing_under_it_is_read() {
+        let p = profile(&plan()).unwrap();
+        let root = naming(&p, "/");
+        assert_eq!(
+            root.iter()
+                .filter(|(ops, _)| ops != "file-read-metadata")
+                .map(|(ops, body)| (ops.as_str(), body.as_str()))
+                .collect::<Vec<_>>(),
+            [("file-read-data", "(allow file-read-data (literal \"/\"))")],
+            "{p}"
+        );
+        assert!(!p.contains("(subpath \"/\")"), "{p}");
+    }
+
+    #[test]
+    fn every_file_rule_names_its_paths_as_literals_and_subpaths() {
+        // the checks on the home and on the root read the paths these two forms name; a
+        // `prefix` or a `regex` would grant past them unseen. The terminals are the one
+        // pattern, in the devices rule alone.
+        let p = profile(&plan()).unwrap();
+        for (ops, body) in rules(&p) {
+            if !reaches_files(&ops) {
+                continue;
+            }
+            let devices = body.contains("(literal \"/dev/null\")");
+            for (form, named) in filters(&body) {
+                let terminals = devices && form == "regex" && named == "^/dev/ttys[0-9]+$";
+                assert!(
+                    ["literal", "subpath"].contains(&form.as_str()) || terminals,
+                    "{ops} names a path by {form}:\n{body}"
+                );
+            }
+            if devices {
+                assert_eq!(body.matches("(regex ").count(), 1, "{body}");
+                assert!(body.contains(r##"(regex #"^/dev/ttys[0-9]+$")"##), "{body}");
+            }
+        }
     }
 
     #[test]
@@ -734,6 +831,20 @@ mod on_a_mac {
     }
 
     #[test]
+    fn a_confined_process_starts_and_its_own_exit_code_comes_back() {
+        let inside = tempfile::tempdir().unwrap();
+        let (code, out, _) = run_captured(&plan(inside.path(), &["/usr/bin/true"])).unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+        // a code of its own, which a death by signal, reported as 1, cannot pass for
+        let (code, out, _) = run_captured(&plan(
+            inside.path(),
+            &["/bin/sh", "-c", "echo started; exit 7"],
+        ))
+        .unwrap();
+        assert_eq!((code, out.as_slice()), (7, b"started\n".as_slice()));
+    }
+
+    #[test]
     fn a_confined_cat_reads_inside_the_grant_and_not_outside() {
         let inside = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -741,7 +852,8 @@ mod on_a_mac {
         std::fs::write(outside.path().join("out.txt"), "secret").unwrap();
         let read = |file: &Path| {
             let f = file.display().to_string();
-            run_captured(&plan(inside.path(), &["/bin/cat", &f])).unwrap()
+            let (code, out, _) = run_captured(&plan(inside.path(), &["/bin/cat", &f])).unwrap();
+            (code, out)
         };
         let (code, out) = read(&inside.path().join("in.txt"));
         assert_eq!((code, out.as_slice()), (0, b"granted".as_slice()));

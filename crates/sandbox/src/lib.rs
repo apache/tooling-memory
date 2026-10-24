@@ -415,9 +415,12 @@ impl Layout {
         }
     }
 
-    /// A path under the private home, as the harness sees it.
+    /// A path under the private home, as the harness sees it. The box's paths are Unix
+    /// ones whatever the host, Linux in a container launched from Windows among them, so
+    /// `/` joins them rather than the host's separator.
     fn under_home(&self, rel: &str) -> String {
-        self.home.join(rel).display().to_string()
+        let home = self.home.display().to_string();
+        format!("{}/{rel}", home.trim_end_matches('/'))
     }
 
     /// The shell command that runs the memory's hook for `harness`.
@@ -2813,6 +2816,8 @@ mod tests {
         ] {
             assert!(plugin.contains(needle), "{needle} in\n{plugin}");
         }
+        // driving it takes a fake memory binary, which is a shell script
+        #[cfg(unix)]
         if let Ok(node) = find_on_path("node") {
             drive_opencode_plugin(&node, &plugin);
         }
@@ -2893,6 +2898,7 @@ mod tests {
 
     /// Drives the plugin: a denied tool call, the events of one turn, a compaction and
     /// an idle, with a client whose messages call must never be awaited.
+    #[cfg(unix)]
     const OPENCODE_HARNESS: &str = r#"
 const [plugin] = process.argv.slice(2);
 const mod = await import(plugin);

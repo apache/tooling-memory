@@ -1,0 +1,57 @@
+# Layout A, and B under the default seccomp profile: egress sidecar and harness in one pod,
+# sharing the socket through an emptyDir. run.sh runs the check in the harness directly (A)
+# and under unshare (B, RuntimeDefault).
+---
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: layout-a
+  namespace: as-spike
+spec:
+  podTemplate:
+    metadata:
+      labels: {spike: agent-sandbox, layout: layout-a}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      initContainers:
+      - name: egress            # native sidecar: the stand-in for amem's egress
+        image: docker.io/library/python:3.12-slim
+        imagePullPolicy: Never
+        restartPolicy: Always
+        command: ["python3", "-I", "/opt/egress/egress.py"]
+        env: [{name: EGRESS_SOCKET, value: /run/memory/egress.sock}]
+        volumeMounts:
+        - {name: sock, mountPath: /run/memory}
+        - {name: egress-stub, mountPath: /opt/egress, readOnly: true}
+      containers:
+      - name: harness
+        image: docker.io/library/python:3.12-slim
+        imagePullPolicy: Never
+        command: ["sleep", "infinity"]
+        env: [{name: HOME, value: /home/user}]
+        workingDir: /work
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: [ALL]}
+          seccompProfile: {type: RuntimeDefault}
+        volumeMounts:
+        - {name: sock, mountPath: /run/memory}
+        - {name: home, mountPath: /home/user}
+        - {name: work, mountPath: /work}
+        - {name: tmp, mountPath: /tmp}
+        - {name: memory-bin, mountPath: /opt/memory, readOnly: true}
+        - {name: projection, mountPath: /memory, readOnly: true}
+        - {name: check, mountPath: /opt/check, readOnly: true}
+      volumes:
+      - {name: sock, emptyDir: {}}
+      - {name: home, emptyDir: {}}
+      - {name: work, emptyDir: {}}
+      - {name: tmp, emptyDir: {}}
+      - {name: projection, emptyDir: {}}
+      - {name: memory-bin, configMap: {name: memory-bin, defaultMode: 0555}}
+      - {name: egress-stub, configMap: {name: egress-stub}}
+      - {name: check, configMap: {name: contract-check}}

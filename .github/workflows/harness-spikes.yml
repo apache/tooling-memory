@@ -1,0 +1,230 @@
+name: Harness spikes
+
+# The harness-container spikes (spikes/harness-containers, docs/harness-containers.md) that
+# need what a WSL2 laptop lacks: a Mac for our Seatbelt backend, a rootful node for
+# agent-sandbox with `hostUsers: false`, and /dev/kvm for gVisor's kvm platform. Nothing here
+# builds or ships anything; each job's log is the result, shown in the run's summary and
+# kept as an artifact. A FAIL line in a log is a finding, not a failed job: the runners
+# exit 0 after printing what the check reported. A check that did not finish is a failed
+# job, since then not everything was looked at: each check ends on a DONE line. Run by
+# hand, and on a pull request that changes the spikes, the sandbox crate whose Seatbelt
+# tests run here, or this file.
+#
+# Every job runs on GitHub's runners. The kind job can move to ASF Infra's (RunsOn: one
+# EC2 instance per job, the labels tooling-agenda uses) once Infra adds this repository,
+# with a fork's pull request kept on GitHub's; the job holds the expression. The macOS job
+# needs GitHub's Macs, and the kvm job GitHub's VMs, which offer /dev/kvm.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - spikes/harness-containers/**
+      - crates/sandbox/**
+      - .github/workflows/harness-spikes.yml
+
+permissions:
+  contents: read
+
+# bash rather than the default `bash -e`, for pipefail: a step that pipes into tee fails
+# with what it piped
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The contract check under our own Seatbelt backend, which is dry-coded and has not run on
+  # a Mac before: `amem launch --harness command` with the real egress, everything at its
+  # host path. What the profile denies is in the system log, collected after.
+  seatbelt:
+    name: seatbelt (macos)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build -p amem
+      # crash reports are collected from here on, the tests' own sandbox-exec runs among
+      # them; a log's time moves with each line, so a marker of its own
+      - run: touch "$RUNNER_TEMP/check-started"
+      - name: the Seatbelt backend's own tests, which only a Mac compiles
+        run: cargo test -p dm-sandbox --lib seatbelt 2>&1 | tee sandbox-tests.log
+      - name: contract check under Seatbelt
+        if: always()
+        run: |
+          sw_vers | tee seatbelt.log
+          spikes/harness-containers/run-seatbelt.sh 2>&1 | tee -a seatbelt.log
+          grep -q '^DONE ' seatbelt.log || { echo "the check did not finish"; exit 1; }
+      - name: where a launch stops, step by step
+        if: always()
+        run: spikes/harness-containers/seatbelt-steps.sh 2>&1 | tee steps.log
+      - name: crash reports from the run
+        if: always()
+        run: |
+          # a process killed on a signal leaves a report rather than a denial
+          mkdir -p crashes
+          find "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports \
+            -newer "$RUNNER_TEMP/check-started" -type f 2>/dev/null | while read -r f; do cp "$f" crashes/; done
+          ls -l crashes
+      - name: what Seatbelt denied
+        if: always()
+        run: |
+          # every Sandbox report since the job started; the summary counts those naming a
+          # process the check runs
+          log show --last 30m --style compact --predicate 'sender == "Sandbox"' > denials.log
+          grep -E 'deny\(' denials.log | grep -E '(python3?|Python|xcrun|sh|bash|true|echo|amem|memory|sandbox-exec)\([0-9]+\)' > denials-ours.log || true
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '### Seatbelt (macOS)'
+            echo '```text'
+            grep -E '^test |^test result' sandbox-tests.log || true
+            cat seatbelt.log
+            echo '```'
+            echo '```text'
+            cat steps.log
+            echo '```'
+            echo "Crash reports since the check: $(ls crashes | wc -l)"
+            echo "Sandbox denials naming the check's processes: $(wc -l < denials-ours.log); all reports are in the artifact."
+            echo '```text'
+            # sed reads to the end, where head would leave sort to die on a closed pipe
+            sort -u denials-ours.log | sed -n 1,100p
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: seatbelt
+          path: |
+            sandbox-tests.log
+            seatbelt.log
+            steps.log
+            crashes/
+            denials.log
+            denials-ours.log
+
+  # agent-sandbox's layouts on kind with the node under Docker, which is rootful here: on a
+  # rootless node `hostUsers: false` cannot start, because containerd's idmapped mounts need
+  # privilege over the node's filesystem.
+  agent-sandbox-userns:
+    name: agent-sandbox, hostUsers false (rootful kind)
+    # ASF Infra's runners have not yet taken a job from this repository: a job with their
+    # labels stayed queued (run 40044203643). Once Infra adds the repository, this becomes
+    #   ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["runs-on={0}","cpu=8","family=c7i","image=ubuntu24-full-x64","tag=infra"]', github.run_id)) || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: kind and kubectl
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP/bin"
+          curl -fsSLO https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          curl -fsSLO https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256sum
+          sha256sum -c kind-linux-amd64.sha256sum && install -m755 kind-linux-amd64 kind
+          curl -fsSLO https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl
+          curl -fsSLO https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl.sha256
+          echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c && chmod +x kubectl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: docker pull docker.io/library/python:3.12-slim
+      # Ubuntu's AppArmor lets an unprivileged process create a user namespace but not
+      # write its uid map, which is every `unshare -U` in layout B; a node that runs our
+      # backend turns this off, as the WSL2 host had
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: every layout, hostUsers false among them
+        run: |
+          ENGINE=docker DOWN=1 spikes/harness-containers/agent-sandbox/run.sh 2>&1 | tee kind.log
+          grep -q '^DONE ' kind.log || { echo "no check finished"; exit 1; }
+          # a section that began a check and has no DONE stopped partway; one that never
+          # began (a command refused before the check ran) shows its reason instead
+          awk '/^### /{if(s&&!d){print "stopped partway: " h; b=1}; h=$0; s=d=0}
+               /^(PASS|FAIL) /{s=1} /^DONE /{d=1}
+               END{if(s&&!d){print "stopped partway: " h; b=1}; exit b}' kind.log
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '### agent-sandbox on rootful kind'
+            echo '```text'
+            grep -E '^(### |PASS|FAIL|DONE|REACH|BLOCK|exit=|Failed|node |unshare: )' kind.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agent-sandbox-userns
+          path: kind.log
+
+  # gVisor on its kvm platform beside systrap: the contract check on each, then the
+  # overhead against runc. The runner is itself a VM, so kvm is nested here too, as it was
+  # under WSL2; this is a second reading, not the bare-metal one.
+  gvisor-kvm:
+    name: gVisor kvm platform (nested)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: open /dev/kvm and unprivileged user namespaces to the runner's user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm-spike.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          # Ubuntu's AppArmor refuses unprivileged user namespaces by default; rootless
+          # runsc and podman need them
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: gVisor
+        run: |
+          mkdir -p "$RUNNER_TEMP/gvisor" && cd "$RUNNER_TEMP/gvisor"
+          gh release download release-20261012.0 -R google/gvisor -p gvisor-x86_64.tar.bz2 -p SHA256SUMS
+          grep x86_64.tar.bz2 SHA256SUMS | sha256sum -c && mkdir x && tar -xjf gvisor-x86_64.tar.bz2 -C x
+          echo "RUNSC=$PWD/x/runsc" >> "$GITHUB_ENV"
+      - name: contract check, systrap then kvm
+        run: |
+          uname -r | tee gvisor.log
+          for platform in systrap kvm; do
+            echo "== $platform" | tee -a gvisor.log
+            RUNSC_FLAGS=--platform=$platform spikes/harness-containers/run-gvisor.sh 2>&1 | tee run.log
+            cat run.log >> gvisor.log
+            grep -q '^DONE ' run.log || { echo "the check on $platform did not finish"; exit 1; }
+          done
+      - name: a Node rootfs with the harnesses
+        run: |
+          podman run --name h docker.io/library/node:24-slim npm install -g \
+            @anthropic-ai/claude-code@2.1.296 @openai/codex@0.162.1 @google/gemini-cli@0.63.0
+          mkdir "$RUNNER_TEMP/rootfs" && podman export h | tar -x -C "$RUNNER_TEMP/rootfs" && podman rm h
+      - name: overhead against runc
+        run: |
+          ROOTFS="$RUNNER_TEMP/rootfs" spikes/harness-containers/bench-compare.sh | tee bench.md
+          grep -q '^| node_start' bench.md || { echo "no task completed in every box"; exit 1; }
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '### gVisor, systrap and kvm (nested)'
+            echo '```text'
+            cat gvisor.log
+            echo '```'
+            cat bench.md 2>/dev/null
+          } >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gvisor-kvm
+          path: |
+            gvisor.log
+            bench.md

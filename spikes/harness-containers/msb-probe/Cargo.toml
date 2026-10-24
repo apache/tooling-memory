@@ -1,0 +1,12 @@
+[package]
+name = "msb-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+microsandbox = { version = "=0.7.8", default-features = false, features = ["local", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Standalone: a spike, not a member of the repository workspace.
+[workspace]
