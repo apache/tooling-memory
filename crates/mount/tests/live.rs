@@ -1,5 +1,5 @@
 //! The mount, live: a memory's render served over FUSE, read with ordinary file calls.
-//! Skipped where the host has no FUSE, saying so.
+//! Skipped where the host has no FUSE, saying so; on CI that is a failure.
 
 // An integration test is test code; a panic here is the failure being reported.
 #![allow(clippy::unwrap_used)]
@@ -30,6 +30,20 @@ async fn rendered(root: &Path) -> (Arc<Memory>, String, PathBuf) {
     (m, w.id, render)
 }
 
+/// Whether this host can serve a FUSE mount. Without it a test says it skipped, except on
+/// CI, which is set up to run it and fails instead.
+fn fuse_available() -> bool {
+    let Err(why) = dm_mount::availability() else {
+        return true;
+    };
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{why}, and on CI the mount tests must run"
+    );
+    eprintln!("skipping: {why}");
+    false
+}
+
 fn names(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -42,8 +56,7 @@ fn names(dir: &Path) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_open_in_the_mount_is_a_get_the_memory_serves_logs_and_tapes() {
-    if let Err(why) = dm_mount::availability() {
-        eprintln!("skipping: {why}");
+    if !fuse_available() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -124,8 +137,7 @@ async fn an_open_in_the_mount_is_a_get_the_memory_serves_logs_and_tapes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_record_s_word_decides_an_open_not_the_render_s() {
-    if let Err(why) = dm_mount::availability() {
-        eprintln!("skipping: {why}");
+    if !fuse_available() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();

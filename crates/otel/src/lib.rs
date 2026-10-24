@@ -213,7 +213,9 @@ pub fn init(service_name: &str) -> Option<Guard> {
 fn build(service_name: &str) -> Result<Guard, String> {
     // an https collector wants a TLS stack; the egress installs the same one
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // a redirect is not followed: it would carry the exporter's headers to another host
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(EXPORT_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;
