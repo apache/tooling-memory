@@ -537,9 +537,12 @@ fn replay_resends_a_sessions_recorded_calls_and_scores_them() {
     let session = walk(&dir)
         .into_iter()
         .find_map(|p| {
-            let s = p.to_string_lossy().into_owned();
-            let at = s.find("/.contexts/")?;
-            s[at + 11..].split('/').next().map(str::to_string)
+            // by component, since Windows separates them with `\`
+            let mut names = p
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned());
+            names.find(|n| n == ".contexts")?;
+            names.next()
         })
         .unwrap_or_else(|| panic!("no contexts under {}", dir.display()));
     let mut replay = vec!["replay", session.as_str()];
