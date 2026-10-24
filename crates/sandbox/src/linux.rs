@@ -72,12 +72,13 @@ const NO_SECCOMP: &str = "the sandbox cannot install its seccomp filter here: it
 
 /// Why a read-only grant cannot be made read-only below its submounts. A kernel before
 /// Linux 5.12 has no `mount_setattr`, and a container runtime's seccomp profile that does
-/// not know the call answers it with `ENOSYS` as well.
+/// not allow the call answers it with `ENOSYS` or `EPERM`.
 const NO_MOUNT_SETATTR: &str = "mount_setattr is not available here: it needs Linux 5.12 or \
                                 later, and a seccomp profile that allows it";
 
 /// Whether `mount_setattr` answers here, asked with an empty path and a size below the
-/// first `mount_attr`: arguments it refuses for another reason than `ENOSYS`.
+/// first `mount_attr`: a kernel that has the call refuses that size with `EINVAL` before
+/// it checks anything else, so any other answer is a filter in the way.
 fn has_mount_setattr() -> bool {
     // SAFETY: an empty NUL-terminated path, no mount_attr, and a size of zero; the kernel
     // refuses the call before it reads either pointer.
@@ -91,7 +92,7 @@ fn has_mount_setattr() -> bool {
             0,
         )
     };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
 }
 
 /// Whether this host lets an unprivileged process build the sandbox at all: can it

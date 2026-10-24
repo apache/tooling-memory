@@ -154,8 +154,8 @@ fn a_mount_under_a_read_only_grant_is_read_only_inside() {
     assert_eq!(common::report(&out.stdout), want, "{said}");
 }
 
-/// Run by the test below, under a seccomp filter that answers `mount_setattr` with
-/// `ENOSYS`: say what [`dm_sandbox::linux::availability`] answers, and whether a launch
+/// Run by the tests below, under a seccomp filter that answers `mount_setattr` with
+/// `ENOSYS` or `EPERM`: say what [`dm_sandbox::linux::availability`] answers, and whether a launch
 /// with read-only grants starts.
 #[test]
 #[ignore = "the host side of the mount_setattr test, under a filter that hides the call"]
@@ -189,9 +189,10 @@ fn bpf(code: u32, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 }
 
 /// This binary's [`probe_availability_without_mount_setattr`], under a seccomp filter
-/// that answers `mount_setattr` with `ENOSYS` and allows every other call, as a
-/// container runtime's profile that does not know the call does.
-fn without_mount_setattr() -> Command {
+/// that answers `mount_setattr` with `errno` and allows every other call, as a container
+/// runtime's profile that does not know the call does: `ENOSYS` from one that names
+/// calls it does not know so, `EPERM` from one whose default answer is that.
+fn without_mount_setattr(errno: i32) -> Command {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args([
         "--exact",
@@ -201,7 +202,7 @@ fn without_mount_setattr() -> Command {
         "--test-threads=1",
     ]);
     let nr = u32::try_from(libc::SYS_mount_setattr).unwrap();
-    let errno = libc::SECCOMP_RET_ERRNO | u32::try_from(libc::ENOSYS).unwrap();
+    let errno = libc::SECCOMP_RET_ERRNO | u32::try_from(errno).unwrap();
     let program = [
         bpf(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 4, 0, 0),
         bpf(
@@ -239,7 +240,7 @@ fn without_mount_setattr_availability_says_so_and_a_launch_does_not_start() {
     if !common::confinable() {
         return;
     }
-    let out = without_mount_setattr().output().unwrap();
+    let out = without_mount_setattr(libc::ENOSYS).output().unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{said}{stderr}");
@@ -250,4 +251,21 @@ fn without_mount_setattr_availability_says_so_and_a_launch_does_not_start() {
             .collect();
     assert_eq!(common::report(&out.stdout), want, "{said}{stderr}");
     assert!(stderr.contains(NO_MOUNT_SETATTR), "{stderr}");
+}
+
+#[test]
+fn a_filter_that_answers_mount_setattr_with_eperm_is_not_taken_for_the_call() {
+    if !common::confinable() {
+        return;
+    }
+    let out = without_mount_setattr(libc::EPERM).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}{stderr}");
+    let want: BTreeMap<String, String> =
+        [("availability", NO_MOUNT_SETATTR), ("launch", "refused")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+    assert_eq!(common::report(&out.stdout), want, "{said}{stderr}");
 }
