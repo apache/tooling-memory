@@ -835,7 +835,8 @@ mod on_a_mac {
         let inside = tempfile::tempdir().unwrap();
         let (code, out, _) = run_captured(&plan(inside.path(), &["/usr/bin/true"])).unwrap();
         assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
-        // a code of its own, which a death by signal, reported as 1, cannot pass for
+        // a code of its own, which a death by signal, reported as 128 and its number,
+        // cannot pass for
         let (code, out, _) = run_captured(&plan(
             inside.path(),
             &["/bin/sh", "-c", "echo started; exit 7"],

@@ -509,12 +509,17 @@ fn become_pid_one() -> Result<(), Error> {
         let mut status: libc::c_int = 0;
         // SAFETY: waitpid on our own child with a valid status pointer.
         let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        // the code as crate::measure::exit_code gives it, said without allocating
         let code = if r < 0 {
             1
+        } else if libc::WIFSIGNALED(status) {
+            let signal = libc::WTERMSIG(status);
+            if crate::measure::is_said(signal) {
+                say_the_relay_died(signal, libc::WCOREDUMP(status));
+            }
+            128 + signal
         } else if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
-        } else if libc::WIFSIGNALED(status) {
-            128 + libc::WTERMSIG(status)
         } else {
             1
         };
@@ -523,6 +528,48 @@ fn become_pid_one() -> Result<(), Error> {
         unsafe { libc::_exit(code) };
     }
     Ok(())
+}
+
+/// Say on standard error that the relay died of `signal`, as [`crate::measure::exit_code`]
+/// says it, in one `write` from a buffer on the stack. This runs after a fork from a
+/// launcher with other threads, where allocating or taking stderr's lock can hang on a
+/// lock one of them held at the fork.
+fn say_the_relay_died(signal: i32, core_dumped: bool) {
+    fn put(buf: &mut [u8], at: usize, bytes: &[u8]) -> usize {
+        let end = (at + bytes.len()).min(buf.len());
+        buf[at..end].copy_from_slice(&bytes[..end - at]);
+        end
+    }
+    let mut digits = [0u8; 10];
+    let mut first = digits.len();
+    let mut rest = signal.unsigned_abs();
+    loop {
+        first -= 1;
+        digits[first] = b'0' + u8::try_from(rest % 10).unwrap_or(0);
+        rest /= 10;
+        if rest == 0 || first == 0 {
+            break;
+        }
+    }
+    let number = &digits[first..];
+    let mut buf = [0u8; 96];
+    let mut n = put(&mut buf, 0, b"memory: the relay was killed by ");
+    if let Some(name) = crate::measure::signal_name(signal) {
+        n = put(&mut buf, n, name.as_bytes());
+        n = put(&mut buf, n, b" (signal ");
+        n = put(&mut buf, n, number);
+        n = put(&mut buf, n, b")");
+    } else {
+        n = put(&mut buf, n, b"signal ");
+        n = put(&mut buf, n, number);
+    }
+    if core_dumped {
+        n = put(&mut buf, n, b", core dumped");
+    }
+    n = put(&mut buf, n, b"\n");
+    // SAFETY: write to fd 2 from a live buffer of at least n bytes; a failure is ignored,
+    // as there is nowhere else to say it.
+    unsafe { libc::write(2, buf.as_ptr().cast(), n) };
 }
 
 /// What `memory relay` does inside: spawn the harness and wait for it. The relay is
@@ -536,5 +583,5 @@ pub fn spawn_in_pid_namespace(argv: &[OsString]) -> Result<i32, Error> {
         .args(&argv[1..])
         .status()
         .map_err(|e| confine(format!("spawn {}: {e}", argv[0].to_string_lossy())))?;
-    Ok(status.code().unwrap_or(1))
+    Ok(crate::measure::exit_code(status, &argv[0]))
 }
