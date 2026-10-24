@@ -1,0 +1,18 @@
+# Dependabot version updates. ASF Infra's GitHub Actions policy requires automatic dependency
+# management on every repository that uses Actions. The workflows pin each external action by
+# commit, and Infra must have approved that commit: a bump to a commit that Infra has not
+# approved fails the check and waits for approval. One grouped pull request a week, after a
+# cooldown, so that a release has some days to be withdrawn before it is proposed.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
