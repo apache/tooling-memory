@@ -278,7 +278,10 @@ impl Egress {
                 return Err(Error::NotHosted(name.clone()));
             }
         }
+        // a redirect goes back to the caller as it came: followed here, it would carry an
+        // injected key to wherever the upstream pointed, with no check on the address
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .use_rustls_tls()
             .connect_timeout(std::time::Duration::from_secs(20))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
@@ -2280,5 +2283,142 @@ mod tests {
             Egress::with_tool_servers(plain, HashMap::new(), server(), &dir.path().join("t2.db")),
             Err(Error::NotHosted(_))
         ));
+    }
+
+    /// The headers of each request a server was sent.
+    type Heard = Arc<std::sync::Mutex<Vec<HeaderMap>>>;
+
+    /// A server on loopback that keeps the headers of every request it is sent: where a
+    /// followed redirect lands.
+    async fn bystander() -> (std::net::SocketAddr, Heard) {
+        let heard: Heard = Arc::default();
+        let kept = heard.clone();
+        let app = Router::new().fallback(move |req: Request| {
+            let kept = kept.clone();
+            async move {
+                kept.lock().unwrap().push(req.headers().clone());
+                "the bystander's page"
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, heard)
+    }
+
+    /// An upstream that answers every request with a 307 to `location`.
+    async fn redirecting_upstream(location: String) -> std::net::SocketAddr {
+        let app = Router::new().fallback(move || {
+            let location = location.clone();
+            async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(header::LOCATION, location)],
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    fn injected(header: &'static str) -> Auth {
+        Auth::Inject {
+            header: HeaderName::from_static(header),
+            value: "real-key".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_from_upstream_goes_back_to_the_harness_and_is_not_followed() {
+        let (elsewhere, heard) = bystander().await;
+        // another host: reqwest strips authorization there, and not these keys
+        let location = format!("http://localhost:{}/steal", elsewhere.port());
+        for (name, key) in [("anthropic", "x-api-key"), ("gemini", "x-goog-api-key")] {
+            let upstream = redirecting_upstream(location.clone()).await;
+            let (_d, e) = fixture(Some((
+                name,
+                Destination::forward(format!("http://{upstream}"), injected(key)),
+            )))
+            .await;
+            for method in [Method::POST, Method::GET] {
+                let r = e
+                    .router()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/{name}/v1/messages"))
+                            .method(method.clone())
+                            .header("content-type", "application/json")
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let heard = heard.lock().unwrap().clone();
+                assert!(
+                    heard.is_empty(),
+                    "{method} at {name}: the redirect was followed, and the other server heard {heard:?}"
+                );
+                assert_eq!(
+                    r.status(),
+                    StatusCode::TEMPORARY_REDIRECT,
+                    "{method} at {name}"
+                );
+                assert_eq!(r.headers()[header::LOCATION], location.as_str());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_launcher_s_own_calls_do_not_follow_a_redirect() {
+        let (elsewhere, heard) = bystander().await;
+        let location = format!("http://localhost:{}/steal", elsewhere.port());
+        let upstream = redirecting_upstream(location.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let m = Arc::new(with_hosted_fetch(
+            &dir.path().join("m"),
+            &format!("http://{upstream}/mcp"),
+            Label::Public,
+        ));
+        let mut destinations = HashMap::new();
+        destinations.insert(
+            "anthropic".to_string(),
+            Destination::forward(format!("http://{upstream}"), injected("x-api-key")),
+        );
+        let mut tools = HashMap::new();
+        tools.insert(
+            "fetch".to_string(),
+            Destination::forward(format!("http://{upstream}"), injected("authorization")),
+        );
+        let e =
+            Egress::with_tool_servers(m, destinations, tools, &dir.path().join("t.db")).unwrap();
+        let heard_nothing = |call: &str| {
+            let heard = heard.lock().unwrap().clone();
+            assert!(
+                heard.is_empty(),
+                "{call}: the redirect was followed, and the other server heard {heard:?}"
+            );
+        };
+
+        let listed = e.get("anthropic", "v1/models").await;
+        heard_nothing("get");
+        let err = listed.unwrap_err().to_string();
+        assert!(err.contains("307"), "get: {err}");
+
+        let called = e
+            .call("anthropic", "v1/messages", &serde_json::json!({}))
+            .await;
+        heard_nothing("call");
+        let err = called.unwrap_err().to_string();
+        assert!(err.contains("307"), "call: {err}");
+
+        let posted = e
+            .post("fetch", "/mcp", HeaderMap::new(), Bytes::from_static(b"{}"))
+            .await;
+        heard_nothing("post");
+        let posted = posted.unwrap();
+        assert_eq!(posted.status, 307);
+        assert_eq!(posted.headers[header::LOCATION], location.as_str());
     }
 }
