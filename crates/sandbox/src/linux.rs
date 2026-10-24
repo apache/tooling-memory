@@ -42,6 +42,70 @@ fn enter_user_namespace(uid: u32, gid: u32) -> Result<(), Error> {
     Ok(())
 }
 
+/// Why this host will not let an unprivileged process confine anything, in a sentence
+/// that names the fix.
+fn restricted_why() -> String {
+    let what = "this host will not let an unprivileged process enter a user namespace";
+    let apparmor =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .is_ok_and(|v| v.trim() == "1");
+    if apparmor {
+        format!(
+            "{what}: kernel.apparmor_restrict_unprivileged_userns is 1, so AppArmor moves a \
+             binary that has no profile of its own into one without CAP_SYS_ADMIN. Give amem a \
+             profile that allows it: packaging/apparmor/amem"
+        )
+    } else {
+        format!("{what}; --unconfined runs the harness without a sandbox")
+    }
+}
+
+/// Whether this host lets an unprivileged process build the sandbox at all: can it
+/// create a user namespace and map itself into it?
+///
+/// Probed in a child, because the answer is a namespace the asking process would
+/// otherwise be stuck in, and by calling [`enter_user_namespace`] itself rather than a
+/// copy of it: a probe that unshares a different set of namespaces, or writes the maps
+/// in a different order, can disagree with the launch it is meant to predict, and a
+/// check that says a working host is broken is worse than no check. The first cut of
+/// this did exactly that.
+///
+/// A sentence rather than a flag, since what to do differs: a kernel without user
+/// namespaces is one thing, Ubuntu's AppArmor moving an unprofiled binary into a profile
+/// without CAP_SYS_ADMIN is another, and the second is fixed by installing a profile
+/// rather than by giving up on confinement.
+///
+/// # Errors
+///
+/// Why not, in a sentence `amem doctor` and the launch line can carry.
+pub fn availability() -> Result<(), String> {
+    // SAFETY: fork in a process that only waits for the child; the child makes the same
+    // syscalls a launch does and _exits without running atexit handlers, which belong to
+    // the parent.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(format!("fork: {}", std::io::Error::last_os_error()));
+    }
+    if pid == 0 {
+        let ok = enter_user_namespace(getuid().as_raw(), getgid().as_raw()).is_ok();
+        // SAFETY: exiting the probe child without running the parent's atexit handlers.
+        unsafe { libc::_exit(i32::from(!ok)) };
+    }
+    let mut status: libc::c_int = 0;
+    // SAFETY: waitpid on our own child with a valid status pointer.
+    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        return Err(format!("waitpid: {}", std::io::Error::last_os_error()));
+    }
+    if !libc::WIFEXITED(status) {
+        return Err("the user-namespace probe did not exit normally".to_string());
+    }
+    if libc::WEXITSTATUS(status) == 0 {
+        Ok(())
+    } else {
+        Err(restricted_why())
+    }
+}
+
 fn bind(m: &Mount, root: &Path) -> Result<(), Error> {
     let target = root.join(m.target.strip_prefix("/").unwrap_or(&m.target));
     if m.source.is_dir() {
@@ -231,6 +295,26 @@ fn build_root(plan: &Plan, root: &Path) -> Result<(), Error> {
         }
     }
     std::fs::create_dir_all(root.join("proc")).map_err(confine)?;
+    // The procfs for the harness's pid namespace, mounted here rather than over /proc
+    // after the pivot. `mount -t proc` from a non-initial user namespace is refused
+    // unless a fully visible procfs already exists in this mount namespace:
+    // fs/proc/root.c, mount_too_revealing(). The host's is still visible at this point
+    // and satisfies that; after pivot_root detaches the old root, nothing does, and the
+    // mount fails with EPERM on kernels that enforce the check (seen on 6.17).
+    //
+    // Binding the host's procfs instead is not an option: the kernel refuses to clone
+    // it into the new namespace at all, recursively or not, with EINVAL.
+    //
+    // This is why the pid namespace is entered before the root is built: the mount
+    // shows the pid namespace it was made in, so it has to come after the fork.
+    mount(
+        Some("proc"),
+        &root.join("proc"),
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .map_err(|e| confine(format!("mount proc: {e}")))?;
     std::fs::create_dir_all(root.join("run")).map_err(confine)?;
     let old = root.join(".old-root");
     std::fs::create_dir_all(&old).map_err(confine)?;
@@ -297,8 +381,11 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
                 enter_user_namespace(uid, gid)?;
                 sethostname(&plan2.hostname).map_err(|e| confine(format!("hostname: {e}")))?;
                 loopback_up()?;
-                build_root(&plan2, &root2)?;
+                // before build_root: it mounts this namespace's procfs, which must be
+                // made after the fork that enters the namespace and before pivot_root
+                // takes the host's procfs out of view
                 become_pid_one()?;
+                build_root(&plan2, &root2)?;
                 Ok(())
             };
             go().map_err(|e| {
@@ -318,7 +405,13 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
 ///
 /// `unshare(CLONE_NEWPID)` only moves the caller's *children* into the new namespace, so
 /// this forks once more: the parent waits for the child and exits with its status; the
-/// child, now pid 1, mounts `/proc` for its namespace and goes on to exec the relay.
+/// child, now pid 1, goes on to build the root and exec the relay.
+///
+/// Called before [`build_root`], which mounts the procfs for this namespace while the
+/// host's is still visible. A procfs mount shows the pid namespace it was made in, so it
+/// has to happen after this fork, and the visibility the kernel demands of it is gone
+/// once `pivot_root` has detached the old root -- which leaves only the window between
+/// the two.
 fn become_pid_one() -> Result<(), Error> {
     unshare(CloneFlags::CLONE_NEWPID).map_err(|e| confine(format!("unshare pid: {e}")))?;
     // SAFETY: fork between fork and exec in an already single-threaded child; the parent
@@ -347,14 +440,6 @@ fn become_pid_one() -> Result<(), Error> {
         // which belong to the parent that forked us.
         unsafe { libc::_exit(code) };
     }
-    mount(
-        Some("proc"),
-        "/proc",
-        Some("proc"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-        None::<&str>,
-    )
-    .map_err(|e| confine(format!("mount /proc: {e}")))?;
     Ok(())
 }
 
