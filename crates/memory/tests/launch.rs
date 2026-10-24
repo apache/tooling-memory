@@ -205,16 +205,21 @@ fn launch_refuses_without_the_credential_its_mode_needs() {
 }
 
 /// Whether this kernel lets an unprivileged process create user and network namespaces.
-/// Ubuntu's AppArmor restriction and some CI kernels say no; the confined test is then
-/// reported as skipped rather than failed.
+/// Ubuntu's AppArmor restriction says no by default; a confined test is then reported as
+/// skipped rather than failed, except on CI, which is set up to run it and fails instead.
 #[cfg(target_os = "linux")]
 fn namespaces_available() -> bool {
-    Command::new("unshare")
+    let available = Command::new("unshare")
         .args(["--user", "--map-root-user", "--net", "--mount", "true"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|s| s.success());
+    assert!(
+        available || std::env::var_os("CI").is_none(),
+        "unprivileged namespaces are not available, and on CI the confined tests must run"
+    );
+    available
 }
 
 #[cfg(target_os = "linux")]
@@ -502,6 +507,144 @@ fn fake_harness(dir: &Path, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     bins
+}
+
+/// How many times `stderr` says that a process died of `signal`, numbered `number`.
+fn deaths_by(stderr: &str, signal: &str, number: i32) -> usize {
+    stderr
+        .lines()
+        .filter(|l| l.contains(&format!("killed by {signal} (signal {number})")))
+        .count()
+}
+
+#[test]
+fn an_unconfined_harness_killed_by_a_signal_exits_128_and_its_number_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), "kill -ABRT $$");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = launch(&root, &bins, &work, &["--unconfined"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 6), "{stderr}");
+    assert_eq!(deaths_by(&stderr, "SIGABRT", 6), 1, "{stderr}");
+}
+
+#[test]
+fn the_relay_reports_a_harness_killed_by_a_signal_as_128_and_its_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = memory()
+        .args(["relay", "--socket"])
+        .arg(dir.path().join("egress.sock"))
+        .args(["--listen", "127.0.0.1:0", "--", "sh", "-c", "kill -KILL $$"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 9), "{stderr}");
+    assert_eq!(deaths_by(&stderr, "SIGKILL", 9), 1, "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_harness_killed_by_a_signal_exits_128_and_its_number_and_says_so_once() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_harness(&work, "kill -ABRT $$");
+
+    let out = launch(&root, &bins, &work, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 6), "{stderr}");
+    assert_eq!(deaths_by(&stderr, "SIGABRT", 6), 1, "{stderr}");
+}
+
+#[test]
+fn a_harness_ended_by_sigint_or_sigpipe_exits_128_and_its_number_quietly() {
+    for (signal, number) in [("INT", 2), ("PIPE", 13)] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = memory()
+            .args(["relay", "--socket"])
+            .arg(dir.path().join("egress.sock"))
+            .args(["--listen", "127.0.0.1:0", "--", "sh", "-c"])
+            .arg(format!("kill -{signal} $$"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(128 + number),
+            "SIG{signal}: {stderr}"
+        );
+        assert!(!stderr.contains("killed by"), "SIG{signal}: {stderr}");
+    }
+}
+
+/// The pid of the relay whose harness command line names `harness`, from `/proc`.
+#[cfg(target_os = "linux")]
+fn relay_of(harness: &Path) -> Option<String> {
+    let harness = harness.display().to_string();
+    std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
+        let pid = e.file_name().to_string_lossy().into_owned();
+        let cmdline = std::fs::read(e.path().join("cmdline")).ok()?;
+        let args: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        (args.get(1).is_some_and(|a| a == "relay") && args.iter().any(|a| a.contains(&harness)))
+            .then_some(pid)
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_relay_killed_by_a_signal_exits_128_and_its_number_and_says_so_once() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_harness(&work, "touch ./started; exec sleep 60");
+
+    let mut cmd = memory();
+    cmd.args(["--root", root.to_str().unwrap(), "launch"])
+        .args(["--harness", "claude", "--auth", "key"])
+        .args(["--workdir", work.to_str().unwrap(), "--", "-p", "hello"])
+        .env("PATH", path_with(&bins))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !work.join("started").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let relay = relay_of(&bins).expect("the relay is running");
+    let killed = Command::new("kill")
+        .args(["-KILL", &relay])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 9), "{stderr}");
+    let said = stderr
+        .lines()
+        .filter(|l| l.contains("the relay was killed by SIGKILL (signal 9)"))
+        .count();
+    assert_eq!(said, 1, "{stderr}");
 }
 
 /// Shell that speaks MCP to the egress with curl: initialize, write a handoff, complete
@@ -1177,7 +1320,8 @@ fn a_kept_tree_is_the_commit_and_repeated_runs_are_not_a_subscription_s() {
 
 /// The projection as a live mount: a shell `cat` inside the sandbox, which no hook
 /// sees, is a `get` the memory serves and logs. Where this host has no FUSE the launch
-/// says the projection is a render, and the test says it skipped the rest.
+/// says the projection is a render, and the test says it skipped the rest; on CI, which
+/// has FUSE, that is a failure.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_file_read_inside_the_sandbox_is_a_get_the_memory_serves() {
@@ -1219,6 +1363,10 @@ fn a_file_read_inside_the_sandbox_is_a_get_the_memory_serves() {
     let reads = dm_server::reads::all(&root).unwrap();
     let gets: Vec<_> = reads.iter().filter(|r| r.tool == "get").collect();
     if stderr.contains("is a render:") {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "on CI the projection must be a live mount: {stderr}"
+        );
         eprintln!("skipping the rest: {stderr}");
         assert!(gets.is_empty(), "no hook, no mount, no get: {gets:?}");
         return;

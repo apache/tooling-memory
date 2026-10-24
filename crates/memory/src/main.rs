@@ -3979,7 +3979,7 @@ fn spawn_harness(argv: &[OsString]) -> Result<i32, String> {
             .args(&argv[1..])
             .status()
             .map_err(|e| e.to_string())?;
-        Ok(status.code().unwrap_or(1))
+        Ok(dm_sandbox::measure::exit_code(status, &argv[0]))
     }
 }
 
