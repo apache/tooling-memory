@@ -1685,8 +1685,10 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
             .with_tunnels([
                 "oauth2.googleapis.com",
                 // Antigravity's eligibility check, before anything else, on a login:
-                // the account's profile, then its picture. The picture's host only:
-                // any Compute Engine VM has a name under googleusercontent.com
+                // the account's profile, then its picture. The picture's host, not the
+                // domain: a Compute Engine VM's reverse name is under googleusercontent.com
+                // and resolves to the VM. A tunnel pins the front end it connects to, not
+                // the tenant behind it, since the TLS name inside is not checked
                 "www.googleapis.com",
                 "lh3.googleusercontent.com",
                 "accounts.google.com",
@@ -5033,11 +5035,29 @@ mod backend_tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_login_s_tunnel_admits_the_hosts_it_names_and_no_name_anyone_can_get() {
-        use axum::body::Body;
-        use axum::http::{Method, Request, StatusCode};
+    /// The status and body the egress answers `CONNECT host:443` with. A oneshot is
+    /// never upgraded, so nothing is dialled.
+    async fn connect(egress: &Egress, host: &str) -> (axum::http::StatusCode, String) {
         use tower::ServiceExt;
+        let r = egress
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::CONNECT)
+                    .uri(format!("{host}:443"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn a_google_login_tunnels_to_the_hosts_it_needs_and_not_to_a_vm_s_reverse_name() {
+        use axum::http::StatusCode;
         let dir = tempfile::tempdir().unwrap();
         let memory =
             Arc::new(Memory::init(&dir.path().join("m"), "human:test:me", "dom-me").unwrap());
@@ -5047,9 +5067,10 @@ mod backend_tests {
                 .map(|n| (n.to_string(), pass_through_provider(n).unwrap()))
                 .collect();
         let egress = Egress::new(memory, destinations, &dir.path().join("t.db")).unwrap();
-        // names anyone can get, by renting a VM or publishing a site or a bucket
+        // a Compute Engine VM's reverse name, which resolves to the VM, 34.117.59.81;
+        // then names on Google's and GitHub's shared front ends, which no login's
+        // CONNECT authority names
         for host in [
-            // a Compute Engine VM's reverse name, which resolves to the VM, 34.117.59.81
             "81.59.117.34.bc.googleusercontent.com",
             "someone.appspot.com",
             "someone-abc123-uc.a.run.app",
@@ -5058,20 +5079,13 @@ mod backend_tests {
             "someone.github.io",
             "raw.githubusercontent.com",
         ] {
-            let r = egress
-                .router()
-                .oneshot(
-                    Request::builder()
-                        .method(Method::CONNECT)
-                        .uri(format!("{host}:443"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(r.status(), StatusCode::FORBIDDEN, "a tunnel to {host}");
+            let (status, body) = connect(&egress, host).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "a tunnel to {host}: {body}");
+            assert!(
+                body.contains("no destination allows a tunnel to"),
+                "a tunnel to {host}: {body}"
+            );
         }
-        let google = pass_through_provider("google").unwrap();
         // a Google login's token refresh and Cloud Code, and Antigravity's eligibility
         // check: the account's profile at www.googleapis.com, its picture at lh3
         for host in [
@@ -5082,11 +5096,8 @@ mod backend_tests {
             "www.googleapis.com",
             "lh3.googleusercontent.com",
         ] {
-            assert!(
-                google.tunnel_hosts.iter().any(|h| h == host),
-                "{host}: {:?}",
-                google.tunnel_hosts
-            );
+            let (status, body) = connect(&egress, host).await;
+            assert_eq!(status, StatusCode::OK, "a tunnel to {host}: {body}");
         }
     }
 
