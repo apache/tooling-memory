@@ -102,8 +102,8 @@ CONNECT tunnel to an allowlist of hosts. That is pinned egress without metering:
 end to end, so the egress sees no tokens and checks the ceiling when the tunnel opens. It
 also reads the TLS ClientHello before it dials, and closes a tunnel whose hello names any
 host but the one the CONNECT was allowed for, or hides its name, so a shared front end is
-not asked for another tenant through an allowed name. What
-a tunnelled run cost is then what the harness says it cost: after the run the launcher reads
+not asked for another tenant through an allowed name. What a tunnelled run cost is then
+what the harness says it cost: after the run the launcher reads
 the transcript the harness left and records its own token counts, Codex's running total
 from its rollout and Claude Code's per-call usage, into the same telemetry marked `harness`
 rather than `egress`, so `amem usage` and the savings funnel show them, flagged as

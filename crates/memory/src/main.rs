@@ -1687,8 +1687,8 @@ fn pass_through_provider(name: &str) -> Result<Destination, Box<dyn std::error::
                 // Antigravity's eligibility check, before anything else, on a login:
                 // the account's profile, then its picture. The picture's host, not the
                 // domain: a Compute Engine VM's reverse name is under googleusercontent.com
-                // and resolves to the VM. A tunnel pins the front end it connects to, not
-                // the tenant behind it, since the TLS name inside is not checked
+                // and resolves to the VM. The egress also holds the tunnel's TLS name to
+                // the host; the paths and HTTP Host behind that name it cannot see
                 "www.googleapis.com",
                 "lh3.googleusercontent.com",
                 "accounts.google.com",
