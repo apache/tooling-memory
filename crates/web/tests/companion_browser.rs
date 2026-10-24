@@ -65,8 +65,9 @@ fn port_of(headers: &HeaderMap) -> String {
 }
 
 /// A site with a sign-in that sets a cookie and sends the browser on to `next`, a page
-/// that says who is signed in, a page that says so only once its script has run, a
-/// redirect to the same server under another name, and a page whose script goes there.
+/// that says who is signed in, the same page answered late, a page that says so only once
+/// its script has run, a redirect to the same server under another name, a page whose
+/// script goes there, and a page whose script goes to `about:blank`.
 async fn site() -> SocketAddr {
     async fn login(
         axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -82,6 +83,11 @@ async fn site() -> SocketAddr {
         Html(format!(
             "<html><head><title>Account</title></head><body><p>Signed in as {who}.</p></body></html>"
         ))
+    }
+    // the page, answered long after a tab's first look at its navigation
+    async fn late(headers: HeaderMap) -> Html<String> {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        page(headers).await
     }
     // the page is a shell until its script runs, which only a browser does
     async fn app(headers: HeaderMap) -> Html<String> {
@@ -104,13 +110,21 @@ async fn site() -> SocketAddr {
              <script>location.href = 'http://localhost:{port}/page';</script></body></html>"
         ))
     }
+    async fn blank() -> Html<&'static str> {
+        Html(
+            "<html><head><title>Blanking</title></head><body>\
+             <script>location.href = 'about:blank';</script></body></html>",
+        )
+    }
     serve(
         Router::new()
             .route("/login", get(login))
             .route("/page", get(page))
+            .route("/late", get(late))
             .route("/app", get(app))
             .route("/away", get(away))
-            .route("/leave", get(leave)),
+            .route("/leave", get(leave))
+            .route("/blank", get(blank)),
     )
     .await
 }
@@ -363,6 +377,39 @@ async fn rendered(web: SocketAddr, site: SocketAddr, chrome: &Browser) {
     );
 }
 
+/// Rendered, at the tab's own `about:blank`: a page that answers late is waited for, and
+/// a page whose script sends the tab to `about:blank` is refused.
+async fn rendered_by_the_blank(web: SocketAddr, site: SocketAddr, chrome: &Browser) {
+    // a page that answers late is waited for: until the page commits, the tab shows the
+    // blank it was opened on, which is not a place the page was sent to
+    let late = format!("http://127.0.0.1:{}/late", site.port());
+    let waited = render(web, &late, &["127.0.0.1"]).await;
+    assert_eq!(waited["status"], 200, "{waited}\n{}", chrome.log());
+    assert_eq!(waited["final_url"], late, "{waited}");
+    assert!(
+        waited["body"]
+            .as_str()
+            .unwrap()
+            .contains("Signed in as owner-42."),
+        "{waited}"
+    );
+
+    // a rendered page whose script sends the tab to about:blank is refused, not read
+    let blanked = render(
+        web,
+        &format!("http://127.0.0.1:{}/blank", site.port()),
+        &["127.0.0.1"],
+    )
+    .await;
+    assert_eq!(blanked["final_url"], "about:blank", "{blanked}");
+    assert!(
+        blanked["error"].as_str().unwrap().contains("may not reach"),
+        "{blanked}\n{}",
+        chrome.log()
+    );
+    assert!(blanked.get("body").is_none(), "{blanked}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_companion_fetches_with_the_browser_s_cookies_and_only_where_the_ask_lets_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -446,6 +493,7 @@ async fn the_companion_fetches_with_the_browser_s_cookies_and_only_where_the_ask
     );
 
     rendered(web, site, &chrome).await;
+    rendered_by_the_blank(web, site, &chrome).await;
 
     // the cap holds
     let capped = {
