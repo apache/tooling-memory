@@ -9,6 +9,11 @@ name: Harness spikes
 # job, since then not everything was looked at: each check ends on a DONE line. Run by
 # hand, and on a pull request that changes the spikes, the sandbox crate whose Seatbelt
 # tests run here, or this file.
+#
+# The kind job runs on ASF Infra's runners (RunsOn: one EC2 instance per job, the labels
+# tooling-agenda uses) for anything from this repository, and on GitHub's own pool for a
+# pull request from a fork, so code from a fork never runs on a machine of ours. The macOS
+# job needs GitHub's Macs, and the kvm job GitHub's VMs, which offer /dev/kvm.
 
 on:
   workflow_dispatch:
@@ -108,7 +113,7 @@ jobs:
   # privilege over the node's filesystem.
   agent-sandbox-userns:
     name: agent-sandbox, hostUsers false (rootful kind)
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["runs-on={0}","cpu=8","family=c7i","image=ubuntu24-full-x64","tag=infra"]', github.run_id)) || 'ubuntu-latest' }}
     timeout-minutes: 40
     env:
       GH_TOKEN: ${{ github.token }}
