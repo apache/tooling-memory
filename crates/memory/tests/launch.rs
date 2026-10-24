@@ -400,6 +400,88 @@ fn a_confined_harness_killed_by_a_signal_exits_128_and_its_number_and_says_so_on
     assert_eq!(deaths_by(&stderr, "SIGABRT", 6), 1, "{stderr}");
 }
 
+#[test]
+fn a_harness_ended_by_sigint_or_sigpipe_exits_128_and_its_number_quietly() {
+    for (signal, number) in [("INT", 2), ("PIPE", 13)] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = memory()
+            .args(["relay", "--socket"])
+            .arg(dir.path().join("egress.sock"))
+            .args(["--listen", "127.0.0.1:0", "--", "sh", "-c"])
+            .arg(format!("kill -{signal} $$"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(128 + number),
+            "SIG{signal}: {stderr}"
+        );
+        assert!(!stderr.contains("killed by"), "SIG{signal}: {stderr}");
+    }
+}
+
+/// The pid of the relay whose harness command line names `harness`, from `/proc`.
+#[cfg(target_os = "linux")]
+fn relay_of(harness: &Path) -> Option<String> {
+    let harness = harness.display().to_string();
+    std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
+        let pid = e.file_name().to_string_lossy().into_owned();
+        let cmdline = std::fs::read(e.path().join("cmdline")).ok()?;
+        let args: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        (args.get(1).is_some_and(|a| a == "relay") && args.iter().any(|a| a.contains(&harness)))
+            .then_some(pid)
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_relay_killed_by_a_signal_exits_128_and_its_number_and_says_so_once() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_harness(&work, "touch ./started; exec sleep 60");
+
+    let mut cmd = memory();
+    cmd.args(["--root", root.to_str().unwrap(), "launch"])
+        .args(["--harness", "claude", "--auth", "key"])
+        .args(["--workdir", work.to_str().unwrap(), "--", "-p", "hello"])
+        .env("PATH", path_with(&bins))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !work.join("started").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let relay = relay_of(&bins).expect("the relay is running");
+    let killed = Command::new("kill")
+        .args(["-KILL", &relay])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(128 + 9), "{stderr}");
+    let said = stderr
+        .lines()
+        .filter(|l| l.contains("the relay was killed by SIGKILL (signal 9)"))
+        .count();
+    assert_eq!(said, 1, "{stderr}");
+}
+
 /// Shell that speaks MCP to the egress with curl: initialize, write a handoff, complete
 /// the task named in the prompt.
 const COMPLETES_ITS_TASK: &str = r#"

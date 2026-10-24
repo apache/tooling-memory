@@ -55,37 +55,51 @@ pub fn run(cmd: &mut Command, capture: bool) -> std::io::Result<(i32, Vec<u8>, R
 
 /// The code a process ended with, as a shell gives it: its own exit code, or 128 plus
 /// the number of the signal that killed it. A death by signal is said on standard error,
-/// naming `program`, since the code alone does not tell it from an exit.
+/// naming `program`, since the code alone does not tell it from an exit; SIGINT and
+/// SIGPIPE are not, as a shell does not say them.
 #[must_use]
-pub fn exit_code(
-    status: ExitStatus,
-    #[cfg_attr(not(unix), allow(unused_variables))] program: &OsStr,
-) -> i32 {
+pub fn exit_code(status: ExitStatus, program: &OsStr) -> i32 {
+    #[cfg(not(unix))]
+    let _ = program;
     #[cfg(unix)]
     {
+        use std::io::Write;
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            let core = if status.core_dumped() {
-                ", core dumped"
-            } else {
-                ""
-            };
-            eprintln!(
-                "memory: {} was killed by {}{core}",
-                program.to_string_lossy(),
-                signal_named(signal)
-            );
+            if is_said(signal) {
+                let core = if status.core_dumped() {
+                    ", core dumped"
+                } else {
+                    ""
+                };
+                let name = signal_name(signal).map_or_else(
+                    || format!("signal {signal}"),
+                    |name| format!("{name} (signal {signal})"),
+                );
+                let line = format!(
+                    "memory: {} was killed by {name}{core}\n",
+                    program.to_string_lossy()
+                );
+                // one write, so what other threads print does not land inside the line
+                let _ = std::io::stderr().write_all(line.as_bytes());
+            }
             return 128 + signal;
         }
     }
     status.code().unwrap_or(1)
 }
 
-/// A signal by name and number, as `SIGABRT (signal 6)`; by number alone where it has no
-/// name here.
+/// Whether a death by this signal is said: not SIGINT, which the terminal sent, nor
+/// SIGPIPE, which a reader that stopped reading caused.
 #[cfg(unix)]
-fn signal_named(signal: i32) -> String {
-    let name = match signal {
+pub(crate) fn is_said(signal: i32) -> bool {
+    !matches!(signal, libc::SIGINT | libc::SIGPIPE)
+}
+
+/// A signal's name, where it has one here.
+#[cfg(unix)]
+pub(crate) fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
         libc::SIGHUP => "SIGHUP",
         libc::SIGINT => "SIGINT",
         libc::SIGQUIT => "SIGQUIT",
@@ -106,9 +120,8 @@ fn signal_named(signal: i32) -> String {
         libc::SIGVTALRM => "SIGVTALRM",
         libc::SIGPROF => "SIGPROF",
         libc::SIGSYS => "SIGSYS",
-        _ => return format!("signal {signal}"),
-    };
-    format!("{name} (signal {signal})")
+        _ => return None,
+    })
 }
 
 /// This process's own CPU time so far, user and system, in milliseconds: the launcher's
