@@ -7,7 +7,11 @@
 //! own world and sees no other process.
 //!
 //! No network interface exists inside except loopback. The only way out is the unix
-//! socket bind-mounted from the host, which the relay forwards to.
+//! socket bind-mounted from the host, which the relay forwards to. The last step before
+//! the exec sets `no_new_privs` and installs a seccomp filter that refuses
+//! what a network namespace does not cover: vsock and io_uring.
+
+mod seccomp;
 
 use crate::{Error, Mount, Plan, Resources};
 use nix::mount::{mount, MsFlags};
@@ -60,8 +64,14 @@ fn restricted_why() -> String {
     }
 }
 
+/// Why the sandbox's seccomp filter cannot be installed. A container runtime's profile
+/// can refuse `seccomp(2)` itself.
+const NO_SECCOMP: &str = "the sandbox cannot install its seccomp filter here: it needs a \
+                          kernel with seccomp filters, and a seccomp profile that allows \
+                          seccomp(2)";
+
 /// Whether this host lets an unprivileged process build the sandbox at all: can it
-/// create a user namespace and map itself into it?
+/// create a user namespace and map itself into it, and install the seccomp filter?
 ///
 /// Probed in a child, because the answer is a namespace the asking process would
 /// otherwise be stuck in, and by calling [`enter_user_namespace`] itself rather than a
@@ -75,10 +85,14 @@ fn restricted_why() -> String {
 /// without CAP_SYS_ADMIN is another, and the second is fixed by installing a profile
 /// rather than by giving up on confinement.
 ///
+/// The child also installs the launch's seccomp filter, compiled before the fork as a
+/// launch compiles it.
+///
 /// # Errors
 ///
 /// Why not, in a sentence `amem doctor` and the launch line can carry.
 pub fn availability() -> Result<(), String> {
+    let filter = seccomp::program().map_err(|e| e.to_string())?;
     // SAFETY: fork in a process that only waits for the child; the child makes the same
     // syscalls a launch does and _exits without running atexit handlers, which belong to
     // the parent.
@@ -87,9 +101,15 @@ pub fn availability() -> Result<(), String> {
         return Err(format!("fork: {}", std::io::Error::last_os_error()));
     }
     if pid == 0 {
-        let ok = enter_user_namespace(getuid().as_raw(), getgid().as_raw()).is_ok();
+        let code = if enter_user_namespace(getuid().as_raw(), getgid().as_raw()).is_err() {
+            1
+        } else if seccomp::install(&filter).is_err() {
+            3
+        } else {
+            0
+        };
         // SAFETY: exiting the probe child without running the parent's atexit handlers.
-        unsafe { libc::_exit(i32::from(!ok)) };
+        unsafe { libc::_exit(code) };
     }
     let mut status: libc::c_int = 0;
     // SAFETY: waitpid on our own child with a valid status pointer.
@@ -99,10 +119,10 @@ pub fn availability() -> Result<(), String> {
     if !libc::WIFEXITED(status) {
         return Err("the user-namespace probe did not exit normally".to_string());
     }
-    if libc::WEXITSTATUS(status) == 0 {
-        Ok(())
-    } else {
-        Err(restricted_why())
+    match libc::WEXITSTATUS(status) {
+        0 => Ok(()),
+        3 => Err(NO_SECCOMP.to_string()),
+        _ => Err(restricted_why()),
     }
 }
 
@@ -366,6 +386,9 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
 
     let plan2 = plan.clone();
     let root2 = root.clone();
+    // compiled here, since compiling allocates and installing it does not
+    let filter = seccomp::program()?;
+    let open_files = open_files_limit();
     let mut cmd = Command::new(&plan.argv[0]);
     cmd.args(&plan.argv[1..]);
     cmd.env_clear();
@@ -393,10 +416,69 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
                 // failed here, where stderr is still the terminal
                 eprintln!("memory: sandbox: {e}");
                 std::io::Error::other(e.to_string())
-            })
+            })?;
+            cloexec_from_three(open_files)
+                .inspect_err(|_| say(b"cannot mark inherited descriptors close-on-exec"))?;
+            // last, so the setup above may make calls the filter refuses
+            seccomp::install(&filter).inspect_err(|_| say(NO_SECCOMP.as_bytes()))
         });
     }
     Ok((cmd, root))
+}
+
+/// Say what failed between fork and exec, on stderr, without allocating.
+fn say(what: &[u8]) {
+    for part in [b"memory: sandbox: ".as_slice(), what, b"\n"] {
+        // SAFETY: a write of a buffer with its own length to stderr.
+        unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
+    }
+}
+
+/// The soft limit on open files, the highest descriptor number this process can hold.
+fn open_files_limit() -> libc::c_int {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit with a valid pointer to write into.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 1024;
+    }
+    libc::c_int::try_from(limit.rlim_cur).unwrap_or(libc::c_int::MAX)
+}
+
+/// Mark every descriptor from 3 up close-on-exec, so the harness inherits only its
+/// standard streams. A socket the launcher left open would otherwise work inside: a
+/// vsock socket made outside the filter reaches the host. The launcher passes nothing
+/// into the sandbox as a descriptor; the egress socket is bind-mounted as a path.
+///
+/// `close_range` with `CLOSE_RANGE_CLOEXEC` (Linux 5.11) does it in one call. Before
+/// that, `fcntl` sets `FD_CLOEXEC` on each number below `limit`, the open-files limit
+/// read before the fork. Allocates nothing.
+fn cloexec_from_three(limit: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: close_range with integer arguments only.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3,
+            libc::c_uint::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    // ENOSYS before Linux 5.9, EINVAL for the flag before 5.11
+    if !matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+        return Err(e);
+    }
+    for fd in 3..limit {
+        // SAFETY: fcntl on a descriptor number; one that is not open fails with EBADF
+        // and has nothing to mark.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    Ok(())
 }
 
 /// Enter a pid namespace and become its pid 1. Runs between fork and exec, while the
@@ -427,12 +509,17 @@ fn become_pid_one() -> Result<(), Error> {
         let mut status: libc::c_int = 0;
         // SAFETY: waitpid on our own child with a valid status pointer.
         let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        // the code as crate::measure::exit_code gives it, said without allocating
         let code = if r < 0 {
             1
+        } else if libc::WIFSIGNALED(status) {
+            let signal = libc::WTERMSIG(status);
+            if crate::measure::is_said(signal) {
+                say_the_relay_died(signal, libc::WCOREDUMP(status));
+            }
+            128 + signal
         } else if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
-        } else if libc::WIFSIGNALED(status) {
-            128 + libc::WTERMSIG(status)
         } else {
             1
         };
@@ -441,6 +528,48 @@ fn become_pid_one() -> Result<(), Error> {
         unsafe { libc::_exit(code) };
     }
     Ok(())
+}
+
+/// Say on standard error that the relay died of `signal`, as [`crate::measure::exit_code`]
+/// says it, in one `write` from a buffer on the stack. This runs after a fork from a
+/// launcher with other threads, where allocating or taking stderr's lock can hang on a
+/// lock one of them held at the fork.
+fn say_the_relay_died(signal: i32, core_dumped: bool) {
+    fn put(buf: &mut [u8], at: usize, bytes: &[u8]) -> usize {
+        let end = (at + bytes.len()).min(buf.len());
+        buf[at..end].copy_from_slice(&bytes[..end - at]);
+        end
+    }
+    let mut digits = [0u8; 10];
+    let mut first = digits.len();
+    let mut rest = signal.unsigned_abs();
+    loop {
+        first -= 1;
+        digits[first] = b'0' + u8::try_from(rest % 10).unwrap_or(0);
+        rest /= 10;
+        if rest == 0 || first == 0 {
+            break;
+        }
+    }
+    let number = &digits[first..];
+    let mut buf = [0u8; 96];
+    let mut n = put(&mut buf, 0, b"memory: the relay was killed by ");
+    if let Some(name) = crate::measure::signal_name(signal) {
+        n = put(&mut buf, n, name.as_bytes());
+        n = put(&mut buf, n, b" (signal ");
+        n = put(&mut buf, n, number);
+        n = put(&mut buf, n, b")");
+    } else {
+        n = put(&mut buf, n, b"signal ");
+        n = put(&mut buf, n, number);
+    }
+    if core_dumped {
+        n = put(&mut buf, n, b", core dumped");
+    }
+    n = put(&mut buf, n, b"\n");
+    // SAFETY: write to fd 2 from a live buffer of at least n bytes; a failure is ignored,
+    // as there is nowhere else to say it.
+    unsafe { libc::write(2, buf.as_ptr().cast(), n) };
 }
 
 /// What `memory relay` does inside: spawn the harness and wait for it. The relay is
@@ -454,5 +583,5 @@ pub fn spawn_in_pid_namespace(argv: &[OsString]) -> Result<i32, Error> {
         .args(&argv[1..])
         .status()
         .map_err(|e| confine(format!("spawn {}: {e}", argv[0].to_string_lossy())))?;
-    Ok(status.code().unwrap_or(1))
+    Ok(crate::measure::exit_code(status, &argv[0]))
 }
