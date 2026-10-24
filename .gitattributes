@@ -1,0 +1,4 @@
+# Unix line endings in every checkout, Windows included, as AGENTS.md asks: the code
+# reads some of these files as text (the policy through include_str!, among others), and
+# a checkout that turns LF into CRLF changes what it reads
+* text=auto eol=lf
