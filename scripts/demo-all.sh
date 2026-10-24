@@ -15,12 +15,21 @@ root=${1:?demo root}; shift
 here=$(cd "$(dirname "$0")/.." && pwd)
 acts=${ACTS:-1 2 3 4 5 6 7 8 9 10 11}
 if [ -n "${DEMO_TRANSCRIPT:-}" ] && [ -z "${DEMO_TEED:-}" ]; then
-  # run again with everything going through tee, and keep the run's own exit code
+  # Run again with everything going through tee, and keep the run's own exit code.
+  # `set -e` would abort this group the moment the inner run failed, before the exit
+  # code was written, leaving `exit ""` -- "Illegal number" in place of the real
+  # failure, and only ever when the demo failed and a transcript was asked for. So the
+  # code is read with -e off, and a missing file counts as a failure rather than as
+  # nothing at all.
   status=$(mktemp)
-  { DEMO_TEED=1 sh "$0" "$root" "$@" 2>&1; echo $? >"$status"; } | tee "$DEMO_TRANSCRIPT"
-  code=$(cat "$status"); rm -f "$status"
+  {
+    set +e
+    DEMO_TEED=1 sh "$0" "$root" "$@" 2>&1
+    echo $? >"$status"
+  } | tee "$DEMO_TRANSCRIPT"
+  code=$(cat "$status" 2>/dev/null || true); rm -f "$status"
   echo "transcript: $DEMO_TRANSCRIPT"
-  exit "$code"
+  exit "${code:-1}"
 fi
 . "$here/scripts/demo/show.sh"
 _rule '#'
