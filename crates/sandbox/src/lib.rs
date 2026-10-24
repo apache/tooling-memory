@@ -2813,6 +2813,8 @@ mod tests {
         ] {
             assert!(plugin.contains(needle), "{needle} in\n{plugin}");
         }
+        // driving it takes a fake memory binary, which is a shell script
+        #[cfg(unix)]
         if let Ok(node) = find_on_path("node") {
             drive_opencode_plugin(&node, &plugin);
         }
@@ -2893,6 +2895,7 @@ mod tests {
 
     /// Drives the plugin: a denied tool call, the events of one turn, a compaction and
     /// an idle, with a client whose messages call must never be awaited.
+    #[cfg(unix)]
     const OPENCODE_HARNESS: &str = r#"
 const [plugin] = process.argv.slice(2);
 const mod = await import(plugin);
