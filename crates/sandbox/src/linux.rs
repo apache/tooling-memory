@@ -147,8 +147,55 @@ fn bind(m: &Mount, root: &Path) -> Result<(), Error> {
             None::<&str>,
         )
         .map_err(|e| confine(format!("remount ro {}: {e}", target.display())))?;
+        read_only_below(&target)?;
     }
     Ok(())
+}
+
+/// Make every mount under `target` read-only and nosuid as well. A bind with `MS_REC`
+/// copies the source's submounts, `/usr/lib/wsl/lib` under `/usr` on WSL2 say, and the
+/// remount reaches the top mount only. `mount_setattr(2)` with `AT_RECURSIVE` sets the
+/// flags on the whole tree at once, a submount another mount hides included.
+///
+/// A kernel older than Linux 5.12 has no `mount_setattr`, and the launch fails there
+/// rather than leave a submount writable under a read-only grant.
+fn read_only_below(target: &Path) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|e| confine(format!("{}: {e}", target.display())))?;
+    let attr = libc::mount_attr {
+        attr_set: libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    // SAFETY: a NUL-terminated path and a mount_attr passed with its own size; the kernel
+    // only reads both.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_RECURSIVE,
+            &attr,
+            std::mem::size_of::<libc::mount_attr>(),
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ENOSYS) {
+        return Err(confine(format!(
+            "cannot make the mounts under {} read-only: this kernel has no mount_setattr, \
+             which Linux 5.12 added",
+            target.display()
+        )));
+    }
+    Err(confine(format!(
+        "mount_setattr ro {}: {e}",
+        target.display()
+    )))
 }
 
 /// The restricting flags a mount already carries, to carry into its read-only remount.
