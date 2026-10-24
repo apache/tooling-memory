@@ -33,13 +33,19 @@ fn fetch_component() -> PathBuf {
         .join("../..")
         .canonicalize()
         .unwrap();
-    let out = Command::new(env!("CARGO"))
+    let mut build = Command::new(env!("CARGO"));
+    build
         .args(["build", "--manifest-path"])
         .arg(repo.join("taps/Cargo.toml"))
         .args(["-p", "tap-fetch", "--target", "wasm32-wasip2", "--release"])
-        .env_remove("CARGO_TARGET_DIR")
-        .output()
-        .unwrap();
+        .env_remove("CARGO_TARGET_DIR");
+    // under `cargo llvm-cov` its wrapper instruments each crate it names, `dm_fetch`
+    // among them, and the wasm target has no profiler runtime; the component is not
+    // what is measured, so it builds without the wrapper
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        build.env_remove("RUSTC_WRAPPER");
+    }
+    let out = build.output().unwrap();
     assert!(
         out.status.success(),
         "{}",

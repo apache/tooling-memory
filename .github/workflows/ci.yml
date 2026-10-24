@@ -80,6 +80,17 @@ jobs:
           toolchain: stable
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The companion test loads an unpacked extension, which Google Chrome's own builds
+      # refuse; the Windows image has no Chromium or Chrome for Testing, so this fetches
+      # the stable Chrome for Testing and names it in CHROME
+      - name: Chrome for Testing
+        shell: pwsh
+        run: |
+          $known = Invoke-RestMethod https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json
+          $url = ($known.channels.Stable.downloads.chrome | Where-Object platform -eq 'win64').url
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\chrome.zip"
+          Expand-Archive "$env:RUNNER_TEMP\chrome.zip" -DestinationPath "$env:RUNNER_TEMP\chrome"
+          "CHROME=$env:RUNNER_TEMP\chrome\chrome-win64\chrome.exe" >> $env:GITHUB_ENV
       - run: cargo test --workspace
         # the embedded PostgreSQL for the ledger tests lists its releases through GitHub's
         # API; unauthenticated, a runner's address is soon refused

@@ -12,7 +12,8 @@ pub fn build(package: &str) -> PathBuf {
         .canonicalize()
         .unwrap();
     let manifest = repo.join("taps/Cargo.toml");
-    let out = std::process::Command::new(env!("CARGO"))
+    let mut build = std::process::Command::new(env!("CARGO"));
+    build
         .args([
             "build",
             "--manifest-path",
@@ -23,9 +24,14 @@ pub fn build(package: &str) -> PathBuf {
             "wasm32-wasip2",
             "--release",
         ])
-        .env_remove("CARGO_TARGET_DIR")
-        .output()
-        .expect("cargo runs");
+        .env_remove("CARGO_TARGET_DIR");
+    // under `cargo llvm-cov` its wrapper instruments each crate it names, `dm_fetch`
+    // among them, and the wasm target has no profiler runtime; the component is not
+    // what is measured, so it builds without the wrapper
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        build.env_remove("RUSTC_WRAPPER");
+    }
+    let out = build.output().expect("cargo runs");
     assert!(
         out.status.success(),
         "the tap did not build (is the wasm32-wasip2 target installed? rustup target add wasm32-wasip2):\n{}",
