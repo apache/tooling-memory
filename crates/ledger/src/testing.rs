@@ -7,18 +7,18 @@
 //! where that cannot be done, the test is skipped with the reason on stderr. Under CI it
 //! is an error instead: a green run there says the PostgreSQL half ran.
 
-use postgresql_embedded::{PostgreSQL, Settings, VersionReq};
+use postgresql_embedded::{PostgreSQL, Settings, VersionReq, BOOTSTRAP_DATABASE};
 use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
 
-/// The release the embedded server is, held exactly rather than the newest. 18.6.1's Linux
-/// and macOS archives store zone aliases, `UTC` among them, as tar hard links, which the
-/// extractor of `postgresql_archive` 0.20 skips (theseus-rs/postgresql-embedded#263, fixed
-/// in 0.22, which the reqwest pin in Cargo.toml holds back); `UTC` is the zone a client
-/// sets on connect, so every database is refused. 18.6.0's Linux and macOS archives carry
-/// no zone data and read the system's, so a host without `/usr/share/zoneinfo` fails the
-/// same way; its Windows archive carries plain files. The pin can go with the 0.22 upgrade.
-const EMBEDDED_RELEASE: &str = "=18.6.0";
+/// The release the embedded server is, held exactly rather than the newest, so a new
+/// archive cannot change what the tests run on. Not 18.6.0, whose Linux build loads
+/// `libxml2.so.2` from the system, and Ubuntu 26.04 has none; 18.6.1 carries its libraries
+/// beside its binaries. 18.6.1's Linux and macOS archives
+/// store zone aliases, `UTC` among them, as tar hard links, which the extractor of
+/// `postgresql_archive` 0.20 skips (theseus-rs/postgresql-embedded#263, fixed in 0.22,
+/// which the reqwest pin in Cargo.toml holds back): see [`create_database`].
+const EMBEDDED_RELEASE: &str = "=18.6.1";
 
 /// The release installed, once in a process. Installing lists every release through
 /// GitHub's API; a setup that finds the release installed asks nothing. Concurrent tests
@@ -81,7 +81,7 @@ impl PgServer {
         if let Err(e) = pg.start().await {
             return unavailable(format!("embedded PostgreSQL did not start: {e}"));
         }
-        pg.create_database("ledger")
+        create_database(&pg.settings().url(BOOTSTRAP_DATABASE), "ledger")
             .await
             .map_err(|e| format!("embedded PostgreSQL will not create a database: {e}"))?;
         let url = pg.settings().url("ledger");
@@ -114,6 +114,17 @@ impl PgServer {
             url: with_db(admin, &name),
         })
     }
+}
+
+/// Makes database `name` on the server `admin` names, with tokio-postgres, which sets no
+/// zone on connect. `PostgreSQL::create_database` connects with a client that sets `UTC`,
+/// which the embedded 18.6.1 is installed without, and is refused.
+async fn create_database(admin: &str, name: &str) -> Result<(), tokio_postgres::Error> {
+    let (client, conn) = tokio_postgres::connect(admin, NoTls).await?;
+    tokio::spawn(conn);
+    client
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
 }
 
 fn fresh_name() -> String {
