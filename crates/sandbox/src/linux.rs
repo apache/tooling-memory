@@ -7,7 +7,11 @@
 //! own world and sees no other process.
 //!
 //! No network interface exists inside except loopback. The only way out is the unix
-//! socket bind-mounted from the host, which the relay forwards to.
+//! socket bind-mounted from the host, which the relay forwards to. The last step before
+//! the exec sets `no_new_privs` and installs a seccomp filter that refuses
+//! what a network namespace does not cover: vsock and io_uring.
+
+mod seccomp;
 
 use crate::{Error, Mount, Plan, Resources};
 use nix::mount::{mount, MsFlags};
@@ -366,6 +370,8 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
 
     let plan2 = plan.clone();
     let root2 = root.clone();
+    // compiled here, since compiling allocates and installing it does not
+    let filter = seccomp::program()?;
     let mut cmd = Command::new(&plan.argv[0]);
     cmd.args(&plan.argv[1..]);
     cmd.env_clear();
@@ -393,6 +399,12 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
                 // failed here, where stderr is still the terminal
                 eprintln!("memory: sandbox: {e}");
                 std::io::Error::other(e.to_string())
+            })?;
+            // last, so the setup above may make calls the filter refuses
+            seccomp::install(&filter).inspect_err(|_| {
+                // a static message, which needs no allocation between fork and exec
+                let say = b"memory: sandbox: cannot install the seccomp filter\n";
+                libc::write(2, say.as_ptr().cast(), say.len());
             })
         });
     }
