@@ -32,6 +32,7 @@ use futures_util::StreamExt;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
@@ -65,7 +66,11 @@ pub struct Destination {
     pub auth: Auth,
     /// Hosts a `CONNECT` tunnel may be opened to, for a harness with no base-URL
     /// override that is pointed here with `HTTPS_PROXY`. An entry starting with a dot
-    /// matches that domain and its subdomains. Empty for an ordinary forward.
+    /// matches that domain and its subdomains. An entry allows port 443, or the port it
+    /// names, `host:port` or `[v6]:port`. A name is resolved when the tunnel opens and
+    /// refused when it resolves to loopback, a private or link-local range, or another
+    /// address no internet host has; an entry that is an address is dialled as named.
+    /// Empty for an ordinary forward.
     /// A tunnel is pinned egress without metering: TLS runs end to end, so the egress
     /// sees no usage and checks the ceiling only when the tunnel opens.
     pub tunnel_hosts: Vec<String>,
@@ -714,8 +719,173 @@ fn host_allowed(entry: &str, host: &str) -> bool {
     }
 }
 
-/// `CONNECT host:port`: open a TCP tunnel when some destination allows the host and the
-/// session's label is within that destination's ceiling. Anything else here is a 404.
+/// The port a tunnel entry allows when it names none.
+const TUNNEL_PORT: u16 = 443;
+
+/// A host and its port, from `host`, `host:port`, `[v6]` or `[v6]:port`, with the
+/// brackets taken off; a bare IPv6 address is a host with no port. `None` for a port
+/// that is not a number or brackets that do not close.
+fn host_and_port(s: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        return match after {
+            "" => Some((host, None)),
+            _ => Some((host, Some(after.strip_prefix(':')?.parse().ok()?))),
+        };
+    }
+    match s.split_once(':') {
+        Some((host, port)) if !port.contains(':') => Some((host, Some(port.parse().ok()?))),
+        _ => Some((s, None)),
+    }
+}
+
+/// Whether a tunnel entry admits `host` on `port`: the host as [`host_allowed`] has it,
+/// and the port the entry names, or [`TUNNEL_PORT`] when it names none.
+fn entry_allows(entry: &str, host: &str, port: u16) -> bool {
+    host_and_port(entry)
+        .is_some_and(|(h, p)| p.unwrap_or(TUNNEL_PORT) == port && host_allowed(h, host))
+}
+
+/// Whether a tunnel may not reach an address a name resolved to: an address that is
+/// this machine, a network it sits on, its cloud's metadata service, or no host on the
+/// internet. The same for an IPv4 address carried in an IPv6 one.
+fn denied(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => denied_v4(v),
+        IpAddr::V6(v) => denied_v6(v),
+    }
+}
+
+fn denied_v4(v: Ipv4Addr) -> bool {
+    let [a, b, ..] = v.octets();
+    // link-local holds the metadata address, 169.254.169.254; broadcast is in 240/4
+    v.is_unspecified()
+        || v.is_loopback()
+        || v.is_private()
+        || v.is_link_local()
+        || v.is_multicast()
+        || v.is_documentation()
+        || a == 0
+        || a >= 240
+        || (a == 100 && (b & 0xc0) == 64)
+        || (a == 198 && (b & 0xfe) == 18)
+}
+
+fn denied_v6(v: Ipv6Addr) -> bool {
+    let s = v.segments();
+    // unique local, fc00::/7, holds the metadata address fd00:ec2::254
+    v.is_unspecified()
+        || v.is_loopback()
+        || v.is_multicast()
+        || v.is_unique_local()
+        || v.is_unicast_link_local()
+        || (s[0] & 0xffc0) == 0xfec0
+        || (s[0] == 0x2001 && s[1] == 0x0db8)
+        || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
+        || embedded_v4(v).is_some_and(denied_v4)
+}
+
+/// The IPv4 address an IPv6 one carries: mapped, `::ffff:a.b.c.d`; compatible,
+/// `::a.b.c.d`; or behind NAT64's well-known prefix, `64:ff9b::a.b.c.d`.
+fn embedded_v4(v: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = v.segments();
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        let [.., a, b, c, d] = v.octets();
+        return Some(Ipv4Addr::new(a, b, c, d));
+    }
+    v.to_ipv4()
+}
+
+/// The addresses a tunnel to `host` may dial: an entry that is an address is the
+/// launcher's own choice and is dialled as named; a name is resolved here, once, and
+/// refused when any address it resolves to is [`denied`]. The dial goes to these
+/// addresses, so a second answer for the name cannot change where the tunnel goes.
+async fn tunnel_addresses(
+    entry_host: &str,
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, Box<Response>> {
+    if let Ok(ip) = entry_host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
+        Ok(found) => found.collect(),
+        Err(e) => {
+            return Err(Box::new(error_json(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                &format!("{host} does not resolve: {e}"),
+            )))
+        }
+    };
+    if addrs.is_empty() {
+        return Err(Box::new(error_json(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            &format!("{host} resolves to no address"),
+        )));
+    }
+    if let Some(bad) = addrs.iter().find(|a| denied(a.ip())) {
+        return Err(Box::new(error_json(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &format!(
+                "{host} resolves to {}, which a tunnel may not reach",
+                bad.ip()
+            ),
+        )));
+    }
+    Ok(addrs)
+}
+
+/// What a `CONNECT` to `authority` tunnels under: the destination whose entry allows
+/// the host on that port, within the session's ceiling, and the checked addresses to
+/// dial. The response that refuses it otherwise.
+async fn tunnel_for(
+    inner: &Inner,
+    authority: &str,
+) -> Result<(String, Vec<SocketAddr>), Box<Response>> {
+    let refuse = |message: &str| {
+        Box::new(error_json(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            message,
+        ))
+    };
+    let Some((host, port)) = host_and_port(authority) else {
+        return Err(Box::new(error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("{authority} is not a host and port"),
+        )));
+    };
+    let port = port.unwrap_or(TUNNEL_PORT);
+    let found = inner.destinations.iter().find_map(|(name, d)| {
+        d.tunnel_hosts
+            .iter()
+            .find(|e| entry_allows(e, host, port))
+            .map(|e| (name, e))
+    });
+    let Some((name, entry)) = found else {
+        return Err(refuse(&format!(
+            "no destination allows a tunnel to {host}:{port}"
+        )));
+    };
+    let ceiling = inner.memory.grants().ceiling(name).unwrap_or(Label::Public);
+    let label = inner.memory.label();
+    if label > ceiling {
+        return Err(refuse(&format!(
+            "this session has read {label} material and {name} accepts at most {ceiling}"
+        )));
+    }
+    let entry_host = host_and_port(entry).map_or(entry.as_str(), |(h, _)| h);
+    let addrs = tunnel_addresses(entry_host, host, port).await?;
+    Ok((name.clone(), addrs))
+}
+
+/// `CONNECT host:port`: open a TCP tunnel when some destination allows the host on that
+/// port, the session's label is within that destination's ceiling, and the host's
+/// addresses are ones a tunnel may reach. Anything else here is a 404.
 async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) -> Response {
     if req.method() != Method::CONNECT {
         return error_json(StatusCode::NOT_FOUND, "not_found_error", "no such path");
@@ -732,43 +902,18 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority.as_str(), |(h, _)| h);
-    let Some((name, _)) = inner
-        .destinations
-        .iter()
-        .find(|(_, d)| d.tunnel_hosts.iter().any(|h| host_allowed(h, host)))
-    else {
-        return error_json(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            &format!("no destination allows a tunnel to {host}"),
-        );
-    };
-    let ceiling = inner.memory.grants().ceiling(name).unwrap_or(Label::Public);
-    let label = inner.memory.label();
-    if label > ceiling {
-        return error_json(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            &format!("this session has read {label} material and {name} accepts at most {ceiling}"),
-        );
-    }
-    let target = if authority.contains(':') {
-        authority.clone()
-    } else {
-        format!("{authority}:443")
+    let (name, addrs) = match tunnel_for(&inner, &authority).await {
+        Ok(found) => found,
+        Err(refusal) => return *refusal,
     };
     let on_upgrade = hyper::upgrade::on(&mut req);
-    let name = name.clone();
     let session = inner.memory.session_id().to_string();
     let started = std::time::SystemTime::now();
     tokio::spawn(async move {
         let Ok(upgraded) = on_upgrade.await else {
             return;
         };
-        let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+        let Ok(mut outbound) = tokio::net::TcpStream::connect(&addrs[..]).await else {
             return;
         };
         let mut inbound = hyper_util::rt::TokioIo::new(upgraded);
@@ -1972,6 +2117,141 @@ mod tests {
         assert!(!host_allowed(".githubcopilot.com", "notgithubcopilot.com"));
     }
 
+    #[test]
+    fn an_entry_allows_443_or_the_port_it_names() {
+        // (entry, host, port, allowed)
+        let cases = [
+            ("api.github.com", "api.github.com", 443, true),
+            ("api.github.com", "api.github.com", 22, false),
+            ("api.github.com", "api.github.com", 80, false),
+            (".grok.com", "code.grok.com", 443, true),
+            (".grok.com", "code.grok.com", 8443, false),
+            ("relay.example:8443", "relay.example", 8443, true),
+            ("relay.example:8443", "relay.example", 443, false),
+            ("[::1]:4000", "::1", 4000, true),
+            ("[::1]:4000", "::1", 443, false),
+            ("[::1]", "::1", 443, true),
+            // a bare IPv6 address names no port
+            ("::1", "::1", 443, true),
+            // an entry whose port does not parse allows nothing
+            ("relay.example:http", "relay.example", 443, false),
+            ("relay.example:", "relay.example", 443, false),
+            ("[::1", "::1", 443, false),
+        ];
+        for (entry, host, port, allowed) in cases {
+            assert_eq!(
+                entry_allows(entry, host, port),
+                allowed,
+                "{entry} for {host}:{port}"
+            );
+        }
+        assert_eq!(host_and_port("[::1]:443"), Some(("::1", Some(443))));
+        assert_eq!(
+            host_and_port("api.github.com"),
+            Some(("api.github.com", None))
+        );
+    }
+
+    #[test]
+    fn a_tunnel_may_not_reach_this_machine_its_networks_or_metadata() {
+        let denied_here = [
+            // loopback and unspecified, this network
+            "127.0.0.1",
+            "127.255.255.254",
+            "0.0.0.0",
+            "0.1.2.3",
+            "::1",
+            "::",
+            // private and shared (CGNAT)
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "fc00::1",
+            "fdff:ffff::1",
+            // link-local and the metadata services in it
+            "169.254.0.1",
+            "169.254.169.254",
+            "fe80::1",
+            "febf::1",
+            "fd00:ec2::254",
+            "fec0::1",
+            // multicast, broadcast, reserved
+            "224.0.0.1",
+            "239.255.255.250",
+            "255.255.255.255",
+            "240.0.0.1",
+            "ff02::1",
+            // documentation and benchmarking
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "2001:db8::1",
+            "3fff::1",
+            "3fff:fff::1",
+            // IPv4 carried in IPv6
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::ffff:10.0.0.1",
+            "::ffff:100.64.0.1",
+            "::ffff:224.0.0.1",
+            "::ffff:255.255.255.255",
+            "::127.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+        ];
+        for a in denied_here {
+            assert!(denied(a.parse().unwrap()), "{a} is denied");
+        }
+        let reachable = [
+            "1.1.1.1",
+            "8.8.8.8",
+            "140.82.112.3",
+            "9.255.255.255",
+            "11.0.0.0",
+            "172.15.255.255",
+            "172.32.0.0",
+            "192.167.255.255",
+            "192.169.0.0",
+            "100.63.255.255",
+            "100.128.0.0",
+            "169.253.255.255",
+            "169.255.0.0",
+            "198.17.255.255",
+            "198.20.0.0",
+            "223.255.255.255",
+            "2606:4700:4700::1111",
+            "2001:db9::1",
+            "3fff:1000::1",
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+        ];
+        for a in reachable {
+            assert!(!denied(a.parse().unwrap()), "{a} is reachable");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_is_resolved_once_and_its_checked_addresses_are_what_is_dialled() {
+        // an address in the request is checked as a name's answer is, without DNS
+        let public = tunnel_addresses(".example", "1.1.1.1", 443).await.unwrap();
+        assert_eq!(public, vec!["1.1.1.1:443".parse().unwrap()]);
+        let refused = tunnel_addresses(".example", "169.254.169.254", 443)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        // an entry that is an address is dialled as named, loopback included
+        let named = tunnel_addresses("127.0.0.1", "127.0.0.1", 4000)
+            .await
+            .unwrap();
+        assert_eq!(named, vec!["127.0.0.1:4000".parse().unwrap()]);
+    }
+
     #[tokio::test]
     async fn an_upstream_base_with_a_path_keeps_it() {
         // DashScope's compatible endpoint lives under a path; the harness's /v1/...
@@ -2019,16 +2299,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_connect_tunnel_opens_only_to_allowed_hosts_within_the_ceiling() {
-        // a plain TCP echo "upstream" standing in for a TLS host
+    type Peers = Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>;
+
+    /// A plain TCP echo server on loopback standing in for a TLS host, which keeps the
+    /// peer address of every connection it accepts.
+    async fn echo_upstream() -> (std::net::SocketAddr, Peers) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let peers = Peers::default();
+        let seen = peers.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = listener.accept().await else {
+                let Ok((mut s, peer)) = listener.accept().await else {
                     break;
                 };
+                seen.lock().unwrap().push(peer);
                 tokio::spawn(async move {
                     let mut buf = [0u8; 64];
                     if let Ok(n) = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await {
@@ -2037,25 +2322,78 @@ mod tests {
                 });
             }
         });
-        let (_d, e) = fixture(Some(("github", Destination::tunnel(["127.0.0.1"])))).await;
-        let egress_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let egress_addr = egress_listener.local_addr().unwrap();
-        let app = e.router();
-        tokio::spawn(async move { axum::serve(egress_listener, app).await.unwrap() });
+        (addr, peers)
+    }
 
-        // the proxy handshake by hand, as a client behind HTTPS_PROXY would do it
+    /// The connections `upstream` accepted other than one the test opens now. Accepts
+    /// are in order, so a dial the egress made before this call is in the list.
+    async fn dialled(upstream: std::net::SocketAddr, peers: &Peers) -> Vec<std::net::SocketAddr> {
+        let own = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        let mine = own.local_addr().unwrap();
+        for _ in 0..500 {
+            if peers.lock().unwrap().contains(&mine) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let all = peers.lock().unwrap().clone();
+        assert!(all.contains(&mine), "the upstream accepts connections");
+        all.into_iter().filter(|p| *p != mine).collect()
+    }
+
+    /// The egress served on a loopback port.
+    async fn serve(e: &Egress) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = e.router();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// `CONNECT authority` by hand, as a client behind `HTTPS_PROXY` sends it: the
+    /// response head and body, and the stream, which is the tunnel when it opened.
+    async fn connect(
+        egress: std::net::SocketAddr,
+        authority: &str,
+    ) -> (String, tokio::net::TcpStream) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut c = tokio::net::TcpStream::connect(egress_addr).await.unwrap();
-        c.write_all(format!("CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
+        let mut c = tokio::net::TcpStream::connect(egress).await.unwrap();
+        c.write_all(
+            format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
             c.read_exact(&mut byte).await.unwrap();
             head.push(byte[0]);
         }
-        let head = String::from_utf8_lossy(&head);
+        let mut answer = String::from_utf8_lossy(&head).into_owned();
+        let length = answer
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|n| n.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        c.read_exact(&mut body).await.unwrap();
+        answer.push_str(&String::from_utf8_lossy(&body));
+        (answer, c)
+    }
+
+    #[tokio::test]
+    async fn a_connect_tunnel_opens_only_to_allowed_hosts_within_the_ceiling() {
+        let (addr, _) = echo_upstream().await;
+        // an entry that is an address and names its port: the launcher's own choice
+        let entry = format!("127.0.0.1:{}", addr.port());
+        let (_d, e) = fixture(Some(("github", Destination::tunnel([entry])))).await;
+        let egress = serve(&e).await;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (head, mut c) = connect(egress, &addr.to_string()).await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         c.write_all(b"ping").await.unwrap();
         let mut echo = [0u8; 4];
@@ -2063,13 +2401,56 @@ mod tests {
         assert_eq!(&echo, b"ping", "bytes flow through the tunnel untouched");
 
         // a host no destination allows
-        let mut c = tokio::net::TcpStream::connect(egress_addr).await.unwrap();
-        c.write_all(b"CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n\r\n")
-            .await
-            .unwrap();
-        let mut buf = vec![0u8; 256];
-        let n = c.read(&mut buf).await.unwrap();
-        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 403"));
+        let (head, _) = connect(egress, "evil.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_goes_only_to_the_port_its_entry_names_or_443() {
+        let (upstream, peers) = echo_upstream().await;
+        // an entry with no port allows 443 and no other
+        let (_d, e) = fixture(Some(("github", Destination::tunnel(["127.0.0.1"])))).await;
+        let egress = serve(&e).await;
+        let (head, _) = connect(egress, &upstream.to_string()).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(
+            head.contains(&format!("127.0.0.1:{}", upstream.port())),
+            "{head}"
+        );
+        // an entry that names a port allows that port and no other
+        let other = format!("127.0.0.1:{}", upstream.port() ^ 1);
+        let (_d, e) = fixture(Some(("github", Destination::tunnel([other])))).await;
+        let egress = serve(&e).await;
+        let (head, _) = connect(egress, &upstream.to_string()).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(
+            dialled(upstream, &peers).await,
+            Vec::new(),
+            "nothing was dialled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_to_a_name_that_resolves_to_a_denied_address_is_refused_before_dialling() {
+        // localhost resolves to loopback on every host, from the hosts file and not DNS
+        let (_d, e) = fixture(Some(("github", Destination::tunnel(["localhost"])))).await;
+        let egress = serve(&e).await;
+        let (head, _) = connect(egress, "localhost:443").await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(head.contains("a tunnel may not reach"), "{head}");
+        // a name whose entry names the port is resolved and checked all the same
+        let (upstream, peers) = echo_upstream().await;
+        let entry = format!("localhost:{}", upstream.port());
+        let (_d, e) = fixture(Some(("github", Destination::tunnel([entry.clone()])))).await;
+        let egress = serve(&e).await;
+        let (head, _) = connect(egress, &entry).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(head.contains("a tunnel may not reach"), "{head}");
+        assert_eq!(
+            dialled(upstream, &peers).await,
+            Vec::new(),
+            "nothing was dialled"
+        );
     }
 
     #[tokio::test]
