@@ -339,8 +339,10 @@ where
         return Decision::Allow;
     };
     // a search over an absolute ancestor of the projection covers it; a relative path
-    // is the working tree's, which does not hold the projection
-    let covers = searches(tool) && path.is_absolute() && projection.starts_with(&path);
+    // is the working tree's, which does not hold the projection. The paths are the
+    // box's, rooted at `/` whatever the host: on Windows `/` has a root but is not
+    // absolute, having no drive
+    let covers = searches(tool) && path.has_root() && projection.starts_with(&path);
     // a glob reaches wherever its pattern says, whatever its path says; a grep's
     // pattern is a regex over text, not a place
     let by_pattern = globs(tool)

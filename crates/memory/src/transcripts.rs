@@ -113,11 +113,16 @@ pub async fn keep_file(
     path: &Path,
 ) -> Result<Kept, Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(hooks::transcript_file(path))?;
-    let origin = home
-        .and_then(|h| path.strip_prefix(h).ok())
-        .unwrap_or(path)
-        .display()
-        .to_string();
+    // a place under the home is kept one way on every host, its names joined by `/`,
+    // so the same transcript has the same origin wherever it was kept
+    let origin = match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rel) => rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        None => path.display().to_string(),
+    };
     Ok(memory
         .keep_transcript(Keep {
             domain: domain.map(str::to_string),
