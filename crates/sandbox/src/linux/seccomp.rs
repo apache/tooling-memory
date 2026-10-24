@@ -89,6 +89,7 @@ pub(super) fn program() -> Result<BpfProgram, Error> {
 ///
 /// The errno of the `prctl` or `seccomp` call that failed.
 pub(super) fn install(program: &BpfProgram) -> std::io::Result<()> {
+    // an unprivileged process may install a filter only under no_new_privs
     // SAFETY: prctl with integer arguments only.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(std::io::Error::last_os_error());
