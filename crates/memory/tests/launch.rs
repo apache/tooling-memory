@@ -205,16 +205,21 @@ fn launch_refuses_without_the_credential_its_mode_needs() {
 }
 
 /// Whether this kernel lets an unprivileged process create user and network namespaces.
-/// Ubuntu's AppArmor restriction and some CI kernels say no; the confined test is then
-/// reported as skipped rather than failed.
+/// Ubuntu's AppArmor restriction says no by default; a confined test is then reported as
+/// skipped rather than failed, except on CI, which is set up to run it and fails instead.
 #[cfg(target_os = "linux")]
 fn namespaces_available() -> bool {
-    Command::new("unshare")
+    let available = Command::new("unshare")
         .args(["--user", "--map-root-user", "--net", "--mount", "true"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|s| s.success());
+    assert!(
+        available || std::env::var_os("CI").is_none(),
+        "unprivileged namespaces are not available, and on CI the confined tests must run"
+    );
+    available
 }
 
 #[cfg(target_os = "linux")]
@@ -1175,7 +1180,8 @@ fn a_kept_tree_is_the_commit_and_repeated_runs_are_not_a_subscription_s() {
 
 /// The projection as a live mount: a shell `cat` inside the sandbox, which no hook
 /// sees, is a `get` the memory serves and logs. Where this host has no FUSE the launch
-/// says the projection is a render, and the test says it skipped the rest.
+/// says the projection is a render, and the test says it skipped the rest; on CI, which
+/// has FUSE, that is a failure.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_file_read_inside_the_sandbox_is_a_get_the_memory_serves() {
@@ -1217,6 +1223,10 @@ fn a_file_read_inside_the_sandbox_is_a_get_the_memory_serves() {
     let reads = dm_server::reads::all(&root).unwrap();
     let gets: Vec<_> = reads.iter().filter(|r| r.tool == "get").collect();
     if stderr.contains("is a render:") {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "on CI the projection must be a live mount: {stderr}"
+        );
         eprintln!("skipping the rest: {stderr}");
         assert!(gets.is_empty(), "no hook, no mount, no get: {gets:?}");
         return;
