@@ -6,7 +6,7 @@
 # The record: made and seeded when there is none, as the first act would; RESET=1
 # starts a demo record over (one holding dom-demo, never MEMORY_ROOT's), and a record an
 # older demo made is reported, since today's acts assume what `amem init` now writes. The harness image: unpacked into the record, so the sessions run the
-# harness versions images/harness/Dockerfile pins, built first when there is none and
+# harness versions images/harness pins, built first when there is none and
 # rebuilt when the unpacked one is not the pinned Claude Code (IMAGE_REBUILD=1 forces
 # it). The gateway: its key, and whether it answers. The logins: what `amem doctor`
 # finds. Podman: whether it can run in this shell, which the demo does not need here
@@ -61,10 +61,10 @@ else
 fi
 
 # ---- the harness image, unpacked into the record
-pinned=$(sed -n 's/^ARG CLAUDE_CODE=\(.*\)$/\1/p' "$here/images/harness/Dockerfile")
+pinned=$(sed -n 's|^    "@anthropic-ai/claude-code": "\(.*\)",\{0,1\}$|\1|p' "$here/images/harness/package.json")
 installed() {
   r=$("$memory" --root "$root" image path 2>/dev/null) || return 0
-  f=$(find "$r/usr" -path '*node_modules/@anthropic-ai/claude-code/package.json' 2>/dev/null | head -n 1)
+  f=$(find "$r/opt/harness" "$r/usr" -path '*node_modules/@anthropic-ai/claude-code/package.json' 2>/dev/null | head -n 1)
   [ -n "$f" ] && sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$f" | head -n 1
   return 0
 }

@@ -6,19 +6,39 @@ built from the Dockerfile here. `make image` copies the release binary in and bu
 tag is `durable-memory/harness:dev`; `MEMORY_IMAGE` or `--image` overrides it at launch.
 
 The image is the homogeneous environment: the same harness versions and tools on every
-machine, independent of what a developer's WSL or laptop contains. The versions are the
-`ARG`s at the top of the Dockerfile and nothing else; bump them there.
+machine, independent of what a developer's WSL or laptop contains. The seven npm harnesses
+are pinned in `package.json`, and every package under them, transitive ones included, in
+`package-lock.json`, by version and sha512; `npm ci` installs exactly that into
+`/opt/harness`, and their bins are linked into `/usr/local/bin`. Node and pi are the `ARG`s
+at the top of the Dockerfile. Muse Code follows its release channel.
+
+To bump an npm harness by hand, change its version in `package.json` and regenerate the lock.
+No Node on the host is needed:
+
+```sh
+cd images/harness
+podman run --rm -v "$PWD":/w:Z -w /w docker.io/library/node:24 \
+  npm install --package-lock-only --no-fund --no-audit
+```
+
+`package.json` also carries `overrides`, which hold a package under one harness at a version
+other than the one the harness pins, for a fix the harness has not taken yet. Each entry is
+scoped to its harness. Today there is one: `@qwen-code/qwen-code` pins `sharp` at exactly
+0.35.4, which has CVE-2026-96889 in its bundled librsvg (GHSA-wq5f-xc86-pv6w), and the entry
+holds it at 0.35.5. Remove the entry once qwen-code pins 0.35.5 or later itself; while it is
+there, a qwen-code that pins a newer `sharp` is held back to 0.35.5. A global install
+(`npm install -g`) ignores `overrides`, which is one reason the image installs from the lock.
 
 ## When it is rebuilt
 
 Never on a run. `amem launch` uses the image it is given and fails fast if it is missing.
-The image's inputs are the pins in the Dockerfile and the base image, so it is rebuilt when
-those move, and on a clock for the one that moves silently:
+The image's inputs are the pins in the lockfile and the Dockerfile, and the base image, so it
+is rebuilt when those move, and on a clock for the one that moves silently:
 
 | When | What | Why |
 |---|---|---|
 | A pin changes | `.github/workflows/image.yml` builds with the release binary to show the image still builds; nothing is published, so each machine builds its own with `make image` | A new harness version is a deliberate, reviewed change |
-| Daily, 05:41 UTC | `scripts/bump-harness-versions.sh` checks npm and nodejs.org for newer versions of the seven harnesses and the Node line, and opens or updates a pull request bumping the pins | Security releases of a harness land within a day; a person still merges |
+| Daily, 05:41 UTC | `scripts/bump-harness-versions.sh` checks npm and nodejs.org for newer versions of the seven npm harnesses, pi and the Node line, regenerates the lock when an npm harness moved, and opens or updates a pull request bumping the pins | Security releases of a harness land within a day; a person still merges |
 | A machine wants the base image's and apt's updates | `make image` again, after pulling `ubuntu:24.04`; Muse Code moves here too, since its launcher takes the version from Meta's release channel at build time | `ubuntu:24.04` moves under its tag, and nothing is published for a machine to pull instead |
 | Urgent | Bump the pin by hand and merge | The daily check is the floor, not the ceiling |
 

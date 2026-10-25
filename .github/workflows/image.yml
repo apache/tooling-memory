@@ -40,7 +40,7 @@ jobs:
           git config user.name "harness-image bot"
           git config user.email "noreply@github.com"
           git checkout -B bot/harness-pins
-          git add images/harness/Dockerfile
+          git add images/harness/Dockerfile images/harness/package.json images/harness/package-lock.json
           git commit -m "image: bump harness pins" -m "${{ steps.bump.outputs.changes }}"
           git push -f origin bot/harness-pins
           gh pr create --fill --base main --head bot/harness-pins \
