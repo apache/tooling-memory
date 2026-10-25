@@ -253,6 +253,16 @@ fn confined_launch_has_no_network_and_no_host_home() {
     assert!(text.contains("HOME=/home/user"), "{text}");
     assert!(text.contains(&format!("cwd={}", work.display())), "{text}");
     assert!(stderr.contains("confined to"), "{stderr}");
+    let left: Vec<_> = std::fs::read_dir(root.join("state/run"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("egress-"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the session takes its socket away: {left:?}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -333,6 +343,156 @@ fn a_launch_that_fails_after_rendering_leaves_no_render_behind() {
         .map(|d| d.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
     assert!(left.is_empty(), "a render outlived its session: {left:?}");
+}
+
+/// A root whose egress socket, `state/run/egress-<pid>.sock`, is longer than any system
+/// lets a unix socket path be.
+fn root_too_long_for_its_socket(dir: &Path) -> PathBuf {
+    let deep = dir.join("d".repeat(120));
+    std::fs::create_dir_all(&deep).unwrap();
+    init_root(&deep)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_launch_whose_socket_cannot_be_bound_fails_and_says_why() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = root_too_long_for_its_socket(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_claude(&work);
+
+    let out = launch(&root, &bins, &work, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        !work.join("fake-claude.out").exists(),
+        "the harness did not start: {stderr}"
+    );
+    let prefix = root.join("state/run/egress-").display().to_string();
+    let at = stderr.find(&prefix).expect(&stderr);
+    let end = stderr[at..].find(".sock").expect(&stderr) + ".sock".len();
+    let socket = &stderr[at..at + end];
+    assert!(
+        stderr.contains(&format!("{} bytes", socket.len())),
+        "the error names the socket's length: {stderr}"
+    );
+}
+
+#[test]
+fn an_unconfined_launch_needs_no_socket_and_runs_from_a_long_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = root_too_long_for_its_socket(dir.path());
+    let bins = fake_claude(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = launch(&root, &bins, &work, &["--unconfined"]);
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(read_out(&work).contains("mcp=200"), "{}", read_out(&work));
+}
+
+#[test]
+fn an_unconfined_launch_binds_no_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let run = root.join("state/run");
+    let bins = fake_harness(
+        dir.path(),
+        &format!("ls -a '{}' > ./run.ls; exit 0", run.display()),
+    );
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = launch(&root, &bins, &work, &["--unconfined"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let seen = std::fs::read_to_string(work.join("run.ls")).unwrap();
+    assert!(
+        !seen.contains("egress-"),
+        "state/run while the harness ran: {seen}"
+    );
+}
+
+/// `amem inside` with this requests directory, a subscription login in a host home, and
+/// a prompt; the caller answers the requests.
+fn inside(root: &Path, requests: &Path, host_home: &Path) -> std::process::Child {
+    std::fs::create_dir_all(host_home.join(".claude")).unwrap();
+    std::fs::write(host_home.join(".claude/.credentials.json"), "{}").unwrap();
+    memory()
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "inside",
+            "--harness",
+            "claude",
+            "--auth",
+            "subscription",
+        ])
+        .args([
+            "--requests",
+            requests.to_str().unwrap(),
+            "--host-home",
+            host_home.to_str().unwrap(),
+        ])
+        .args(["--prompt", "say the answer", "--no-handoff"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn inside_with_a_requests_directory_too_long_for_its_socket_fails_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let requests = dir.path().join("v".repeat(120));
+    std::fs::create_dir_all(&requests).unwrap();
+    let socket = requests.join("egress.sock");
+
+    let out = inside(&root, &requests, &dir.path().join("host-home"))
+        .wait_with_output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{} bytes", socket.as_os_str().len())),
+        "the error names the socket's length: {stderr}"
+    );
+    assert!(
+        !requests.join("req-0.json").exists(),
+        "no run was asked for"
+    );
+}
+
+#[test]
+fn a_relay_that_cannot_listen_does_not_run_the_harness() {
+    let dir = tempfile::tempdir().unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = taken.local_addr().unwrap().to_string();
+    let marker = dir.path().join("ran");
+    let out = memory()
+        .args(["relay", "--socket"])
+        .arg(dir.path().join("egress.sock"))
+        .args(["--listen", &listen, "--", "touch"])
+        .arg(&marker)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(!marker.exists(), "the harness ran without a route out");
+    assert!(stderr.contains(&listen), "{stderr}");
 }
 
 // ---- non-interactive: a prompt, and a task from the ledger ----
@@ -696,6 +856,1093 @@ fn a_prompted_launch_runs_headless_and_insists_on_a_handoff() {
     );
 }
 
+/// A confined prompted run captures the harness's standard output through a pipe, which
+/// holds 64 KiB. A harness that writes more than that finishes, and all of what it wrote
+/// reaches the launcher's own output. Bounded in time: a launch that never returns is
+/// this test failing, and its process group is killed so nothing outlives the test.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_prompted_run_captures_more_than_a_pipe_holds() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let root = init_root(dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bins = fake_harness(
+        &work,
+        "printf 'begin\\n'; head -c 200000 /dev/zero | tr '\\0' a; printf '\\nend\\n'; exit 0",
+    );
+    let stdout = dir.path().join("stdout");
+    let stderr = dir.path().join("stderr");
+    let mut cmd = memory();
+    cmd.args([
+        "--root",
+        root.to_str().unwrap(),
+        "launch",
+        "--harness",
+        "claude",
+        "--auth",
+        "key",
+    ])
+    .args(["--workdir", work.to_str().unwrap()])
+    .args(["--prompt", "hello", "--no-handoff"])
+    .env("PATH", path_with(&bins))
+    .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+    .stdin(Stdio::null())
+    .stdout(std::fs::File::create(&stdout).unwrap())
+    .stderr(std::fs::File::create(&stderr).unwrap())
+    .process_group(0);
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() > deadline {
+            Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", child.id())])
+                .status()
+                .ok();
+            child.wait().ok();
+            panic!(
+                "the launch had not returned after 90 s, with {} bytes out: {}",
+                std::fs::metadata(&stdout).map(|m| m.len()).unwrap_or(0),
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let err = std::fs::read_to_string(&stderr).unwrap();
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(err.contains("confined to"), "{err}");
+    let out = std::fs::read_to_string(&stdout).unwrap();
+    let want = format!("begin\n{}\nend\n", "a".repeat(200_000));
+    assert!(
+        out.contains(&want),
+        "the harness's output, whole: {} bytes out",
+        out.len()
+    );
+}
+
+// ---- a launcher told to stop, and one killed ----
+
+/// A confined prompted launch, with its temporary
+/// directory at `tmp`, so the scratch directory it makes is where the test looks. Its
+/// output goes to `<work>.out` and `<work>.err`.
+#[cfg(target_os = "linux")]
+fn start_confined(root: &Path, work: &Path, tmp: &Path) -> std::process::Child {
+    start_amem(
+        root,
+        work,
+        tmp,
+        &["launch", "--prompt", "hello", "--no-handoff"],
+    )
+}
+
+/// `amem <args>` for the claude harness on a key, in `work`, as [`start_confined`] runs it.
+#[cfg(target_os = "linux")]
+fn start_amem(root: &Path, work: &Path, tmp: &Path, args: &[&str]) -> std::process::Child {
+    amem_in(root, work, tmp, args)
+        .stdout(std::fs::File::create(work.with_extension("out")).unwrap())
+        .spawn()
+        .unwrap()
+}
+
+/// As [`start_amem`], with standard output a pipe whose reader is already gone: a
+/// launcher piped into a program that has exited.
+#[cfg(target_os = "linux")]
+fn start_amem_into_a_closed_pipe(
+    root: &Path,
+    work: &Path,
+    tmp: &Path,
+    args: &[&str],
+) -> std::process::Child {
+    let mut child = amem_in(root, work, tmp, args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    child
+}
+
+/// The command [`start_amem`] runs, its standard output not yet set.
+#[cfg(target_os = "linux")]
+fn amem_in(root: &Path, work: &Path, tmp: &Path, args: &[&str]) -> Command {
+    let mut cmd = memory();
+    cmd.args(["--root", root.to_str().unwrap()])
+        .args(args)
+        .args(["--harness", "claude", "--auth", "key"])
+        .args(["--workdir", work.to_str().unwrap()]);
+    cmd.env("PATH", path_with(&work.join("bins")))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .env("TMPDIR", tmp)
+        .stdin(Stdio::null())
+        .stderr(std::fs::File::create(work.with_extension("err")).unwrap());
+    cmd
+}
+
+/// A working tree whose harness says it started, then runs until it is killed.
+#[cfg(target_os = "linux")]
+fn sleeper(dir: &Path, name: &str) -> PathBuf {
+    let work = dir.join(name);
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(&work, "touch ./started\nsleep 300");
+    work
+}
+
+/// A launch whose harness has started and runs until it is killed, and its working tree.
+#[cfg(target_os = "linux")]
+fn running_sleeper(
+    root: &Path,
+    dir: &Path,
+    name: &str,
+    tmp: &Path,
+) -> (std::process::Child, PathBuf) {
+    let work = sleeper(dir, name);
+    let launch = start_confined(root, &work, tmp);
+    assert!(
+        started(&work, 60),
+        "{}",
+        std::fs::read_to_string(work.with_extension("err")).unwrap()
+    );
+    (launch, work)
+}
+
+/// Send `child` the signal named `sig`, as `kill` names it.
+#[cfg(target_os = "linux")]
+fn signal(child: &std::process::Child, sig: &str) {
+    let ok = Command::new("kill")
+        .args([&format!("-{sig}"), &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(ok.success());
+}
+
+/// Wait for `child` to exit, `secs` at most.
+#[cfg(target_os = "linux")]
+fn exited(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if let Some(s) = child.try_wait().unwrap() {
+            return Some(s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    None
+}
+
+/// Wait for the harness in `work` to have started, `secs` at most.
+#[cfg(target_os = "linux")]
+fn started(work: &Path, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if work.join("started").exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+/// The processes whose command line names something under `dir`, or whose working
+/// directory is under it, as pid and command line.
+#[cfg(target_os = "linux")]
+fn processes_under(dir: &Path) -> Vec<(String, String)> {
+    let needle = dir.to_string_lossy().into_owned();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|pid| {
+            let at = Path::new("/proc").join(&pid);
+            let c = std::fs::read(at.join("cmdline")).ok()?;
+            let c = String::from_utf8_lossy(&c).replace('\0', " ");
+            // or working there: a harness's child whose command line names nothing
+            let cwd = std::fs::read_link(at.join("cwd")).ok();
+            (c.contains(&needle) || cwd.is_some_and(|d| d.starts_with(dir))).then_some((pid, c))
+        })
+        .collect()
+}
+
+/// Whether no process names anything under `dir` within `secs`.
+#[cfg(target_os = "linux")]
+fn gone_within(dir: &Path, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if processes_under(dir).is_empty() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+/// The mounts under `dir`, from this process's mount table: no mountpoint is touched,
+/// since one a launcher left may not answer.
+#[cfg(target_os = "linux")]
+fn mounts_under(dir: &Path) -> Vec<String> {
+    let needle = format!("{}/", dir.display());
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .filter(|m| m.starts_with(&needle))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The names in `dir`, listed without a stat of any of them.
+#[cfg(target_os = "linux")]
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Kills, when dropped, every process whose command line names something under its
+/// directory, and lazily unmounts what is left there: a test that fails leaves nothing
+/// running or mounted. A run's harness goes with its relay, pid 1 of its namespace.
+#[cfg(target_os = "linux")]
+struct Reap(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl Drop for Reap {
+    fn drop(&mut self) {
+        for (pid, _) in processes_under(&self.0) {
+            Command::new("kill")
+                .args(["-KILL", &pid])
+                .stderr(Stdio::null())
+                .status()
+                .ok();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for m in mounts_under(&self.0) {
+            Command::new("fusermount3").args(["-uz", &m]).status().ok();
+        }
+    }
+}
+
+/// What a launch leaves: the processes of its run, its mount, its scratch directory,
+/// its socket and its render. A SIGTERM ends the run and removes every one, as a run
+/// that ends of itself does, and the launcher exits as a process the signal ended.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_told_to_stop_ends_its_run_and_leaves_nothing() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let (mut launch, work) = running_sleeper(&root, dir.path(), "work", &tmp);
+    assert!(
+        !mounts_under(&root).is_empty(),
+        "the projection is a live mount"
+    );
+    assert_eq!(names_in(&tmp).len(), 1, "the run has its scratch directory");
+
+    signal(&launch, "TERM");
+    let status = exited(&mut launch, 30);
+
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    // said once, as the stop; the kill that ends the sandbox is not a death to report
+    assert_eq!(err.matches("SIGTERM").count(), 1, "{err}");
+    assert!(!err.contains("killed by"), "{err}");
+    assert_eq!(processes_under(dir.path()), Vec::new());
+    assert_eq!(mounts_under(&root), Vec::<String>::new());
+    assert_eq!(
+        names_in(&tmp),
+        Vec::<String>::new(),
+        "the scratch directory"
+    );
+    assert_eq!(names_in(&root.join("state/run")), Vec::<String>::new());
+    assert_eq!(
+        names_in(&root.join("state/mount/claude")),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        names_in(&root.join("state/projection/claude")),
+        Vec::<String>::new()
+    );
+}
+
+/// SIGKILL `killed`, a running launch in `work`, and check what it leaves: no process of
+/// its run, which dies with it, and its scratch directory, socket and mount.
+#[cfg(target_os = "linux")]
+fn killed_by_sigkill(root: &Path, tmp: &Path, killed: &mut std::process::Child, work: &Path) {
+    signal(killed, "KILL");
+    killed.wait().unwrap();
+    // the sandbox dies with its launcher: the intermediate, the relay, the harness
+    assert!(gone_within(work, 5), "{:?}", processes_under(work));
+    let killed_socket = format!("egress-{}.sock", killed.id());
+    assert!(names_in(&root.join("state/run")).contains(&killed_socket));
+
+    let killed_scratch = format!("memory-sandbox-{}", killed.id());
+    assert!(names_in(tmp).contains(&killed_scratch));
+    assert_eq!(
+        mounts_under(root).len(),
+        2,
+        "the killed launch's mount is left"
+    );
+}
+
+/// SIGKILL cannot be caught: a launcher killed by it leaves its scratch directory and its
+/// mount, with nothing running to serve it. The next launch sweeps both, and what a
+/// killed launcher of long ago left, and keeps what a live launcher holds.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_next_launch_sweeps_what_a_killed_one_left_and_keeps_a_live_one_s() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    // left by a launcher long gone: its pid is no process now
+    let mut gone = Command::new("/bin/sh").args(["-c", ":"]).spawn().unwrap();
+    let gone_pid = gone.id();
+    gone.wait().unwrap();
+    std::fs::create_dir(tmp.join(format!("memory-sandbox-{gone_pid}"))).unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let (mut live, _) = running_sleeper(&root, dir.path(), "live", &tmp);
+    let live_mounts = mounts_under(&root);
+    assert_eq!(live_mounts.len(), 1);
+    let (mut killed, killed_work) = running_sleeper(&root, dir.path(), "killed", &tmp);
+    assert_eq!(mounts_under(&root).len(), 2);
+    killed_by_sigkill(&root, &tmp, &mut killed, &killed_work);
+
+    let next_work = dir.path().join("next");
+    std::fs::create_dir_all(&next_work).unwrap();
+    fake_harness(&next_work, "exit 0");
+    let mut next = start_confined(&root, &next_work, &tmp);
+    let status = exited(&mut next, 60);
+    let err = std::fs::read_to_string(next_work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "{err}");
+
+    assert_eq!(
+        names_in(&tmp),
+        vec![format!("memory-sandbox-{}", live.id())],
+        "the killed launch's scratch directory and the old one are swept"
+    );
+    assert_eq!(
+        mounts_under(&root),
+        live_mounts,
+        "the killed launch's mount is swept and the live launch's stays"
+    );
+    let live_session = Path::new(&live_mounts[0]).file_name().unwrap();
+    let live_session = live_session.to_string_lossy().into_owned();
+    assert_eq!(
+        names_in(&root.join("state/mount/claude")),
+        vec![live_session.clone(), format!("{live_session}.lock")],
+        "the live launch's mountpoint and its record"
+    );
+    assert_eq!(
+        names_in(&root.join("state/run")),
+        vec![format!("egress-{}.sock", live.id())],
+        "the killed launch's socket is swept and the live launch's stays"
+    );
+    assert!(
+        live.try_wait().unwrap().is_none(),
+        "the live launch runs on"
+    );
+    // and it still ends cleanly
+    signal(&live, "TERM");
+    assert_eq!(exited(&mut live, 30).and_then(|s| s.code()), Some(128 + 15));
+    assert_eq!(mounts_under(&root), Vec::<String>::new());
+    assert_eq!(names_in(&tmp), Vec::<String>::new());
+}
+
+/// A terminal that hangs up sends SIGHUP to its session's leader, and refuses every write
+/// after it. The launcher still ends the run and cleans up: no panic on a write to the
+/// terminal that is gone stops it first.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_whose_terminal_hangs_up_still_cleans_up() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    if !script_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let work = sleeper(dir.path(), "work");
+    let _reap = Reap(dir.path().to_path_buf());
+    // the launcher as the session leader of a terminal of its own, which script makes
+    let line = format!(
+        "exec {} --root {} launch --prompt hello --no-handoff --harness claude --auth key --workdir {}",
+        env!("CARGO_BIN_EXE_amem"),
+        root.display(),
+        work.display()
+    );
+    let mut terminal = Command::new("script")
+        .args(["-qfec", &line, "/dev/null"])
+        .env("PATH", path_with(&work.join("bins")))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .env("TMPDIR", &tmp)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(started(&work, 60));
+    assert!(!mounts_under(&root).is_empty());
+
+    // the terminal goes: its other end closes, and the kernel hangs it up
+    signal(&terminal, "KILL");
+    terminal.wait().unwrap();
+
+    assert!(
+        gone_within(dir.path(), 30),
+        "{:?}",
+        processes_under(dir.path())
+    );
+    assert_eq!(mounts_under(&root), Vec::<String>::new());
+    assert_eq!(
+        names_in(&tmp),
+        Vec::<String>::new(),
+        "the scratch directory"
+    );
+    assert_eq!(
+        names_in(&root.join("state/run")),
+        Vec::<String>::new(),
+        "the socket"
+    );
+    assert_eq!(
+        names_in(&root.join("state/mount/claude")),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        names_in(&root.join("state/projection/claude")),
+        Vec::<String>::new(),
+        "the render"
+    );
+}
+
+/// An unconfined run is told to stop as a confined one is: at once, with 143.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unconfined_launcher_told_to_stop_ends_its_run_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    // exec, so the process the launcher spawned is the one that sleeps
+    fake_harness(&work, "touch ./started\nexec sleep 300");
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut launch = start_amem(
+        &root,
+        &work,
+        &tmp,
+        &[
+            "launch",
+            "--unconfined",
+            "--prompt",
+            "hello",
+            "--no-handoff",
+        ],
+    );
+    assert!(
+        started(&work, 60),
+        "{}",
+        std::fs::read_to_string(work.with_extension("err")).unwrap()
+    );
+    signal(&launch, "TERM");
+    let status = exited(&mut launch, 10);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    assert_eq!(names_in(&root.join("state/run")), Vec::<String>::new());
+}
+
+/// A launcher that is stopped (Ctrl-Z) does not answer for its mount. Another launch
+/// does not ask it anything: it starts, runs and ends, and the stopped launcher's mount
+/// is kept for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stopped_launcher_s_mount_is_kept_and_not_asked() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let (mut stopped, _) = running_sleeper(&root, dir.path(), "stopped", &tmp);
+    let its_mounts = mounts_under(&root);
+    assert_eq!(its_mounts.len(), 1);
+    signal(&stopped, "STOP");
+
+    let next_work = dir.path().join("next");
+    std::fs::create_dir_all(&next_work).unwrap();
+    fake_harness(&next_work, "exit 0");
+    let mut next = start_confined(&root, &next_work, &tmp);
+    let status = exited(&mut next, 60);
+    signal(&stopped, "CONT");
+    let err = std::fs::read_to_string(next_work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "{err}");
+    assert_eq!(
+        mounts_under(&root),
+        its_mounts,
+        "the stopped launcher's mount stays"
+    );
+
+    signal(&stopped, "TERM");
+    assert_eq!(
+        exited(&mut stopped, 30).and_then(|s| s.code()),
+        Some(128 + 15)
+    );
+    assert_eq!(mounts_under(&root), Vec::<String>::new());
+}
+
+/// `amem work --loop` told to stop mid-run settles the task it holds, as when the harness
+/// stops of itself: back in the pool with a handoff. It claims nothing more.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_told_to_stop_releases_its_task_with_a_handoff_and_claims_no_other() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let ids = [file_task(&root, "First"), file_task(&root, "Second")];
+    let work = sleeper(dir.path(), "work");
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut worker = start_amem(
+        &root,
+        &work,
+        &tmp,
+        &["work", "--loop", "--lease-seconds", "60"],
+    );
+    assert!(
+        started(&work, 60),
+        "{}",
+        std::fs::read_to_string(work.with_extension("err")).unwrap()
+    );
+    signal(&worker, "TERM");
+    let status = exited(&mut worker, 30);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+
+    let claimed: Vec<&String> = ids
+        .iter()
+        .filter(|id| err.contains(&format!("claimed {id}")))
+        .collect();
+    assert_eq!(claimed.len(), 1, "one task claimed: {err}");
+    for id in &ids {
+        let t = cli(&root, &["task", "get", id]);
+        assert_eq!(t["status"], "admitted", "in the pool: {t}");
+        if claimed.contains(&id) {
+            assert!(t["handoff"].as_str().is_some(), "with a handoff: {t}");
+        } else {
+            assert!(t["handoff"].is_null(), "never claimed: {t}");
+        }
+    }
+}
+
+/// A worker in `dir/work` whose harness prints, says it started, then runs until killed;
+/// one task filed for it.
+#[cfg(target_os = "linux")]
+fn a_task_and_a_printing_sleeper(root: &Path, dir: &Path) -> (String, PathBuf) {
+    let id = file_task(root, "First");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(&work, "echo working\ntouch ./started\nsleep 300");
+    (id, work)
+}
+
+/// Whether task `id` is back in the pool, and with a handoff.
+#[cfg(target_os = "linux")]
+fn released(root: &Path, id: &str) -> (bool, bool) {
+    let t = cli(root, &["task", "get", id]);
+    (t["status"] == "admitted", t["handoff"].as_str().is_some())
+}
+
+/// A launcher piped into a reader that has gone: the answer it prints after a stop
+/// goes nowhere, and the worker settles its task and the launch finishes all the same.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_whose_output_reader_has_gone_still_settles_and_cleans_up() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (id, work) = a_task_and_a_printing_sleeper(&root, dir.path());
+    let _reap = Reap(dir.path().to_path_buf());
+    for args in [
+        &["work", "--loop", "--lease-seconds", "60"][..],
+        &["launch", "--prompt", "hello", "--no-handoff"][..],
+    ] {
+        std::fs::remove_file(work.join("started")).ok();
+        let mut launch = start_amem_into_a_closed_pipe(&root, &work, &tmp, args);
+        assert!(started(&work, 60), "{args:?}");
+        signal(&launch, "TERM");
+        let status = exited(&mut launch, 30);
+        let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(128 + 15),
+            "{args:?}: {err}"
+        );
+        assert_eq!(
+            names_in(&root.join("state/run")),
+            Vec::<String>::new(),
+            "{err}"
+        );
+        assert_eq!(
+            names_in(&root.join("state/projection/claude")),
+            Vec::<String>::new()
+        );
+    }
+    assert_eq!(released(&root, &id), (true, true), "back with a handoff");
+}
+
+/// A launcher started to ignore SIGHUP, under `nohup` or by a shell without job control,
+/// goes on ignoring it: the run is not stopped.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_started_to_ignore_sighup_is_not_stopped_by_it() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let work = sleeper(dir.path(), "work");
+    let _reap = Reap(dir.path().to_path_buf());
+    let line = format!(
+        "trap '' HUP; exec {} --root {} launch --prompt hello --no-handoff --harness claude --auth key --workdir {}",
+        env!("CARGO_BIN_EXE_amem"),
+        root.display(),
+        work.display()
+    );
+    let mut launch = Command::new("/bin/sh")
+        .args(["-c", &line])
+        .env("PATH", path_with(&work.join("bins")))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .env("TMPDIR", &tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(work.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    assert!(started(&work, 60));
+
+    signal(&launch, "HUP");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert!(
+        launch.try_wait().unwrap().is_none(),
+        "the run goes on: {err}"
+    );
+    assert_eq!(mounts_under(&root).len(), 1);
+    signal(&launch, "TERM");
+    assert_eq!(
+        exited(&mut launch, 30).and_then(|s| s.code()),
+        Some(128 + 15)
+    );
+}
+
+/// A headless unconfined run that left a child in the background, holding its output
+/// open: a stop kills the child too, and the worker settles its task and exits.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unconfined_worker_told_to_stop_ends_what_its_harness_left_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let id = file_task(&root, "First");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(
+        &work,
+        "touch ./started\nsh -c \"sleep 300; echo $PWD\" &\nwait",
+    );
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut worker = start_amem(
+        &root,
+        &work,
+        &tmp,
+        &["work", "--unconfined", "--loop", "--lease-seconds", "60"],
+    );
+    assert!(
+        started(&work, 60),
+        "{}",
+        std::fs::read_to_string(work.with_extension("err")).unwrap()
+    );
+    signal(&worker, "TERM");
+    let status = exited(&mut worker, 15);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    assert!(gone_within(&work, 5), "{:?}", processes_under(&work));
+    assert_eq!(released(&root, &id), (true, true), "back with a handoff");
+}
+
+/// Whether script(1) is here to make a terminal with; on CI it must be.
+#[cfg(target_os = "linux")]
+fn script_available() -> bool {
+    let here = Command::new("script").arg("--version").output().is_ok();
+    assert!(
+        here || std::env::var_os("CI").is_none(),
+        "util-linux script makes the terminal here, and on CI it must be there"
+    );
+    if !here {
+        eprintln!("skipping: no script(1) to make a terminal with");
+    }
+    here
+}
+
+/// `amem <args>` for the claude harness in `work`, as the session leader of a terminal
+/// of its own that script(1) makes, its standard error to `<work>.err`. script exits
+/// with the launcher's code, and keeps what the terminal showed in `<work>.tty`.
+#[cfg(target_os = "linux")]
+fn on_a_terminal(root: &Path, work: &Path, tmp: &Path, args: &str) -> std::process::Child {
+    let line = format!(
+        "exec {} --root {} {args} --harness claude --auth key --workdir {} 2>{}",
+        env!("CARGO_BIN_EXE_amem"),
+        root.display(),
+        work.display(),
+        work.with_extension("err").display()
+    );
+    Command::new("script")
+        .args(["-qfec", &line])
+        .arg(work.with_extension("tty"))
+        .env("PATH", path_with(&work.join("bins")))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .env("TMPDIR", tmp)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// The pid of the launcher running on `root`.
+#[cfg(target_os = "linux")]
+fn launcher_of(root: &Path) -> String {
+    let bin = env!("CARGO_BIN_EXE_amem");
+    let found: Vec<String> = processes_under(root)
+        .into_iter()
+        .filter(|(_, c)| c.starts_with(bin) && c.contains(" --root "))
+        .map(|(pid, _)| pid)
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    found[0].clone()
+}
+
+/// A headless unconfined run on a terminal stays in the terminal's foreground group: a
+/// harness that sets the terminal, as a password prompt does, is not stopped for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_headless_unconfined_run_on_a_terminal_may_use_the_terminal() {
+    if !script_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(
+        &work,
+        "stty -echo </dev/tty; stty echo </dev/tty; echo answered",
+    );
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut terminal = on_a_terminal(
+        &root,
+        &work,
+        &tmp,
+        "launch --unconfined --prompt hello --no-handoff",
+    );
+    let status = exited(&mut terminal, 30);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap_or_default();
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "{err}");
+    let shown = std::fs::read_to_string(work.with_extension("tty")).unwrap_or_default();
+    assert!(shown.contains("answered"), "{shown}");
+}
+
+/// A worker on a terminal whose harness left a child in the background, holding the
+/// run's output open: its task and a launcher in `dir/work`.
+#[cfg(target_os = "linux")]
+fn a_worker_on_a_terminal_with_a_background_child(
+    root: &Path,
+    dir: &Path,
+    tmp: &Path,
+) -> (String, PathBuf, std::process::Child) {
+    let id = file_task(root, "First");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(
+        &work,
+        "touch ./started\nsh -c \"sleep 300; echo $PWD\" &\nwait",
+    );
+    let terminal = on_a_terminal(
+        root,
+        &work,
+        tmp,
+        "work --unconfined --loop --lease-seconds 60",
+    );
+    assert!(
+        started(&work, 60),
+        "{}",
+        std::fs::read_to_string(work.with_extension("err")).unwrap_or_default()
+    );
+    (id, work, terminal)
+}
+
+/// On a terminal the harness is in the terminal's group, which a stop does not kill
+/// whole; what it left in the background, holding the output open, does not keep the
+/// worker from settling its task and exiting.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_on_a_terminal_told_to_stop_ends_though_its_harness_left_a_child() {
+    if !script_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let (id, work, mut terminal) =
+        a_worker_on_a_terminal_with_a_background_child(&root, dir.path(), &tmp);
+    let launcher = launcher_of(&root);
+    Command::new("kill")
+        .args(["-TERM", &launcher])
+        .status()
+        .unwrap();
+    let status = exited(&mut terminal, 15);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap_or_default();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    assert_eq!(released(&root, &id), (true, true), "back with a handoff");
+}
+
+/// A headless unconfined harness that exits at once, leaving a child that holds its
+/// output and ignores it: the run is still in flight while its output is read, so a stop
+/// then kills the child with the harness's process group.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stop_kills_what_an_exited_harness_left_holding_its_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let id = file_task(&root, "First");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(
+        &work,
+        "sh -c \"sleep 300; echo $PWD\" &\ntouch ./started\nexit 0",
+    );
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut worker = start_amem(
+        &root,
+        &work,
+        &tmp,
+        &["work", "--unconfined", "--loop", "--lease-seconds", "60"],
+    );
+    assert!(started(&work, 60));
+    // the harness has gone; its child holds the output
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let child = |dir: &Path| {
+        processes_under(dir)
+            .into_iter()
+            .any(|(_, c)| c.contains("sleep 300; echo"))
+    };
+    assert!(child(&work), "{:?}", processes_under(&work));
+    signal(&worker, "TERM");
+    let status = exited(&mut worker, 15);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    assert!(gone_within(&work, 5), "{:?}", processes_under(&work));
+    assert_eq!(released(&root, &id), (true, true), "back with a handoff");
+}
+
+/// Whether the harness in `work`, which wrote its pid to `./pid`, has exited within
+/// `secs`: gone, or a zombie its parent has not reaped.
+#[cfg(target_os = "linux")]
+fn exited_unreaped(work: &Path, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if let Ok(pid) = std::fs::read_to_string(work.join("pid")) {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
+            // the state follows the command name, which ends at the last ')'
+            let state = stat
+                .as_deref()
+                .ok()
+                .and_then(|s| s.rsplit_once(')'))
+                .and_then(|(_, rest)| rest.trim_start().chars().next());
+            if matches!(state, None | Some('Z')) {
+                return true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
+/// A harness killed by SIGKILL before any stop, an out-of-memory kill say, is said to
+/// have been, though a stop comes while what it left still holds its output.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_harness_killed_before_a_stop_is_said_to_have_been_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(
+        &work,
+        "sh -c \"sleep 300; echo $PWD\" &\necho $$ > ./pid\ntouch ./started\nkill -9 $$",
+    );
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut launch = start_amem(
+        &root,
+        &work,
+        &tmp,
+        &[
+            "launch",
+            "--unconfined",
+            "--prompt",
+            "hello",
+            "--no-handoff",
+        ],
+    );
+    assert!(started(&work, 60));
+    // the stop after the harness's death, which leaves it a zombie until it is reaped
+    assert!(exited_unreaped(&work, 30), "the harness did not die");
+    signal(&launch, "TERM");
+    let status = exited(&mut launch, 15);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    assert!(err.contains("was killed by SIGKILL"), "{err}");
+}
+
+/// Told twice to stop, a worker does not wait for the run's cleanup, but it leaves
+/// nothing no sweep removes: its task back in the pool, its render and its socket gone.
+/// The second signal comes as soon as the first is said, before the task is settled: the
+/// task comes back with no handoff, which only this path does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_told_twice_to_stop_releases_its_task_and_removes_its_render() {
+    if !script_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let (id, work, mut terminal) =
+        a_worker_on_a_terminal_with_a_background_child(&root, dir.path(), &tmp);
+    use nix::sys::signal::{kill, Signal};
+    let launcher = nix::unistd::Pid::from_raw(launcher_of(&root).parse().unwrap());
+    kill(launcher, Signal::SIGINT).unwrap();
+    // the second from the loop that sees the first in progress, with no process to
+    // start between: it comes a millisecond or so after the stop is said, before the
+    // cleanup that follows it, the reap and the settling of the task, is done. The read
+    // of the output that what the harness left holds open can only make that longer.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let read_err = || std::fs::read_to_string(work.with_extension("err")).unwrap_or_default();
+    while !read_err().contains("ending the run and cleaning up") {
+        assert!(std::time::Instant::now() < deadline, "{}", read_err());
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    kill(launcher, Signal::SIGINT).unwrap();
+    let status = exited(&mut terminal, 30);
+    let err = read_err();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 2), "{err}");
+    assert_eq!(
+        released(&root, &id),
+        (true, false),
+        "back, with no handoff: {err}"
+    );
+    assert_eq!(
+        names_in(&root.join("state/projection/claude")),
+        Vec::<String>::new(),
+        "the render"
+    );
+    assert_eq!(
+        names_in(&root.join("state/run")),
+        Vec::<String>::new(),
+        "the socket"
+    );
+}
+
+/// Under umask 000 the launcher's own scratch directory is still its own: a confined run
+/// is not refused for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_run_under_umask_000_runs() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(&work, "exit 0");
+    let _reap = Reap(dir.path().to_path_buf());
+    let line = format!(
+        "umask 000; exec {} --root {} launch --prompt hello --no-handoff --harness claude --auth key --workdir {}",
+        env!("CARGO_BIN_EXE_amem"),
+        root.display(),
+        work.display()
+    );
+    let out = Command::new("/bin/sh")
+        .args(["-c", &line])
+        .env("PATH", path_with(&work.join("bins")))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .env("TMPDIR", &tmp)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("confined to"), "{err}");
+}
+
 // ---- the wslc backend's inside half, driven by a fake host ----
 
 /// `memory inside` writes run requests for the host and waits for exit codes. This fake
@@ -743,32 +1990,8 @@ fn inside_writes_image_requests_and_reports_done() {
     let root = init_root(dir.path());
     let requests = dir.path().join("volume");
     std::fs::create_dir_all(&requests).unwrap();
-    let host_home = dir.path().join("host-home");
-    std::fs::create_dir_all(host_home.join(".claude")).unwrap();
-    std::fs::write(host_home.join(".claude/.credentials.json"), "{}").unwrap();
 
-    let child = memory()
-        .args([
-            "--root",
-            root.to_str().unwrap(),
-            "inside",
-            "--harness",
-            "claude",
-            "--auth",
-            "subscription",
-        ])
-        .args([
-            "--requests",
-            requests.to_str().unwrap(),
-            "--host-home",
-            host_home.to_str().unwrap(),
-        ])
-        .args(["--prompt", "say the answer", "--no-handoff"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = inside(&root, &requests, &dir.path().join("host-home"));
 
     let req = await_request(&requests.join("req-0.json"));
     check_image_request(&req);
@@ -792,6 +2015,10 @@ fn inside_writes_image_requests_and_reports_done() {
             .unwrap()
             .trim(),
         "0"
+    );
+    assert!(
+        !requests.join("egress.sock").exists(),
+        "the session takes its socket away with it"
     );
 }
 

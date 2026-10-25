@@ -41,7 +41,10 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod measure;
+#[cfg(target_os = "linux")]
+mod scratch;
 pub mod seatbelt;
+pub mod stop;
 
 pub use measure::Resources;
 

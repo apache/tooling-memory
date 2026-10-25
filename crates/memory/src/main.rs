@@ -39,6 +39,7 @@ mod review;
 mod savings;
 mod sources;
 mod status;
+mod stops;
 mod taps;
 mod tool_server;
 mod transcripts;
@@ -1925,8 +1926,7 @@ async fn prepare_launch(
     });
     deputy.iter().for_each(|d| memory.set_deputy(d));
     memory.set_tools(taps::TapTools::with_egress(root, egress.clone()));
-    let run_dir = root.join("state/run");
-    std::fs::create_dir_all(&run_dir)?;
+    let run_dir = run_dir(root)?;
     Ok(Prepared {
         memory,
         egress,
@@ -1945,6 +1945,57 @@ async fn prepare_launch(
         model: None,
         metered,
     })
+}
+
+/// Where launchers keep their egress sockets, made if need be, with what killed
+/// launchers left there swept.
+fn run_dir(root: &Path) -> std::io::Result<PathBuf> {
+    let dir = root.join("state/run");
+    std::fs::create_dir_all(&dir)?;
+    sweep_sockets(&dir);
+    Ok(dir)
+}
+
+/// Remove the egress sockets killed launchers left in `run_dir`. One goes only when it is
+/// named `egress-<pid>.sock`, as [`prepare_launch`] names it, it is a socket and not a
+/// link, and the launcher its name carries is not a running process. Returns the
+/// sockets removed.
+fn sweep_sockets(run_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return Vec::new();
+    };
+    let own = std::process::id();
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let digits = name
+                .to_str()?
+                .strip_prefix("egress-")?
+                .strip_suffix(".sock")?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let pid: u32 = digits.parse().ok()?;
+            if pid == 0 || pid == own || dm_sandbox::stop::process_runs(pid) {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if !e.file_type().ok()?.is_socket() {
+                    return None;
+                }
+                // a pid names a process in this pid namespace only: a launcher in
+                // another, sharing the root, still listens
+                if !dm_sandbox::stop::socket_refuses(&e.path()) {
+                    return None;
+                }
+            }
+            std::fs::remove_file(e.path()).ok()?;
+            Some(e.path())
+        })
+        .collect()
 }
 
 /// What a tunnelled harness reported about itself, read from the transcript it left and
@@ -2047,6 +2098,8 @@ async fn run_confined(
     capture: bool,
     runner: &Runner,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
+    // counted until the mount below is gone, so a launcher told to stop waits for it
+    let _in_flight = stops::InFlight::enter()?;
     let host_home = home_dir();
     let rootfs = match runner {
         Runner::Image(rootfs) => Some(rootfs.as_path()),
@@ -2117,11 +2170,11 @@ async fn run_confined(
 /// The session's render served as a live mount, where this host can: every open of an
 /// entry inside is then a `get` the memory serves, whatever tool made it, and the hook
 /// is told it need not make one. Where it cannot, the render is mounted as files, as
-/// before, and the launch says why. Mounts killed launchers left under the harness's
-/// mount directory are cleared first.
+/// before, and the launch says why. Mounts killed launchers left under the root's mount
+/// directory, of any harness, are cleared first.
 fn live_mount(p: &Prepared, harness: Harness) -> Option<dm_mount::Mounted> {
+    dm_mount::sweep_root(&p.root);
     let base = p.root.join(dm_mount::MOUNTS).join(harness.binary());
-    dm_mount::sweep(&base);
     let at = base.join(p.projection.file_name().unwrap_or_default());
     match dm_mount::mount(p.memory.clone(), &p.projection, &at) {
         Ok(m) => {
@@ -2898,6 +2951,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         (None, None) => None,
     };
     let (program, args) = split_program(harness.into(), args);
+    let stops = stops::Stops::listen()?;
     let session = Session::start(
         root,
         harness.into(),
@@ -2912,13 +2966,21 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         RunOptions::new(model, subagents, program, None).empty_memory(empty_memory),
     )
     .await?;
-    let code = match prompt {
-        Some(prompt) => work::prompted(&session, &prompt, &args, no_handoff).await?,
-        None => work::interactive(&session, &args).await?,
-    };
-    if mine_after {
-        session.mine(mine_model.as_deref(), mine_via).await?;
-    }
+    let code = stops
+        .around(
+            async {
+                let code = match prompt {
+                    Some(prompt) => work::prompted(&session, &prompt, &args, no_handoff).await?,
+                    None => work::interactive(&session, &args).await?,
+                };
+                if mine_after {
+                    session.mine(mine_model.as_deref(), mine_via).await?;
+                }
+                Ok(code)
+            },
+            session.abandon(),
+        )
+        .await?;
     session.finish(code).await;
     std::process::exit(code);
 }
@@ -2974,6 +3036,7 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
     };
     let workdir = resolve_workdir(root, workdir)?;
     refuse_browser_unconfined(unconfined, backend)?;
+    let stops = stops::Stops::listen()?;
     let session = Session::start(
         root,
         harness.into(),
@@ -3000,7 +3063,9 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         prefetch: !no_prefetch,
         task,
     };
-    let code = work::run(&session, &options).await?;
+    let code = stops
+        .around(work::run(&session, &options), session.abandon())
+        .await?;
     session.finish(code).await;
     std::process::exit(code);
 }
@@ -3395,8 +3460,9 @@ pub struct Session {
     /// The model, in the harness's own flag, after every run's arguments: a flag after
     /// the prompt is where every harness, subcommand or not, accepts one.
     model: Option<String>,
+    /// Serving the egress socket, for every runner but the unconfined one.
     #[cfg(unix)]
-    serve_unix: tokio::task::JoinHandle<Result<(), dm_egress::Error>>,
+    serve_unix: Option<tokio::task::JoinHandle<Result<(), dm_egress::Error>>>,
     /// What the session says about itself to the web launcher that started it.
     #[allow(dead_code)] // kept for its drop, which writes the last word
     status: Option<status::Writer>,
@@ -3482,19 +3548,16 @@ impl Session {
             p.home.clone_from(h);
         }
 
+        // bound here, so a socket that cannot be bound fails the launch with its own error;
+        // the unconfined harness reaches the egress over TCP and needs no socket
         #[cfg(unix)]
-        let serve_unix = {
+        let serve_unix = if matches!(runner, Runner::Unconfined(_)) {
+            None
+        } else {
+            let listener = Egress::bind_unix(&p.socket)?;
             let egress = p.egress.clone();
-            let socket = p.socket.clone();
-            tokio::spawn(async move { egress.serve_unix(&socket).await })
+            Some(tokio::spawn(async move { egress.serve(listener).await }))
         };
-        #[cfg(unix)]
-        for _ in 0..100 {
-            if p.socket.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
         if let Runner::Requests(r) = &runner {
             // the harness container runs as uid 1000 and must reach the socket and leave
             // its exit code beside it; this process is root in the egress container
@@ -3514,11 +3577,10 @@ impl Session {
         if let Runner::Unconfined(slot) = &mut runner {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
-            drop(listener);
             let egress = p.egress.clone();
             *slot = Some((
                 addr,
-                tokio::spawn(async move { egress.serve_tcp(addr).await }),
+                tokio::spawn(async move { egress.serve(listener).await }),
             ));
         }
         announce(&runner, &p, harness, &workdir);
@@ -3689,15 +3751,18 @@ impl Session {
         let started = std::time::Instant::now();
         let (user, sys) = dm_sandbox::measure::own_cpu_ms();
         let (code, out, used) = match &self.runner {
-            Runner::Unconfined(Some((addr, _))) => run_unconfined(
-                self.harness,
-                self.auth,
-                &self.workdir,
-                &self.p.home,
-                &format!("http://{addr}"),
-                args,
-                capture,
-            ),
+            Runner::Unconfined(Some((addr, _))) => {
+                run_unconfined(
+                    self.harness,
+                    self.auth,
+                    &self.workdir,
+                    &self.p.home,
+                    &format!("http://{addr}"),
+                    args,
+                    capture,
+                )
+                .await
+            }
             Runner::Unconfined(None) => Err("the unconfined runner was not started".into()),
             Runner::Namespaces | Runner::Image(_) | Runner::Seatbelt => {
                 run_confined(
@@ -3810,6 +3875,18 @@ impl Session {
         }
     }
 
+    /// What a launcher told twice to stop does before it exits at once: remove the
+    /// socket and the render, which no sweep removes, and put the task a worker holds
+    /// back in the pool. The run in flight, its mount and its scratch directory, end
+    /// with the launcher and are swept by the next one.
+    pub async fn abandon(&self) {
+        std::fs::remove_file(&self.p.socket).ok();
+        std::fs::remove_dir_all(&self.p.projection).ok();
+        if let Some(id) = work::holding() {
+            self.p.memory.release(&id, None).await.ok();
+        }
+    }
+
     /// Stop serving, report usage, take the transcripts the record now keeps out of the
     /// private home, and tell the host the final code where there is one. After mining,
     /// which reads the home's copy.
@@ -3818,18 +3895,19 @@ impl Session {
             serve.abort();
         }
         #[cfg(unix)]
-        {
-            self.serve_unix.abort();
+        if let Some(serve) = &self.serve_unix {
+            serve.abort();
             std::fs::remove_file(&self.p.socket).ok();
         }
+        // the render was this session's alone, and goes with it; here as well as in the
+        // guard, since a launch ends in process::exit, which runs no destructors. Before
+        // anything is said, which a terminal that hung up refuses.
+        std::fs::remove_dir_all(&self.p.projection).ok();
         if !self.p.metered {
             record_reported_usage(&self.p);
         }
         report_usage(&self.p.egress);
         transcripts::remove_kept(&self.p.memory, &self.p.home).await;
-        // the render was this session's alone, and goes with it; here as well as in the
-        // guard, since a launch ends in process::exit, which runs no destructors
-        std::fs::remove_dir_all(&self.p.projection).ok();
         if let Runner::Requests(r) = &self.runner {
             std::fs::write(r.dir.join(requests::DONE), code.to_string()).ok();
         }
@@ -3854,7 +3932,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Run the harness on the host with the egress on a TCP port. The same configuration as
 /// the confined path, minus the namespaces.
 #[allow(clippy::too_many_arguments)] // the host-side twin of dm_sandbox::Request
-fn run_unconfined(
+async fn run_unconfined(
     harness: Harness,
     auth: AuthMode,
     workdir: &Path,
@@ -3863,6 +3941,9 @@ fn run_unconfined(
     args: &[String],
     capture: bool,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
+    // counted until the harness is reaped and its end said, so a launcher told to stop
+    // waits for that rather than exiting first
+    let _in_flight = stops::InFlight::enter()?;
     std::fs::create_dir_all(home)?;
     let mut cmd = std::process::Command::new(harness.binary());
     cmd.current_dir(workdir);
@@ -3915,7 +3996,17 @@ fn run_unconfined(
         }
     }
     cmd.args(args);
-    let (code, out, r) = dm_sandbox::measure::run(&mut cmd, capture)?;
+    // on a thread of its own, so a launcher told to stop hears the signal while it runs;
+    // a headless run in a process group of its own, so a stop kills what it left in the
+    // background too, and an interactive one in the terminal's foreground group
+    let (code, out, r) = tokio::task::spawn_blocking(move || {
+        if capture {
+            dm_sandbox::measure::run_grouped(&mut cmd, capture)
+        } else {
+            dm_sandbox::measure::run(&mut cmd, capture)
+        }
+    })
+    .await??;
     Ok((
         code,
         capture.then(|| String::from_utf8_lossy(&out).into_owned()),
@@ -3945,12 +4036,11 @@ fn relay(
         .enable_all()
         .build()?;
     let socket = socket.to_path_buf();
-    let listen = listen.to_string();
+    // bound before the harness starts, which without it has no way out
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind(listen))
+        .map_err(|e| format!("cannot listen on {listen}: {e}"))?;
     rt.spawn(async move {
-        let Ok(listener) = tokio::net::TcpListener::bind(&listen).await else {
-            eprintln!("relay: cannot listen on {listen}");
-            return;
-        };
         loop {
             let Ok((mut inbound, _)) = listener.accept().await else {
                 continue;
@@ -5283,5 +5373,69 @@ mod backend_tests {
             port.starts_with("127.0.0.1:") && !port.ends_with(":0"),
             "{port}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod socket_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn a_killed_launcher_s_socket_is_swept_and_nothing_a_live_one_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let mut gone = std::process::Command::new("/bin/sh")
+            .args(["-c", ":"])
+            .spawn()
+            .unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        let mut live_child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read x"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let live = live_child.id();
+        let stale = run_dir.join(format!("egress-{dead}.sock"));
+        // the file a listener leaves when its process dies: nothing answers there
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        // a dead pid's name on a socket something still listens on: a launcher in
+        // another pid namespace, whose pid means nothing here
+        let elsewhere = run_dir.join(format!("egress-{dead}2.sock"));
+        let _elsewhere = std::os::unix::net::UnixListener::bind(&elsewhere).unwrap();
+        let held = run_dir.join(format!("egress-{live}.sock"));
+        let _held = std::os::unix::net::UnixListener::bind(&held).unwrap();
+        let own = run_dir.join(format!("egress-{}.sock", std::process::id()));
+        let _own = std::os::unix::net::UnixListener::bind(&own).unwrap();
+        // a dead pid's name on a file that is not a socket, and on a link
+        let file = run_dir.join(format!("egress-{dead}0.sock"));
+        std::fs::write(&file, "").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("kept.sock");
+        let _target = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        let link = run_dir.join(format!("egress-{dead}1.sock"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let other = run_dir.join(format!("other-{dead}.sock"));
+        let _other = std::os::unix::net::UnixListener::bind(&other).unwrap();
+
+        // a few times: a process another test forks holds a copy of the closed
+        // listener's descriptor until it execs, and a connection to it meanwhile is taken
+        let mut swept = Vec::new();
+        for _ in 0..20 {
+            swept.extend(sweep_sockets(run_dir));
+            if !stale.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        live_child.kill().unwrap();
+        live_child.wait().unwrap();
+        assert_eq!(swept, vec![stale.clone()]);
+        assert!(!stale.exists());
+        for kept in [&held, &own, &file, &other, &target, &elsewhere] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+        assert!(link.is_symlink());
     }
 }

@@ -10,6 +10,7 @@ use fuser::{
     LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
     ReplyEntry, ReplyOpen, Request,
 };
+use nix::fcntl::{Flock, FlockArg};
 use serde_json::json;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -54,10 +55,113 @@ pub(crate) fn availability() -> Result<(), String> {
     }
 }
 
+/// The record that a launcher serves the mount at `at`: an exclusive lock on the file
+/// beside it, `<at>.lock`, held from before the mountpoint is made until after it is
+/// gone. The kernel lets the lock go when the launcher dies, however it dies, so a
+/// sweep can tell a dead launcher's mount from a live one's without asking the mount,
+/// which a live launcher that is stopped does not answer.
+pub(crate) struct Owner {
+    path: PathBuf,
+    _lock: Flock<std::fs::File>,
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        // removed while still locked, so no sweep takes a lock on a file going away
+        std::fs::remove_file(&self.path).ok();
+    }
+}
+
+/// The lock file of the mount at `at`.
+pub(crate) fn lock_path(at: &Path) -> PathBuf {
+    let mut name = at.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn open_lock(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path)
+}
+
+/// Whether the file at `path` is still the one `file` has open.
+fn still_at(path: &Path, file: &std::fs::File) -> bool {
+    match (std::fs::symlink_metadata(path), file.metadata()) {
+        (Ok(at), Ok(held)) => at.dev() == held.dev() && at.ino() == held.ino(),
+        _ => false,
+    }
+}
+
+/// Take the record for a mount at `at`, before its mountpoint is made.
+pub(crate) fn own(at: &Path) -> Result<Owner, Error> {
+    let path = lock_path(at);
+    let failed = |source| Error::Io {
+        path: path.display().to_string(),
+        source,
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| Error::Io {
+            path: dir.display().to_string(),
+            source: e,
+        })?;
+    }
+    // twice: a sweep can remove a free record between its open here and its lock
+    for _ in 0..2 {
+        let file = open_lock(&path, true).map_err(failed)?;
+        let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| failed(std::io::Error::from(e)))?;
+        if still_at(&path, &lock) {
+            return Ok(Owner { path, _lock: lock });
+        }
+    }
+    Err(failed(std::io::Error::other(
+        "removed while it was being locked",
+    )))
+}
+
+/// What the record of the mount at `at` says.
+pub(crate) enum Held {
+    /// A launcher holds it: its mount is not to be touched, nor asked anything.
+    Live,
+    /// No launcher holds it; the lock is taken here, for as long as this lives.
+    Gone(Flock<std::fs::File>),
+    /// There is none: a mount from before records were kept.
+    Unrecorded,
+}
+
+/// Read the record of the mount at `at`.
+pub(crate) fn held(at: &Path) -> Held {
+    let path = lock_path(at);
+    let Ok(file) = open_lock(&path, false) else {
+        return if path.exists() || path.is_symlink() {
+            Held::Live
+        } else {
+            Held::Unrecorded
+        };
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) if still_at(&path, &lock) => Held::Gone(lock),
+        _ => Held::Live,
+    }
+}
+
 /// Whether `at` is a mount whose server is gone: a killed launcher leaves one, and every
-/// call on it fails with "transport endpoint is not connected".
+/// call on it fails with "transport endpoint is not connected". The server is the
+/// launcher, so this is the record of whether its launcher lives. A link at `at` is not
+/// followed, and is not a dead mount.
 fn is_dead(at: &Path) -> bool {
-    std::fs::metadata(at)
+    if std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
+    }
+    // an open, which always reaches the server: the kernel answers a stat from its
+    // cache for as long as the attributes' TTL after the server has gone
+    std::fs::read_dir(at)
         .err()
         .is_some_and(|e| e.raw_os_error() == Some(libc_enotconn()))
 }
