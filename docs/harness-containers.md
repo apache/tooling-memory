@@ -25,17 +25,18 @@ Nothing replaces the wrapper. No project found combines what `crates/egress` doe
 place: one unix socket as the box's only way out, per-session token metering from streamed
 responses, a label-versus-ceiling check before anything leaves, and memory served over MCP
 on the same socket. Around it, three things are worth taking, and five of our own gaps
-surfaced on the way:
+surfaced on the way. By 25 October all five were fixed on `main`; each row names the pull
+request:
 
 | Action | What | Why |
 |---|---|---|
-| Fix | Refuse `AF_VSOCK` and `io_uring` with seccomp, set `no_new_privs`, in our Linux backend | The network namespace does not cover vsock; on WSL2 and any VM guest it reaches the host. Measured, below |
-| Fix | Make the read-only system bind recursive (`mount_setattr` with `AT_RECURSIVE`) | Submounts under `/usr` stay writable inside our sandbox today; only file ownership holds them. Measured, below |
-| Fix | Port-restrict the CONNECT tunnel and check the resolved address before dialling | `crates/egress/src/lib.rs:756-771` dials any port on an allowed name, wherever it resolves |
-| Fix | Add `.github/dependabot.yml` | None exists; see the image section |
-| Fixed here | The Seatbelt profile now lists the root directory and reads the system's tool selections (`609304d`, `535e356`). Still to fix: the macOS CI job does not compile | On macOS 26.6 every process under the old profile aborted at start, `/usr/bin/true` included. With the fix, the contract check passes every check under Seatbelt on GitHub's runner, below |
-| Fix | Fail the launch when the egress socket cannot be bound, and say why | A root whose socket path passes 108 bytes launches anyway and fails on a bind mount instead. Measured, below |
-| Adopt | `seccompiler` (Apache-2.0 OR BSD-3) and `landlock` (MIT OR Apache-2.0) in `crates/sandbox`, with Codex's seccomp rule set as the reference | The first fix, as libraries, from the rule set three harnesses already use |
+| Fixed, #14 | Refuse `AF_VSOCK` and `io_uring` with seccomp, set `no_new_privs`, in our Linux backend | The network namespace does not cover vsock; on WSL2 and any VM guest it reaches the host. Measured, below |
+| Fixed, #15 | Make the read-only system bind recursive (`mount_setattr` with `AT_RECURSIVE`) | Submounts under `/usr` stayed writable inside our sandbox; only file ownership held them. Measured, below |
+| Fixed, #13 and #24 | Port-restrict the CONNECT tunnel and check the resolved address before dialling (#13); check the TLS server name inside the tunnel against the CONNECT host (#24) | The tunnel dialled any port on an allowed name, wherever it resolved, and the harness chose the server name after the 200 |
+| Fixed, #12 | Add `.github/dependabot.yml`, for the workflows' actions | None existed; npm and the image's base wait on the lockfile row below |
+| Fixed here, and #5, #17 | The Seatbelt profile now lists the root directory and reads the system's tool selections (`609304d`, `535e356`). The macOS CI job compiles (#5), and a death by signal is reported as one (#17) | On macOS 26.6 every process under the old profile aborted at start, `/usr/bin/true` included. With the fix, the contract check passes every check under Seatbelt on GitHub's runner, below |
+| Fixed, #16 | Fail the launch when the egress socket cannot be bound, and say why | A root whose socket path passed 108 bytes launched anyway and failed on a bind mount instead. Measured, below |
+| Adopt | `seccompiler` (Apache-2.0 OR BSD-3) and `landlock` (MIT OR Apache-2.0) in `crates/sandbox`, with Codex's seccomp rule set as the reference | The first fix, as libraries, from the rule set three harnesses already use. `seccompiler` is in, with #14; Landlock is not yet |
 | Adopt | gVisor as an optional hardened Linux backend | Passed every check here, rootless, no KVM, no daemon; the Node harnesses run under it, and a real Claude Code call completed through it |
 | Adopt | An npm lockfile and a digest-pinned base for `images/harness`, bumped by Dependabot | Built here at no cost in size or time; pins what the harnesses pull in and the base, and retires the npm half of `scripts/bump-harness-versions.sh`. Node (an `ARG` Dependabot does not bump) and pi still need the script or a lock of their own |
 | Watch | microsandbox, as one backend for Linux, macOS and Windows | The only candidate that could. With no NIC its network holds, but the image's root is a read-write mount, and its vsock route stalls on a request over 32 KB, so a real call never completes; open upstream as #1878, not fixed in 0.7.9 |
@@ -86,7 +87,7 @@ row below is from the corrected check, run on 23 October.
 | Box | Failed |
 |---|---|
 | host, unconfined (the control) | 9 of 12, as it must |
-| **ours**, `amem launch --harness command` | no vsock; a writable mount under `/usr` |
+| **ours**, `amem launch --harness command`, before #14 and #15 | no vsock; a writable mount under `/usr` |
 | rootless podman, runc, `--network none` | no vsock |
 | nsjail, built from master (`4ff54a6`), with a seccomp rule refusing vsock and io_uring | none |
 | nsjail without the rule | no vsock |
@@ -173,8 +174,12 @@ host whatever the namespace says. Every box built on namespaces failed this chec
 seccomp rule refused the family, and passed with it; gVisor passes because its netstack has no
 vsock. Codex (`codex-rs/linux-sandbox/src/seccomp.rs`) and sandbox-runtime
 (`vendor/seccomp-src/seccomp-unix-block.c`) refuse `AF_VSOCK` and `io_uring_*` for this reason.
-`crates/sandbox` has no seccomp filter and does not set `PR_SET_NO_NEW_PRIVS`. Whether
+`crates/sandbox` had no seccomp filter and did not set `PR_SET_NO_NEW_PRIVS`. Whether
 anything on the WSL2 host answers was not established; that the route exists was.
+
+**Fixed in #14.** The child sets `no_new_privs` and installs a `seccompiler` filter as its last
+step before exec, refusing `AF_VSOCK` sockets and the `io_uring` calls, and marks every
+inherited descriptor from 3 up close-on-exec, so a vsock socket the launcher held cannot pass in.
 
 **A read-only bind that is not recursive.** Our backend binds `/usr` with `MS_BIND | MS_REC`
 and then remounts it read-only (`crates/sandbox/src/linux.rs:63-80`); the remount applies to
@@ -184,12 +189,21 @@ and show as `nobody` inside. Any host submount the user owns under a read-only g
 writable from the sandbox. podman, nsjail, fcage and gVisor did not show it. `mount_setattr(2)`
 with `AT_RECURSIVE` and `MOUNT_ATTR_RDONLY` (Linux 5.12) is the fix.
 
+**Fixed in #15.** Every read-only grant now gets `mount_setattr` with `AT_RECURSIVE`, and a
+host without the call fails a confined launch rather than falling back to a remount per mount.
+
 **The CONNECT tunnel.** `connect_or_not_found` takes the port from the request's authority and
 `TcpStream::connect` resolves and dials it (`crates/egress/src/lib.rs:756-771`). An allowed name
 is reachable on any port, and a name that resolves to loopback, a private range or a metadata
 address is dialled. sandbox-runtime, iron-proxy, Smokescreen, Codex's network proxy and
 Envoy's `resolved_address_filter` all guard this. The fix: 443 unless the allowlist entry names
 a port, resolve first, refuse a denied range, dial the checked address.
+
+**Fixed in #13**, as above. #24 then closed the next hole, found by an adversarial pass on #20:
+after the 200 the harness chose the TLS server name, so one allowed name on a shared front end
+reached its other tenants. The egress now reads the ClientHello before it dials and refuses one
+whose server name is not the CONNECT host, or that carries Encrypted Client Hello. What it
+cannot see is still open: the HTTP `Host` and the paths behind an allowed name.
 
 **A socket path past 108 bytes.** The egress socket lives under the root, at
 `state/run/egress-<pid>.sock`. A unix socket path has a 108-byte limit. With a root whose
@@ -202,6 +216,9 @@ The cause is in the launcher. It spawns `serve_unix` as a task, waits up to two 
 socket to appear, and goes on whether or not it did (`crates/memory/src/main.rs:3482-3494`).
 The bind error stays in the task. The fix: check the path length before binding, or wait on the
 bind's result rather than on the file.
+
+**Fixed in #16.** The launcher binds before it starts serving, and a path too long fails the
+launch with the path and its length.
 
 **A Seatbelt profile under which nothing starts.** Our macOS backend was dry-coded, and this
 was its first run on a Mac: GitHub's `macos-latest`, macOS 26.6.2.
@@ -238,13 +255,15 @@ confinement, and the check now reads it so. `535e356` grants `/private/var/selec
 system. Without it every shell printed `Error opening /private/var/select/sh`, and Python's
 shim printed an `xcode-select` error.
 
-Two things remain:
-- **The developer-tools shims still warn.** `/usr/bin/python3` reads
-  `/private/var/db/xcode_select_link` and the active Xcode under `/Applications`, whose path
-  differs from one machine to the next. It prints an `xcode-select` warning and runs.
-- **The CI macOS job still does not compile.** It is the `crates/mount` dead code, for a branch
-  of its own. Until it compiles, the spikes workflow runs this backend's tests on a Mac, on
-  a pull request that changes `crates/sandbox` and on one that changes the spikes.
+Since then:
+- **The CI macOS job compiles** (#5), so this backend's `sandbox-exec` tests run on every pull
+  request that is not docs only.
+- **A death by signal is reported** (#17): the launcher exits 128 plus the signal's number, as a
+  shell does, and names the signal on one line.
+
+One thing remains: **the developer-tools shims still warn.** `/usr/bin/python3` reads
+`/private/var/db/xcode_select_link` and the active Xcode under `/Applications`, whose path
+differs from one machine to the next. It prints an `xcode-select` warning and runs.
 
 ## Embeddable confinement
 
@@ -257,7 +276,7 @@ WSL containers stay our only route to point 2 there.
 
 | Candidate | Licence | Verdict | Why |
 |---|---|---|---|
-| `seccompiler` (rust-vmm) and `landlock` | Apache-2.0 OR BSD-3; MIT OR Apache-2.0 | **adopt** | Pure Rust; closes the vsock gap and adds Landlock under our mounts |
+| `seccompiler` (rust-vmm) and `landlock` | Apache-2.0 OR BSD-3; MIT OR Apache-2.0 | **adopt** | Pure Rust; closes the vsock gap and adds Landlock under our mounts. `seccompiler` is in since #14; Landlock is not yet |
 | Codex `codex-rs` sandbox crates | Apache-2.0 | **borrow** the seccomp rules and Seatbelt profiles | Not on crates.io (workspace version 0.0.0); Linux runs bubblewrap; host paths, so no point 2 |
 | nsjail | Apache-2.0 | **fallback** | One binary, held both points here with the rule; the 3.6 release needs libnl-3 (LGPL), master does not |
 | ferroday-cage | MIT OR Apache-2.0 | **watch** | The library shape we would want, held both points here; three months old, one maintainer |
