@@ -50,6 +50,6 @@ that has a fixed release the harness does not take yet. Dependabot cannot raise 
 itself. Each entry is scoped to the harness that pins the package, so it changes nothing
 else. Today one entry sets `sharp` to 0.35.5 under `@qwen-code/qwen-code` (CVE-2026-96889,
 in the `librsvg` that `sharp` bundles); qwen-code 0.25.0 and 0.26.0 pin it at 0.35.4. npm
-does not warn when an override applies, so a bump runs `npm ls sharp` and removes the entry
-when the harness pins 0.35.5 or later itself. `images/harness/Dockerfile` installs with
-`npm install -g`, which ignores `overrides`, so the image built today still has 0.35.4.
+does not warn when an override applies, so remove the entry when the harness pins 0.35.5 or
+later itself. `images/harness` now installs from a lockfile of its own, with the same entry,
+and its daily bump says when an override there is no longer needed.

@@ -6,14 +6,9 @@
 # Build with `make image`, which copies the release binary in beside this file.
 FROM ubuntu:24.04
 
+# The npm harnesses' versions are in package.json, and every package under them in
+# package-lock.json; the rest are here.
 ARG NODE_VERSION=24.22.1
-ARG CLAUDE_CODE=2.1.310
-ARG CODEX=0.164.0
-ARG GEMINI_CLI=0.65.0
-ARG COPILOT=1.0.103
-ARG OPENCODE=1.19.4
-ARG QWEN_CODE=0.26.1
-ARG GROK=1.0.70
 ARG PI=1.4.0
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -27,15 +22,20 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
       | tar -xJ -C /usr/local --strip-components=1 \
  && node --version
 
-RUN npm install -g --no-fund --no-audit \
-      "@anthropic-ai/claude-code@${CLAUDE_CODE}" \
-      "@openai/codex@${CODEX}" \
-      "@google/gemini-cli@${GEMINI_CLI}" \
-      "@github/copilot@${COPILOT}" \
-      "opencode-ai@${OPENCODE}" \
-      "@qwen-code/qwen-code@${QWEN_CODE}" \
-      "@xai-official/grok@${GROK}" \
+# The npm harnesses from the lockfile beside this file: every package, transitive ones
+# included, at the version and sha512 the lock names, and with package.json's overrides,
+# which a global install would ignore. The harnesses' own bins, and not their dependencies',
+# are linked into /usr/local/bin, as a global install links them and where the launcher
+# starts a harness in the image.
+COPY package.json package-lock.json /opt/harness/
+RUN cd /opt/harness && npm ci --no-fund --no-audit \
  && npm cache clean --force \
+ && node -e 'const h = "/opt/harness"; \
+      for (const n of Object.keys(require(h + "/package.json").dependencies)) { \
+        const b = require(h + "/node_modules/" + n + "/package.json").bin || {}; \
+        for (const k of typeof b === "string" ? [n.split("/").pop()] : Object.keys(b)) \
+          require("fs").symlinkSync(h + "/node_modules/.bin/" + k, "/usr/local/bin/" + k); \
+      }' \
  && claude --version && codex --version && gemini --version && copilot --version && opencode --version \
  && qwen --version && grok --version
 

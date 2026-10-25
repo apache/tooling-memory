@@ -1,12 +1,15 @@
 # The harness image: built when its inputs change, to show the Dockerfile still builds, and
 # never published; machines build their own with `make image`. Pins are bumped by a daily
-# check that opens a pull request. Never on a run: `memory launch` uses the tag it is given.
+# check that opens a pull request, and a pull request that touches them has its lockfile
+# checked against package.json. Never on a run: `memory launch` uses the tag it is given.
 name: image
 
 on:
   push:
     branches: [main]
     paths: ["images/harness/**", "crates/**", "Cargo.*", ".github/workflows/image.yml"]
+  pull_request:
+    paths: ["images/harness/**", "scripts/bump-harness-versions.sh", ".github/workflows/image.yml"]
   schedule:
     - cron: "41 5 * * *"   # daily pin check
   workflow_dispatch:
@@ -40,7 +43,7 @@ jobs:
           git config user.name "harness-image bot"
           git config user.email "noreply@github.com"
           git checkout -B bot/harness-pins
-          git add images/harness/Dockerfile
+          git add images/harness/Dockerfile images/harness/package.json images/harness/package-lock.json
           git commit -m "image: bump harness pins" -m "${{ steps.bump.outputs.changes }}"
           git push -f origin bot/harness-pins
           gh pr create --fill --base main --head bot/harness-pins \
@@ -48,10 +51,25 @@ jobs:
             --body "$(printf 'Daily pin check.\n\n%s' "${{ steps.bump.outputs.changes }}")" \
             || gh pr edit bot/harness-pins --body "$(printf 'Daily pin check.\n\n%s' "${{ steps.bump.outputs.changes }}")"
 
-  # On a change to the inputs: build with the release binary, to show the image still
-  # builds. Nothing is pushed.
+  # On a pull request: package.json and package-lock.json agree, so `npm ci` in the build
+  # takes the lock as it stands. A hand edit of one without the other fails here, not on main.
+  lock:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: The lock matches package.json
+        run: cd images/harness && npm ci --dry-run --ignore-scripts --no-audit --no-fund
+
+  # On a change to the inputs on main, or by hand: build with the release binary, to show
+  # the image still builds. Nothing is pushed.
   build:
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
