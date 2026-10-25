@@ -1050,8 +1050,8 @@ fn started(work: &Path, secs: u64) -> bool {
     false
 }
 
-/// The processes whose command line names something under `dir`, as pid and command
-/// line.
+/// The processes whose command line names something under `dir`, or whose working
+/// directory is under it, as pid and command line.
 #[cfg(target_os = "linux")]
 fn processes_under(dir: &Path) -> Vec<(String, String)> {
     let needle = dir.to_string_lossy().into_owned();
@@ -1061,10 +1061,13 @@ fn processes_under(dir: &Path) -> Vec<(String, String)> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
         .filter_map(|pid| {
-            let c = std::fs::read(Path::new("/proc").join(&pid).join("cmdline")).ok()?;
-            Some((pid, String::from_utf8_lossy(&c).replace('\0', " ")))
+            let at = Path::new("/proc").join(&pid);
+            let c = std::fs::read(at.join("cmdline")).ok()?;
+            let c = String::from_utf8_lossy(&c).replace('\0', " ");
+            // or working there: a harness's child whose command line names nothing
+            let cwd = std::fs::read_link(at.join("cwd")).ok();
+            (c.contains(&needle) || cwd.is_some_and(|d| d.starts_with(dir))).then_some((pid, c))
         })
-        .filter(|(_, c)| c.contains(&needle))
         .collect()
 }
 
@@ -1792,11 +1795,47 @@ fn a_stop_kills_what_an_exited_harness_left_holding_its_output() {
     assert_eq!(released(&root, &id), (true, true), "back with a handoff");
 }
 
+/// A harness killed by SIGKILL before any stop, an out-of-memory kill say, is said to
+/// have been, though a stop comes while what it left still holds its output.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_harness_killed_before_a_stop_is_said_to_have_been_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(
+        &work,
+        "sh -c \"sleep 300; echo $PWD\" &\ntouch ./started\nkill -9 $$",
+    );
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut launch = start_amem(
+        &root,
+        &work,
+        &tmp,
+        &[
+            "launch",
+            "--unconfined",
+            "--prompt",
+            "hello",
+            "--no-handoff",
+        ],
+    );
+    assert!(started(&work, 60));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    signal(&launch, "TERM");
+    let status = exited(&mut launch, 15);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    assert!(err.contains("was killed by SIGKILL"), "{err}");
+}
+
 /// Told twice to stop, a worker does not wait for the run's cleanup, but it leaves
 /// nothing no sweep removes: its task back in the pool, its render and its socket gone.
-/// The run's output held open by what its harness left in the background holds the
-/// cleanup open, so the second signal comes before the task is settled: the task comes
-/// back with no handoff, which only this path does.
+/// The second signal comes as soon as the first is said, before the task is settled: the
+/// task comes back with no handoff, which only this path does.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_worker_told_twice_to_stop_releases_its_task_and_removes_its_render() {
@@ -1814,8 +1853,9 @@ fn a_worker_told_twice_to_stop_releases_its_task_and_removes_its_render() {
     let launcher = nix::unistd::Pid::from_raw(launcher_of(&root).parse().unwrap());
     kill(launcher, Signal::SIGINT).unwrap();
     // the second from the loop that sees the first in progress, with no process to
-    // start between: the run's output, held open by what the harness left, keeps the
-    // cleanup waiting for the read's grace, seconds, which this comes well within
+    // start between: it comes a millisecond or so after the stop is said, before the
+    // cleanup that follows it, the reap and the settling of the task, is done. The read
+    // of the output that what the harness left holds open can only make that longer.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let read_err = || std::fs::read_to_string(work.with_extension("err")).unwrap_or_default();
     while !read_err().contains("ending the run and cleaning up") {

@@ -7,7 +7,7 @@ use crate::Error;
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::kill;
-use nix::unistd::{getuid, Pid};
+use nix::unistd::{geteuid, Pid};
 use std::fs::File;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ impl Scratch {
         // one that was there already, another user's or one anyone may write into, is
         // not built in
         let meta = dir.metadata().map_err(|e| failed(&e))?;
-        if meta.uid() != getuid().as_raw() || meta.mode() & 0o002 != 0 {
+        if meta.uid() != geteuid().as_raw() || meta.mode() & 0o002 != 0 {
             return Err(failed(&"not this user's own directory"));
         }
         let lock = Flock::lock(dir, FlockArg::LockExclusiveNonblock)
@@ -113,7 +113,7 @@ pub(crate) fn sweep(tmp: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let own = i32::try_from(std::process::id()).unwrap_or(0);
-    let me = getuid().as_raw();
+    let me = geteuid().as_raw();
     entries
         .flatten()
         .filter_map(|e| {

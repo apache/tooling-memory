@@ -5415,7 +5415,16 @@ mod socket_sweep_tests {
         let other = run_dir.join(format!("other-{dead}.sock"));
         let _other = std::os::unix::net::UnixListener::bind(&other).unwrap();
 
-        let swept = sweep_sockets(run_dir);
+        // a few times: a process another test forks holds a copy of the closed
+        // listener's descriptor until it execs, and a connection to it meanwhile is taken
+        let mut swept = Vec::new();
+        for _ in 0..20 {
+            swept.extend(sweep_sockets(run_dir));
+            if !stale.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         live_child.kill().unwrap();
         live_child.wait().unwrap();

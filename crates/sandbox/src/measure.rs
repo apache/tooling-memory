@@ -96,6 +96,8 @@ fn run_as(
         (out, ended)
     });
     exited(&child);
+    // whether a stop had been sent by the time it exited: then a SIGKILL was the stop's
+    let stopped = crate::stop::stopping();
     // read to the end while the exited child is not yet reaped: a stop meanwhile still
     // kills its process group, what it left in the background, and its number is
     // given to no other process or group while it is unreaped
@@ -107,7 +109,7 @@ fn run_as(
     }
     // no longer stopped once it is reaped, after which its numbers may be given again
     drop(stoppable);
-    let (code, mut r) = wait(child, cmd.get_program())?;
+    let (code, mut r) = wait(child, cmd.get_program(), stopped)?;
     read_failed?;
     r.wall_ms = millis(started.elapsed());
     Ok((code, out, r))
@@ -170,14 +172,20 @@ fn exited(_child: &Child) {}
 /// [`crate::stop::stop`] has sent it.
 #[must_use]
 pub fn exit_code(status: ExitStatus, program: &OsStr) -> i32 {
+    exit_code_as(status, program, crate::stop::stopping())
+}
+
+/// As [`exit_code`], with `stopped` whether the stop had been sent when the process
+/// exited: a SIGKILL from before it, an out-of-memory kill say, is said.
+fn exit_code_as(status: ExitStatus, program: &OsStr, stopped: bool) -> i32 {
     #[cfg(not(unix))]
-    let _ = program;
+    let _ = (program, stopped);
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            let stopped = signal == libc::SIGKILL && crate::stop::stopping();
+            let stopped = signal == libc::SIGKILL && stopped;
             if is_said(signal) && !stopped {
                 let core = if status.core_dumped() {
                     ", core dumped"
@@ -254,7 +262,7 @@ pub fn own_cpu_ms() -> (u64, u64) {
 }
 
 #[cfg(unix)]
-fn wait(child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
+fn wait(child: Child, program: &OsStr, stopped: bool) -> std::io::Result<(i32, Resources)> {
     use std::os::unix::process::ExitStatusExt;
     let pid = libc::pid_t::try_from(child.id()).map_err(std::io::Error::other)?;
     let mut status: libc::c_int = 0;
@@ -274,7 +282,7 @@ fn wait(child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
     // reaped above; dropping the handle does not wait again
     drop(child);
     Ok((
-        exit_code(ExitStatus::from_raw(status), program),
+        exit_code_as(ExitStatus::from_raw(status), program, stopped),
         Resources {
             wall_ms: 0,
             user_ms: timeval_ms(usage.ru_utime),
@@ -286,9 +294,9 @@ fn wait(child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
 }
 
 #[cfg(not(unix))]
-fn wait(mut child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
+fn wait(mut child: Child, program: &OsStr, stopped: bool) -> std::io::Result<(i32, Resources)> {
     let status = child.wait()?;
-    Ok((exit_code(status, program), Resources::default()))
+    Ok((exit_code_as(status, program, stopped), Resources::default()))
 }
 
 fn millis(d: Duration) -> u64 {

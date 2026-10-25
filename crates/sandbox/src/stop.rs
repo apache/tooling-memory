@@ -103,8 +103,11 @@ pub fn has_a_terminal() -> bool {
 }
 
 /// Whether nothing listens on the unix socket at `path`: a connection to it is refused.
-/// The connection does not wait: a listener whose backlog is full, one that is stopped
-/// and takes no more, counts as one that listens.
+/// The connection does not wait. On Linux a listener whose backlog is full, one that is
+/// stopped and takes no more, counts as one that listens. Elsewhere, macOS say, a full
+/// backlog refuses as well; the sweep asks only after the pid the socket is named for
+/// has been found not running, and without pid namespaces there that pid is the
+/// listener's, so a full backlog there is not a live launcher's.
 #[must_use]
 pub fn socket_refuses(path: &std::path::Path) -> bool {
     #[cfg(unix)]
@@ -120,22 +123,8 @@ pub fn socket_refuses(path: &std::path::Path) -> bool {
         for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
             *to = *from as libc::c_char;
         }
-        // SAFETY: a socket call with constant arguments; it returns a descriptor or -1.
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        let fd = nonblocking_unix_stream();
         if fd < 0 {
-            return false;
-        }
-        // non-blocking and close-on-exec by fcntl, as every unix has it
-        // SAFETY: fcntl on the socket made above, with integer arguments.
-        let set = unsafe {
-            let fl = libc::fcntl(fd, libc::F_GETFL);
-            fl >= 0
-                && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) == 0
-                && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0
-        };
-        if !set {
-            // SAFETY: close of the socket made above.
-            unsafe { libc::close(fd) };
             return false;
         }
         let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_un>()).unwrap_or(0);
@@ -153,6 +142,46 @@ pub fn socket_refuses(path: &std::path::Path) -> bool {
     {
         let _ = path;
         false
+    }
+}
+
+/// A non-blocking, close-on-exec unix stream socket, or -1.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+fn nonblocking_unix_stream() -> libc::c_int {
+    // SAFETY: a socket call with constant arguments; it returns a descriptor or -1.
+    unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    }
+}
+
+/// A non-blocking, close-on-exec unix stream socket, or -1: by fcntl after the socket
+/// call, where the socket call cannot set either.
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "freebsd"))
+))]
+fn nonblocking_unix_stream() -> libc::c_int {
+    // SAFETY: a socket call with constant arguments, then fcntl on the descriptor it
+    // returned, and its close when fcntl fails.
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return -1;
+        }
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        let set = fl >= 0
+            && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) == 0
+            && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0;
+        if set {
+            fd
+        } else {
+            libc::close(fd);
+            -1
+        }
     }
 }
 
@@ -405,8 +434,9 @@ mod tests {
     #[test]
     fn a_socket_refuses_only_when_nothing_listens_and_a_full_one_does_not_hang() {
         let dir = tempfile::tempdir().unwrap();
+        // bound and never listening: refused, whatever a fork by another test copies
         let gone = dir.path().join("gone.sock");
-        drop(std::os::unix::net::UnixListener::bind(&gone).unwrap());
+        bound_only(&gone);
         assert!(socket_refuses(&gone));
         let live = dir.path().join("live.sock");
         let _live = std::os::unix::net::UnixListener::bind(&live).unwrap();
@@ -416,8 +446,37 @@ mod tests {
             "not there: not refused"
         );
 
+        full_backlog_is_a_listener(dir.path());
+    }
+
+    /// Bind a unix stream socket at `path` and close it, without listening.
+    fn bound_only(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: a zeroed address filled with a path that fits, a socket, its bind and
+        // its close.
+        unsafe {
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (to, from) in addr.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
+                *to = *from as libc::c_char;
+            }
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0);
+            let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
+            libc::close(fd);
+        }
+    }
+
+    /// On Linux a full backlog is a listener, said without waiting. macOS refuses a
+    /// connection to a full backlog.
+    #[cfg(not(target_os = "linux"))]
+    fn full_backlog_is_a_listener(_dir: &std::path::Path) {}
+
+    #[cfg(target_os = "linux")]
+    fn full_backlog_is_a_listener(dir: &std::path::Path) {
         // a listener that accepts nothing, its backlog filled
-        let full = dir.path().join("full.sock");
+        let full = dir.join("full.sock");
         let listener = std::os::unix::net::UnixListener::bind(&full).unwrap();
         {
             use std::os::fd::AsRawFd;
@@ -450,6 +509,7 @@ mod tests {
     }
 
     /// A non-blocking connection to `path` that is kept open; `None` once one would wait.
+    #[cfg(target_os = "linux")]
     fn socket2_like_connect(path: &std::path::Path) -> Option<libc::c_int> {
         use std::os::unix::ffi::OsStrExt;
         // SAFETY: as in socket_refuses: a zeroed address filled with a path that fits, a
