@@ -270,7 +270,8 @@ pub(crate) enum Answer {
 /// What `seen`, an upstream's first bytes, say about the client's next ones. One
 /// ChangeCipherSpec before the ServerHello is skipped: a server sends one after its
 /// retry request, which comes before the answer to the second hello, and none before
-/// its first answer.
+/// its first answer. Any record of its type after that one is refused, since no server
+/// sends one there and what follows it is not read.
 pub(crate) fn answer(seen: &[u8]) -> Answer {
     const UNREAD: &str = "the upstream's ServerHello cannot be read";
     let at = match change_cipher_spec(seen) {
@@ -281,6 +282,9 @@ pub(crate) fn answer(seen: &[u8]) -> Answer {
     let Some(rest) = seen.get(at..) else {
         return Answer::More;
     };
+    if rest.first() == Some(&CHANGE_CIPHER_SPEC[0]) {
+        return Answer::Refused("the upstream sent a second ChangeCipherSpec".into());
+    }
     match handshake(rest, SERVER_HELLO) {
         Ok(None) => Answer::More,
         Ok(Some(found)) if found.message.get(6..38) == Some(&RETRY_RANDOM[..]) => {
@@ -1210,9 +1214,27 @@ mod tests {
         }
         let plain = [&CCS[..], &fixtures::plain_server_hello()].concat();
         assert_eq!(answer(&plain), Answer::Other);
-        // one only, and a record of its type that is not one is not read past
-        let twice = [&CCS[..], &CCS[..], &retry].concat();
-        assert_eq!(answer(&twice), Answer::Other);
+        // one only: a second record of its type is refused from its first byte, whatever
+        // it is and whatever follows; a record of its type that is not one is not read past
+        let mut let_through = Vec::new();
+        for second in [
+            [&CCS[..], &retry].concat(),
+            CCS.to_vec(),
+            vec![20],
+            vec![20, 3, 3, 0, 1, 2],
+            vec![20, 9],
+        ] {
+            let judged = answer(&[&CCS[..], &second].concat());
+            if !matches!(judged, Answer::Refused(_)) {
+                let start = &second[..second.len().min(6)];
+                let_through.push(format!("{start:?}: {judged:?}"));
+            }
+        }
+        assert_eq!(
+            let_through,
+            Vec::<String>::new(),
+            "refused, and let through"
+        );
         for bad in [&[20, 3, 3, 0, 1, 2][..], &[20, 3, 3, 0, 2, 1, 1], &[20, 2]] {
             let first = [bad, &retry[..]].concat();
             assert!(matches!(answer(&first), Answer::Refused(_)), "{bad:?}");
