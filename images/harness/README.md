@@ -12,21 +12,31 @@ are pinned in `package.json`, and every package under them, transitive ones incl
 `/opt/harness`, and their bins are linked into `/usr/local/bin`. Node and pi are the `ARG`s
 at the top of the Dockerfile. Muse Code follows its release channel.
 
-To bump an npm harness by hand, change its version in `package.json` and regenerate the lock.
-No Node on the host is needed:
+To bump every pin to its latest release, as the daily check does, run the bump script. It
+needs npm, so without Node on the host run it in a container, from the repository's root:
+
+```sh
+podman run --rm -v "$PWD":/r:Z -w /r docker.io/library/node:24 sh scripts/bump-harness-versions.sh
+```
+
+To set one npm harness to a given version, change `package.json` and the lock together:
 
 ```sh
 cd images/harness
 podman run --rm -v "$PWD":/w:Z -w /w docker.io/library/node:24 \
-  npm install --package-lock-only --no-fund --no-audit
+  npm install --package-lock-only --save-exact --no-fund --no-audit '@openai/codex@0.164.0'
 ```
+
+A pull request that touches this directory has its lock checked against `package.json`.
 
 `package.json` also carries `overrides`, which hold a package under one harness at a version
 other than the one the harness pins, for a fix the harness has not taken yet. Each entry is
 scoped to its harness. Today there is one: `@qwen-code/qwen-code` pins `sharp` at exactly
 0.35.4, which has CVE-2026-96889 in its bundled librsvg (GHSA-wq5f-xc86-pv6w), and the entry
 holds it at 0.35.5. Remove the entry once qwen-code pins 0.35.5 or later itself; while it is
-there, a qwen-code that pins a newer `sharp` is held back to 0.35.5. A global install
+there, a qwen-code that pins a newer `sharp` is held back to 0.35.5. npm says nothing when an
+override applies, so the bump script does: after a bump it prints a line for each override
+that its harness no longer needs, which lands in the daily pull request. A global install
 (`npm install -g`) ignores `overrides`, which is one reason the image installs from the lock.
 
 ## When it is rebuilt

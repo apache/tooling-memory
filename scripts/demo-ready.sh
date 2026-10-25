@@ -62,10 +62,16 @@ fi
 
 # ---- the harness image, unpacked into the record
 pinned=$(sed -n 's|^    "@anthropic-ai/claude-code": "\(.*\)",\{0,1\}$|\1|p' "$here/images/harness/package.json")
+# an image built from another lock, or before there was one, is not the pinned one even when
+# its Claude Code is: an override or another harness may differ
 installed() {
   r=$("$memory" --root "$root" image path 2>/dev/null) || return 0
-  f=$(find "$r/opt/harness" "$r/usr" -path '*node_modules/@anthropic-ai/claude-code/package.json' 2>/dev/null | head -n 1)
-  [ -n "$f" ] && sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$f" | head -n 1
+  if ! cmp -s "$r/opt/harness/package-lock.json" "$here/images/harness/package-lock.json"; then
+    echo "built from another lock"
+    return 0
+  fi
+  f="$r/opt/harness/node_modules/@anthropic-ai/claude-code/package.json"
+  [ -f "$f" ] && sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$f" | head -n 1
   return 0
 }
 have=$(installed)
