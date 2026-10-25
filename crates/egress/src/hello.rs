@@ -20,7 +20,9 @@
 //! are encrypted, carry no name, and are skipped by a server that asked for a retry.
 //! Nothing the client sends after its first hello goes upstream until the ServerHello is
 //! read, and the answer to the second hello must not be a retry request again, which TLS
-//! 1.3 forbids. After that the bytes are copied both ways unread.
+//! 1.3 forbids; the dummy ChangeCipherSpec a server sends after its retry request is
+//! skipped there, in whatever reads it comes. After that the bytes are copied both ways
+//! unread.
 //!
 //! What is not: the egress cannot see inside TLS. A front end that still routes on the
 //! HTTP Host header inside the session (domain fronting) can be asked for another
@@ -53,8 +55,13 @@ pub(crate) const EARLY_DATA_MAX: usize = 4 * (CIPHERTEXT_MAX + 5);
 /// ClientHello: a ChangeCipherSpec, the most early data, and a hello of [`HELLO_MAX`].
 pub(crate) const RETRY_MAX: usize = CHANGE_CIPHER_SPEC.len() + EARLY_DATA_MAX + HELLO_MAX;
 
-/// How long a tunnel has, once it opens, for the client's ClientHello, the upstream's
-/// ServerHello, and after a HelloRetryRequest the second ClientHello, all together.
+/// The most of the upstream's bytes the egress holds before it decides on an answer: a
+/// ChangeCipherSpec and a ServerHello of [`HELLO_MAX`].
+pub(crate) const ANSWER_MAX: usize = CHANGE_CIPHER_SPEC.len() + HELLO_MAX;
+
+/// How long a tunnel has, once it opens, for all the hellos the egress reads: the
+/// client's ClientHello, the upstream's answer to it, and after a HelloRetryRequest the
+/// second ClientHello and the answer to that. One deadline covers them all.
 pub(crate) const HELLO_WAIT: Duration = Duration::from_secs(10);
 
 /// A fatal TLS alert, `access_denied`, for a client whose hello is refused, so its TLS
@@ -151,21 +158,9 @@ pub(crate) fn second_verdict(first: &[u8], host: &str) -> Verdict {
 /// then any early-data records, [`EARLY_DATA_MAX`] bytes of them at most. `None` while
 /// they are incomplete.
 fn before_second(first: &[u8]) -> Result<Option<usize>, &'static str> {
-    let mut at = 0;
-    if first.first() == Some(&CHANGE_CIPHER_SPEC[0]) {
-        let expected = first
-            .iter()
-            .zip(CHANGE_CIPHER_SPEC)
-            .enumerate()
-            .all(|(i, (got, want))| i == 2 || *got == want);
-        if !expected {
-            return Err(BEFORE_SECOND);
-        }
-        if first.len() < CHANGE_CIPHER_SPEC.len() {
-            return Ok(None);
-        }
-        at = CHANGE_CIPHER_SPEC.len();
-    }
+    let Some(mut at) = change_cipher_spec(first).map_err(|()| BEFORE_SECOND)? else {
+        return Ok(None);
+    };
     let early = at;
     while let Some(rest) = first
         .get(at..)
@@ -263,51 +258,96 @@ pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
 pub(crate) enum Answer {
     /// Not enough bytes yet to tell.
     More,
-    /// A HelloRetryRequest: the client sends a second ClientHello next.
-    Retry,
+    /// A HelloRetryRequest, in this many bytes with a ChangeCipherSpec before it: the
+    /// client sends a second ClientHello next.
+    Retry(usize),
     /// Anything that asks for no second hello: a ServerHello, an alert.
     Other,
     /// A handshake that could be a retry request and cannot be read, and why.
     Refused(String),
 }
 
-/// What `seen`, an upstream's first bytes, say about the client's next ones.
+/// What `seen`, an upstream's first bytes, say about the client's next ones. One
+/// ChangeCipherSpec before the ServerHello is skipped: a server sends one after its
+/// retry request, which comes before the answer to the second hello, and none before
+/// its first answer.
 pub(crate) fn answer(seen: &[u8]) -> Answer {
-    match handshake(seen, SERVER_HELLO) {
+    const UNREAD: &str = "the upstream's ServerHello cannot be read";
+    let at = match change_cipher_spec(seen) {
+        Ok(Some(at)) => at,
+        Ok(None) => return Answer::More,
+        Err(()) => return Answer::Refused(UNREAD.into()),
+    };
+    let Some(rest) = seen.get(at..) else {
+        return Answer::More;
+    };
+    match handshake(rest, SERVER_HELLO) {
         Ok(None) => Answer::More,
-        Ok(Some(found)) if found.message.get(6..38) == Some(&RETRY_RANDOM[..]) => Answer::Retry,
+        Ok(Some(found)) if found.message.get(6..38) == Some(&RETRY_RANDOM[..]) => {
+            Answer::Retry(at + found.records)
+        }
         Ok(Some(_)) => Answer::Other,
         Err(why) if why == NOT_TLS || why == NOT_HELLO => Answer::Other,
-        Err(_) => Answer::Refused("the upstream's ServerHello cannot be read".into()),
+        Err(_) => Answer::Refused(UNREAD.into()),
     }
 }
 
-/// Read from `upstream` until [`answer`] decides, sending each read on to `client` as
-/// it comes, within [`HELLO_MAX`] bytes and by `deadline`. Whether the upstream asked
-/// for a second ClientHello; why the tunnel stops otherwise.
+/// The length of the ChangeCipherSpec record at the start of `bytes`, 0 when they start
+/// with another record; `None` while they could still be one. An error for a record of
+/// its type that is not one.
+fn change_cipher_spec(bytes: &[u8]) -> Result<Option<usize>, ()> {
+    if bytes.first() != Some(&CHANGE_CIPHER_SPEC[0]) {
+        return Ok(Some(0));
+    }
+    let expected = bytes
+        .iter()
+        .zip(CHANGE_CIPHER_SPEC)
+        .enumerate()
+        .all(|(i, (got, want))| i == 2 || *got == want);
+    if !expected {
+        return Err(());
+    }
+    Ok((bytes.len() >= CHANGE_CIPHER_SPEC.len()).then_some(CHANGE_CIPHER_SPEC.len()))
+}
+
+/// What [`read_answer`] read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Next {
+    /// A HelloRetryRequest, and the upstream's bytes read after it, sent on already:
+    /// where the next answer starts.
+    Retry(Vec<u8>),
+    /// An answer that asks for no second hello.
+    Other,
+}
+
+/// Read from `upstream`, after the bytes `seen` already holds, until [`answer`]
+/// decides, sending each read on to `client` as it comes, within [`ANSWER_MAX`] bytes
+/// and by `deadline`. What the upstream answered; why the tunnel stops otherwise.
 pub(crate) async fn read_answer<U, C>(
     upstream: &mut U,
     client: &mut C,
+    mut seen: Vec<u8>,
     deadline: Instant,
-) -> Result<bool, String>
+) -> Result<Next, String>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
     let read = async {
-        let mut seen = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
             match answer(&seen) {
-                Answer::Retry => return Ok(true),
-                Answer::Other => return Ok(false),
+                Answer::Retry(length) => {
+                    return Ok(Next::Retry(seen.get(length..).unwrap_or_default().to_vec()))
+                }
+                Answer::Other => return Ok(Next::Other),
                 Answer::Refused(why) => return Err(why),
-                Answer::More if seen.len() >= HELLO_MAX => {
-                    return Err(format!("no whole ServerHello in {HELLO_MAX} bytes"))
+                Answer::More if seen.len() >= ANSWER_MAX => {
+                    return Err(format!("no whole ServerHello in {ANSWER_MAX} bytes"))
                 }
                 Answer::More => {}
             }
-            let room = chunk.len().min(HELLO_MAX - seen.len());
+            let room = chunk.len().min(ANSWER_MAX.saturating_sub(seen.len()));
             let n = match upstream.read(&mut chunk[..room]).await {
                 Ok(0) => return Err("the upstream closed before its ServerHello".into()),
                 Ok(n) => n,
@@ -593,14 +633,18 @@ pub(crate) mod fixtures {
     /// What a TLS 1.3 front end that wants another key share answers a ClientHello with:
     /// a HelloRetryRequest, then a ChangeCipherSpec for middleboxes.
     pub(crate) fn retry_request() -> Vec<u8> {
+        [retry_alone(), vec![20, 3, 3, 0, 1, 1]].concat()
+    }
+
+    /// [`retry_request`] without its ChangeCipherSpec: the HelloRetryRequest, in one
+    /// record.
+    pub(crate) fn retry_alone() -> Vec<u8> {
         let versions = (0x2b, vec![3, 4]);
         let key_share = (0x33, vec![0, 0x1d]);
-        let mut out = records(
+        records(
             &server_hello(super::RETRY_RANDOM, &[versions, key_share]),
             512,
-        );
-        out.extend_from_slice(&[20, 3, 3, 0, 1, 1]);
-        out
+        )
     }
 
     /// A TLS 1.3 ServerHello that is no retry request, in one record.
@@ -976,14 +1020,16 @@ mod tests {
     #[test]
     fn a_retry_request_is_told_from_any_other_answer() {
         let retry = retry_request();
-        assert_eq!(answer(&retry), Answer::Retry);
+        let alone = retry.len() - 6;
+        assert_eq!(answer(&retry), Answer::Retry(alone));
         for end in 0..retry.len() - 6 {
             assert_eq!(answer(&retry[..end]), Answer::More, "{end}");
         }
         // split over records of every size
         let message = server_hello(RETRY_RANDOM, &[(0x2b, vec![3, 4])]);
         for size in [1, 2, 7, 38, message.len() - 1] {
-            assert_eq!(answer(&records(&message, size)), Answer::Retry, "{size}");
+            let first = records(&message, size);
+            assert_eq!(answer(&first), Answer::Retry(first.len()), "{size}");
         }
         // a TLS 1.3 ServerHello, and a TLS 1.2 one followed in its record by more
         let mut random = RETRY_RANDOM;
@@ -1034,8 +1080,9 @@ mod tests {
             }
             std::future::pending::<()>().await;
         });
-        let retry = read_answer(&mut from_upstream, &mut to_client, soon(HELLO_WAIT)).await;
-        assert_eq!(retry, Ok(true));
+        let deadline = soon(HELLO_WAIT);
+        let retry = read_answer(&mut from_upstream, &mut to_client, Vec::new(), deadline).await;
+        assert!(matches!(retry, Ok(Next::Retry(_))), "{retry:?}");
         drop(to_client);
         let mut got = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut client, &mut got)
@@ -1047,7 +1094,7 @@ mod tests {
         let (_upstream, mut from_upstream) = tokio::io::duplex(64);
         let (mut to_client, _client) = tokio::io::duplex(64);
         let wait = Duration::from_millis(50);
-        let why = read_answer(&mut from_upstream, &mut to_client, soon(wait)).await;
+        let why = read_answer(&mut from_upstream, &mut to_client, Vec::new(), soon(wait)).await;
         assert_eq!(why, Err("no whole ServerHello in time".into()));
     }
 
@@ -1127,8 +1174,7 @@ mod tests {
         let (mut client, mut egress) = tokio::io::duplex(1 << 17);
         client.write_all(&over).await.unwrap();
         let read = read_hello(&mut egress, HOST, true, Vec::new(), soon(HELLO_WAIT)).await;
-        let why = read.err().unwrap_or_default();
-        assert!(why.contains("early data"), "{why}");
+        assert_eq!(read.err().as_deref(), Some(TOO_EARLY));
     }
 
     #[tokio::test]
@@ -1150,5 +1196,53 @@ mod tests {
         let took = started.elapsed();
         assert!(took < Duration::from_secs(1), "ended after {took:?}");
         assert_eq!(read.err(), Some("no whole ClientHello in time".into()));
+    }
+
+    #[test]
+    fn the_change_cipher_spec_after_a_retry_request_is_skipped_before_the_next_answer() {
+        let retry = retry_request();
+        let alone = retry.len() - 6;
+        // with the answer, and with nothing yet after it
+        let first = [&CCS[..], &retry].concat();
+        assert_eq!(answer(&first), Answer::Retry(6 + alone));
+        for end in 0..6 + alone {
+            assert_eq!(answer(&first[..end]), Answer::More, "{end}");
+        }
+        let plain = [&CCS[..], &fixtures::plain_server_hello()].concat();
+        assert_eq!(answer(&plain), Answer::Other);
+        // one only, and a record of its type that is not one is not read past
+        let twice = [&CCS[..], &CCS[..], &retry].concat();
+        assert_eq!(answer(&twice), Answer::Other);
+        for bad in [&[20, 3, 3, 0, 1, 2][..], &[20, 3, 3, 0, 2, 1, 1], &[20, 2]] {
+            let first = [bad, &retry[..]].concat();
+            assert!(matches!(answer(&first), Answer::Refused(_)), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_bytes_after_a_retry_request_start_the_next_answer() {
+        // the request with half its ChangeCipherSpec, then the other half and a second
+        // request, in reads of their own
+        let retry = retry_request();
+        let (split, rest) = retry.split_at(retry.len() - 3);
+        let (mut upstream, mut from_upstream) = tokio::io::duplex(4096);
+        let (mut to_client, _client) = tokio::io::duplex(1 << 16);
+        upstream.write_all(split).await.unwrap();
+        let deadline = soon(HELLO_WAIT);
+        let first = read_answer(&mut from_upstream, &mut to_client, Vec::new(), deadline).await;
+        assert_eq!(first, Ok(Next::Retry(vec![20, 3, 3])));
+        let Ok(Next::Retry(seen)) = first else {
+            return;
+        };
+        upstream
+            .write_all(&[rest, &retry[..]].concat())
+            .await
+            .unwrap();
+        let again = read_answer(&mut from_upstream, &mut to_client, seen, deadline).await;
+        assert_eq!(
+            again,
+            Ok(Next::Retry(CCS.to_vec())),
+            "a second request, seen as one"
+        );
     }
 }
