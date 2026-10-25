@@ -575,7 +575,8 @@ fn cloexec_from_three(limit: libc::c_int) -> std::io::Result<()> {
 fn become_pid_one() -> Result<(), Error> {
     unshare(CloneFlags::CLONE_NEWPID).map_err(|e| confine(format!("unshare pid: {e}")))?;
     // SAFETY: fork between fork and exec in an already single-threaded child; the parent
-    // branch only waits and exits, the child branch only mounts and returns to exec.
+    // branch only closes descriptors, waits and exits, the child branch only mounts and
+    // returns to exec.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(confine(format!(
@@ -584,6 +585,11 @@ fn become_pid_one() -> Result<(), Error> {
         )));
     }
     if pid > 0 {
+        // The intermediate never execs, so its copies of the launcher's descriptors
+        // stay open until it exits: among them std's exec-error channel, whose end of
+        // file is what lets `spawn` return. The child, pid 1, keeps its own copies and
+        // reports through that channel as before.
+        close_from_three();
         let mut status: libc::c_int = 0;
         // SAFETY: waitpid on our own child with a valid status pointer.
         let r = unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -648,6 +654,21 @@ fn say_the_relay_died(signal: i32, core_dumped: bool) {
     // SAFETY: write to fd 2 from a live buffer of at least n bytes; a failure is ignored,
     // as there is nowhere else to say it.
     unsafe { libc::write(2, buf.as_ptr().cast(), n) };
+}
+
+/// Close every descriptor from 3 up. Runs between fork and exec, so it allocates nothing:
+/// `close_range` (Linux 5.9) in one call, or else `close` on each number below the
+/// open-files limit.
+fn close_from_three() {
+    // SAFETY: close_range with integer arguments only.
+    let r = unsafe { libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) };
+    if r == 0 {
+        return;
+    }
+    for fd in 3..open_files_limit() {
+        // SAFETY: close of a descriptor number; one that is not open fails with EBADF.
+        unsafe { libc::close(fd) };
+    }
 }
 
 /// What `memory relay` does inside: spawn the harness and wait for it. The relay is
