@@ -242,10 +242,12 @@ impl Runs {
         if self.stopping() {
             h.kill();
         }
+        let killed = h.killed.clone();
         list.push(h);
         Registered {
             runs: self,
             pid: child.id(),
+            killed,
         }
     }
 }
@@ -254,6 +256,15 @@ impl Runs {
 pub(crate) struct Registered<'a> {
     runs: &'a Runs,
     pid: u32,
+    killed: std::sync::Arc<AtomicBool>,
+}
+
+impl Registered<'_> {
+    /// Whether a stop killed the run while it was still running: then a SIGKILL it ended
+    /// with was the stop's, and not a death to report.
+    pub(crate) fn killed(&self) -> bool {
+        self.killed.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for Registered<'_> {
@@ -266,6 +277,8 @@ impl Drop for Registered<'_> {
 /// not a number a later process may be given once it is reaped.
 struct Handle {
     pid: u32,
+    /// Set when a stop kills the run before it has exited.
+    killed: std::sync::Arc<AtomicBool>,
     /// Whether the pid leads a process group of the run's own, killed with it.
     #[cfg(unix)]
     group: bool,
@@ -286,7 +299,12 @@ impl Handle {
                 .filter(|fd| *fd >= 0)
                 // SAFETY: a descriptor pidfd_open just returned, owned by nothing else.
                 .map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
-            Handle { pid, group, pidfd }
+            Handle {
+                pid,
+                killed: std::sync::Arc::default(),
+                group,
+                pidfd,
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -294,13 +312,43 @@ impl Handle {
             let _ = group;
             Handle {
                 pid,
+                killed: std::sync::Arc::default(),
                 #[cfg(unix)]
                 group,
             }
         }
     }
 
+    /// Whether the run has already exited, though not yet reaped.
+    fn exited(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let pid: libc::id_t = self.pid;
+            // SAFETY: siginfo_t is plain data, for which all zeroes is a valid value.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: waitid on this process's own child, without waiting and leaving it
+            // unreaped, with a valid pointer to write into.
+            let r = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            // a child that has exited fills the siginfo; one still running leaves it zero
+            r == 0 && info.si_signo != 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     fn kill(&self) {
+        if !self.exited() {
+            self.killed.store(true, Ordering::SeqCst);
+        }
         #[cfg(unix)]
         if self.group {
             if let Ok(pid) = libc::pid_t::try_from(self.pid) {

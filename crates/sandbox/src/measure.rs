@@ -96,8 +96,6 @@ fn run_as(
         (out, ended)
     });
     exited(&child);
-    // whether a stop had been sent by the time it exited: then a SIGKILL was the stop's
-    let stopped = crate::stop::stopping();
     // read to the end while the exited child is not yet reaped: a stop meanwhile still
     // kills its process group, what it left in the background, and its number is
     // given to no other process or group while it is unreaped
@@ -107,6 +105,8 @@ fn run_as(
         read_failed = read_until_ended(&ended);
         out = std::mem::take(&mut *lock(&buf));
     }
+    // whether a stop killed it while it ran: then a SIGKILL it ended with was the stop's
+    let stopped = stoppable.killed();
     // no longer stopped once it is reaped, after which its numbers may be given again
     drop(stoppable);
     let (code, mut r) = wait(child, cmd.get_program(), stopped)?;
@@ -175,8 +175,8 @@ pub fn exit_code(status: ExitStatus, program: &OsStr) -> i32 {
     exit_code_as(status, program, crate::stop::stopping())
 }
 
-/// As [`exit_code`], with `stopped` whether the stop had been sent when the process
-/// exited: a SIGKILL from before it, an out-of-memory kill say, is said.
+/// As [`exit_code`], with `stopped` whether a stop killed the process while it ran: a
+/// SIGKILL from before the stop, an out-of-memory kill say, is said.
 fn exit_code_as(status: ExitStatus, program: &OsStr, stopped: bool) -> i32 {
     #[cfg(not(unix))]
     let _ = (program, stopped);

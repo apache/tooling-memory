@@ -1795,6 +1795,29 @@ fn a_stop_kills_what_an_exited_harness_left_holding_its_output() {
     assert_eq!(released(&root, &id), (true, true), "back with a handoff");
 }
 
+/// Whether the harness in `work`, which wrote its pid to `./pid`, has exited within
+/// `secs`: gone, or a zombie its parent has not reaped.
+#[cfg(target_os = "linux")]
+fn exited_unreaped(work: &Path, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if let Ok(pid) = std::fs::read_to_string(work.join("pid")) {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
+            // the state follows the command name, which ends at the last ')'
+            let state = stat
+                .as_deref()
+                .ok()
+                .and_then(|s| s.rsplit_once(')'))
+                .and_then(|(_, rest)| rest.trim_start().chars().next());
+            if matches!(state, None | Some('Z')) {
+                return true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
 /// A harness killed by SIGKILL before any stop, an out-of-memory kill say, is said to
 /// have been, though a stop comes while what it left still holds its output.
 #[cfg(target_os = "linux")]
@@ -1808,7 +1831,7 @@ fn a_harness_killed_before_a_stop_is_said_to_have_been_killed() {
     std::fs::create_dir_all(&work).unwrap();
     fake_harness(
         &work,
-        "sh -c \"sleep 300; echo $PWD\" &\ntouch ./started\nkill -9 $$",
+        "sh -c \"sleep 300; echo $PWD\" &\necho $$ > ./pid\ntouch ./started\nkill -9 $$",
     );
     let _reap = Reap(dir.path().to_path_buf());
     let mut launch = start_amem(
@@ -1824,7 +1847,8 @@ fn a_harness_killed_before_a_stop_is_said_to_have_been_killed() {
         ],
     );
     assert!(started(&work, 60));
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // the stop after the harness's death, which leaves it a zombie until it is reaped
+    assert!(exited_unreaped(&work, 30), "the harness did not die");
     signal(&launch, "TERM");
     let status = exited(&mut launch, 15);
     let err = std::fs::read_to_string(work.with_extension("err")).unwrap();

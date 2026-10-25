@@ -3941,6 +3941,9 @@ async fn run_unconfined(
     args: &[String],
     capture: bool,
 ) -> Result<Ran, Box<dyn std::error::Error>> {
+    // counted until the harness is reaped and its end said, so a launcher told to stop
+    // waits for that rather than exiting first
+    let _in_flight = stops::InFlight::enter()?;
     std::fs::create_dir_all(home)?;
     let mut cmd = std::process::Command::new(harness.binary());
     cmd.current_dir(workdir);
