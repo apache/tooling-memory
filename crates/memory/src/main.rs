@@ -1987,11 +1987,8 @@ fn sweep_sockets(run_dir: &Path) -> Vec<PathBuf> {
                     return None;
                 }
                 // a pid names a process in this pid namespace only: a launcher in
-                // another, sharing the root, still listens, and a stopped one still
-                // takes the connection into its backlog
-                let refused = std::os::unix::net::UnixStream::connect(e.path())
-                    .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused);
-                if !refused {
+                // another, sharing the root, still listens
+                if !dm_sandbox::stop::socket_refuses(&e.path()) {
                     return None;
                 }
             }

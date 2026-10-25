@@ -131,7 +131,7 @@ impl Stops {
             };
             dm_sandbox::stop::stop();
             let said = say(signal);
-            if !said || (signal == 1 && on_a_terminal()) {
+            if !said || (signal == 1 && !both_to_files()) {
                 // nowhere to say anything: what the flow and the finish print goes nowhere,
                 // rather than ending the launcher in a panic before it cleans up
                 dm_sandbox::stop::quiet_standard_streams().ok();
@@ -141,7 +141,9 @@ impl Stops {
                     biased;
                     n = first(&mut signals) => {
                         // told twice: stop waiting, but leave nothing the next launch
-                        // cannot sweep
+                        // cannot sweep. The cap bounds the waits in it only: a removal or
+                        // a ledger statement that runs synchronously runs to its end
+                        // (the ledger's own busy timeout bounds a statement).
                         let quick = std::time::Duration::from_secs(5);
                         tokio::time::timeout(quick, hard).await.ok();
                         std::process::exit(128 + n);
@@ -160,11 +162,19 @@ impl Stops {
     }
 }
 
-/// Whether standard output or standard error is a terminal, which a SIGHUP says has gone.
+/// Whether standard output and standard error both go to regular files, as under
+/// `nohup`. Otherwise a SIGHUP may mean they have gone: a terminal that hung up, which
+/// then no longer answers as a terminal, or a pipe to a reader on it.
 #[cfg(unix)]
-fn on_a_terminal() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdout().is_terminal() || std::io::stderr().is_terminal()
+fn both_to_files() -> bool {
+    use std::os::fd::AsFd;
+    let to_a_file = |fd: std::os::fd::BorrowedFd<'_>| {
+        fd.try_clone_to_owned()
+            .map(std::fs::File::from)
+            .and_then(|f| f.metadata())
+            .is_ok_and(|m| m.is_file())
+    };
+    to_a_file(std::io::stdout().as_fd()) && to_a_file(std::io::stderr().as_fd())
 }
 
 /// Say on standard error that a signal stops the launcher. Whether it was said: a

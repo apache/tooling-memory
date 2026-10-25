@@ -1278,13 +1278,7 @@ fn a_launcher_whose_terminal_hangs_up_still_cleans_up() {
         eprintln!("skipping: unprivileged namespaces are not available here");
         return;
     }
-    let script = Command::new("script").arg("--version").output();
-    assert!(
-        script.is_ok() || std::env::var_os("CI").is_none(),
-        "util-linux script makes the terminal here, and on CI it must be there"
-    );
-    if script.is_err() {
-        eprintln!("skipping: no script(1) to make a terminal with");
+    if !script_available() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -1614,36 +1608,184 @@ fn an_unconfined_worker_told_to_stop_ends_what_its_harness_left_running() {
     assert_eq!(released(&root, &id), (true, true), "back with a handoff");
 }
 
-/// Told twice to stop, quickly, a worker does not wait for the run's cleanup, but it
-/// leaves nothing no sweep removes: its task is back in the pool, its render and its
-/// socket are gone.
+/// Whether script(1) is here to make a terminal with; on CI it must be.
+#[cfg(target_os = "linux")]
+fn script_available() -> bool {
+    let here = Command::new("script").arg("--version").output().is_ok();
+    assert!(
+        here || std::env::var_os("CI").is_none(),
+        "util-linux script makes the terminal here, and on CI it must be there"
+    );
+    if !here {
+        eprintln!("skipping: no script(1) to make a terminal with");
+    }
+    here
+}
+
+/// `amem <args>` for the claude harness in `work`, as the session leader of a terminal
+/// of its own that script(1) makes, its standard error to `<work>.err`. script exits
+/// with the launcher's code, and keeps what the terminal showed in `<work>.tty`.
+#[cfg(target_os = "linux")]
+fn on_a_terminal(root: &Path, work: &Path, tmp: &Path, args: &str) -> std::process::Child {
+    let line = format!(
+        "exec {} --root {} {args} --harness claude --auth key --workdir {} 2>{}",
+        env!("CARGO_BIN_EXE_amem"),
+        root.display(),
+        work.display(),
+        work.with_extension("err").display()
+    );
+    Command::new("script")
+        .args(["-qfec", &line])
+        .arg(work.with_extension("tty"))
+        .env("PATH", path_with(&work.join("bins")))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .env("TMPDIR", tmp)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// The pid of the launcher running on `root`.
+#[cfg(target_os = "linux")]
+fn launcher_of(root: &Path) -> String {
+    let bin = env!("CARGO_BIN_EXE_amem");
+    let found: Vec<String> = processes_under(root)
+        .into_iter()
+        .filter(|(_, c)| c.starts_with(bin) && c.contains(" --root "))
+        .map(|(pid, _)| pid)
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    found[0].clone()
+}
+
+/// A headless unconfined run on a terminal stays in the terminal's foreground group: a
+/// harness that sets the terminal, as a password prompt does, is not stopped for it.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_worker_told_twice_to_stop_releases_its_task_and_removes_its_render() {
-    if !namespaces_available() {
-        eprintln!("skipping: unprivileged namespaces are not available here");
+fn a_headless_unconfined_run_on_a_terminal_may_use_the_terminal() {
+    if !script_available() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let root = init_root(dir.path());
     let tmp = dir.path().join("tmp");
     std::fs::create_dir_all(&tmp).unwrap();
-    let (id, work) = a_task_and_a_printing_sleeper(&root, dir.path());
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(
+        &work,
+        "stty -echo </dev/tty; stty echo </dev/tty; echo answered",
+    );
     let _reap = Reap(dir.path().to_path_buf());
-    let mut worker = start_amem(
+    let mut terminal = on_a_terminal(
         &root,
         &work,
         &tmp,
-        &["work", "--loop", "--lease-seconds", "60"],
+        "launch --unconfined --prompt hello --no-handoff",
     );
-    assert!(started(&work, 60));
-    signal(&worker, "INT");
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    signal(&worker, "INT");
-    let status = exited(&mut worker, 30);
-    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    let status = exited(&mut terminal, 30);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap_or_default();
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "{err}");
+    let shown = std::fs::read_to_string(work.with_extension("tty")).unwrap_or_default();
+    assert!(shown.contains("answered"), "{shown}");
+}
+
+/// A worker on a terminal whose harness left a child in the background, holding the
+/// run's output open: its task and a launcher in `dir/work`.
+#[cfg(target_os = "linux")]
+fn a_worker_on_a_terminal_with_a_background_child(
+    root: &Path,
+    dir: &Path,
+    tmp: &Path,
+) -> (String, PathBuf, std::process::Child) {
+    let id = file_task(root, "First");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(&work, "touch ./started\ntail -f \"$PWD/started\" &\nwait");
+    let terminal = on_a_terminal(
+        root,
+        &work,
+        tmp,
+        "work --unconfined --loop --lease-seconds 60",
+    );
+    assert!(
+        started(&work, 60),
+        "{}",
+        std::fs::read_to_string(work.with_extension("err")).unwrap_or_default()
+    );
+    (id, work, terminal)
+}
+
+/// On a terminal the harness is in the terminal's group, which a stop does not kill
+/// whole; what it left in the background, holding the output open, does not keep the
+/// worker from settling its task and exiting.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_on_a_terminal_told_to_stop_ends_though_its_harness_left_a_child() {
+    if !script_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let (id, work, mut terminal) =
+        a_worker_on_a_terminal_with_a_background_child(&root, dir.path(), &tmp);
+    let launcher = launcher_of(&root);
+    Command::new("kill")
+        .args(["-TERM", &launcher])
+        .status()
+        .unwrap();
+    let status = exited(&mut terminal, 15);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap_or_default();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    assert_eq!(released(&root, &id), (true, true), "back with a handoff");
+}
+
+/// Told twice to stop, a worker does not wait for the run's cleanup, but it leaves
+/// nothing no sweep removes: its task back in the pool, its render and its socket gone.
+/// The run's output held open by what its harness left in the background holds the
+/// cleanup open, so the second signal comes before the task is settled: the task comes
+/// back with no handoff, which only this path does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_told_twice_to_stop_releases_its_task_and_removes_its_render() {
+    if !script_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let _reap = Reap(dir.path().to_path_buf());
+    let (id, work, mut terminal) =
+        a_worker_on_a_terminal_with_a_background_child(&root, dir.path(), &tmp);
+    let launcher = launcher_of(&root);
+    Command::new("kill")
+        .args(["-INT", &launcher])
+        .status()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let read_err = || std::fs::read_to_string(work.with_extension("err")).unwrap_or_default();
+    while !read_err().contains("ending the run and cleaning up") {
+        assert!(std::time::Instant::now() < deadline, "{}", read_err());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Command::new("kill")
+        .args(["-INT", &launcher])
+        .status()
+        .unwrap();
+    let status = exited(&mut terminal, 30);
+    let err = read_err();
     assert_eq!(status.and_then(|s| s.code()), Some(128 + 2), "{err}");
-    assert!(released(&root, &id).0, "back in the pool: {err}");
+    assert_eq!(
+        released(&root, &id),
+        (true, false),
+        "back, with no handoff: {err}"
+    );
     assert_eq!(
         names_in(&root.join("state/projection/claude")),
         Vec::<String>::new(),
@@ -1654,6 +1796,42 @@ fn a_worker_told_twice_to_stop_releases_its_task_and_removes_its_render() {
         Vec::<String>::new(),
         "the socket"
     );
+}
+
+/// Under umask 000 the launcher's own scratch directory is still its own: a confined run
+/// is not refused for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_run_under_umask_000_runs() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(&work, "exit 0");
+    let _reap = Reap(dir.path().to_path_buf());
+    let line = format!(
+        "umask 000; exec {} --root {} launch --prompt hello --no-handoff --harness claude --auth key --workdir {}",
+        env!("CARGO_BIN_EXE_amem"),
+        root.display(),
+        work.display()
+    );
+    let out = Command::new("/bin/sh")
+        .args(["-c", &line])
+        .env("PATH", path_with(&work.join("bins")))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .env("TMPDIR", &tmp)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("confined to"), "{err}");
 }
 
 // ---- the wslc backend's inside half, driven by a fake host ----

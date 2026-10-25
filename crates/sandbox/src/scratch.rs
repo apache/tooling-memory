@@ -9,7 +9,7 @@ use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::kill;
 use nix::unistd::{getuid, Pid};
 use std::fs::File;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// What every scratch directory's name starts with; the launcher's pid follows.
@@ -32,11 +32,18 @@ impl Scratch {
         sweep(tmp);
         let path = dir(tmp);
         let failed = |e: &dyn std::fmt::Display| Error::Confine(format!("{}: {e}", path.display()));
-        std::fs::create_dir_all(&path).map_err(|e| failed(&e))?;
+        std::fs::create_dir_all(tmp).map_err(|e| failed(&e))?;
+        // made with a mode of its own, whatever the umask: this user's alone
+        let made = match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => return Err(failed(&e)),
+        };
         let dir = open_dir(&path).map_err(|e| failed(&e))?;
-        // one another user made first, or one anyone may write into, is not built in
+        // one that was there already, another user's or one anyone may write into, is
+        // not built in
         let meta = dir.metadata().map_err(|e| failed(&e))?;
-        if meta.uid() != getuid().as_raw() || meta.mode() & 0o002 != 0 {
+        if !made && (meta.uid() != getuid().as_raw() || meta.mode() & 0o002 != 0) {
             return Err(failed(&"not this user's own directory"));
         }
         let lock = Flock::lock(dir, FlockArg::LockExclusiveNonblock)

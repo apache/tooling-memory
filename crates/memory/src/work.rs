@@ -323,7 +323,7 @@ async fn one(
 ) -> Fallible<i32> {
     let lease_seconds = options.lease_seconds;
     eprintln!("memory: claimed {}: {}", task.id, task.title);
-    let _holding = Holding::of(&task.id);
+    let holding = Holding::of(&task.id);
     let memory = session.memory();
     let platform = Platform::for_harness(&memory, session.harness()).await;
     let prompt = prompt_for(
@@ -379,6 +379,9 @@ async fn one(
     if !output.trim().is_empty() {
         crate::stops::answer(&output);
     }
+    // settled from here: a launcher told twice to stop no longer releases it, as the
+    // release or completion below may already be done, and the task another's
+    drop(holding);
     settle(session.harness(), client, task, code, output).await
 }
 

@@ -82,6 +82,70 @@ pub(crate) fn register(child: &std::process::Child, group: bool) -> Registered<'
     RUNS.register(child, group)
 }
 
+/// Whether this process has a controlling terminal, which a process group of a run's
+/// own would be stopped for touching.
+#[must_use]
+pub fn has_a_terminal() -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/tty")
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Whether nothing listens on the unix socket at `path`: a connection to it is refused.
+/// The connection does not wait: a listener whose backlog is full, one that is stopped
+/// and takes no more, counts as one that listens.
+#[must_use]
+pub fn socket_refuses(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        // SAFETY: sockaddr_un is plain data, for which all zeroes is a valid value.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if bytes.len() >= addr.sun_path.len() {
+            return false;
+        }
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+            *to = *from as libc::c_char;
+        }
+        // SAFETY: a socket call with constant arguments; it returns a descriptor or -1.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return false;
+        }
+        let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_un>()).unwrap_or(0);
+        // SAFETY: connect of the socket made above to an address of the size given, then
+        // close of that socket.
+        unsafe {
+            let r = libc::connect(fd, (&raw const addr).cast(), len);
+            let refused =
+                r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECONNREFUSED);
+            libc::close(fd);
+            refused
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Whether this process ignores `signal`, as one started under `nohup`, or in the
 /// background by a shell without job control, ignores SIGHUP or SIGINT. A launcher keeps
 /// that: it does not stop on a signal it was started to ignore.
@@ -201,8 +265,9 @@ impl Handle {
         #[cfg(unix)]
         if self.group {
             if let Ok(pid) = libc::pid_t::try_from(self.pid) {
-                // SAFETY: kill of the process group this run's child leads; the leader is
-                // not yet waited for, so no other group has its number.
+                // SAFETY: kill of the process group this run's child leads. The handle is
+                // dropped before the leader is reaped, so while it is here no other
+                // process or group can have the leader's number.
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
         }
@@ -325,5 +390,74 @@ mod tests {
         // SAFETY: as above, back to the default.
         unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
         assert!(!ignored(libc::SIGUSR2));
+    }
+
+    #[test]
+    fn a_socket_refuses_only_when_nothing_listens_and_a_full_one_does_not_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone.sock");
+        drop(std::os::unix::net::UnixListener::bind(&gone).unwrap());
+        assert!(socket_refuses(&gone));
+        let live = dir.path().join("live.sock");
+        let _live = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        assert!(!socket_refuses(&live));
+        assert!(
+            !socket_refuses(&dir.path().join("none.sock")),
+            "not there: not refused"
+        );
+
+        // a listener that accepts nothing, its backlog filled
+        let full = dir.path().join("full.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&full).unwrap();
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: listen on a socket this test holds, with the smallest backlog.
+            assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        }
+        let mut held = Vec::new();
+        loop {
+            let s = socket2_like_connect(&full);
+            match s {
+                Some(fd) => held.push(fd),
+                None => break,
+            }
+            assert!(held.len() < 1000, "the backlog never filled");
+        }
+        // on a thread of its own, so a probe that waits fails here rather than hangs
+        let (said, answer) = std::sync::mpsc::channel();
+        let probed = full.clone();
+        std::thread::spawn(move || said.send(socket_refuses(&probed)).ok());
+        let refused = answer.recv_timeout(std::time::Duration::from_secs(2));
+        assert_eq!(
+            refused,
+            Ok(false),
+            "a full backlog is a listener, said at once"
+        );
+        for fd in held {
+            // SAFETY: close of a socket this test opened.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A non-blocking connection to `path` that is kept open; `None` once one would wait.
+    fn socket2_like_connect(path: &std::path::Path) -> Option<libc::c_int> {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: as in socket_refuses: a zeroed address filled with a path that fits, a
+        // non-blocking socket, a connect of it.
+        unsafe {
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (to, from) in addr.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
+                *to = *from as libc::c_char;
+            }
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
+            let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            if libc::connect(fd, (&raw const addr).cast(), len) == 0 {
+                Some(fd)
+            } else {
+                libc::close(fd);
+                None
+            }
+        }
     }
 }
