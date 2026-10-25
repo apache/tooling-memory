@@ -259,6 +259,10 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
     let client = Arc::new(client(session.memory()).await?);
     let mut last = NOTHING_TO_DO;
     loop {
+        // a launcher told to stop claims nothing more
+        if dm_sandbox::stop::stopping() {
+            return Ok(last);
+        }
         let claimed = match &options.task {
             Some(id) => client.claim(id, options.lease_seconds).await?,
             // a worker only claims: rank is the ledger's, moved along dependency edges
@@ -285,7 +289,11 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
         if options.task.is_some() {
             return Ok(last);
         }
-        if let Some(plan) = &options.mine {
+        if let Some(plan) = options
+            .mine
+            .as_ref()
+            .filter(|_| !dm_sandbox::stop::stopping())
+        {
             let via = if plan.via_harness {
                 crate::MineVia::Harness
             } else {
@@ -309,6 +317,12 @@ async fn one(
 ) -> Fallible<i32> {
     let lease_seconds = options.lease_seconds;
     eprintln!("memory: claimed {}: {}", task.id, task.title);
+    // counted until the task is settled: a launcher told to stop waits, and the task
+    // goes back to the pool with a handoff, as when the harness stops of itself
+    let Ok(_in_flight) = crate::stops::InFlight::enter() else {
+        client.release(&task.id, None).await?;
+        return Err("the launcher is stopping".into());
+    };
     let memory = session.memory();
     let platform = Platform::for_harness(&memory, session.harness()).await;
     let prompt = prompt_for(
@@ -341,7 +355,16 @@ async fn one(
         .run_task(&session.harness().headless(&prompt), true, Some(&task.id))
         .await;
     heartbeat.abort();
-    let (code, output) = run?;
+    let (code, output) = match run {
+        Ok(ran) => ran,
+        Err(e) => {
+            // a run refused because a stop came first leaves nothing to settle
+            if dm_sandbox::stop::stopping() {
+                client.release(&task.id, None).await.ok();
+            }
+            return Err(e);
+        }
+    };
     let output = output.map(|o| answer_of(session, o));
     let now = client.get_task(&task.id).await?;
     file_outbox(

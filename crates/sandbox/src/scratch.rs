@@ -36,6 +36,9 @@ impl Scratch {
         let dir = open_dir(&path).map_err(|e| failed(&e))?;
         let lock = Flock::lock(dir, FlockArg::LockExclusiveNonblock)
             .map_err(|(_, e)| failed(&format!("held by another process: {e}")))?;
+        if !still_at(&path, &lock) {
+            return Err(failed(&"removed or replaced while it was being locked"));
+        }
         Ok(Scratch { path, _lock: lock })
     }
 
@@ -63,6 +66,15 @@ fn open_dir(path: &Path) -> std::io::Result<File> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(path)
+}
+
+/// Whether the directory at `path` is still the one `dir` has open: a sweep may remove
+/// it, and another make it again, between the open and the lock.
+fn still_at(path: &Path, dir: &File) -> bool {
+    match (std::fs::symlink_metadata(path), dir.metadata()) {
+        (Ok(at), Ok(held)) => at.dev() == held.dev() && at.ino() == held.ino(),
+        _ => false,
+    }
 }
 
 /// The pid a scratch directory's name carries, when the name is one this module makes.
@@ -103,7 +115,10 @@ pub(crate) fn sweep(tmp: &Path) -> Vec<PathBuf> {
             if dir.metadata().ok()?.uid() != me {
                 return None;
             }
-            let _held = Flock::lock(dir, FlockArg::LockExclusiveNonblock).ok()?;
+            let held = Flock::lock(dir, FlockArg::LockExclusiveNonblock).ok()?;
+            if !still_at(&path, &held) {
+                return None;
+            }
             std::fs::remove_dir(&path).ok()?;
             Some(path)
         })
@@ -194,6 +209,24 @@ mod tests {
         assert!(linked.is_symlink());
         assert!(outside.path().is_dir());
         assert!(full.join("kept").is_file());
+    }
+
+    #[test]
+    fn a_directory_made_again_after_it_was_opened_is_not_the_one_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(format!("{PREFIX}1"));
+        std::fs::create_dir(&path).unwrap();
+        let held = open_dir(&path).unwrap();
+        assert!(still_at(&path, &held));
+        // made while the first still exists, so it cannot be given the same inode
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert!(
+            !still_at(&path, &held),
+            "a sweep and another launcher came between"
+        );
     }
 
     #[test]

@@ -27,6 +27,51 @@ pub fn stopping() -> bool {
     RUNS.stopping()
 }
 
+/// Whether a process with this pid runs. One that does, whoever's, or one that cannot be
+/// told, counts as running, so that what a live process owns is never swept.
+#[must_use]
+pub fn process_runs(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        if pid <= 0 {
+            return true;
+        }
+        // SAFETY: kill with signal 0 sends nothing; it only checks that the pid exists.
+        let r = unsafe { libc::kill(pid, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Point standard output and standard error at the null device, for a launcher whose
+/// terminal has hung up: a write to it fails, and `print!` and `eprintln!` panic on a
+/// failed write, which would end the launcher before it cleans up.
+///
+/// # Errors
+///
+/// When the null device cannot be opened or put in place.
+pub fn quiet_standard_streams() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+        for fd in [1, 2] {
+            // SAFETY: dup2 of a descriptor this function holds open onto a standard one.
+            if unsafe { libc::dup2(null.as_raw_fd(), fd) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Count `child` among the runs [`stop`] kills, until the returned value is dropped;
 /// killed at once when [`stop`] has already been called. Called before the child is
 /// waited for, while its pid is still its own.

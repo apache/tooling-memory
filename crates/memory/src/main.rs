@@ -1926,8 +1926,7 @@ async fn prepare_launch(
     });
     deputy.iter().for_each(|d| memory.set_deputy(d));
     memory.set_tools(taps::TapTools::with_egress(root, egress.clone()));
-    let run_dir = root.join("state/run");
-    std::fs::create_dir_all(&run_dir)?;
+    let run_dir = run_dir(root)?;
     Ok(Prepared {
         memory,
         egress,
@@ -1946,6 +1945,52 @@ async fn prepare_launch(
         model: None,
         metered,
     })
+}
+
+/// Where launchers keep their egress sockets, made if need be, with what killed
+/// launchers left there swept.
+fn run_dir(root: &Path) -> std::io::Result<PathBuf> {
+    let dir = root.join("state/run");
+    std::fs::create_dir_all(&dir)?;
+    sweep_sockets(&dir);
+    Ok(dir)
+}
+
+/// Remove the egress sockets killed launchers left in `run_dir`. One goes only when it is
+/// named `egress-<pid>.sock`, as [`prepare_launch`] names it, it is a socket and not a
+/// link, and the launcher its name carries is not a running process. Returns the
+/// sockets removed.
+fn sweep_sockets(run_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return Vec::new();
+    };
+    let own = std::process::id();
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let digits = name
+                .to_str()?
+                .strip_prefix("egress-")?
+                .strip_suffix(".sock")?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let pid: u32 = digits.parse().ok()?;
+            if pid == 0 || pid == own || dm_sandbox::stop::process_runs(pid) {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if !e.file_type().ok()?.is_socket() {
+                    return None;
+                }
+            }
+            std::fs::remove_file(e.path()).ok()?;
+            Some(e.path())
+        })
+        .collect()
 }
 
 /// What a tunnelled harness reported about itself, read from the transcript it left and
@@ -3696,15 +3741,18 @@ impl Session {
         let started = std::time::Instant::now();
         let (user, sys) = dm_sandbox::measure::own_cpu_ms();
         let (code, out, used) = match &self.runner {
-            Runner::Unconfined(Some((addr, _))) => run_unconfined(
-                self.harness,
-                self.auth,
-                &self.workdir,
-                &self.p.home,
-                &format!("http://{addr}"),
-                args,
-                capture,
-            ),
+            Runner::Unconfined(Some((addr, _))) => {
+                run_unconfined(
+                    self.harness,
+                    self.auth,
+                    &self.workdir,
+                    &self.p.home,
+                    &format!("http://{addr}"),
+                    args,
+                    capture,
+                )
+                .await
+            }
             Runner::Unconfined(None) => Err("the unconfined runner was not started".into()),
             Runner::Namespaces | Runner::Image(_) | Runner::Seatbelt => {
                 run_confined(
@@ -3862,7 +3910,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Run the harness on the host with the egress on a TCP port. The same configuration as
 /// the confined path, minus the namespaces.
 #[allow(clippy::too_many_arguments)] // the host-side twin of dm_sandbox::Request
-fn run_unconfined(
+async fn run_unconfined(
     harness: Harness,
     auth: AuthMode,
     workdir: &Path,
@@ -3923,7 +3971,9 @@ fn run_unconfined(
         }
     }
     cmd.args(args);
-    let (code, out, r) = dm_sandbox::measure::run(&mut cmd, capture)?;
+    // on a thread of its own, so a launcher told to stop hears the signal while it runs
+    let (code, out, r) =
+        tokio::task::spawn_blocking(move || dm_sandbox::measure::run(&mut cmd, capture)).await??;
     Ok((
         code,
         capture.then(|| String::from_utf8_lossy(&out).into_owned()),
@@ -5290,5 +5340,55 @@ mod backend_tests {
             port.starts_with("127.0.0.1:") && !port.ends_with(":0"),
             "{port}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod socket_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn a_killed_launcher_s_socket_is_swept_and_nothing_a_live_one_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let mut gone = std::process::Command::new("/bin/sh")
+            .args(["-c", ":"])
+            .spawn()
+            .unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        let mut live_child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read x"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let live = live_child.id();
+        let stale = run_dir.join(format!("egress-{dead}.sock"));
+        let _stale = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+        let held = run_dir.join(format!("egress-{live}.sock"));
+        let _held = std::os::unix::net::UnixListener::bind(&held).unwrap();
+        let own = run_dir.join(format!("egress-{}.sock", std::process::id()));
+        let _own = std::os::unix::net::UnixListener::bind(&own).unwrap();
+        // a dead pid's name on a file that is not a socket, and on a link
+        let file = run_dir.join(format!("egress-{dead}0.sock"));
+        std::fs::write(&file, "").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("kept.sock");
+        let _target = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        let link = run_dir.join(format!("egress-{dead}1.sock"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let other = run_dir.join(format!("other-{dead}.sock"));
+        let _other = std::os::unix::net::UnixListener::bind(&other).unwrap();
+
+        let swept = sweep_sockets(run_dir);
+
+        live_child.kill().unwrap();
+        live_child.wait().unwrap();
+        assert_eq!(swept, vec![stale.clone()]);
+        assert!(!stale.exists());
+        for kept in [&held, &own, &file, &other, &target] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+        assert!(link.is_symlink());
     }
 }

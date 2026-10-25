@@ -149,6 +149,9 @@ pub struct Mounted {
     at: PathBuf,
     #[cfg(target_os = "linux")]
     session: Option<fuser::BackgroundSession>,
+    /// Dropped after the mount and its mountpoint are gone.
+    #[cfg(target_os = "linux")]
+    _owner: linux::Owner,
 }
 
 impl Mounted {
@@ -186,12 +189,15 @@ pub fn mount(memory: Arc<Memory>, render: &Path, at: &Path) -> Result<Mounted, E
     availability().map_err(Error::Unavailable)?;
     #[cfg(target_os = "linux")]
     {
+        // before the mountpoint is made, so no sweep removes it as empty meanwhile
+        let owner = linux::own(at)?;
         linux::clear_dead(at);
         std::fs::create_dir_all(at).map_err(io(at))?;
         let session = linux::serve(memory, render, at)?;
         Ok(Mounted {
             at: at.to_path_buf(),
             session: Some(session),
+            _owner: owner,
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -201,9 +207,10 @@ pub fn mount(memory: Arc<Memory>, render: &Path, at: &Path) -> Result<Mounted, E
 }
 
 /// Clear what killed launchers left under `base`, a harness's mount directory: a dead
-/// mount is unmounted and its directory removed, an empty directory removed. A mount
-/// another launcher is serving is left alone, and a link is never followed. Returns the
-/// directories cleared.
+/// mount is unmounted and its directory removed, an empty directory removed, and the
+/// record of each removed. A mount whose record a live launcher holds is not touched or
+/// asked anything, since a stopped launcher would not answer; a link is never followed.
+/// Returns the directories cleared.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 pub fn sweep(base: &Path) -> Vec<PathBuf> {
     let mut cleared = Vec::new();
@@ -220,12 +227,49 @@ pub fn sweep(base: &Path) -> Vec<PathBuf> {
         }
         let path = entry.path();
         #[cfg(target_os = "linux")]
-        linux::clear_dead(&path);
+        if let Some(swept) = sweep_recorded(&path) {
+            cleared.extend(swept);
+            continue;
+        }
         if std::fs::remove_dir(&path).is_ok() {
             cleared.push(path);
         }
     }
     cleared
+}
+
+/// Sweep `path` by its record: `None` for a mountpoint from before records were kept,
+/// which the caller removes when it is empty, as then.
+#[cfg(target_os = "linux")]
+fn sweep_recorded(path: &Path) -> Option<Option<PathBuf>> {
+    let name = path.file_name()?.to_str()?;
+    if let Some(at) = name.strip_suffix(".lock") {
+        // a record whose launcher died before it made the mountpoint
+        let at = path.with_file_name(at);
+        if let linux::Held::Gone(lock) = linux::held(&at) {
+            let no_mountpoint = std::fs::symlink_metadata(&at)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+            if no_mountpoint {
+                std::fs::remove_file(path).ok();
+            }
+            drop(lock);
+        }
+        return Some(None);
+    }
+    match linux::held(path) {
+        linux::Held::Live => Some(None),
+        linux::Held::Gone(lock) => {
+            linux::clear_dead(path);
+            let removed = std::fs::remove_dir(path).is_ok();
+            std::fs::remove_file(linux::lock_path(path)).ok();
+            drop(lock);
+            Some(removed.then(|| path.to_path_buf()))
+        }
+        linux::Held::Unrecorded => {
+            linux::clear_dead(path);
+            None
+        }
+    }
 }
 
 /// [`sweep`] every harness's mount directory under `root`'s [`MOUNTS`], so a launch of
@@ -342,5 +386,40 @@ mod tests {
         assert!(sweep_root(linked_root.path()).is_empty());
         assert!(empty_outside.is_dir());
         assert!(session_outside.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sweep_keeps_what_a_live_launcher_s_record_holds_and_clears_a_dead_one_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("claude");
+        std::fs::create_dir_all(&base).unwrap();
+        // a live launcher: it holds its record, its mountpoint may not answer
+        let live = base.join("sess-live");
+        let owner = linux::own(&live).unwrap();
+        std::fs::create_dir(&live).unwrap();
+        // one about to make its mountpoint: the record is there, the directory not yet
+        let coming = linux::own(&base.join("sess-coming")).unwrap();
+        // a dead launcher's record and mountpoint, and a record without a mountpoint
+        let dead = base.join("sess-dead");
+        std::fs::write(linux::lock_path(&dead), "").unwrap();
+        std::fs::create_dir(&dead).unwrap();
+        let stray = linux::lock_path(&base.join("sess-stray"));
+        std::fs::write(&stray, "").unwrap();
+
+        let cleared = sweep(&base);
+
+        assert_eq!(cleared, vec![dead.clone()]);
+        assert!(!linux::lock_path(&dead).exists());
+        assert!(!stray.exists());
+        assert!(live.is_dir(), "a live launcher's mountpoint is kept");
+        assert!(linux::lock_path(&live).exists());
+        assert!(linux::lock_path(&base.join("sess-coming")).exists());
+        drop(owner);
+        drop(coming);
+        assert!(
+            !linux::lock_path(&live).exists(),
+            "the record goes with its owner"
+        );
     }
 }

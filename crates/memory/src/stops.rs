@@ -5,7 +5,9 @@
 //! signal's number, as a shell reports a process a signal ended.
 //!
 //! SIGKILL cannot be caught. What a launcher killed by it leaves, the next launcher to
-//! start a run sweeps: `dm_sandbox` its scratch directory, `dm_mount` its mount.
+//! start a run sweeps: `dm_sandbox` its scratch directory, `dm_mount` its mount, and the
+//! launcher its egress socket, each named for or locked by the launcher that made it.
+//! Its render stays: nothing records which launcher a render belongs to.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -85,16 +87,28 @@ impl Stops {
         {
             let [(n1, mut s1), (n2, mut s2), (n3, mut s3)] = self.signals;
             let mut flow = std::pin::pin!(flow);
+            // the signals first: a harness the same hangup ended returns into a flow that
+            // would print to the terminal that hung up
             let signal = tokio::select! {
-                r = &mut flow => return r,
+                biased;
                 _ = s1.recv() => n1,
                 _ = s2.recv() => n2,
                 _ = s3.recv() => n3,
+                r = &mut flow => return r,
             };
             dm_sandbox::stop::stop();
-            say(signal);
+            if !say(signal) || signal == 1 {
+                // nowhere to say anything: what the flow and the finish print goes nowhere,
+                // rather than ending the launcher in a panic before it cleans up
+                dm_sandbox::stop::quiet_standard_streams().ok();
+            }
             while IN_FLIGHT.load(Ordering::SeqCst) > 0 {
                 tokio::select! {
+                    biased;
+                    // told twice: stop waiting for the cleanup
+                    _ = s1.recv() => std::process::exit(128 + n1),
+                    _ = s2.recv() => std::process::exit(128 + n2),
+                    _ = s3.recv() => std::process::exit(128 + n3),
                     _ = &mut flow => break,
                     () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
                 }
@@ -108,10 +122,10 @@ impl Stops {
     }
 }
 
-/// Say on standard error that a signal stops the launcher. A terminal that hung up
-/// refuses the write, which is then not said.
+/// Say on standard error that a signal stops the launcher. Whether it was said: a
+/// terminal that hung up refuses the write.
 #[cfg(unix)]
-fn say(signal: i32) {
+fn say(signal: i32) -> bool {
     use std::io::Write;
     let name = match signal {
         1 => "SIGHUP",
@@ -119,5 +133,5 @@ fn say(signal: i32) {
         _ => "SIGTERM",
     };
     let line = format!("memory: {name}: ending the run and cleaning up\n");
-    let _ = std::io::stderr().write_all(line.as_bytes());
+    std::io::stderr().write_all(line.as_bytes()).is_ok()
 }

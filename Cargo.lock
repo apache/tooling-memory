@@ -959,6 +959,7 @@ version = "0.1.0"
 dependencies = [
  "dm-server",
  "fuser",
+ "nix 0.31.3",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
