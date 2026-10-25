@@ -75,8 +75,31 @@ pub fn quiet_standard_streams() -> std::io::Result<()> {
 /// Count `child` among the runs [`stop`] kills, until the returned value is dropped;
 /// killed at once when [`stop`] has already been called. Called before the child is
 /// waited for, while its pid is still its own.
-pub(crate) fn register(child: &std::process::Child) -> Registered<'static> {
-    RUNS.register(child)
+///
+/// With `group`, the child leads a process group of its own, and the whole group is
+/// killed: what the run left running in the background holds its output open.
+pub(crate) fn register(child: &std::process::Child, group: bool) -> Registered<'static> {
+    RUNS.register(child, group)
+}
+
+/// Whether this process ignores `signal`, as one started under `nohup`, or in the
+/// background by a shell without job control, ignores SIGHUP or SIGINT. A launcher keeps
+/// that: it does not stop on a signal it was started to ignore.
+#[must_use]
+pub fn ignored(signal: i32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: sigaction is plain data, for which all zeroes is a valid value.
+        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: sigaction with a null new action only reads the current one into `old`.
+        let r = unsafe { libc::sigaction(signal, std::ptr::null(), &raw mut old) };
+        r == 0 && old.sa_sigaction == libc::SIG_IGN
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        false
+    }
 }
 
 /// Runs spawned and not yet waited for, and whether they are being stopped.
@@ -108,8 +131,8 @@ impl Runs {
         self.stopping.load(Ordering::SeqCst)
     }
 
-    fn register(&self, child: &std::process::Child) -> Registered<'_> {
-        let h = Handle::of(child.id());
+    fn register(&self, child: &std::process::Child, group: bool) -> Registered<'_> {
+        let h = Handle::of(child.id(), group);
         let mut list = self.running();
         // read under the lock that stop takes after setting it: a run registered while
         // stop goes through its list is either in the list or sees the flag
@@ -140,12 +163,15 @@ impl Drop for Registered<'_> {
 /// not a number a later process may be given once it is reaped.
 struct Handle {
     pid: u32,
+    /// Whether the pid leads a process group of the run's own, killed with it.
+    #[cfg(unix)]
+    group: bool,
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
 }
 
 impl Handle {
-    fn of(pid: u32) -> Handle {
+    fn of(pid: u32, group: bool) -> Handle {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::FromRawFd;
@@ -157,15 +183,29 @@ impl Handle {
                 .filter(|fd| *fd >= 0)
                 // SAFETY: a descriptor pidfd_open just returned, owned by nothing else.
                 .map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
-            Handle { pid, pidfd }
+            Handle { pid, group, pidfd }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Handle { pid }
+            #[cfg(not(unix))]
+            let _ = group;
+            Handle {
+                pid,
+                #[cfg(unix)]
+                group,
+            }
         }
     }
 
     fn kill(&self) {
+        #[cfg(unix)]
+        if self.group {
+            if let Ok(pid) = libc::pid_t::try_from(self.pid) {
+                // SAFETY: kill of the process group this run's child leads; the leader is
+                // not yet waited for, so no other group has its number.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+        }
         #[cfg(target_os = "linux")]
         if let Some(fd) = &self.pidfd {
             use std::os::fd::AsRawFd;
@@ -222,9 +262,9 @@ mod tests {
     fn a_stop_kills_the_runs_in_flight_and_every_run_after_it() {
         let runs = Runs::new();
         let before = waiting();
-        let kept = runs.register(&before);
+        let kept = runs.register(&before, false);
         let mut done = Command::new("/bin/sh").args(["-c", ":"]).spawn().unwrap();
-        let gone = runs.register(&done);
+        let gone = runs.register(&done, false);
         done.wait().unwrap();
         drop(gone);
         assert_eq!(runs.running().len(), 1);
@@ -237,7 +277,53 @@ mod tests {
         drop(kept);
         assert!(runs.running().is_empty());
         let after = waiting();
-        let _r = runs.register(&after);
+        let _r = runs.register(&after, false);
         assert!(killed(after), "a run spawned after the stop is killed");
+    }
+
+    #[test]
+    fn a_stop_kills_a_grouped_run_and_what_it_left_in_the_background() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let runs = Runs::new();
+        let mut leader = Command::new("/bin/sh");
+        leader
+            .args(["-c", "/bin/sleep 300 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut leader = leader.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let background: u32 = line.trim().parse().unwrap();
+        let _r = runs.register(&leader, true);
+        assert!(process_runs(background));
+
+        runs.stop();
+
+        assert!(killed(leader));
+        let gone = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            !process_runs(background)
+        });
+        if !gone {
+            Command::new("kill")
+                .args(["-KILL", &background.to_string()])
+                .status()
+                .ok();
+        }
+        assert!(gone, "the background child goes with its group");
+    }
+
+    #[test]
+    fn a_signal_this_process_ignores_is_said_to_be_ignored() {
+        assert!(!ignored(libc::SIGUSR2));
+        // SAFETY: setting SIGUSR2, which nothing in this test binary uses, to ignored.
+        unsafe { libc::signal(libc::SIGUSR2, libc::SIG_IGN) };
+        assert!(ignored(libc::SIGUSR2));
+        // SAFETY: as above, back to the default.
+        unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
+        assert!(!ignored(libc::SIGUSR2));
     }
 }

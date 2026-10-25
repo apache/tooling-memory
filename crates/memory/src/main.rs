@@ -1986,6 +1986,14 @@ fn sweep_sockets(run_dir: &Path) -> Vec<PathBuf> {
                 if !e.file_type().ok()?.is_socket() {
                     return None;
                 }
+                // a pid names a process in this pid namespace only: a launcher in
+                // another, sharing the root, still listens, and a stopped one still
+                // takes the connection into its backlog
+                let refused = std::os::unix::net::UnixStream::connect(e.path())
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused);
+                if !refused {
+                    return None;
+                }
             }
             std::fs::remove_file(e.path()).ok()?;
             Some(e.path())
@@ -2962,16 +2970,19 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     )
     .await?;
     let code = stops
-        .around(async {
-            let code = match prompt {
-                Some(prompt) => work::prompted(&session, &prompt, &args, no_handoff).await?,
-                None => work::interactive(&session, &args).await?,
-            };
-            if mine_after {
-                session.mine(mine_model.as_deref(), mine_via).await?;
-            }
-            Ok(code)
-        })
+        .around(
+            async {
+                let code = match prompt {
+                    Some(prompt) => work::prompted(&session, &prompt, &args, no_handoff).await?,
+                    None => work::interactive(&session, &args).await?,
+                };
+                if mine_after {
+                    session.mine(mine_model.as_deref(), mine_via).await?;
+                }
+                Ok(code)
+            },
+            session.abandon(),
+        )
         .await?;
     session.finish(code).await;
     std::process::exit(code);
@@ -3055,7 +3066,9 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         prefetch: !no_prefetch,
         task,
     };
-    let code = stops.around(work::run(&session, &options)).await?;
+    let code = stops
+        .around(work::run(&session, &options), session.abandon())
+        .await?;
     session.finish(code).await;
     std::process::exit(code);
 }
@@ -3865,6 +3878,18 @@ impl Session {
         }
     }
 
+    /// What a launcher told twice to stop does before it exits at once: remove the
+    /// socket and the render, which no sweep removes, and put the task a worker holds
+    /// back in the pool. The run in flight, its mount and its scratch directory, end
+    /// with the launcher and are swept by the next one.
+    pub async fn abandon(&self) {
+        std::fs::remove_file(&self.p.socket).ok();
+        std::fs::remove_dir_all(&self.p.projection).ok();
+        if let Some(id) = work::holding() {
+            self.p.memory.release(&id, None).await.ok();
+        }
+    }
+
     /// Stop serving, report usage, take the transcripts the record now keeps out of the
     /// private home, and tell the host the final code where there is one. After mining,
     /// which reads the home's copy.
@@ -3971,9 +3996,17 @@ async fn run_unconfined(
         }
     }
     cmd.args(args);
-    // on a thread of its own, so a launcher told to stop hears the signal while it runs
-    let (code, out, r) =
-        tokio::task::spawn_blocking(move || dm_sandbox::measure::run(&mut cmd, capture)).await??;
+    // on a thread of its own, so a launcher told to stop hears the signal while it runs;
+    // a headless run in a process group of its own, so a stop kills what it left in the
+    // background too, and an interactive one in the terminal's foreground group
+    let (code, out, r) = tokio::task::spawn_blocking(move || {
+        if capture {
+            dm_sandbox::measure::run_grouped(&mut cmd, capture)
+        } else {
+            dm_sandbox::measure::run(&mut cmd, capture)
+        }
+    })
+    .await??;
     Ok((
         code,
         capture.then(|| String::from_utf8_lossy(&out).into_owned()),
@@ -5364,7 +5397,12 @@ mod socket_sweep_tests {
             .unwrap();
         let live = live_child.id();
         let stale = run_dir.join(format!("egress-{dead}.sock"));
-        let _stale = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+        // the file a listener leaves when its process dies: nothing answers there
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        // a dead pid's name on a socket something still listens on: a launcher in
+        // another pid namespace, whose pid means nothing here
+        let elsewhere = run_dir.join(format!("egress-{dead}2.sock"));
+        let _elsewhere = std::os::unix::net::UnixListener::bind(&elsewhere).unwrap();
         let held = run_dir.join(format!("egress-{live}.sock"));
         let _held = std::os::unix::net::UnixListener::bind(&held).unwrap();
         let own = run_dir.join(format!("egress-{}.sock", std::process::id()));
@@ -5386,7 +5424,7 @@ mod socket_sweep_tests {
         live_child.wait().unwrap();
         assert_eq!(swept, vec![stale.clone()]);
         assert!(!stale.exists());
-        for kept in [&held, &own, &file, &other, &target] {
+        for kept in [&held, &own, &file, &other, &target, &elsewhere] {
             assert!(kept.exists(), "{}", kept.display());
         }
         assert!(link.is_symlink());

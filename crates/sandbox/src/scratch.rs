@@ -34,6 +34,11 @@ impl Scratch {
         let failed = |e: &dyn std::fmt::Display| Error::Confine(format!("{}: {e}", path.display()));
         std::fs::create_dir_all(&path).map_err(|e| failed(&e))?;
         let dir = open_dir(&path).map_err(|e| failed(&e))?;
+        // one another user made first, or one anyone may write into, is not built in
+        let meta = dir.metadata().map_err(|e| failed(&e))?;
+        if meta.uid() != getuid().as_raw() || meta.mode() & 0o002 != 0 {
+            return Err(failed(&"not this user's own directory"));
+        }
         let lock = Flock::lock(dir, FlockArg::LockExclusiveNonblock)
             .map_err(|(_, e)| failed(&format!("held by another process: {e}")))?;
         if !still_at(&path, &lock) {
@@ -209,6 +214,17 @@ mod tests {
         assert!(linked.is_symlink());
         assert!(outside.path().is_dir());
         assert!(full.join("kept").is_file());
+    }
+
+    #[test]
+    fn a_directory_anyone_may_write_into_is_not_built_in() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = dir(tmp.path());
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Scratch::make(tmp.path()).is_err());
+        assert!(path.is_dir(), "left as it was");
     }
 
     #[test]

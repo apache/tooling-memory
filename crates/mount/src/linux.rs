@@ -111,15 +111,18 @@ pub(crate) fn own(at: &Path) -> Result<Owner, Error> {
             source: e,
         })?;
     }
-    let file = open_lock(&path, true).map_err(failed)?;
-    let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock)
-        .map_err(|(_, e)| failed(std::io::Error::from(e)))?;
-    if !still_at(&path, &lock) {
-        return Err(failed(std::io::Error::other(
-            "removed while it was being locked",
-        )));
+    // twice: a sweep can remove a free record between its open here and its lock
+    for _ in 0..2 {
+        let file = open_lock(&path, true).map_err(failed)?;
+        let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| failed(std::io::Error::from(e)))?;
+        if still_at(&path, &lock) {
+            return Ok(Owner { path, _lock: lock });
+        }
     }
-    Ok(Owner { path, _lock: lock })
+    Err(failed(std::io::Error::other(
+        "removed while it was being locked",
+    )))
 }
 
 /// What the record of the mount at `at` says.

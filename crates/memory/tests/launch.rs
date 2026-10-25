@@ -948,6 +948,32 @@ fn start_confined(root: &Path, work: &Path, tmp: &Path) -> std::process::Child {
 /// `amem <args>` for the claude harness on a key, in `work`, as [`start_confined`] runs it.
 #[cfg(target_os = "linux")]
 fn start_amem(root: &Path, work: &Path, tmp: &Path, args: &[&str]) -> std::process::Child {
+    amem_in(root, work, tmp, args)
+        .stdout(std::fs::File::create(work.with_extension("out")).unwrap())
+        .spawn()
+        .unwrap()
+}
+
+/// As [`start_amem`], with standard output a pipe whose reader is already gone: a
+/// launcher piped into a program that has exited.
+#[cfg(target_os = "linux")]
+fn start_amem_into_a_closed_pipe(
+    root: &Path,
+    work: &Path,
+    tmp: &Path,
+    args: &[&str],
+) -> std::process::Child {
+    let mut child = amem_in(root, work, tmp, args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    child
+}
+
+/// The command [`start_amem`] runs, its standard output not yet set.
+#[cfg(target_os = "linux")]
+fn amem_in(root: &Path, work: &Path, tmp: &Path, args: &[&str]) -> Command {
     let mut cmd = memory();
     cmd.args(["--root", root.to_str().unwrap()])
         .args(args)
@@ -957,9 +983,8 @@ fn start_amem(root: &Path, work: &Path, tmp: &Path, args: &[&str]) -> std::proce
         .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
         .env("TMPDIR", tmp)
         .stdin(Stdio::null())
-        .stdout(std::fs::File::create(work.with_extension("out")).unwrap())
         .stderr(std::fs::File::create(work.with_extension("err")).unwrap());
-    cmd.spawn().unwrap()
+    cmd
 }
 
 /// A working tree whose harness says it started, then runs until it is killed.
@@ -1444,6 +1469,191 @@ fn a_worker_told_to_stop_releases_its_task_with_a_handoff_and_claims_no_other() 
             assert!(t["handoff"].is_null(), "never claimed: {t}");
         }
     }
+}
+
+/// A worker in `dir/work` whose harness prints, says it started, then runs until killed;
+/// one task filed for it.
+#[cfg(target_os = "linux")]
+fn a_task_and_a_printing_sleeper(root: &Path, dir: &Path) -> (String, PathBuf) {
+    let id = file_task(root, "First");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(&work, "echo working\ntouch ./started\nsleep 300");
+    (id, work)
+}
+
+/// Whether task `id` is back in the pool, and with a handoff.
+#[cfg(target_os = "linux")]
+fn released(root: &Path, id: &str) -> (bool, bool) {
+    let t = cli(root, &["task", "get", id]);
+    (t["status"] == "admitted", t["handoff"].as_str().is_some())
+}
+
+/// A launcher piped into a reader that has gone: the answer it prints after a stop
+/// goes nowhere, and the worker settles its task and the launch finishes all the same.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_whose_output_reader_has_gone_still_settles_and_cleans_up() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (id, work) = a_task_and_a_printing_sleeper(&root, dir.path());
+    let _reap = Reap(dir.path().to_path_buf());
+    for args in [
+        &["work", "--loop", "--lease-seconds", "60"][..],
+        &["launch", "--prompt", "hello", "--no-handoff"][..],
+    ] {
+        std::fs::remove_file(work.join("started")).ok();
+        let mut launch = start_amem_into_a_closed_pipe(&root, &work, &tmp, args);
+        assert!(started(&work, 60), "{args:?}");
+        signal(&launch, "TERM");
+        let status = exited(&mut launch, 30);
+        let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(128 + 15),
+            "{args:?}: {err}"
+        );
+        assert_eq!(
+            names_in(&root.join("state/run")),
+            Vec::<String>::new(),
+            "{err}"
+        );
+        assert_eq!(
+            names_in(&root.join("state/projection/claude")),
+            Vec::<String>::new()
+        );
+    }
+    assert_eq!(released(&root, &id), (true, true), "back with a handoff");
+}
+
+/// A launcher started to ignore SIGHUP, under `nohup` or by a shell without job control,
+/// goes on ignoring it: the run is not stopped.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_started_to_ignore_sighup_is_not_stopped_by_it() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let work = sleeper(dir.path(), "work");
+    let _reap = Reap(dir.path().to_path_buf());
+    let line = format!(
+        "trap '' HUP; exec {} --root {} launch --prompt hello --no-handoff --harness claude --auth key --workdir {}",
+        env!("CARGO_BIN_EXE_amem"),
+        root.display(),
+        work.display()
+    );
+    let mut launch = Command::new("/bin/sh")
+        .args(["-c", &line])
+        .env("PATH", path_with(&work.join("bins")))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .env("TMPDIR", &tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(work.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    assert!(started(&work, 60));
+
+    signal(&launch, "HUP");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert!(
+        launch.try_wait().unwrap().is_none(),
+        "the run goes on: {err}"
+    );
+    assert_eq!(mounts_under(&root).len(), 1);
+    signal(&launch, "TERM");
+    assert_eq!(
+        exited(&mut launch, 30).and_then(|s| s.code()),
+        Some(128 + 15)
+    );
+}
+
+/// A headless unconfined run that left a child in the background, holding its output
+/// open: a stop kills the child too, and the worker settles its task and exits.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unconfined_worker_told_to_stop_ends_what_its_harness_left_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let id = file_task(&root, "First");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(&work, "touch ./started\ntail -f \"$PWD/started\" &\nwait");
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut worker = start_amem(
+        &root,
+        &work,
+        &tmp,
+        &["work", "--unconfined", "--loop", "--lease-seconds", "60"],
+    );
+    assert!(
+        started(&work, 60),
+        "{}",
+        std::fs::read_to_string(work.with_extension("err")).unwrap()
+    );
+    signal(&worker, "TERM");
+    let status = exited(&mut worker, 15);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    assert!(gone_within(&work, 5), "{:?}", processes_under(&work));
+    assert_eq!(released(&root, &id), (true, true), "back with a handoff");
+}
+
+/// Told twice to stop, quickly, a worker does not wait for the run's cleanup, but it
+/// leaves nothing no sweep removes: its task is back in the pool, its render and its
+/// socket are gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_told_twice_to_stop_releases_its_task_and_removes_its_render() {
+    if !namespaces_available() {
+        eprintln!("skipping: unprivileged namespaces are not available here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (id, work) = a_task_and_a_printing_sleeper(&root, dir.path());
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut worker = start_amem(
+        &root,
+        &work,
+        &tmp,
+        &["work", "--loop", "--lease-seconds", "60"],
+    );
+    assert!(started(&work, 60));
+    signal(&worker, "INT");
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    signal(&worker, "INT");
+    let status = exited(&mut worker, 30);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 2), "{err}");
+    assert!(released(&root, &id).0, "back in the pool: {err}");
+    assert_eq!(
+        names_in(&root.join("state/projection/claude")),
+        Vec::<String>::new(),
+        "the render"
+    );
+    assert_eq!(
+        names_in(&root.join("state/run")),
+        Vec::<String>::new(),
+        "the socket"
+    );
 }
 
 // ---- the wslc backend's inside half, driven by a fake host ----

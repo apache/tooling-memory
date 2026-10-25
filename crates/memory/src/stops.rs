@@ -44,14 +44,34 @@ impl Drop for InFlight {
 }
 
 /// The signals that stop a launcher, listened for from when this is made, so one that
-/// arrives while the session starts is not the process's death.
+/// arrives while the session starts is not the process's death. A signal the launcher
+/// was started to ignore, as under `nohup`, is not listened for and stays ignored.
 pub struct Stops {
     #[cfg(unix)]
-    signals: [(i32, tokio::signal::unix::Signal); 3],
+    signals: [(i32, Option<tokio::signal::unix::Signal>); 3],
+}
+
+/// The first of the signals listened for, by number.
+#[cfg(unix)]
+async fn first(signals: &mut [(i32, Option<tokio::signal::unix::Signal>); 3]) -> i32 {
+    async fn one(s: &mut Option<tokio::signal::unix::Signal>) {
+        match s {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+    }
+    let [(n1, s1), (n2, s2), (n3, s3)] = signals;
+    tokio::select! {
+        () = one(s1) => *n1,
+        () = one(s2) => *n2,
+        () = one(s3) => *n3,
+    }
 }
 
 impl Stops {
-    /// Listen for SIGTERM, SIGINT and SIGHUP from now on.
+    /// Listen for SIGTERM, SIGINT and SIGHUP from now on, each that is not ignored.
     ///
     /// # Errors
     ///
@@ -60,11 +80,21 @@ impl Stops {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
+            let listen = |n: i32, kind: SignalKind| -> std::io::Result<_> {
+                Ok((
+                    n,
+                    if dm_sandbox::stop::ignored(n) {
+                        None
+                    } else {
+                        Some(signal(kind)?)
+                    },
+                ))
+            };
             Ok(Stops {
                 signals: [
-                    (15, signal(SignalKind::terminate())?),
-                    (2, signal(SignalKind::interrupt())?),
-                    (1, signal(SignalKind::hangup())?),
+                    listen(15, SignalKind::terminate())?,
+                    listen(2, SignalKind::interrupt())?,
+                    listen(1, SignalKind::hangup())?,
                 ],
             })
         }
@@ -77,27 +107,31 @@ impl Stops {
     /// Run `flow`, a session's work, to its end, or until a signal stops it. On a signal
     /// every run is killed; the run in flight is let finish its cleanup, and whatever the
     /// flow would do after it is not done. Returns the flow's code, or 128 plus the
-    /// signal's number.
+    /// signal's number. A second signal while the cleanup runs ends the wait: `hard`,
+    /// quick cleanup that must not be left out, runs, and the launcher exits.
     ///
     /// # Errors
     ///
     /// The flow's, when it ends of itself.
-    pub async fn around(self, flow: impl Future<Output = Fallible<i32>>) -> Fallible<i32> {
+    pub async fn around(
+        self,
+        flow: impl Future<Output = Fallible<i32>>,
+        hard: impl Future<Output = ()>,
+    ) -> Fallible<i32> {
         #[cfg(unix)]
         {
-            let [(n1, mut s1), (n2, mut s2), (n3, mut s3)] = self.signals;
+            let mut signals = self.signals;
             let mut flow = std::pin::pin!(flow);
             // the signals first: a harness the same hangup ended returns into a flow that
             // would print to the terminal that hung up
             let signal = tokio::select! {
                 biased;
-                _ = s1.recv() => n1,
-                _ = s2.recv() => n2,
-                _ = s3.recv() => n3,
+                n = first(&mut signals) => n,
                 r = &mut flow => return r,
             };
             dm_sandbox::stop::stop();
-            if !say(signal) || signal == 1 {
+            let said = say(signal);
+            if !said || (signal == 1 && on_a_terminal()) {
                 // nowhere to say anything: what the flow and the finish print goes nowhere,
                 // rather than ending the launcher in a panic before it cleans up
                 dm_sandbox::stop::quiet_standard_streams().ok();
@@ -105,10 +139,13 @@ impl Stops {
             while IN_FLIGHT.load(Ordering::SeqCst) > 0 {
                 tokio::select! {
                     biased;
-                    // told twice: stop waiting for the cleanup
-                    _ = s1.recv() => std::process::exit(128 + n1),
-                    _ = s2.recv() => std::process::exit(128 + n2),
-                    _ = s3.recv() => std::process::exit(128 + n3),
+                    n = first(&mut signals) => {
+                        // told twice: stop waiting, but leave nothing the next launch
+                        // cannot sweep
+                        let quick = std::time::Duration::from_secs(5);
+                        tokio::time::timeout(quick, hard).await.ok();
+                        std::process::exit(128 + n);
+                    }
                     _ = &mut flow => break,
                     () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
                 }
@@ -117,9 +154,17 @@ impl Stops {
         }
         #[cfg(not(unix))]
         {
+            let _ = hard;
             flow.await
         }
     }
+}
+
+/// Whether standard output or standard error is a terminal, which a SIGHUP says has gone.
+#[cfg(unix)]
+fn on_a_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal() || std::io::stderr().is_terminal()
 }
 
 /// Say on standard error that a signal stops the launcher. Whether it was said: a
@@ -134,4 +179,17 @@ fn say(signal: i32) -> bool {
     };
     let line = format!("memory: {name}: ending the run and cleaning up\n");
     std::io::stderr().write_all(line.as_bytes()).is_ok()
+}
+
+/// Write `text` to standard output, and a line end after it when it has none. A reader
+/// that has gone, a closed pipe, is not an error here: the launcher goes on to settle and
+/// clean up, where `print!` would panic.
+pub fn answer(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes());
+    if !text.ends_with('\n') {
+        let _ = out.write_all(b"\n");
+    }
+    let _ = out.flush();
 }

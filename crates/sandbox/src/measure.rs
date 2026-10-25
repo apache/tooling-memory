@@ -39,12 +39,37 @@ pub struct Resources {
 ///
 /// When the process cannot be spawned, its output read, or it cannot be waited for.
 pub fn run(cmd: &mut Command, capture: bool) -> std::io::Result<(i32, Vec<u8>, Resources)> {
+    run_as(cmd, capture, false)
+}
+
+/// As [`run`], with the process in a process group of its own, which
+/// [`crate::stop::stop`] kills whole: a background child the run left holds its output
+/// open, and the read of it would not end. Not for a run on the terminal, which must be
+/// in the terminal's foreground group to read it.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn run_grouped(cmd: &mut Command, capture: bool) -> std::io::Result<(i32, Vec<u8>, Resources)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    run_as(cmd, capture, cfg!(unix))
+}
+
+fn run_as(
+    cmd: &mut Command,
+    capture: bool,
+    group: bool,
+) -> std::io::Result<(i32, Vec<u8>, Resources)> {
     let started = Instant::now();
     if capture {
         cmd.stdin(Stdio::null()).stdout(Stdio::piped());
     }
     let mut child = cmd.spawn()?;
-    let _stoppable = crate::stop::register(&child);
+    let _stoppable = crate::stop::register(&child, group);
     let mut out = Vec::new();
     if let Some(mut s) = child.stdout.take() {
         s.read_to_end(&mut out)?;
