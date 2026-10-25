@@ -447,20 +447,23 @@ pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>, Resources), Error> {
 }
 
 fn measured(plan: &Plan, capture: bool) -> Result<(i32, Vec<u8>, Resources), Error> {
-    let (mut cmd, root) = command(plan)?;
+    let scratch = crate::scratch::Scratch::make(&std::env::temp_dir())?;
+    let (mut cmd, _) = command(plan)?;
     let ran = crate::measure::run(&mut cmd, capture)
         .map_err(|e| confine(format!("spawn {}: {e}", plan.argv[0])));
-    std::fs::remove_dir_all(&root).ok();
+    drop(scratch);
     ran
 }
 
 /// The command that builds the sandbox in `pre_exec` and execs the relay, and the
-/// scratch directory it pivots into, for the caller to remove.
+/// scratch directory it pivots into, which the caller holds as a [`crate::scratch::Scratch`].
 fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
-    let root = std::env::temp_dir().join(format!("memory-sandbox-{}", std::process::id()));
-    std::fs::create_dir_all(&root).map_err(|e| confine(format!("{}: {e}", root.display())))?;
+    // made and locked by the caller's Scratch; not made again here, where it would
+    // not be locked
+    let root = crate::scratch::dir(&std::env::temp_dir());
+    let launcher = nix::unistd::getpid();
 
     let plan2 = plan.clone();
     let root2 = root.clone();
@@ -482,10 +485,17 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
                 enter_user_namespace(uid, gid)?;
                 sethostname(&plan2.hostname).map_err(|e| confine(format!("hostname: {e}")))?;
                 loopback_up()?;
+                // the run ends with the launcher, however the launcher ends
+                die_with_parent(launcher)?;
+                // the intermediate, as pid 1 can still tell it after the fork: its
+                // parent is outside its namespace, and getppid reads 0 there
+                let intermediate = pidfd_of_self();
                 // before build_root: it mounts this namespace's procfs, which must be
                 // made after the fork that enters the namespace and before pivot_root
                 // takes the host's procfs out of view
                 become_pid_one()?;
+                // pid 1: the namespace, and the harness in it, ends with the intermediate
+                die_with_intermediate(intermediate)?;
                 build_root(&plan2, &root2)?;
                 Ok(())
             };
@@ -668,6 +678,56 @@ fn close_from_three() {
     for fd in 3..open_files_limit() {
         // SAFETY: close of a descriptor number; one that is not open fails with EBADF.
         unsafe { libc::close(fd) };
+    }
+}
+
+/// Have the kernel SIGKILL this process when the thread that forked it ends, and fail if
+/// `parent` is no longer its parent: gone before the request took hold. Runs between fork
+/// and exec; the setting outlives the exec. Allocates only to say why it failed.
+fn die_with_parent(parent: nix::unistd::Pid) -> Result<(), Error> {
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|e| confine(format!("parent-death signal: {e}")))?;
+    if nix::unistd::getppid() == parent {
+        Ok(())
+    } else {
+        Err(confine("the launcher has gone"))
+    }
+}
+
+/// A pidfd for this process, close-on-exec, or -1 where the kernel has none (before 5.3).
+fn pidfd_of_self() -> libc::c_int {
+    // SAFETY: pidfd_open with this process's pid and no flags; it returns a new
+    // descriptor or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+    libc::c_int::try_from(fd).unwrap_or(-1)
+}
+
+/// As [`die_with_parent`] for pid 1, whose parent is the intermediate behind `pidfd`:
+/// fail if the intermediate has already exited, which makes the pidfd readable. Without
+/// a pidfd the check is not made, and an intermediate that dies between its fork and
+/// the request leaves pid 1 to run until the harness ends.
+fn die_with_intermediate(pidfd: libc::c_int) -> Result<(), Error> {
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|e| confine(format!("parent-death signal: {e}")))?;
+    if pidfd < 0 {
+        return Ok(());
+    }
+    let mut poll = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll on one valid pollfd, without waiting; then close of the pidfd this
+    // process owns.
+    let gone = unsafe {
+        let ready = libc::poll(&raw mut poll, 1, 0);
+        libc::close(pidfd);
+        ready > 0
+    };
+    if gone {
+        Err(confine("the intermediate has gone"))
+    } else {
+        Ok(())
     }
 }
 

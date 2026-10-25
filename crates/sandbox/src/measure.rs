@@ -39,34 +39,154 @@ pub struct Resources {
 ///
 /// When the process cannot be spawned, its output read, or it cannot be waited for.
 pub fn run(cmd: &mut Command, capture: bool) -> std::io::Result<(i32, Vec<u8>, Resources)> {
+    run_as(cmd, capture, false)
+}
+
+/// As [`run`], with the process in a process group of its own, which
+/// [`crate::stop::stop`] kills whole with what the run left in the background, when this
+/// process has no controlling terminal. With one, the process stays in the terminal's
+/// foreground group: in a group of its own it would be stopped by the first touch of
+/// the terminal, a password prompt or `stty`.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn run_grouped(cmd: &mut Command, capture: bool) -> std::io::Result<(i32, Vec<u8>, Resources)> {
+    #[cfg(unix)]
+    if !crate::stop::has_a_terminal() {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        return run_as(cmd, capture, true);
+    }
+    run_as(cmd, capture, false)
+}
+
+/// How long a stopped run's output is read for once the run itself has gone: what it
+/// left in the background, and did not die with it, may hold the output open.
+const GRACE: Duration = Duration::from_secs(2);
+
+fn run_as(
+    cmd: &mut Command,
+    capture: bool,
+    group: bool,
+) -> std::io::Result<(i32, Vec<u8>, Resources)> {
     let started = Instant::now();
     if capture {
         cmd.stdin(Stdio::null()).stdout(Stdio::piped());
     }
     let mut child = cmd.spawn()?;
+    let stoppable = crate::stop::register(&child, group);
+    // read on a thread of its own, so the run is waited for while its output is read
+    let read = child.stdout.take().map(|mut s| {
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (done, ended) = std::sync::mpsc::channel();
+        let into = out.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let r = loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => lock(&into).extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => break Err(e),
+                }
+            };
+            done.send(r).ok();
+        });
+        (out, ended)
+    });
+    exited(&child);
+    // read to the end while the exited child is not yet reaped: a stop meanwhile still
+    // kills its process group, what it left in the background, and its number is
+    // given to no other process or group while it is unreaped
     let mut out = Vec::new();
-    if let Some(mut s) = child.stdout.take() {
-        s.read_to_end(&mut out)?;
+    let mut read_failed = Ok(());
+    if let Some((buf, ended)) = read {
+        read_failed = read_until_ended(&ended);
+        out = std::mem::take(&mut *lock(&buf));
     }
-    let (code, mut r) = wait(child, cmd.get_program())?;
+    // whether a stop killed it while it ran: then a SIGKILL it ended with was the stop's
+    let stopped = stoppable.killed();
+    // no longer stopped once it is reaped, after which its numbers may be given again
+    drop(stoppable);
+    let (code, mut r) = wait(child, cmd.get_program(), stopped)?;
+    read_failed?;
     r.wall_ms = millis(started.elapsed());
     Ok((code, out, r))
 }
 
+fn lock(m: &std::sync::Mutex<Vec<u8>>) -> std::sync::MutexGuard<'_, Vec<u8>> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Wait for the reader to reach the end of the output, or, once the launcher is told
+/// to stop, for [`GRACE`] at most: what the run left in the background may hold it open.
+fn read_until_ended(ended: &std::sync::mpsc::Receiver<std::io::Result<()>>) -> std::io::Result<()> {
+    let mut since: Option<Instant> = None;
+    loop {
+        match ended.recv_timeout(Duration::from_millis(50)) {
+            Ok(r) => return r,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if crate::stop::stopping() {
+                    let at = *since.get_or_insert_with(Instant::now);
+                    if at.elapsed() > GRACE {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Wait for `child` to exit, without reaping it.
+#[cfg(unix)]
+fn exited(child: &Child) {
+    let pid: libc::id_t = child.id();
+    loop {
+        // SAFETY: siginfo_t is plain data, for which all zeroes is a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid on our own child, not yet reaped, leaving it unreaped (WNOWAIT),
+        // with a valid pointer to write into.
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn exited(_child: &Child) {}
+
 /// The code a process ended with, as a shell gives it: its own exit code, or 128 plus
 /// the number of the signal that killed it. A death by signal is said on standard error,
 /// naming `program`, since the code alone does not tell it from an exit; SIGINT and
-/// SIGPIPE are not, as a shell does not say them.
+/// SIGPIPE are not, as a shell does not say them, nor a SIGKILL once
+/// [`crate::stop::stop`] has sent it.
 #[must_use]
 pub fn exit_code(status: ExitStatus, program: &OsStr) -> i32 {
+    exit_code_as(status, program, crate::stop::stopping())
+}
+
+/// As [`exit_code`], with `stopped` whether a stop killed the process while it ran: a
+/// SIGKILL from before the stop, an out-of-memory kill say, is said.
+fn exit_code_as(status: ExitStatus, program: &OsStr, stopped: bool) -> i32 {
     #[cfg(not(unix))]
-    let _ = program;
+    let _ = (program, stopped);
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            if is_said(signal) {
+            let stopped = signal == libc::SIGKILL && stopped;
+            if is_said(signal) && !stopped {
                 let core = if status.core_dumped() {
                     ", core dumped"
                 } else {
@@ -142,7 +262,7 @@ pub fn own_cpu_ms() -> (u64, u64) {
 }
 
 #[cfg(unix)]
-fn wait(child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
+fn wait(child: Child, program: &OsStr, stopped: bool) -> std::io::Result<(i32, Resources)> {
     use std::os::unix::process::ExitStatusExt;
     let pid = libc::pid_t::try_from(child.id()).map_err(std::io::Error::other)?;
     let mut status: libc::c_int = 0;
@@ -162,7 +282,7 @@ fn wait(child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
     // reaped above; dropping the handle does not wait again
     drop(child);
     Ok((
-        exit_code(ExitStatus::from_raw(status), program),
+        exit_code_as(ExitStatus::from_raw(status), program, stopped),
         Resources {
             wall_ms: 0,
             user_ms: timeval_ms(usage.ru_utime),
@@ -174,9 +294,9 @@ fn wait(child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
 }
 
 #[cfg(not(unix))]
-fn wait(mut child: Child, program: &OsStr) -> std::io::Result<(i32, Resources)> {
+fn wait(mut child: Child, program: &OsStr, stopped: bool) -> std::io::Result<(i32, Resources)> {
     let status = child.wait()?;
-    Ok((exit_code(status, program), Resources::default()))
+    Ok((exit_code_as(status, program, stopped), Resources::default()))
 }
 
 fn millis(d: Duration) -> u64 {

@@ -185,10 +185,7 @@ pub async fn prompted(
     let (code, output) = session.run(&argv, true).await?;
     let output = output.map(|o| answer_of(session, o));
     if let Some(out) = &output {
-        print!("{out}");
-        if !out.ends_with('\n') {
-            println!();
-        }
+        crate::stops::answer(out);
     }
     let mut after = handoff_ids(&client, None).await?;
     let wrote = after.difference(&before).next().is_some();
@@ -259,6 +256,12 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
     let client = Arc::new(client(session.memory()).await?);
     let mut last = NOTHING_TO_DO;
     loop {
+        // counted from before the claim until the task is settled: a launcher told to
+        // stop waits, and the task goes back to the pool with a handoff, as when the
+        // harness stops of itself. One told to stop claims nothing more.
+        let Ok(in_flight) = crate::stops::InFlight::enter() else {
+            return Ok(last);
+        };
         let claimed = match &options.task {
             Some(id) => client.claim(id, options.lease_seconds).await?,
             // a worker only claims: rank is the ledger's, moved along dependency edges
@@ -270,6 +273,7 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
             }
         };
         let Some(task) = claimed else {
+            drop(in_flight);
             if !options.keep_going {
                 eprintln!("memory: nothing claimable");
                 return Ok(if last == NOTHING_TO_DO {
@@ -281,11 +285,21 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
             tokio::time::sleep(options.idle).await;
             continue;
         };
+        if dm_sandbox::stop::stopping() {
+            // claimed while the stop came: not started, so back with no handoff
+            client.release(&task.id, None).await.ok();
+            return Ok(last);
+        }
         last = one(session, &client, &task, options).await?;
+        drop(in_flight);
         if options.task.is_some() {
             return Ok(last);
         }
-        if let Some(plan) = &options.mine {
+        if let Some(plan) = options
+            .mine
+            .as_ref()
+            .filter(|_| !dm_sandbox::stop::stopping())
+        {
             let via = if plan.via_harness {
                 crate::MineVia::Harness
             } else {
@@ -309,6 +323,7 @@ async fn one(
 ) -> Fallible<i32> {
     let lease_seconds = options.lease_seconds;
     eprintln!("memory: claimed {}: {}", task.id, task.title);
+    let holding = Holding::of(&task.id);
     let memory = session.memory();
     let platform = Platform::for_harness(&memory, session.harness()).await;
     let prompt = prompt_for(
@@ -341,7 +356,16 @@ async fn one(
         .run_task(&session.harness().headless(&prompt), true, Some(&task.id))
         .await;
     heartbeat.abort();
-    let (code, output) = run?;
+    let (code, output) = match run {
+        Ok(ran) => ran,
+        Err(e) => {
+            // a run refused because a stop came first leaves nothing to settle
+            if dm_sandbox::stop::stopping() {
+                client.release(&task.id, None).await.ok();
+            }
+            return Err(e);
+        }
+    };
     let output = output.map(|o| answer_of(session, o));
     let now = client.get_task(&task.id).await?;
     file_outbox(
@@ -353,12 +377,44 @@ async fn one(
     .await?;
     let output = output.unwrap_or_default();
     if !output.trim().is_empty() {
-        print!("{output}");
-        if !output.ends_with('\n') {
-            println!();
-        }
+        crate::stops::answer(&output);
     }
+    // settled from here: a launcher told twice to stop no longer releases it, as the
+    // release or completion below may already be done, and the task another's
+    drop(holding);
     settle(session.harness(), client, task, code, output).await
+}
+
+/// The task this worker holds, if any: what a launcher told twice to stop releases
+/// before it exits.
+static HOLDING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The task this worker holds, while it holds one.
+pub fn holding() -> Option<String> {
+    HOLDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// A task held, from its claim until it is settled.
+struct Holding;
+
+impl Holding {
+    fn of(id: &str) -> Holding {
+        *HOLDING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.to_string());
+        Holding
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        *HOLDING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 /// After the harness exits: a completed task stays complete; a task still held goes
