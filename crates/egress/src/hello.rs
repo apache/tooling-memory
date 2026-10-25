@@ -221,10 +221,14 @@ pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
     } else {
         (verdict as fn(&[u8], &str) -> Verdict, HELLO_MAX)
     };
+    const LATE: &str = "no whole ClientHello in time";
     let read = async {
         let mut chunk = [0u8; 4096];
         loop {
             match judge(&first, host) {
+                // the timeout below looks at the deadline only once this future waits, so
+                // bytes it finds ready after the deadline are refused here
+                Verdict::Allowed(_) if Instant::now() >= deadline => return Err(LATE.into()),
                 Verdict::Allowed(length) => {
                     let after = first.get(length..).map(<[u8]>::to_vec);
                     first.truncate(length);
@@ -250,7 +254,7 @@ pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
     };
     tokio::time::timeout_at(deadline, read)
         .await
-        .unwrap_or_else(|_| Err("no whole ClientHello in time".into()))
+        .unwrap_or_else(|_| Err(LATE.into()))
 }
 
 /// What an upstream's first bytes say.
@@ -337,10 +341,15 @@ where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
+    const LATE: &str = "no whole ServerHello in time";
     let read = async {
         let mut chunk = [0u8; 4096];
         loop {
             match answer(&seen) {
+                // as in [`read_hello`]: an answer found after the deadline is refused
+                Answer::Retry(_) | Answer::Other if Instant::now() >= deadline => {
+                    return Err(LATE.into())
+                }
                 Answer::Retry(length) => {
                     return Ok(Next::Retry(seen.get(length..).unwrap_or_default().to_vec()))
                 }
@@ -366,7 +375,7 @@ where
     };
     tokio::time::timeout_at(deadline, read)
         .await
-        .unwrap_or_else(|_| Err("no whole ServerHello in time".into()))
+        .unwrap_or_else(|_| Err(LATE.into()))
 }
 
 /// The ClientHello at the start of `first` and the bytes its records take; `None`
@@ -1265,6 +1274,55 @@ mod tests {
             again,
             Ok(Next::Retry(CCS.to_vec())),
             "a second request, seen as one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_hello_that_fills_a_record_may_follow_a_change_cipher_spec() {
+        let versions = (0x2b, vec![3, 4]);
+        let base = server_hello([0x5a; 32], &[versions.clone(), (0xff01, Vec::new())]).len();
+        let padding = (0xff01, vec![0; RECORD_MAX - base]);
+        let full = server_hello([0x5a; 32], &[versions, padding]);
+        assert_eq!(full.len(), RECORD_MAX, "the ServerHello fills one record");
+        let sent = [&CCS[..], &records(&full, RECORD_MAX)].concat();
+        let (mut upstream, mut from_upstream) = tokio::io::duplex(1 << 16);
+        let (mut to_client, _client) = tokio::io::duplex(1 << 16);
+        upstream.write_all(&sent).await.unwrap();
+        let deadline = soon(HELLO_WAIT);
+        let read = read_answer(&mut from_upstream, &mut to_client, Vec::new(), deadline).await;
+        assert_eq!(read, Ok(Next::Other));
+    }
+
+    #[tokio::test]
+    async fn bytes_that_are_ready_after_the_deadline_are_not_taken() {
+        let mut let_through = Vec::new();
+        let hello = records(&message(&[sni(&[HOST])]), 512);
+        // a hello already held, and one ready to be read
+        for (held, ready) in [(hello.clone(), Vec::new()), (Vec::new(), hello.clone())] {
+            let (mut client, mut egress) = tokio::io::duplex(4096);
+            client.write_all(&ready).await.unwrap();
+            let past = Instant::now();
+            let read = read_hello(&mut egress, HOST, false, held, past).await;
+            if read.as_ref().err().map(String::as_str) != Some("no whole ClientHello in time") {
+                let_through.push(format!("a hello: {:?}", read.map(|f| f.hello.len())));
+            }
+        }
+        // an answer already held, and one ready to be read
+        let plain = fixtures::plain_server_hello();
+        for (held, ready) in [(plain.clone(), Vec::new()), (Vec::new(), plain.clone())] {
+            let (mut upstream, mut from_upstream) = tokio::io::duplex(4096);
+            let (mut to_client, _client) = tokio::io::duplex(4096);
+            upstream.write_all(&ready).await.unwrap();
+            let past = Instant::now();
+            let read = read_answer(&mut from_upstream, &mut to_client, held, past).await;
+            if read != Err("no whole ServerHello in time".into()) {
+                let_through.push(format!("an answer: {read:?}"));
+            }
+        }
+        assert_eq!(
+            let_through,
+            Vec::<String>::new(),
+            "taken after the deadline"
         );
     }
 }
