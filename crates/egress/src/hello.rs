@@ -14,10 +14,13 @@
 //!
 //! What is checked: the first ClientHello, before the dial, which must end with the
 //! record that carries it; then the upstream's ServerHello, sent on to the client as it
-//! comes, and when that is a HelloRetryRequest, the second ClientHello, after an
-//! optional ChangeCipherSpec, held to the same rule before it goes upstream. Nothing the
-//! client sends after its first hello goes upstream until the ServerHello is read.
-//! After that the bytes are copied both ways unread.
+//! comes, and when that is a HelloRetryRequest, the second ClientHello, held to the same
+//! rule before it goes upstream. Before the second hello may come one ChangeCipherSpec
+//! and early data, application-data records the client sent with its first hello, which
+//! are encrypted, carry no name, and are skipped by a server that asked for a retry.
+//! Nothing the client sends after its first hello goes upstream until the ServerHello is
+//! read, and the answer to the second hello must not be a retry request again, which TLS
+//! 1.3 forbids. After that the bytes are copied both ways unread.
 //!
 //! What is not: the egress cannot see inside TLS. A front end that still routes on the
 //! HTTP Host header inside the session (domain fronting) can be asked for another
@@ -39,6 +42,17 @@ const RECORD_MAX: usize = 16 * 1024;
 /// hundred bytes to a few kilobytes; one that needs more is refused.
 pub(crate) const HELLO_MAX: usize = RECORD_MAX + 5;
 
+/// The longest TLS record a protected payload takes: a fragment, and 256 bytes.
+const CIPHERTEXT_MAX: usize = RECORD_MAX + 256;
+
+/// The most early data a client may send before its second ClientHello: four records of
+/// the largest size, with their headers.
+pub(crate) const EARLY_DATA_MAX: usize = 4 * (CIPHERTEXT_MAX + 5);
+
+/// The most of the client's bytes the egress holds before it decides on its second
+/// ClientHello: a ChangeCipherSpec, the most early data, and a hello of [`HELLO_MAX`].
+pub(crate) const RETRY_MAX: usize = CHANGE_CIPHER_SPEC.len() + EARLY_DATA_MAX + HELLO_MAX;
+
 /// How long a tunnel has, once it opens, for the client's ClientHello, the upstream's
 /// ServerHello, and after a HelloRetryRequest the second ClientHello, all together.
 pub(crate) const HELLO_WAIT: Duration = Duration::from_secs(10);
@@ -59,6 +73,7 @@ pub(crate) const RETRY_RANDOM: [u8; 32] = [
 const CHANGE_CIPHER_SPEC: [u8; 6] = [20, 3, 3, 0, 1, 1];
 
 const HANDSHAKE: u8 = 22;
+const APPLICATION_DATA: u8 = 23;
 const CLIENT_HELLO: u8 = 1;
 const SERVER_HELLO: u8 = 2;
 const SERVER_NAME: u16 = 0;
@@ -77,7 +92,9 @@ const AFTER_HELLO: &str = "the ClientHello's record carries more after it";
 const HIDDEN: &str =
     "the ClientHello uses Encrypted Client Hello (ECH), so the name in the clear is a decoy";
 const TWO_NAMES: &str = "the ClientHello carries two server names";
-const NOT_CCS: &str = "the record before the second ClientHello is not a ChangeCipherSpec";
+const BEFORE_SECOND: &str =
+    "a record before the second ClientHello is no ChangeCipherSpec, early data or hello";
+const TOO_EARLY: &str = "the early data before the second ClientHello is too long";
 
 /// What a tunnel's first bytes say.
 #[derive(Debug, PartialEq, Eq)]
@@ -112,33 +129,82 @@ pub(crate) fn verdict(first: &[u8], host: &str) -> Verdict {
 }
 
 /// [`verdict`] on the client's bytes after a HelloRetryRequest: the second ClientHello,
-/// after the ChangeCipherSpec record a client in middlebox compatibility mode sends
-/// first. Any other record before the hello is refused.
+/// after what [`before_second`] allows before it. Any other record there is refused.
 pub(crate) fn second_verdict(first: &[u8], host: &str) -> Verdict {
-    if first.first() != Some(&CHANGE_CIPHER_SPEC[0]) {
-        return verdict(first, host);
-    }
-    let expected = first
-        .iter()
-        .zip(CHANGE_CIPHER_SPEC)
-        .enumerate()
-        .all(|(i, (got, want))| i == 2 || *got == want);
-    if !expected {
-        return Verdict::Refused(NOT_CCS.into());
-    }
-    let Some(hello) = first.get(CHANGE_CIPHER_SPEC.len()..) else {
+    let at = match before_second(first) {
+        Ok(Some(at)) => at,
+        Ok(None) => return Verdict::More,
+        Err(why) => return Verdict::Refused(why.into()),
+    };
+    let Some(hello) = first.get(at..) else {
         return Verdict::More;
     };
     match verdict(hello, host) {
-        Verdict::Allowed(length) => Verdict::Allowed(CHANGE_CIPHER_SPEC.len() + length),
+        Verdict::Allowed(length) => Verdict::Allowed(at + length),
+        Verdict::Refused(why) if why == NOT_TLS => Verdict::Refused(BEFORE_SECOND.into()),
         other => other,
     }
+}
+
+/// How many of the bytes at the start of `first` come before the second ClientHello:
+/// the ChangeCipherSpec a client in middlebox compatibility mode sends, if it is there,
+/// then any early-data records, [`EARLY_DATA_MAX`] bytes of them at most. `None` while
+/// they are incomplete.
+fn before_second(first: &[u8]) -> Result<Option<usize>, &'static str> {
+    let mut at = 0;
+    if first.first() == Some(&CHANGE_CIPHER_SPEC[0]) {
+        let expected = first
+            .iter()
+            .zip(CHANGE_CIPHER_SPEC)
+            .enumerate()
+            .all(|(i, (got, want))| i == 2 || *got == want);
+        if !expected {
+            return Err(BEFORE_SECOND);
+        }
+        if first.len() < CHANGE_CIPHER_SPEC.len() {
+            return Ok(None);
+        }
+        at = CHANGE_CIPHER_SPEC.len();
+    }
+    let early = at;
+    while let Some(rest) = first
+        .get(at..)
+        .filter(|r| r.first() == Some(&APPLICATION_DATA))
+    {
+        let Some(length) = early_record(rest)? else {
+            return Ok(None);
+        };
+        at += length;
+        if at - early > EARLY_DATA_MAX {
+            return Err(TOO_EARLY);
+        }
+    }
+    Ok(Some(at))
+}
+
+/// The length, header included, of the application-data record at the start of
+/// `rest`; `None` while it is incomplete.
+fn early_record(rest: &[u8]) -> Result<Option<usize>, &'static str> {
+    if let [_, major, ..] = rest {
+        if *major != 3 {
+            return Err(BEFORE_SECOND);
+        }
+    }
+    let Some(&[_, _, _, hi, lo]) = rest.first_chunk::<5>() else {
+        return Ok(None);
+    };
+    let length = 5 + usize::from(u16::from_be_bytes([hi, lo]));
+    // an empty record is not allowed, and a longer one is not TLS
+    if length == 5 || length > 5 + CIPHERTEXT_MAX {
+        return Err(BEFORE_SECOND);
+    }
+    Ok((rest.len() >= length).then_some(length))
 }
 
 /// A ClientHello as read from the client: the bytes that carry it, and any the client
 /// sent after them in the same reads.
 pub(crate) struct Flight {
-    /// The records the hello takes, a ChangeCipherSpec before it included.
+    /// The records the hello takes, with what came before a second hello.
     pub(crate) hello: Vec<u8>,
     /// What came after them.
     pub(crate) after: Vec<u8>,
@@ -146,7 +212,8 @@ pub(crate) struct Flight {
 
 /// Read from `client`, after the bytes `first` already holds, until [`verdict`] (or
 /// [`second_verdict`], after a retry request) decides for `host`, within [`HELLO_MAX`]
-/// bytes and by `deadline`. The hello when it is allowed; why not otherwise.
+/// bytes ([`RETRY_MAX`] after a retry request) and by `deadline`. The hello when it is
+/// allowed; why not otherwise.
 pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
     client: &mut R,
     host: &str,
@@ -154,7 +221,11 @@ pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
     mut first: Vec<u8>,
     deadline: Instant,
 ) -> Result<Flight, String> {
-    let judge = if retry { second_verdict } else { verdict };
+    let (judge, max) = if retry {
+        (second_verdict as fn(&[u8], &str) -> Verdict, RETRY_MAX)
+    } else {
+        (verdict as fn(&[u8], &str) -> Verdict, HELLO_MAX)
+    };
     let read = async {
         let mut chunk = [0u8; 4096];
         loop {
@@ -169,12 +240,12 @@ pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
                     });
                 }
                 Verdict::Refused(why) => return Err(why),
-                Verdict::More if first.len() >= HELLO_MAX => {
-                    return Err(format!("no whole ClientHello in {HELLO_MAX} bytes"))
+                Verdict::More if first.len() >= max => {
+                    return Err(format!("no whole ClientHello in {max} bytes"))
                 }
                 Verdict::More => {}
             }
-            let room = chunk.len().min(HELLO_MAX - first.len());
+            let room = chunk.len().min(max - first.len());
             match client.read(&mut chunk[..room]).await {
                 Ok(0) => return Err("the client closed before a whole ClientHello".into()),
                 Ok(n) => first.extend_from_slice(&chunk[..n]),
@@ -532,6 +603,11 @@ pub(crate) mod fixtures {
         out
     }
 
+    /// A TLS 1.3 ServerHello that is no retry request, in one record.
+    pub(crate) fn plain_server_hello() -> Vec<u8> {
+        records(&server_hello([0x5a; 32], &[(0x2b, vec![3, 4])]), 512)
+    }
+
     /// `message` in TLS handshake records of at most `size` bytes each.
     pub(crate) fn records(message: &[u8], size: usize) -> Vec<u8> {
         let mut out = Vec::new();
@@ -880,12 +956,11 @@ mod tests {
         let mut other = vec![20, 3, 3, 0, 1, 1];
         other.extend_from_slice(&records(&message(&[sni(&["other-tenant.example"])]), 512));
         assert!(matches!(second_verdict(&other, HOST), Verdict::Refused(_)));
-        // two ChangeCipherSpecs, one of another length, early data, or an alert first
+        // two ChangeCipherSpecs, one of another length or content, or an alert first
         for before in [
             &[20, 3, 3, 0, 1, 1, 20, 3, 3, 0, 1, 1][..],
             &[20, 3, 3, 0, 2, 1, 1],
             &[20, 3, 3, 0, 1, 2],
-            &[23, 3, 3, 0, 1, 0],
             &[21, 3, 3, 0, 2, 1, 0],
         ] {
             let mut first = before.to_vec();
@@ -974,5 +1049,106 @@ mod tests {
         let wait = Duration::from_millis(50);
         let why = read_answer(&mut from_upstream, &mut to_client, soon(wait)).await;
         assert_eq!(why, Err("no whole ServerHello in time".into()));
+    }
+
+    /// The longest record TLS allows a protected payload: a fragment, and 256 bytes.
+    const CIPHERTEXT: usize = RECORD_MAX + 256;
+
+    /// Application-data records, early data here, with payloads of these lengths.
+    fn early_records(lengths: &[usize]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &length in lengths {
+            out.extend_from_slice(&[23, 3, 3]);
+            out.extend_from_slice(&(length as u16).to_be_bytes());
+            out.extend(std::iter::repeat_n(0xab, length));
+        }
+        out
+    }
+
+    const CCS: [u8; 6] = [20, 3, 3, 0, 1, 1];
+
+    #[test]
+    fn early_data_may_come_between_the_change_cipher_spec_and_the_second_hello() {
+        let hello = records(&message(&[sni(&[HOST])]), 512);
+        for before in [
+            [&CCS[..], &early_records(&[30])].concat(),
+            [&CCS[..], &early_records(&[30, 200])].concat(),
+            early_records(&[30]),
+        ] {
+            let first = [&before[..], &hello].concat();
+            let judged = second_verdict(&first, HOST);
+            assert_eq!(judged, Verdict::Allowed(first.len()), "{before:?}");
+            for end in 0..first.len() {
+                assert_eq!(second_verdict(&first[..end], HOST), Verdict::More, "{end}");
+            }
+        }
+        // the hello after it is held to the name all the same
+        let other = records(&message(&[sni(&["other-tenant.example"])]), 512);
+        let first = [&CCS[..], &early_records(&[30]), &other].concat();
+        assert!(matches!(second_verdict(&first, HOST), Verdict::Refused(_)));
+        // no other record there: an alert, a heartbeat, a ChangeCipherSpec after the
+        // early data, a handshake that is no ClientHello, or an early-data record that is
+        // empty or longer than TLS allows
+        for before in [
+            vec![21, 3, 3, 0, 2, 1, 0],
+            vec![24, 3, 3, 0, 1, 1],
+            [&CCS[..], &early_records(&[30]), &CCS[..]].concat(),
+            [&early_records(&[30])[..], &[22, 3, 3, 0, 4, 2, 0, 0, 0]].concat(),
+            vec![23, 3, 3, 0, 0],
+            [&[23, 3, 3][..], &((CIPHERTEXT + 1) as u16).to_be_bytes()].concat(),
+            vec![23, 2, 3, 0, 1, 0],
+        ] {
+            let first = [&before[..], &hello].concat();
+            let judged = second_verdict(&first, HOST);
+            assert!(
+                matches!(judged, Verdict::Refused(_)),
+                "{before:?}: {judged:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_hello_that_fills_a_record_may_follow_a_change_cipher_spec_and_early_data() {
+        let base = message(&[sni(&[HOST]), (21, Vec::new())]).len();
+        let full = message(&[sni(&[HOST]), (21, vec![0; RECORD_MAX - base])]);
+        assert_eq!(full.len(), RECORD_MAX, "the hello fills one record");
+        let hello = records(&full, RECORD_MAX);
+        let most = early_records(&[CIPHERTEXT; 4]);
+        for before in [CCS.to_vec(), [&CCS[..], &most].concat()] {
+            let first = [&before[..], &hello].concat();
+            let (mut client, mut egress) = tokio::io::duplex(1 << 17);
+            client.write_all(&first).await.unwrap();
+            let read = read_hello(&mut egress, HOST, true, Vec::new(), soon(HELLO_WAIT)).await;
+            let read = read.map(|f| f.hello.len());
+            assert_eq!(read, Ok(first.len()), "{} bytes before it", before.len());
+        }
+        // one byte of early data more is refused
+        let over = [&CCS[..], &most, &early_records(&[1]), &hello].concat();
+        let (mut client, mut egress) = tokio::io::duplex(1 << 17);
+        client.write_all(&over).await.unwrap();
+        let read = read_hello(&mut egress, HOST, true, Vec::new(), soon(HELLO_WAIT)).await;
+        let why = read.err().unwrap_or_default();
+        assert!(why.contains("early data"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_trickles_its_hello_is_refused_when_the_deadline_comes() {
+        let hello = records(&message(&[sni(&[HOST])]), 512);
+        let (mut client, mut egress) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            for byte in hello {
+                if client.write_all(&[byte]).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            std::future::pending::<()>().await;
+        });
+        let started = std::time::Instant::now();
+        let wait = Duration::from_millis(300);
+        let read = read_hello(&mut egress, HOST, false, Vec::new(), soon(wait)).await;
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "ended after {took:?}");
+        assert_eq!(read.err(), Some("no whole ClientHello in time".into()));
     }
 }

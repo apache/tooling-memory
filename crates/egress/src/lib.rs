@@ -1041,9 +1041,10 @@ enum Stop {
 
 /// The upstream end of a tunnel to `host`, dialled at `addrs` once the client's
 /// ClientHello names the host, and, when the upstream answers with a HelloRetryRequest,
-/// once the client's second ClientHello does too. Everything read on the way has been
-/// sent on, so the two ends are ready to be copied both ways; the hellos are read within
-/// the egress's `hello_wait`, all together, from now.
+/// once the client's second ClientHello does too and the answer to it is no second
+/// retry request. Everything read on the way has been sent on, so the two ends are ready
+/// to be copied both ways; the hellos and answers are read within the egress's
+/// `hello_wait`, all together, from now.
 async fn opened(
     inner: &Inner,
     inbound: &mut hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
@@ -1065,14 +1066,25 @@ async fn opened(
     let retry = hello::read_answer(&mut outbound, inbound, deadline)
         .await
         .map_err(Stop::Refused)?;
-    let rest = if retry {
-        let second = hello::read_hello(inbound, host, true, first.after, deadline)
+    let mut rest = first.after;
+    if retry {
+        let second = hello::read_hello(inbound, host, true, rest, deadline)
             .await
             .map_err(|why| Stop::Refused(format!("after a HelloRetryRequest, {why}")))?;
-        [second.hello, second.after].concat()
-    } else {
-        first.after
-    };
+        let sent = outbound.write_all(&second.hello).await;
+        sent.map_err(|_| Stop::Ended)?;
+        // TLS 1.3 allows one retry request; a second would have the client send a third
+        // hello, unchecked
+        let again = hello::read_answer(&mut outbound, inbound, deadline)
+            .await
+            .map_err(Stop::Refused)?;
+        if again {
+            return Err(Stop::Refused(
+                "the upstream asked for a second retry".into(),
+            ));
+        }
+        rest = second.after;
+    }
     let sent = outbound.write_all(&rest).await;
     sent.map_err(|_| Stop::Ended)?;
     Ok(outbound)
@@ -2745,50 +2757,112 @@ mod tests {
         );
     }
 
-    /// An upstream standing in for a TLS 1.3 front end that asks for a second hello: it
-    /// reads one ClientHello, answers [`hello::fixtures::retry_request`], and hands over
-    /// all it reads after that once the tunnel closes its side.
-    async fn retrying_upstream() -> (SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    /// What a fake TLS upstream heard: each ClientHello it answered, as its records came,
+    /// and everything after the last of them until its client closed.
+    #[derive(Debug, Default)]
+    struct Answered {
+        hellos: Vec<Vec<u8>>,
+        after: Vec<u8>,
+    }
+
+    /// An upstream standing in for a TLS 1.3 front end: it answers each ClientHello it
+    /// reads with the next of `answers`, after that answer's delay, reading the hellos
+    /// after the first as a client sends them after a retry request. Once it has answered
+    /// them all, or reads anything else, it keeps what comes until its client closes.
+    async fn tls_upstream(
+        answers: Vec<(std::time::Duration, Vec<u8>)>,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<Answered>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
-            let mut first = Vec::new();
-            let mut chunk = [0u8; 4096];
-            while hello::verdict(&first, "upstream.example") == hello::Verdict::More {
-                let n = s.read(&mut chunk).await.unwrap();
-                assert_ne!(n, 0, "the first hello reaches the upstream");
-                first.extend_from_slice(&chunk[..n]);
-            }
-            s.write_all(&hello::fixtures::retry_request())
-                .await
-                .unwrap();
-            let mut after = Vec::new();
-            let _ = s.read_to_end(&mut after).await;
-            let _ = tx.send(after);
+            let _ = tx.send(answering(&mut s, answers).await);
         });
         (addr, rx)
     }
 
-    /// A tunnel to upstream.example whose upstream asks for a second hello, and whose
-    /// client sends one naming `name`: what the upstream heard after it asked, and what
-    /// the client got back after the request, and whether the tunnel then closed.
-    async fn retried(name: &str) -> (Vec<u8>, Vec<u8>, bool) {
-        use hello::fixtures::{message, records, retry_request, sni};
+    /// [`tls_upstream`]'s side of one connection.
+    async fn answering(
+        s: &mut tokio::net::TcpStream,
+        answers: Vec<(std::time::Duration, Vec<u8>)>,
+    ) -> Answered {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (upstream, heard) = retrying_upstream().await;
-        let net = FakeNetwork::new(
-            vec![Some(vec!["198.41.0.4:443".parse().unwrap()])],
-            upstream,
-        );
-        let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
-        let (head, mut c) = connect(egress, "upstream.example:443").await;
-        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        c.write_all(&records(&message(&[sni(&["upstream.example"])]), 512))
+        let mut heard = Answered::default();
+        let mut chunk = [0u8; 4096];
+        'answers: for (delay, answer) in answers {
+            let judge = if heard.hellos.is_empty() {
+                hello::verdict
+            } else {
+                hello::second_verdict
+            };
+            let length = loop {
+                match judge(&heard.after, "upstream.example") {
+                    hello::Verdict::Allowed(length) => break length,
+                    hello::Verdict::Refused(_) => break 'answers,
+                    hello::Verdict::More => {}
+                }
+                match s.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break 'answers,
+                    Ok(n) => heard.after.extend_from_slice(&chunk[..n]),
+                }
+            };
+            heard.hellos.push(heard.after.drain(..length).collect());
+            tokio::time::sleep(delay).await;
+            if s.write_all(&answer).await.is_err() {
+                break;
+            }
+        }
+        let _ = s.read_to_end(&mut heard.after).await;
+        heard
+    }
+
+    /// What `heard` delivers within five seconds, or a note that the upstream's
+    /// connection never closed.
+    async fn heard_within(heard: tokio::sync::oneshot::Receiver<Answered>) -> Answered {
+        tokio::time::timeout(std::time::Duration::from_secs(5), heard)
             .await
-            .unwrap();
+            .map(Result::unwrap_or_default)
+            .unwrap_or_else(|_| Answered {
+                hellos: Vec::new(),
+                after: b"the upstream's connection never closed".to_vec(),
+            })
+    }
+
+    /// A ClientHello naming `name`, in one record.
+    fn hello_for(name: &str) -> Vec<u8> {
+        use hello::fixtures::{message, records, sni};
+        records(&message(&[sni(&[name])]), 512)
+    }
+
+    /// The ChangeCipherSpec record a client sends before its second hello.
+    const CCS: [u8; 6] = [20, 3, 3, 0, 1, 1];
+
+    /// An egress tunnel to upstream.example over `upstream`, with `wait` for its hellos,
+    /// and a client of it whose CONNECT was answered 200.
+    async fn tunnel_to(
+        upstream: SocketAddr,
+        wait: std::time::Duration,
+    ) -> (tempfile::TempDir, Egress, tokio::net::TcpStream) {
+        let answer = vec!["198.41.0.4:443".parse().unwrap()];
+        let net = FakeNetwork::new(vec![Some(answer)], upstream);
+        let (d, e, egress) = waiting_tunnel_egress("upstream.example", &net, wait).await;
+        let (head, c) = connect(egress, "upstream.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        (d, e, c)
+    }
+
+    /// A tunnel to upstream.example whose upstream asks for a second hello and then
+    /// answers it, and whose client sends one naming `name`: what the upstream heard,
+    /// what the client got back after the request, and whether the tunnel then closed.
+    async fn retried(name: &str) -> (Answered, Vec<u8>, bool) {
+        use hello::fixtures::{plain_server_hello, retry_request};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let now = std::time::Duration::ZERO;
+        let answers = vec![(now, retry_request()), (now, plain_server_hello())];
+        let (upstream, heard) = tls_upstream(answers).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, hello::HELLO_WAIT).await;
+        c.write_all(&hello_for("upstream.example")).await.unwrap();
         let retry = retry_request();
         let mut got = vec![0u8; retry.len()];
         c.read_exact(&mut got).await.unwrap();
@@ -2796,39 +2870,174 @@ mod tests {
             got, retry,
             "the request for a second hello reaches the client"
         );
-        let mut second = vec![20, 3, 3, 0, 1, 1];
-        second.extend_from_slice(&records(&message(&[sni(&[name])]), 512));
-        c.write_all(&second).await.unwrap();
+        c.write_all(&[&CCS[..], &hello_for(name)].concat())
+            .await
+            .unwrap();
         c.shutdown().await.unwrap();
         let (back, closed) = until_closed(&mut c).await;
-        let heard = tokio::time::timeout(std::time::Duration::from_secs(5), heard)
-            .await
-            .map(Result::unwrap_or_default)
-            .unwrap_or_else(|_| b"the upstream's side never closed".to_vec());
-        (heard, back, closed)
+        drop(c);
+        (heard_within(heard).await, back, closed)
     }
 
     #[tokio::test]
     async fn after_a_retry_request_a_second_hello_that_names_the_host_goes_upstream() {
-        use hello::fixtures::{message, records, sni};
         let (heard, back, closed) = retried("upstream.example").await;
-        let mut second = vec![20, 3, 3, 0, 1, 1];
-        second.extend_from_slice(&records(&message(&[sni(&["upstream.example"])]), 512));
-        assert_eq!(heard, second, "the second hello reaches the upstream whole");
-        assert_eq!(back, Vec::<u8>::new());
+        let second = [&CCS[..], &hello_for("upstream.example")].concat();
+        assert_eq!(
+            heard.hellos,
+            vec![hello_for("upstream.example"), second],
+            "the second hello reaches the upstream whole"
+        );
+        assert_eq!(heard.after, Vec::<u8>::new());
+        assert_eq!(
+            back,
+            hello::fixtures::plain_server_hello(),
+            "and its answer comes back"
+        );
         assert!(closed, "the tunnel closes when both sides have");
     }
 
     #[tokio::test]
     async fn after_a_retry_request_a_second_hello_that_names_another_host_goes_nowhere() {
         let (heard, back, closed) = retried("other-tenant.example").await;
+        assert_eq!(heard.hellos, vec![hello_for("upstream.example")]);
         assert_eq!(
-            heard,
+            heard.after,
             Vec::<u8>::new(),
             "the upstream hears nothing after it asked"
         );
         assert_eq!(back, hello::REFUSED_ALERT.to_vec(), "the client is refused");
         assert!(closed, "the tunnel is closed");
+    }
+
+    #[tokio::test]
+    async fn what_the_client_sends_after_its_first_hello_waits_for_the_upstream_s_answer() {
+        use hello::fixtures::retry_request;
+        use tokio::io::AsyncWriteExt;
+        let answers = vec![(std::time::Duration::ZERO, retry_request())];
+        let (upstream, heard) = tls_upstream(answers).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, hello::HELLO_WAIT).await;
+        // a second hello naming another host, sent with the first before any answer
+        let first = hello_for("upstream.example");
+        let all = [&first[..], &CCS[..], &hello_for("other-tenant.example")].concat();
+        c.write_all(&all).await.unwrap();
+        let (back, closed) = until_closed(&mut c).await;
+        drop(c);
+        let heard = heard_within(heard).await;
+        assert_eq!(heard.hellos, vec![first]);
+        assert_eq!(
+            heard.after,
+            Vec::<u8>::new(),
+            "the upstream hears nothing after the first hello"
+        );
+        let refused = [retry_request(), hello::REFUSED_ALERT.to_vec()].concat();
+        assert_eq!(back, refused, "the request goes back, then the refusal");
+        assert!(closed, "the tunnel is closed");
+    }
+
+    #[tokio::test]
+    async fn a_second_retry_request_is_refused_and_a_third_hello_goes_nowhere() {
+        use hello::fixtures::retry_request;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let now = std::time::Duration::ZERO;
+        let (upstream, heard) =
+            tls_upstream(vec![(now, retry_request()), (now, retry_request())]).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, hello::HELLO_WAIT).await;
+        c.write_all(&hello_for("upstream.example")).await.unwrap();
+        let retry = retry_request();
+        let mut got = vec![0u8; retry.len()];
+        c.read_exact(&mut got).await.unwrap();
+        let second = [&CCS[..], &hello_for("upstream.example")].concat();
+        c.write_all(&second).await.unwrap();
+        let (back, closed) = until_closed(&mut c).await;
+        // a client that goes on regardless
+        let _ = c.write_all(&hello_for("other-tenant.example")).await;
+        let _ = c.shutdown().await;
+        drop(c);
+        let heard = heard_within(heard).await;
+        assert_eq!(heard.hellos, vec![hello_for("upstream.example"), second]);
+        assert_eq!(
+            heard.after,
+            Vec::<u8>::new(),
+            "the upstream hears nothing after its second request"
+        );
+        let refused = [retry, hello::REFUSED_ALERT.to_vec()].concat();
+        assert_eq!(
+            back, refused,
+            "the second request goes back, then the refusal"
+        );
+        assert!(closed, "the tunnel is closed");
+    }
+
+    /// A tunnel with `wait` for its hellos whose upstream answers the first hello `late`
+    /// after it comes, `late` after the tunnel opened: why it was let through, if it was.
+    async fn a_late_answer(wait: std::time::Duration, late: std::time::Duration) -> Option<String> {
+        use tokio::io::AsyncWriteExt;
+        let answers = vec![(late, hello::fixtures::plain_server_hello())];
+        let (upstream, _heard) = tls_upstream(answers).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, wait).await;
+        tokio::time::sleep(late).await;
+        c.write_all(&hello_for("upstream.example")).await.unwrap();
+        let (back, closed) = until_closed(&mut c).await;
+        let refused = back == hello::REFUSED_ALERT && closed;
+        (!refused).then(|| format!("a late answer: answered {back:?}, closed {closed}"))
+    }
+
+    /// A tunnel with `wait` for its hellos whose client sends its first hello `late`
+    /// after the tunnel opened and its second `late` after the retry request: why it was
+    /// let through, if it was.
+    async fn a_late_second_hello(
+        wait: std::time::Duration,
+        late: std::time::Duration,
+    ) -> Option<String> {
+        use hello::fixtures::{plain_server_hello, retry_request};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let now = std::time::Duration::ZERO;
+        let answers = vec![(now, retry_request()), (now, plain_server_hello())];
+        let (upstream, heard) = tls_upstream(answers).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, wait).await;
+        tokio::time::sleep(late).await;
+        c.write_all(&hello_for("upstream.example")).await.unwrap();
+        let mut back = vec![0u8; retry_request().len()];
+        c.read_exact(&mut back).await.unwrap();
+        // the refusal, if it comes while the client waits; the second hello, if not
+        let mut got = Vec::new();
+        let mut closed = tokio::time::timeout(late, c.read_to_end(&mut got))
+            .await
+            .is_ok();
+        if !closed {
+            let second = [&CCS[..], &hello_for("upstream.example")].concat();
+            let _ = c.write_all(&second).await;
+            let (more, now_closed) = until_closed(&mut c).await;
+            got.extend_from_slice(&more);
+            closed = now_closed;
+        }
+        drop(c);
+        let hellos = heard_within(heard).await.hellos.len();
+        let refused = got == hello::REFUSED_ALERT && closed && hellos == 1;
+        (!refused).then(|| {
+            format!(
+                "a late second hello: answered {got:?}, closed {closed}, {hellos} hellos upstream"
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_has_one_wait_for_all_its_hellos_and_answers() {
+        let wait = std::time::Duration::from_millis(1000);
+        let late = std::time::Duration::from_millis(600);
+        let let_through: Vec<String> = [
+            a_late_answer(wait, late).await,
+            a_late_second_hello(wait, late).await,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        assert_eq!(
+            let_through,
+            Vec::<String>::new(),
+            "refused, and let through"
+        );
     }
 
     #[tokio::test]
