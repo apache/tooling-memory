@@ -7,7 +7,11 @@
 //! own world and sees no other process.
 //!
 //! No network interface exists inside except loopback. The only way out is the unix
-//! socket bind-mounted from the host, which the relay forwards to.
+//! socket bind-mounted from the host, which the relay forwards to. The last step before
+//! the exec sets `no_new_privs` and installs a seccomp filter that refuses
+//! what a network namespace does not cover: vsock and io_uring.
+
+mod seccomp;
 
 use crate::{Error, Mount, Plan, Resources};
 use nix::mount::{mount, MsFlags};
@@ -60,8 +64,40 @@ fn restricted_why() -> String {
     }
 }
 
+/// Why the sandbox's seccomp filter cannot be installed. A container runtime's profile
+/// can refuse `seccomp(2)` itself.
+const NO_SECCOMP: &str = "the sandbox cannot install its seccomp filter here: it needs a \
+                          kernel with seccomp filters, and a seccomp profile that allows \
+                          seccomp(2)";
+
+/// Why a read-only grant cannot be made read-only below its submounts. A kernel before
+/// Linux 5.12 has no `mount_setattr`, and a container runtime's seccomp profile that does
+/// not allow the call answers it with `ENOSYS` or `EPERM`.
+const NO_MOUNT_SETATTR: &str = "mount_setattr is not available here: it needs Linux 5.12 or \
+                                later, and a seccomp profile that allows it";
+
+/// Whether `mount_setattr` answers here, asked with an empty path and a size below the
+/// first `mount_attr`: a kernel that has the call refuses that size with `EINVAL` before
+/// it checks anything else, so any other answer is a filter in the way.
+fn has_mount_setattr() -> bool {
+    // SAFETY: an empty NUL-terminated path, no mount_attr, and a size of zero; the kernel
+    // refuses the call before it reads either pointer.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            -1,
+            c"".as_ptr(),
+            0,
+            std::ptr::null::<libc::mount_attr>(),
+            0,
+        )
+    };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
+}
+
 /// Whether this host lets an unprivileged process build the sandbox at all: can it
-/// create a user namespace and map itself into it?
+/// create a user namespace and map itself into it, make a read-only grant read-only
+/// below its submounts, and install the seccomp filter?
 ///
 /// Probed in a child, because the answer is a namespace the asking process would
 /// otherwise be stuck in, and by calling [`enter_user_namespace`] itself rather than a
@@ -75,10 +111,17 @@ fn restricted_why() -> String {
 /// without CAP_SYS_ADMIN is another, and the second is fixed by installing a profile
 /// rather than by giving up on confinement.
 ///
+/// The child also asks for `mount_setattr`, without which every launch fails in
+/// [`read_only_below`].
+///
+/// The child also installs the launch's seccomp filter, compiled before the fork as a
+/// launch compiles it.
+///
 /// # Errors
 ///
 /// Why not, in a sentence `amem doctor` and the launch line can carry.
 pub fn availability() -> Result<(), String> {
+    let filter = seccomp::program().map_err(|e| e.to_string())?;
     // SAFETY: fork in a process that only waits for the child; the child makes the same
     // syscalls a launch does and _exits without running atexit handlers, which belong to
     // the parent.
@@ -87,9 +130,17 @@ pub fn availability() -> Result<(), String> {
         return Err(format!("fork: {}", std::io::Error::last_os_error()));
     }
     if pid == 0 {
-        let ok = enter_user_namespace(getuid().as_raw(), getgid().as_raw()).is_ok();
+        let code = if enter_user_namespace(getuid().as_raw(), getgid().as_raw()).is_err() {
+            1
+        } else if !has_mount_setattr() {
+            2
+        } else if seccomp::install(&filter).is_err() {
+            3
+        } else {
+            0
+        };
         // SAFETY: exiting the probe child without running the parent's atexit handlers.
-        unsafe { libc::_exit(i32::from(!ok)) };
+        unsafe { libc::_exit(code) };
     }
     let mut status: libc::c_int = 0;
     // SAFETY: waitpid on our own child with a valid status pointer.
@@ -99,10 +150,11 @@ pub fn availability() -> Result<(), String> {
     if !libc::WIFEXITED(status) {
         return Err("the user-namespace probe did not exit normally".to_string());
     }
-    if libc::WEXITSTATUS(status) == 0 {
-        Ok(())
-    } else {
-        Err(restricted_why())
+    match libc::WEXITSTATUS(status) {
+        0 => Ok(()),
+        2 => Err(NO_MOUNT_SETATTR.to_string()),
+        3 => Err(NO_SECCOMP.to_string()),
+        _ => Err(restricted_why()),
     }
 }
 
@@ -147,8 +199,54 @@ fn bind(m: &Mount, root: &Path) -> Result<(), Error> {
             None::<&str>,
         )
         .map_err(|e| confine(format!("remount ro {}: {e}", target.display())))?;
+        read_only_below(&target)?;
     }
     Ok(())
+}
+
+/// Make every mount under `target` read-only and nosuid as well. A bind with `MS_REC`
+/// copies the source's submounts, `/usr/lib/wsl/lib` under `/usr` on WSL2 say, and the
+/// remount reaches the top mount only. `mount_setattr(2)` with `AT_RECURSIVE` sets the
+/// flags on the whole tree at once, a submount another mount hides included.
+///
+/// Where `mount_setattr` is not available, [`NO_MOUNT_SETATTR`], the launch fails rather
+/// than leave a submount writable under a read-only grant.
+fn read_only_below(target: &Path) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|e| confine(format!("{}: {e}", target.display())))?;
+    let attr = libc::mount_attr {
+        attr_set: libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    // SAFETY: a NUL-terminated path and a mount_attr passed with its own size; the kernel
+    // only reads both.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_RECURSIVE,
+            &attr,
+            std::mem::size_of::<libc::mount_attr>(),
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ENOSYS) {
+        return Err(confine(format!(
+            "cannot make the mounts under {} read-only: {NO_MOUNT_SETATTR}",
+            target.display()
+        )));
+    }
+    Err(confine(format!(
+        "mount_setattr ro {}: {e}",
+        target.display()
+    )))
 }
 
 /// The restricting flags a mount already carries, to carry into its read-only remount.
@@ -349,23 +447,29 @@ pub fn run_captured(plan: &Plan) -> Result<(i32, Vec<u8>, Resources), Error> {
 }
 
 fn measured(plan: &Plan, capture: bool) -> Result<(i32, Vec<u8>, Resources), Error> {
-    let (mut cmd, root) = command(plan)?;
+    let scratch = crate::scratch::Scratch::make(&std::env::temp_dir())?;
+    let (mut cmd, _) = command(plan)?;
     let ran = crate::measure::run(&mut cmd, capture)
         .map_err(|e| confine(format!("spawn {}: {e}", plan.argv[0])));
-    std::fs::remove_dir_all(&root).ok();
+    drop(scratch);
     ran
 }
 
 /// The command that builds the sandbox in `pre_exec` and execs the relay, and the
-/// scratch directory it pivots into, for the caller to remove.
+/// scratch directory it pivots into, which the caller holds as a [`crate::scratch::Scratch`].
 fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
-    let root = std::env::temp_dir().join(format!("memory-sandbox-{}", std::process::id()));
-    std::fs::create_dir_all(&root).map_err(|e| confine(format!("{}: {e}", root.display())))?;
+    // made and locked by the caller's Scratch; not made again here, where it would
+    // not be locked
+    let root = crate::scratch::dir(&std::env::temp_dir());
+    let launcher = nix::unistd::getpid();
 
     let plan2 = plan.clone();
     let root2 = root.clone();
+    // compiled here, since compiling allocates and installing it does not
+    let filter = seccomp::program()?;
+    let open_files = open_files_limit();
     let mut cmd = Command::new(&plan.argv[0]);
     cmd.args(&plan.argv[1..]);
     cmd.env_clear();
@@ -381,10 +485,17 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
                 enter_user_namespace(uid, gid)?;
                 sethostname(&plan2.hostname).map_err(|e| confine(format!("hostname: {e}")))?;
                 loopback_up()?;
+                // the run ends with the launcher, however the launcher ends
+                die_with_parent(launcher)?;
+                // the intermediate, as pid 1 can still tell it after the fork: its
+                // parent is outside its namespace, and getppid reads 0 there
+                let intermediate = pidfd_of_self();
                 // before build_root: it mounts this namespace's procfs, which must be
                 // made after the fork that enters the namespace and before pivot_root
                 // takes the host's procfs out of view
                 become_pid_one()?;
+                // pid 1: the namespace, and the harness in it, ends with the intermediate
+                die_with_intermediate(intermediate)?;
                 build_root(&plan2, &root2)?;
                 Ok(())
             };
@@ -393,10 +504,69 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
                 // failed here, where stderr is still the terminal
                 eprintln!("memory: sandbox: {e}");
                 std::io::Error::other(e.to_string())
-            })
+            })?;
+            cloexec_from_three(open_files)
+                .inspect_err(|_| say(b"cannot mark inherited descriptors close-on-exec"))?;
+            // last, so the setup above may make calls the filter refuses
+            seccomp::install(&filter).inspect_err(|_| say(NO_SECCOMP.as_bytes()))
         });
     }
     Ok((cmd, root))
+}
+
+/// Say what failed between fork and exec, on stderr, without allocating.
+fn say(what: &[u8]) {
+    for part in [b"memory: sandbox: ".as_slice(), what, b"\n"] {
+        // SAFETY: a write of a buffer with its own length to stderr.
+        unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
+    }
+}
+
+/// The soft limit on open files, the highest descriptor number this process can hold.
+fn open_files_limit() -> libc::c_int {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit with a valid pointer to write into.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 1024;
+    }
+    libc::c_int::try_from(limit.rlim_cur).unwrap_or(libc::c_int::MAX)
+}
+
+/// Mark every descriptor from 3 up close-on-exec, so the harness inherits only its
+/// standard streams. A socket the launcher left open would otherwise work inside: a
+/// vsock socket made outside the filter reaches the host. The launcher passes nothing
+/// into the sandbox as a descriptor; the egress socket is bind-mounted as a path.
+///
+/// `close_range` with `CLOSE_RANGE_CLOEXEC` (Linux 5.11) does it in one call. Before
+/// that, `fcntl` sets `FD_CLOEXEC` on each number below `limit`, the open-files limit
+/// read before the fork. Allocates nothing.
+fn cloexec_from_three(limit: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: close_range with integer arguments only.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3,
+            libc::c_uint::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    // ENOSYS before Linux 5.9, EINVAL for the flag before 5.11
+    if !matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+        return Err(e);
+    }
+    for fd in 3..limit {
+        // SAFETY: fcntl on a descriptor number; one that is not open fails with EBADF
+        // and has nothing to mark.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    Ok(())
 }
 
 /// Enter a pid namespace and become its pid 1. Runs between fork and exec, while the
@@ -415,7 +585,8 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
 fn become_pid_one() -> Result<(), Error> {
     unshare(CloneFlags::CLONE_NEWPID).map_err(|e| confine(format!("unshare pid: {e}")))?;
     // SAFETY: fork between fork and exec in an already single-threaded child; the parent
-    // branch only waits and exits, the child branch only mounts and returns to exec.
+    // branch only closes descriptors, waits and exits, the child branch only mounts and
+    // returns to exec.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(confine(format!(
@@ -424,15 +595,25 @@ fn become_pid_one() -> Result<(), Error> {
         )));
     }
     if pid > 0 {
+        // The intermediate never execs, so its copies of the launcher's descriptors
+        // stay open until it exits: among them std's exec-error channel, whose end of
+        // file is what lets `spawn` return. The child, pid 1, keeps its own copies and
+        // reports through that channel as before.
+        close_from_three();
         let mut status: libc::c_int = 0;
         // SAFETY: waitpid on our own child with a valid status pointer.
         let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        // the code as crate::measure::exit_code gives it, said without allocating
         let code = if r < 0 {
             1
+        } else if libc::WIFSIGNALED(status) {
+            let signal = libc::WTERMSIG(status);
+            if crate::measure::is_said(signal) {
+                say_the_relay_died(signal, libc::WCOREDUMP(status));
+            }
+            128 + signal
         } else if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
-        } else if libc::WIFSIGNALED(status) {
-            128 + libc::WTERMSIG(status)
         } else {
             1
         };
@@ -441,6 +622,113 @@ fn become_pid_one() -> Result<(), Error> {
         unsafe { libc::_exit(code) };
     }
     Ok(())
+}
+
+/// Say on standard error that the relay died of `signal`, as [`crate::measure::exit_code`]
+/// says it, in one `write` from a buffer on the stack. This runs after a fork from a
+/// launcher with other threads, where allocating or taking stderr's lock can hang on a
+/// lock one of them held at the fork.
+fn say_the_relay_died(signal: i32, core_dumped: bool) {
+    fn put(buf: &mut [u8], at: usize, bytes: &[u8]) -> usize {
+        let end = (at + bytes.len()).min(buf.len());
+        buf[at..end].copy_from_slice(&bytes[..end - at]);
+        end
+    }
+    let mut digits = [0u8; 10];
+    let mut first = digits.len();
+    let mut rest = signal.unsigned_abs();
+    loop {
+        first -= 1;
+        digits[first] = b'0' + u8::try_from(rest % 10).unwrap_or(0);
+        rest /= 10;
+        if rest == 0 || first == 0 {
+            break;
+        }
+    }
+    let number = &digits[first..];
+    let mut buf = [0u8; 96];
+    let mut n = put(&mut buf, 0, b"memory: the relay was killed by ");
+    if let Some(name) = crate::measure::signal_name(signal) {
+        n = put(&mut buf, n, name.as_bytes());
+        n = put(&mut buf, n, b" (signal ");
+        n = put(&mut buf, n, number);
+        n = put(&mut buf, n, b")");
+    } else {
+        n = put(&mut buf, n, b"signal ");
+        n = put(&mut buf, n, number);
+    }
+    if core_dumped {
+        n = put(&mut buf, n, b", core dumped");
+    }
+    n = put(&mut buf, n, b"\n");
+    // SAFETY: write to fd 2 from a live buffer of at least n bytes; a failure is ignored,
+    // as there is nowhere else to say it.
+    unsafe { libc::write(2, buf.as_ptr().cast(), n) };
+}
+
+/// Close every descriptor from 3 up. Runs between fork and exec, so it allocates nothing:
+/// `close_range` (Linux 5.9) in one call, or else `close` on each number below the
+/// open-files limit.
+fn close_from_three() {
+    // SAFETY: close_range with integer arguments only.
+    let r = unsafe { libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) };
+    if r == 0 {
+        return;
+    }
+    for fd in 3..open_files_limit() {
+        // SAFETY: close of a descriptor number; one that is not open fails with EBADF.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// Have the kernel SIGKILL this process when the thread that forked it ends, and fail if
+/// `parent` is no longer its parent: gone before the request took hold. Runs between fork
+/// and exec; the setting outlives the exec. Allocates only to say why it failed.
+fn die_with_parent(parent: nix::unistd::Pid) -> Result<(), Error> {
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|e| confine(format!("parent-death signal: {e}")))?;
+    if nix::unistd::getppid() == parent {
+        Ok(())
+    } else {
+        Err(confine("the launcher has gone"))
+    }
+}
+
+/// A pidfd for this process, close-on-exec, or -1 where the kernel has none (before 5.3).
+fn pidfd_of_self() -> libc::c_int {
+    // SAFETY: pidfd_open with this process's pid and no flags; it returns a new
+    // descriptor or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+    libc::c_int::try_from(fd).unwrap_or(-1)
+}
+
+/// As [`die_with_parent`] for pid 1, whose parent is the intermediate behind `pidfd`:
+/// fail if the intermediate has already exited, which makes the pidfd readable. Without
+/// a pidfd the check is not made, and an intermediate that dies between its fork and
+/// the request leaves pid 1 to run until the harness ends.
+fn die_with_intermediate(pidfd: libc::c_int) -> Result<(), Error> {
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|e| confine(format!("parent-death signal: {e}")))?;
+    if pidfd < 0 {
+        return Ok(());
+    }
+    let mut poll = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll on one valid pollfd, without waiting; then close of the pidfd this
+    // process owns.
+    let gone = unsafe {
+        let ready = libc::poll(&raw mut poll, 1, 0);
+        libc::close(pidfd);
+        ready > 0
+    };
+    if gone {
+        Err(confine("the intermediate has gone"))
+    } else {
+        Ok(())
+    }
 }
 
 /// What `memory relay` does inside: spawn the harness and wait for it. The relay is
@@ -454,5 +742,5 @@ pub fn spawn_in_pid_namespace(argv: &[OsString]) -> Result<i32, Error> {
         .args(&argv[1..])
         .status()
         .map_err(|e| confine(format!("spawn {}: {e}", argv[0].to_string_lossy())))?;
-    Ok(status.code().unwrap_or(1))
+    Ok(crate::measure::exit_code(status, &argv[0]))
 }

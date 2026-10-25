@@ -59,6 +59,7 @@ dependencies = [
  "dm-web",
  "dm-wslc-api",
  "futures-util",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "tempfile",
@@ -67,6 +68,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-tungstenite 0.30.0",
  "toml",
+ "tower",
  "url",
 ]
 
@@ -897,6 +899,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
+ "libc",
  "opentelemetry",
  "opentelemetry_sdk",
  "reqwest 0.13.1",
@@ -957,6 +960,7 @@ version = "0.1.0"
 dependencies = [
  "dm-server",
  "fuser",
+ "nix 0.31.3",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -1012,6 +1016,7 @@ dependencies = [
  "dm-core",
  "libc",
  "nix 0.31.3",
+ "seccompiler",
  "serde",
  "serde_json",
  "tempfile",
@@ -3538,6 +3543,15 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "security-framework"

@@ -1,0 +1,33 @@
+# Dependabot version updates for the workflows' actions. ASF Infra's GitHub Actions policy
+# requires automatic dependency management on every repository that uses Actions. The
+# actions under actions/* are free to use at any commit, and Infra allows Swatinem/rust-cache
+# and taiki-e/install-action at any version, so their bumps need nothing more.
+#
+# dtolnay/rust-toolchain is pinned to the commit that Infra's allow-list names. That commit is
+# on no upstream branch, since the action's branches are pushed again for each toolchain, so
+# Dependabot cannot find a newer one. It is ignored here, and a bump goes by hand, beside a
+# change to apache/infrastructure-actions.
+#
+# Version updates come as one grouped pull request a week, after a cooldown, so that a release
+# has some days to be withdrawn first. Security updates have no cooldown; they come as one
+# grouped pull request too, as Infra's Dependabot page recommends. Cargo, npm and the image
+# are out of scope here: cargo deny checks the crates, and the image workflow bumps its pins.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns: ["*"]
+      github-actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci

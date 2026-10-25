@@ -38,3 +38,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 tokio-tungstenite = "0.30"
 tempfile = "3.27.0"
 tokio-postgres = "0.7.18"
+tower = { version = "0.5.3", features = ["util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", features = ["signal"] }

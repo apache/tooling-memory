@@ -88,7 +88,7 @@ whole of what differs:
 | Claude Code | `ANTHROPIC_BASE_URL` | `--mcp-config` | subscription, key, gateway |
 | Codex | `model_providers.<id>.base_url` in `config.toml`; with a ChatGPT login, a CONNECT tunnel to the ChatGPT hosts | `mcp_servers.<id>.url` | subscription, key, gateway; `--provider xai` for Grok |
 | Gemini CLI | `GOOGLE_GEMINI_BASE_URL`; with a Google login, `CODE_ASSIST_ENDPOINT` | `mcpServers.<id>.httpUrl` | subscription, key |
-| Antigravity CLI (`agy`) | `GOOGLE_GEMINI_BASE_URL`, once its settings name the Gemini API as the model provider; with a Google login, `HTTPS_PROXY` to the egress, which tunnels only to Google's login and Cloud Code hosts, pinned without metering | `mcpServers.<id>.serverUrl` in `~/.gemini/config/mcp_config.json` | subscription (the token file `agy` left under `~/.gemini/antigravity-cli`), key. Not in the harness image yet. Proven on a real login 7 October, prompted, with the host's binary, once two more hosts were tunnelled: the eligibility check asks `www.googleapis.com` for the account and `.googleusercontent.com` for its picture before anything else |
+| Antigravity CLI (`agy`) | `GOOGLE_GEMINI_BASE_URL`, once its settings name the Gemini API as the model provider; with a Google login, `HTTPS_PROXY` to the egress, which tunnels only to Google's login and Cloud Code hosts, pinned without metering | `mcpServers.<id>.serverUrl` in `~/.gemini/config/mcp_config.json` | subscription (the token file `agy` left under `~/.gemini/antigravity-cli`), key. Not in the harness image yet. Proven on a real login 7 October, prompted, with the host's binary, once two more hosts were tunnelled: the eligibility check asks `www.googleapis.com` for the account and `lh3.googleusercontent.com` for its picture before anything else |
 | Qwen Code | `OPENAI_BASE_URL`, once its settings select the OpenAI auth type | `mcpServers.<id>.httpUrl` | key only, since Qwen's free login tier ended in April 2026; `dashscope` by default, `--provider openai` or `xai` |
 | Grok Build (`grok`) | `GROK_XAI_API_BASE_URL`, which only API-key inference reads; with a Grok login, `HTTPS_PROXY` to the egress, which tunnels only to Grok's proxy and relay hosts and `auth.x.ai`, pinned without metering | `mcp_servers.<id>.url` in `config.toml` | subscription, key |
 | Muse Code (`muse`) | `--base-url` on `exec`, which the launcher puts after the prompt, since only the subcommand takes it; a key is `META_API_KEY`, which outranks a login | `mcp_servers.<id>` as a `streamable_http` entry in `~/.config/muse/settings.json`, which must carry `schema_version` | key, to Meta's Model API at `api.meta.ai`; subscription as the file `muse login` leaves, copied in, forwarded through the same base; gateway, proven on the Foundation gateway with Qwen. Hooks are Claude Code's shape and events under `hooks` in the same file; the session store is binary journals and a hook gets no transcript path, so the headless run is `exec --json`, whose record stream the launcher keeps as the transcript under the private home and prints only the final text of. Written from a real install, run on its offline echo provider, against a local listener, and through the gateway; a Meta key or login is still untried |
@@ -99,14 +99,18 @@ whole of what differs:
 
 Copilot is the odd one: with no base-URL override, its HTTPS goes through the egress as a
 CONNECT tunnel to an allowlist of hosts. That is pinned egress without metering: TLS runs
-end to end, so the egress sees no tokens and checks the ceiling when the tunnel opens. What
-a tunnelled run cost is then what the harness says it cost: after the run the launcher reads
-the transcript the harness left and records its own token counts, Codex's running total
-from its rollout and Claude Code's per-call usage, into the same telemetry marked `harness`
-rather than `egress`, so `amem usage` and the savings funnel show them, flagged as
-self-reported. Copilot CLI leaves no transcript, so a Copilot run stays uncounted. Under a
-subscription a count is a quantity, not a bill: Codex also reports how much of the plan's
-window a run used, and the launcher prints that.
+end to end, so the egress sees no tokens and checks the ceiling when the tunnel opens. It
+also reads the TLS ClientHello before it dials, and closes a tunnel whose hello names any
+host but the one the CONNECT was allowed for, or hides its name, so a shared front end is
+not asked for another tenant through an allowed name. A client that sends Encrypted
+Client Hello is refused, GREASE ECH included, which Chromium-based clients send by
+default. What a tunnelled run cost is then what the harness says it cost: after the run
+the launcher reads the transcript the harness left and records its own token counts,
+Codex's running total from its rollout and Claude Code's per-call usage, into the same
+telemetry marked `harness` rather than `egress`, so `amem usage` and the savings funnel
+show them, flagged as self-reported. Copilot CLI leaves no transcript, so a Copilot run
+stays uncounted. Under a subscription a count is a quantity, not a bill: Codex also
+reports how much of the plan's window a run used, and the launcher prints that.
 
 The Foundation's gateway, `llm.apache.org`, with the PAT llmao issued in `local/.virtual-key`
 and `LLMAO_URL` pointing at it: through the gateway every harness has one destination,

@@ -32,9 +32,11 @@ use futures_util::StreamExt;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
+mod hello;
 pub mod telemetry;
 pub mod usage;
 
@@ -65,7 +67,11 @@ pub struct Destination {
     pub auth: Auth,
     /// Hosts a `CONNECT` tunnel may be opened to, for a harness with no base-URL
     /// override that is pointed here with `HTTPS_PROXY`. An entry starting with a dot
-    /// matches that domain and its subdomains. Empty for an ordinary forward.
+    /// matches that domain and its subdomains. An entry allows port 443, or the port it
+    /// names, `host:port` or `[v6]:port`. A name is resolved when the tunnel opens and
+    /// refused when it resolves to loopback, a private or link-local range, or another
+    /// address no internet host has; an entry that is an address is dialled as named.
+    /// Empty for an ordinary forward.
     /// A tunnel is pinned egress without metering: TLS runs end to end, so the egress
     /// sees no usage and checks the ceiling only when the tunnel opens.
     pub tunnel_hosts: Vec<String>,
@@ -189,10 +195,30 @@ pub enum Error {
     /// A direct call the upstream did not answer with success.
     #[error("{0}")]
     Upstream(String),
+    /// A unix socket path longer than the system takes.
+    #[error(
+        "egress socket {} is {len} bytes long, and a unix socket path takes at most {max} bytes here, {} with the closing NUL",
+        .path.display(),
+        .max + 1
+    )]
+    SocketPath {
+        /// The path.
+        path: std::path::PathBuf,
+        /// Its length in bytes.
+        len: usize,
+        /// The longest path the system takes, in bytes, without the closing NUL.
+        max: usize,
+    },
     /// A tool server named for a tool the grants do not host.
     #[error("{0} is not a hosted tool in grants.toml; a tool server is reached only for [taps.{0}] hosted = \"...\"")]
     NotHosted(String),
 }
+
+/// `sizeof(sockaddr_un.sun_path)`: the most a unix socket path takes, its closing NUL
+/// included. The field is the struct's last, so its size is what follows its offset.
+#[cfg(unix)]
+pub const SUN_PATH: usize =
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
 
 struct Inner {
     memory: Arc<Memory>,
@@ -203,6 +229,53 @@ struct Inner {
     tools: HashMap<String, Destination>,
     client: reqwest::Client,
     telemetry: Telemetry,
+    /// How a tunnel's host is resolved and dialled.
+    network: Arc<dyn Network>,
+    /// How long a tunnel has for the TLS hellos the egress reads, [`hello::HELLO_WAIT`]
+    /// outside a test.
+    hello_wait: std::time::Duration,
+}
+
+/// How the egress resolves a tunnel's host and dials it: the system's resolver and TCP,
+/// or a stand-in in a test.
+trait Network: Send + Sync {
+    /// The addresses `host` resolves to, with `port`.
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> futures_util::future::BoxFuture<'static, std::io::Result<Vec<SocketAddr>>>;
+
+    /// A connection to the first of `addrs` that answers.
+    fn connect(
+        &self,
+        addrs: Vec<SocketAddr>,
+    ) -> futures_util::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>>;
+}
+
+/// The system's resolver and TCP.
+struct SystemNetwork;
+
+impl Network for SystemNetwork {
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> futures_util::future::BoxFuture<'static, std::io::Result<Vec<SocketAddr>>> {
+        let host = host.to_string();
+        Box::pin(async move {
+            Ok(tokio::net::lookup_host((host.as_str(), port))
+                .await?
+                .collect())
+        })
+    }
+
+    fn connect(
+        &self,
+        addrs: Vec<SocketAddr>,
+    ) -> futures_util::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>> {
+        Box::pin(async move { tokio::net::TcpStream::connect(&addrs[..]).await })
+    }
 }
 
 /// What a tool server answered one request with.
@@ -278,7 +351,10 @@ impl Egress {
                 return Err(Error::NotHosted(name.clone()));
             }
         }
+        // a redirect goes back to the caller as it came: followed here, it would carry an
+        // injected key to wherever the upstream pointed, with no check on the address
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .use_rustls_tls()
             .connect_timeout(std::time::Duration::from_secs(20))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
@@ -298,6 +374,8 @@ impl Egress {
                 tools,
                 client,
                 telemetry,
+                network: Arc::new(SystemNetwork),
+                hello_wait: hello::HELLO_WAIT,
             }),
         })
     }
@@ -406,13 +484,14 @@ impl Egress {
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
         let status = resp.status();
+        let to = pointed_to(status, resp.headers());
         let text = resp
             .text()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
         if !status.is_success() {
             return Err(Error::Upstream(format!(
-                "{status} from {destination}/{rest}: {}",
+                "{status} from {destination}/{rest}{to}: {}",
                 text.chars().take(300).collect::<String>()
             )));
         }
@@ -452,6 +531,7 @@ impl Egress {
             .send()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
+        let to = pointed_to(resp.status(), resp.headers());
         let status = resp.status().as_u16();
         let text = resp
             .text()
@@ -483,7 +563,7 @@ impl Egress {
         }
         if !(200..300).contains(&status) {
             return Err(Error::Upstream(format!(
-                "{destination} answered {status}: {text}"
+                "{destination} answered {status}{to}: {text}"
             )));
         }
         Ok(value)
@@ -505,18 +585,57 @@ impl Egress {
             .with_state(self.clone())
     }
 
-    /// Serve on a unix socket until the task is cancelled. Removes a stale socket first.
-    /// Unix only; Windows runs the harness unconfined over TCP.
+    /// Bind the unix socket the egress serves on. A path longer than the system takes is
+    /// refused with its length. A socket already at the path is removed when no listener
+    /// holds it, and refused when one does; anything else there is refused and left in
+    /// place. Needs a Tokio runtime. Unix only; Windows runs the harness unconfined over
+    /// TCP.
+    ///
+    /// # Errors
+    ///
+    /// When the path is too long, something other than a stale socket is there, or the
+    /// socket cannot be bound.
+    #[cfg(unix)]
+    pub fn bind_unix(path: &FsPath) -> Result<tokio::net::UnixListener, Error> {
+        let len = path.as_os_str().len();
+        if len >= SUN_PATH {
+            return Err(Error::SocketPath {
+                path: path.to_path_buf(),
+                len,
+                max: SUN_PATH - 1,
+            });
+        }
+        let named = |e: std::io::Error| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("bind {}: {e}", path.display()),
+            ))
+        };
+        remove_stale_socket(path).map_err(named)?;
+        tokio::net::UnixListener::bind(path).map_err(named)
+    }
+
+    /// Serve on a unix socket until the task is cancelled, as [`Egress::bind_unix`] binds
+    /// it.
     ///
     /// # Errors
     ///
     /// When the socket cannot be bound or serving fails.
     #[cfg(unix)]
     pub async fn serve_unix(&self, path: &FsPath) -> Result<(), Error> {
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        let listener = tokio::net::UnixListener::bind(path)?;
+        self.serve(Self::bind_unix(path)?).await
+    }
+
+    /// Serve on a listener already bound, unix or TCP, until the task is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// When serving fails.
+    pub async fn serve<L>(&self, listener: L) -> Result<(), Error>
+    where
+        L: axum::serve::Listener,
+        L::Addr: std::fmt::Debug,
+    {
         axum::serve(listener, self.router()).await?;
         Ok(())
     }
@@ -527,9 +646,35 @@ impl Egress {
     ///
     /// When the address cannot be bound or serving fails.
     pub async fn serve_tcp(&self, addr: std::net::SocketAddr) -> Result<(), Error> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, self.router()).await?;
-        Ok(())
+        self.serve(tokio::net::TcpListener::bind(addr).await?).await
+    }
+}
+
+/// Remove a socket no listener holds. Nothing there is fine; a socket a listener answers
+/// on, or anything that is not a socket, is an error and stays.
+#[cfg(unix)]
+fn remove_stale_socket(path: &FsPath) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        other => other?,
+    };
+    if !meta.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "something that is not a socket is there; it is left in place",
+        ));
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(std::io::Error::new(
+            ErrorKind::AddrInUse,
+            "the socket is in use by another launch",
+        )),
+        Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+            std::fs::remove_file(path)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -603,6 +748,19 @@ fn copy_headers(from: &HeaderMap, strip_credentials: bool) -> HeaderMap {
         out.append(name.clone(), value.clone());
     }
     out
+}
+
+/// Where a redirect points, as the end of an error message: ` to ` and its `Location`.
+/// Empty for a status that is not a redirect.
+fn pointed_to(status: StatusCode, headers: &HeaderMap) -> String {
+    if !status.is_redirection() {
+        return String::new();
+    }
+    let to = headers
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("no Location");
+    format!(" to {to}")
 }
 
 /// The upstream URL. When the egress injects the credential, a `key=` query parameter
@@ -714,8 +872,195 @@ fn host_allowed(entry: &str, host: &str) -> bool {
     }
 }
 
-/// `CONNECT host:port`: open a TCP tunnel when some destination allows the host and the
-/// session's label is within that destination's ceiling. Anything else here is a 404.
+/// The port a tunnel entry allows when it names none.
+const TUNNEL_PORT: u16 = 443;
+
+/// A host and its port, from `host`, `host:port`, `[v6]` or `[v6]:port`, with the
+/// brackets taken off; a bare IPv6 address is a host with no port. `None` for a port
+/// that is not a number or brackets that do not close.
+fn host_and_port(s: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        return match after {
+            "" => Some((host, None)),
+            _ => Some((host, Some(after.strip_prefix(':')?.parse().ok()?))),
+        };
+    }
+    match s.split_once(':') {
+        Some((host, port)) if !port.contains(':') => Some((host, Some(port.parse().ok()?))),
+        _ => Some((s, None)),
+    }
+}
+
+/// Whether a tunnel entry admits `host` on `port`: the host as [`host_allowed`] has it,
+/// and the port the entry names, or [`TUNNEL_PORT`] when it names none.
+fn entry_allows(entry: &str, host: &str, port: u16) -> bool {
+    host_and_port(entry)
+        .is_some_and(|(h, p)| p.unwrap_or(TUNNEL_PORT) == port && host_allowed(h, host))
+}
+
+/// Whether a tunnel may not reach an address a name resolved to: an address that is
+/// this machine, a network it sits on, its cloud's metadata service, or no host on the
+/// internet. The same for an IPv4 address carried in an IPv6 one.
+fn denied(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => denied_v4(v),
+        IpAddr::V6(v) => denied_v6(v),
+    }
+}
+
+fn denied_v4(v: Ipv4Addr) -> bool {
+    let [a, b, c, _] = v.octets();
+    // link-local holds the metadata address, 169.254.169.254; broadcast is in 240/4
+    v.is_unspecified()
+        || v.is_loopback()
+        || v.is_private()
+        || v.is_link_local()
+        || v.is_multicast()
+        || v.is_documentation()
+        || a == 0
+        || a >= 240
+        || (a == 100 && (b & 0xc0) == 64)
+        || (a == 198 && (b & 0xfe) == 18)
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 88 && c == 99)
+}
+
+fn denied_v6(v: Ipv6Addr) -> bool {
+    let s = v.segments();
+    // unique local, fc00::/7, holds the metadata address fd00:ec2::254; then
+    // site-local, documentation, discard-only, the IETF protocol block 2001::/23,
+    // SRv6 SIDs and local-use NAT64
+    v.is_unspecified()
+        || v.is_loopback()
+        || v.is_multicast()
+        || v.is_unique_local()
+        || v.is_unicast_link_local()
+        || (s[0] & 0xffc0) == 0xfec0
+        || (s[0] == 0x2001 && s[1] == 0x0db8)
+        || (s[0] == 0x3fff && (s[1] & 0xf000) == 0)
+        || s[..4] == [0x100, 0, 0, 0]
+        || (s[0] == 0x2001 && s[1] < 0x200)
+        || s[0] == 0x5f00
+        || s[..3] == [0x64, 0xff9b, 1]
+        || embedded_v4(v).is_some_and(denied_v4)
+}
+
+/// The IPv4 address an IPv6 one carries: mapped, `::ffff:a.b.c.d`; compatible,
+/// `::a.b.c.d`; translated, `::ffff:0:a.b.c.d`; or behind NAT64's well-known prefix,
+/// `64:ff9b::a.b.c.d`.
+fn embedded_v4(v: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = v.segments();
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || s[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        let [.., a, b, c, d] = v.octets();
+        return Some(Ipv4Addr::new(a, b, c, d));
+    }
+    v.to_ipv4()
+}
+
+/// The addresses a tunnel to `host` may dial: an entry that is an address is the
+/// launcher's own choice and is dialled as named; a name is resolved here, once, and
+/// its answer [`checked`]. The dial goes to these addresses, so a second answer for the
+/// name cannot change where the tunnel goes.
+async fn tunnel_addresses(
+    network: &dyn Network,
+    entry_host: &str,
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, Box<Response>> {
+    if let Ok(ip) = entry_host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    match network.resolve(host, port).await {
+        Ok(addrs) => checked(host, addrs),
+        Err(e) => {
+            eprintln!("egress: tunnel to {host}: {e}");
+            Err(Box::new(error_json(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                &format!("{host} does not resolve"),
+            )))
+        }
+    }
+}
+
+/// A name's answer, refused when it is empty or any address in it is [`denied`]. The
+/// refusal names no address; the egress's own log does.
+fn checked(host: &str, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, Box<Response>> {
+    if addrs.is_empty() {
+        eprintln!("egress: tunnel to {host}: no address");
+        return Err(Box::new(error_json(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            &format!("{host} does not resolve"),
+        )));
+    }
+    if let Some(bad) = addrs.iter().find(|a| denied(a.ip())) {
+        eprintln!(
+            "egress: tunnel to {host}: {} is in a denied range",
+            bad.ip()
+        );
+        return Err(Box::new(error_json(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &format!("{host} resolves to an address a tunnel may not reach"),
+        )));
+    }
+    Ok(addrs)
+}
+
+/// What a `CONNECT` to `authority` tunnels under: the destination whose entry allows
+/// the host on that port, within the session's ceiling, the host, and the checked
+/// addresses to dial. The response that refuses it otherwise.
+async fn tunnel_for(
+    inner: &Inner,
+    authority: &str,
+) -> Result<(String, String, Vec<SocketAddr>), Box<Response>> {
+    let refuse = |message: &str| {
+        Box::new(error_json(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            message,
+        ))
+    };
+    let Some((host, port)) = host_and_port(authority) else {
+        return Err(Box::new(error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("{authority} is not a host and port"),
+        )));
+    };
+    let port = port.unwrap_or(TUNNEL_PORT);
+    let found = inner.destinations.iter().find_map(|(name, d)| {
+        d.tunnel_hosts
+            .iter()
+            .find(|e| entry_allows(e, host, port))
+            .map(|e| (name, e))
+    });
+    let Some((name, entry)) = found else {
+        return Err(refuse(&format!(
+            "no destination allows a tunnel to {host}:{port}"
+        )));
+    };
+    let ceiling = inner.memory.grants().ceiling(name).unwrap_or(Label::Public);
+    let label = inner.memory.label();
+    if label > ceiling {
+        return Err(refuse(&format!(
+            "this session has read {label} material and {name} accepts at most {ceiling}"
+        )));
+    }
+    let entry_host = host_and_port(entry).map_or(entry.as_str(), |(h, _)| h);
+    let addrs = tunnel_addresses(inner.network.as_ref(), entry_host, host, port).await?;
+    Ok((name.clone(), host.to_string(), addrs))
+}
+
+/// `CONNECT host:port`: open a TCP tunnel when some destination allows the host on that
+/// port, the session's label is within that destination's ceiling, and the host's
+/// addresses are ones a tunnel may reach. Anything else here is a 404.
+///
+/// The 200 goes back before the dial, since a client sends its ClientHello only after
+/// it. The tunnel is then [`opened`] with its TLS hellos checked, and refused with a TLS
+/// alert and closed when they do not name the host.
 async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) -> Response {
     if req.method() != Method::CONNECT {
         return error_json(StatusCode::NOT_FOUND, "not_found_error", "no such path");
@@ -732,46 +1077,29 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority.as_str(), |(h, _)| h);
-    let Some((name, _)) = inner
-        .destinations
-        .iter()
-        .find(|(_, d)| d.tunnel_hosts.iter().any(|h| host_allowed(h, host)))
-    else {
-        return error_json(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            &format!("no destination allows a tunnel to {host}"),
-        );
-    };
-    let ceiling = inner.memory.grants().ceiling(name).unwrap_or(Label::Public);
-    let label = inner.memory.label();
-    if label > ceiling {
-        return error_json(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            &format!("this session has read {label} material and {name} accepts at most {ceiling}"),
-        );
-    }
-    let target = if authority.contains(':') {
-        authority.clone()
-    } else {
-        format!("{authority}:443")
+    let (name, host, addrs) = match tunnel_for(&inner, &authority).await {
+        Ok(found) => found,
+        Err(refusal) => return *refusal,
     };
     let on_upgrade = hyper::upgrade::on(&mut req);
-    let name = name.clone();
     let session = inner.memory.session_id().to_string();
     let started = std::time::SystemTime::now();
     tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
         let Ok(upgraded) = on_upgrade.await else {
             return;
         };
-        let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
-            return;
-        };
         let mut inbound = hyper_util::rt::TokioIo::new(upgraded);
+        let mut outbound = match opened(&inner, &mut inbound, &host, addrs).await {
+            Ok(outbound) => outbound,
+            Err(Stop::Refused(why)) => {
+                eprintln!("egress: tunnel to {host}: {why}; closed");
+                let _ = inbound.write_all(&hello::REFUSED_ALERT).await;
+                let _ = inbound.shutdown().await;
+                return;
+            }
+            Err(Stop::Ended) => return,
+        };
         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
         let _ = inner.telemetry.record(
             started,
@@ -785,6 +1113,66 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
         );
     });
     Response::new(Body::empty())
+}
+
+/// Why a tunnel stopped before its bytes were copied both ways.
+enum Stop {
+    /// A hello that does not name the host, or one not read whole within the bounds and
+    /// the wait, and why: the client is told.
+    Refused(String),
+    /// A dial that failed or an upstream that went away: the tunnel just ends.
+    Ended,
+}
+
+/// The upstream end of a tunnel to `host`, dialled at `addrs` once the client's
+/// ClientHello names the host, and, when the upstream answers with a HelloRetryRequest,
+/// once the client's second ClientHello does too and the answer to it is no second
+/// retry request. Everything read on the way has been sent on, so the two ends are ready
+/// to be copied both ways; the hellos and answers are read within the egress's
+/// `hello_wait`, all together, from now.
+async fn opened(
+    inner: &Inner,
+    inbound: &mut hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
+    host: &str,
+    addrs: Vec<SocketAddr>,
+) -> Result<tokio::net::TcpStream, Stop> {
+    use tokio::io::AsyncWriteExt;
+    let deadline = tokio::time::Instant::now() + inner.hello_wait;
+    let first = hello::read_hello(inbound, host, false, Vec::new(), deadline)
+        .await
+        .map_err(Stop::Refused)?;
+    let mut outbound = inner
+        .network
+        .connect(addrs)
+        .await
+        .map_err(|_| Stop::Ended)?;
+    let sent = outbound.write_all(&first.hello).await;
+    sent.map_err(|_| Stop::Ended)?;
+    let answer = hello::read_answer(&mut outbound, inbound, Vec::new(), deadline)
+        .await
+        .map_err(Stop::Refused)?;
+    let mut rest = first.after;
+    if let hello::Next::Retry(seen) = answer {
+        let second = hello::read_hello(inbound, host, true, rest, deadline)
+            .await
+            .map_err(|why| Stop::Refused(format!("after a HelloRetryRequest, {why}")))?;
+        let sent = outbound.write_all(&second.hello).await;
+        sent.map_err(|_| Stop::Ended)?;
+        // TLS 1.3 allows one retry request; a second would have the client send a third
+        // hello, unchecked
+        let again = hello::read_answer(&mut outbound, inbound, seen, deadline)
+            .await
+            .map_err(Stop::Refused)?;
+        if again != hello::Next::Other {
+            return Err(Stop::Refused(
+                "the upstream asked for a second retry".into(),
+            ));
+        }
+        rest = second.after;
+    }
+    let sent = outbound.write_all(&rest).await;
+    sent.map_err(|_| Stop::Ended)?;
+    Ok(outbound)
 }
 
 /// The upstream request: the harness's request with hop-by-hop headers dropped, the
@@ -1042,28 +1430,14 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    if !status.is_success() && std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
-        // a diagnostic: who refused, and how. The body is read here and not relayed, so
-        // this is for finding out, not for running.
-        let url = upstream.url().to_string();
-        let server = upstream
-            .headers()
-            .get("server")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-            .to_string();
-        let cf = upstream.headers().contains_key("cf-ray");
-        let body = upstream.text().await.unwrap_or_default();
-        eprintln!(
-            "egress debug: {status} from {url} server={server} cloudflare={cf} body={:?}",
-            body.chars().take(300).collect::<String>()
-        );
-        return error_json(
-            status,
-            "upstream_error",
-            &body.chars().take(300).collect::<String>(),
-        );
-    }
+    let upstream = if !status.is_success() && std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
+        match debugged(status, upstream).await {
+            Debugged::Relay(upstream) => upstream,
+            Debugged::Refused(refusal) => return refusal,
+        }
+    } else {
+        upstream
+    };
     let resp_headers = copy_headers(upstream.headers(), false);
     let content_type = upstream
         .headers()
@@ -1088,6 +1462,45 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
     *response.status_mut() = status;
     *response.headers_mut() = resp_headers;
     response
+}
+
+/// What the debug mode does with an upstream's answer that is not a success.
+enum Debugged {
+    /// Relay it as it came: a redirect, which the harness needs whole, `Location` and all.
+    Relay(reqwest::Response),
+    /// Answer with this instead: the start of the upstream's body, read here.
+    Refused(Response),
+}
+
+/// A diagnostic, with `MEMORY_EGRESS_DEBUG` set: who refused, and how, on stderr. A
+/// redirect is logged with where it points and relayed; any other answer's body is read
+/// here and not relayed, so this is for finding out, not for running.
+async fn debugged(status: StatusCode, upstream: reqwest::Response) -> Debugged {
+    let url = upstream.url().to_string();
+    if status.is_redirection() {
+        eprintln!(
+            "egress debug: {status} from {url}{}, relayed",
+            pointed_to(status, upstream.headers())
+        );
+        return Debugged::Relay(upstream);
+    }
+    let server = upstream
+        .headers()
+        .get("server")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let cf = upstream.headers().contains_key("cf-ray");
+    let body = upstream.text().await.unwrap_or_default();
+    eprintln!(
+        "egress debug: {status} from {url} server={server} cloudflare={cf} body={:?}",
+        body.chars().take(300).collect::<String>()
+    );
+    Debugged::Refused(error_json(
+        status,
+        "upstream_error",
+        &body.chars().take(300).collect::<String>(),
+    ))
 }
 
 /// Record the call once its usage is known, when the body has streamed through. A call
@@ -1232,6 +1645,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::hello::fixtures::rustls_hello;
     use super::*;
     use tower::ServiceExt;
 
@@ -1288,6 +1702,94 @@ mod tests {
         let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("\"serverInfo\""), "{text}");
+    }
+
+    /// A path under `dir` of exactly `len` bytes, its directories made.
+    #[cfg(unix)]
+    fn socket_path_of(dir: &FsPath, len: usize) -> std::path::PathBuf {
+        let base = dir.join("egress.sock").as_os_str().len();
+        let pad = dir.join("p".repeat(len - base - 1));
+        std::fs::create_dir_all(&pad).unwrap();
+        let path = pad.join("egress.sock");
+        assert_eq!(path.as_os_str().len(), len);
+        path
+    }
+
+    /// `sizeof(sockaddr_un.sun_path)` as the system headers give it, not as the egress
+    /// does.
+    #[cfg(unix)]
+    const SUN_PATH: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+        108
+    } else {
+        104
+    };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_path_too_long_for_the_system_is_refused_with_its_length() {
+        let (d, e) = fixture(None).await;
+        let path = socket_path_of(d.path(), SUN_PATH);
+        let err = e.serve_unix(&path).await.unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains(&format!("{SUN_PATH} bytes")), "{err}");
+        assert!(err.contains(&format!("at most {}", SUN_PATH - 1)), "{err}");
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_path_one_byte_under_the_limit_is_served() {
+        let (d, e) = fixture(None).await;
+        let path = socket_path_of(d.path(), SUN_PATH - 1);
+        let serving =
+            tokio::time::timeout(std::time::Duration::from_millis(200), e.serve_unix(&path)).await;
+        assert!(serving.is_err(), "still serving: {serving:?}");
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_no_listener_holds_is_replaced() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("egress.sock");
+        drop(Egress::bind_unix(&path).unwrap());
+        assert!(path.exists(), "a dropped listener leaves its file behind");
+        let again = Egress::bind_unix(&path).unwrap();
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        again.accept().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_another_listener_holds_is_left_to_it() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("egress.sock");
+        let held = Egress::bind_unix(&path).unwrap();
+        let err = Egress::bind_unix(&path).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("in use by another launch"), "{err}");
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        held.accept().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_that_is_not_a_socket_is_refused_and_left_in_place() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("egress.sock");
+        std::fs::write(&file, "kept").unwrap();
+        let err = Egress::bind_unix(&file).unwrap_err().to_string();
+        assert!(err.contains(&file.display().to_string()), "{err}");
+        assert!(err.contains("not a socket"), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
+
+        let link = d.path().join("link.sock");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let err = Egress::bind_unix(&link).unwrap_err().to_string();
+        assert!(err.contains(&link.display().to_string()), "{err}");
+        assert!(err.contains("not a socket"), "{err}");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
     }
 
     #[tokio::test]
@@ -1972,6 +2474,791 @@ mod tests {
         assert!(!host_allowed(".githubcopilot.com", "notgithubcopilot.com"));
     }
 
+    #[test]
+    fn an_entry_allows_443_or_the_port_it_names() {
+        // (entry, host, port, allowed)
+        let cases = [
+            ("api.github.com", "api.github.com", 443, true),
+            ("api.github.com", "api.github.com", 22, false),
+            ("api.github.com", "api.github.com", 80, false),
+            (".grok.com", "code.grok.com", 443, true),
+            (".grok.com", "code.grok.com", 8443, false),
+            ("relay.example:8443", "relay.example", 8443, true),
+            ("relay.example:8443", "relay.example", 443, false),
+            ("[::1]:4000", "::1", 4000, true),
+            ("[::1]:4000", "::1", 443, false),
+            ("[::1]", "::1", 443, true),
+            // a bare IPv6 address names no port
+            ("::1", "::1", 443, true),
+            // an entry whose port does not parse allows nothing
+            ("relay.example:http", "relay.example", 443, false),
+            ("relay.example:", "relay.example", 443, false),
+            ("[::1", "::1", 443, false),
+        ];
+        for (entry, host, port, allowed) in cases {
+            assert_eq!(
+                entry_allows(entry, host, port),
+                allowed,
+                "{entry} for {host}:{port}"
+            );
+        }
+        assert_eq!(host_and_port("[::1]:443"), Some(("::1", Some(443))));
+        assert_eq!(
+            host_and_port("api.github.com"),
+            Some(("api.github.com", None))
+        );
+    }
+
+    /// Addresses a tunnel may not reach, by range, with the edges of each.
+    const DENIED: &[&str] = &[
+        // loopback and unspecified, this network
+        "127.0.0.1",
+        "127.255.255.254",
+        "0.0.0.0",
+        "0.1.2.3",
+        "::1",
+        "::",
+        // private and shared (CGNAT)
+        "10.0.0.1",
+        "10.255.255.255",
+        "172.16.0.1",
+        "172.31.255.255",
+        "192.168.1.1",
+        "100.64.0.1",
+        "100.127.255.255",
+        "fc00::1",
+        "fdff:ffff::1",
+        // link-local and the metadata services in it
+        "169.254.0.1",
+        "169.254.169.254",
+        "fe80::1",
+        "febf::1",
+        "fd00:ec2::254",
+        "fec0::1",
+        // multicast, broadcast, reserved
+        "224.0.0.1",
+        "239.255.255.250",
+        "255.255.255.255",
+        "240.0.0.1",
+        "ff02::1",
+        // documentation and benchmarking
+        "192.0.2.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "198.18.0.1",
+        "198.19.255.255",
+        "2001:db8::1",
+        "3fff::1",
+        "3fff:fff::1",
+        // IPv4 carried in IPv6
+        "::ffff:127.0.0.1",
+        "::ffff:169.254.169.254",
+        "::ffff:10.0.0.1",
+        "::ffff:100.64.0.1",
+        "::ffff:224.0.0.1",
+        "::ffff:255.255.255.255",
+        "::127.0.0.1",
+        "64:ff9b::a9fe:a9fe",
+        "64:ff9b::7f00:1",
+        "::ffff:0:7f00:1",
+        "::ffff:0:a9fe:a9fe",
+        "::ffff:0:a00:1",
+        // special-purpose: IETF protocol assignments, 6to4 relay anycast,
+        // discard-only, the IETF protocol block (Teredo, benchmarking, ORCHID),
+        // SRv6 SIDs, local-use NAT64
+        "192.0.0.0",
+        "192.0.0.255",
+        "192.88.99.0",
+        "192.88.99.255",
+        "100::1",
+        "100::ffff:ffff:ffff:ffff",
+        "2001::1",
+        "2001:2::1",
+        "2001:10::1",
+        "2001:1ff:ffff::1",
+        "5f00::1",
+        "5f00:ffff::1",
+        "64:ff9b:1::1",
+        "64:ff9b:1:ffff::1",
+        "64:ff9b:1::808:808",
+    ];
+
+    /// Addresses just outside those ranges, which a tunnel may reach.
+    const REACHABLE: &[&str] = &[
+        "1.1.1.1",
+        "8.8.8.8",
+        "140.82.112.3",
+        "9.255.255.255",
+        "11.0.0.0",
+        "172.15.255.255",
+        "172.32.0.0",
+        "192.167.255.255",
+        "192.169.0.0",
+        "100.63.255.255",
+        "100.128.0.0",
+        "169.253.255.255",
+        "169.255.0.0",
+        "198.17.255.255",
+        "198.20.0.0",
+        "223.255.255.255",
+        "2606:4700:4700::1111",
+        "2001:db9::1",
+        "3fff:1000::1",
+        "::ffff:8.8.8.8",
+        "64:ff9b::808:808",
+        "::ffff:0:808:808",
+        "191.255.255.255",
+        "192.0.1.0",
+        "192.88.98.255",
+        "192.88.100.0",
+        "100:0:0:1::1",
+        "2001:200::1",
+        "2001:4860:4860::8888",
+    ];
+
+    #[test]
+    fn a_tunnel_may_not_reach_this_machine_its_networks_or_metadata() {
+        let judged = |a: &&str| denied(a.parse().unwrap());
+        let let_through: Vec<&str> = DENIED.iter().copied().filter(|a| !judged(a)).collect();
+        let refused: Vec<&str> = REACHABLE.iter().copied().filter(judged).collect();
+        assert_eq!(let_through, Vec::<&str>::new(), "denied, and let through");
+        assert_eq!(refused, Vec::<&str>::new(), "reachable, and refused");
+    }
+
+    #[tokio::test]
+    async fn an_address_in_the_request_is_checked_as_a_name_s_answer_is() {
+        // the system's resolver hands an address back as it is, without DNS
+        let public = tunnel_addresses(&SystemNetwork, ".example", "1.1.1.1", 443)
+            .await
+            .unwrap();
+        assert_eq!(public, vec!["1.1.1.1:443".parse().unwrap()]);
+        let refused = tunnel_addresses(&SystemNetwork, ".example", "169.254.169.254", 443)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        // an entry that is an address is dialled as named, loopback included
+        let named = tunnel_addresses(&SystemNetwork, "127.0.0.1", "127.0.0.1", 4000)
+            .await
+            .unwrap();
+        assert_eq!(named, vec!["127.0.0.1:4000".parse().unwrap()]);
+    }
+
+    #[test]
+    fn an_answer_with_any_denied_address_is_refused_whichever_comes_first() {
+        let public: SocketAddr = "198.41.0.4:443".parse().unwrap();
+        let other: SocketAddr = "[2001:503:ba3e::2:30]:443".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let metadata: SocketAddr = "[fd00:ec2::254]:443".parse().unwrap();
+        for answer in [
+            vec![public, loopback],
+            vec![loopback, public],
+            vec![public, other, metadata],
+            vec![metadata, public, other],
+        ] {
+            let refusal = checked("upstream.example", answer.clone()).unwrap_err();
+            assert_eq!(refusal.status(), StatusCode::FORBIDDEN, "{answer:?}");
+        }
+        assert_eq!(
+            checked("upstream.example", vec![public, other]).unwrap(),
+            vec![public, other]
+        );
+        let empty = checked("upstream.example", Vec::new()).unwrap_err();
+        assert_eq!(empty.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// A network for tunnel tests: a name's answers in turn, the last one again after
+    /// that, `None` for a resolver that fails; every dial is kept and goes to `upstream`.
+    struct FakeNetwork {
+        answers: Vec<Option<Vec<SocketAddr>>>,
+        resolved: std::sync::atomic::AtomicUsize,
+        dialled: std::sync::Mutex<Vec<Vec<SocketAddr>>>,
+        upstream: SocketAddr,
+    }
+
+    impl FakeNetwork {
+        fn new(answers: Vec<Option<Vec<SocketAddr>>>, upstream: SocketAddr) -> Arc<FakeNetwork> {
+            Arc::new(FakeNetwork {
+                answers,
+                resolved: std::sync::atomic::AtomicUsize::new(0),
+                dialled: std::sync::Mutex::new(Vec::new()),
+                upstream,
+            })
+        }
+
+        fn resolved(&self) -> usize {
+            self.resolved.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn dialled(&self) -> Vec<Vec<SocketAddr>> {
+            self.dialled.lock().unwrap().clone()
+        }
+    }
+
+    impl Network for FakeNetwork {
+        fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> futures_util::future::BoxFuture<'static, std::io::Result<Vec<SocketAddr>>> {
+            let n = self
+                .resolved
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answer = self.answers[n.min(self.answers.len() - 1)].clone();
+            Box::pin(async move {
+                answer.ok_or_else(|| std::io::Error::other("SERVFAIL from 10.9.8.7"))
+            })
+        }
+
+        fn connect(
+            &self,
+            addrs: Vec<SocketAddr>,
+        ) -> futures_util::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>>
+        {
+            self.dialled.lock().unwrap().push(addrs);
+            let upstream = self.upstream;
+            Box::pin(async move { tokio::net::TcpStream::connect(upstream).await })
+        }
+    }
+
+    /// An egress with one tunnel destination to `entry`, on `network`, served on loopback.
+    async fn tunnel_egress(
+        entry: &str,
+        network: &Arc<FakeNetwork>,
+    ) -> (tempfile::TempDir, Egress, SocketAddr) {
+        waiting_tunnel_egress(entry, network, hello::HELLO_WAIT).await
+    }
+
+    /// [`tunnel_egress`], with `wait` for a tunnel's hellos.
+    async fn waiting_tunnel_egress(
+        entry: &str,
+        network: &Arc<FakeNetwork>,
+        wait: std::time::Duration,
+    ) -> (tempfile::TempDir, Egress, SocketAddr) {
+        let (d, mut e) = fixture(Some(("github", Destination::tunnel([entry])))).await;
+        let inner = Arc::get_mut(&mut e.inner).unwrap();
+        inner.network = network.clone();
+        inner.hello_wait = wait;
+        let addr = serve(&e).await;
+        (d, e, addr)
+    }
+
+    /// A ClientHello for `host` and the bytes after it, sent into an open tunnel, come
+    /// back from the echo upstream untouched.
+    async fn echoes(c: &mut tokio::net::TcpStream, host: &str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut sent = rustls_hello(host, true);
+        sent.extend_from_slice(b"ping");
+        c.write_all(&sent).await.unwrap();
+        let mut echo = vec![0u8; sent.len()];
+        c.read_exact(&mut echo).await.unwrap();
+        assert_eq!(echo, sent, "the tunnel reaches the upstream");
+    }
+
+    #[tokio::test]
+    async fn a_name_is_resolved_once_and_its_checked_answer_is_what_is_dialled() {
+        let (upstream, _) = echo_upstream().await;
+        let first: SocketAddr = "198.41.0.4:443".parse().unwrap();
+        let second: SocketAddr = "198.41.0.5:443".parse().unwrap();
+        // a resolver whose second answer differs from its first, as a rebinding one does
+        let net = FakeNetwork::new(vec![Some(vec![first]), Some(vec![second])], upstream);
+        let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
+        let (head, mut c) = connect(egress, "upstream.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        echoes(&mut c, "upstream.example").await;
+        assert_eq!(
+            net.dialled(),
+            vec![vec![first]],
+            "the checked answer is dialled"
+        );
+        assert_eq!(net.resolved(), 1, "the name is resolved once");
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_a_denied_address_is_refused_and_nothing_is_dialled() {
+        let (upstream, _) = echo_upstream().await;
+        let public: SocketAddr = "198.41.0.4:443".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        for answer in [vec![public, loopback], vec![loopback, public]] {
+            let net = FakeNetwork::new(vec![Some(answer.clone())], upstream);
+            let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
+            let (head, _) = connect(egress, "upstream.example:443").await;
+            assert!(head.starts_with("HTTP/1.1 403"), "{answer:?}: {head}");
+            assert!(
+                head.contains("upstream.example resolves to an address a tunnel may not reach"),
+                "{head}"
+            );
+            assert!(!head.contains("127.0.0.1"), "{head}");
+            assert_eq!(net.dialled(), Vec::<Vec<SocketAddr>>::new(), "{answer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_that_does_not_resolve_is_refused_without_the_resolver_s_words() {
+        let (upstream, _) = echo_upstream().await;
+        for answer in [None, Some(Vec::new())] {
+            let net = FakeNetwork::new(vec![answer.clone()], upstream);
+            let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
+            let (head, _) = connect(egress, "upstream.example:443").await;
+            assert!(head.starts_with("HTTP/1.1 502"), "{answer:?}: {head}");
+            assert!(head.contains("upstream.example does not resolve"), "{head}");
+            assert!(
+                !head.contains("SERVFAIL") && !head.contains("10.9.8.7"),
+                "{head}"
+            );
+            assert_eq!(net.dialled(), Vec::<Vec<SocketAddr>>::new(), "{answer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connect_that_names_no_port_is_to_443() {
+        let (upstream, _) = echo_upstream().await;
+        let net = FakeNetwork::new(vec![None], upstream);
+        // an entry with no port allows the request with no port
+        let (_d, _e, egress) = tunnel_egress("127.0.0.1", &net).await;
+        let (head, mut c) = connect(egress, "127.0.0.1").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        echoes(&mut c, "127.0.0.1").await;
+        assert_eq!(net.dialled(), vec![vec!["127.0.0.1:443".parse().unwrap()]]);
+        // an entry that names another port does not
+        let net = FakeNetwork::new(vec![None], upstream);
+        let (_d, _e, egress) = tunnel_egress("127.0.0.1:8443", &net).await;
+        let (head, _) = connect(egress, "127.0.0.1").await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(net.dialled(), Vec::<Vec<SocketAddr>>::new());
+    }
+
+    /// Everything the egress sends back on `c` until it closes the tunnel, or what came
+    /// within five seconds when it does not.
+    async fn until_closed(c: &mut tokio::net::TcpStream) -> (Vec<u8>, bool) {
+        use tokio::io::AsyncReadExt;
+        let mut got = Vec::new();
+        let read = c.read_to_end(&mut got);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .is_ok();
+        (got, closed)
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_forwards_a_client_hello_that_names_the_connect_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (upstream, _) = echo_upstream().await;
+        let answer: SocketAddr = "198.41.0.4:443".parse().unwrap();
+        let net = FakeNetwork::new(vec![Some(vec![answer])], upstream);
+        let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
+        let (head, mut c) = connect(egress, "upstream.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut sent = rustls_hello("upstream.example", true);
+        sent.extend_from_slice(b"and after it");
+        c.write_all(&sent).await.unwrap();
+        let mut echo = vec![0u8; sent.len()];
+        c.read_exact(&mut echo).await.unwrap();
+        assert_eq!(
+            echo, sent,
+            "the hello and what follows reach the upstream intact"
+        );
+        assert_eq!(net.dialled(), vec![vec![answer]]);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_whose_first_bytes_name_another_host_sends_nothing_upstream() {
+        use tokio::io::AsyncWriteExt;
+        let (upstream, peers) = echo_upstream().await;
+        let mut let_through = Vec::new();
+        for (case, first) in [
+            ("another name", rustls_hello("other-tenant.example", true)),
+            ("no name", rustls_hello("upstream.example", false)),
+            (
+                "not TLS",
+                b"GET / HTTP/1.1\r\nHost: other-tenant.example\r\n\r\n".to_vec(),
+            ),
+        ] {
+            let answer = vec!["198.41.0.4:443".parse().unwrap()];
+            let net = FakeNetwork::new(vec![Some(answer)], upstream);
+            let (_d, _e, egress) = tunnel_egress("upstream.example", &net).await;
+            let (head, mut c) = connect(egress, "upstream.example:443").await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{case}: {head}");
+            c.write_all(&first).await.unwrap();
+            let (got, closed) = until_closed(&mut c).await;
+            let echoed = got.windows(first.len()).any(|w| w == first);
+            let alerted = got == hello::REFUSED_ALERT;
+            if !net.dialled().is_empty() || !closed || echoed || !alerted {
+                let_through.push(format!(
+                    "{case}: dialled {:?}, closed {closed}, echoed {echoed}, answered {got:?}",
+                    net.dialled()
+                ));
+            }
+        }
+        assert_eq!(
+            let_through,
+            Vec::<String>::new(),
+            "refused, and let through"
+        );
+        assert_eq!(
+            dialled(upstream, &peers).await,
+            Vec::new(),
+            "the upstream heard nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_sent_no_hello_is_closed_when_its_wait_is_up_with_nothing_dialled() {
+        let (upstream, _) = echo_upstream().await;
+        let answer = vec!["198.41.0.4:443".parse().unwrap()];
+        let net = FakeNetwork::new(vec![Some(answer)], upstream);
+        let wait = std::time::Duration::from_millis(300);
+        let (_d, _e, egress) = waiting_tunnel_egress("upstream.example", &net, wait).await;
+        let (head, mut c) = connect(egress, "upstream.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let started = std::time::Instant::now();
+        let (got, closed) = until_closed(&mut c).await;
+        let took = started.elapsed();
+        assert!(closed, "the tunnel is closed");
+        assert!(
+            took + std::time::Duration::from_millis(100) >= wait,
+            "closed after {took:?}, before its wait was up"
+        );
+        assert!(
+            took < wait + std::time::Duration::from_secs(2),
+            "closed after {took:?}, long after its wait of {wait:?}"
+        );
+        assert_eq!(got, hello::REFUSED_ALERT.to_vec(), "the client is refused");
+        assert_eq!(
+            net.dialled(),
+            Vec::<Vec<SocketAddr>>::new(),
+            "nothing is dialled"
+        );
+    }
+
+    /// What a fake TLS upstream heard: each ClientHello it answered, as its records came,
+    /// and everything after the last of them until its client closed.
+    #[derive(Debug, Default)]
+    struct Answered {
+        hellos: Vec<Vec<u8>>,
+        after: Vec<u8>,
+    }
+
+    /// The writes of one answer of [`tls_upstream`]: each after its delay.
+    type Writes = Vec<(std::time::Duration, Vec<u8>)>;
+
+    /// One answer: these bytes, at once.
+    fn at_once(bytes: Vec<u8>) -> Writes {
+        vec![(std::time::Duration::ZERO, bytes)]
+    }
+
+    /// An upstream standing in for a TLS 1.3 front end: it answers each ClientHello it
+    /// reads with the next of `answers`, reading the hellos after the first as a client
+    /// sends them after a retry request. Once it has answered them all, or reads
+    /// anything else, it keeps what comes until its client closes.
+    async fn tls_upstream(
+        answers: Vec<Writes>,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<Answered>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = tx.send(answering(&mut s, answers).await);
+        });
+        (addr, rx)
+    }
+
+    /// [`tls_upstream`]'s side of one connection.
+    async fn answering(s: &mut tokio::net::TcpStream, answers: Vec<Writes>) -> Answered {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut heard = Answered::default();
+        let mut chunk = [0u8; 4096];
+        'answers: for writes in answers {
+            let judge = if heard.hellos.is_empty() {
+                hello::verdict
+            } else {
+                hello::second_verdict
+            };
+            let length = loop {
+                match judge(&heard.after, "upstream.example") {
+                    hello::Verdict::Allowed(length) => break length,
+                    hello::Verdict::Refused(_) => break 'answers,
+                    hello::Verdict::More => {}
+                }
+                match s.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break 'answers,
+                    Ok(n) => heard.after.extend_from_slice(&chunk[..n]),
+                }
+            };
+            heard.hellos.push(heard.after.drain(..length).collect());
+            for (delay, bytes) in writes {
+                tokio::time::sleep(delay).await;
+                if s.write_all(&bytes).await.is_err() {
+                    break 'answers;
+                }
+            }
+        }
+        let _ = s.read_to_end(&mut heard.after).await;
+        heard
+    }
+
+    /// What `heard` delivers within five seconds, or a note that the upstream's
+    /// connection never closed.
+    async fn heard_within(heard: tokio::sync::oneshot::Receiver<Answered>) -> Answered {
+        tokio::time::timeout(std::time::Duration::from_secs(5), heard)
+            .await
+            .map(Result::unwrap_or_default)
+            .unwrap_or_else(|_| Answered {
+                hellos: Vec::new(),
+                after: b"the upstream's connection never closed".to_vec(),
+            })
+    }
+
+    /// A ClientHello naming `name`, in one record.
+    fn hello_for(name: &str) -> Vec<u8> {
+        use hello::fixtures::{message, records, sni};
+        records(&message(&[sni(&[name])]), 512)
+    }
+
+    /// The ChangeCipherSpec record a client sends before its second hello.
+    const CCS: [u8; 6] = [20, 3, 3, 0, 1, 1];
+
+    /// An egress tunnel to upstream.example over `upstream`, with `wait` for its hellos,
+    /// and a client of it whose CONNECT was answered 200.
+    async fn tunnel_to(
+        upstream: SocketAddr,
+        wait: std::time::Duration,
+    ) -> (tempfile::TempDir, Egress, tokio::net::TcpStream) {
+        let answer = vec!["198.41.0.4:443".parse().unwrap()];
+        let net = FakeNetwork::new(vec![Some(answer)], upstream);
+        let (d, e, egress) = waiting_tunnel_egress("upstream.example", &net, wait).await;
+        let (head, c) = connect(egress, "upstream.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        (d, e, c)
+    }
+
+    /// A tunnel to upstream.example whose upstream asks for a second hello and then
+    /// answers it, and whose client sends one naming `name`: what the upstream heard,
+    /// what the client got back after the request, and whether the tunnel then closed.
+    async fn retried(name: &str) -> (Answered, Vec<u8>, bool) {
+        use hello::fixtures::{plain_server_hello, retry_request};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let answers = vec![at_once(retry_request()), at_once(plain_server_hello())];
+        let (upstream, heard) = tls_upstream(answers).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, hello::HELLO_WAIT).await;
+        c.write_all(&hello_for("upstream.example")).await.unwrap();
+        let retry = retry_request();
+        let mut got = vec![0u8; retry.len()];
+        c.read_exact(&mut got).await.unwrap();
+        assert_eq!(
+            got, retry,
+            "the request for a second hello reaches the client"
+        );
+        c.write_all(&[&CCS[..], &hello_for(name)].concat())
+            .await
+            .unwrap();
+        c.shutdown().await.unwrap();
+        let (back, closed) = until_closed(&mut c).await;
+        drop(c);
+        (heard_within(heard).await, back, closed)
+    }
+
+    #[tokio::test]
+    async fn after_a_retry_request_a_second_hello_that_names_the_host_goes_upstream() {
+        let (heard, back, closed) = retried("upstream.example").await;
+        let second = [&CCS[..], &hello_for("upstream.example")].concat();
+        assert_eq!(
+            heard.hellos,
+            vec![hello_for("upstream.example"), second],
+            "the second hello reaches the upstream whole"
+        );
+        assert_eq!(heard.after, Vec::<u8>::new());
+        assert_eq!(
+            back,
+            hello::fixtures::plain_server_hello(),
+            "and its answer comes back"
+        );
+        assert!(closed, "the tunnel closes when both sides have");
+    }
+
+    #[tokio::test]
+    async fn after_a_retry_request_a_second_hello_that_names_another_host_goes_nowhere() {
+        let (heard, back, closed) = retried("other-tenant.example").await;
+        assert_eq!(heard.hellos, vec![hello_for("upstream.example")]);
+        assert_eq!(
+            heard.after,
+            Vec::<u8>::new(),
+            "the upstream hears nothing after it asked"
+        );
+        assert_eq!(back, hello::REFUSED_ALERT.to_vec(), "the client is refused");
+        assert!(closed, "the tunnel is closed");
+    }
+
+    #[tokio::test]
+    async fn what_the_client_sends_after_its_first_hello_waits_for_the_upstream_s_answer() {
+        use hello::fixtures::retry_request;
+        use tokio::io::AsyncWriteExt;
+        let (upstream, heard) = tls_upstream(vec![at_once(retry_request())]).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, hello::HELLO_WAIT).await;
+        // a second hello naming another host, sent with the first before any answer
+        let first = hello_for("upstream.example");
+        let all = [&first[..], &CCS[..], &hello_for("other-tenant.example")].concat();
+        c.write_all(&all).await.unwrap();
+        let (back, closed) = until_closed(&mut c).await;
+        drop(c);
+        let heard = heard_within(heard).await;
+        assert_eq!(heard.hellos, vec![first]);
+        assert_eq!(
+            heard.after,
+            Vec::<u8>::new(),
+            "the upstream hears nothing after the first hello"
+        );
+        let refused = [retry_request(), hello::REFUSED_ALERT.to_vec()].concat();
+        assert_eq!(back, refused, "the request goes back, then the refusal");
+        assert!(closed, "the tunnel is closed");
+    }
+
+    /// A tunnel whose upstream asks for a retry with `first` and then asks again, and
+    /// whose client sends its second hello and a third naming other-tenant.example, in
+    /// the same write when `together`, after the tunnel closes otherwise: why the tunnel
+    /// was let through, if it was.
+    async fn retried_twice(case: &str, first: Writes, together: bool) -> Option<String> {
+        use hello::fixtures::{retry_alone, retry_request};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (upstream, heard) = tls_upstream(vec![first, at_once(retry_request())]).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, hello::HELLO_WAIT).await;
+        c.write_all(&hello_for("upstream.example")).await.unwrap();
+        let mut got = vec![0u8; retry_alone().len()];
+        c.read_exact(&mut got).await.unwrap();
+        let second = [&CCS[..], &hello_for("upstream.example")].concat();
+        let third = hello_for("other-tenant.example");
+        let sent = if together {
+            [&second[..], &third].concat()
+        } else {
+            second.clone()
+        };
+        c.write_all(&sent).await.unwrap();
+        let (back, closed) = until_closed(&mut c).await;
+        // a client that goes on regardless
+        let _ = c.write_all(&third).await;
+        let _ = c.shutdown().await;
+        drop(c);
+        let heard = heard_within(heard).await;
+        let hellos = heard.hellos == vec![hello_for("upstream.example"), second];
+        let alerted = back.ends_with(&hello::REFUSED_ALERT);
+        let refused = hellos && heard.after.is_empty() && alerted && closed;
+        (!refused).then(|| {
+            format!(
+                "{case}: {} hellos upstream, then {:?}; answered {back:?}, closed {closed}",
+                heard.hellos.len(),
+                heard.after
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn a_second_retry_request_is_refused_and_a_third_hello_goes_nowhere() {
+        use hello::fixtures::{retry_alone, retry_request};
+        let later = std::time::Duration::from_millis(100);
+        let alone = vec![
+            (std::time::Duration::ZERO, retry_alone()),
+            (later, CCS.to_vec()),
+        ];
+        let split = vec![
+            (
+                std::time::Duration::ZERO,
+                [&retry_alone()[..], &CCS[..3]].concat(),
+            ),
+            (later, CCS[3..].to_vec()),
+        ];
+        let let_through: Vec<String> = [
+            retried_twice("the third after", at_once(retry_request()), false).await,
+            retried_twice("the third with the second", at_once(retry_request()), true).await,
+            retried_twice("the dummy ChangeCipherSpec on its own", alone, false).await,
+            retried_twice("the dummy ChangeCipherSpec split", split, false).await,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        assert_eq!(
+            let_through,
+            Vec::<String>::new(),
+            "refused, and let through"
+        );
+    }
+
+    /// A tunnel with `wait` for its hellos whose upstream answers the first hello `late`
+    /// after it comes, `late` after the tunnel opened: why it was let through, if it was.
+    async fn a_late_answer(wait: std::time::Duration, late: std::time::Duration) -> Option<String> {
+        use tokio::io::AsyncWriteExt;
+        let answers = vec![vec![(late, hello::fixtures::plain_server_hello())]];
+        let (upstream, _heard) = tls_upstream(answers).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, wait).await;
+        tokio::time::sleep(late).await;
+        c.write_all(&hello_for("upstream.example")).await.unwrap();
+        let (back, closed) = until_closed(&mut c).await;
+        let refused = back == hello::REFUSED_ALERT && closed;
+        (!refused).then(|| format!("a late answer: answered {back:?}, closed {closed}"))
+    }
+
+    /// A tunnel with `wait` for its hellos whose client sends its first hello `late`
+    /// after the tunnel opened and its second `late` after the retry request: why it was
+    /// let through, if it was.
+    async fn a_late_second_hello(
+        wait: std::time::Duration,
+        late: std::time::Duration,
+    ) -> Option<String> {
+        use hello::fixtures::{plain_server_hello, retry_request};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let answers = vec![at_once(retry_request()), at_once(plain_server_hello())];
+        let (upstream, heard) = tls_upstream(answers).await;
+        let (_d, _e, mut c) = tunnel_to(upstream, wait).await;
+        tokio::time::sleep(late).await;
+        c.write_all(&hello_for("upstream.example")).await.unwrap();
+        let length = retry_request().len();
+        let mut back = Vec::new();
+        let _ = (&mut c).take(length as u64).read_to_end(&mut back).await;
+        if back.len() < length {
+            // a runner slow enough that the first hello came after the wait: refused
+            // before any retry request, which is a refusal all the same
+            let refused = back == hello::REFUSED_ALERT;
+            return (!refused).then(|| format!("a late first hello: answered {back:?}"));
+        }
+        // the refusal, if it comes while the client waits; the second hello, if not
+        let mut got = Vec::new();
+        let mut closed = tokio::time::timeout(late, c.read_to_end(&mut got))
+            .await
+            .is_ok();
+        if !closed {
+            let second = [&CCS[..], &hello_for("upstream.example")].concat();
+            let _ = c.write_all(&second).await;
+            let (more, now_closed) = until_closed(&mut c).await;
+            got.extend_from_slice(&more);
+            closed = now_closed;
+        }
+        drop(c);
+        let hellos = heard_within(heard).await.hellos.len();
+        let refused = got == hello::REFUSED_ALERT && closed && hellos == 1;
+        (!refused).then(|| {
+            format!(
+                "a late second hello: answered {got:?}, closed {closed}, {hellos} hellos upstream"
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_has_one_wait_for_all_its_hellos_and_answers() {
+        let wait = std::time::Duration::from_millis(1000);
+        let late = std::time::Duration::from_millis(600);
+        let let_through: Vec<String> = [
+            a_late_answer(wait, late).await,
+            a_late_second_hello(wait, late).await,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        assert_eq!(
+            let_through,
+            Vec::<String>::new(),
+            "refused, and let through"
+        );
+    }
+
     #[tokio::test]
     async fn an_upstream_base_with_a_path_keeps_it() {
         // DashScope's compatible endpoint lives under a path; the harness's /v1/...
@@ -2019,57 +3306,160 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_connect_tunnel_opens_only_to_allowed_hosts_within_the_ceiling() {
-        // a plain TCP echo "upstream" standing in for a TLS host
+    type Peers = Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>;
+
+    /// A plain TCP echo server on loopback standing in for a TLS host, which keeps the
+    /// peer address of every connection it accepts.
+    async fn echo_upstream() -> (std::net::SocketAddr, Peers) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let peers = Peers::default();
+        let seen = peers.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = listener.accept().await else {
+                let Ok((mut s, peer)) = listener.accept().await else {
                     break;
                 };
+                seen.lock().unwrap().push(peer);
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 64];
-                    if let Ok(n) = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await {
-                        let _ = tokio::io::AsyncWriteExt::write_all(&mut s, &buf[..n]).await;
-                    }
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
                 });
             }
         });
-        let (_d, e) = fixture(Some(("github", Destination::tunnel(["127.0.0.1"])))).await;
-        let egress_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let egress_addr = egress_listener.local_addr().unwrap();
-        let app = e.router();
-        tokio::spawn(async move { axum::serve(egress_listener, app).await.unwrap() });
+        (addr, peers)
+    }
 
-        // the proxy handshake by hand, as a client behind HTTPS_PROXY would do it
+    /// The connections `upstream` accepted other than one the test opens now. Accepts
+    /// are in order, so a dial the egress made before this call is in the list.
+    async fn dialled(upstream: std::net::SocketAddr, peers: &Peers) -> Vec<std::net::SocketAddr> {
+        let own = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        let mine = own.local_addr().unwrap();
+        for _ in 0..500 {
+            if peers.lock().unwrap().contains(&mine) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let all = peers.lock().unwrap().clone();
+        assert!(all.contains(&mine), "the upstream accepts connections");
+        all.into_iter().filter(|p| *p != mine).collect()
+    }
+
+    /// The egress served on a loopback port.
+    async fn serve(e: &Egress) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = e.router();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// `CONNECT authority` by hand, as a client behind `HTTPS_PROXY` sends it: the
+    /// response head and body, and the stream, which is the tunnel when it opened.
+    async fn connect(
+        egress: std::net::SocketAddr,
+        authority: &str,
+    ) -> (String, tokio::net::TcpStream) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut c = tokio::net::TcpStream::connect(egress_addr).await.unwrap();
-        c.write_all(format!("CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
+        let mut c = tokio::net::TcpStream::connect(egress).await.unwrap();
+        c.write_all(
+            format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
             c.read_exact(&mut byte).await.unwrap();
             head.push(byte[0]);
         }
-        let head = String::from_utf8_lossy(&head);
+        let mut answer = String::from_utf8_lossy(&head).into_owned();
+        let length = answer
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|n| n.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        c.read_exact(&mut body).await.unwrap();
+        answer.push_str(&String::from_utf8_lossy(&body));
+        (answer, c)
+    }
+
+    #[tokio::test]
+    async fn a_connect_tunnel_opens_only_to_allowed_hosts_within_the_ceiling() {
+        let (addr, _) = echo_upstream().await;
+        // an entry that is an address and names its port: the launcher's own choice
+        let entry = format!("127.0.0.1:{}", addr.port());
+        let (_d, e) = fixture(Some(("github", Destination::tunnel([entry])))).await;
+        let egress = serve(&e).await;
+
+        let (head, mut c) = connect(egress, &addr.to_string()).await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        c.write_all(b"ping").await.unwrap();
-        let mut echo = [0u8; 4];
-        c.read_exact(&mut echo).await.unwrap();
-        assert_eq!(&echo, b"ping", "bytes flow through the tunnel untouched");
+        echoes(&mut c, "127.0.0.1").await;
 
         // a host no destination allows
-        let mut c = tokio::net::TcpStream::connect(egress_addr).await.unwrap();
-        c.write_all(b"CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n\r\n")
-            .await
-            .unwrap();
-        let mut buf = vec![0u8; 256];
-        let n = c.read(&mut buf).await.unwrap();
-        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 403"));
+        let (head, _) = connect(egress, "evil.example:443").await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_goes_only_to_the_port_its_entry_names_or_443() {
+        let (upstream, peers) = echo_upstream().await;
+        // an entry with no port allows 443 and no other
+        let (_d, e) = fixture(Some(("github", Destination::tunnel(["127.0.0.1"])))).await;
+        let egress = serve(&e).await;
+        let (head, _) = connect(egress, &upstream.to_string()).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(
+            head.contains(&format!("127.0.0.1:{}", upstream.port())),
+            "{head}"
+        );
+        // an entry that names a port allows that port and no other
+        let other = format!("127.0.0.1:{}", upstream.port() ^ 1);
+        let (_d, e) = fixture(Some(("github", Destination::tunnel([other])))).await;
+        let egress = serve(&e).await;
+        let (head, _) = connect(egress, &upstream.to_string()).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(
+            dialled(upstream, &peers).await,
+            Vec::new(),
+            "nothing was dialled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_to_a_name_that_resolves_to_a_denied_address_is_refused_before_dialling() {
+        // localhost resolves to loopback on every host, from the hosts file and not DNS
+        let (_d, e) = fixture(Some(("github", Destination::tunnel(["localhost"])))).await;
+        let egress = serve(&e).await;
+        let (head, _) = connect(egress, "localhost:443").await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(
+            head.contains("localhost resolves to an address a tunnel may not reach"),
+            "{head}"
+        );
+        // the refusal names no address; the address stays in the egress's own log
+        assert!(
+            !head.contains("127.0.0.1") && !head.contains("::1"),
+            "{head}"
+        );
+        // a name whose entry names the port is resolved and checked all the same
+        let (upstream, peers) = echo_upstream().await;
+        let entry = format!("localhost:{}", upstream.port());
+        let (_d, e) = fixture(Some(("github", Destination::tunnel([entry.clone()])))).await;
+        let egress = serve(&e).await;
+        let (head, _) = connect(egress, &entry).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(head.contains("a tunnel may not reach"), "{head}");
+        assert_eq!(
+            dialled(upstream, &peers).await,
+            Vec::new(),
+            "nothing was dialled"
+        );
     }
 
     #[tokio::test]
@@ -2280,5 +3670,215 @@ mod tests {
             Egress::with_tool_servers(plain, HashMap::new(), server(), &dir.path().join("t2.db")),
             Err(Error::NotHosted(_))
         ));
+    }
+
+    /// The headers of each request a server was sent.
+    type Heard = Arc<std::sync::Mutex<Vec<HeaderMap>>>;
+
+    /// A server on loopback that keeps the headers of every request it is sent: where a
+    /// followed redirect lands.
+    async fn bystander() -> (std::net::SocketAddr, Heard) {
+        let heard: Heard = Arc::default();
+        let kept = heard.clone();
+        let app = Router::new().fallback(move |req: Request| {
+            let kept = kept.clone();
+            async move {
+                kept.lock().unwrap().push(req.headers().clone());
+                "the bystander's page"
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, heard)
+    }
+
+    /// The redirects an upstream may answer with.
+    const REDIRECTS: [StatusCode; 5] = [
+        StatusCode::MOVED_PERMANENTLY,
+        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
+        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::PERMANENT_REDIRECT,
+    ];
+
+    /// An upstream that answers every request with `status` to `location`.
+    async fn redirecting_upstream(status: StatusCode, location: String) -> std::net::SocketAddr {
+        let app = Router::new().fallback(move || {
+            let location = location.clone();
+            async move { (status, [(header::LOCATION, location)]) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    fn injected(header: &'static str) -> Auth {
+        Auth::Inject {
+            header: HeaderName::from_static(header),
+            value: "real-key".into(),
+        }
+    }
+
+    /// What the bystander heard since it was last asked, as a leak to report.
+    fn leaked(heard: &Heard, what: String) -> Option<String> {
+        let got = std::mem::take(&mut *heard.lock().unwrap());
+        (!got.is_empty()).then(|| {
+            format!("{what}: the redirect was followed, and the other server heard {got:?}")
+        })
+    }
+
+    /// A direct call's answer to a redirect: an error that names the status and where
+    /// the upstream pointed.
+    fn names_the_redirect<T: std::fmt::Debug>(
+        got: Result<T, Error>,
+        status: StatusCode,
+        location: &str,
+        what: &str,
+    ) {
+        let err = got.unwrap_err().to_string();
+        assert!(
+            err.contains(status.as_str()) && err.contains(location),
+            "{what} {status}: {err}"
+        );
+    }
+
+    async fn forwarded(e: &Egress, name: &str, method: Method) -> Response {
+        e.router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{name}/v1/messages"))
+                    .method(method)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_redirect_from_upstream_goes_back_to_the_harness_and_is_not_followed() {
+        let (elsewhere, heard) = bystander().await;
+        // another host: reqwest strips authorization there, and not these keys
+        let location = format!("http://localhost:{}/steal", elsewhere.port());
+        let mut leaks = Vec::new();
+        for status in REDIRECTS {
+            let upstream = redirecting_upstream(status, location.clone()).await;
+            for (name, key) in [("anthropic", "x-api-key"), ("gemini", "x-goog-api-key")] {
+                let (_d, e) = fixture(Some((
+                    name,
+                    Destination::forward(format!("http://{upstream}"), injected(key)),
+                )))
+                .await;
+                for method in [Method::POST, Method::GET] {
+                    let r = forwarded(&e, name, method.clone()).await;
+                    let what = format!("{method} {status} at {name}");
+                    if let Some(leak) = leaked(&heard, what.clone()) {
+                        leaks.push(leak);
+                        continue;
+                    }
+                    assert_eq!(r.status(), status, "{what}");
+                    assert_eq!(r.headers()[header::LOCATION], location.as_str(), "{what}");
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "{leaks:#?}");
+    }
+
+    /// An egress with `upstream` as a keyed destination and as a tool server.
+    fn launcher_egress(upstream: std::net::SocketAddr) -> (tempfile::TempDir, Egress) {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Arc::new(with_hosted_fetch(
+            &dir.path().join("m"),
+            &format!("http://{upstream}/mcp"),
+            Label::Public,
+        ));
+        let mut destinations = HashMap::new();
+        destinations.insert(
+            "anthropic".to_string(),
+            Destination::forward(format!("http://{upstream}"), injected("x-api-key")),
+        );
+        let mut tools = HashMap::new();
+        tools.insert(
+            "fetch".to_string(),
+            Destination::forward(format!("http://{upstream}"), injected("authorization")),
+        );
+        let e =
+            Egress::with_tool_servers(m, destinations, tools, &dir.path().join("t.db")).unwrap();
+        (dir, e)
+    }
+
+    #[tokio::test]
+    async fn the_launcher_s_own_calls_do_not_follow_a_redirect() {
+        let (elsewhere, heard) = bystander().await;
+        let location = format!("http://localhost:{}/steal", elsewhere.port());
+        let mut leaks = Vec::new();
+        for status in REDIRECTS {
+            let upstream = redirecting_upstream(status, location.clone()).await;
+            let (_d, e) = launcher_egress(upstream);
+
+            let listed = e.get("anthropic", "v1/models").await;
+            match leaked(&heard, format!("get {status}")) {
+                Some(leak) => leaks.push(leak),
+                None => names_the_redirect(listed, status, &location, "get"),
+            }
+
+            let called = e
+                .call("anthropic", "v1/messages", &serde_json::json!({}))
+                .await;
+            match leaked(&heard, format!("call {status}")) {
+                Some(leak) => leaks.push(leak),
+                None => names_the_redirect(called, status, &location, "call"),
+            }
+
+            let posted = e
+                .post("fetch", "/mcp", HeaderMap::new(), Bytes::from_static(b"{}"))
+                .await;
+            match leaked(&heard, format!("post {status}")) {
+                Some(leak) => leaks.push(leak),
+                None => {
+                    let posted = posted.unwrap();
+                    assert_eq!(posted.status, status.as_u16(), "post");
+                    assert_eq!(posted.headers[header::LOCATION], location.as_str());
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "{leaks:#?}");
+    }
+
+    #[tokio::test]
+    async fn the_debug_mode_relays_a_redirect_as_it_came() {
+        // the mode is read from the process's environment, so its helper is tested here
+        let to = "https://elsewhere.example/";
+        for status in REDIRECTS {
+            let upstream = axum::http::Response::builder()
+                .status(status)
+                .header(header::LOCATION, to)
+                .body("")
+                .unwrap();
+            match debugged(status, reqwest::Response::from(upstream)).await {
+                Debugged::Relay(r) => {
+                    assert_eq!(r.status(), status);
+                    assert_eq!(r.headers()[header::LOCATION], to);
+                }
+                Debugged::Refused(r) => {
+                    panic!("{status} is answered in debug mode, without its Location: {r:?}")
+                }
+            }
+        }
+        // any other refusal is answered with the start of its body
+        let upstream = axum::http::Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body("down")
+            .unwrap();
+        let got = debugged(StatusCode::BAD_GATEWAY, reqwest::Response::from(upstream)).await;
+        let Debugged::Refused(r) = got else {
+            panic!("a 502 is relayed in debug mode")
+        };
+        assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("down"));
     }
 }

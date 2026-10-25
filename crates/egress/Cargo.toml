@@ -25,6 +25,9 @@ thiserror.workspace = true
 time = { version = "0.3.45", features = ["formatting", "parsing"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
 [lints]
 workspace = true
 
