@@ -63,7 +63,7 @@ pub fn run_grouped(cmd: &mut Command, capture: bool) -> std::io::Result<(i32, Ve
 
 /// How long a stopped run's output is read for once the run itself has gone: what it
 /// left in the background, and did not die with it, may hold the output open.
-const GRACE: Duration = Duration::from_millis(500);
+const GRACE: Duration = Duration::from_secs(2);
 
 fn run_as(
     cmd: &mut Command,
@@ -96,15 +96,19 @@ fn run_as(
         (out, ended)
     });
     exited(&child);
-    // no longer stopped by pid once it has exited, and before it is reaped, after which
-    // its pid and its process group's number may be given to another
-    drop(stoppable);
-    let (code, mut r) = wait(child, cmd.get_program())?;
+    // read to the end while the exited child is not yet reaped: a stop meanwhile still
+    // kills its process group, what it left in the background, and its number is
+    // given to no other process or group while it is unreaped
     let mut out = Vec::new();
+    let mut read_failed = Ok(());
     if let Some((buf, ended)) = read {
-        read_until_ended(&ended)?;
+        read_failed = read_until_ended(&ended);
         out = std::mem::take(&mut *lock(&buf));
     }
+    // no longer stopped once it is reaped, after which its numbers may be given again
+    drop(stoppable);
+    let (code, mut r) = wait(child, cmd.get_program())?;
+    read_failed?;
     r.wall_ms = millis(started.elapsed());
     Ok((code, out, r))
 }

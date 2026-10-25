@@ -1587,7 +1587,10 @@ fn an_unconfined_worker_told_to_stop_ends_what_its_harness_left_running() {
     let id = file_task(&root, "First");
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
-    fake_harness(&work, "touch ./started\ntail -f \"$PWD/started\" &\nwait");
+    fake_harness(
+        &work,
+        "touch ./started\nsh -c \"sleep 300; echo $PWD\" &\nwait",
+    );
     let _reap = Reap(dir.path().to_path_buf());
     let mut worker = start_amem(
         &root,
@@ -1703,7 +1706,10 @@ fn a_worker_on_a_terminal_with_a_background_child(
     let id = file_task(root, "First");
     let work = dir.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    fake_harness(&work, "touch ./started\ntail -f \"$PWD/started\" &\nwait");
+    fake_harness(
+        &work,
+        "touch ./started\nsh -c \"sleep 300; echo $PWD\" &\nwait",
+    );
     let terminal = on_a_terminal(
         root,
         &work,
@@ -1745,6 +1751,47 @@ fn a_worker_on_a_terminal_told_to_stop_ends_though_its_harness_left_a_child() {
     assert_eq!(released(&root, &id), (true, true), "back with a handoff");
 }
 
+/// A headless unconfined harness that exits at once, leaving a child that holds its
+/// output and ignores it: the run is still in flight while its output is read, so a stop
+/// then kills the child with the harness's process group.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stop_kills_what_an_exited_harness_left_holding_its_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let id = file_task(&root, "First");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    fake_harness(
+        &work,
+        "sh -c \"sleep 300; echo $PWD\" &\ntouch ./started\nexit 0",
+    );
+    let _reap = Reap(dir.path().to_path_buf());
+    let mut worker = start_amem(
+        &root,
+        &work,
+        &tmp,
+        &["work", "--unconfined", "--loop", "--lease-seconds", "60"],
+    );
+    assert!(started(&work, 60));
+    // the harness has gone; its child holds the output
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let child = |dir: &Path| {
+        processes_under(dir)
+            .into_iter()
+            .any(|(_, c)| c.contains("sleep 300; echo"))
+    };
+    assert!(child(&work), "{:?}", processes_under(&work));
+    signal(&worker, "TERM");
+    let status = exited(&mut worker, 15);
+    let err = std::fs::read_to_string(work.with_extension("err")).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{err}");
+    assert!(gone_within(&work, 5), "{:?}", processes_under(&work));
+    assert_eq!(released(&root, &id), (true, true), "back with a handoff");
+}
+
 /// Told twice to stop, a worker does not wait for the run's cleanup, but it leaves
 /// nothing no sweep removes: its task back in the pool, its render and its socket gone.
 /// The run's output held open by what its harness left in the background holds the
@@ -1763,21 +1810,19 @@ fn a_worker_told_twice_to_stop_releases_its_task_and_removes_its_render() {
     let _reap = Reap(dir.path().to_path_buf());
     let (id, work, mut terminal) =
         a_worker_on_a_terminal_with_a_background_child(&root, dir.path(), &tmp);
-    let launcher = launcher_of(&root);
-    Command::new("kill")
-        .args(["-INT", &launcher])
-        .status()
-        .unwrap();
+    use nix::sys::signal::{kill, Signal};
+    let launcher = nix::unistd::Pid::from_raw(launcher_of(&root).parse().unwrap());
+    kill(launcher, Signal::SIGINT).unwrap();
+    // the second from the loop that sees the first in progress, with no process to
+    // start between: the run's output, held open by what the harness left, keeps the
+    // cleanup waiting for the read's grace, seconds, which this comes well within
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let read_err = || std::fs::read_to_string(work.with_extension("err")).unwrap_or_default();
     while !read_err().contains("ending the run and cleaning up") {
         assert!(std::time::Instant::now() < deadline, "{}", read_err());
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    Command::new("kill")
-        .args(["-INT", &launcher])
-        .status()
-        .unwrap();
+    kill(launcher, Signal::SIGINT).unwrap();
     let status = exited(&mut terminal, 30);
     let err = read_err();
     assert_eq!(status.and_then(|s| s.code()), Some(128 + 2), "{err}");

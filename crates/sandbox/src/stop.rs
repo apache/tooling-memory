@@ -88,8 +88,11 @@ pub(crate) fn register(child: &std::process::Child, group: bool) -> Registered<'
 pub fn has_a_terminal() -> bool {
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        // without waiting: a serial line without CLOCAL would hold the open
         std::fs::OpenOptions::new()
             .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
             .open("/dev/tty")
             .is_ok()
     }
@@ -118,14 +121,21 @@ pub fn socket_refuses(path: &std::path::Path) -> bool {
             *to = *from as libc::c_char;
         }
         // SAFETY: a socket call with constant arguments; it returns a descriptor or -1.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
         if fd < 0 {
+            return false;
+        }
+        // non-blocking and close-on-exec by fcntl, as every unix has it
+        // SAFETY: fcntl on the socket made above, with integer arguments.
+        let set = unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            fl >= 0
+                && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) == 0
+                && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+        };
+        if !set {
+            // SAFETY: close of the socket made above.
+            unsafe { libc::close(fd) };
             return false;
         }
         let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_un>()).unwrap_or(0);
@@ -450,7 +460,12 @@ mod tests {
             for (to, from) in addr.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
                 *to = *from as libc::c_char;
             }
-            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            libc::fcntl(
+                fd,
+                libc::F_SETFL,
+                libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+            );
             let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
             if libc::connect(fd, (&raw const addr).cast(), len) == 0 {
                 Some(fd)

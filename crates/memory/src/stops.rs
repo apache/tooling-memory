@@ -4,6 +4,13 @@
 //! removing its socket and its render. The launcher then exits with 128 plus the
 //! signal's number, as a shell reports a process a signal ended.
 //!
+//! A headless run without a terminal is in a process group of its own, which a stop
+//! kills whole, with what the harness left in the background. On a terminal the harness
+//! stays in the terminal's foreground group, so it may use the terminal: a signal sent
+//! to the launcher alone then ends the harness and not what it left in the background,
+//! which the launcher stops waiting for after a short grace. Ctrl-C, which the terminal
+//! sends to the whole foreground group, reaches those too.
+//!
 //! SIGKILL cannot be caught. What a launcher killed by it leaves, the next launcher to
 //! start a run sweeps: `dm_sandbox` its scratch directory, `dm_mount` its mount, and the
 //! launcher its egress socket, each named for or locked by the launcher that made it.
