@@ -488,11 +488,14 @@ impl Egress {
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
         let status = resp.status();
+        let needles = injected(&dest);
         let to = pointed_to(status, resp.headers());
+        let to = String::from_utf8_lossy(&scrub::replace(to.as_bytes(), &needles)).into_owned();
         let text = resp
-            .text()
+            .bytes()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
+        let text = String::from_utf8_lossy(&scrub::replace(&text, &needles)).into_owned();
         if !status.is_success() {
             return Err(Error::Upstream(format!(
                 "{status} from {destination}/{rest}{to}: {}",
@@ -535,12 +538,15 @@ impl Egress {
             .send()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
+        let needles = injected(&dest);
         let to = pointed_to(resp.status(), resp.headers());
+        let to = String::from_utf8_lossy(&scrub::replace(to.as_bytes(), &needles)).into_owned();
         let status = resp.status().as_u16();
         let text = resp
-            .text()
+            .bytes()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
+        let text = String::from_utf8_lossy(&scrub::replace(&text, &needles)).into_owned();
         let value: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         let usage = usage::from_value(&value).unwrap_or_else(|| Usage {
@@ -1499,9 +1505,10 @@ async fn debugged(
 ) -> Debugged {
     let url = upstream.url().to_string();
     if status.is_redirection() {
+        let to = pointed_to(status, upstream.headers());
         eprintln!(
             "egress debug: {status} from {url}{}, relayed",
-            pointed_to(status, upstream.headers())
+            String::from_utf8_lossy(&scrub::replace(to.as_bytes(), needles))
         );
         return Debugged::Relay(upstream);
     }
@@ -1995,6 +2002,88 @@ mod tests {
                 "the tool the model asked for"
             );
             assert_eq!(c.destination, "openai");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_way_out_of_the_egress_hands_on_an_echoed_credential() {
+        // a provider that quotes the credential it was sent: a 200 with a usage block on
+        // POST, a 200 listing on GET, and a 401 on either when asked for one
+        let echo = |req: Request| async move {
+            let key = req.headers()["authorization"].to_str().unwrap().to_string();
+            let refuse = req.uri().path() == "/v1/refuse";
+            let status = if refuse {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::OK
+            };
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "model": "m", "data": [], "echo": key,
+                    "choices": [], "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+                })
+                .to_string(),
+            )
+        };
+        let fake = Router::new()
+            .route("/v1/chat/completions", any(echo))
+            .route("/v1/models", any(echo))
+            .route("/v1/refuse", any(echo));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let (_d, e) = fixture(Some((
+            "openai",
+            Destination::forward(
+                format!("http://{addr}"),
+                Auth::Inject {
+                    header: header::AUTHORIZATION,
+                    value: "Bearer sk-real-0123456789".into(),
+                },
+            ),
+        )))
+        .await;
+        let ask = serde_json::json!({ "model": "m", "messages": [] });
+        // the launcher's own calls, as the deputy and mining make them
+        let answered = e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        assert!(!answered.to_string().contains("sk-real"), "{answered}");
+        let refused = e.call("openai", "v1/refuse", &ask).await.unwrap_err();
+        assert!(!refused.to_string().contains("sk-real"), "{refused}");
+        let listed = e.get("openai", "v1/models").await.unwrap();
+        assert!(!listed.to_string().contains("sk-real"), "{listed}");
+        let refused = e.get("openai", "v1/refuse").await.unwrap_err();
+        assert!(!refused.to_string().contains("sk-real"), "{refused}");
+        // and the harness's, through the proxy
+        let r = e
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(ask.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("sk-real"));
+        // what the record keeps of both answered calls holds the replacement only
+        let m = e.inner.memory.clone();
+        let mut kept = Vec::new();
+        for _ in 0..50 {
+            kept = m.contexts(m.session_id()).await.unwrap_or_default();
+            if kept.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(kept.len(), 2, "both answered calls kept");
+        for c in &kept {
+            assert!(!c.response.contains("sk-real"), "{}", c.response);
+            assert!(c.response.contains(scrub::REDACTED), "{}", c.response);
         }
     }
 

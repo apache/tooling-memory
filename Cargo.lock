@@ -890,6 +890,7 @@ dependencies = [
 name = "dm-egress"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "axum",
  "bytes",
  "dm-core",
