@@ -24,7 +24,14 @@ pub const KNOWN: &[(&str, &str)] = &[
         "LLMAO_URL",
         "the gateway's address: the local LiteLLM when unset, https://llm.apache.org for the Foundation's",
     ),
-    ("GH_TOKEN", "copilot, on your GitHub login"),
+    (
+        "GH_TOKEN",
+        "copilot, on your GitHub login, when COPILOT_GITHUB_TOKEN is not set",
+    ),
+    (
+        "COPILOT_GITHUB_TOKEN",
+        "copilot, on a token with only the Copilot Requests permission",
+    ),
     (
         "GOOGLE_CLOUD_PROJECT",
         "gemini on a Google login with a project of its own",
@@ -193,6 +200,20 @@ pub fn gh_token() -> Option<String> {
         .ok()?;
     let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !t.is_empty()).then_some(t)
+}
+
+/// The token Copilot CLI runs on, and the variable it goes in: `COPILOT_GITHUB_TOKEN`,
+/// a token that can make Copilot requests and nothing else, when it is set; else the
+/// GitHub login, as [`gh_token`] finds it, which reaches every repository the login can.
+#[must_use]
+pub fn copilot_token() -> Option<(&'static str, String)> {
+    if let Some(t) = std::env::var("COPILOT_GITHUB_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+    {
+        return Some(("COPILOT_GITHUB_TOKEN", t));
+    }
+    gh_token().map(|t| ("GH_TOKEN", t))
 }
 
 /// The default root when neither `--root` nor `MEMORY_ROOT` names one: `~/memory`.

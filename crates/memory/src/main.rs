@@ -1742,11 +1742,18 @@ fn route_for(
     let (destination, ceiling_of) = match auth {
         AuthMode::Subscription => {
             if harness == Harness::Copilot {
-                let token = crate::credentials::gh_token().ok_or(
-                    "copilot needs GH_TOKEN in the launcher's environment or credentials.env, \
-                     or a `gh auth login` on this host",
+                let (var, token) = crate::credentials::copilot_token().ok_or(
+                    "copilot needs COPILOT_GITHUB_TOKEN or GH_TOKEN in the launcher's \
+                     environment or credentials.env, or a `gh auth login` on this host",
                 )?;
-                harness_env.push(("GH_TOKEN".to_string(), token));
+                if var == "GH_TOKEN" {
+                    eprintln!(
+                        "memory: copilot holds your GitHub login's token, which reaches every \
+                         repository the login can; a token with only the Copilot Requests \
+                         permission, as COPILOT_GITHUB_TOKEN, keeps that out of the sandbox"
+                    );
+                }
+                harness_env.push((var.to_string(), token));
             }
             let ceiling_of = if name == "github-copilot" {
                 "github".to_string()

@@ -257,9 +257,9 @@ impl Harness {
     ];
 
     /// The file a subscription login leaves under the home, which subscription mode
-    /// copies in, and how to make it. Copilot's login is `GH_TOKEN`, not a file; Qwen
-    /// and pi have no login mode the launcher can carry, and a command has no login of
-    /// its own.
+    /// copies in, and how to make it. Copilot's login is a token, `COPILOT_GITHUB_TOKEN`
+    /// or `GH_TOKEN`, not a file; Qwen and pi have no login mode the launcher can carry,
+    /// and a command has no login of its own.
     #[must_use]
     pub fn login(self) -> Option<Login> {
         let (file, how) = match self {
@@ -482,7 +482,7 @@ pub struct Request<'a> {
     pub host_home: Option<&'a Path>,
     /// Credentials the harness itself must hold, passed into its environment. For
     /// subscription modes that are a token rather than a file, such as Copilot's
-    /// `GH_TOKEN`.
+    /// `COPILOT_GITHUB_TOKEN` or `GH_TOKEN`.
     pub harness_env: &'a [(String, String)],
     /// The model the run was given, for an adapter whose config has to name it:
     /// OpenCode lists a custom provider's models, and cannot ask models.dev here.
@@ -1020,7 +1020,7 @@ fn setup_harness(
         Harness::Grok => setup_grok(req, at, relay, provider, env),
         Harness::Muse => setup_muse(req, at, relay, provider, env, tail),
         Harness::Pi => setup_pi(req, at, relay, provider, env),
-        Harness::Copilot => setup_copilot(req, at, relay, env),
+        Harness::Copilot => setup_copilot(req, at, relay, env, argv),
         Harness::OpenCode => setup_opencode(req, at, relay, provider, env),
         Harness::Command => {
             setup_command(req, relay, provider, env);
@@ -1641,18 +1641,22 @@ fn setup_copilot(
     at: &Layout,
     relay: &str,
     env: &mut BTreeMap<String, String>,
+    argv: &mut Vec<String>,
 ) -> Result<(), Error> {
     if req.auth != AuthMode::Subscription {
         return Err(Error::Unsupported(
-            "copilot has no API-key mode; it uses your GitHub login. Use --auth subscription with GH_TOKEN set".into(),
+            "copilot has no API-key mode; it uses your GitHub login. Use --auth subscription with COPILOT_GITHUB_TOKEN or GH_TOKEN set".into(),
         ));
     }
-    if !env.contains_key("GH_TOKEN") {
+    if !env.contains_key("COPILOT_GITHUB_TOKEN") && !env.contains_key("GH_TOKEN") {
         return Err(Error::Unsupported(
-            "copilot needs GH_TOKEN in the launcher's environment (try: GH_TOKEN=$(gh auth token))"
+            "copilot needs COPILOT_GITHUB_TOKEN, or GH_TOKEN, in the launcher's environment (try: GH_TOKEN=$(gh auth token))"
                 .into(),
         ));
     }
+    // its built-in GitHub MCP server would act on GitHub with the token, past the
+    // memory server and its policy; GitHub is reached through granted tools instead
+    argv.push("--disable-builtin-mcps".into());
     let mcp = serde_json::json!({
         "mcpServers": { "memory": { "type": "http", "url": format!("{relay}/mcp") } }
     });
@@ -2950,6 +2954,30 @@ await ev("session.idle", { sessionID: "../../evil" });
             plan.env["GH_TOKEN"], "gho_test",
             "the harness holds its own login"
         );
+        // its own GitHub MCP server would act with that login, past the memory server
+        assert!(
+            plan.argv.iter().any(|a| a == "--disable-builtin-mcps"),
+            "{:?}",
+            plan.argv
+        );
+        // a token for Copilot alone serves in place of the login
+        let copilot_only = vec![(
+            "COPILOT_GITHUB_TOKEN".to_string(),
+            "github_pat_test".to_string(),
+        )];
+        let (_, plan) = f
+            .plan_with(
+                Harness::Copilot,
+                AuthMode::Subscription,
+                None,
+                "p4",
+                &[],
+                false,
+                &copilot_only,
+            )
+            .unwrap();
+        assert_eq!(plan.env["COPILOT_GITHUB_TOKEN"], "github_pat_test");
+        assert!(!plan.env.contains_key("GH_TOKEN"));
         assert!(
             matches!(
                 f.plan_with(

@@ -39,6 +39,7 @@ const PASS_ENV: &[&str] = &[
     "LLMAO_KEY",
     "LLMAO_URL",
     "GH_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
     "GOOGLE_CLOUD_PROJECT",
     // the web launcher's id for the session, for the status it reads; an id, not a path
     "AMEM_WEB_SESSION",
