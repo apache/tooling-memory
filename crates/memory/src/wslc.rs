@@ -213,7 +213,7 @@ fn egress_run_args(
             ));
         }
     }
-    for (k, v) in egress_env(extra) {
+    for (k, v) in egress_env(&tap_credentials(&l.root), extra) {
         a.push("-e".into());
         a.push(format!("{k}={v}"));
     }
@@ -222,23 +222,54 @@ fn egress_run_args(
     a
 }
 
-/// The egress container's environment: what `PASS_ENV` names and is set here, then what
-/// the launch adds, which wins.
-pub(crate) fn egress_env(extra: &[(String, String)]) -> Vec<(String, String)> {
+/// The variables the root's tap grants name as credentials. The egress container runs
+/// the taps and calls the hosted tool servers, so these go there with `PASS_ENV`. A name
+/// that would change how the container runs, rather than hold a credential, is left out.
+pub(crate) fn tap_credentials(root: &Path) -> Vec<String> {
+    let Ok(g) = dm_policy::Grants::load(&root.join(dm_server::GRANTS_FILE)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = g
+        .taps
+        .values()
+        .filter_map(|t| t.credential.clone())
+        .filter(|n| {
+            !n.is_empty()
+                && n.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && !matches!(n.as_str(), "PATH" | "HOME" | "USER" | "SHELL" | "TMPDIR")
+                && !n.starts_with("LD_")
+                && !n.starts_with("MEMORY_")
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The egress container's environment: what `PASS_ENV` and the taps' credentials name
+/// and is set here, then what the launch adds, which wins.
+pub(crate) fn egress_env(taps: &[String], extra: &[(String, String)]) -> Vec<(String, String)> {
     let mut env = Vec::new();
-    for k in PASS_ENV {
+    let names = PASS_ENV.iter().map(|k| (*k).to_string()).chain(
+        taps.iter()
+            .filter(|t| !PASS_ENV.contains(&t.as_str()))
+            .cloned(),
+    );
+    for k in names {
+        let k = k.as_str();
         if extra.iter().any(|(ek, _)| ek == k) {
             continue;
         }
         // a GitHub login lives in gh's keyring, where the container cannot ask for it
-        let v = std::env::var(k).ok().filter(|v| !v.is_empty());
-        let v = if *k == "GH_TOKEN" {
+        let v = crate::credentials::present(std::env::var(k).ok());
+        let v = if k == "GH_TOKEN" {
             v.or_else(crate::credentials::gh_token)
         } else {
             v
         };
         if let Some(v) = v {
-            env.push(((*k).to_string(), v));
+            env.push((k.to_string(), v));
         }
     }
     env.extend(extra.iter().cloned());
@@ -683,6 +714,48 @@ fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_taps_credentials_go_to_the_egress_container_and_nothing_that_runs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        dm_server::Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let path = dir.path().join(dm_server::GRANTS_FILE);
+        let mut g = dm_policy::Grants::load(&path).unwrap();
+        for (tap, var) in [
+            ("search", "DM_SEARCH_KEY"),
+            ("issues", "GH_TOKEN"),
+            ("bad", "LD_PRELOAD"),
+            ("worse", "PATH"),
+            ("odd", "not-a-name"),
+        ] {
+            g.taps.insert(
+                tap.into(),
+                dm_policy::TapGrant {
+                    domain: "dom-me".into(),
+                    ceiling: dm_core::Label::Public,
+                    credential: Some(var.into()),
+                    ..dm_policy::TapGrant::default()
+                },
+            );
+        }
+        std::fs::write(&path, g.render().unwrap()).unwrap();
+        assert_eq!(
+            tap_credentials(dir.path()),
+            vec!["DM_SEARCH_KEY".to_string(), "GH_TOKEN".to_string()]
+        );
+        std::env::set_var("DM_SEARCH_KEY", "from-host");
+        let env = egress_env(&tap_credentials(dir.path()), &[]);
+        std::env::remove_var("DM_SEARCH_KEY");
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "DM_SEARCH_KEY" && v == "from-host"),
+            "{env:?}"
+        );
+        assert!(
+            env.iter().filter(|(k, _)| k == "GH_TOKEN").count() <= 1,
+            "a name in PASS_ENV and a grant is passed once: {env:?}"
+        );
+    }
     use std::collections::BTreeMap;
 
     fn request(interactive: bool) -> RunRequest {

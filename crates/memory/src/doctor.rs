@@ -230,27 +230,6 @@ fn credential_names(root: &Path, at_start: &[String], checks: &mut Vec<Check>, f
                     format!("from {from}: {opens}"),
                 ));
             }
-            None if *name == "COPILOT_GITHUB_TOKEN" => {
-                // without it copilot runs on the login's token, which reaches every
-                // repository the login can, from inside the sandbox
-                let login = found.github || found.set.iter().any(|n| n == "GH_TOKEN");
-                checks.push(if login {
-                    check(
-                        "credentials",
-                        *name,
-                        Status::Warn,
-                        "not set: copilot gets your GitHub login's token, which reaches every repository the login can",
-                    )
-                    .fix("a fine-grained token with only the Copilot Requests permission, as COPILOT_GITHUB_TOKEN in credentials.env")
-                } else {
-                    check(
-                        "credentials",
-                        *name,
-                        Status::Absent,
-                        format!("not set: {opens}"),
-                    )
-                });
-            }
             None if *name == "GH_TOKEN" => {
                 // gh keeps its token in the keyring; asking it is how a login is found
                 found.github = credentials::gh_token().is_some();
@@ -268,7 +247,7 @@ fn credential_names(root: &Path, at_start: &[String], checks: &mut Vec<Check>, f
                         Status::Absent,
                         format!("not set: {opens}"),
                     )
-                    .fix("gh auth login, or GH_TOKEN in credentials.env")
+                    .fix("for copilot, COPILOT_GITHUB_TOKEN in credentials.env; else gh auth login, or GH_TOKEN there")
                 });
             }
             None => checks.push(check(
@@ -282,28 +261,64 @@ fn credential_names(root: &Path, at_start: &[String], checks: &mut Vec<Check>, f
     found.github |= found.set.iter().any(|n| n == "GH_TOKEN");
 }
 
+/// When copilot runs here on the GitHub login, `COPILOT_GITHUB_TOKEN`'s line says what
+/// that costs: the login's token reaches every repository the login can, from inside
+/// the sandbox. Decided once the harnesses are known, so a host without copilot is not
+/// told about it.
+fn copilot_token(checks: &mut [Check], found: &Found) {
+    let on_login = found.runnable.contains(&Harness::Copilot)
+        && found.github
+        && !found.set.iter().any(|n| n == "COPILOT_GITHUB_TOKEN");
+    if !on_login {
+        return;
+    }
+    if let Some(c) = checks
+        .iter_mut()
+        .find(|c| c.area == "credentials" && c.subject == "COPILOT_GITHUB_TOKEN")
+    {
+        *c = check(
+            "credentials",
+            "COPILOT_GITHUB_TOKEN",
+            Status::Warn,
+            "not set: copilot gets your GitHub login's token, which reaches every repository the login can",
+        )
+        .fix("a fine-grained token with only the Copilot Requests permission, as COPILOT_GITHUB_TOKEN in credentials.env");
+    }
+}
+
 /// The credential each tap's grant names, which only the launcher's environment holds:
 /// a tap without it runs with none, and a hosted tool's server is called with none.
-fn tap_credentials(root: &Path, checks: &mut Vec<Check>) {
+fn tap_credentials(root: &Path, at_start: &[String], checks: &mut Vec<Check>) {
     let Ok(g) = dm_policy::Grants::load(&root.join(dm_server::GRANTS_FILE)) else {
         return;
     };
     for (name, tap) in &g.taps {
         let Some(var) = &tap.credential else { continue };
         let subject = format!("taps.{name}");
-        let set = std::env::var(var).is_ok_and(|v| !v.trim().is_empty());
+        let set = credentials::present(std::env::var(var).ok()).is_some();
+        // a name the launcher reads may have come from credentials.env, loaded at start
+        let from = if KNOWN.iter().any(|(k, _)| k == var) && !at_start.iter().any(|n| n == var) {
+            credentials::FILE
+        } else {
+            "environment"
+        };
         checks.push(if set {
             check(
                 "credentials",
                 subject,
                 Status::Pass,
-                format!("{var} from environment"),
+                format!("{var} from {from}"),
             )
         } else {
             let then = if tap.hosted.is_some() {
                 "its tool server is called with no credential"
             } else {
                 "it runs without one"
+            };
+            let then = if var == "GH_TOKEN" {
+                format!("{then}, except on the wslc backend, which fills it from `gh auth token`")
+            } else {
+                then.to_string()
             };
             check(
                 "credentials",
@@ -689,9 +704,10 @@ pub async fn report(root: &Path, at_start: &[String], offline: bool) -> Report {
     let mut found = Found::default();
     let have_record = record(root, &mut checks);
     credential_names(root, at_start, &mut checks, &mut found);
-    tap_credentials(root, &mut checks);
+    tap_credentials(root, at_start, &mut checks);
     logins(&mut checks, &mut found);
     harnesses(root, &mut checks, &mut found).await;
+    copilot_token(&mut checks, &found);
     gateway(root, offline, have_record, &mut checks, &mut found).await;
     web(root, &mut checks).await;
     let ready = Harness::ALL

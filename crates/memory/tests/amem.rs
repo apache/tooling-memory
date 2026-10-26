@@ -227,7 +227,15 @@ fn doctor_warns_where_a_credential_reaches_past_its_use_or_is_missing() {
              ceiling = \"public\"\ncredential = \"DM_ISSUES_TOKEN\"\n"
         ),
     );
+    // a GitHub login on a host without copilot: nothing to say about copilot's token
+    let r = doctor_json(&h, &[("GH_TOKEN", "gho-from-env")]);
+    let c = find(&r, "credentials", "COPILOT_GITHUB_TOKEN");
+    assert_eq!(c["status"], "absent", "{c}");
     h.script("copilot", "echo 'GitHub Copilot CLI 1.0.103.'");
+    // copilot and no GitHub token at all: nothing it would get
+    let r = doctor_json(&h, &[]);
+    let c = find(&r, "credentials", "COPILOT_GITHUB_TOKEN");
+    assert_eq!(c["status"], "absent", "{c}");
     let r = doctor_json(
         &h,
         &[("GH_TOKEN", "gho-from-env"), ("DM_ISSUES_TOKEN", "x")],

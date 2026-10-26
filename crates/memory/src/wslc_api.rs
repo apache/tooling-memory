@@ -78,7 +78,7 @@ pub(crate) fn egress_spec(
         mounts: vec![shared(volume)],
         init: ProcessSpec {
             argv: wslc::inside_command(l),
-            env: wslc::egress_env(extra),
+            env: wslc::egress_env(&wslc::tap_credentials(&l.root), extra),
             cwd: None,
         },
         auto_remove: false,

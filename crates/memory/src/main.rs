@@ -1308,7 +1308,7 @@ fn main() {
     // the environment is written here, while this is the only thread
     let at_start = credentials::KNOWN
         .iter()
-        .filter(|(k, _)| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+        .filter(|(k, _)| credentials::present(std::env::var(k).ok()).is_some())
         .map(|(k, _)| (*k).to_string())
         .collect::<Vec<_>>();
     credentials::load(&root);

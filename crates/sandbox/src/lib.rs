@@ -1650,13 +1650,18 @@ fn setup_copilot(
     }
     if !env.contains_key("COPILOT_GITHUB_TOKEN") && !env.contains_key("GH_TOKEN") {
         return Err(Error::Unsupported(
-            "copilot needs COPILOT_GITHUB_TOKEN, or GH_TOKEN, in the launcher's environment (try: GH_TOKEN=$(gh auth token))"
+            "copilot needs COPILOT_GITHUB_TOKEN (a token with only the Copilot Requests permission), or GH_TOKEN, in the launcher's environment"
                 .into(),
         ));
     }
-    // its built-in GitHub MCP server would act on GitHub with the token, past the
-    // memory server and its policy; GitHub is reached through granted tools instead
+    // its built-in GitHub MCP server would act on GitHub with the token, past the memory
+    // server and its policy. That is all the flag removes: the token is still in the
+    // harness's environment, and a shell the model runs can use it through the tunnel to
+    // GitHub's hosts, so only a token with nothing but Copilot Requests bounds what that
+    // reaches. Copilot's own stripping of the token from its shells is kept on as well; it
+    // is a habit, not a boundary, since the process holding the token runs as the same user
     argv.push("--disable-builtin-mcps".into());
+    argv.push("--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN".into());
     let mcp = serde_json::json!({
         "mcpServers": { "memory": { "type": "http", "url": format!("{relay}/mcp") } }
     });
@@ -2960,7 +2965,16 @@ await ev("session.idle", { sessionID: "../../evil" });
             "{:?}",
             plan.argv
         );
-        // a token for Copilot alone serves in place of the login
+        assert!(
+            plan.argv
+                .iter()
+                .any(|a| a == "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN"),
+            "{:?}",
+            plan.argv
+        );
+        // a token for Copilot alone serves in place of the login, and the login in the
+        // launcher's own environment does not follow it in
+        std::env::set_var("GH_TOKEN", "gho_launcher");
         let copilot_only = vec![(
             "COPILOT_GITHUB_TOKEN".to_string(),
             "github_pat_test".to_string(),
@@ -2976,8 +2990,13 @@ await ev("session.idle", { sessionID: "../../evil" });
                 &copilot_only,
             )
             .unwrap();
+        std::env::remove_var("GH_TOKEN");
         assert_eq!(plan.env["COPILOT_GITHUB_TOKEN"], "github_pat_test");
-        assert!(!plan.env.contains_key("GH_TOKEN"));
+        assert!(
+            !plan.env.values().any(|v| v == "gho_launcher"),
+            "{:?}",
+            plan.env
+        );
         assert!(
             matches!(
                 f.plan_with(
