@@ -63,8 +63,12 @@ fn patterns() -> &'static Patterns {
         .unwrap_or_else(|_| regex::Regex::new("$^").unwrap_or_else(|_| unreachable!())),
         encoded: regex::Regex::new(r"[A-Za-z0-9+/]{200,}={0,2}|\b[0-9a-fA-F]{160,}\b")
             .unwrap_or_else(|_| regex::Regex::new("$^").unwrap_or_else(|_| unreachable!())),
+        // provider keys; GitHub's classic and fine-grained tokens; AWS; private keys;
+        // Slack's bot, user and app tokens; GitLab, Google OAuth and API keys, npm,
+        // Atlassian, Stripe; a JWT; a credential in an Authorization header or a URL,
+        // which is how git's Basic form shows up in an error
         secret: regex::Regex::new(
-            r"\b(sk|rk)-[A-Za-z0-9_-]{20,}|\bgh[pousr]_[A-Za-z0-9]{30,}|\bAKIA[0-9A-Z]{16}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bxox[baprs]-[A-Za-z0-9-]{10,}",
+            r"\b(sk|rk)-[A-Za-z0-9_-]{20,}|\bgh[pousr]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{50,}|\bAKIA[0-9A-Z]{16}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bx(ox[baprse]|app)-[A-Za-z0-9-]{10,}|\bglpat-[A-Za-z0-9_-]{20,}|\bya29\.[A-Za-z0-9_-]{20,}|\bAIza[0-9A-Za-z_-]{35}|\bnpm_[A-Za-z0-9]{36}\b|\bATATT[A-Za-z0-9_=-]{30,}|\b[sr]k_(live|test)_[A-Za-z0-9]{20,}|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|(?i:\bauthorization:\s*(basic|bearer|token))\s+[A-Za-z0-9+/._~=-]{16,}|\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]{8,}@",
         )
         .unwrap_or_else(|_| regex::Regex::new("$^").unwrap_or_else(|_| unreachable!())),
     })
@@ -195,6 +199,54 @@ mod tests {
         assert!(kinds_of(&format!("payload: {blob}")).contains(&Kind::Encoded));
         assert!(kinds_of("key: sk-abcdefghijklmnopqrstuvwxyz0123").contains(&Kind::Secret));
         assert!(kinds_of("-----BEGIN RSA PRIVATE KEY-----").contains(&Kind::Secret));
+    }
+
+    #[test]
+    fn the_token_shapes_services_issue_now_are_secrets() {
+        // each fixture is its prefix and a body joined here, so no line of this file
+        // looks like a live token to a push-time secret scanner
+        for (prefix, body) in [
+            (
+                "github_pat_",
+                "11ABCDEFG0123456789abc_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW",
+            ),
+            ("glpat-", "abcdefghijklmnopqrst"),
+            ("ya29.", "a0AfH6SMBabcdefghijklmnopqrstuvwxyz"),
+            ("npm_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            ("ATATT", "3xFfGF0abcdefghijklmnopqrstuvwxyz0123456789"),
+            ("xapp-", "1-A0123456789-0123456789012-abcdef"),
+            (
+                "eyJ",
+                "hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+            ),
+            ("Authorization: Basic ", "eC1hY2Nlc3MtdG9rZW46c2VjcmV0dmFsdWU="),
+            ("authorization: bearer ", "abcdefghijklmnopqrstuvwxyz"),
+            (
+                "https://x-access-token:",
+                "s3cr3tvalue123@github.com/apache/repo.git",
+            ),
+            ("AIza", "SyA-abcdefghijklmnopqrstuvwxyz01234"),
+            ("sk_live_", "abcdefghijklmnopqrstuvwx"),
+        ] {
+            let token = format!("{prefix}{body}");
+            assert!(
+                kinds_of(&format!("upstream said: {token} (401)")).contains(&Kind::Secret),
+                "{token}"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_about_tokens_is_not_a_secret() {
+        for text in [
+            "Fine-grained tokens start with github_pat_ and GitLab's with glpat-.",
+            "Clone from https://git@github.com/apache/repo.git, or with Basic auth.",
+            "The server listens on http://localhost:8080/mcp@v2 for now.",
+            "Every JWT starts with eyJhbGciOi, the encoded header.",
+            "Set the Authorization: Bearer header from the grant.",
+        ] {
+            assert!(!kinds_of(text).contains(&Kind::Secret), "{text}");
+        }
     }
 
     #[test]
