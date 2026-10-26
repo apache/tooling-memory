@@ -37,6 +37,7 @@ use std::path::Path as FsPath;
 use std::sync::Arc;
 
 mod hello;
+mod scrub;
 pub mod telemetry;
 pub mod usage;
 
@@ -441,11 +442,14 @@ impl Egress {
             }
         };
         let status = resp.status().as_u16();
-        let headers = resp.headers().clone();
+        let needles = injected(dest);
+        let mut headers = resp.headers().clone();
+        scrub::headers(&mut headers, &needles);
         let body = resp
-            .text()
+            .bytes()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
+        let body = String::from_utf8_lossy(&scrub::replace(&body, &needles)).into_owned();
         let _ = inner
             .telemetry
             .record(started, inner.memory.session_id(), tool, status, &usage);
@@ -1430,15 +1434,17 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let needles = injected(&dest);
     let upstream = if !status.is_success() && std::env::var_os("MEMORY_EGRESS_DEBUG").is_some() {
-        match debugged(status, upstream).await {
+        match debugged(status, upstream, &needles).await {
             Debugged::Relay(upstream) => upstream,
             Debugged::Refused(refusal) => return refusal,
         }
     } else {
         upstream
     };
-    let resp_headers = copy_headers(upstream.headers(), false);
+    let mut resp_headers = copy_headers(upstream.headers(), false);
+    scrub::headers(&mut resp_headers, &needles);
     let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
@@ -1448,6 +1454,7 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
     let body_stream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
+    let body_stream = scrub::body(body_stream, needles);
     let (body_stream, tapped) = tap(body_stream);
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<Usage>>();
     let stream = usage_tail(body_stream, content_type.as_deref(), tx);
@@ -1464,6 +1471,15 @@ async fn proxy(egress: Egress, destination: String, rest: String, req: Request) 
     response
 }
 
+/// What [`scrub`] replaces in a destination's answers: the credential the egress put on
+/// the request, if it put one on.
+fn injected(dest: &Destination) -> Vec<Vec<u8>> {
+    match &dest.auth {
+        Auth::Inject { value, .. } => scrub::needles(value),
+        Auth::PassThrough => Vec::new(),
+    }
+}
+
 /// What the debug mode does with an upstream's answer that is not a success.
 enum Debugged {
     /// Relay it as it came: a redirect, which the harness needs whole, `Location` and all.
@@ -1474,8 +1490,13 @@ enum Debugged {
 
 /// A diagnostic, with `MEMORY_EGRESS_DEBUG` set: who refused, and how, on stderr. A
 /// redirect is logged with where it points and relayed; any other answer's body is read
-/// here and not relayed, so this is for finding out, not for running.
-async fn debugged(status: StatusCode, upstream: reqwest::Response) -> Debugged {
+/// here and not relayed, so this is for finding out, not for running. The injected
+/// credential is replaced before the body is cut short, so no part of it is shown.
+async fn debugged(
+    status: StatusCode,
+    upstream: reqwest::Response,
+    needles: &[Vec<u8>],
+) -> Debugged {
     let url = upstream.url().to_string();
     if status.is_redirection() {
         eprintln!(
@@ -1491,7 +1512,8 @@ async fn debugged(status: StatusCode, upstream: reqwest::Response) -> Debugged {
         .unwrap_or("-")
         .to_string();
     let cf = upstream.headers().contains_key("cf-ray");
-    let body = upstream.text().await.unwrap_or_default();
+    let body = upstream.bytes().await.unwrap_or_default();
+    let body = String::from_utf8_lossy(&scrub::replace(&body, needles)).into_owned();
     eprintln!(
         "egress debug: {status} from {url} server={server} cloudflare={cf} body={:?}",
         body.chars().take(300).collect::<String>()
@@ -2404,6 +2426,61 @@ mod tests {
         assert_eq!(s[0].destination, "anthropic");
         assert_eq!(s[0].model, "claude-opus-5-5");
         assert_eq!((s[0].input_tokens, s[0].output_tokens), (11, 7));
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_echoes_the_injected_credential_does_not_hand_it_on() {
+        // a provider that quotes the credential it was sent, in a header and in a body
+        // whose chunks split it
+        let fake = Router::new().route(
+            "/v1/messages",
+            any(|req: Request| async move {
+                let key = req.headers()["authorization"].to_str().unwrap().to_string();
+                let (head, tail) = key.split_at(12);
+                let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+                    Ok(Bytes::from(format!("{{\"error\":\"bad key {head}"))),
+                    Ok(Bytes::from(format!("{tail}\"}}"))),
+                ];
+                (
+                    [(HeaderName::from_static("x-seen"), key.clone())],
+                    Body::from_stream(futures_util::stream::iter(chunks)),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let (_d, e) = fixture(Some((
+            "openai",
+            Destination::forward(
+                format!("http://{addr}"),
+                Auth::Inject {
+                    header: header::AUTHORIZATION,
+                    value: "Bearer sk-real-0123456789".into(),
+                },
+            ),
+        )))
+        .await;
+        let r = e
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/messages")
+                    .method("POST")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let seen = r.headers()["x-seen"].to_str().unwrap().to_string();
+        let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!seen.contains("sk-real"), "{seen}");
+        assert!(!body.contains("sk-real"), "{body}");
+        assert_eq!(
+            body,
+            "{\"error\":\"bad key [credential removed by the egress]\"}"
+        );
     }
 
     #[tokio::test]
@@ -3597,7 +3674,9 @@ mod tests {
         assert_eq!(r.headers["mcp-session-id"], "s-1");
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(v["saw"], "{\"id\":1}");
-        assert_eq!(v["bearer"], "Bearer ts-secret");
+        // the server saw the injected bearer, and its echo of it comes back replaced
+        assert!(!r.body.contains("ts-secret"), "{}", r.body);
+        assert_eq!(v["bearer"], "[credential removed by the egress]");
         assert_eq!(v["session"], "s-0");
         // recorded as a call to the tool, with no tokens and a latency
         let rows = e.telemetry().summary().unwrap();
@@ -3858,7 +3937,7 @@ mod tests {
                 .header(header::LOCATION, to)
                 .body("")
                 .unwrap();
-            match debugged(status, reqwest::Response::from(upstream)).await {
+            match debugged(status, reqwest::Response::from(upstream), &[]).await {
                 Debugged::Relay(r) => {
                     assert_eq!(r.status(), status);
                     assert_eq!(r.headers()[header::LOCATION], to);
@@ -3873,12 +3952,37 @@ mod tests {
             .status(StatusCode::BAD_GATEWAY)
             .body("down")
             .unwrap();
-        let got = debugged(StatusCode::BAD_GATEWAY, reqwest::Response::from(upstream)).await;
+        let got = debugged(
+            StatusCode::BAD_GATEWAY,
+            reqwest::Response::from(upstream),
+            &[],
+        )
+        .await;
         let Debugged::Refused(r) = got else {
             panic!("a 502 is relayed in debug mode")
         };
         assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
         let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("down"));
+        // a refusal that quotes the injected credential where the cut falls shows none
+        // of it, not even the part before the cut
+        let quoted = format!("{}Bearer sk-real-0123456789", "x".repeat(290));
+        let upstream = axum::http::Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(quoted)
+            .unwrap();
+        let needles = scrub::needles("Bearer sk-real-0123456789");
+        let got = debugged(
+            StatusCode::UNAUTHORIZED,
+            reqwest::Response::from(upstream),
+            &needles,
+        )
+        .await;
+        let Debugged::Refused(r) = got else {
+            panic!("a 401 is relayed in debug mode")
+        };
+        let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("Bearer sk"), "{body}");
     }
 }
