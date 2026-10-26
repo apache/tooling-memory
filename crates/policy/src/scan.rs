@@ -63,13 +63,24 @@ fn patterns() -> &'static Patterns {
         .unwrap_or_else(|_| regex::Regex::new("$^").unwrap_or_else(|_| unreachable!())),
         encoded: regex::Regex::new(r"[A-Za-z0-9+/]{200,}={0,2}|\b[0-9a-fA-F]{160,}\b")
             .unwrap_or_else(|_| regex::Regex::new("$^").unwrap_or_else(|_| unreachable!())),
-        // provider keys; GitHub's classic and fine-grained tokens; AWS; private keys;
-        // Slack's bot, user and app tokens; GitLab, Google OAuth and API keys, npm,
-        // Atlassian, Stripe; a JWT; a credential in an Authorization header or a URL,
-        // which is how git's Basic form shows up in an error
-        secret: regex::Regex::new(
-            r"\b(sk|rk)-[A-Za-z0-9_-]{20,}|\bgh[pousr]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{50,}|\bAKIA[0-9A-Z]{16}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bx(ox[baprse]|app)-[A-Za-z0-9-]{10,}|\bglpat-[A-Za-z0-9_-]{20,}|\bya29\.[A-Za-z0-9_-]{20,}|\bAIza[0-9A-Za-z_-]{35}|\bnpm_[A-Za-z0-9]{36}\b|\bATATT[A-Za-z0-9_=-]{30,}|\b[sr]k_(live|test)_[A-Za-z0-9]{20,}|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|(?i:\bauthorization:\s*(basic|bearer|token))\s+[A-Za-z0-9+/._~=-]{16,}|\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]{8,}@",
-        )
+        // provider keys; GitHub's classic and fine-grained tokens; AWS keys, long-lived
+        // and session; private keys; Slack's bot, user, refresh and app tokens; GitLab
+        // personal and deploy tokens, Google OAuth and API keys, npm, Atlassian, Vault,
+        // Stripe; a JWT; a credential in an Authorization or X-Api-Key header however it
+        // is quoted, in a query parameter, or in a URL, which is how git's Basic form
+        // shows up in an error
+        secret: regex::Regex::new(concat!(
+            r"\b(sk|rk)-[A-Za-z0-9_-]{20,}|\bgh[pousr]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{50,}",
+            r"|\b(AKIA|ASIA)[0-9A-Z]{16}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----",
+            r"|\bx(ox[baprse]|app)-[A-Za-z0-9-]{10,}|\bgl(pat|dt)-[A-Za-z0-9_-]{20,}",
+            r"|\bya29\.[A-Za-z0-9_-]{20,}|\bAIza[0-9A-Za-z_-]{35}|\bnpm_[A-Za-z0-9]{36}\b",
+            r"|\bATATT[A-Za-z0-9_=-]{30,}|\bhvs\.[A-Za-z0-9_-]{24,}|\b[sr]k_(live|test)_[A-Za-z0-9]{20,}",
+            r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+            r#"|(?i:\bauthorization["']?\s*[:=]\s*["']?(basic|bearer|token))\s+[A-Za-z0-9+/._~=-]{16,}"#,
+            r#"|(?i:\bx-api-key["']?\s*[:=]\s*["']?)[A-Za-z0-9+/._~=-]{16,}"#,
+            r"|(?i:[?&](access_token|api_key|apikey|token)=)[A-Za-z0-9._~-]{16,}",
+            r"|(?i:\b[a-z][a-z0-9+.-]*://)[^\s/:@]*:[^\s/@$<>{}]{8,}@",
+        ))
         .unwrap_or_else(|_| regex::Regex::new("$^").unwrap_or_else(|_| unreachable!())),
     })
 }
@@ -100,10 +111,23 @@ fn excerpt(text: &str, start: usize, end: usize) -> String {
     s.replace('\n', " ")
 }
 
+/// A credential in a URL that is a name for one rather than one: `USER:PASSWORD@`, the
+/// form examples and docs give. Placeholders in `${...}`, `$VAR` and `<...>` the
+/// pattern itself leaves out.
+fn placeholder(found: &str) -> bool {
+    let Some(rest) = found.strip_suffix('@').filter(|_| found.contains("://")) else {
+        return false;
+    };
+    let password = rest.rsplit(':').next().unwrap_or_default();
+    password.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+}
+
 /// Scan a text. Findings come in document order, one per kind at most, the first of
 /// each; the policy acts on kinds, and a reader wants the first place to look.
 #[must_use]
 pub fn scan(text: &str) -> Vec<Finding> {
+    // a byte order mark leads many a file and error body; it hides nothing there
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let p = patterns();
     let mut out = Vec::new();
     let checks: [(Kind, &regex::Regex); 5] = [
@@ -114,7 +138,10 @@ pub fn scan(text: &str) -> Vec<Finding> {
         (Kind::Secret, &p.secret),
     ];
     for (kind, re) in checks {
-        if let Some(m) = re.find(text) {
+        let found = re
+            .find_iter(text)
+            .find(|m| kind != Kind::Secret || !placeholder(m.as_str()));
+        if let Some(m) = found {
             out.push(Finding {
                 kind,
                 excerpt: excerpt(text, m.start(), m.end()),
@@ -227,6 +254,24 @@ mod tests {
             ),
             ("AIza", "SyA-abcdefghijklmnopqrstuvwxyz01234"),
             ("sk_live_", "abcdefghijklmnopqrstuvwx"),
+            ("rk_live_", "abcdefghijklmnopqrstuvwx"),
+            ("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            ("AKIA", "ABCDEFGHIJKLMNOP"),
+            ("ASIA", "ABCDEFGHIJKLMNOP"),
+            ("xoxe-", "1-abcdefghijklmnop"),
+            ("hvs.", "CAESIabcdefghijklmnopqrstuvwxyz"),
+            ("gldt-", "abcdefghijklmnopqrst"),
+            // a header as JSON, as a dict's repr, and as a form field quote it
+            (
+                "{\"config\":{\"headers\":{\"Authorization\":\"Bearer ",
+                "abcdefghijklmnopqrstuvwxyz0123456789\"}}}",
+            ),
+            ("{'Authorization': 'Bearer ", "abcdefghijklmnopqrstuvwxyz0123456789'}"),
+            ("Authorization=Bearer ", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            ("X-Api-Key: ", "abcdefghijklmnopqrstuvwx"),
+            ("redis://:", "averylongpassword123@cache:6379"),
+            ("HTTPS://user:", "s3cr3tvalue123@example.org/x"),
+            ("https://api.example.org/v1?access_token=", "abcdefghijklmnopqrstuvwxyz012345"),
         ] {
             let token = format!("{prefix}{body}");
             assert!(
@@ -244,9 +289,21 @@ mod tests {
             "The server listens on http://localhost:8080/mcp@v2 for now.",
             "Every JWT starts with eyJhbGciOi, the encoded header.",
             "Set the Authorization: Bearer header from the grant.",
+            // placeholders in the forms the docs give for a credential in a URL
+            "git clone https://x-access-token:${GITHUB_TOKEN}@github.com/apache/repo.git",
+            "Push to https://oauth2:$GITLAB_TOKEN@gitlab.com/group/repo.git instead.",
+            "The DSN is postgres://USER:PASSWORD@HOST:5432/DB in every example.",
+            "Use https://user:<password>@host for basic auth.",
+            "Or https://x-access-token:<your-token>@github.com/apache/repo.git.",
         ] {
             assert!(!kinds_of(text).contains(&Kind::Secret), "{text}");
         }
+    }
+
+    #[test]
+    fn a_byte_order_mark_at_the_start_is_not_hidden_text() {
+        assert!(scan("\u{FEFF}upstream 404: no such page").is_empty());
+        assert!(kinds_of("upstream \u{FEFF}404").contains(&Kind::HiddenText));
     }
 
     #[test]

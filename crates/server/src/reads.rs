@@ -63,16 +63,24 @@ pub struct ReadLog {
 /// A line appended to a JSONL file under the state directory; a failure is dropped,
 /// as a log's is.
 pub fn append_line(path: &Path, line: &str) {
+    let _ = try_append_line(path, line);
+}
+
+/// A line appended to a JSONL file under the state directory, for a caller that has to
+/// know whether it was kept.
+///
+/// # Errors
+///
+/// The file could not be opened or written.
+pub fn try_append_line(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p).ok();
+        std::fs::create_dir_all(p)?;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{line}");
-    }
+        .open(path)?;
+    writeln!(f, "{line}")
 }
 
 /// One write, as the write log records it: which session wrote which entry, so a
