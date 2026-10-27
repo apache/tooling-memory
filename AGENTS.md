@@ -138,11 +138,11 @@ is the direction (PLAN.md, Build speed); until then the cache is local.
   reader test instead**, at the same points. The prompt is `/reader-test`, in
   `.claude/commands/reader-test.md`: write the questions the change should answer first,
   then one fresh agent answers them from the changed files and their diff and from nothing
-  else but what every session loads, and another fact-checks each claim against the code. A wrong or
-  missing answer is a finding against the text. The command says when a revision needs
-  both agents again, the fact check alone, or neither. Say in the PR description that the
-  pass ran, the questions, how the reader did, what the fact check found, and what is
-  still open.
+  else but what every session loads, and another fact-checks each claim against the code.
+  A wrong or missing answer is a finding against the text. The command says when a
+  revision needs both agents again, the fact check alone, or neither. Say in the PR
+  description that the pass ran, the questions, how the reader did, what the fact check
+  found, and what is still open.
 - **A review is tied to a commit, so re-request it after every push**, and do not read a
   clean round as a verdict.
 
