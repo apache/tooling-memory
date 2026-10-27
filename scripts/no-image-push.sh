@@ -65,7 +65,7 @@ function takes_value(tool, o) {
 # An engine option that takes the next word as its value: `docker -H host push`,
 # `docker compose -f a.yml push`, `ctr -n ns images push`.
 function engine_value(o) {
-    return o ~ /^(-[hcfnlp]|--(host|context|config|log-level|url|connection|identity|root|runroot|storage-driver|namespace|address|kubeconfig|file|project-name|profile|env-file|project-directory|name|network|tag|creds|authfile|platform))$/
+    return o ~ /^(-[hcfnlp]|--(host|context|config|log-level|url|connection|identity|root|runroot|storage-driver|namespace|address|kubeconfig|file|project-name|profile|env-file|project-directory|name|network|tag|creds|authfile|platform|env|label|build-arg|retry-times|src|dest|src-creds|dest-creds|format|cache-from))$/ || o == "-e"
 }
 function verbs(tool) {
     if (tool == "skopeo") return " copy sync login "
@@ -83,8 +83,11 @@ function judge(t, n,   tool, i, m, nw, value, v, last) {
     if (tool ~ /^\$/) tool = "$"; else tool = base(tool)
     m = 0; value = 0
     for (i = t + 1; i <= n; i++) {
-        if (w[i] == "--push" || w[i] ~ /push=true/ || w[i] ~ /type=registry/) return "--push"
         if (value) { value = 0; continue }
+        # the program a container runs has options of its own: `podman run img x --push`
+        if (m >= 1 && nw[1] ~ /^(run|exec|create|start)$/) break
+        if (w[i] ~ /^--cache-from=/) continue
+        if (w[i] == "--push" || w[i] ~ /push=true/ || w[i] ~ /type=registry/) return "--push"
         if (w[i] ~ /^-/) { if (w[i] !~ /=/ && engine_value(w[i])) value = 1; continue }
         nw[++m] = w[i]
     }
@@ -92,8 +95,13 @@ function judge(t, n,   tool, i, m, nw, value, v, last) {
     v = verbs(tool)
     last = nw[m]
     if (index(v, " " nw[1] " ")) {
-        if (tool == "skopeo" && nw[1] != "login" && local_target(last)) return ""
-        if (tool == "ko" && (index(" " joined " ", " --local ") || index(joined, "--push=false"))) return ""
+        # a copy or sync to a local store pulls; a local ko build, a crane credential
+        # read and an oras copy to a layout push nothing
+        if (tool == "skopeo" && nw[1] == "copy" && local_target(last)) return ""
+        if (tool == "skopeo" && nw[1] == "sync" && joined ~ / --dest[ =](dir|oci)( |$)/) return ""
+        if (tool == "ko" && joined ~ / (--local|-l|--push=false)( |$)/) return ""
+        if (tool ~ /crane$/ && nw[1] == "auth" && nw[2] != "login") return ""
+        if (tool == "oras" && joined ~ / --to-oci-layout/) return ""
         return nw[1]
     }
     if (nw[1] ~ /^(image|images|manifest|artifact|compose|system|registry)$/ && m >= 2 && index(v, " " nw[2] " ")) return nw[2]
@@ -106,16 +114,21 @@ function report(line) { printf "%s:%d: %s\n", name, NR, line; found = 1 }
 function scan(line,   low, n, i, k, t, c, word, words, opts_of, value) {
     low = tolower(line)
     if (low ~ /build-push-action|push-to-registry|bake-action|copytoregistry|deploy-pages|write-all/ \
-        || low ~ /uses:[^#]*(release|login|ecr|ghcr|registry|docker-build-push)/ \
+        || low ~ /uses:[^#]*(release|login|ghcr|registry|docker-build-push)/ \
         || low ~ /(packages|pages)[^#]*:[^#]*write/ \
-        || low ~ /type=registry|push=true|push:[[:space:]]*true|"push"[[:space:]]*:[[:space:]]*true/ \
+        || low ~ /^[[:space:]]*push:[[:space:]]*true|"push"[[:space:]]*:[[:space:]]*true|output[^#]*type=registry/ \
         || low ~ /(^|[^[:alnum:]_-])gh[[:space:]]+release[[:space:]]+(create|upload|edit)/ \
         || low ~ /(^|[^[:alnum:]_-])gh[[:space:]]+api[^#]*\/(releases|packages)[^#]*(-x|--method|-f|--field|--raw-field|--input)/ \
         || low ~ ("[\"\047](" engines ")[\"\047][[:space:]]*,[[:space:]]*[\"\047](push|login)[\"\047]")) {
         report(line)
         return
     }
-    gsub(/\$\([A-Za-z0-9_]+\)|\$\{[^}]*\}/, "$V", low)
+    while (match(low, /\$\([a-z0-9_]+\)/)) low = substr(low, 1, RSTART - 1) "$" substr(low, RSTART + 2, RLENGTH - 3) substr(low, RSTART + RLENGTH)
+    while (match(low, /\$\{[^}]*\}/)) {
+        inner = substr(low, RSTART + 2, RLENGTH - 3)
+        gsub(/[^a-z0-9_]/, "_", inner)
+        low = substr(low, 1, RSTART - 1) "$" inner substr(low, RSTART + RLENGTH)
+    }
     gsub(/&&|\|\||[;|&(){}`]/, " ; ", low)
     n = split(low, words, /[[:space:]]+/)
     k = 0; t = 0; opts_of = ""; value = 0; joined = ""
@@ -137,8 +150,9 @@ function scan(line,   low, n, i, k, t, c, word, words, opts_of, value) {
         c = word
         sub(/^[@+-]+/, "", c)
         c = base(c)
-        if (c ~ /^\$/ && c ~ /git/) { t = -1; continue }
-        if (c != "" && (engine(c) || c ~ /^\$/)) { w[k] = c; t = k; continue }
+        # a variable is an engine when its name says so: `$runtime`, `$ENGINE`, `${DOCKER}`
+        if (c ~ /^\$/ && c ~ /(docker|podman|engine|runtime|container|ctr|wslc|buildah|nerdctl|crane|skopeo|oras|oci)/) { w[k] = c; t = k; continue }
+        if (c != "" && engine(c)) { w[k] = c; t = k; continue }
         t = -1
     }
 }

@@ -123,7 +123,7 @@ command=$(
         sed -e 's/\\n/\
 /g' -e 's/\\[rt]/ /g' -e 's/\\"/"/g' -e 's/\\\\/\\/g' |
         drop_heredoc_bodies |
-        sed -e ':a' -e '$!{' -e '/\\$/{' -e 'N' -e 's/\\\n/ /' -e 'ta' -e '}' -e '}' |
+        sed -e ':a' -e '$!{' -e '/\\$/{' -e '/^\(\\\\\)*$/b' -e '/[^\\]\(\\\\\)*$/b' -e 'N' -e 's/\\\n/ /' -e 'ta' -e '}' -e '}' |
         tr '\n' ';'
 )
 
@@ -306,33 +306,48 @@ check_git_stash() {
 # (`image push`, `compose -f a.yml push`): `docker -H host push` pushes, and `podman run
 # --name login` and `docker --debug logs push` do not.
 check_image_push() {
-    _tool=$(printf '%s' "${1##*/}" | tr -d "\"'\\\\")
+    # the quotes and backslashes out of the whole command at once, then its words again
+    _unquoted=$(printf '%s' "$*" | tr -d "\"'\\\\")
+    set -f
+    # shellcheck disable=SC2086  # splitting into words is the point
+    set -- $_unquoted
+    set +f
+    _tool=${1##*/}
     shift
     case $_tool in
-        '$'*git* | '$'*GIT*) return 0 ;;
-        '$'*) _tool='$' ;;
+        # a variable is an engine when its name says so: `$runtime`, `$ENGINE`, `${DOCKER}`
+        '$'*)
+            case $(printf '%s' "$_tool" | tr '[:upper:]' '[:lower:]') in
+                *docker* | *podman* | *engine* | *runtime* | *container* | *ctr* | *wslc* | \
+                    *buildah* | *nerdctl* | *crane* | *skopeo* | *oras* | *oci*) _tool='$' ;;
+                *) return 0 ;;
+            esac
+            ;;
         *) : ;;
     esac
     _n1='' _n2='' _n3='' _last='' _value='' _all=' '
     for _w in "$@"; do
-        _w=$(printf '%s' "$_w" | tr -d "\"'\\\\")
         _all="$_all$_w "
-        case $_w in
-            --push | *push=true* | *type=registry*)
-                refuse "\`$_tool ... $_w\` would send an image to a registry. This repository never publishes an image: the harness image holds harnesses the project may not redistribute." \
-                    "Build and keep it local: make image. images/harness/README.md says why."
-                ;;
-            *) : ;;
-        esac
         if [ -n "$_value" ]; then
             _value=''
             continue
         fi
+        # the program a container runs has options of its own: `podman run img x --push`
+        case $_n1 in
+            run | exec | create | start) break ;;
+            *) : ;;
+        esac
         case $_w in
-            -[HcfnlpC] | --host | --context | --config | --log-level | --url | --connection | --identity | \
+            --cache-from=*) continue ;;
+            --push | *push=true* | *type=registry*)
+                refuse "\`$_tool ... $_w\` would send an image to a registry. This repository never publishes an image: the harness image holds harnesses the project may not redistribute." \
+                    "Build and keep it local: make image. images/harness/README.md says why."
+                ;;
+            -[HcfnlpCe] | --host | --context | --config | --log-level | --url | --connection | --identity | \
                 --root | --runroot | --storage-driver | --namespace | --address | --kubeconfig | --file | \
                 --project-name | --profile | --env-file | --project-directory | --name | --network | --tag | \
-                --creds | --authfile | --platform)
+                --creds | --authfile | --platform | --env | --label | --build-arg | --retry-times | --src | \
+                --dest | --src-creds | --dest-creds | --format | --cache-from)
                 _value=yes
                 continue
                 ;;
@@ -372,14 +387,19 @@ check_image_push() {
     [ "$_n1 $_n2 $_n3" = "buildx imagetools create" ] && _hit='imagetools create'
     case $_tool:$_n1:$_all in
         buildah:commit:*' docker://'*) _hit='commit docker://' ;;
-        # a copy or sync to a local store pulls, and a local ko build pushes nothing
-        skopeo:copy:* | skopeo:sync:*)
+        # a copy or sync to a local store pulls; a local ko build, a crane credential read
+        # and an oras copy to a layout push nothing
+        skopeo:copy:*)
             case $_last in
                 oci:* | oci-archive:* | dir:* | docker-archive:* | containers-storage:* | docker-daemon:*) _hit='' ;;
                 *) : ;;
             esac
             ;;
-        ko:*:*' --local '* | ko:*:*' --push=false '*) _hit='' ;;
+        skopeo:sync:*' --dest dir '* | skopeo:sync:*' --dest oci '* | skopeo:sync:*' --dest=dir '* | \
+            skopeo:sync:*' --dest=oci '*) _hit='' ;;
+        ko:*:*' --local '* | ko:*:*' -L '* | ko:*:*' --push=false '*) _hit='' ;;
+        crane:auth:* | gcrane:auth:*) [ "$_n2" = login ] || _hit='' ;;
+        oras:*:*' --to-oci-layout'*) _hit='' ;;
         *) : ;;
     esac
     if [ -n "$_hit" ]; then
@@ -842,7 +862,14 @@ check_part() {
         return 0
     fi
     # the command's name with its quotes and backslashes gone: `"podman" push` runs podman
-    _cmd=$(printf '%s' "${1##*/}" | tr -d "\"'\\\\")
+    _cmd=${1##*/}
+    case $_cmd in
+        *\\*) _cmd=$(printf '%s' "$_cmd" | tr -d "\"'\\\\") ;;
+        *)
+            _cmd=${_cmd#[\"\']}
+            _cmd=${_cmd%[\"\']}
+            ;;
+    esac
     case $_cmd in
         git) check_git "$@" ;;
         gh) check_gh "$@" ;;
