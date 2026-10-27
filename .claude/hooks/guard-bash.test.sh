@@ -29,9 +29,20 @@ payload_for() {
         "$(as_json_string "$1")" "$(as_json_string "${2:-a command}")"
 }
 
+# A guard that loops is a guard that stalls every call until the hook times out and then
+# lets it run: ten seconds a case turns that into a failure here, where `timeout` exists.
+if command -v timeout > /dev/null 2>&1; then
+    limit='timeout 10'
+else
+    limit=''
+fi
+
 run_guard() {
     status=0
-    output=$(payload_for "$1" "${2:-}" | sh "$guard" 2>&1) || status=$?
+    output=$(payload_for "$1" "${2:-}" | $limit sh "$guard" 2>&1) || status=$?
+    if [ "$status" -eq 124 ]; then
+        output="the guard did not finish in ten seconds"
+    fi
 }
 
 allow() {
@@ -180,6 +191,26 @@ refuse "bash -xc 'podman push x'"
 refuse 'if true; then git add -A; fi'
 refuse 'sudo -u me git add -A'
 refuse "bash -lc 'git add -A'"
+refuse 'if podman push x; then :; fi'
+refuse 'if a; then b; else podman push x; fi'
+refuse 'while podman push x; do :; done'
+refuse 'until podman push x; do :; done'
+refuse 'ionice -c 3 podman push x'
+refuse 'sudo -g wheel podman push x'
+refuse 'sudo -n podman push x'
+refuse 'env -u FOO podman push x'
+refuse 'env -i podman push x'
+refuse 'xargs -n 1 podman push < tags'
+refuse 'timeout -s KILL 600 docker push x'
+refuse 'timeout 600 docker push x'
+refuse 'docker compose -f local/compose.yml push'
+refuse 'podman compose -f a.yml -f b.yml push'
+refuse 'ctr -n k8s.io images push x'
+refuse 'docker --context remote image push x'
+refuse 'buildah commit ctr docker://ghcr.io/apache/harness'
+refuse 'gh release edit v1 --draft=false'
+refuse "bash -o pipefail -c 'podman push x'"
+refuse "bash --login -c 'git add -A'"
 allow 'podman build -t durable-memory/harness:dev images/harness'
 allow 'podman run --rm --name login alpine true'
 allow 'podman run --rm -e push alpine true'
@@ -197,6 +228,30 @@ allow 'gh release list'
 allow 'crane digest ghcr.io/apache/harness'
 allow 'grep -n "podman push" scripts/no-image-push.test.sh'
 allow 'make no-image-push-test'
+allow 'docker buildx imagetools inspect node:24'
+allow 'docker --debug logs push'
+allow 'podman --remote run --rm --name login alpine true'
+allow 'skopeo copy docker://docker.io/library/node:24 oci:node'
+allow 'ko build --local ./cmd/x'
+allow '$GIT push origin main'
+allow '"$git" push origin HEAD'
+# a wrapper with nothing after it runs nothing; reading it must end
+allow 'env'
+allow 'git status; env'
+allow 'echo a b | xargs'
+allow 'sudo'
+allow 'timeout'
+# a shell's own options before -c, and a script run with options of its own
+allow "bash -o pipefail -c 'cargo test 2>&1 | tee /tmp/t.log'"
+allow "bash -euo pipefail -c 'make check'"
+allow "bash --login -c 'make check'"
+allow "bash --norc -c 'cargo build'"
+allow 'bash -x scripts/foo.sh src tests'
+allow 'sh scripts/x.sh -v --spec foo'
+allow 'sudo apt-get install -y podman'
+allow 'env FOO=1 cargo test'
+allow 'nice -n 5 make check'
+allow 'ls | xargs -0 grep -l x'
 allow 'wslc.exe build -t durable-memory/harness:dev images/harness'
 allow 'docker build --pull -t harness:abc images/harness'
 allow 'podman pull docker.io/library/node:24'

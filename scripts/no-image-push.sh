@@ -8,9 +8,11 @@
 #
 # It reads each file the way a shell would read a command in it: a line continued with a
 # backslash is one line, quotes around a word do not count, the words in front of a
-# command (`sudo -E`, `env`, `xargs`, `then`, `sh -c`, a YAML `run:`, a make `@`) are passed
-# over, and an engine named by a variable (`"$runtime" push`, `$(ENGINE) push`) is an
-# engine. It fails on:
+# command (`sudo -u root`, `env -i`, `xargs -n 1`, `timeout 600`, `then`, `sh -c`, a YAML
+# `run:`, a make `@`) are passed over with their options, an engine's own options are
+# passed over with their values (`docker -H host push`, `compose -f a.yml push`), and an
+# engine named by a variable (`"$runtime" push`, `$(ENGINE) push`) is an engine, unless
+# the variable names git. It fails on:
 #
 # - a push or a registry login by an engine or a registry tool, with its subcommand found
 #   past the options (`docker -H host push`) and through `image`, `manifest`, `compose`
@@ -25,8 +27,9 @@
 # It is a breaker against an accident, not a boundary: a person who means to push can
 # write a push it does not read. It reads every file git knows or would add, except
 # Markdown, these two scripts, the guard and its tests (which name the same commands to
-# refuse them) and the vendored scripts under crates/web/static/vendor. A file it cannot
-# read, a name git lists that is not a file, and a failure of git or awk all fail the run.
+# refuse them), the vendored scripts under crates/web/static/vendor, and a binary file not
+# yet added. A file it cannot read, a name git lists that is not a file, git listing
+# nothing, and a failure of git or awk all fail the run.
 #
 #   scripts/no-image-push.sh [file...]    default: the repository's files
 #
@@ -44,11 +47,25 @@ program='
 function base(s,   n, parts) { n = split(s, parts, "/"); return parts[n] }
 function unquote(s) { gsub(/["\047\\]/, "", s); return s }
 function engine(s) { return s ~ ("^(" engines ")$") }
-function prefix(s) {
-    if (s ~ /^(sudo|doas|env|time|nohup|exec|command|nice|ionice|xargs|eval|then|do|else|if|while|until|!|-|run|run:|sh|bash|dash|zsh|ksh|ash)$/) return 1
-    if (s ~ /^-/ && seen_prefix) return 1
-    if (s ~ /^[a-z_][a-z0-9_]*=/) return 1
-    return s ~ /:$/
+# The words in front of a command, and the options each takes before the command: a word
+# here is passed over, and so is the value of an option that takes one. The line is in
+# lower case by now, so `-C` and `-c` are one option here.
+function wrapper(s) { return s ~ /^(sudo|doas|env|nice|ionice|xargs|timeout|time|nohup|exec|command|eval|then|do|else|if|while|until|!|-|run|run:|sh|bash|dash|zsh|ksh|ash)$/ }
+function takes_value(tool, o) {
+    if (tool == "sudo") return o ~ /^-[ugchprtd]$/
+    if (tool == "doas") return o ~ /^-[uc]$/
+    if (tool == "env") return o ~ /^-[ucs]$/
+    if (tool == "nice") return o ~ /^-n$/
+    if (tool == "ionice") return o ~ /^-[cnp]$/
+    if (tool == "xargs") return o ~ /^-[inlpsdea]$/
+    if (tool == "timeout") return o ~ /^-[sk]$/
+    if (tool ~ /^(sh|bash|dash|zsh|ksh|ash)$/) return o ~ /^-[a-z]*o$/
+    return 0
+}
+# An engine option that takes the next word as its value: `docker -H host push`,
+# `docker compose -f a.yml push`, `ctr -n ns images push`.
+function engine_value(o) {
+    return o ~ /^(-[hcfnlp]|--(host|context|config|log-level|url|connection|identity|root|runroot|storage-driver|namespace|address|kubeconfig|file|project-name|profile|env-file|project-directory|name|network|tag|creds|authfile|platform))$/
 }
 function verbs(tool) {
     if (tool == "skopeo") return " copy sync login "
@@ -58,55 +75,69 @@ function verbs(tool) {
     if (tool == "ko") return " publish build resolve apply "
     return " push login "
 }
+function local_target(s) { return s ~ /^(oci|oci-archive|dir|docker-archive|containers-storage|docker-daemon):/ }
 # One command, its words in w[t..n] with the tool at w[t]: what in it sends an image out,
 # or "" for nothing.
-function judge(t, n,   tool, i, first, second, before, v) {
+function judge(t, n,   tool, i, m, nw, value, v, last) {
     tool = w[t]
     if (tool ~ /^\$/) tool = "$"; else tool = base(tool)
-    first = ""; second = ""; before = ""
+    m = 0; value = 0
     for (i = t + 1; i <= n; i++) {
         if (w[i] == "--push" || w[i] ~ /push=true/ || w[i] ~ /type=registry/) return "--push"
-        if (w[i] ~ /^-/) { if (first == "") before = w[i]; continue }
-        if (first == "") { first = w[i]; continue }
-        if (second == "") second = w[i]
+        if (value) { value = 0; continue }
+        if (w[i] ~ /^-/) { if (w[i] !~ /=/ && engine_value(w[i])) value = 1; continue }
+        nw[++m] = w[i]
     }
+    if (m == 0) return ""
     v = verbs(tool)
-    if (first != "" && index(v, " " first " ")) return first
-    # the verb after a group (`image push`, `compose push`), or after an option that took
-    # the first word as its value (`-H host push`)
-    if (first ~ /^(image|images|manifest|artifact|compose|system|registry|farm|buildx)$/ || (before != "" && before !~ /=/)) {
-        if (second != "" && index(v, " " second " ")) return second
-        if (first == "farm" && second == "build") return "farm build"
+    last = nw[m]
+    if (index(v, " " nw[1] " ")) {
+        if (tool == "skopeo" && nw[1] != "login" && local_target(last)) return ""
+        if (tool == "ko" && (index(" " joined " ", " --local ") || index(joined, "--push=false"))) return ""
+        return nw[1]
     }
+    if (nw[1] ~ /^(image|images|manifest|artifact|compose|system|registry)$/ && m >= 2 && index(v, " " nw[2] " ")) return nw[2]
+    if (nw[1] == "farm" && nw[2] == "build") return "farm build"
+    if (nw[1] == "buildx" && nw[2] == "imagetools" && nw[3] == "create") return "imagetools create"
+    if (tool == "buildah" && nw[1] == "commit" && index(joined, "docker://")) return "commit docker://"
     return ""
 }
 function report(line) { printf "%s:%d: %s\n", name, NR, line; found = 1 }
-function scan(line,   low, n, i, k, t, c, word, words) {
+function scan(line,   low, n, i, k, t, c, word, words, opts_of, value) {
     low = tolower(line)
-    if (low ~ /build-push-action|push-to-registry|login-action|podman-login|bake-action|action-gh-release|imagetools|write-all/ \
-        || low ~ /packages[^#]*:[^#]*write/ \
-        || low ~ /(^|[^[:alnum:]_-])gh[[:space:]]+release[[:space:]]+(create|upload)/) {
+    if (low ~ /build-push-action|push-to-registry|bake-action|copytoregistry|deploy-pages|write-all/ \
+        || low ~ /uses:[^#]*(release|login|ecr|ghcr|registry|docker-build-push)/ \
+        || low ~ /(packages|pages)[^#]*:[^#]*write/ \
+        || low ~ /type=registry|push=true|push:[[:space:]]*true|"push"[[:space:]]*:[[:space:]]*true/ \
+        || low ~ /(^|[^[:alnum:]_-])gh[[:space:]]+release[[:space:]]+(create|upload|edit)/ \
+        || low ~ /(^|[^[:alnum:]_-])gh[[:space:]]+api[^#]*\/(releases|packages)[^#]*(-x|--method|-f|--field|--raw-field|--input)/ \
+        || low ~ ("[\"\047](" engines ")[\"\047][[:space:]]*,[[:space:]]*[\"\047](push|login)[\"\047]")) {
         report(line)
         return
     }
     gsub(/\$\([A-Za-z0-9_]+\)|\$\{[^}]*\}/, "$V", low)
     gsub(/&&|\|\||[;|&(){}`]/, " ; ", low)
     n = split(low, words, /[[:space:]]+/)
-    k = 0; t = 0; seen_prefix = 0
+    k = 0; t = 0; opts_of = ""; value = 0; joined = ""
     for (i = 1; i <= n + 1; i++) {
         word = (i <= n) ? unquote(words[i]) : ";"
         if (word == ";") {
             if (t > 0 && judge(t, k) != "") { report(line); return }
-            k = 0; t = 0; seen_prefix = 0
+            k = 0; t = 0; opts_of = ""; value = 0; joined = ""
             continue
         }
         if (word == "") continue
-        k++; w[k] = word
+        k++; w[k] = word; joined = joined " " word
         if (t != 0) continue
-        if (prefix(word)) { seen_prefix = 1; continue }
+        if (value) { value = 0; continue }
+        if (opts_of != "" && word ~ /^-/) { value = takes_value(opts_of, word); continue }
+        if (opts_of == "timeout" && word ~ /^[0-9]/) continue
+        if (wrapper(word)) { opts_of = word; continue }
+        if (word ~ /^[a-z_][a-z0-9_]*=/ || word ~ /:$/) continue
         c = word
         sub(/^[@+-]+/, "", c)
         c = base(c)
+        if (c ~ /^\$/ && c ~ /git/) { t = -1; continue }
         if (c != "" && (engine(c) || c ~ /^\$/)) { w[k] = c; t = k; continue }
         t = -1
     }
@@ -114,13 +145,16 @@ function scan(line,   low, n, i, k, t, c, word, words) {
 function code(line,   low) {
     if (line ~ /["\047]push["\047]/) { report(line); return }
     if (names_engine && line ~ /["\047]login["\047]/) { report(line); return }
+    if (names_engine && line ~ /"[^"]*[[:space:]]push([[:space:]][^"]*)?"/) { report(line); return }
     low = tolower(line)
     if (low ~ ("(" engines ")[[:space:]]+((image|manifest)[[:space:]]+)?(push|login)([^[:alnum:]_-]|$)")) report(line)
 }
+# a line that ends in an odd number of backslashes goes on to the next
+function continued(s) { return match(s, /\\+$/) && RLENGTH % 2 == 1 }
 {
     gsub(/\r/, "")
     if (is_code) { code($0); next }
-    if ($0 ~ /\\$/) { held = held substr($0, 1, length($0) - 1) " "; next }
+    if (continued($0)) { held = held substr($0, 1, length($0) - 1) " "; next }
     scan(held $0)
     held = ""
 }
@@ -172,11 +206,18 @@ skipped() {
 }
 
 failures=0
-if [ "${1:-}" = --listed ]; then
-    # called by the whole-repository run below, with the names git gave
+if [ "${1:-}" = --listed ] || [ "${1:-}" = --listed-untracked ]; then
+    # called by the whole-repository run below, with the names git gave. A file not yet
+    # added that git would call binary, an image saved as a tarball say, is not read: it
+    # reaches the repository only by a commit, and is read from then on.
+    untracked=''
+    [ "$1" = --listed-untracked ] && untracked=yes
     shift
     for file in "$@"; do
         skipped "$file" && continue
+        if [ -n "$untracked" ] && [ -f "$file" ] && [ -s "$file" ] && ! grep -I -q '' "$file"; then
+            continue
+        fi
         if [ ! -e "$file" ] && [ ! -L "$file" ] && [ -n "$(git ls-files --deleted -- "$file")" ]; then
             continue
         fi
@@ -196,8 +237,10 @@ else
         exit 1
     fi
     status=0
-    git -c core.quotePath=false ls-files -z --cached --others --exclude-standard |
+    git -c core.quotePath=false ls-files -z --cached |
         xargs -0 sh "$here/no-image-push.sh" --listed || status=$?
+    git -c core.quotePath=false ls-files -z --others --exclude-standard |
+        xargs -0 sh "$here/no-image-push.sh" --listed-untracked || status=$?
     [ "$status" -eq 0 ] || exit 1
     exit 0
 fi

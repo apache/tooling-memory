@@ -123,7 +123,7 @@ command=$(
         sed -e 's/\\n/\
 /g' -e 's/\\[rt]/ /g' -e 's/\\"/"/g' -e 's/\\\\/\\/g' |
         drop_heredoc_bodies |
-        sed -e ':a' -e '/\\$/N' -e 's/\\\n/ /' -e 'ta' |
+        sed -e ':a' -e '$!{' -e '/\\$/{' -e 'N' -e 's/\\\n/ /' -e 'ta' -e '}' -e '}' |
         tr '\n' ';'
 )
 
@@ -165,44 +165,47 @@ strip_prefixes() {
         case ${_rest%%[[:space:]]*} in
             time | nohup | exec | command | then | do | else | if | while | until | '!' | eval | *=*) : ;;
             # these take options of their own before the command, and some options a value:
-            # `sudo -u root podman`, `env -i PATH=x podman`, `nice -n 5 podman`, `xargs -I{} podman`
-            sudo | doas | env | nice | ionice | xargs)
-                _rest=${_rest#*[[:space:]]}
+            # `sudo -u root podman`, `env -i PATH=x podman`, `nice -n 5 podman`, `xargs -I{} podman`.
+            # A wrapper with nothing after it (`ls | xargs`, a bare `env`) runs nothing to read.
+            sudo | doas | env | nice | ionice | xargs | timeout)
+                _wrapper=${_rest%%[[:space:]]*}
+                case $_rest in
+                    *[[:space:]]*) _rest=${_rest#*[[:space:]]} ;;
+                    *)
+                        _rest=''
+                        break
+                        ;;
+                esac
                 while :; do
-                    case ${_rest%%[[:space:]]*} in
-                        -u | -g | -C | -h | -p | -n | -c | -I | -L | -P | -s | -d | -E | -i | -S | -H | -[a-zA-Z] | -[a-zA-Z]* | --*)
-                            case ${_rest%%[[:space:]]*} in
-                                -u | -g | -C | -h | -p | -n | -c | -I | -L | -P | -s | -d) _skip_value=yes ;;
-                                *) _skip_value='' ;;
-                            esac
-                            case $_rest in
-                                *[[:space:]]*) _rest=${_rest#*[[:space:]]} ;;
-                                *) break ;;
-                            esac
-                            if [ -n "$_skip_value" ]; then
-                                case $_rest in
-                                    *[[:space:]]*) _rest=${_rest#*[[:space:]]} ;;
-                                    *) break ;;
-                                esac
-                            fi
-                            ;;
+                    _word=${_rest%%[[:space:]]*}
+                    case $_word in
+                        -*) : ;;
+                        # `timeout 600 make test`: the duration before the command
+                        [0-9]*) [ "$_wrapper" = timeout ] || break ;;
                         *) break ;;
                     esac
-                done
-                continue
-                ;;
-            # `timeout 600 make test` runs make, and so does `timeout --signal=KILL 600`.
-            timeout)
-                _rest=${_rest#*[[:space:]]}
-                while :; do
-                    case ${_rest%%[[:space:]]*} in
-                        -* | [0-9]*) : ;;
-                        *) break ;;
+                    _skip_value=''
+                    case $_wrapper:$_word in
+                        sudo:-[ugChpUrtTD] | doas:-[uC] | env:-[uCS] | nice:-n | ionice:-[cnp] | \
+                            xargs:-[InLPsdEa] | timeout:-[sk]) _skip_value=yes ;;
+                        *) : ;;
                     esac
                     case $_rest in
                         *[[:space:]]*) _rest=${_rest#*[[:space:]]} ;;
-                        *) break ;;
+                        *)
+                            _rest=''
+                            break
+                            ;;
                     esac
+                    if [ -n "$_skip_value" ]; then
+                        case $_rest in
+                            *[[:space:]]*) _rest=${_rest#*[[:space:]]} ;;
+                            *)
+                                _rest=''
+                                break
+                                ;;
+                        esac
+                    fi
                 done
                 continue
                 ;;
@@ -298,34 +301,51 @@ check_git_stash() {
 # files to the same rule, read the same way; this holds what a session types.
 #
 # Quotes and backslashes in a word do not count (`"podman" push`), and a command named by
-# a variable (`$ENGINE push`) is read as an engine. The verb is the first word that is not
-# an option, or the second after a group (`image push`, `compose push`) or after an option
-# that took the first as its value (`-H host push`): `podman run --name login` is a run.
+# a variable (`$ENGINE push`) is read as an engine, unless the variable names git. The verb
+# is the first word that is not an option or an option's value, or the next after a group
+# (`image push`, `compose -f a.yml push`): `docker -H host push` pushes, and `podman run
+# --name login` and `docker --debug logs push` do not.
 check_image_push() {
     _tool=$(printf '%s' "${1##*/}" | tr -d "\"'\\\\")
     shift
     case $_tool in
+        '$'*git* | '$'*GIT*) return 0 ;;
         '$'*) _tool='$' ;;
         *) : ;;
     esac
-    _first='' _second='' _before=''
+    _n1='' _n2='' _n3='' _last='' _value='' _all=' '
     for _w in "$@"; do
         _w=$(printf '%s' "$_w" | tr -d "\"'\\\\")
+        _all="$_all$_w "
         case $_w in
             --push | *push=true* | *type=registry*)
                 refuse "\`$_tool ... $_w\` would send an image to a registry. This repository never publishes an image: the harness image holds harnesses the project may not redistribute." \
                     "Build and keep it local: make image. images/harness/README.md says why."
                 ;;
-            -*)
-                [ -n "$_first" ] || _before=$_w
-                continue
-                ;;
             *) : ;;
         esac
-        if [ -z "$_first" ]; then
-            _first=$_w
-        elif [ -z "$_second" ]; then
-            _second=$_w
+        if [ -n "$_value" ]; then
+            _value=''
+            continue
+        fi
+        case $_w in
+            -[HcfnlpC] | --host | --context | --config | --log-level | --url | --connection | --identity | \
+                --root | --runroot | --storage-driver | --namespace | --address | --kubeconfig | --file | \
+                --project-name | --profile | --env-file | --project-directory | --name | --network | --tag | \
+                --creds | --authfile | --platform)
+                _value=yes
+                continue
+                ;;
+            -*) continue ;;
+            *) : ;;
+        esac
+        _last=$_w
+        if [ -z "$_n1" ]; then
+            _n1=$_w
+        elif [ -z "$_n2" ]; then
+            _n2=$_w
+        elif [ -z "$_n3" ]; then
+            _n3=$_w
         fi
     done
     case $_tool in
@@ -338,24 +358,30 @@ check_image_push() {
     esac
     _hit=''
     for _v in $_verbs; do
-        [ "$_first" = "$_v" ] && _hit=$_v
+        [ "$_n1" = "$_v" ] && _hit=$_v
     done
-    _group=''
-    case $_first in
-        image | images | manifest | artifact | compose | system | registry | farm | buildx) _group=yes ;;
+    case $_n1 in
+        image | images | manifest | artifact | compose | system | registry)
+            for _v in $_verbs; do
+                [ "$_n2" = "$_v" ] && _hit=$_v
+            done
+            ;;
         *) : ;;
     esac
-    case $_before in
-        '' | *=*) : ;;
-        *) _group=yes ;;
+    [ "$_n1 $_n2" = "farm build" ] && _hit='farm build'
+    [ "$_n1 $_n2 $_n3" = "buildx imagetools create" ] && _hit='imagetools create'
+    case $_tool:$_n1:$_all in
+        buildah:commit:*' docker://'*) _hit='commit docker://' ;;
+        # a copy or sync to a local store pulls, and a local ko build pushes nothing
+        skopeo:copy:* | skopeo:sync:*)
+            case $_last in
+                oci:* | oci-archive:* | dir:* | docker-archive:* | containers-storage:* | docker-daemon:*) _hit='' ;;
+                *) : ;;
+            esac
+            ;;
+        ko:*:*' --local '* | ko:*:*' --push=false '*) _hit='' ;;
+        *) : ;;
     esac
-    if [ -z "$_hit" ] && [ -n "$_group" ]; then
-        for _v in $_verbs; do
-            [ "$_second" = "$_v" ] && _hit=$_v
-        done
-        [ "$_first $_second" = "farm build" ] && _hit='farm build'
-        [ "$_first $_second" = "buildx imagetools" ] && _hit='buildx imagetools'
-    fi
     if [ -n "$_hit" ]; then
         refuse "\`$_tool ... $_hit\` would send an image to a registry, or log in to send one. This repository never publishes an image: the harness image holds harnesses the project may not redistribute." \
             "Build and keep it local: make image. images/harness/README.md says why."
@@ -731,7 +757,7 @@ check_gh() {
         esac
     done
     case "${1:-} ${2:-}" in
-        'release create' | 'release upload')
+        'release create' | 'release upload' | 'release edit')
             refuse "\`gh ${1} ${2}\` makes or fills a GitHub release. This repository never publishes a release there: an Apache release is voted on and goes to downloads.apache.org." \
                 "Leave releases to the release process. images/harness/README.md says why nothing here publishes."
             ;;
@@ -781,21 +807,26 @@ check_part() {
     case ${_head##*/} in
         sh | bash | dash | ash | zsh | ksh)
             case $_stripped in
-                # -c alone, or at the end of a cluster: `bash -lc`, `sh -xc`
+                # -c alone, or at the end of a cluster (`bash -lc`, `sh -xc`), after any other
+                # options, `-o pipefail` and `--login` among them
                 *[[:space:]]-c[[:space:]]* | *[[:space:]]-[a-zA-Z]*c[[:space:]]*)
                     _inner=$(printf '%s\n' "$_stripped" |
-                        sed 's/^[^[:space:]]*\([[:space:]][[:space:]]*-[a-zA-Z]*\)*[[:space:]][[:space:]]*-[a-zA-Z]*c[[:space:]][[:space:]]*//')
-                    # The command string is quoted as a whole, and the quotes around it
-                    # are the shell's rather than part of what runs.
-                    case $_inner in
-                        "'"*"'" | '"'*'"')
-                            _inner=${_inner#?}
-                            _inner=${_inner%?}
-                            ;;
-                        *) : ;;
-                    esac
-                    check_line "$_inner"
-                    return 0
+                        sed -E 's/^[^[:space:]]+([[:space:]]+(-[a-zA-Z]*o[[:space:]]+[^-[:space:]][^[:space:]]*|--[a-z-]+|-[a-zA-Z]+))*[[:space:]]+-[a-zA-Z]*c[[:space:]]+//')
+                    # What the pattern could not take apart is not a -c string, and reading it
+                    # again as one would never end: it is read below as the command it is.
+                    if [ "$_inner" != "$_stripped" ]; then
+                        # The command string is quoted as a whole, and the quotes around it
+                        # are the shell's rather than part of what runs.
+                        case $_inner in
+                            "'"*"'" | '"'*'"')
+                                _inner=${_inner#?}
+                                _inner=${_inner%?}
+                                ;;
+                            *) : ;;
+                        esac
+                        check_line "$_inner"
+                        return 0
+                    fi
                     ;;
                 *) : ;;
             esac

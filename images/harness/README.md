@@ -80,6 +80,15 @@ who means to push can write a push that they do not read.
   `packages` permission to a workflow that names other permissions, so this line only
   makes the rule visible.
 
-A workflow that a branch changes runs before `make check` can stop it. Only a setting of
-the repository or of the organisation can stop that first run. Ask ASF Infra to turn off
-GitHub Packages for this repository if that matters.
+What they do not stop:
+
+- A push written to get past them, for example an engine found with `$(command -v podman)`,
+  or a command run through `cmd.exe /c` or `powershell.exe`.
+- An image saved to a file and then uploaded some other way, for example as a workflow
+  artifact.
+- A workflow that a branch changes. It runs before `make check` can stop it. Only a
+  setting of the repository or of the organisation can stop that first run. Ask ASF Infra
+  to turn off GitHub Packages for this repository if that matters.
+
+`scripts/no-image-push.sh` also refuses a Rust, Python or JavaScript string that is
+exactly `"push"`, whatever it is for. Write such a word another way.
