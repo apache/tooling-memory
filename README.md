@@ -133,16 +133,19 @@ argued from taste.
 Several parts around one record, and no one of them is the safety boundary on its own.
 The **memory server** is what an agent harness reaches over MCP: it serves the record by
 summaries first, holds the task ledger, and checks every read and write against the
-policy. The **launcher** runs a harness in a **sandbox**, with no network except the
-**egress**, which forwards its model and tool calls to a provider, a gateway or a tool
-server, holds each to its destination's ceiling, meters them, holds the credentials,
-enforces spend limits and records each call's decision context. The memory server and the
-egress enforce the same grants; the sandbox makes the egress the only way out. An agent
-starts empty, loads a small index called T0, works a task it
-claimed, and writes a handoff when it stops; the next agent continues from the handoff,
-not a transcript. Around them, the **librarian** curates the record on a budget, the
-**perimeter** decides what may be read, written and admitted, and a person promotes what
-the system may rely on.
+policy. The **launcher** runs a harness in a **sandbox** with no network: the one thing
+the harness can reach is the **egress**, which serves it the memory server's MCP and
+forwards its model calls to a provider or a gateway. The egress holds each model call to
+its destination's ceiling, meters it, enforces spend limits, records its decision
+context, and holds the credentials unless the harness runs on its own subscription login.
+A tool the harness asks the memory server for runs in the launcher, outside the sandbox,
+and every request it makes is decided against the session's label; a hosted tool's call
+leaves through the egress like a model call. The **perimeter**, the policy over
+`grants.toml` and the record's policy entries, is what the memory server, the egress and
+the tools all enforce. An agent starts empty, loads a small index called T0, works a task
+it claimed, and writes a handoff when it stops; the next agent continues from the
+handoff, not a transcript. Around them, the **librarian** curates the record on a budget,
+and a person promotes what the system may rely on.
 
 ```
   person ──▶ amem: web launcher, CLI, profiles
@@ -229,9 +232,10 @@ claude mcp add memory -- /path/to/amem --root ~/memory serve --author "agent:cla
 
 The agent gets `t0`, `search`, `get`, `write`, `list`, `recall`, `promote`, the ledger's tools
 and `transcript_turn`, and its writes land at raw trust under the author given.
-Unconfined means only that: the record's rules hold for what the harness reads and writes
-over MCP, but no sandbox or egress stands around the rest of what it does, and it keeps
-its own network and credentials.
+Such a harness has no sandbox and no egress. The policy still decides what it reads and
+writes over MCP, but it keeps its own network and credentials, nothing meters its model
+calls, and no model's ceiling caps what it may read. `amem launch --unconfined` is the
+middle case: no sandbox, but the model calls still go through the egress.
 
 ## The parts, and their commands
 
