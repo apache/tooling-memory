@@ -130,12 +130,15 @@ argued from taste.
 
 ## What it is
 
-Two halves around one record. The **memory server** is what an agent harness reaches
-over MCP: it serves the record by summaries first, holds the task ledger, and checks every
-read and write against the policy. The **launcher** runs a harness confined, with no
-network except the **egress**, which forwards its model calls to a provider or a gateway,
-meters them, holds the credentials, enforces spend limits and records each call's
-decision context. An agent starts empty, loads a small index called T0, works a task it
+Several parts around one record, and no one of them is the safety boundary on its own.
+The **memory server** is what an agent harness reaches over MCP: it serves the record by
+summaries first, holds the task ledger, and checks every read and write against the
+policy. The **launcher** runs a harness in a **sandbox**, with no network except the
+**egress**, which forwards its model and tool calls to a provider, a gateway or a tool
+server, holds each to its destination's ceiling, meters them, holds the credentials,
+enforces spend limits and records each call's decision context. The memory server and the
+egress enforce the same grants; the sandbox makes the egress the only way out. An agent
+starts empty, loads a small index called T0, works a task it
 claimed, and writes a handoff when it stops; the next agent continues from the handoff,
 not a transcript. Around them, the **librarian** curates the record on a budget, the
 **perimeter** decides what may be read, written and admitted, and a person promotes what
@@ -145,7 +148,7 @@ the system may rely on.
   person ──▶ amem: web launcher, CLI, profiles
                │ launch / work (a claimed task)
                ▼
-  ┌─ confined harness, no network ───────┐
+  ┌─ sandbox: harness, no network ───────┐
   │ Claude Code, Codex, Gemini CLI, ...  │──MCP──▶ memory server ──▶ record/   entries, transcripts, contexts, tapes
   └──────────────┬───────────────────────┘          │  policy:  ├──▶ index    SQLite FTS5, BM25
                  │ model calls                      │  Rego     ├──▶ ledger   SQLite, or PostgreSQL
@@ -226,6 +229,9 @@ claude mcp add memory -- /path/to/amem --root ~/memory serve --author "agent:cla
 
 The agent gets `t0`, `search`, `get`, `write`, `list`, `recall`, `promote`, the ledger's tools
 and `transcript_turn`, and its writes land at raw trust under the author given.
+Unconfined means only that: the record's rules hold for what the harness reads and writes
+over MCP, but no sandbox or egress stands around the rest of what it does, and it keeps
+its own network and credentials.
 
 ## The parts, and their commands
 
