@@ -73,6 +73,7 @@ to the repository is committed under `.claude/`:
 | `.claude/hooks/guard-bash.sh` | refuses a command that stages with a wildcard, reaches into the shared stash, passes `--no-verify`, pipes `cargo` or `make` into `head` or `tail`, or posts an issue or pull request body that does not say who wrote it |
 | `.claude/hooks/guard-bash.test.sh` | what the guard refuses, and what it must go on allowing. Run by `make check` |
 | `.claude/commands/adversarial.md` | the prompt the pre-PR pass is given, and the classes it attacks |
+| `.claude/commands/reader-test.md` | the prompts a docs-only branch is given instead: a cold reader, and a check against the code |
 
 If the guard refuses something this repository actually asks for, that is a bug in the
 guard: add the case to the test and fix it rather than working around it. Whatever else
@@ -131,8 +132,12 @@ is the direction (PLAN.md, Build speed); until then the cache is local.
   prompt is `/adversarial`, in `.claude/commands/adversarial.md`. A fresh agent, never a
   fork: a fork inherits the reasoning that wrote the branch and agrees with it. Answer what
   it finds as you would a reviewer, and say in the PR description that the pass ran and
-  what came of it, so a pass that found nothing leaves a trace. Skip it for a branch that
-  touches only docs.
+  what came of it, so a pass that found nothing leaves a trace.
+- **A branch that touches only docs gets a reader test instead**, at the same point. The
+  prompt is `/reader-test`, in `.claude/commands/reader-test.md`: write the questions the
+  change should answer first, then one fresh agent answers them from the changed files
+  alone and another checks each claim against the code. A wrong answer is a finding
+  against the text. Say in the PR description how the reader did and what the check found.
 - **A review is tied to a commit, so re-request it after every push**, and do not read a
   clean round as a verdict.
 
