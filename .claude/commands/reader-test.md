@@ -1,90 +1,123 @@
 ---
-description: Hand a docs-only branch to two fresh subagents, one that reads only the changed files and their diff and one that fact-checks them against the code
+description: Give a docs-only branch to two fresh subagents, one that reads only the changed files and their diff and one that checks their facts against the code
 argument-hint: "[branch] (defaults to the current one)"
 ---
 
 # Read the branch before the pull request
 
-AGENTS.md asks for this in place of `/adversarial` on a docs-only branch, one where
+AGENTS.md asks for this pass in place of `/adversarial` on a docs-only branch. A docs-only
+branch is one where
 `git diff --name-only --no-renames origin/main...origin/<branch> | scripts/docs-only.sh`
-exits 0: after the push and before the PR is opened, and for a revision of an open PR,
-after its push and before review is re-requested. A doc fails in two ways that a reviewer
-who knows the code does not see: a reader comes away believing something other than what
-was meant, or the doc says something the code does not do. One subagent tests each.
+exits 0. AGENTS.md asks for the pass after the push and before you open the PR. It also
+asks for the pass on a revision of an open PR, after its push and before you request
+review again.
 
-Work out the branch (`$ARGUMENTS`, or `git rev-parse --abbrev-ref HEAD`), confirm it is
-pushed and that `origin/<branch>` is what you mean to have read. Then, before spawning
-anything:
+A doc can fail in two ways that a reviewer who knows the code does not see:
 
-1. **Write the questions.** Three to five questions the change should let a reader
-   answer, each with the answer you mean the doc to give. Ask what a reader would act on
-   ("which part stops X", "what do you lose if you Y"), not what a sentence says. Keep the
-   answers to yourself; the reader never sees them. The reader is not quite cold: every
-   session here loads CLAUDE.md, AGENTS.md through it, and the user's own memory and
-   context, before it reads anything. Ask what that text cannot answer, and when the
-   change is to AGENTS.md itself, tell the reader that the copy in its directory is the
-   one to go by.
-2. **Copy the changed files** as they stand on `origin/<branch>` into a fresh directory in
-   your scratchpad, with nothing else in it, and save `git diff origin/main...origin/<branch>`
-   beside them as `change.diff`.
+- A reader comes away with a belief that is different from what the writer meant.
+- The doc says something that the code does not do.
 
-Then spawn **two fresh subagents of the `general-purpose` type** in one message, never
-forks, which would inherit the reasoning that wrote the branch and agree with it. Do not
-edit the worktree until both report.
+One subagent tests for each failure.
+
+Find the branch (`$ARGUMENTS`, or `git rev-parse --abbrev-ref HEAD`). Make sure that it is
+pushed, and that `origin/<branch>` is the text that you want the subagents to read. Then,
+before you start a subagent, do these steps:
+
+1. **Write the questions.** Write three to five questions that the change should let a
+   reader answer. For each question, write the answer that you intend the doc to give. Ask
+   about what a reader would act on, not about what a sentence says. For example: "which
+   part stops X", "what do you lose if you Y". Do not give the answers to the reader. The
+   reader never sees them. The reader does not start with no context. Before it reads
+   anything, every session here loads CLAUDE.md, AGENTS.md through CLAUDE.md, and the
+   user's own memory and context. Ask what that text cannot answer. When the change is to
+   AGENTS.md itself, tell the reader to use the copy in its directory.
+2. **Copy the changed files** as they are on `origin/<branch>` into a new directory in
+   your scratchpad. Save `git diff origin/main...origin/<branch>` next to them as
+   `change.diff`. Put nothing else in the directory.
+
+Then start **two fresh subagents of the `general-purpose` type** in one message. Never use
+forks. A fork inherits the reasoning that wrote the branch, and it agrees with that
+reasoning. Do not edit the worktree until both subagents report.
 
 ## The reader
 
-> You are a reader new to this project. Read only the files in `<dir>`: the changed
-> documents, and `change.diff`, which shows what changed in them. **Read nothing else**: no
-> other file in the repository, no code, no web. What a reader cannot find in these files,
-> you do not know. Change nothing.
+> You are a reader who is new to this repository. Read only the files in `<dir>`. They
+> are the changed documents, and `change.diff`, which shows the changes to them. **Read
+> nothing else**: no other file in the repository, no code, no web. If a reader cannot
+> find something in these files, you do not know it. Do not change anything.
 >
-> 1. Before the questions: in five sentences or fewer, what does the change tell you that
->    the old text did not?
-> 2. Answer each question below from the documents alone. Quote the sentence each answer
->    rests on. Where the documents do not answer, say so; do not guess from what such
->    projects usually do.
-> 3. List each place where you stopped or read twice: a term used before it is defined,
->    two passages that disagree, a sentence you could read two ways (give both readings),
->    a claim about a part the documents never introduce.
+> 1. Before you answer the questions, say what the change tells you that the old text did
+>    not. Use five sentences or fewer.
+> 2. Answer each question below only from the documents. Quote the sentence that each
+>    answer comes from. If the documents do not give an answer, say so. Do not guess from
+>    what such projects usually do.
+> 3. List each place where you stopped, or where you read a passage two times:
+>
+>    - a term that the documents use before they define it;
+>    - two passages that do not agree;
+>    - a sentence that you can read in two ways (give both readings);
+>    - a claim about a part that the documents never introduce.
 >
 > <the questions, without the answers>
 
 ## The fact check
 
-> You are checking a documentation change in this repository against the code. Read
-> AGENTS.md as it stands on `origin/<branch>` first. **Change nothing, commit nothing,
-> post nothing to GitHub.** The change is `git diff origin/main...origin/<branch>`.
+> You check a documentation change in this repository against the code. First, read
+> AGENTS.md as it is on `origin/<branch>`. **Do not change anything. Do not commit
+> anything. Do not post anything to GitHub.** The change is
+> `git diff origin/main...origin/<branch>`.
 >
-> List every claim the added or changed lines make about what the code does, what a
-> command does, what a file holds, or which part does what. For each, read the code on
-> `origin/<branch>` and give one verdict: **HOLDS** with the `file:line` that shows it,
-> **WRONG** with the `file:line` that shows otherwise and what the text should say, or
-> **UNCHECKED** with why you could not settle it. A claim the text implies but does not
-> state counts: a component given a job, a list that reads as complete. Where the doc
-> describes a plan as well as what is built, say whether a claim about the plan fits the
-> code that exists, rather than marking it WRONG for not being built yet. Where the change
-> is to the repository's own rules, also check that it agrees with the rest of AGENTS.md,
-> the other commands, the hooks, the scripts and CI. Report WRONG first. Do not report
-> style.
+> List every claim that the added or changed lines make about these:
+>
+> - what the code does;
+> - what a command does;
+> - what a file holds;
+> - which part does what.
+>
+> For each claim, read the code on `origin/<branch>`. Then give one verdict:
+>
+> - **HOLDS**, with the `file:line` that shows it;
+> - **WRONG**, with the `file:line` that shows otherwise, and what the text should say;
+> - **UNCHECKED**, with the reason that you could not decide it.
+>
+> A claim that the text implies but does not state also counts. This includes a component
+> that the text gives a job, and a list that reads as complete. A doc can describe a plan
+> as well as what exists. For a claim about the plan, say whether it fits the code that
+> exists. Do not mark it WRONG only because the code for it does not exist yet. If the
+> change is to the rules of the repository, also check that the change agrees with these:
+>
+> - the rest of AGENTS.md;
+> - the other commands;
+> - the hooks;
+> - the scripts;
+> - CI.
+>
+> Report WRONG first. Do not report on style.
 >
 > <on a re-run, add: Check only the lines that `git diff <commit>..origin/<branch>`
-> changes, but report anything WRONG you find anywhere in the full diff. `<commit>` is the
-> one the last fact check read.>
+> changes. But report anything WRONG that you find anywhere in the full diff. `<commit>`
+> is the commit that the last fact check read.>
 
 ## When they report
 
-Grade the reader's answers against yours. A wrong or missing answer is a finding against
-the text, not against the reader: change the text until a fresh reader would answer it.
-Verify each WRONG from the fact check yourself before acting on it, and settle each
-UNCHECKED or name it in the PR description as open.
+Grade the answers of the reader against your answers. A wrong or missing answer is a
+finding against the text, not against the reader. Change the text until a fresh reader
+can answer the question. Before you act on a WRONG from the fact check, verify it
+yourself. Find whether each UNCHECKED claim holds, or name it as open in the PR description.
 
-A revision of one word or one punctuation mark needs no new pass. A larger revision is new
-text: push it and run two fresh agents again, with the same questions, since a fix for one
-reader's confusion can make a claim the code does not hold. Once the latest reader has
-answered every question correctly, a revision for that reader's other notes needs only the
-fact check, on the lines the revision changed. These rules hold for a revision of an open
-PR too.
+A revision of one word or of one punctuation mark needs no new pass. A larger revision is
+new text. Push it, and run two fresh agents again with the same questions. The reason is
+that a fix for the confusion of one reader can make a claim that the code does not hold.
+After the latest reader answers every question correctly, a revision for the other notes
+of that reader needs only the fact check. That fact check reads only the lines that the
+revision changed. These rules also apply to a revision of an open PR.
 
-Then say in the PR description that the pass ran, the questions, how the reader did, what
-the fact check found, and what is still open, so a pass that found nothing leaves a trace.
+Then, in the PR description, give:
+
+- that the pass ran;
+- the questions;
+- how the reader did;
+- what the fact check found;
+- what is still open.
+
+Thus the PR also shows a pass that found nothing.
