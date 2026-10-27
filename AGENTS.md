@@ -151,23 +151,36 @@ is the direction (PLAN.md, Build speed); until then the cache is local.
 - **A review is tied to a commit, so re-request it after every push**, and do not read a
   clean round as a verdict.
 
+## Writing in ASD-STE100
+
+Write in [ASD-STE100](https://www.asd-ste100.org/) (Simplified Technical English):
+
+- Keep each sentence short. Use not more than 20 words in an instruction and not more
+  than 25 words in a description.
+- Write about one topic in each sentence.
+- Use the active voice and the simple tenses.
+- Use one word for one thing. Do not use a different word for variety. The words are in
+  [docs/terms.md](docs/terms.md); add a term there in the commit that first needs it.
+- Do not use idioms or figurative language.
+
+This applies to:
+
+- pull request descriptions, comments on issues and pull requests, and commit messages;
+- `README.md`, `CONTRIBUTING.md`, `local/README.md`, the READMEs beside the code, and the
+  Markdown documents in `docs/`;
+- the AGENTS files, and the commands in `.claude/commands/`.
+
+These keep their own style: the paper (`docs/durable-memory-for-disposable-agents.md`),
+the case study (`docs/seeding-a-foundation.md`), `PLAN.md`, the records in `spikes/`, the
+example records in `examples/`, code comments, and the text of the web pages and the
+design book.
+
 ## Writing on an issue or a pull request
 
 A comment from a session goes up under somebody's account and is read by colleagues.
 
 - **Answer what was asked, and stop.**
-- **Write in [ASD-STE100](https://www.asd-ste100.org/) (Simplified Technical English).**
-  This rule applies to pull request descriptions, to comments on issues and pull
-  requests, and to commit messages. Use these rules:
-
-  - Keep each sentence short. Use not more than 20 words in an instruction and not more
-    than 25 words in a description.
-  - Write about one topic in each sentence.
-  - Use the active voice and the simple tenses.
-  - Use one word for one thing. Do not use a different word for variety.
-  - Do not use idioms or figurative language.
-
-  Code comments, `docs/` and the AGENTS files keep their current style.
+- **Write in ASD-STE100**, as the section above says.
 - **The account holder approves the text first.** A comment cannot be unsent.
 - **Say who wrote it**, on a line of its own at the end. The guard refuses a `gh` command
   that posts a body without it:
