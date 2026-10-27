@@ -1,5 +1,5 @@
 ---
-description: Hand a docs-only branch to two fresh subagents, one that reads only the changed files and one that fact-checks them against the code
+description: Hand a docs-only branch to two fresh subagents, one that reads only the changed files and their diff and one that fact-checks them against the code
 argument-hint: "[branch] (defaults to the current one)"
 ---
 
@@ -20,9 +20,10 @@ anything:
    answer, each with the answer you mean the doc to give. Ask what a reader would act on
    ("which part stops X", "what do you lose if you Y"), not what a sentence says. Keep the
    answers to yourself; the reader never sees them. The reader is not quite cold: every
-   session here loads CLAUDE.md, and AGENTS.md through it, before it reads anything. Ask
-   what that text cannot answer, and when the change is to AGENTS.md itself, tell the
-   reader that the copy in its directory is the one to go by.
+   session here loads CLAUDE.md, AGENTS.md through it, and the user's own memory and
+   context, before it reads anything. Ask what that text cannot answer, and when the
+   change is to AGENTS.md itself, tell the reader that the copy in its directory is the
+   one to go by.
 2. **Copy the changed files** as they stand on `origin/<branch>` into a fresh directory in
    your scratchpad, with nothing else in it, and save `git diff origin/main...origin/<branch>`
    beside them as `change.diff`.
