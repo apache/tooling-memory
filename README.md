@@ -134,19 +134,20 @@ Several parts around one record. No one of them is the safety boundary on its ow
 
 - The **memory server** is what an agent harness reaches over MCP. It serves the record
   by summaries first, holds the task ledger, and checks every read and write against the
-  policy. In a launch, it reads nothing above the model's ceiling.
+  policy. In a launch, it gives the harness nothing above the **ceiling** of its model's
+  destination: the highest label that may be sent there.
 - The **launcher** runs a harness in a **sandbox**, which has no network. The one thing
   the harness can reach is the egress.
 - The **egress** carries the memory server's MCP to the harness and forwards the
   harness's model calls to a provider or a gateway. It holds each call to its
-  destination's **ceiling**: the highest label that may be sent there. A call it forwards
-  is also metered, held to its spend limit, and recorded with its decision context. A
-  call it tunnels, as for Copilot and for the ChatGPT, Grok Build and Antigravity logins,
-  is checked against the ceiling when the tunnel opens and is not metered. The egress
-  holds the credentials, unless the harness runs on its own subscription login.
-- The **tools**, fetch, search and the other taps, run outside the sandbox: in the `amem`
-  process, on a tool server called through the egress, or in the owner's browser. Each
-  decides every request against the session's label.
+  destination's ceiling. A call it forwards is also metered, held to its spend limit,
+  and recorded with its decision context. A call it tunnels, as for Copilot, for Codex's
+  ChatGPT login and for the Grok Build and Antigravity logins, is checked against the
+  ceiling when the tunnel opens and is not metered. The egress holds the credentials,
+  unless the harness runs on its own subscription login.
+- The **tools**, fetch, search and the other tool taps, run outside the sandbox: in the
+  `amem` process, on a tool server called through the egress, or in the owner's browser.
+  Each decides every request against the session's label.
 - The **perimeter** is the policy over `grants.toml` and the record's policy entries. The
   memory server, the egress and the tools all enforce it.
 
@@ -233,7 +234,7 @@ pi, in native Linux namespaces from the harness image once `make unpack` has put
 place (every one but Antigravity is in it), under WSL containers, or, not yet run on a
 Mac, under Seatbelt on macOS; auth is
 `key`, `gateway`, or `subscription`, the harness's own login, which the egress passes
-through and meters as plan quota. [local/README.md](local/README.md) is the full guide.
+through and, where it forwards rather than tunnels, meters as plan quota. [local/README.md](local/README.md) is the full guide.
 
 Or point a harness at the memory server alone over stdio, unconfined:
 
