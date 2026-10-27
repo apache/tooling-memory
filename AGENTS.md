@@ -55,6 +55,11 @@ with an explicit request from the user, ask before overriding it.
   it; do not relax that, and give a crate that needs foreign calls its own binding crate
   rather than a third exception. `make check` holds both halves (`scripts/unsafe-crates.sh`,
   and clippy for the binding's Windows target).
+- **No image leaves this machine.** Nothing here pushes an image to a registry or logs in
+  to one: the harness image holds harnesses the project may not redistribute, and it is
+  built from unreleased source. `scripts/no-image-push.sh` holds the files to this in
+  `make check`, and the guard holds what a session types. images/harness/README.md says
+  why.
 - **Nothing reaches outside its root.** The wrapper is a confined process: it touches the
   record, its own state, and its grants file, each behind a rooted operator, and nothing
   else on the host. A name is validated before it becomes a path. Code that opens a file
@@ -70,7 +75,7 @@ to the repository is committed under `.claude/`:
 | Path | What it is |
 | ---- | ---------- |
 | `.claude/settings.json` | the permission allowlist (cargo, make, and read-only `git` and `gh`) and the hook registration |
-| `.claude/hooks/guard-bash.sh` | refuses a command that stages with a wildcard, reaches into the shared stash, passes `--no-verify`, pipes `cargo` or `make` into `head` or `tail`, or posts an issue or pull request body that does not say who wrote it |
+| `.claude/hooks/guard-bash.sh` | refuses a command that stages with a wildcard, reaches into the shared stash, passes `--no-verify`, pipes `cargo` or `make` into `head` or `tail`, pushes an image or logs in to a registry, or posts an issue or pull request body that does not say who wrote it |
 | `.claude/hooks/guard-bash.test.sh` | what the guard refuses, and what it must go on allowing. Run by `make check` |
 | `.claude/commands/adversarial.md` | the prompt the pre-PR pass is given, and the classes it attacks |
 

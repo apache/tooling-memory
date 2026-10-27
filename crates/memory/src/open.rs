@@ -407,9 +407,9 @@ mod tests {
         for bad in [
             "http://example.org/",
             "ftp://x/",
-            "sstriker.github.io",
+            "someone.github.io",
             "https://",
-            "https://sstriker.github.io/durable-memory/",
+            "https://someone.github.io/tooling-memory/",
             "http://127.0.0.1:1@evil.example/",
             "http://localhost:8000\\@evil.example/",
             "https://user:pw@amem.example/",

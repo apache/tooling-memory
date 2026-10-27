@@ -55,3 +55,22 @@ is rebuilt when those move, and on a clock for the one that moves silently:
 Locally, `make image` is for developing the launcher itself. The pull request the bot opens
 runs CI like any other once a maintainer approves the workflow run, since it is opened with
 the workflow's own token.
+
+## Never published
+
+Nobody publishes this image, and nothing in this repository can push it to a registry.
+Each machine builds its own with `make image`. There are two reasons:
+
+- The image holds harnesses under their vendors' own licences. Claude Code and Copilot
+  CLI are two of them, and the project may not redistribute them. The Apache release
+  policy says that each artifact that the project distributes contains only code with a
+  suitable licence.
+- The image is built from unreleased source. The Apache release policy says that the
+  project does not publish unreleased material outside its development community.
+
+Three parts hold this:
+
+- `scripts/no-image-push.sh`, run by `make check`, fails when a script, a workflow, the
+  `Makefile` or a Dockerfile would push an image or log in to a registry.
+- `.claude/hooks/guard-bash.sh` refuses such a command when a session types it.
+- `.github/workflows/image.yml` gives its token no `packages` permission.

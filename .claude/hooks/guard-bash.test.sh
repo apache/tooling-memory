@@ -105,6 +105,34 @@ allow 'git stash push -u -m podling-names-wip'
 allow 'git stash list'
 allow 'git stash apply 0d2e4a1'
 
+# An image never leaves this machine for a registry (images/harness/README.md)
+refuse 'podman push durable-memory/harness:dev ghcr.io/apache/harness:dev'
+refuse 'docker push ghcr.io/apache/harness'
+refuse 'wslc.exe push durable-memory/harness:dev'
+refuse 'docker image push ghcr.io/apache/harness'
+refuse 'podman manifest push harness docker://ghcr.io/apache/harness'
+refuse 'docker -H tcp://builder:2375 push ghcr.io/apache/harness'
+refuse 'docker buildx build --push -t ghcr.io/apache/harness images/harness'
+refuse 'docker buildx build --output type=registry images/harness'
+refuse 'buildah push harness docker://ghcr.io/apache/harness'
+refuse 'skopeo copy containers-storage:harness docker://ghcr.io/apache/harness'
+refuse 'crane push harness.tar ghcr.io/apache/harness'
+refuse 'oras push ghcr.io/apache/harness:1 file'
+refuse 'echo "$TOKEN" | podman login ghcr.io -u me --password-stdin'
+refuse 'make image && podman push durable-memory/harness:dev ghcr.io/apache/harness'
+refuse "sh -c 'podman push durable-memory/harness:dev ghcr.io/apache/harness'"
+refuse 'sudo docker push ghcr.io/apache/harness'
+allow 'podman build -t durable-memory/harness:dev images/harness'
+allow 'wslc.exe build -t durable-memory/harness:dev images/harness'
+allow 'docker build --pull -t harness:abc images/harness'
+allow 'podman pull docker.io/library/node:24'
+allow 'podman images'
+allow 'podman image ls'
+allow 'podman save durable-memory/harness:dev -o harness.tar'
+allow 'podman run --rm -v "$PWD":/r:Z -w /r docker.io/library/node:24 sh scripts/bump-harness-versions.sh'
+allow 'docker buildx build -t harness images/harness'
+allow 'skopeo inspect docker://docker.io/library/node:24'
+
 # The pre-commit gate
 refuse 'git commit --no-verify -m "fix: thing"'
 refuse 'git commit -n -m "fix: thing"'
@@ -555,7 +583,7 @@ allow "gh api -X PATCH repos/a/b/issues/comments/1 -F body=@$signed"
 allow "gh api -X PATCH repos/a/b/issues/comments/1 -F body=@$unsigned"
 # reading through those same paths is most of what the api is used for here, and stays allowed
 # whatever happens to the gap above
-allow 'gh api repos/sstriker/durable-memory/pulls/8/comments'
+allow 'gh api repos/apache/tooling-memory/pulls/8/comments'
 allow 'gh api repos/a/b/pulls/1/reviews --jq .state'
 # Prose about posting is not posting, even inside the body of a post. A signed comment
 # explaining how to reply - quoting the command on a line of its own - was counted as a second
@@ -592,7 +620,7 @@ allow 'gh pr view 800 --json body'
 allow 'gh pr diff 800'
 allow 'gh pr checks 800'
 allow 'gh run view 123 --log-failed'
-allow 'gh api repos/sstriker/durable-memory/pulls/8/comments'
+allow 'gh api repos/apache/tooling-memory/pulls/8/comments'
 allow 'gh pr edit 800 --add-label ready'
 # no body flag: the editor opens and a person types it themselves
 allow 'gh pr create --fill'

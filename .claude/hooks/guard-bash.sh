@@ -263,6 +263,58 @@ check_git_stash() {
     esac
 }
 
+# Nothing in this repository pushes an image, or logs in to a registry to push one
+# (images/harness/README.md, "Never published"). The harness image carries harnesses
+# under their vendors' own licences, which the project may not redistribute, so a push
+# from here is never right, whatever the tag. scripts/no-image-push.sh holds the files to
+# the same rule; this holds what a session types.
+#
+# The subcommand is the first word that is not an option, or the second where an option
+# takes a value (`docker -H host push`); `image push` and `manifest push` are pushes too.
+check_image_push() {
+    _tool=${1##*/}
+    shift
+    _first='' _second=''
+    for _w in "$@"; do
+        case $_w in
+            -*) continue ;;
+            *) : ;;
+        esac
+        if [ -z "$_first" ]; then
+            _first=$_w
+        else
+            _second=$_w
+            break
+        fi
+    done
+    _verbs='push login'
+    case $_tool in
+        skopeo) _verbs='copy sync login' ;;
+        crane) _verbs='push copy append auth' ;;
+        oras) _verbs='push login' ;;
+        *) : ;;
+    esac
+    _hit=''
+    for _v in $_verbs; do
+        if [ "$_first" = "$_v" ] || [ "$_second" = "$_v" ]; then
+            _hit=$_v
+        fi
+    done
+    case $_first in
+        buildx)
+            case " $* " in
+                *' --push '* | *push=true* | *type=registry*) _hit=push ;;
+                *) : ;;
+            esac
+            ;;
+        *) : ;;
+    esac
+    if [ -n "$_hit" ]; then
+        refuse "\`$_tool ... $_hit\` would send an image to a registry, or log in to send one. This repository never publishes an image: the harness image holds harnesses the project may not redistribute." \
+            "Build and keep it local: make image. images/harness/README.md says why."
+    fi
+}
+
 # A quoted run of several words is a value, not options.
 #
 # The words this guard walks are the call split on whitespace with the quotes still in
@@ -705,6 +757,9 @@ check_part() {
     case ${1##*/} in
         git) check_git "$@" ;;
         gh) check_gh "$@" ;;
+        docker | podman | buildah | nerdctl | wslc | wslc.exe | skopeo | crane | oras)
+            check_image_push "$@"
+            ;;
         *) : ;;
     esac
 }

@@ -1,5 +1,9 @@
 # The harness image: built when its inputs change, to show the Dockerfile still builds, and
-# never published; machines build their own with `make image`. Pins are bumped by a daily
+# never published; machines build their own with `make image`. It holds harnesses under
+# their vendors' own licences, Claude Code and Copilot CLI among them, which the project
+# may not redistribute, and it is built from unreleased source (images/harness/README.md).
+# So this workflow's token gets no `packages` permission, and scripts/no-image-push.sh,
+# run by `make check`, fails any file here that would send an image to a registry. Pins are bumped by a daily
 # check that opens a pull request, and a pull request that touches them has its lockfile
 # checked against package.json. Never on a run: `memory launch` uses the tag it is given.
 name: image
@@ -17,6 +21,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  packages: none
 
 jobs:
   # Daily: bump the pins and open (or update) a pull request. CI runs on it like any PR
