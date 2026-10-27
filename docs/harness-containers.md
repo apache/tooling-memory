@@ -27,8 +27,8 @@ we would ship or require. Thus bubblewrap is out.
 
 ## The answer, short
 
-No project replaces the launcher and its egress. No project that we found does in one place all
-that `crates/egress` does:
+No project replaces the wrapper: the memory server and its egress. No project that we found does
+in one place all that `crates/egress` does:
 - one unix socket is the only way out of the sandbox;
 - it meters tokens for each session from streamed responses;
 - it checks the label against the ceiling before anything goes out;

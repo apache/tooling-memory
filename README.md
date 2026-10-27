@@ -530,5 +530,5 @@ gives what works only at demo scale. [PLAN.md](PLAN.md) holds the decisions, the
 and the order in which production backends go in.
 
 [docs/llm-apache-org.md](docs/llm-apache-org.md) gives what we propose to the Foundation's
-gateway, llmao at llm.apache.org, and why, from one trace across the launcher and the
+gateway, llmao at llm.apache.org, and why, from one trace across the wrapper and the
 gateway to the tool servers that the gateway hosts.

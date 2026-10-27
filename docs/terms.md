@@ -17,7 +17,8 @@ term here in the same commit as the first document that needs it.
 | `amem` | The binary. It holds the launcher, the memory server, the egress, the web launcher and the command line | memory (for the binary), memoryd, the CLI (for the binary) |
 | memory server | The part that serves the record over MCP: T0, search, get, write, the ledger's memory tools, and the tools | the server (alone), MCP server (for this part) |
 | memory tool | An MCP tool of the memory server: `t0`, `search`, `get`, `write`, `recall`, `claim_next` and the others | tool (alone), operation |
-| launcher | The part of `amem` that starts a harness in a sandbox, with an egress | wrapper |
+| launcher | The part of `amem` that starts a harness in a sandbox, with an egress | |
+| wrapper | The memory server and the egress of one session together: the one confined process that a harness talks to (PLAN.md's word) | the launcher (for the wrapper) |
 | launch | One `amem launch` or `amem work`, or a profile: one sandbox, one egress and one session | run (for a launch) |
 | session | The memory server's session for one launch, with an id, a session label and a transcript. The harness runs in it once, or once for each task with `--loop`; each of those is a harness run | conversation |
 | sandbox | The confinement around a harness | jail |

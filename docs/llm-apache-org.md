@@ -44,7 +44,7 @@ uses need one trace:
 
 - cost per task
 - the audit of what an agent decided
-- debugging a failed session across our launcher, the gateway and a tool server.
+- debugging a failed session across our wrapper, the gateway and a tool server.
 
 When a fleet of agents works at all hours, on any task that it can claim, one trace is how
 anyone finds out what happened.

@@ -87,11 +87,11 @@ Then it runs the harness on that prompt. While the harness works, the launcher h
 lease and sends heartbeats. Thus a harness that crashes or stops responding cannot leave a
 task stuck. When the harness exits, a task that the harness completed stays complete, and
 the exit code is 0. If the harness did not complete the task, the task goes back to the
-pool, and the exit code is 4. The launcher files the harness's output as a handoff and
-attaches it to the task. Thus the next claimant starts where this one stopped. If no task
-is claimable, the exit code is 3. The launcher uses the ledger through the memory tools of
-the memory server, as a client, like the harness. Thus the ledger's rules are in one
-place, and a launcher of an earlier version still works.
+pool, and the exit code is 4. In that case, the launcher files the harness's output as a
+handoff and attaches it to the task. Thus the next claimant starts where this one stopped.
+If no task is claimable, the exit code is 3. The launcher uses the ledger through the
+memory tools of the memory server, as a client, like the harness. Thus the ledger's rules
+are in one place, and a launcher of an earlier version still works.
 
 ```sh
 amem task create "Finish the import" --body "Steps 3 to 5." --priority 5

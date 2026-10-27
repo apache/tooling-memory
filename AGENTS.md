@@ -85,10 +85,11 @@ before you override the instruction.
   built from unreleased source. `scripts/no-image-push.sh` applies this rule to the files
   in `make check`. The guard applies it to the commands that a session types.
   images/harness/README.md gives the reasons.
-- **Nothing has access outside its root.** `amem` is a confined process. It has
-  access only to the record, its own state and its grants file, each through a rooted
-  operator. It has access to nothing else on the host. Code validates a name before the
-  name becomes a path. Code is a bug if it does one of these things:
+- **Nothing has access outside its root.** The wrapper, the per-session memory server and
+  its egress, is a confined process. It has access only to the record, its own state and
+  its grants file, each through a rooted operator. It has access to nothing else on the
+  host. Code validates a name before the name becomes a path. Code is a bug if it does one
+  of these things:
 
   - It opens a file by an absolute path.
   - It reads an environment variable for a location.
@@ -105,7 +106,7 @@ of the Claude Code harness that belongs to the repository is committed under `.c
 | Path | What it is |
 | ---- | ---------- |
 | `.claude/settings.json` | the permission allowlist (cargo, make, and read-only `git` and `gh`) and the hook registration |
-| `.claude/hooks/guard-bash.sh` | It refuses a command that does one of these: stages with a wildcard; runs a bare `git stash`, or a `git stash push` without a message; passes `--no-verify`; pipes `cargo` or `make` into `head` or `tail`; pushes an image, logs in to a registry or makes a GitHub release; posts an issue or pull request body that does not say who wrote it |
+| `.claude/hooks/guard-bash.sh` | It refuses a command that does one of these: stages with a wildcard; runs `git stash` bare or with `save`, `pop`, `clear` or `drop`, or a `git stash push` without a message; passes `--no-verify`; pipes `cargo` or `make` into `head` or `tail`; pushes an image, logs in to a registry or makes a GitHub release; posts an issue or pull request body that does not say who wrote it |
 | `.claude/hooks/guard-bash.test.sh` | what the guard refuses, and what it must continue to allow. `make check` runs it |
 | `.claude/commands/adversarial.md` | the prompt for the pre-PR pass, and the classes that the pass attacks |
 | `.claude/commands/reader-test.md` | the prompts for a docs-only branch, instead of that pass: a reader that has only the changed files and their diff, and a fact check against the code |
@@ -124,7 +125,7 @@ rules apply to that agent, and it learns them when it reads them.
 | `crates/index` | search index, summaries first; backends behind one trait | native |
 | `crates/ledger` | tasks, leases, origin dedup; backends behind one trait | native |
 | `crates/policy` | the grants file, labels, ceilings | native, wasm |
-| `crates/server` | the service that the command line and the memory server call: T0, bundles, and the memory server over MCP | native |
+| `crates/server` | the service that the command line and the MCP handler call: T0, bundles, and the memory server over MCP | native |
 | `crates/egress` | the egress, the one way out: it forwards with ceilings and usage, and carries MCP over HTTP | native |
 | `crates/sandbox` | the sandbox: the plan, a namespaces sandbox backend for Linux, and Seatbelt for macOS (dry-coded) | native |
 | `crates/memory` | the binary, `amem`: serve, launch, relay, doctor, and the command line | native |
