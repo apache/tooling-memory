@@ -136,7 +136,7 @@ summaries first, holds the task ledger, and checks every read and write against 
 policy. The **launcher** runs a harness in a **sandbox** with no network: the one thing
 the harness can reach is the **egress**, which serves it the memory server's MCP and
 forwards its model calls to a provider or a gateway. The egress holds each model call to
-its destination's ceiling, meters it, enforces spend limits, records its decision
+its destination's ceiling, the highest label that may be sent there, meters it, enforces spend limits, records its decision
 context, and holds the credentials unless the harness runs on its own subscription login.
 A tool the harness asks the memory server for runs in the launcher, outside the sandbox,
 and every request it makes is decided against the session's label; a hosted tool's call
