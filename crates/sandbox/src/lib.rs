@@ -2959,7 +2959,7 @@ await ev("session.idle", { sessionID: "../../evil" });
             plan.env["GH_TOKEN"], "gho_test",
             "the harness holds its own login"
         );
-        // its own GitHub MCP server would act with that login, past the memory server
+        // its own GitHub MCP server would act with that login, outside every grant
         assert!(
             plan.argv.iter().any(|a| a == "--disable-builtin-mcps"),
             "{:?}",
