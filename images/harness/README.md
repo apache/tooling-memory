@@ -68,9 +68,18 @@ Each machine builds its own with `make image`. There are two reasons:
 - The image is built from unreleased source. The Apache release policy says that the
   project does not publish unreleased material outside its development community.
 
-Three parts hold this:
+Three parts hold this. They stop an accident. They are not a security boundary: a person
+who means to push can write a push that they do not read.
 
-- `scripts/no-image-push.sh`, run by `make check`, fails when a script, a workflow, the
-  `Makefile` or a Dockerfile would push an image or log in to a registry.
-- `.claude/hooks/guard-bash.sh` refuses such a command when a session types it.
-- `.github/workflows/image.yml` gives its token no `packages` permission.
+- `scripts/no-image-push.sh`, run by `make check`, reads each file as a shell reads a
+  command. It fails when a file would push an image, log in to a registry, make or fill a
+  GitHub release, or give a workflow `packages: write`. This includes Rust, Python and
+  JavaScript that pass `"push"` as an argument.
+- `.claude/hooks/guard-bash.sh` refuses the same commands when a session types them.
+- `.github/workflows/image.yml` names `packages: none`. GitHub already gives no
+  `packages` permission to a workflow that names other permissions, so this line only
+  makes the rule visible.
+
+A workflow that a branch changes runs before `make check` can stop it. Only a setting of
+the repository or of the organisation can stop that first run. Ask ASF Infra to turn off
+GitHub Packages for this repository if that matters.

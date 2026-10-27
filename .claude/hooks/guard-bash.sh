@@ -123,6 +123,7 @@ command=$(
         sed -e 's/\\n/\
 /g' -e 's/\\[rt]/ /g' -e 's/\\"/"/g' -e 's/\\\\/\\/g' |
         drop_heredoc_bodies |
+        sed -e ':a' -e '/\\$/N' -e 's/\\\n/ /' -e 'ta' |
         tr '\n' ';'
 )
 
@@ -162,7 +163,34 @@ strip_prefixes() {
             *) : ;;
         esac
         case ${_rest%%[[:space:]]*} in
-            sudo | env | time | nohup | exec | command | *=*) : ;;
+            time | nohup | exec | command | then | do | else | if | while | until | '!' | eval | *=*) : ;;
+            # these take options of their own before the command, and some options a value:
+            # `sudo -u root podman`, `env -i PATH=x podman`, `nice -n 5 podman`, `xargs -I{} podman`
+            sudo | doas | env | nice | ionice | xargs)
+                _rest=${_rest#*[[:space:]]}
+                while :; do
+                    case ${_rest%%[[:space:]]*} in
+                        -u | -g | -C | -h | -p | -n | -c | -I | -L | -P | -s | -d | -E | -i | -S | -H | -[a-zA-Z] | -[a-zA-Z]* | --*)
+                            case ${_rest%%[[:space:]]*} in
+                                -u | -g | -C | -h | -p | -n | -c | -I | -L | -P | -s | -d) _skip_value=yes ;;
+                                *) _skip_value='' ;;
+                            esac
+                            case $_rest in
+                                *[[:space:]]*) _rest=${_rest#*[[:space:]]} ;;
+                                *) break ;;
+                            esac
+                            if [ -n "$_skip_value" ]; then
+                                case $_rest in
+                                    *[[:space:]]*) _rest=${_rest#*[[:space:]]} ;;
+                                    *) break ;;
+                                esac
+                            fi
+                            ;;
+                        *) break ;;
+                    esac
+                done
+                continue
+                ;;
             # `timeout 600 make test` runs make, and so does `timeout --signal=KILL 600`.
             timeout)
                 _rest=${_rest#*[[:space:]]}
@@ -263,52 +291,71 @@ check_git_stash() {
     esac
 }
 
-# Nothing in this repository pushes an image, or logs in to a registry to push one
-# (images/harness/README.md, "Never published"). The harness image carries harnesses
-# under their vendors' own licences, which the project may not redistribute, so a push
-# from here is never right, whatever the tag. scripts/no-image-push.sh holds the files to
-# the same rule; this holds what a session types.
+# Nothing in this repository pushes an image, releases one, or logs in to a registry to
+# push one (images/harness/README.md, "Never published"). The harness image carries
+# harnesses under their vendors' own licences, which the project may not redistribute, so
+# a push from here is never right, whatever the tag. scripts/no-image-push.sh holds the
+# files to the same rule, read the same way; this holds what a session types.
 #
-# The subcommand is the first word that is not an option, or the second where an option
-# takes a value (`docker -H host push`); `image push` and `manifest push` are pushes too.
+# Quotes and backslashes in a word do not count (`"podman" push`), and a command named by
+# a variable (`$ENGINE push`) is read as an engine. The verb is the first word that is not
+# an option, or the second after a group (`image push`, `compose push`) or after an option
+# that took the first as its value (`-H host push`): `podman run --name login` is a run.
 check_image_push() {
-    _tool=${1##*/}
+    _tool=$(printf '%s' "${1##*/}" | tr -d "\"'\\\\")
     shift
-    _first='' _second=''
+    case $_tool in
+        '$'*) _tool='$' ;;
+        *) : ;;
+    esac
+    _first='' _second='' _before=''
     for _w in "$@"; do
+        _w=$(printf '%s' "$_w" | tr -d "\"'\\\\")
         case $_w in
-            -*) continue ;;
+            --push | *push=true* | *type=registry*)
+                refuse "\`$_tool ... $_w\` would send an image to a registry. This repository never publishes an image: the harness image holds harnesses the project may not redistribute." \
+                    "Build and keep it local: make image. images/harness/README.md says why."
+                ;;
+            -*)
+                [ -n "$_first" ] || _before=$_w
+                continue
+                ;;
             *) : ;;
         esac
         if [ -z "$_first" ]; then
             _first=$_w
-        else
+        elif [ -z "$_second" ]; then
             _second=$_w
-            break
         fi
     done
-    _verbs='push login'
     case $_tool in
         skopeo) _verbs='copy sync login' ;;
-        crane) _verbs='push copy append auth' ;;
-        oras) _verbs='push login' ;;
-        *) : ;;
+        crane | gcrane) _verbs='push copy cp append auth' ;;
+        oras) _verbs='push cp copy login' ;;
+        regctl) _verbs='copy put login' ;;
+        ko) _verbs='publish build resolve apply' ;;
+        *) _verbs='push login' ;;
     esac
     _hit=''
     for _v in $_verbs; do
-        if [ "$_first" = "$_v" ] || [ "$_second" = "$_v" ]; then
-            _hit=$_v
-        fi
+        [ "$_first" = "$_v" ] && _hit=$_v
     done
+    _group=''
     case $_first in
-        buildx)
-            case " $* " in
-                *' --push '* | *push=true* | *type=registry*) _hit=push ;;
-                *) : ;;
-            esac
-            ;;
+        image | images | manifest | artifact | compose | system | registry | farm | buildx) _group=yes ;;
         *) : ;;
     esac
+    case $_before in
+        '' | *=*) : ;;
+        *) _group=yes ;;
+    esac
+    if [ -z "$_hit" ] && [ -n "$_group" ]; then
+        for _v in $_verbs; do
+            [ "$_second" = "$_v" ] && _hit=$_v
+        done
+        [ "$_first $_second" = "farm build" ] && _hit='farm build'
+        [ "$_first $_second" = "buildx imagetools" ] && _hit='buildx imagetools'
+    fi
     if [ -n "$_hit" ]; then
         refuse "\`$_tool ... $_hit\` would send an image to a registry, or log in to send one. This repository never publishes an image: the harness image holds harnesses the project may not redistribute." \
             "Build and keep it local: make image. images/harness/README.md says why."
@@ -684,6 +731,13 @@ check_gh() {
         esac
     done
     case "${1:-} ${2:-}" in
+        'release create' | 'release upload')
+            refuse "\`gh ${1} ${2}\` makes or fills a GitHub release. This repository never publishes a release there: an Apache release is voted on and goes to downloads.apache.org." \
+                "Leave releases to the release process. images/harness/README.md says why nothing here publishes."
+            ;;
+        *) : ;;
+    esac
+    case "${1:-} ${2:-}" in
         # `gh api` reaches the same comments, and is the only way one is edited. It is not here:
         # writing that branch cost three of the five defects this rule was reviewed for, in a
         # guard whose whole difficulty is telling a command from text that looks like one. The
@@ -727,8 +781,10 @@ check_part() {
     case ${_head##*/} in
         sh | bash | dash | ash | zsh | ksh)
             case $_stripped in
-                *[[:space:]]-c[[:space:]]*)
-                    _inner=${_stripped#*[[:space:]]-c[[:space:]]}
+                # -c alone, or at the end of a cluster: `bash -lc`, `sh -xc`
+                *[[:space:]]-c[[:space:]]* | *[[:space:]]-[a-zA-Z]*c[[:space:]]*)
+                    _inner=$(printf '%s\n' "$_stripped" |
+                        sed 's/^[^[:space:]]*\([[:space:]][[:space:]]*-[a-zA-Z]*\)*[[:space:]][[:space:]]*-[a-zA-Z]*c[[:space:]][[:space:]]*//')
                     # The command string is quoted as a whole, and the quotes around it
                     # are the shell's rather than part of what runs.
                     case $_inner in
@@ -754,10 +810,16 @@ check_part() {
     if [ "$#" -eq 0 ]; then
         return 0
     fi
-    case ${1##*/} in
+    # the command's name with its quotes and backslashes gone: `"podman" push` runs podman
+    _cmd=$(printf '%s' "${1##*/}" | tr -d "\"'\\\\")
+    case $_cmd in
         git) check_git "$@" ;;
         gh) check_gh "$@" ;;
-        docker | podman | buildah | nerdctl | wslc | wslc.exe | skopeo | crane | oras)
+        docker | podman | podman-remote | buildah | nerdctl | wslc | wslc.exe | docker-compose | \
+            podman-compose | skopeo | crane | gcrane | oras | regctl | ctr | helm | ko)
+            check_image_push "$@"
+            ;;
+        '$'*)
             check_image_push "$@"
             ;;
         *) : ;;
