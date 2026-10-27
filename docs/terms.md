@@ -18,8 +18,8 @@ term here in the same commit as the first document that needs it.
 | memory server | The part that serves the record over MCP: T0, search, get, write, the ledger's memory tools, and the tools | the server (alone), MCP server (for this part) |
 | memory tool | An MCP tool of the memory server: `t0`, `search`, `get`, `write`, `recall`, `claim_next` and the others | tool (alone), operation |
 | launcher | The part of `amem` that starts a harness in a sandbox, with an egress | wrapper |
-| launch | One `amem launch` or `amem work`, or a profile: one sandbox and one egress, with one session, or one session for each task with `--loop` | run (for a launch) |
-| session | One run of a harness in a launch, from its start to its exit, with an id, a session label and a transcript | conversation |
+| launch | One `amem launch` or `amem work`, or a profile: one sandbox, one egress and one session | run (for a launch) |
+| session | The memory server's session for one launch, with an id, a session label and a transcript. The harness runs in it once, or once for each task with `--loop`; each of those is a harness run | conversation |
 | sandbox | The confinement around a harness | jail |
 | sandbox backend | One way to make a sandbox, the value of `--backend`: `namespaces`, `image` (namespaces in the harness image), `wslc`, `seatbelt`, or `none` (no sandbox). `auto` selects one for the platform | runtime (for a sandbox backend) |
 | harness image | The OCI image that holds the harnesses, Node, Python and `amem`, for the `image` and `wslc` sandbox backends | the image (alone) |
@@ -85,3 +85,26 @@ term here in the same commit as the first document that needs it.
 | source | What a tool brought in, kept under `.sources/` and cited as `source:<id>`. Transcripts are sources too | |
 | transcript | The turns of one session, kept in the record | log (for a transcript) |
 | trace | An OpenTelemetry trace | |
+
+## Words with a second sense
+
+The documents also use some terms above, and some words from the "Do not use" column, for
+a different thing. Name that thing in full where it could be read as the term.
+
+| Word | The other sense | Write |
+|---|---|---|
+| budget | The tasks or tokens that one curation cycle may use (`--budget-tasks`, `--budget-tokens`), or LiteLLM's budget for each project | curation budget, LiteLLM budget |
+| projection | The ledger built from the event log | the ledger's projection of the log |
+| root | The root user, or the `/` directory, or the top of a URL | root user, root directory |
+| runtime | A container runtime (podman, docker, wslc), or the Wasm runtime | container runtime, Wasm runtime |
+| session | A WSL containers session, which is a VM, or an MCP session | WSL session |
+| tool | A tool of a harness or a model API: shell, web, file and the like | the harness's tools |
+| workspace | The Cargo workspace, or the workspace of Gemini CLI or Qwen Code | Cargo workspace |
+| home | A home directory, such as the private home in the sandbox | private home |
+| note | The outbox note that a hook leaves, which the launcher files as a handoff | outbox note |
+| proxy | `HTTPS_PROXY`, LiteLLM's proxy, or a product with "proxy" in its name | the name in code font |
+| user | A Unix user, or the person who gives an agent a request | Unix user |
+| board | The task board: the `/board` page, and `--subagents board` | the board |
+| librarian | In the paper's sense, an agent that curates | the paper's librarians |
+| run | One harness process in a session, one evaluation run, or one demo run | harness run, evaluation run |
+| telemetry | OpenTelemetry data, or the librarian's signals | OpenTelemetry, the librarian's telemetry |
