@@ -130,22 +130,30 @@ argued from taste.
 
 ## What it is
 
-Several parts around one record, and no one of them is the safety boundary on its own.
-The **memory server** is what an agent harness reaches over MCP: it serves the record by
-summaries first, holds the task ledger, and checks every read and write against the
-policy. The **launcher** runs a harness in a **sandbox** with no network: the one thing
-the harness can reach is the **egress**, which serves it the memory server's MCP and
-forwards its model calls to a provider or a gateway. The egress holds each model call to
-its destination's ceiling, the highest label that may be sent there, meters it, enforces spend limits, records its decision
-context, and holds the credentials unless the harness runs on its own subscription login.
-A tool the harness asks the memory server for runs in the launcher, outside the sandbox,
-and every request it makes is decided against the session's label; a hosted tool's call
-leaves through the egress like a model call. The **perimeter**, the policy over
-`grants.toml` and the record's policy entries, is what the memory server, the egress and
-the tools all enforce. An agent starts empty, loads a small index called T0, works a task
-it claimed, and writes a handoff when it stops; the next agent continues from the
-handoff, not a transcript. Around them, the **librarian** curates the record on a budget,
-and a person promotes what the system may rely on.
+Several parts around one record. No one of them is the safety boundary on its own.
+
+- The **memory server** is what an agent harness reaches over MCP. It serves the record
+  by summaries first, holds the task ledger, and checks every read and write against the
+  policy. In a launch, it reads nothing above the model's ceiling.
+- The **launcher** runs a harness in a **sandbox**, which has no network. The one thing
+  the harness can reach is the egress.
+- The **egress** carries the memory server's MCP to the harness and forwards the
+  harness's model calls to a provider or a gateway. It holds each call to its
+  destination's **ceiling**: the highest label that may be sent there. A call it forwards
+  is also metered, held to its spend limit, and recorded with its decision context. A
+  call it tunnels, as for Copilot and for the ChatGPT, Grok Build and Antigravity logins,
+  is checked against the ceiling when the tunnel opens and is not metered. The egress
+  holds the credentials, unless the harness runs on its own subscription login.
+- The **tools**, fetch, search and the other taps, run outside the sandbox: in the `amem`
+  process, on a tool server called through the egress, or in the owner's browser. Each
+  decides every request against the session's label.
+- The **perimeter** is the policy over `grants.toml` and the record's policy entries. The
+  memory server, the egress and the tools all enforce it.
+
+An agent starts empty, loads a small index called T0, works a task it claimed, and writes
+a handoff when it stops; the next agent continues from the handoff, not a transcript.
+Around them, the **librarian** curates the record on a budget, and a person promotes what
+the system may rely on.
 
 ```
   person ──▶ amem: web launcher, CLI, profiles
@@ -159,6 +167,9 @@ and a person promotes what the system may rely on.
               egress ──▶ provider or gateway        │
        metered, spend-limited, contexts recorded    └── librarian: curation, checker, canaries, drift
 ```
+
+The MCP arrow is drawn straight to the memory server, but it too passes through the
+egress, the harness's one way out.
 
 Everything lives under one root, `~/memory` unless `--root` or `MEMORY_ROOT` says
 otherwise, and the process touches nothing outside it:
@@ -232,10 +243,11 @@ claude mcp add memory -- /path/to/amem --root ~/memory serve --author "agent:cla
 
 The agent gets `t0`, `search`, `get`, `write`, `list`, `recall`, `promote`, the ledger's tools
 and `transcript_turn`, and its writes land at raw trust under the author given.
-Such a harness has no sandbox and no egress. The policy still decides what it reads and
-writes over MCP, but it keeps its own network and credentials, nothing meters its model
-calls, and no model's ceiling caps what it may read. `amem launch --unconfined` is the
-middle case: no sandbox, but the model calls still go through the egress.
+Such a harness has no sandbox, and its model calls do not go through an egress. The
+policy still decides what it reads and writes over MCP. But the harness keeps its own
+network and credentials, nothing meters its model calls, and no model's ceiling caps what
+it may read. `amem launch --unconfined` is the middle case, for Claude Code and Codex so
+far: no sandbox, but the model calls still go through the egress.
 
 ## The parts, and their commands
 
