@@ -128,16 +128,18 @@ is the direction (PLAN.md, Build speed); until then the cache is local.
 ## Pull requests
 
 - Branch from `main`, open the PR against `main`, `make check` passing first.
-- **A fresh subagent attacks the branch after the push and before the pull request.** The
+- **A fresh subagent attacks the branch after the push and before the pull request**, and
+  again after each push that revises an open one, before review is re-requested. The
   prompt is `/adversarial`, in `.claude/commands/adversarial.md`. A fresh agent, never a
   fork: a fork inherits the reasoning that wrote the branch and agrees with it. Answer what
   it finds as you would a reviewer, and say in the PR description that the pass ran and
   what came of it, so a pass that found nothing leaves a trace.
-- **A branch that touches only docs gets a reader test instead**, at the same point. The
-  prompt is `/reader-test`, in `.claude/commands/reader-test.md`: write the questions the
-  change should answer first, then one fresh agent answers them from the changed files
-  alone and another checks each claim against the code. A wrong answer is a finding
-  against the text. Say in the PR description how the reader did and what the check found.
+- **A branch that `scripts/docs-only.sh` accepts gets a reader test instead**, at the same
+  points. The prompt is `/reader-test`, in `.claude/commands/reader-test.md`: write the
+  questions the change should answer first, then one fresh agent answers them from the
+  changed files alone and another checks each claim against the code. A wrong or missing
+  answer is a finding against the text. Say in the PR description that the pass ran, the
+  questions, how the reader did, and what the check found.
 - **A review is tied to a commit, so re-request it after every push**, and do not read a
   clean round as a verdict.
 
