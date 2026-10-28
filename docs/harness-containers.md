@@ -1,90 +1,121 @@
 # Harness containers: what exists that we could use instead of our own
 
-Written 20 October 2026, with the runs that needed `/dev/kvm`, a larger uid range and a real
-login added on 23 October. The question: of what we built to confine a harness and route its
-calls (`crates/sandbox`, the WSL containers backend, `images/harness`, `crates/egress`), what
-could be replaced by existing work licensed Apache-2.0 or more permissively, and what should
-stay ours.
+We wrote this report on 20 October 2026. On 23 October we added the runs that needed `/dev/kvm`,
+a larger uid range and a real login. We built these parts to confine a harness and to route its
+calls: `crates/sandbox`, the WSL containers backend, `images/harness` and `crates/egress`. The
+question is which of these parts existing work can replace, and which parts should stay ours.
+The existing work must have the Apache-2.0 licence or a more permissive licence.
 
-Five layers were surveyed: embeddable confinement, external runtimes, the harness image, the
-egress beside the box, and whole agent-sandbox platforms. Every licence below was read from
-the repository or crate manifest on 19 or 20 October 2026 (`gh api repos/OWNER/REPO/license`,
-and the LICENSE file where that said NOASSERTION), never from memory. The top candidates were
-run on one machine against one check; [spikes/harness-containers](../spikes/harness-containers/)
-holds the scripts and the raw results. Where something below was read but not run, it says so.
+We surveyed five layers:
+- embeddable confinement;
+- external runtimes;
+- the harness image;
+- the egress beside the sandbox;
+- whole agent-sandbox platforms.
 
-**In bounds**: Apache-2.0, MIT, BSD, ISC, Zlib, BSL-1.0, CC0, the Foundation's Category A.
-**Noted, ranked out**: MPL-2.0 and EPL (Category B). **Out**: GPL, LGPL, AGPL, SSPL, BUSL,
-proprietary, and open-core where the part we would need is the paid one. Executing a
-separately installed LGPL binary is not linking it, but it is still a dependency we would
-ship or require, so bubblewrap counts as out.
+We read each licence below from the repository or the crate manifest on 19 or 20 October 2026,
+never from memory. We used `gh api repos/OWNER/REPO/license`, and the LICENSE file where that
+command said NOASSERTION. We ran the top candidates on one machine against one check.
+[spikes/harness-containers](../spikes/harness-containers/) holds the scripts and the raw
+results. Where we read a candidate but did not run it, the text says so.
+
+**Allowed**: Apache-2.0, MIT, BSD, ISC, Zlib, BSL-1.0, CC0, the Foundation's Category A.
+**Noted, ranked as out**: MPL-2.0 and EPL (Category B). **Out**: GPL, LGPL, AGPL, SSPL, BUSL,
+proprietary, and open-core when the part that we would need is the paid part. To execute an
+LGPL binary that is installed separately is not to link it. But it is still a dependency that
+we would ship or require. Thus bubblewrap is out.
 
 ## The answer, short
 
-Nothing replaces the wrapper. No project found combines what `crates/egress` does in one
-place: one unix socket as the box's only way out, per-session token metering from streamed
-responses, a label-versus-ceiling check before anything leaves, and memory served over MCP
-on the same socket. Around it, three things are worth taking, and five of our own gaps
-surfaced on the way. By 25 October all five were fixed on `main`; each row names the pull
-request:
+No project replaces the wrapper: the memory server and its egress. No project that we found does
+in one place all that `crates/egress` does:
+- one unix socket is the only way out of the sandbox;
+- it meters tokens for each session from streamed responses;
+- it checks the label against the ceiling before anything goes out;
+- the memory server is on the same socket, over MCP.
+
+Three things are worth taking, to use around it. We also found five gaps in our own code during
+the research. By 25 October, `main` had fixes for all five. Each row names the pull request:
 
 | Action | What | Why |
 |---|---|---|
-| Fixed, #14 | Refuse `AF_VSOCK` and `io_uring` with seccomp, set `no_new_privs`, in our Linux backend | The network namespace does not cover vsock; on WSL2 and any VM guest it reaches the host. Measured, below |
-| Fixed, #15 | Make the read-only system bind recursive (`mount_setattr` with `AT_RECURSIVE`) | Submounts under `/usr` stayed writable inside our sandbox; only file ownership held them. Measured, below |
-| Fixed, #13 and #24 | Port-restrict the CONNECT tunnel and check the resolved address before dialling (#13); check the TLS server name inside the tunnel against the CONNECT host (#24) | The tunnel dialled any port on an allowed name, wherever it resolved, and the harness chose the server name after the 200 |
-| Fixed, #12 | Add `.github/dependabot.yml`, for the workflows' actions | None existed; npm and the image's base wait on the lockfile row below |
-| Fixed here, and #5, #17 | The Seatbelt profile now lists the root directory and reads the system's tool selections (`609304d`, `535e356`). The macOS CI job compiles (#5), and a death by signal is reported as one (#17) | On macOS 26.6 every process under the old profile aborted at start, `/usr/bin/true` included. With the fix, the contract check passes every check under Seatbelt on GitHub's runner, below |
-| Fixed, #16 | Fail the launch when the egress socket cannot be bound, and say why | A root whose socket path passed 108 bytes launched anyway and failed on a bind mount instead. Measured, below |
-| Adopt | `seccompiler` (Apache-2.0 OR BSD-3) and `landlock` (MIT OR Apache-2.0) in `crates/sandbox`, with Codex's seccomp rule set as the reference | The first fix, as libraries, from the rule set three harnesses already use. `seccompiler` is in, with #14; Landlock is not yet |
-| Adopt | gVisor as an optional hardened Linux backend | Passed every check here, rootless, no KVM, no daemon; the Node harnesses run under it, and a real Claude Code call completed through it |
-| Adopt, lockfile done | An npm lockfile and a digest-pinned base for `images/harness`, bumped by Dependabot | Built here at no cost in size or time; pins what the harnesses pull in and the base, and retires the npm half of `scripts/bump-harness-versions.sh`. Node (an `ARG` Dependabot does not bump) and pi still need the script or a lock of their own. The image now installs the seven npm harnesses from `images/harness/package-lock.json`, which also lets an override hold `sharp` at a fixed version under qwen-code. The npm half of the script is not retired yet: it bumps `package.json` and the lock together, until Dependabot for npm takes that over. The digest-pinned base and Dependabot for npm and docker are still open |
-| Watch | microsandbox, as one backend for Linux, macOS and Windows | The only candidate that could. With no NIC its network holds, but the image's root is a read-write mount, and its vsock route stalls on a request over 32 KB, so a real call never completes; open upstream as #1878, not fixed in 0.7.9 |
-| Target | kubernetes-sigs/agent-sandbox for the institutional shape, Agent Substrate later | On kind, the egress as a sidecar and our backend inside the harness container, under a seccomp profile that allows `unshare`, passed every check; neither replaces the laptop launcher |
+| Fixed, #14 | In our Linux backend, refuse `AF_VSOCK` and `io_uring` with seccomp, and set `no_new_privs` | The network namespace does not cover vsock. On WSL2 and on any VM guest, vsock reaches the host. We measured this (below) |
+| Fixed, #15 | Make the read-only system bind recursive (`mount_setattr` with `AT_RECURSIVE`) | Submounts under `/usr` stayed writable inside our sandbox. Only file ownership prevented writes to them. We measured this (below) |
+| Fixed, #13 and #24 | Restrict the ports of the CONNECT tunnel, and check the resolved address before dialling (#13). Check the TLS server name in the tunnel against the CONNECT host (#24) | The tunnel dialled any port on an allowed name, to any address that the name resolved to. The harness chose the server name after the 200 |
+| Fixed, #12 | Add `.github/dependabot.yml`, for the actions of the workflows | No such file existed. npm and the base of the harness image wait for the lockfile row below |
+| Fixed here, and #5, #17 | The Seatbelt profile now lists the root directory and reads the system's tool selections (`609304d`, `535e356`). The macOS CI job compiles (#5). The launcher reports a death by signal as a death by signal (#17) | On macOS 26.6, every process under the old profile aborted at start, `/usr/bin/true` too. With the fix, the contract check passes every check under Seatbelt on GitHub's runner (below) |
+| Fixed, #16 | Fail the launch when the egress socket cannot be bound, and say why | With a root whose socket path was longer than 108 bytes, the launch continued. It failed later on a bind mount. We measured this (below) |
+| Adopt | `seccompiler` (Apache-2.0 OR BSD-3) and `landlock` (MIT OR Apache-2.0) in `crates/sandbox`, with Codex's seccomp rule set as the reference | These libraries give the first fix, from the rule set that three harnesses already use. `seccompiler` is in, with #14. Landlock is not in yet |
+| Adopt | gVisor as an optional hardened Linux backend | It passed every check here. It is rootless, and needs no KVM and no daemon. The Node harnesses run under it. A real Claude Code call completed through it |
+| Adopt, lockfile done | An npm lockfile and a digest-pinned base for `images/harness`, bumped by Dependabot | We built it here, and it did not increase the size or the build time. It pins the packages that the harnesses pull in, and it pins the base. It retires the npm half of `scripts/bump-harness-versions.sh`. Node (an `ARG` that Dependabot does not bump) and pi still need the script or a lock of their own. The harness image now installs the seven npm harnesses from `images/harness/package-lock.json`. Thus an override can also hold `sharp` at a fixed version under qwen-code. The npm half of the script is not retired yet. It bumps `package.json` and the lock together, until Dependabot for npm does that work. The digest-pinned base and Dependabot for npm and docker are still open |
+| Watch | microsandbox, as one backend for Linux, macOS and Windows | It is the only candidate that could do this. With no NIC, its network holds. But the root of the image is a read-write mount. Its vsock route stalls on a request over 32 KB, so a real call never completes. This is open upstream as #1878, and 0.7.9 does not fix it |
+| Target | kubernetes-sigs/agent-sandbox for the institutional shape, Agent Substrate later | On kind, one layout passed every check. In it, the egress is a sidecar, and our backend is inside the harness container, under a seccomp profile that allows `unshare`. Neither replaces the launcher on a laptop |
 
 ## The contract any replacement has to hold
 
-From `crates/sandbox/src/lib.rs` and PLAN.md M5, M6 and M8:
+The contract comes from `crates/sandbox/src/lib.rs` and from PLAN.md M5, M6 and M8:
 
 1. **No network.** The harness has no interface but loopback. Its only way out is one unix
-   socket to the egress, bind-mounted in and relayed by `amem relay` to a loopback port. The
-   egress is the only process with the network.
-2. **A fixed filesystem.** The system read-only, a private home and the working tree
-   read-write, the memory binary and the record's projection read-only, nothing else of the
-   host. On Linux at fixed paths: `/home/user`, `/opt/memory/memory`, `/run/memory/egress.sock`,
-   `/memory`.
-3. **Unprivileged.** No root, no daemon, no container runtime on Linux.
-4. **macOS**: Seatbelt, dry-coded. **Windows**: WSL containers, the egress in one container and
-   the harness in another with `--network none`, sharing the socket through a volume.
-5. **One image** for the containers backend, `images/harness`, pinned.
-6. **The egress**: model calls forwarded per destination with the credential injected, the
-   label checked against the destination's ceiling first, token usage metered per session
-   from every response including streamed ones, per-session and per-day token limits, a
-   CONNECT tunnel to an allowlist for a harness with no base-URL override, OpenTelemetry
-   traces, and `/mcp` on the same socket. Cost is priced outside the egress, by `amem cost`
-   from `prices.toml`.
+   socket to the egress. The socket comes in as a bind mount, and `amem relay` relays it to a
+   loopback port. The egress is the only process with the network.
+2. **A fixed filesystem.** The system is read-only. A private home and the working tree are
+   read-write. The `amem` binary and the projection are read-only. The sandbox shows nothing
+   else of the host. On Linux, these are at fixed paths: `/home/user`, `/opt/memory/memory`,
+   `/run/memory/egress.sock`, `/memory`.
+3. **Unprivileged.** No root, no daemon, and no container runtime on Linux.
+4. **macOS**: Seatbelt, dry-coded. **Windows**: WSL containers. The egress is in one container.
+   The harness is in another container, with `--network none`. The two containers share the
+   socket through a volume.
+5. **One image** for the containers backend: `images/harness`, pinned.
+6. **The egress**:
+   - It forwards model calls for each destination, and injects the credential.
+   - It checks the label against the ceiling of the destination first.
+   - It meters token usage for each session, from every response, streamed responses too.
+   - It enforces token limits for each session and for each day.
+   - It opens a CONNECT tunnel to an allowlist, for a harness that has no base-URL override.
+   - It sends OpenTelemetry traces.
+   - It serves `/mcp` on the same socket.
 
-What is ours today, by size (`wc -l`, tests included): `crates/sandbox` 5,094 lines, of which
-the Linux backend is 373 and Seatbelt 768, and the harness adapters, which stay whatever is
-adopted, are most of `lib.rs`; the Windows path is `crates/wslc-api` (1,345) plus
-`crates/memory/src/wslc.rs` and `wslc_api.rs` (1,873); `crates/egress` 3,372; the image is a
-64-line Dockerfile and a 38-line bump script.
+   `amem cost` prices the cost outside the egress, from `prices.toml`.
+
+Our code today, by size (`wc -l`, with tests):
+- `crates/sandbox`: 5,094 lines. Of these, the Linux backend is 373 and Seatbelt is 768. The
+  harness adapters are most of `lib.rs`, and they stay, whatever we adopt.
+- The Windows path: `crates/wslc-api` (1,345), plus `crates/memory/src/wslc.rs` and
+  `wslc_api.rs` (1,873).
+- `crates/egress`: 3,372.
+- The harness image: a 64-line Dockerfile and a 38-line bump script.
 
 ## What the spikes showed
 
-One check, `contract-check.py`, run inside each box against the same fixture: a scratch tree
-laid out as the launcher lays out a session, a stand-in egress on a unix socket, and a marker
-file in a host home that must stay invisible. It asserts point 1 (only loopback, no TCP out,
-no name resolution, no vsock, the egress answers) and point 2 (home and tree writable,
-projection, system and memory binary read-only, no writable mount under the read-only system,
-the marker invisible). Linux on WSL2, kernel 6.18.40, x86_64.
+We ran one check, `contract-check.py`, inside each sandbox against the same fixture. The fixture
+has:
+- a scratch tree, with the layout that the launcher gives a session;
+- a stand-in egress on a unix socket;
+- a marker file in a host home, which must stay invisible.
 
-"Read-only" is the mount's flag (`statvfs`), and "invisible" is "no such file". The first
-version tried a write instead, and took "exists" as false on any error. The pre-PR review
-showed both passing on an unconfined host, where file mode alone refused the write. Every
-row below is from the corrected check, run on 23 October.
+The check asserts point 1:
+- only loopback;
+- no TCP out;
+- no name resolution;
+- no vsock;
+- the egress answers.
 
-| Box | Failed |
+It asserts point 2:
+- the home and the working tree are writable;
+- the projection, the system and the `amem` binary are read-only;
+- no writable mount is under the read-only system;
+- the marker is invisible.
+
+The host is Linux on WSL2, kernel 6.18.40, x86_64.
+
+"Read-only" means the flag of the mount (`statvfs`). "Invisible" means "no such file". The
+first version of the check tried a write instead. It also took "exists" as false on any error.
+The pre-PR review showed that both checks passed on an unconfined host, where only the file
+mode refused the write. Each row below comes from the corrected check, which we ran on 23
+October.
+
+| Sandbox, or the host | Failed |
 |---|---|
 | host, unconfined (the control) | 9 of 12, as it must |
 | **ours**, `amem launch --harness command`, before #14 and #15 | no vsock; a writable mount under `/usr` |
@@ -95,20 +126,21 @@ row below is from the corrected check, run on 23 October.
 | fcage without the rule | no vsock |
 | gVisor `release-20261012.0`, rootless, systrap | none |
 | gVisor, the same, on its `kvm` platform | none |
-| **ours**, Seatbelt, macOS 26.6 on GitHub's runner, with the fix below | none; the interfaces are reported, not checked, since Seatbelt denies their use rather than removing them |
-| microsandbox 0.7.8, `msb run --net none` | only loopback: the guest keeps `eth0` and `dummy0`, denied by policy rather than absent; the system is a read-write mount |
-| microsandbox 0.7.8, Rust SDK, `disable_network()` | only loopback, on the name alone: the guest has no network device, and `dummy0`, its kernel's discard device, is down with no address and no route; the system is a read-write mount |
+| **ours**, Seatbelt, macOS 26.6 on GitHub's runner, with the fix below | none. The check reports the interfaces but does not check them, because Seatbelt denies their use and does not remove them |
+| microsandbox 0.7.8, `msb run --net none` | only loopback: the guest keeps `eth0` and `dummy0`. A policy denies them, but they are present. The system is a read-write mount |
+| microsandbox 0.7.8, Rust SDK, `disable_network()` | only loopback, only because of a name: the guest has no network device. `dummy0`, the discard device of its kernel, is down, with no address and no route. The system is a read-write mount |
 
 The harness smoke test, `harness-smoke.sh`, runs Claude Code 2.1.296, Codex 0.162.1 and Gemini
-CLI 0.63.0 from one Node rootfs: all three start under podman and under gVisor, and Claude
-Code's calls reach the stand-in egress through a loopback relay under both. The stand-in,
-outside the box, logged 7 requests under podman and 6 under gVisor in 20 seconds.
+CLI 0.63.0 from one Node rootfs. All three start under podman and under gVisor. Under both, the
+calls of Claude Code go through a loopback relay to the stand-in egress. The stand-in is outside
+the sandbox. In 20 seconds, it logged 7 requests under podman and 6 under gVisor.
 
-A real call, `harness-call.sh`: Claude Code asked for one word on a subscription login. The
-stand-in egress forwarded to `api.anthropic.com` and logged each request. The box got only the
-login's access token, never its refresh token, so nothing inside could rotate the host's login.
+A real call, `harness-call.sh`: Claude Code asked for one word, with a subscription login. The
+stand-in egress forwarded to `api.anthropic.com` and logged each request. The sandbox got only
+the access token of the login, never its refresh token. Thus nothing in the sandbox could rotate
+the login of the host.
 
-| Box | Result |
+| Sandbox | Result |
 |---|---|
 | **ours**, `amem launch --harness claude`, the real egress | answered; the egress metered 1 call, 2 tokens in, 4 out, 10,182 from cache |
 | rootless podman, runc | answered: one `POST /v1/messages`, 200 |
@@ -116,21 +148,22 @@ login's access token, never its refresh token, so nothing inside could rotate th
 | gVisor, kvm | answered: one `POST /v1/messages`, 200 |
 | microsandbox, SDK, no NIC | timed out; nothing reached the egress |
 
-The microsandbox failure is its vsock route, not the harness. Tested over raw vsock inside the
-guest:
-- Requests of up to 32 KB arrive whole and are answered at once.
+The cause of the microsandbox failure is its vsock route, not the harness. We tested over raw
+vsock in the guest:
+- Requests of up to 32 KB arrive complete and get an answer immediately.
 - From 48 KB, the host gets the start of the request, then nothing.
-- Sent in 8 KB writes, 128 KB arrives.
+- In 8 KB writes, 128 KB arrives.
 - 1 MB stops at 262,080 bytes.
 
-That is upstream issue #1878, "vsock route (guest → host unix socket) stalls after 256 KiB of
-upload when the host does not write back", open, and not addressed in 0.7.9. Claude Code's
-first request carries some 10,000 tokens of prompt (the cache figure above), well over 32 KB,
-and an egress that reads a request before answering never writes back early. The same binary in the same image answered under podman.
+This is upstream issue #1878, "vsock route (guest → host unix socket) stalls after 256 KiB of
+upload when the host does not write back". It is open, and 0.7.9 does not address it. The first
+request of Claude Code carries approximately 10,000 tokens of prompt (the cache figure above).
+That is much more than 32 KB. An egress that reads a request before it answers never writes
+back early. The same binary in the same image answered under podman.
 
-What gVisor costs, from `bench-compare.sh` on the same rootfs. Each figure is the median of
-three interleaved rounds on a quiet machine, on 23 October. runc is in milliseconds, each
-gVisor column a multiple of it:
+The cost of gVisor comes from `bench-compare.sh` on the same rootfs. Each figure is the median
+of three interleaved rounds on a quiet machine, on 23 October. The runc column is in
+milliseconds. Each gVisor column is a multiple of runc:
 
 | Task | runc | gVisor | mounts cached | kvm platform |
 |---|---|---|---|---|
@@ -141,21 +174,21 @@ gVisor column a multiple of it:
 | copy a `node_modules` tree in `/tmp` | 118 ms | 2.2x | 2.1x | 2.2x |
 | a CPU loop in Node | 1,056 ms | 1.2x | 1.2x | 1.2x |
 
-The run on 20 October, without the kvm column, gave multiples within 0.6 of these.
+The run on 20 October had no kvm column. Its multiples were within 0.6 of these.
 
-Caching the mounts (`--file-access-mounts=exclusive`) changes nothing. It is safe only if
-nothing on the host edits the tree during the session. So the cost is the syscall
-interception of the `systrap` platform, not revalidation.
+A cache of the mounts (`--file-access-mounts=exclusive`) changes nothing. The cache is safe
+only if nothing on the host edits the working tree during the session. Thus the cost comes from
+the syscall interception of the `systrap` platform, not from revalidation.
 
-The `kvm` platform is no cheaper here: slower everywhere except the working tree. WSL2 is
-itself a Hyper-V guest, so `kvm` runs nested here, which is the likely reason. On bare metal
-it was not measured. What either cost adds to a real session, most of which is spent waiting
-on the model, was not measured.
+The `kvm` platform does not cost less here. It is slower in each task except the working tree.
+WSL2 is itself a Hyper-V guest, so `kvm` runs nested here. This is the probable reason. We did
+not measure it on bare metal. We did not measure what either cost adds to a real session. A
+real session spends most of its time waiting for the model.
 
-A second nested reading, from the workflow's `gvisor-kvm` job on GitHub's Ubuntu 26.04 runner
-(an Azure VM, kernel 7.0.0-1017-azure, run `40019093054`), the median of three interleaved
-rounds as above. The contract check
-passed every check on both platforms there. kvm is the slower again:
+A second nested reading came from the `gvisor-kvm` job of the workflow, on GitHub's Ubuntu
+26.04 runner (an Azure VM, kernel 7.0.0-1017-azure, run `40019093054`). Each figure is the
+median of three interleaved rounds, as above. There, the contract check passed every check on
+both platforms. Again, kvm is the slower platform:
 
 | Task | runc | gVisor | mounts cached | kvm platform |
 |---|---|---|---|---|
@@ -168,190 +201,208 @@ passed every check on both platforms there. kvm is the slower again:
 
 ## Five gaps in our own code
 
-**vsock.** A network namespace does not cover `AF_VSOCK`. Inside our sandbox a vsock socket
-can be created, and on WSL2, or any VM guest with a vsock device, it addresses the hypervisor's
-host whatever the namespace says. Every box built on namespaces failed this check until a
-seccomp rule refused the family, and passed with it; gVisor passes because its netstack has no
-vsock. Codex (`codex-rs/linux-sandbox/src/seccomp.rs`) and sandbox-runtime
-(`vendor/seccomp-src/seccomp-unix-block.c`) refuse `AF_VSOCK` and `io_uring_*` for this reason.
-`crates/sandbox` had no seccomp filter and did not set `PR_SET_NO_NEW_PRIVS`. Whether
-anything on the WSL2 host answers was not established; that the route exists was.
+**vsock.** A network namespace does not cover `AF_VSOCK`. In our sandbox, a process can create a
+vsock socket. On WSL2, or on any VM guest with a vsock device, that socket addresses the host of
+the hypervisor. The namespace does not change this. Each sandbox built on namespaces failed this
+check until a seccomp rule refused the family. With the rule, each passed. gVisor passes
+because its netstack has no vsock. Codex (`codex-rs/linux-sandbox/src/seccomp.rs`) and
+sandbox-runtime (`vendor/seccomp-src/seccomp-unix-block.c`) refuse `AF_VSOCK` and `io_uring_*`
+for this reason. `crates/sandbox` had no seccomp filter and did not set `PR_SET_NO_NEW_PRIVS`.
+We did not find out whether anything on the WSL2 host answers. We did find that the route
+exists.
 
 **Fixed in #14.** The child sets `no_new_privs` and installs a `seccompiler` filter as its last
-step before exec, refusing `AF_VSOCK` sockets and the `io_uring` calls, and marks every
-inherited descriptor from 3 up close-on-exec, so a vsock socket the launcher held cannot pass in.
+step before exec. The filter refuses `AF_VSOCK` sockets and the `io_uring` calls. The child also
+marks each inherited descriptor from 3 up as close-on-exec. Thus a vsock socket that the
+launcher held cannot pass in.
 
-**A read-only bind that is not recursive.** Our backend binds `/usr` with `MS_BIND | MS_REC`
-and then remounts it read-only (`crates/sandbox/src/linux.rs:63-80`); the remount applies to
-the top mount only. On WSL2, `/usr/lib/wsl/lib` and `/usr/lib/modules/<kernel>` are separate
-mounts and stay read-write inside. A write there failed only because the files are root-owned
-and show as `nobody` inside. Any host submount the user owns under a read-only grant would be
-writable from the sandbox. podman, nsjail, fcage and gVisor did not show it. `mount_setattr(2)`
-with `AT_RECURSIVE` and `MOUNT_ATTR_RDONLY` (Linux 5.12) is the fix.
+**A read-only bind that is not recursive.** Our backend binds `/usr` with `MS_BIND | MS_REC`,
+and then remounts it read-only (`crates/sandbox/src/linux.rs:63-80`). The remount applies only
+to the top mount. On WSL2, `/usr/lib/wsl/lib` and `/usr/lib/modules/<kernel>` are separate
+mounts. In the sandbox, they stay read-write. A write there failed only because root owns the
+files, and the sandbox shows them as `nobody`. From the sandbox, a process could write to any
+host submount that the user owns under a read-only grant. podman, nsjail, fcage and gVisor did
+not show this gap. `mount_setattr(2)` with `AT_RECURSIVE` and `MOUNT_ATTR_RDONLY` (Linux 5.12)
+is the fix.
 
-**Fixed in #15.** Every read-only grant now gets `mount_setattr` with `AT_RECURSIVE`, and a
-host without the call fails a confined launch rather than falling back to a remount per mount.
+**Fixed in #15.** Each read-only grant now gets `mount_setattr` with `AT_RECURSIVE`. On a host
+without the call, a confined launch fails. It does not fall back to a remount for each mount.
 
-**The CONNECT tunnel.** `connect_or_not_found` takes the port from the request's authority and
-`TcpStream::connect` resolves and dials it (`crates/egress/src/lib.rs:756-771`). An allowed name
-is reachable on any port, and a name that resolves to loopback, a private range or a metadata
-address is dialled. sandbox-runtime, iron-proxy, Smokescreen, Codex's network proxy and
-Envoy's `resolved_address_filter` all guard this. The fix: 443 unless the allowlist entry names
-a port, resolve first, refuse a denied range, dial the checked address.
+**The CONNECT tunnel.** `connect_or_not_found` takes the port from the authority of the
+request. Then `TcpStream::connect` resolves and dials it (`crates/egress/src/lib.rs:756-771`).
+An allowed name is reachable on any port. The egress also dials a name that resolves to
+loopback, to a private range or to a metadata address. sandbox-runtime, iron-proxy,
+Smokescreen, Codex's network proxy and Envoy's `resolved_address_filter` all guard this. The fix
+has four steps:
+1. Port 443, unless the allowlist entry names a port.
+2. Resolve first.
+3. Refuse a denied range.
+4. Dial the checked address.
 
-**Fixed in #13**, as above. #24 then closed the next hole, found by an adversarial pass on #20:
-after the 200 the harness chose the TLS server name, so one allowed name on a shared front end
-reached its other tenants. The egress now reads the ClientHello before it dials and refuses one
-whose server name is not the CONNECT host, or that carries Encrypted Client Hello. What it
-cannot see is still open: the HTTP `Host` and the paths behind an allowed name.
+**Fixed in #13**, as above. Then #24 fixed the next gap. An adversarial pass on #20 found it.
+After the 200, the harness chose the TLS server name. Thus one allowed name on a shared front
+end gave access to the other tenants of that front end. The egress now reads the ClientHello
+before it dials. It refuses a ClientHello whose server name is not the CONNECT host. It also
+refuses a ClientHello that carries Encrypted Client Hello. Two things that the egress cannot see
+are still open: the HTTP `Host`, and the paths behind an allowed name.
 
-**A socket path past 108 bytes.** The egress socket lives under the root, at
-`state/run/egress-<pid>.sock`. A unix socket path has a 108-byte limit. With a root whose
-socket path came to 146 bytes, `amem launch` printed
-`bind .../egress-<pid>.sock -> /tmp/memory-sandbox-<pid>/run/memory/egress.sock: ENOENT` and
-then `spawn /opt/memory/memory: Invalid argument`, which name neither cause. The same launch
-from a short root completed the real call above.
+**A socket path past 108 bytes.** The egress socket is under the root, at
+`state/run/egress-<pid>.sock`. A unix socket path has a 108-byte limit. We used a root that
+gave a socket path of 146 bytes. `amem launch` printed
+`bind .../egress-<pid>.sock -> /tmp/memory-sandbox-<pid>/run/memory/egress.sock: ENOENT`. Then
+it printed `spawn /opt/memory/memory: Invalid argument`. Neither message names the cause. The
+same launch from a short root completed the real call above.
 
-The cause is in the launcher. It spawns `serve_unix` as a task, waits up to two seconds for the
-socket to appear, and goes on whether or not it did (`crates/memory/src/main.rs:3482-3494`).
-The bind error stays in the task. The fix: check the path length before binding, or wait on the
-bind's result rather than on the file.
+The cause is in the launcher. It spawns `serve_unix` as a task. It waits up to two seconds for
+the socket to appear. Then it continues, whether the socket appeared or not
+(`crates/memory/src/main.rs:3482-3494`). The bind error stays in the task. The fix: check the
+path length before the bind, or wait for the result of the bind and not for the file.
 
-**Fixed in #16.** The launcher binds before it starts serving, and a path too long fails the
-launch with the path and its length.
+**Fixed in #16.** The launcher binds before it starts to serve. If the path is too long, the
+launch fails and gives the path and its length.
 
-**A Seatbelt profile under which nothing starts.** Our macOS backend was dry-coded, and this
-was its first run on a Mac: GitHub's `macos-latest`, macOS 26.6.2.
+**A Seatbelt profile under which nothing starts.** Our macOS backend was dry-coded. This was its
+first run on a Mac: GitHub's `macos-latest`, macOS 26.6.2.
 
-What happened, run by `.github/workflows/harness-spikes.yml`:
-- Every `amem launch` exited 1 without a word, `/usr/bin/true` included (`seatbelt-steps.sh`).
-- Run under `sandbox-exec` directly with the profile's shape rebuilt (`seatbelt-bisect.sh`),
-  `/usr/bin/true`, `amem --version` and the relay each died on SIGABRT.
+`.github/workflows/harness-spikes.yml` ran these steps, with these results:
+- Each `amem launch` exited 1 with no message. This included the launch of `/usr/bin/true`
+  (`seatbelt-steps.sh`).
+- We ran `/usr/bin/true`, `amem --version` and the relay directly under `sandbox-exec`, with
+  the shape of the profile rebuilt (`seatbelt-bisect.sh`). Each died on SIGABRT.
 - Under `(allow default)` they ran.
 
-The cause, bisected:
-- The only Sandbox reports naming these processes were `deny(1) file-read-data /` and
+We bisected the cause:
+- The only Sandbox reports that named these processes were `deny(1) file-read-data /` and
   `deny(1) file-write-data /dev/dtracehelper`.
-- Adding `(allow file-read-data (literal "/"))` alone let all three start, and let a shell run
+- When we added only `(allow file-read-data (literal "/"))`, all three started, and a shell ran
   through the relay. The `dtracehelper` grant changed nothing.
-- The profile grants `/` its metadata only (`crates/sandbox/src/seatbelt.rs`, the metadata rule
-  of `render`). The process start reads the root directory's listing, and aborts when refused.
+- The profile grants only the metadata of `/` (`crates/sandbox/src/seatbelt.rs`, the metadata
+  rule of `render`). At process start, the process reads the listing of the root directory.
+  When the profile refuses this, the process aborts.
 
-Why nothing caught it: the launcher reports a death by signal as exit 1 without saying so,
-in two places (`crates/sandbox/src/measure.rs:73`, the `wait` function, and the relay at
-`crates/memory/src/main.rs:3986`). And the macOS CI job that runs this backend's
-`sandbox-exec` tests failed to compile on the last two runs on `main` (`0eacdb8`, `3ed7b48`):
-`fn io` in `crates/mount/src/lib.rs:57` is dead code on macOS, an error under `-D warnings`.
-So those tests did not run.
+Why nothing found it: the launcher reports a death by signal as exit 1, and does not say so. It
+does this in two places (`crates/sandbox/src/measure.rs:73`, the `wait` function, and the relay
+at `crates/memory/src/main.rs:3986`). Also, the macOS CI job runs the `sandbox-exec` tests of
+this backend. That job failed to compile on the last two runs on `main` (`0eacdb8`, `3ed7b48`).
+`fn io` in `crates/mount/src/lib.rs:57` is dead code on macOS, which is an error under
+`-D warnings`. Thus those tests did not run.
 
-**Fixed on this branch.** `609304d` adds the grant, with a unit test for the rule and a macOS
-test that `/usr/bin/true` starts and a shell returns its own code. On `60677f6`, without the
-grant, that test and the two older macOS tests failed in the macOS job (`left: 1, right: 0`).
-With the grant they pass.
+**Fixed on this branch.** `609304d` adds the grant. It also adds a unit test for the rule, and a
+macOS test. The macOS test checks that `/usr/bin/true` starts and that a shell returns its own
+code. On `60677f6`, without the grant, that test and the two older macOS tests failed in the
+macOS job (`left: 1, right: 0`). With the grant they pass.
 
-The contract check then ran under our backend for the first time. It passed every check but
-the host marker: the sandbox refused the `stat` with EPERM, which on macOS is the
-confinement, and the check now reads it so. `535e356` grants `/private/var/select` with the
-system. Without it every shell printed `Error opening /private/var/select/sh`, and Python's
-shim printed an `xcode-select` error.
+Then the contract check ran under our backend for the first time. It passed every check except
+the host marker. The sandbox refused the `stat` with EPERM. On macOS, this refusal is the
+confinement, and the check now reads it that way. `535e356` grants `/private/var/select` with
+the system. Without it, each shell printed `Error opening /private/var/select/sh`, and the shim
+of Python printed an `xcode-select` error.
 
 Since then:
-- **The CI macOS job compiles** (#5), so this backend's `sandbox-exec` tests run on every pull
-  request that is not docs only.
-- **A death by signal is reported** (#17): the launcher exits 128 plus the signal's number, as a
-  shell does, and names the signal on one line.
+- **The CI macOS job compiles** (#5). Thus the `sandbox-exec` tests of this backend run on each
+  pull request that is not docs only.
+- **The launcher reports a death by signal** (#17). It exits 128 plus the number of the signal,
+  as a shell does. It names the signal on one line.
 
 One thing remains: **the developer-tools shims still warn.** `/usr/bin/python3` reads
-`/private/var/db/xcode_select_link` and the active Xcode under `/Applications`, whose path
-differs from one machine to the next. It prints an `xcode-select` warning and runs.
+`/private/var/db/xcode_select_link` and the active Xcode under `/Applications`. The path of the
+active Xcode is different on each machine. `/usr/bin/python3` prints an `xcode-select` warning
+and runs.
 
 ## Embeddable confinement
 
-What the harnesses ship, read from their trees: on Linux, Codex, sandbox-runtime (Claude
-Code's), Gemini CLI and Copilot CLI all run bubblewrap, compiled in or exec'd, and keep host
-paths; Cursor goes straight to Landlock and seccomp; on macOS everyone uses Seatbelt; on
-Windows each has its own (sandbox users with WFP, restricted tokens, ProcessContainer). Nobody
-links a permissive namespace library, and none gives fixed paths inside the box on Windows, so
-WSL containers stay our only route to point 2 there.
+We read the source trees of the harnesses to find what they ship:
+- On Linux, Codex, sandbox-runtime (the one in Claude Code), Gemini CLI and Copilot CLI all run
+  bubblewrap, compiled in or exec'd. They keep host paths. Cursor uses Landlock and seccomp
+  directly.
+- On macOS, each harness uses Seatbelt.
+- On Windows, each harness has its own method (sandbox users with WFP, restricted tokens,
+  ProcessContainer).
+
+No harness links a permissive namespace library. On Windows, no harness gives fixed paths inside
+the sandbox. Thus on Windows, WSL containers stay our only way to hold point 2.
 
 | Candidate | Licence | Verdict | Why |
 |---|---|---|---|
-| `seccompiler` (rust-vmm) and `landlock` | Apache-2.0 OR BSD-3; MIT OR Apache-2.0 | **adopt** | Pure Rust; closes the vsock gap and adds Landlock under our mounts. `seccompiler` is in since #14; Landlock is not yet |
-| Codex `codex-rs` sandbox crates | Apache-2.0 | **borrow** the seccomp rules and Seatbelt profiles | Not on crates.io (workspace version 0.0.0); Linux runs bubblewrap; host paths, so no point 2 |
-| nsjail | Apache-2.0 | **fallback** | One binary, held both points here with the rule; the 3.6 release needs libnl-3 (LGPL), master does not |
-| ferroday-cage | MIT OR Apache-2.0 | **watch** | The library shape we would want, held both points here; three months old, one maintainer |
-| nono | Apache-2.0 | **borrow** ideas | Landlock-first, loopback-only network namespace with a supervisor-held listener, close to our relay; no mount namespace, so no point 2 |
-| sandlock (multikernel) | Apache-2.0 | **borrow** | Landlock plus seccomp in Rust, a second layer inside our namespaces; read, not run |
-| agent-safehouse | Apache-2.0 | **borrow** | Per-harness Seatbelt rules, a cross-check for our generated profile; read, not run |
-| Microsoft MXC `mxc-sdk` | MIT | **revisit** for a native Windows backend | Linux runs bubblewrap; its WSL containers path has no stdin and no mount targets, so it does not replace `crates/wslc-api` |
-| sandbox-runtime (`srt`) | Apache-2.0 | **learn from** | Same network design as ours; execs bubblewrap and socat (GPL) on Linux, reads the whole host by default |
-| youki `libcontainer` | Apache-2.0 | **learn from** | Heavy; its `pathrs` dependency is MPL-2.0 or LGPL-3.0 |
+| `seccompiler` (rust-vmm) and `landlock` | Apache-2.0 OR BSD-3; MIT OR Apache-2.0 | **adopt** | Pure Rust. It fixes the vsock gap and adds Landlock under our mounts. `seccompiler` is in since #14. Landlock is not in yet |
+| Codex `codex-rs` sandbox crates | Apache-2.0 | **borrow** the seccomp rules and Seatbelt profiles | Not on crates.io (workspace version 0.0.0). On Linux it runs bubblewrap. It keeps host paths, so no point 2 |
+| nsjail | Apache-2.0 | **fallback** | One binary. With the rule, it held both points here. The 3.6 release needs libnl-3 (LGPL); master does not |
+| ferroday-cage | MIT OR Apache-2.0 | **watch** | It has the library shape that we would want, and it held both points here. It is three months old and has one maintainer |
+| nono | Apache-2.0 | **borrow** ideas | Landlock first. A network namespace with only loopback, and a listener that a supervisor holds, similar to our relay. No mount namespace, so no point 2 |
+| sandlock (multikernel) | Apache-2.0 | **borrow** | Landlock and seccomp in Rust, as a second layer inside our namespaces. We read it but did not run it |
+| agent-safehouse | Apache-2.0 | **borrow** | Seatbelt rules for each harness, to cross-check our generated profile. We read it but did not run it |
+| Microsoft MXC `mxc-sdk` | MIT | **revisit** for a native Windows backend | On Linux it runs bubblewrap. Its WSL containers path has no stdin and no mount targets. Thus it does not replace `crates/wslc-api` |
+| sandbox-runtime (`srt`) | Apache-2.0 | **learn from** | The same network design as ours. On Linux it execs bubblewrap and socat (GPL). By default it reads the whole host |
+| youki `libcontainer` | Apache-2.0 | **learn from** | Heavy. Its `pathrs` dependency is MPL-2.0 or LGPL-3.0 |
 | gaol, extrasafe, landrun, rappct, isobox | various permissive | reject | Stale, Landlock only, or too small to trust under a boundary |
 | bubblewrap, firejail, hakoniwa, birdcage, syd, crun | LGPL, GPL | **out** on licence | |
 
 ## External runtimes
 
-How the egress socket crosses the boundary decides most of this layer. Same kernel (runc,
-podman, gVisor): bind the socket in, as now; gVisor needs `--host-uds=open`. A VM: a unix
-socket on a shared filesystem cannot be connected from the guest, so the VMM maps a guest
-vsock port to the host socket instead, and `amem relay` needs a vsock client (Apple's runtime
-is the exception, presenting a unix socket in the guest). Or the egress moves into the VM
-beside the harness, which is what our WSL containers backend does.
+How the egress socket goes through the boundary decides most of this layer:
+- Same kernel (runc, podman, gVisor): bind the socket in, as now. gVisor needs
+  `--host-uds=open`.
+- A VM: the guest cannot connect to a unix socket on a shared filesystem. So the VMM maps a
+  guest vsock port to the host socket instead, and `amem relay` needs a vsock client. Apple's
+  runtime is the exception: it presents a unix socket in the guest.
+- Or the egress moves into the VM beside the harness. Our WSL containers backend does this.
 
 | Candidate | Licence | Verdict | Why |
 |---|---|---|---|
-| **gVisor** (`runsc`) | Apache-2.0 | **adopt** as an optional Linux backend | Passed every check, rootless, no KVM, no daemon, on both `systrap` and `kvm`; the three harnesses ran under it, and a real call completed. The box runs as uid 0 inside (the caller outside), because rootless `runsc` refuses a uid map of its own; binding the host's `/usr` fails rootless on WSL2, so the root comes from the image; about 100 MB of binaries to pin |
-| **microsandbox** | Apache-2.0; its guest kernel, libkrunfw, is LGPL-2.1 and GPL-2.0 | **watch** | The only candidate for one backend on Linux, macOS and Windows from one image. With no NIC its network holds; its root is writable, and its vsock route cannot yet carry a real request. See below |
-| Apple `container` / Containerization | Apache-2.0 | **spike on a Mac** | `--network none`, and a `-v` mounted host socket is relayed in as a unix socket, so the relay is unchanged; needs macOS 26 on Apple Silicon and an arm64 image (the Dockerfile hard-codes the x64 Node tarball). Read, not run |
-| libkrun (direct) | Apache-2.0 | fallback for microsandbox | The engine under it; a binding crate and our own guest init |
-| runc, podman | Apache-2.0 | **learn from** | Held both points here bar vsock; no isolation gain over our namespaces on Linux |
-| Firecracker | Apache-2.0 | reject | No virtio-fs for a live working tree; the jailer needs root |
+| **gVisor** (`runsc`) | Apache-2.0 | **adopt** as an optional Linux backend | It passed every check, rootless, needs no KVM and no daemon, on both `systrap` and `kvm`. The three harnesses ran under it, and a real call completed. The sandbox runs as uid 0 inside (the caller outside), because rootless `runsc` refuses a uid map of its own. A rootless bind of the host's `/usr` fails on WSL2, so the root comes from the image. It has about 100 MB of binaries to pin |
+| **microsandbox** | Apache-2.0; its guest kernel, libkrunfw, is LGPL-2.1 and GPL-2.0 | **watch** | The only candidate for one backend on Linux, macOS and Windows from one image. With no NIC, its network holds. Its root is writable, and its vsock route cannot yet carry a real request. See below |
+| Apple `container` / Containerization | Apache-2.0 | **spike on a Mac** | It has `--network none`. It relays a host socket mounted with `-v` in as a unix socket, so the relay does not change. It needs macOS 26 on Apple Silicon and an arm64 image (the Dockerfile hard-codes the x64 Node tarball). We read it but did not run it |
+| libkrun (direct) | Apache-2.0 | fallback for microsandbox | The engine under microsandbox; a binding crate and our own guest init |
+| runc, podman | Apache-2.0 | **learn from** | They held both points here, except vsock. On Linux, they give no more isolation than our namespaces |
+| Firecracker | Apache-2.0 | reject | No virtio-fs for a live working tree. The jailer needs root |
 | Kata Containers | Apache-2.0 | reject | Shim and virtiofsd run as root |
-| Lima, Colima, Cloud Hypervisor, crosvm, vfkit, smolvm, BoxLite, Gondolin | permissive | **learn from** | VM managers or building blocks, not a boundary we would use as is |
-| Hyperlight | Apache-2.0 | reject | Cannot run a Linux userland |
+| Lima, Colima, Cloud Hypervisor, crosvm, vfkit, smolvm, BoxLite, Gondolin | permissive | **learn from** | VM managers or components, not a boundary that we would use without change |
+| Hyperlight | Apache-2.0 | reject | It cannot run a Linux userland |
 | crun | GPL-2.0-or-later | **out** | |
 | Docker Sandboxes (`sbx`) | proprietary | **out** | Its credential proxy matches our egress model |
 
-**microsandbox, run here.** `msb run` booted the image as a libkrun microVM with the fixture
-mounted over virtiofs at the Linux layout, as uid 1000, and the egress mapped from guest vsock
-port 5000 to the host socket. Everything held except one thing: the CLI's `--net none` is a
-deny-all policy, and the guest keeps `eth0` and `dummy0`, so TCP out is refused by the host's
-policy rather than unreachable. That is a policed network, not point 1. The SDK's
-`disable_network()` sets `network.enabled = false` (`sdk/rust/lib/sandbox/builder.rs:657`),
-which the CLI cannot express.
+**microsandbox, run here.** `msb run` booted the image as a libkrun microVM, as uid 1000. It
+mounted the fixture over virtiofs at the Linux layout. It mapped the egress from guest vsock
+port 5000 to the host socket. Everything held except one thing on the network. The `--net none`
+of the CLI is a deny-all policy, and the guest keeps `eth0` and `dummy0`. Thus TCP out is not
+unreachable: the policy of the host refuses it. That is a policed network, not point 1. The
+SDK's `disable_network()` sets `network.enabled = false`
+(`sdk/rust/lib/sandbox/builder.rs:657`). The CLI cannot express this.
 
-A Rust probe that uses it, in `spikes/harness-containers/msb-probe/`, booted a guest with no
-network device: its virtio devices are console, block, virtiofs, vsock, balloon and rng, and
-no net. "Only loopback" failed on the name alone: `dummy0`, the guest kernel's own discard
-device, down, with no address and no route.
+A Rust probe in `spikes/harness-containers/msb-probe/` uses it. The probe booted a guest with no
+network device. The virtio devices of the guest are console, block, virtiofs, vsock, balloon and
+rng, and no net. "Only loopback" failed only because of a name: `dummy0`, the discard device of
+the guest kernel. It is down, with no address and no route.
 
-The system is another matter, under the CLI and the SDK alike. The image's root is mounted
-read-write. It is the sandbox's own copy-on-write layer, so the host is not exposed. But a
-harness can change its own `/usr` for the sandbox's life, and point 2 says the system is
-read-only. The first version of the check missed this: uid 1000 cannot write root-owned
-files, and the check took that for a read-only mount. Neither the CLI's help nor the SDK's
-builder offers a read-only root.
+The system is a different problem, under the CLI and under the SDK. microsandbox mounts the root
+of the image read-write. That root is the sandbox's own copy-on-write layer, so the host is not
+exposed. But a harness can change its own `/usr` for the life of the sandbox. Point 2 says that
+the system is read-only. The first version of the check did not find this. uid 1000 cannot
+write files that root owns, and the check took that as a read-only mount. Neither the help of
+the CLI nor the builder of the SDK offers a read-only root.
 
-The vsock route answered on port 5000 and no other port on the host did. It does not carry a
-large request: past 32 KB in one write, or 256 KB in all, the upload stalls until the host
-writes something back (the real-call table above, and upstream #1878). Until that is fixed,
-no harness completes a call through it. It is beta ("expect breaking changes"), keeps state in a SQLite database under
-`MSB_HOME`, and derives a unix socket path from `MSB_HOME` that must stay under 108 bytes.
+The vsock route answered on port 5000. No other port on the host answered. The route does not
+carry a large request. Past 32 KB in one write, or past 256 KB in total, the upload stalls until
+the host writes something back (the real-call table above, and upstream #1878). Until there is a
+fix, no harness completes a call through it. microsandbox is beta ("expect breaking changes").
+It keeps state in a SQLite database under `MSB_HOME`. It derives a unix socket path from
+`MSB_HOME`, and that path must stay under 108 bytes.
 
 ## The harness image
 
 | Option | Licence | Verdict | Why |
 |---|---|---|---|
-| Keep the Dockerfile; add `package.json` and `package-lock.json` for the harnesses, `npm ci`; `FROM ubuntu:24.04@sha256:...`; Dependabot for npm, docker and github-actions | Dependabot MIT | **adopt** | Built: same size and build time as today, every package pinned with an integrity hash, and the base by digest. Retires the npm half of `bump-harness-versions.sh`; Node's version is an `ARG`, which Dependabot does not bump, so that half stays. pi needs a lock of its own, and Muse Code stays a script step |
-| numtide/llm-agents.nix with nix2container | MIT; Apache-2.0 | **learn from** | Built: all nine harnesses, reproducible to the image id, Muse Code pinned by hash. But a third larger, ahead of our pins on eight of nine (taking numtide's versions, or overriding each), 281 of 288 store paths from numtide's cache, and Nix itself (LGPL-2.1) in the build |
-| Docker's sandbox kit spec and kits | Apache-2.0 (the `sbx` tool is proprietary) | **borrow** | Per-harness credential and allowlist declarations; their harness versions float |
+| Keep the Dockerfile; add `package.json` and `package-lock.json` for the harnesses, `npm ci`; `FROM ubuntu:24.04@sha256:...`; Dependabot for npm, docker and github-actions | Dependabot MIT | **adopt** | We built it. The size and the build time are the same as today. Each package has a pin with an integrity hash, and the base has a pin by digest. It retires the npm half of `bump-harness-versions.sh`. The Node version is an `ARG`, which Dependabot does not bump, so that half stays. pi needs a lock of its own, and Muse Code stays a script step |
+| numtide/llm-agents.nix with nix2container | MIT; Apache-2.0 | **learn from** | We built it: all nine harnesses, reproducible to the image id, with Muse Code pinned by hash. But it is a third larger. It is ahead of our pins on eight of nine (so we would have to take numtide's versions, or override each). 281 of 288 store paths come from numtide's cache. Nix itself (LGPL-2.1) is in the build |
+| Docker's sandbox kit spec and kits | Apache-2.0 (the `sbx` tool is proprietary) | **borrow** | Credential and allowlist declarations for each harness. Their harness versions are not pinned |
 | apko and melange (Wolfi) | Apache-2.0 | learn from | Wolfi packages only Codex and Node of our set |
-| Dev Container Features and CLI | MIT | reject | The lock pins the feature, not the tool it installs; Anthropic's feature has no version option; no WSL containers driver |
-| Anthropic's Claude Code devcontainer | all rights reserved | out | Also keeps a network and needs `NET_ADMIN` |
+| Dev Container Features and CLI | MIT | reject | The lock pins the feature, not the tool that it installs. Anthropic's feature has no version option. There is no WSL containers driver |
+| Anthropic's Claude Code devcontainer | all rights reserved | out | It also keeps a network, and it needs `NET_ADMIN` |
 
-All three were built and run through the contract check and the harness smoke under podman
-on 20 October (`spikes/harness-containers/image-lockfile/`, `image-nix/`); each passed as the
-podman baseline does, failing only the vsock check, which is the runtime's, not the image's:
+On 20 October, we built all three and ran them through the contract check and the harness smoke
+under podman (`spikes/harness-containers/image-lockfile/`, `image-nix/`). Each passed as the
+podman baseline does. Each failed only the vsock check, which belongs to the runtime, not to
+the image:
 
 | Image | Build | Size | Pinned | Versions |
 |---|---|---|---|---|
@@ -359,32 +410,40 @@ podman baseline does, failing only the vsock check, which is the runtime's, not 
 | with the lockfile | 313 s | 3.15 GB | 107 lockfile packages, each with an integrity hash; base by digest | our pins |
 | llm-agents.nix, nix2container | 360 s from an empty store, plus 116 s to load; 61 s unchanged | 4.08 GB | the flake lock, every store path by hash | numtide's, newer than ours on eight of nine |
 
-The lockfile closes less than it looks: the seven npm harnesses install only 30 or 31
-packages between them, most shipping as bundles or per-platform binaries, so most lock entries
-are platform variants that never install. The large float is pi, 119 packages through
-`npm -g`, which needs its own lock because it installs with `--ignore-scripts` while Claude
-Code's postinstall has to run. Both npm builds report five install scripts "not covered by
-allowScripts"; they ran under npm 11.19, and whether npm 12 blocks them is to check before
-the next Node bump. The proposed `dependabot.yml` is in the lockfile spike directory, not yet
-in `.github/`.
+The lockfile does less than it seems to. Together, the seven npm harnesses install only 30 or
+31 packages. Most of these ship as bundles or as binaries for each platform. Thus most lock
+entries are platform variants that never install. The large set that is not pinned is pi: 119
+packages through `npm -g`. pi needs its own lock, because it installs with `--ignore-scripts`,
+and the postinstall of Claude Code has to run. Both npm builds report five install scripts "not
+covered by allowScripts". These scripts ran under npm 11.19. Before the next Node bump, check
+whether npm 12 blocks them. The proposed `dependabot.yml` is in the lockfile spike directory,
+not yet in `.github/`.
 
 The repository has GitHub Actions workflows and no `.github/dependabot.yml`. The research
-reports that ASF Infra's Dependabot page requires one for the github-actions ecosystem on every
-repository that uses Actions; that page was read by the research agent, not checked again here.
+reports that the Dependabot page of ASF Infra requires one for the github-actions ecosystem, on
+each repository that uses Actions. The research agent read that page. We did not check it again
+here.
 
 ## The egress, and who else meters tokens
 
-The slices a third party could take: the CONNECT allowlist with an address guard, credential
-injection, TLS termination so a tunnel can be metered, and metrics. What stays ours: the
-socket-and-relay topology, the label check (it needs the session's read history), per-session
-metering and limits, and `/mcp` served by `dm_server`.
+A third party could take these parts:
+- the CONNECT allowlist, with an address guard;
+- credential injection;
+- TLS termination, to meter a tunnel;
+- metrics.
 
-Who meters tokens, from streamed responses included, read from each tree: agentgateway, Agent
-Router (formerly Envoy AI Gateway), LiteLLM's MIT part, agentsh, Busbar, Bifrost, AISIX, Plano
-and GoModel; ccusage reads it from harness logs afterwards. Every sandbox-side proxy
-(sandbox-runtime, Codex's network proxy, iron-proxy, OpenShell, Gondolin, microsandbox, Docker
-Sandboxes, Agent Substrate) injects credentials, holds an allowlist and has a hook before a
-request leaves, and none counts tokens.
+These parts stay ours:
+- the topology of socket and relay;
+- the label check (it needs the read history of the session);
+- metering and limits for each session;
+- `/mcp`, which `dm_server` serves.
+
+We read the source tree of each project. These meter tokens, from streamed responses too:
+agentgateway, Agent Router (formerly Envoy AI Gateway), LiteLLM's MIT part, agentsh, Busbar,
+Bifrost, AISIX, Plano and GoModel. ccusage reads the tokens from harness logs afterwards. These
+proxies are on the sandbox side: sandbox-runtime, Codex's network proxy, iron-proxy, OpenShell,
+Gondolin, microsandbox, Docker Sandboxes, Agent Substrate. Each of them injects credentials,
+holds an allowlist, and has a hook before a request goes out. None of them counts tokens.
 
 | Candidate | Licence | Tokens, streamed | Unit | Cost, budgets | Injection | Allowlist | Pre-egress hook | Metrics | MCP |
 |---|---|---|---|---|---|---|---|---|---|
@@ -401,29 +460,39 @@ request leaves, and none counts tokens.
 | Agent Substrate | Apache-2.0 | no | actor | no | `replace_headers` | `EgressPolicy` | replaceable PEP | partial | no |
 | microsandbox | Apache-2.0 | no | sandbox (bytes) | bandwidth limits | placeholder secrets | rules | no | OTLP resource metrics | no |
 
-Closest to ours is **agentgateway**: a Rust binary for all three platforms that reads input,
-output and cache tokens from JSON and streamed Anthropic and OpenAI responses, prices them from
-a catalog, enforces money or token budgets, injects credentials, exposes hooks, exports gen_ai
-metrics, and ships a Substrate gateway mode. It has no unix-socket listener, no session unit
-(a CEL key fed a session header would serve), no label rule (an ext_authz call back to us), and
-it would front our `/mcp`, not serve it. It could take the model-forwarding leg behind our
-egress, at the price of a second process holding the network and every call metered twice.
-Worth it only if its money budgets and Prometheus metrics are wanted more than one process
-fewer. Envoy itself is rejected: a large C++ daemon with a config language beside a Rust
-binary whose whole job is this; its `resolved_address_filter` is the idea to take for the
-CONNECT fix. Infisical Agent Vault (MIT) does placeholder-key injection on a CONNECT path,
-which is the shape a metered Copilot tunnel would need.
+**agentgateway** is the closest to ours. It is a Rust binary for all three platforms. It does
+these things:
+- It reads input, output and cache tokens from Anthropic and OpenAI responses, as JSON
+  and as streams.
+- It prices the tokens from a catalog.
+- It enforces money or token budgets.
+- It injects credentials.
+- It exposes hooks.
+- It exports gen_ai metrics.
+- It ships a Substrate gateway mode.
+
+It has no unix-socket listener. It has no session unit (a CEL key that gets a session header
+would serve). It has no label rule (an ext_authz call back to us). It would be in front of our
+`/mcp`, and would not serve it. It could do the model forwarding behind our egress. But then a
+second process holds the network, and both processes meter each call. This is worth the cost
+only if we want its money budgets and Prometheus metrics more than we want one process fewer. We
+reject Envoy itself. It is a large C++ daemon with a config language, beside a Rust binary whose
+only job is this. Its `resolved_address_filter` is the idea to take for the CONNECT fix.
+Infisical Agent Vault (MIT) does placeholder-key injection on a CONNECT path. A metered Copilot
+tunnel would need this shape.
 
 ## Whole platforms
 
-One fact shapes this layer: every container in a Kubernetes pod shares one network namespace,
-so a pod by itself cannot give "harness offline, egress sidecar online". The institutional
-shape holds point 1 only if our Linux backend runs inside the harness container (which needs a
-seccomp profile that allows `unshare`, `hostUsers: false`, or Kata), or if the egress runs in
-its own pod and the harness pod reaches it over TCP behind a deny-all policy.
+One fact controls this layer. All containers in a Kubernetes pod share one network namespace.
+Thus a pod alone cannot give "harness offline, egress sidecar online". The institutional shape
+holds point 1 only in one of two conditions:
+- Our Linux backend runs inside the harness container. This needs a seccomp profile that allows
+  `unshare`, `hostUsers: false`, or Kata.
+- The egress runs in its own pod, and the harness pod reaches it over TCP behind a deny-all
+  policy.
 
-That was settled on kind (rootless podman, Kubernetes 1.37, agent-sandbox 1.0.7), with the
-contract check run in the harness container
+We got the answer on kind (rootless podman, Kubernetes 1.37, agent-sandbox 1.0.7). We ran the
+contract check in the harness container
 ([spikes/harness-containers/agent-sandbox](../spikes/harness-containers/agent-sandbox/)):
 
 | Layout | Result |
@@ -431,36 +500,39 @@ contract check run in the harness container
 | A: harness and egress sidecar in one pod | point 1 fails: the harness reaches the API server, cluster DNS, other pods and the internet |
 | B: the same pod, our namespaces backend inside the harness container, default seccomp | `unshare` refused |
 | B, seccomp Unconfined | the network is cut, but vsock is open, as in our own backend |
-| **B, a Localhost seccomp profile: the runtime default plus `unshare`, `setns`, `clone` and mounting, still refusing `AF_VSOCK`** | **every check passes** on the laptop's rootless node, and from a `SandboxTemplate` through a warm pool and a claim too. On the rootful node of GitHub's runner, mounting `/proc` is refused: see below |
+| **B, a Localhost seccomp profile: the runtime default plus `unshare`, `setns`, `clone` and mounting, still refusing `AF_VSOCK`** | **every check passes** on the rootless node of the laptop, and also from a `SandboxTemplate` through a warm pool and a claim. On the rootful node of GitHub's runner, a mount of `/proc` fails: see below |
 | B, `hostUsers: false` | the pod does not start: on a rootless node for two reasons, and on a rootful one because `runc` may not mount `sysfs` |
-| C: the egress in its own pod, the harness pod deny-all but to it | the policy is enforced (kindnet runs kube-network-policies), but the route out is pod-network TCP, not a socket, so point 1 holds only as far as the network plugin does, and the egress Service is reachable from any pod a policy does not stop |
+| C: the egress in its own pod, the harness pod deny-all but to it | kube-network-policies, which kindnet runs, enforces the policy. But the route out is pod-network TCP, not a socket. Thus point 1 holds only as far as the network plugin holds. Any pod that a policy does not stop can reach the egress Service |
 
-So the institutional shape is B, where the node allows it: the egress as a native sidecar
-with the socket in a shared `emptyDir`, our Linux backend inside the harness container, and a
-seccomp profile that every node carries, which is a cluster administrator's step (the
-Security Profiles Operator, for one). kind itself needed no root here, only podman's log
-driver set to `k8s-file`. On the second node tested, B's mount namespace could not mount
-`/proc` (below), so "where the node allows it" is not yet "on any node".
+Thus the institutional shape is B, where the node allows it:
+- the egress as a native sidecar, with the socket in a shared `emptyDir`;
+- our Linux backend inside the harness container;
+- a seccomp profile on each node. A cluster administrator must do this step (the Security
+  Profiles Operator, for example).
 
-`hostUsers: false` met two walls on the rootless node.
+kind itself needed no root here. It needed only the podman log driver set to `k8s-file`. On the
+second node that we tested, the mount namespace of B could not mount `/proc` (below). Thus
+"where the node allows it" is not yet "on any node".
 
-**The kubelet's id ranges.** With no `kubelet` entry in the node's `/etc/subuid`, the kubelet
-picks each pod's 65,536 ids at random from the whole 32-bit range. It gave one pod
-2,558,984,192 and another 1,137,049,600. The node maps only the ids its user was given, and
-16 million more on the host changed nothing. containerd's `setresuid` to such an id fails
-with `invalid argument` (`pkg/sys/unshare_linux.go:167`). Giving the kubelet a range inside
-the node's map fixed it: a `kubelet` user, `getsubids` installed, and `kubelet:131072:7208960`
-(110 pods of 65,536).
+`hostUsers: false` had two problems on the rootless node.
 
-**Idmapped mounts.** containerd then builds the pod's root with an idmapped overlay, and
-`mount_setattr` refused with `operation not permitted`. The node's `/var` is a podman volume
-on the host's ext4. The rootless node holds no privilege over that filesystem, which an
-idmapped mount needs.
+**The kubelet's id ranges.** If the node's `/etc/subuid` has no `kubelet` entry, the kubelet
+picks the 65,536 ids of each pod at random from the whole 32-bit range. It gave one pod
+2,558,984,192 and another 1,137,049,600. The node maps only the ids that its user got. 16
+million more ids on the host changed nothing. containerd's `setresuid` to such an id fails
+with `invalid argument` (`pkg/sys/unshare_linux.go:167`). A range for the kubelet inside the
+node's map fixed it. This needed a `kubelet` user, `getsubids` installed, and
+`kubelet:131072:7208960` (110 pods of 65,536).
 
-So `hostUsers: false` needs a rootful node. **On one, it still did not start.** The workflow's
-kind job ran the node under Docker on GitHub's Ubuntu 26.04 runner (run `40019093054`); the
-node's uid map was the whole range, so it was rootful. Both `hostUsers: false` pods failed to
-create their sandbox:
+**Idmapped mounts.** Then containerd builds the root of the pod with an idmapped overlay.
+`mount_setattr` refused it with `operation not permitted`. The node's `/var` is a podman volume
+on the host's ext4. The rootless node holds no privilege over that filesystem. An idmapped
+mount needs that privilege.
+
+Thus `hostUsers: false` needs a rootful node. **On a rootful node, it still did not start.** The
+kind job of the workflow ran the node under Docker on GitHub's Ubuntu 26.04 runner (run
+`40019093054`). The uid map of the node was the whole range, so the node was rootful. Both
+`hostUsers: false` pods failed to create their sandbox:
 
 ```text
 runc create failed: unable to start container process: error during container init:
@@ -468,60 +540,68 @@ error mounting "sysfs" to rootfs at "/sys": ... flags=MS_RDONLY|MS_NOSUID|MS_NOD
 operation not permitted
 ```
 
-The next run (`40042405694`) printed the node: kernel 7.0.0-1017-azure, containerd 2.3.4,
-runc 1.4.3, and a `/sys` with kind's own files bound over two of its entries,
-`/sys/devices/virtual/dmi/id/product_name` and `product_uuid`. The kernel mounts a fresh
-`sysfs` in a user namespace only when the `sysfs` already visible there is covered by
-nothing but mounts on empty directories (`mnt_already_visible` in `fs/namespace.c`), and these
-two cover files. That is one candidate, from the kernel's rule, not from a run without
-kind's two mounts. Another is not ruled out: `sysfs` also needs the mounter to hold the
-user namespace that owns its network namespace, which fails if the pod's network namespace
-was made outside it. If the first is the cause, `hostUsers: false` cannot start on a kind
-node and a real node is untouched; neither is shown.
+The next run (`40042405694`) printed the details of the node:
+- kernel 7.0.0-1017-azure;
+- containerd 2.3.4;
+- runc 1.4.3;
+- a `/sys` with kind's own files bound over two of its entries,
+  `/sys/devices/virtual/dmi/id/product_name` and `product_uuid`.
 
-The same run started the other layouts, once the runner saved one platform of the image:
-Docker's store had saved an index naming platforms it held no layers for. A and C read as
-they did on the laptop. Every `unshare -U` in B failed writing its uid map, which is Ubuntu's
-AppArmor refusing unprivileged user namespaces on the runner, the setting pull request 3
-addresses for our launcher.
+The kernel mounts a new `sysfs` in a user namespace only in one condition. Each mount over the
+`sysfs` that is already visible there must be on an empty directory (`mnt_already_visible` in
+`fs/namespace.c`). These two mounts cover files. That is one candidate cause. It comes from the
+kernel's rule, not from a run without kind's two mounts. We did not rule out another candidate.
+`sysfs` also needs the mounter to hold the user namespace that owns its network namespace. This
+fails if the pod's network namespace was made outside it. If the first candidate is the cause,
+`hostUsers: false` cannot start on a kind node, and a real node is untouched. No run shows
+either.
 
-With that setting off (run `40045349552`), B ran as far as the laptop's for the network:
-`unshare -Urn` with the Localhost profile passed every check but "only loopback", which a
-run without a mount namespace cannot pass, since `/sys` still shows the pod's interfaces.
-Our backend's full shape, `unshare -Urmnpf --mount-proc`, then failed in every B pod and in
-the warm pool's claim: `unshare: mount /proc failed: Operation not permitted`. On the laptop
-it passed. Two candidates, neither tested: the same kernel rule for `proc`, since the runtime
-covers files under each container's `/proc` (`/proc/kcore` and others); or the runtime's
-AppArmor profile for pods refusing `mount`, which applies on the runner and not under WSL2.
-A pod with `appArmorProfile: Unconfined` would tell them apart. Whether `hostUsers: false`
-alone admits `unshare` under the default profile is still unseen.
+The same run started the other layouts after the runner saved one platform of the image. The
+reason: Docker's store had saved an index that named platforms for which it held no layers. A
+and C gave the same results as on the laptop. Each `unshare -U` in B failed when it wrote its
+uid map. The cause is Ubuntu's AppArmor, which refuses unprivileged user namespaces on the
+runner. Pull request 3 addresses this setting for our launcher.
+
+With that setting off (run `40045349552`), B got as far as the laptop's B for the network.
+`unshare -Urn` with the Localhost profile passed every check except "only loopback". A run
+without a mount namespace cannot pass that check, because `/sys` still shows the pod's
+interfaces. Then the full shape of our backend, `unshare -Urmnpf --mount-proc`, failed in each B
+pod and in the claim of the warm pool: `unshare: mount /proc failed: Operation not permitted`.
+On the laptop it passed. There are two candidate causes, and we tested neither:
+- The same kernel rule, for `proc`. The runtime covers files under the `/proc` of each
+  container (`/proc/kcore` and others).
+- The runtime's AppArmor profile for pods refuses `mount`. This profile applies on the runner
+  and not under WSL2.
+
+A pod with `appArmorProfile: Unconfined` would tell the two candidates apart. No run has
+shown yet whether `hostUsers: false` alone admits `unshare` under the default profile.
 
 | Candidate | Licence | Verdict | Why |
 |---|---|---|---|
-| kubernetes-sigs/agent-sandbox | Apache-2.0 | **target** for the institutional shape | A full PodSpec per sandbox, warm pools, claims, expiry; ships a recall-memory example close to our design |
-| Agent Substrate | Apache-2.0 | **target** later, learn from now | Agents in gVisor or Cloud Hypervisor on Kubernetes; all egress through one replaceable gateway with an allowlist and credential injection, which our egress could be. Pre-1.0, needs a cluster, PostgreSQL and an object store; no host bind mounts, so no point 2 on a laptop; Linux nodes only |
-| OpenSandbox | Apache-2.0 | **borrow** | The closest open design: a per-sandbox egress sidecar holding credentials, Docker or Podman to Kubernetes; its egress is a transparent intercept, not a socket |
-| NVIDIA OpenShell | Apache-2.0 | **learn from** | Our architecture: no network in the box, one socket to a supervisor, injection, a hook, MCP checks, OTel; needs a gateway daemon and Podman 5 or KVM |
-| E2B (SDK and runtime) | Apache-2.0 | learn from | Privileged Docker stack, KVM, about 12 GiB; no host socket or bind mounts |
-| Dagger, container-use | Apache-2.0 | reject | No network-off; container-use leaves the agent on the host |
-| OpenHands, SWE-ReX | MIT | reject | Need a TCP port into the box |
-| Daytona, Coder, Arrakis | AGPL-3.0 | **out** | Daytona's core repository is archived, development moved private |
+| kubernetes-sigs/agent-sandbox | Apache-2.0 | **target** for the institutional shape | A full PodSpec for each sandbox, warm pools, claims, expiry. It ships a recall-memory example similar to our design |
+| Agent Substrate | Apache-2.0 | **target** later, learn from now | Agents in gVisor or Cloud Hypervisor on Kubernetes. All egress goes through one replaceable gateway with an allowlist and credential injection, and our egress could be that gateway. Pre-1.0. It needs a cluster, PostgreSQL and an object store. No host bind mounts, so no point 2 on a laptop. Linux nodes only |
+| OpenSandbox | Apache-2.0 | **borrow** | The closest open design: an egress sidecar for each sandbox that holds credentials, from Docker or Podman to Kubernetes. Its egress is a transparent intercept, not a socket |
+| NVIDIA OpenShell | Apache-2.0 | **learn from** | The same architecture as ours: no network in the sandbox, one socket to a supervisor, injection, a hook, MCP checks, OTel. It needs a gateway daemon, and Podman 5 or KVM |
+| E2B (SDK and runtime) | Apache-2.0 | learn from | A privileged Docker stack, KVM, about 12 GiB. No host socket or bind mounts |
+| Dagger, container-use | Apache-2.0 | reject | No network-off. container-use leaves the agent on the host |
+| OpenHands, SWE-ReX | MIT | reject | They need a TCP port into the sandbox |
+| Daytona, Coder, Arrakis | AGPL-3.0 | **out** | Daytona's core repository is archived, and development moved to private |
 | DevPod | MPL-2.0 | out (Category B) | |
 | Docker Sandboxes | proprietary | **out** | |
 | Hosted services (Cloudflare, Vercel, Modal, Runloop, Blaxel, Morph, Fly Sprites, Together) | open SDKs only | out of scope | A laptop-first, self-hosted reference cannot depend on them |
 
-"Substrate" means Agent Substrate here. The other projects of that name are unlicensed,
-hosted, orchestration above the harness, or the Polkadot framework.
+In this report, "Substrate" means Agent Substrate. The other projects with that name are
+unlicensed, hosted, orchestration above the harness, or the Polkadot framework.
 
 ## What was not done
 
 - Apple `container`, and anything else that needs a Mac's virtualization.
-- gVisor's `kvm` platform on bare metal; here it ran nested under Hyper-V.
+- gVisor's `kvm` platform on bare metal. Here it ran nested under Hyper-V.
 - agent-sandbox with `hostUsers: false` on a node without kind's two files over `/sys`: a
   real cluster's node, or kind with them unmounted.
-- Layout B's full shape on a rootful node with the pod's AppArmor profile `Unconfined`, which
-  says which of the two candidates refuses `/proc`.
-- A real call through nsjail and fcage. Their builds went with the scratch directory, and they
-  bind the socket in exactly as podman does, where the call completed.
-- microsandbox again once #1878 is fixed: `harness-call.sh` through `run-microsandbox-sdk.sh`
-  is the test.
+- Layout B's full shape on a rootful node with the pod's AppArmor profile `Unconfined`. This
+  run would show which of the two candidates refuses `/proc`.
+- A real call through nsjail and fcage. Their builds are gone, with the scratch directory. They
+  bind the socket in exactly as podman does, and under podman the call completed.
+- microsandbox again, after a fix for #1878. The test is `harness-call.sh` through
+  `run-microsandbox-sdk.sh`.

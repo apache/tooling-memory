@@ -2,20 +2,21 @@
 
 ## Prerequisites
 
-- Rust stable, via [rustup](https://rustup.rs), with two more targets:
-  `rustup target add wasm32-unknown-unknown wasm32-wasip2`. The first is the browser
-  reader's; the second builds the taps, which `make check` lints and the tap host's tests
-  build, so the gate needs it.
-- A C toolchain for the bundled SQLite (`build-essential` on Debian and Ubuntu, the Visual
-  Studio Build Tools on Windows).
+- Rust stable, from [rustup](https://rustup.rs), with two more targets:
+  `rustup target add wasm32-unknown-unknown wasm32-wasip2`. The browser reader uses the
+  first target. The second target builds the taps. `make check` lints the taps, and the
+  tests of the tap host build them. Thus the gate needs the second target.
+- A C toolchain for the bundled SQLite: `build-essential` on Debian and Ubuntu, or the
+  Visual Studio Build Tools on Windows.
 - `make`. On Windows, run the targets from Git Bash or WSL.
-- `python3`, for `scripts/conformance.py` and its test, which `make check` and the
-  binary's tests run; the script uses the standard library alone.
-- For the browser reader's tests, a Chrome or Chromium, or Podman or Docker: with no
-  Chrome installed they run the one in the Playwright image through
-  `scripts/chrome-container.sh`, which pulls the image on first use
-  (`podman pull mcr.microsoft.com/playwright:v1.61.1-noble` ahead of time keeps that out
-  of the test's two minutes). `CHROME=<path>` picks one outright.
+- `python3`, for `scripts/conformance.py` and its test. `make check` and the tests of the
+  binary run them. The script uses only the standard library.
+- For the tests of the browser reader: Chrome or Chromium, or Podman or Docker. If no
+  Chrome is installed, the tests use the browser in the Playwright image, through
+  `scripts/chrome-container.sh`. This script pulls the image on its first use. The test
+  has two minutes. To keep the pull out of these two minutes, run
+  `podman pull mcr.microsoft.com/playwright:v1.61.1-noble` before the test. To select a
+  browser directly, set `CHROME=<path>`.
 
 ## Setup
 
@@ -30,27 +31,28 @@ make check       # format, clippy, tests, guard, docs-only and conformance tests
 
 | Command | What it runs |
 | ------- | ------------ |
-| `make check` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the guard, docs-only and conformance tests. The pre-commit gate; a commit of Markdown alone, outside `crates/` and `taps/`, runs the guard tests instead |
-| `make conformance` | `scripts/conformance.py`, the seven M0 steps over MCP, against a fresh record served by this build; `URL=<mcp endpoint>` points it at another server, `OPERATOR=<command>` gives it that server's export, import and reindex for the last two steps |
-| `make test` | `cargo test` alone |
-| `make fmt` | `cargo fmt`, rewriting in place |
+| `make check` | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the guard, docs-only and conformance tests. It is the pre-commit gate. A commit that has only Markdown, outside `crates/` and `taps/`, runs the guard tests instead |
+| `make conformance` | `scripts/conformance.py`: the seven M0 steps over MCP, against a new record that this build serves. `URL=<mcp endpoint>` points it at a different server. `OPERATOR=<command>` gives it the export, import and reindex of that server, for the last two steps |
+| `make test` | only `cargo test` |
+| `make fmt` | `cargo fmt`, which changes the files in place |
 | `make run ARGS='...'` | the `memory` binary, for example `ARGS='init /tmp/m --domain dom-me'` |
-| `make verify` | `check` plus `cargo deny`, `cargo machete`, coverage against `COVERAGE_MIN`, and the browser builds of `dm-core`, `dm-policy` and `dm-reader`. What CI runs |
-| `make e2e` | the browser tests in `e2e/`: the pages driven by Chromium in the Playwright image, with screenshots in `e2e/screenshots/`. Needs Podman or Docker, not Node. Not part of `check` or `verify`; run it for a change to the pages. See [e2e/README.md](e2e/README.md) |
-| `make reader` | rebuilds the browser reader's glue and wasm into `crates/web/static/reader/`; needs `wasm-bindgen-cli` 0.2.129 (`cargo install wasm-bindgen-cli --version 0.2.129`). Commit the result |
-| `make coverage` | `cargo llvm-cov` over the workspace; an lcov report lands in `target/lcov.info` |
+| `make verify` | `check`, and also `cargo deny`, `cargo machete`, coverage against `COVERAGE_MIN`, and the browser builds of `dm-core`, `dm-policy` and `dm-reader`. CI runs this target |
+| `make e2e` | the browser tests in `e2e/`. Chromium in the Playwright image drives the pages. The tests put screenshots in `e2e/screenshots/`. It needs Podman or Docker, not Node. It is not part of `check` or `verify`. Run it for a change to the pages. See [e2e/README.md](e2e/README.md) |
+| `make reader` | builds again the glue and the wasm of the browser reader into `crates/web/static/reader/`. It needs `wasm-bindgen-cli` 0.2.129 (`cargo install wasm-bindgen-cli --version 0.2.129`). Commit the result |
+| `make coverage` | `cargo llvm-cov` over the workspace. It writes an lcov report to `target/lcov.info` |
 
-`verify` needs three cargo extensions. Install them once:
+`verify` needs three cargo extensions. Install them one time:
 
 ```sh
 cargo install cargo-binstall
 cargo binstall cargo-llvm-cov cargo-deny cargo-machete
 ```
 
-`rust-toolchain.toml` pins the channel and pulls in rustfmt, clippy, the llvm tools, and
-the wasm targets, so `rustup` sets the rest up on first use.
+`rust-toolchain.toml` pins the channel. It also adds rustfmt, clippy, the llvm tools and
+the wasm targets. Thus `rustup` sets up the rest on its first use.
 
-One topic per worktree, so several people and sessions can work at once:
+Use one worktree for each topic. Then several people and sessions can work at the same
+time:
 
 ```sh
 git worktree add ../durable-memory-<topic> -b feat/<topic> origin/main
@@ -58,10 +60,10 @@ git worktree add ../durable-memory-<topic> -b feat/<topic> origin/main
 
 ## Pull requests
 
-Branch from `main`. `make check` passes before every commit, which the hook enforces. Write
-the commit subject with a conventional-commit prefix. Open the PR against `main` with a
-description that says what changed and why, and for a new test, what it reported against
-the code before the change.
+Make your branch from `main`. `make check` must pass before each commit. The hook
+enforces this. Write the commit subject with a conventional-commit prefix. Open the PR
+against `main`. In its description, say what changed and why. For a new test, also say
+what the test reported against the code before the change.
 
-[AGENTS.md](AGENTS.md) is the contract for AI agents working here, and most of it is good
-advice for people too.
+[AGENTS.md](AGENTS.md) is the contract for AI agents that work in this repository. Most
+of it is also good advice for people.
