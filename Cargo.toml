@@ -9,7 +9,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/sstriker/durable-memory"
+repository = "https://github.com/apache/tooling-memory"
 
 [workspace.dependencies]
 thiserror = "2"

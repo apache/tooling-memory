@@ -29,9 +29,20 @@ payload_for() {
         "$(as_json_string "$1")" "$(as_json_string "${2:-a command}")"
 }
 
+# A guard that loops is a guard that stalls every call until the hook times out and then
+# lets it run: ten seconds a case turns that into a failure here, where `timeout` exists.
+if command -v timeout > /dev/null 2>&1; then
+    limit='timeout 10'
+else
+    limit=''
+fi
+
 run_guard() {
     status=0
-    output=$(payload_for "$1" "${2:-}" | sh "$guard" 2>&1) || status=$?
+    output=$(payload_for "$1" "${2:-}" | $limit sh "$guard" 2>&1) || status=$?
+    if [ "$status" -eq 124 ]; then
+        output="the guard did not finish in ten seconds"
+    fi
 }
 
 allow() {
@@ -104,6 +115,170 @@ refuse 'git stash push -u'
 allow 'git stash push -u -m podling-names-wip'
 allow 'git stash list'
 allow 'git stash apply 0d2e4a1'
+
+# An image never leaves this machine for a registry (images/harness/README.md)
+refuse 'podman push durable-memory/harness:dev ghcr.io/apache/harness:dev'
+refuse 'docker push ghcr.io/apache/harness'
+refuse 'wslc.exe push durable-memory/harness:dev'
+refuse 'docker image push ghcr.io/apache/harness'
+refuse 'podman manifest push harness docker://ghcr.io/apache/harness'
+refuse 'docker -H tcp://builder:2375 push ghcr.io/apache/harness'
+refuse 'docker buildx build --push -t ghcr.io/apache/harness images/harness'
+refuse 'docker buildx build --output type=registry images/harness'
+refuse 'buildah push harness docker://ghcr.io/apache/harness'
+refuse 'skopeo copy containers-storage:harness docker://ghcr.io/apache/harness'
+refuse 'crane push harness.tar ghcr.io/apache/harness'
+refuse 'oras push ghcr.io/apache/harness:1 file'
+refuse 'echo "$TOKEN" | podman login ghcr.io -u me --password-stdin'
+refuse 'make image && podman push durable-memory/harness:dev ghcr.io/apache/harness'
+refuse "sh -c 'podman push durable-memory/harness:dev ghcr.io/apache/harness'"
+refuse 'sudo docker push ghcr.io/apache/harness'
+refuse 'nerdctl push x/harness'
+refuse 'wslc push durable-memory/harness:dev'
+refuse 'podman-remote push x'
+refuse 'docker-compose push'
+refuse 'podman-compose push'
+refuse 'docker compose push'
+refuse 'podman artifact push x'
+refuse 'ctr images push ghcr.io/apache/harness'
+refuse 'helm push chart.tgz oci://ghcr.io/apache'
+refuse 'helm registry login ghcr.io'
+refuse 'podman farm build -t ghcr.io/apache/harness .'
+refuse 'podman --remote push x'
+refuse 'docker build --push -t ghcr.io/apache/harness .'
+refuse 'docker buildx build --output type=image,push=true .'
+refuse 'docker buildx imagetools create -t ghcr.io/apache/harness a b'
+refuse 'crane copy a ghcr.io/apache/harness'
+refuse 'crane cp a ghcr.io/apache/harness'
+refuse 'crane append -b a -f l.tar -t ghcr.io/apache/harness'
+refuse 'crane auth login ghcr.io'
+refuse 'gcrane push x'
+refuse 'skopeo sync --src dir x --dest docker ghcr.io/apache'
+refuse 'skopeo login ghcr.io'
+refuse 'oras login ghcr.io'
+refuse 'oras cp a ghcr.io/apache/harness'
+refuse 'regctl image copy a ghcr.io/apache/harness'
+refuse 'ko publish ./cmd/x'
+refuse 'gh release upload v1 harness.tar'
+refuse 'gh release create v1 harness.tar'
+refuse '"podman" push x'
+refuse "podman 'push' x"
+refuse 'podman "push" x'
+refuse 'p\odman push x'
+refuse '"skopeo" copy containers-storage:harness docker://ghcr.io/apache/harness'
+refuse '$ENGINE push x'
+refuse '"$ENGINE" push x'
+refuse '${DOCKER:-docker} push x'
+refuse '/usr/bin/podman push x'
+refuse 'podman \
+push x'
+refuse 'docker buildx build \
+  --push -t ghcr.io/apache/harness .'
+refuse 'if true; then podman push x; fi'
+refuse 'for t in a b; do podman push "$t"; done'
+refuse '! podman push x'
+refuse 'echo x | xargs podman push'
+refuse 'xargs -I{} podman push {} < tags'
+refuse 'eval podman push x'
+refuse 'nice -n 5 podman push x'
+refuse 'doas podman push x'
+refuse 'sudo -u root podman push x'
+refuse 'sudo -E podman push x'
+refuse 'env -i PATH=/usr/bin podman push x'
+refuse "sh -lc 'podman push x'"
+refuse "bash -xc 'podman push x'"
+# the words in front of a command hide a git rule no better than an image rule
+refuse 'if true; then git add -A; fi'
+refuse 'sudo -u me git add -A'
+refuse "bash -lc 'git add -A'"
+refuse 'if podman push x; then :; fi'
+refuse 'if a; then b; else podman push x; fi'
+refuse 'while podman push x; do :; done'
+refuse 'until podman push x; do :; done'
+refuse 'ionice -c 3 podman push x'
+refuse 'sudo -g wheel podman push x'
+refuse 'sudo -n podman push x'
+refuse 'env -u FOO podman push x'
+refuse 'env -i podman push x'
+refuse 'xargs -n 1 podman push < tags'
+refuse 'timeout -s KILL 600 docker push x'
+refuse 'timeout 600 docker push x'
+refuse 'docker compose -f local/compose.yml push'
+refuse 'podman compose -f a.yml -f b.yml push'
+refuse 'ctr -n k8s.io images push x'
+refuse 'docker --context remote image push x'
+refuse 'buildah commit ctr docker://ghcr.io/apache/harness'
+refuse 'gh release edit v1 --draft=false'
+refuse "bash -o pipefail -c 'podman push x'"
+refuse "bash --login -c 'git add -A'"
+allow 'podman build -t durable-memory/harness:dev images/harness'
+allow 'podman run --rm --name login alpine true'
+allow 'podman run --rm -e push alpine true'
+allow 'podman inspect login'
+allow 'podman logs push'
+allow 'podman rm -f login'
+allow 'podman load -i harness.tar'
+allow 'podman image inspect durable-memory/harness:dev'
+allow 'podman compose up -d'
+allow 'podman export "$(podman create x)" | tar -x -C rootfs'
+allow 'exec "$runtime" run --rm x'
+allow '"$ENGINE" save x -o x.tar'
+allow 'gh release download release-1 -R google/gvisor -p x.tar.bz2'
+allow 'gh release list'
+allow 'crane digest ghcr.io/apache/harness'
+allow 'grep -n "podman push" scripts/no-image-push.test.sh'
+allow 'make no-image-push-test'
+allow 'docker buildx imagetools inspect node:24'
+allow 'docker --debug logs push'
+allow 'podman --remote run --rm --name login alpine true'
+allow 'skopeo copy docker://docker.io/library/node:24 oci:node'
+allow 'ko build --local ./cmd/x'
+allow '$GIT push origin main'
+allow '"$git" push origin HEAD'
+# a wrapper with nothing after it runs nothing; reading it must end
+allow 'env'
+allow 'git status; env'
+allow 'echo a b | xargs'
+allow 'sudo'
+allow 'timeout'
+# a shell's own options before -c, and a script run with options of its own
+allow "bash -o pipefail -c 'cargo test 2>&1 | tee /tmp/t.log'"
+allow "bash -euo pipefail -c 'make check'"
+allow "bash --login -c 'make check'"
+allow "bash --norc -c 'cargo build'"
+allow 'bash -x scripts/foo.sh src tests'
+allow 'sh scripts/x.sh -v --spec foo'
+allow 'sudo apt-get install -y podman'
+allow 'env FOO=1 cargo test'
+allow 'nice -n 5 make check'
+allow 'ls | xargs -0 grep -l x'
+allow '"$SHELL" -c "git push origin main"'
+allow '$CARGO login'
+allow '"$PY" scripts/conformance.py --push'
+allow 'docker buildx build --cache-from type=registry,ref=ghcr.io/apache/c --load .'
+allow 'docker buildx build --cache-from=type=registry,ref=ghcr.io/apache/c --load .'
+allow 'docker run -e auto_push=true img'
+allow 'podman run --rm img mytool --push'
+allow 'skopeo sync --src docker --dest dir docker.io/library/alpine /tmp/mirror'
+allow 'skopeo copy docker://node:24 dir:/tmp/node --retry-times 3'
+allow 'ko build -L ./cmd/app'
+allow 'crane auth get index.docker.io'
+allow 'oras copy x --to-oci-layout ./dir'
+refuse 'docker buildx build --cache-to type=registry,ref=ghcr.io/apache/c .'
+# an escaped backslash ends the line: the command on the next one is read on its own
+refuse 'echo foo\\
+git add -A'
+refuse 'echo foo\\
+podman push x'
+allow 'wslc.exe build -t durable-memory/harness:dev images/harness'
+allow 'docker build --pull -t harness:abc images/harness'
+allow 'podman pull docker.io/library/node:24'
+allow 'podman images'
+allow 'podman image ls'
+allow 'podman save durable-memory/harness:dev -o harness.tar'
+allow 'podman run --rm -v "$PWD":/r:Z -w /r docker.io/library/node:24 sh scripts/bump-harness-versions.sh'
+allow 'docker buildx build -t harness images/harness'
+allow 'skopeo inspect docker://docker.io/library/node:24'
 
 # The pre-commit gate
 refuse 'git commit --no-verify -m "fix: thing"'
@@ -555,7 +730,7 @@ allow "gh api -X PATCH repos/a/b/issues/comments/1 -F body=@$signed"
 allow "gh api -X PATCH repos/a/b/issues/comments/1 -F body=@$unsigned"
 # reading through those same paths is most of what the api is used for here, and stays allowed
 # whatever happens to the gap above
-allow 'gh api repos/sstriker/durable-memory/pulls/8/comments'
+allow 'gh api repos/apache/tooling-memory/pulls/8/comments'
 allow 'gh api repos/a/b/pulls/1/reviews --jq .state'
 # Prose about posting is not posting, even inside the body of a post. A signed comment
 # explaining how to reply - quoting the command on a line of its own - was counted as a second
@@ -592,7 +767,7 @@ allow 'gh pr view 800 --json body'
 allow 'gh pr diff 800'
 allow 'gh pr checks 800'
 allow 'gh run view 123 --log-failed'
-allow 'gh api repos/sstriker/durable-memory/pulls/8/comments'
+allow 'gh api repos/apache/tooling-memory/pulls/8/comments'
 allow 'gh pr edit 800 --add-label ready'
 # no body flag: the editor opens and a person types it themselves
 allow 'gh pr create --fill'

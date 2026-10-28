@@ -61,4 +61,4 @@ COPY memory /opt/memory/memory
 RUN chmod 0755 /opt/memory/memory && /opt/memory/memory --version
 
 LABEL org.opencontainers.image.title="durable-memory harness" \
-      org.opencontainers.image.source="https://github.com/sstriker/durable-memory"
+      org.opencontainers.image.source="https://github.com/apache/tooling-memory"

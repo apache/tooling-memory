@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: demo-ready podman-ready e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test conformance-test conformance deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
+.PHONY: demo-ready podman-ready e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test no-image-push-test conformance-test conformance deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
 	local-up local-down local-logs local-key local-memory launch usage golden drift taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
@@ -173,7 +173,7 @@ local-memory:
 	else target/release/amem --root "$$MEMORY_ROOT" init --domain dom-me; fi
 
 # `make check` is the pre-commit gate: fast, and what every commit must pass.
-check: wasip2-target fmt-check clippy test guard-test docs-only-test wslcsdk-test conformance-test unsafe-check taps-check
+check: wasip2-target fmt-check clippy test guard-test docs-only-test no-image-push-test wslcsdk-test conformance-test unsafe-check taps-check
 
 # `make verify` is what CI runs: the gate plus dependencies, coverage, and the wasm build.
 verify: check deny machete coverage wasm-check
@@ -197,6 +197,8 @@ guard-test:
 	sh .claude/hooks/guard-bash.test.sh
 docs-only-test:
 	sh scripts/docs-only.test.sh
+no-image-push-test:
+	sh scripts/no-image-push.test.sh
 wslcsdk-test:
 	sh scripts/fetch-wslcsdk.test.sh
 conformance-test:

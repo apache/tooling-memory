@@ -20,8 +20,8 @@
 ## Setup
 
 ```sh
-git clone git@github.com:sstriker/durable-memory.git
-cd durable-memory
+git clone git@github.com:apache/tooling-memory.git
+cd tooling-memory
 make init        # installs the pre-commit hook
 make check       # format, clippy, tests, guard, docs-only and conformance tests
 ```
