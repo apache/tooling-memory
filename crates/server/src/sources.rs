@@ -7,7 +7,10 @@
 //! asks [`Memory::check_fetch`]), the scan of what comes back, and keeping it. What a
 //! tool returns is data, never instructions: it is scanned as a write is, and from
 //! anyone but the owner an answer that carries instructions, a broadcast, tool syntax,
-//! hidden text, a payload or a secret is held for the owner, never served. What is
+//! hidden text, a payload or a secret is held for the owner, never served. What a tool
+//! says when it fails comes from outside too, an upstream's error body or a header it
+//! echoed, and is scanned the same way: one that carries any of those is withheld from
+//! the agent and kept as a line in [`LOG`] for the owner. What is
 //! served is kept under `record/<domain>/.sources/` at the tool's results label, never
 //! indexed, cited by entries as `source:<id>`, and swept on the domain's transcript
 //! clock unless a live entry cites it. The same call made again while its source is
@@ -117,8 +120,14 @@ pub struct Released {
     pub at: OffsetDateTime,
 }
 
-/// Where releases are a line each, under the root.
+/// Where releases, and tool failures withheld from the agent, are a line each, under
+/// the root.
 pub const LOG: &str = "state/sources.jsonl";
+
+/// How much of a withheld failure is kept: its start, which is where an upstream says
+/// what went wrong, so a caller repeating a failing call cannot grow the log without
+/// bound.
+const WITHHELD_BYTES: usize = 16 * 1024;
 
 fn file(id: &str) -> String {
     format!("{id}.json")
@@ -206,7 +215,8 @@ impl Memory {
     ///
     /// [`Error::Denied`] when the tool is not granted, the server runs no tools, the
     /// session may not read the tool's results label, or the answer is held;
-    /// [`Error::Tool`] when the tool fails or a request it needed was refused.
+    /// [`Error::Tool`] when the tool fails or a request it needed was refused, with
+    /// what it said withheld when the scan finds anything in that.
     pub async fn use_tool(self: &Arc<Self>, tool: &str, args: Value) -> Result<Value, Error> {
         let (grant, label) = self.tool_grant(tool)?;
         let id = source_id(tool, &args);
@@ -233,7 +243,7 @@ impl Memory {
                 args.to_string(),
             )
             .await
-            .map_err(Error::Tool)?;
+            .map_err(|said| self.tool_failed(tool, &id, label, said))?;
         let answer: Value = serde_json::from_str(&answer)
             .map_err(|e| Error::Tool(format!("{tool} answered with no JSON: {e}")))?;
         let mut text = String::new();
@@ -282,6 +292,50 @@ impl Memory {
             )));
         }
         Ok(served(&s, false))
+    }
+
+    /// A tool's failure as the agent is told it. What an upstream says when it fails is
+    /// its data as much as an answer is: the session is raised to the tool's results
+    /// label to read it, or told nothing of it above its ceiling. It is told as it came,
+    /// unless the scan finds something in it and the session is not the owner's, when
+    /// the agent is told only what kinds were found and the start of the text is a line
+    /// in [`LOG`].
+    fn tool_failed(&self, tool: &str, id: &str, label: Label, said: String) -> Error {
+        if !lock(&self.session).observe(label) {
+            return Error::Denied(format!(
+                "{tool} failed, and what it said is {label}, above this session's ceiling"
+            ));
+        }
+        let findings = scan::kinds(&scan::scan(&said));
+        if findings.is_empty() || self.principal().id == self.grants.owner {
+            return Error::Tool(said);
+        }
+        let at = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let mut end = said.len().min(WITHHELD_BYTES);
+        while !said.is_char_boundary(end) {
+            end -= 1;
+        }
+        let kept = crate::reads::try_append_line(
+            &self.root.join(LOG),
+            &json!({
+                "at": at, "action": "withhold", "source": id, "tool": tool,
+                "session": self.session_id, "by": self.author, "findings": findings,
+                "error": &said[..end], "length": said.len(),
+            })
+            .to_string(),
+        )
+        .is_ok();
+        let kept = if kept {
+            format!("it is kept in {LOG} for the owner")
+        } else {
+            format!("writing it to {LOG} failed, so it is lost")
+        };
+        Error::Tool(format!(
+            "{tool} failed, and what it said carries {}, which is not knowledge; {kept} and not shown",
+            findings.join(", ")
+        ))
     }
 
     /// The hosts this session may reach through `tool` at its label now: the grant's
@@ -530,5 +584,156 @@ impl Memory {
             }
         }
         Ok(dropped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// A tool that fails, passing on what its upstream said.
+    struct Failing(String);
+
+    impl Tools for Failing {
+        fn call(
+            &self,
+            _memory: Arc<Memory>,
+            _tool: String,
+            _config: String,
+            _args: String,
+        ) -> Answer<'static> {
+            let said = self.0.clone();
+            Box::pin(async move { Err(said) })
+        }
+    }
+
+    const OWNER: &str = "human:test:me";
+    const ECHOED: &str =
+        "upstream 401 for Authorization: token ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+    fn root(dir: &Path, said: &str, author: &str) -> Arc<Memory> {
+        root_with(dir, said, author, None)
+    }
+
+    fn root_with(dir: &Path, said: &str, author: &str, results: Option<Label>) -> Arc<Memory> {
+        Memory::init(dir, OWNER, "dom-me").unwrap();
+        let path = dir.join(crate::GRANTS_FILE);
+        let mut g = dm_policy::Grants::load(&path).unwrap();
+        g.taps.insert(
+            "lookup".into(),
+            dm_policy::TapGrant {
+                domain: "dom-me".into(),
+                tool: true,
+                ceiling: Label::Public,
+                results,
+                ..dm_policy::TapGrant::default()
+            },
+        );
+        std::fs::write(&path, g.render().unwrap()).unwrap();
+        let m = Arc::new(Memory::open(dir).unwrap().with_author(author));
+        m.set_tools(Arc::new(Failing(said.to_string())));
+        m
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_carries_a_secret_is_withheld_and_kept_for_the_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = root(dir.path(), ECHOED, "agent:test");
+        let err = agent
+            .use_tool("lookup", json!({"q": "x"}))
+            .await
+            .unwrap_err();
+        let Error::Tool(why) = &err else {
+            panic!("{err}")
+        };
+        assert!(!why.contains("ghp_"), "{why}");
+        assert!(
+            why.contains("lookup failed") && why.contains("secret"),
+            "{why}"
+        );
+        let log = std::fs::read_to_string(dir.path().join(LOG)).unwrap();
+        assert!(log.contains("\"action\":\"withhold\""), "{log}");
+        assert!(log.contains(ECHOED), "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_plain_failure_and_the_owners_own_are_told_as_they_came() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = root(dir.path(), "upstream 503: try again later", "agent:test");
+        let err = agent
+            .use_tool("lookup", json!({"q": "x"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Tool(m) if m == "upstream 503: try again later"),
+            "{err}"
+        );
+        assert!(
+            !dir.path().join(LOG).exists(),
+            "a plain failure is not logged"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path(), ECHOED, OWNER);
+        let err = owner
+            .use_tool("lookup", json!({"q": "x"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::Tool(m) if m == ECHOED), "{err}");
+        assert!(!dir.path().join(LOG).exists());
+    }
+
+    #[tokio::test]
+    async fn a_failure_raises_the_session_to_the_tools_results_label() {
+        // what an upstream says when it fails is as much its data as an answer is
+        let dir = tempfile::tempdir().unwrap();
+        let agent = root_with(
+            dir.path(),
+            "upstream 500: customer 4411 failed validation",
+            "agent:test",
+            Some(Label::Internal),
+        );
+        assert_eq!(agent.label(), Label::Public);
+        let err = agent
+            .use_tool("lookup", json!({"q": "x"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Tool(m) if m.contains("4411")),
+            "{err}"
+        );
+        assert_eq!(agent.label(), Label::Internal);
+    }
+
+    #[tokio::test]
+    async fn a_withheld_failure_is_kept_cut_to_a_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let said = format!("{ECHOED} {}", "x".repeat(200 * 1024));
+        let agent = root(dir.path(), &said, "agent:test");
+        assert!(agent.use_tool("lookup", json!({"q": "x"})).await.is_err());
+        let log = std::fs::read_to_string(dir.path().join(LOG)).unwrap();
+        assert!(log.contains("ghp_"), "the start is kept");
+        assert!(log.len() < 32 * 1024, "{} bytes", log.len());
+        assert!(
+            log.contains(&format!("\"length\":{}", said.len())),
+            "the length is said"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_could_not_be_kept_does_not_say_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = root(dir.path(), ECHOED, "agent:test");
+        // the log's place is a directory, so nothing can be appended there
+        std::fs::create_dir_all(dir.path().join(LOG)).unwrap();
+        let err = agent
+            .use_tool("lookup", json!({"q": "x"}))
+            .await
+            .unwrap_err();
+        let Error::Tool(why) = &err else {
+            panic!("{err}")
+        };
+        assert!(!why.contains("ghp_"), "{why}");
+        assert!(!why.contains("kept in"), "{why}");
     }
 }
