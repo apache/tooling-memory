@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aho-corasick = "1.1.5"
 axum = "0.8"
 bytes = "1.12.1"
 dm-core = { version = "0.1.0", path = "../core" }
