@@ -23,6 +23,7 @@ const CREDENTIALS: &[&str] = &[
     "LLMAO_KEY",
     "LLMAO_URL",
     "GH_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
     "GOOGLE_CLOUD_PROJECT",
     "LITELLM_MASTER_KEY",
     "POSTGRES_PASSWORD",
@@ -142,7 +143,13 @@ fn doctor_json(h: &Host, env: &[(&str, &str)]) -> serde_json::Value {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8(out.stdout).unwrap();
-    for secret in ["sk-from-env", "sk-from-file", "pat-from-file"] {
+    for secret in [
+        "sk-from-env",
+        "sk-from-file",
+        "pat-from-file",
+        "gho-from-env",
+        "github_pat_from_env",
+    ] {
         assert!(
             !text.contains(secret),
             "doctor printed a credential: {text}"
@@ -204,6 +211,51 @@ fn doctor_names_each_credential_by_where_it_came_from_and_never_its_value() {
     assert_eq!(find(&r, "credentials", "XAI_API_KEY")["status"], "absent");
     // no gh on this PATH and no GH_TOKEN: no GitHub login
     assert_eq!(find(&r, "credentials", "GH_TOKEN")["status"], "absent");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_warns_where_a_credential_reaches_past_its_use_or_is_missing() {
+    let h = doctor_host(&closed_port());
+    let grants = std::fs::read_to_string(h.path("home/memory/grants.toml")).unwrap();
+    h.file(
+        "home/memory/grants.toml",
+        &format!(
+            "{grants}\n[taps.search]\ndomain = \"dom-me\"\nceiling = \"public\"\ntool = true\n\
+             credential = \"DM_SEARCH_KEY\"\nhosted = \"https://tools.example/mcp\"\n\n\
+             [taps.issues]\ndomain = \"dom-me\"\nhosts = [\"api.github.com\"]\n\
+             ceiling = \"public\"\ncredential = \"DM_ISSUES_TOKEN\"\n"
+        ),
+    );
+    // a GitHub login on a host without copilot: nothing to say about copilot's token
+    let r = doctor_json(&h, &[("GH_TOKEN", "gho-from-env")]);
+    let c = find(&r, "credentials", "COPILOT_GITHUB_TOKEN");
+    assert_eq!(c["status"], "absent", "{c}");
+    h.script("copilot", "echo 'GitHub Copilot CLI 1.0.103.'");
+    // copilot and no GitHub token at all: nothing it would get
+    let r = doctor_json(&h, &[]);
+    let c = find(&r, "credentials", "COPILOT_GITHUB_TOKEN");
+    assert_eq!(c["status"], "absent", "{c}");
+    let r = doctor_json(
+        &h,
+        &[("GH_TOKEN", "gho-from-env"), ("DM_ISSUES_TOKEN", "x")],
+    );
+    // copilot would get the login's token, which reaches every repository it can
+    let c = find(&r, "credentials", "COPILOT_GITHUB_TOKEN");
+    assert_eq!(c["status"], "warn", "{c}");
+    // a hosted tool whose credential is not set is called with none
+    let t = find(&r, "credentials", "taps.search");
+    assert_eq!(t["status"], "warn", "{t}");
+    assert!(
+        t["detail"].as_str().unwrap().contains("DM_SEARCH_KEY"),
+        "{t}"
+    );
+    assert_eq!(find(&r, "credentials", "taps.issues")["status"], "pass");
+    // a token for Copilot alone: no warning, and copilot launches on it
+    let r = doctor_json(&h, &[("COPILOT_GITHUB_TOKEN", "github_pat_from_env")]);
+    let c = find(&r, "credentials", "COPILOT_GITHUB_TOKEN");
+    assert_eq!(c["status"], "pass", "{c}");
+    assert_eq!(r["ready"]["copilot"]["subscription"]["ok"], true);
 }
 
 #[cfg(unix)]

@@ -24,7 +24,14 @@ pub const KNOWN: &[(&str, &str)] = &[
         "LLMAO_URL",
         "the gateway's address: the local LiteLLM when unset, https://llm.apache.org for the Foundation's",
     ),
-    ("GH_TOKEN", "copilot, on your GitHub login"),
+    (
+        "GH_TOKEN",
+        "copilot, on your GitHub login, when COPILOT_GITHUB_TOKEN is not set",
+    ),
+    (
+        "COPILOT_GITHUB_TOKEN",
+        "copilot, on a token with only the Copilot Requests permission",
+    ),
     (
         "GOOGLE_CLOUD_PROJECT",
         "gemini on a Google login with a project of its own",
@@ -153,7 +160,7 @@ pub fn load(root: &Path) {
                 eprintln!("amem: {}: {p}", root.join(FILE).display());
             }
             for (k, v) in r.pairs {
-                if std::env::var_os(&k).is_none_or(|e| e.is_empty()) {
+                if present(std::env::var(&k).ok()).is_none() {
                     std::env::set_var(k, v);
                 }
             }
@@ -169,7 +176,11 @@ pub fn source(name: &str, file: Option<&Read>, at_start: &[String]) -> Option<&'
     if at_start.iter().any(|n| n == name) {
         return Some("environment");
     }
-    if file.is_some_and(|r| r.pairs.iter().any(|(k, v)| k == name && !v.is_empty())) {
+    if file.is_some_and(|r| {
+        r.pairs
+            .iter()
+            .any(|(k, v)| k == name && present(Some(v.clone())).is_some())
+    }) {
         return Some(FILE);
     }
     None
@@ -195,6 +206,32 @@ pub fn gh_token() -> Option<String> {
     (out.status.success() && !t.is_empty()).then_some(t)
 }
 
+/// The token Copilot CLI runs on, and the variable it goes in: `COPILOT_GITHUB_TOKEN`,
+/// a token that can make Copilot requests and nothing else, when it is set; else the
+/// GitHub login, as [`gh_token`] finds it, which reaches every repository the login can.
+#[must_use]
+pub fn copilot_token() -> Option<(&'static str, String)> {
+    copilot_choice(std::env::var("COPILOT_GITHUB_TOKEN").ok(), gh_token)
+}
+
+/// The choice [`copilot_token`] makes, from what it found: a Copilot token wins, and the
+/// login is asked for only without one.
+fn copilot_choice(
+    copilot: Option<String>,
+    login: impl FnOnce() -> Option<String>,
+) -> Option<(&'static str, String)> {
+    match present(copilot) {
+        Some(t) => Some(("COPILOT_GITHUB_TOKEN", t)),
+        None => login().map(|t| ("GH_TOKEN", t)),
+    }
+}
+
+/// A value that is there: set, and not blank. The one test of "set" for every name.
+#[must_use]
+pub fn present(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
 /// The default root when neither `--root` nor `MEMORY_ROOT` names one: `~/memory`.
 #[must_use]
 pub fn default_root() -> Option<PathBuf> {
@@ -206,6 +243,26 @@ pub fn default_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_takes_its_own_token_over_the_login_and_asks_for_the_login_only_without_it() {
+        let asked = std::cell::Cell::new(false);
+        let login = || {
+            asked.set(true);
+            Some("gho_login".to_string())
+        };
+        assert_eq!(
+            copilot_choice(Some("github_pat_copilot".into()), login),
+            Some(("COPILOT_GITHUB_TOKEN", "github_pat_copilot".to_string()))
+        );
+        assert!(!asked.get(), "the login is not asked for");
+        // a blank one is not one
+        assert_eq!(
+            copilot_choice(Some("  ".into()), || Some("gho_login".to_string())),
+            Some(("GH_TOKEN", "gho_login".to_string()))
+        );
+        assert_eq!(copilot_choice(None, || None), None);
+    }
 
     #[test]
     fn known_names_are_read_and_others_are_skipped_with_a_reason() {
