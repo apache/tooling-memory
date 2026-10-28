@@ -6,7 +6,7 @@ argument-hint: "[branch] (defaults to the current one)"
 # Attack the branch before the pull request
 
 AGENTS.md asks for this after the push and before the PR is opened, and for a revision of
-an open PR, before the push that asks for re-review. This is the prompt it tells you to
+an open PR, after its push and before review is re-requested. This is the prompt it tells you to
 write.
 
 Work out the branch (`$ARGUMENTS`, or `git rev-parse --abbrev-ref HEAD`), confirm it is
@@ -17,7 +17,7 @@ the worktree until the pass reports.
 
 ## The prompt
 
-> You are doing an adversarial pre-PR review in the sstriker/durable-memory repository.
+> You are doing an adversarial pre-PR review in this repository.
 > Read AGENTS.md and PLAN.md first. **Change nothing, commit nothing, post nothing to
 > GitHub.** Report findings.
 >
