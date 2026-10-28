@@ -351,10 +351,10 @@ four questions with memory used a session each, and left four. This one asked wh
 promotion gate is, and made 2 memory tool calls.
 
 **8.2 The same model again.** The control, on qwen3.8-27b: the same tools in the same
- order as the tape. Its second call asked differently, for example with a different
- search. So from there, the record answered it, not the tape. It gave the same answer as
- in act 6, where it passed. A model is not deterministic, so even the control can be
- different.
+order as the tape. Its second call asked differently, for example with a different
+search. So from there, the record answered it, not the tape. It gave the same answer as
+in act 6, where it passed. A model is not deterministic, so even the control can be
+different.
 
 **8.3 Another model.** On gemma4-26b, its first call already asked differently. Its
 tools align with the tape's less well: alignment 67%. Alignment counts the tools that

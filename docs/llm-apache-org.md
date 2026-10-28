@@ -83,12 +83,12 @@ records the gateway's request id on its span.
 ## 2. Sessions as a caller the gateway can tell apart
 
 **Why.** A key is per project, user and purpose. A fleet of agents runs on one automation
- key. To the gateway, every session on that key looks the same. The gateway cannot limit,
- revoke or bill one session apart from the others. An agent that is out of control can
- spend the project's budget before anyone notices. The same problem blocks a hosted memory
- server. That server must know which session sends each request, because it checks every
- read against what that session has already read, and against the ceiling of the
- destinations of its model calls.
+key. To the gateway, every session on that key looks the same. The gateway cannot limit,
+revoke or bill one session apart from the others. An agent that is out of control can
+spend the project's budget before anyone notices. The same problem blocks a hosted memory
+server. That server must know which session sends each request, because it checks every
+read against what that session has already read, and against the ceiling of the
+destinations of its model calls.
 
 **Standard.** Now: Baggage for a session id. Later: OAuth 2.0 Token Exchange (RFC 8693)
 for a session-scoped token.
@@ -131,11 +131,11 @@ egress would do the exchange.
 ## 3. A model list that tells the truth
 
 **Why.** A harness finds models in the list. It fails on the first call to a model that
- does not answer. Since 5 October or earlier, the list has had `qwen3-8b`, and in that
- time the model often did not answer. Every caller finds this out at the cost of a failed
- session. Drift detection watches whether the model behind a name has changed. While the
- list has only aliases, drift detection cannot tell a deliberate release from a silent
- swap.
+does not answer. Since 5 October or earlier, the list has had `qwen3-8b`, and in that
+time the model often did not answer. Every caller finds this out at the cost of a failed
+session. Drift detection watches whether the model behind a name has changed. While the
+list has only aliases, drift detection cannot tell a deliberate release from a silent
+swap.
 
 **Proposal.** The API's model list follows the health roll-up that llmao already shows
 on its pages. Each alias also names the version that it points at, as a versioned name
@@ -206,8 +206,8 @@ bot closed the issue for the Gemini translation, and the bug is not fixed.
 ## 5. Tool servers: what the registry needs to hold
 
 **Why.** The proxy can manage MCP servers itself. Thus `llm.apache.org` can list the tool
- servers that a key may reach, each on its own host. Two things that we learned from
- building this make that more urgent.
+servers that a key may reach, each on its own host. Two things that we learned from
+building this make that more urgent.
 
 The vendors' own tools do not go through the gateway. Codex's `web_search` runs inside
 OpenAI's API. Claude Code's web search runs inside Anthropic's API. On the gateway's open

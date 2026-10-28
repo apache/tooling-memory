@@ -362,12 +362,12 @@ How the egress socket goes through the boundary decides most of this layer:
 | Docker Sandboxes (`sbx`) | proprietary | **out** | Its credential proxy matches our egress model |
 
 **microsandbox, run here.** `msb run` booted the image as a libkrun microVM, as uid 1000. It
- mounted the fixture over virtiofs at the Linux layout. It mapped the egress from guest vsock
- port 5000 to the host socket. Everything held except one thing on the network. The `--net none`
- of the CLI is a deny-all policy, and the guest keeps `eth0` and `dummy0`. Thus TCP out is not
- unreachable: the policy of the host refuses it. That is a policed network, not point 1. The
- SDK's `disable_network()` sets `network.enabled = false`
- (`sdk/rust/lib/sandbox/builder.rs:657`). The CLI cannot express this.
+mounted the fixture over virtiofs at the Linux layout. It mapped the egress from guest vsock
+port 5000 to the host socket. Everything held except one thing on the network. The `--net none`
+of the CLI is a deny-all policy, and the guest keeps `eth0` and `dummy0`. Thus TCP out is not
+unreachable: the policy of the host refuses it. That is a policed network, not point 1. The
+SDK's `disable_network()` sets `network.enabled = false`
+(`sdk/rust/lib/sandbox/builder.rs:657`). The CLI cannot express this.
 
 A Rust probe in `spikes/harness-containers/msb-probe/` uses it. The probe booted a guest with no
 network device. The virtio devices of the guest are console, block, virtiofs, vsock, balloon and
