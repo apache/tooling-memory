@@ -1338,8 +1338,8 @@ address with a path.
 To try it on this machine, serve `target/hosted`
 (`python3 -m http.server -d target/hosted 8000`). Then run
 `amem --hosted http://localhost:8000/`. A web launcher that already runs over the root
-keeps the origins that it started with. When it started without it, `amem --hosted` says
-so.
+keeps the origins that it started with. When the web launcher started without that
+origin, `amem --hosted` says so.
 
 `amem --hosted <url>` (or `AMEM_HOSTED=<url>` in the environment) then lets the origin of
 that page through. It opens that page, not the web launcher's own page. The fragment has

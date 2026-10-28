@@ -82,8 +82,9 @@ before you override the instruction.
 - **No image leaves this machine.** Nothing in this repository pushes an image to a
   registry, logs in to a registry or makes a GitHub release. There are two reasons. The
   harness image holds harnesses that the project may not redistribute. The image is also
-  built from unreleased source. `scripts/no-image-push.sh` applies this rule to the files
-  in `make check`. The guard applies it to the commands that a session types.
+  built from unreleased source. `make check` runs `scripts/no-image-push.sh`, which
+  applies this rule to the files of the repository. The guard applies it to the commands
+  that a session types.
   images/harness/README.md gives the reasons.
 - **Nothing has access outside its root.** The wrapper, the per-session memory server and
   its egress, is a confined process. It has access only to the record, its own state and
