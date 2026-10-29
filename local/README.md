@@ -1387,14 +1387,15 @@ tail of the transcript, and leaves a note in an outbox in the private home. When
 session ends, the launcher files the notes as handoffs. Each has a mark that says that the
 hook left it, not the agent, and it points to the full transcript.
 
-The launcher always files a note from before compaction, because its content is no longer
-in the context of the harness. It files a note from session end only when the session left
-no handoff of its own. This note is the handoff of last resort. Thus a prompted launch
-where the agent wrote no handoff does not exit 4 when the launcher filed an outbox note.
+The launcher always files an outbox note from before compaction, because its content is no
+longer in the context of the harness. It files an outbox note from session end only when
+the session left no handoff of its own. This note is the handoff of last resort. Thus a
+prompted launch where the agent wrote no handoff does not exit 4 when the launcher filed
+an outbox note.
 
 Transcripts stay where the harness keeps them, under the private home in the state of the
-record. Thus nothing is lost, also when the launcher files no note. The hook reads all
-three transcript shapes:
+record. Thus nothing is lost, also when the launcher files no outbox note. The hook reads
+all three transcript shapes:
 
 - Claude Code: one turn on each line.
 - Codex: the rollout items.
@@ -1432,9 +1433,9 @@ Postgres as two containers, on their own network in the session VM. It does this
 the session VM cannot reach the gateway on the loopback of the host. The egress container
 joins that network. The two containers stay running between launches, as the host stack
 does. `wslc remove -f memory-litellm memory-postgres` removes them. The egress uses the
-key `LITELLM_MASTER_KEY` from the environment or `credentials.env` (`make` reads
-`local/.env`). This is correct for a laptop. It is not correct for the Foundation, where
-the front desk mints a virtual key for each principal.
+key `LITELLM_MASTER_KEY` from the environment or the root's `credentials.env` (`make`
+reads `local/.env`). This is correct for a laptop. It is not correct for the Foundation,
+where the front desk mints a virtual key for each principal.
 
 ## The WSL containers C API
 

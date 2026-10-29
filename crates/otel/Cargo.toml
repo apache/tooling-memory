@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "OpenTelemetry traces from the memory binary: a facade over the OTLP exporter"
+description = "OpenTelemetry traces from the amem binary: a facade over the OTLP exporter"
 
 [dependencies]
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }

@@ -64,7 +64,7 @@ pub async fn run(
         })?;
     if !path.is_file() {
         return Err(format!(
-            "no component installed as {name}; run: memory tap install {name} <file.wasm>"
+            "no component installed as {name}; run: amem tap install {name} <file.wasm>"
         )
         .into());
     }

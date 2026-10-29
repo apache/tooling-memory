@@ -565,7 +565,7 @@ fn gateway_up(root: &Path) -> Fallible<String> {
     let master = std::env::var("LITELLM_MASTER_KEY")
         .ok()
         .filter(|k| !k.is_empty())
-        .ok_or("the gateway inside the VM (--auth or --server-auth gateway) needs LITELLM_MASTER_KEY, in the environment or credentials.env (make reads local/.env)")?;
+        .ok_or("the gateway inside the VM (--auth or --server-auth gateway) needs LITELLM_MASTER_KEY, in the environment or the root's credentials.env (make reads local/.env)")?;
     let pg_password = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "litellm".into());
     if run_ok(&s(&["network", "inspect", GATEWAY_NETWORK])).is_err() {
         run_ok(&s(&["network", "create", GATEWAY_NETWORK]))?;
