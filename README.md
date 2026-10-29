@@ -278,8 +278,9 @@ its own. Run `amem` from the directory that you want as the working tree, or giv
 The web launcher listens on loopback only. Without a key, it serves its static pages and
 answers nothing else. `amem doctor` names each credential that it finds, and where it
 found it. It never shows their values. `LLMAO_KEY` alone points at a local LiteLLM on
-port 4000. A PAT for the Foundation's gateway needs `LLMAO_URL=https://llm.apache.org`
-beside it.
+port 4000. For the Foundation's gateway, put the PAT in `LLMAO_KEY`, and set
+`LLMAO_URL=https://llm.apache.org` beside it. A launch uses the gateway only with
+`--auth gateway` (`AUTH=gateway` with `make`). The default is `--auth subscription`.
 
 The page has a companion. The companion is a browser extension in `crates/web/companion`.
 It fetches for a session with the browser's own logins. It is for Chrome. Load it unpacked

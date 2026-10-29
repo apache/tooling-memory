@@ -1,7 +1,8 @@
 # The harness image
 
-The harness image holds seven of the eight harnesses that `amem launch` knows, Node, and
-the `memory` binary. `make image` builds it from the Dockerfile in this directory. It
+The harness image holds nine of the ten harnesses that `amem launch` knows, Node, and
+the `amem` binary as `/opt/memory/memory`. Antigravity is not in it yet. `make image`
+builds it from the Dockerfile in this directory. It
 copies the release binary into the image. Then it builds with `wslc build` (Windows, WSL
 containers), or with `podman build` where that is present. The tag is
 `durable-memory/harness:dev`. At launch, `MEMORY_IMAGE` or `--image` overrides it.

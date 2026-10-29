@@ -91,7 +91,7 @@ Thus the browser gives a person a view of their own memory and of the public sli
 
 ## 6. Two deployments from one codebase
 
-**The Foundation's reference deployment** is the compose file above. It has these parts:
+**The Foundation's reference deployment** is planned, and it has no compose file yet. It has these parts:
 
 - MinIO;
 - Kafka;
@@ -119,22 +119,31 @@ It has the same surface and the same bundle format. It is the conformance check 
 
 ## 7. Shape of the codebase
 
-One Rust workspace.
+One Rust workspace. The table gives the planned shape. The last column says what is in
+`crates/` today.
 
-| Crate | Holds | Compiles to |
-|---|---|---|
-| `core` | Entries, frontmatter, bundles, digest manifests, the filter model, labels and ceilings. No I/O | native, wasm, WASI |
-| `store` | The record over OpenDAL: versions, tombstones, erasure | native |
-| `index` | Two backends: Tantivy embedded and Solr remote. The results give summaries first | native; Tantivy also wasm for the reader |
-| `ledger` | Two backends: SQLite and Postgres. Claims, leases, origin dedup | native |
-| `log` | Kafka producer and consumer groups. A file-backed log for the laptop | native |
-| `policy` | OPA sidecar client. Regorus for the local grants file | native, wasm |
-| `server` | MCP and HTTP surface, session cache, the read filter and write checks, T0 assembly | native |
-| `sandbox` | Confinement: the plan, namespaces on Linux, Seatbelt on macOS. The WSL container backend is in `amem` (`crates/memory`) | native |
-| `egress` | The one network path out of the confined harness: the MCP of the memory server over HTTP, and model calls with ceilings, credentials, spend and metering | native |
-| `plugins` | WASI host for taps and skill bundles | native |
-| `ui` | The browser reader and curation page | wasm |
-| `memoryd`, `memory-local` | The two binaries | native, Windows and Linux |
+| Crate | Holds | Compiles to | Today |
+|---|---|---|---|
+| `core` | Entries, frontmatter, bundles, digest manifests, the filter model, labels and ceilings. No I/O | native, wasm, WASI | `crates/core` |
+| `store` | The record over OpenDAL: versions, tombstones, erasure | native | `crates/store`, with the file system and in-memory services |
+| `index` | Two backends: Tantivy embedded and Solr remote. The results give summaries first | native; Tantivy also wasm for the reader | `crates/index`, with one backend: SQLite with FTS5 |
+| `ledger` | Two backends: SQLite and Postgres. Claims, leases, origin dedup | native | `crates/ledger`, with both backends |
+| `log` | Kafka producer and consumer groups. A file-backed log for the laptop | native | No crate. The event log is in `crates/server`, with no Kafka |
+| `policy` | OPA sidecar client. Regorus for the local grants file | native, wasm | `crates/policy`, with regorus in the process and no OPA client |
+| `server` | MCP and HTTP surface, session cache, the read filter and write checks, T0 assembly | native | `crates/server` |
+| `sandbox` | Confinement: the plan, namespaces on Linux, Seatbelt on macOS. The WSL container backend is in `amem` (`crates/memory`) | native | `crates/sandbox` |
+| `egress` | The one network path out of the confined harness: the MCP of the memory server over HTTP, and model calls with ceilings, credentials, spend and metering | native | `crates/egress` |
+| `plugins` | WASI host for taps and skill bundles | native | `crates/taps`, a WASI host for taps |
+| `ui` | The browser reader and curation page | wasm | `crates/reader`, the core crate for a browser, and `crates/web`, the pages of the web launcher |
+| `memoryd`, `memory-local` | The two binaries | native, Windows and Linux | One binary, `amem` (`crates/memory`) |
+
+These crates are in `crates/` too, and the plan does not name them:
+
+- `client`: a typed MCP client for the memory server;
+- `fetch`: what the fetch tool does with a page;
+- `mount`: the projection as a live mount;
+- `otel`: OpenTelemetry traces;
+- `wslc-api`: a binding to the WSL containers C API.
 
 ## 8. Portability notes
 

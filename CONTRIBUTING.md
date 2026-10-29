@@ -35,7 +35,7 @@ make check       # format, clippy, tests, guard, docs-only and conformance tests
 | `make conformance` | `scripts/conformance.py`: the seven M0 steps over MCP, against a new record that this build serves. `URL=<mcp endpoint>` points it at a different server. `OPERATOR=<command>` gives it the export, import and reindex of that server, for the last two steps |
 | `make test` | only `cargo test` |
 | `make fmt` | `cargo fmt`, which changes the files in place |
-| `make run ARGS='...'` | the `memory` binary, for example `ARGS='init /tmp/m --domain dom-me'` |
+| `make run ARGS='...'` | the `amem` binary, for example `ARGS='init /tmp/m --domain dom-me'` |
 | `make verify` | `check`, and also `cargo deny`, `cargo machete`, coverage against `COVERAGE_MIN`, and the browser builds of `dm-core`, `dm-policy` and `dm-reader`. CI runs this target |
 | `make e2e` | the browser tests in `e2e/`. Chromium in the Playwright image drives the pages. The tests put screenshots in `e2e/screenshots/`. It needs Podman or Docker, not Node. It is not part of `check` or `verify`. Run it for a change to the pages. See [e2e/README.md](e2e/README.md) |
 | `make reader` | builds again the glue and the wasm of the browser reader into `crates/web/static/reader/`. It needs `wasm-bindgen-cli` 0.2.129 (`cargo install wasm-bindgen-cli --version 0.2.129`). Commit the result |
