@@ -1945,7 +1945,7 @@ fn a_confined_run_under_umask_000_runs() {
 
 // ---- the wslc backend's inside half, driven by a fake host ----
 
-/// `memory inside` writes run requests for the host and waits for exit codes. This fake
+/// `amem inside` writes run requests for the host and waits for exit codes. This fake
 /// host answers them from the test, which proves the protocol and the plan the inside
 /// builds for the harness image without a container runtime.
 /// The host's side of the protocol: wait for the request file.
@@ -2025,7 +2025,7 @@ fn inside_writes_image_requests_and_reports_done() {
 // ---- hooks: a handoff the harness did not write ----
 
 /// A fake harness that behaves like Claude Code's hooks: before "compaction" and at
-/// session end it runs `memory hook claude` with the event on standard input and a
+/// session end it runs `amem hook claude` with the event on standard input and a
 /// transcript on disk, and writes no handoff of its own.
 const FIRES_HOOKS: &str = r#"
 t=./transcript.jsonl

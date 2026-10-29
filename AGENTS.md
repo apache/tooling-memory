@@ -48,8 +48,10 @@ before you override the instruction.
 
   The demo seeds its record only once. So, after you change a file in `docs/` or
   `examples/decisions/`, seed a new record with `make demo-ready RESET=1`. Then run
-  `make golden` and act 6 (`make demo-all ACTS=6`). After you change those two lists, run
-  act 11.
+  `make golden` and act 6 (`make demo-all HARNESS=codex ACTS=6`). Act 6 needs the
+  gateway key in `local/.virtual-key`. Without it, the act says "skipped" and checks
+  nothing. After you change those two lists, run act 11
+  (`make demo-all HARNESS=codex ACTS=11`).
 - **Show that a new assertion fails before you trust it.** Run it against the code as it
   was before your change. Put what it reported in the pull request. If a test only ever
   passed, nobody has shown that it tests anything. Assert the rule, not a bound on the

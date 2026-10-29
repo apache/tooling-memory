@@ -1,4 +1,4 @@
-//! The browser reader, driven by a real browser: `memory web` serves the page, the
+//! The browser reader, driven by a real browser: `amem web` serves the page, the
 //! page exports a domain into a bundle, verifies every entry's digest against the
 //! manifest, indexes the entries in SQLite with FTS5 compiled to WebAssembly, and ranks
 //! a query the way the server does. Headless Chrome or Chromium loads the page with a

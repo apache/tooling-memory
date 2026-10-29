@@ -1,4 +1,4 @@
-//! `memory tap`: a connector installed under the root and run under its grant. The
+//! `amem tap`: a connector installed under the root and run under its grant. The
 //! component lives at `<root>/taps/<name>.wasm`, the grant in the grants file, and the
 //! credential in the launcher's environment under the variable the grant names; the
 //! tap gets the host's outbound hook and nothing else.
