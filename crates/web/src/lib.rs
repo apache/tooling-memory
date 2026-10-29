@@ -1,6 +1,6 @@
 //! A web terminal on the launcher.
 //!
-//! Each session is a pseudo-terminal running `memory launch`, kept alive by this server
+//! Each session is a pseudo-terminal running `amem launch`, kept alive by this server
 //! whether or not a browser is attached. Its output goes into a ring buffer and to every
 //! attached websocket; a browser that connects, or reconnects, gets the ring first, so a
 //! refresh or a dropped connection lands in the same place. Beside the terminal a reading
@@ -58,7 +58,7 @@ const RING_BYTES: usize = 2 * 1024 * 1024;
 pub struct Config {
     /// The record.
     pub root: PathBuf,
-    /// The `memory` binary; sessions run `<binary> --root <root> launch ...`.
+    /// The `amem` binary; sessions run `<binary> --root <root> launch ...`.
     pub memory_binary: PathBuf,
     /// The working tree sessions start in.
     pub workdir: PathBuf,

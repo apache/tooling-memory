@@ -416,7 +416,7 @@ entries are platform variants that never install. The large set that is not pinn
 packages through `npm -g`. pi needs its own lock, because it installs with `--ignore-scripts`,
 and the postinstall of Claude Code has to run. Both npm builds report five install scripts "not
 covered by allowScripts". These scripts ran under npm 11.19. Before the next Node bump, check
-whether npm 12 blocks them. The proposed `dependabot.yml` was in the lockfile spike directory.
+whether npm 12 blocks them. The proposed `dependabot.yml` is in the lockfile spike directory.
 #12 then added `.github/dependabot.yml`, for the actions of the workflows only.
 
 Before #12, the repository had GitHub Actions workflows and no `.github/dependabot.yml`. The

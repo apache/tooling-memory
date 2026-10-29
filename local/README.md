@@ -72,9 +72,9 @@ permission prompts off. Nobody is there to answer them, and a task needs edits a
 commands. The sandbox is the boundary, and the working tree is what the harness can
 change. The harness prints the answer and exits with its exit code. A launch that leaves
 no handoff exits with code 4, unless the harness itself failed: then the launch exits with
-the code of the harness. A note that a hook files at session end counts as a handoff. The
-reason: a non-interactive launch whose outcome is only in its transcript leaves nothing
-for the next session. If you intend this, use `--no-handoff`.
+the code of the harness. A note that a hook files, before compaction or at session end,
+counts as a handoff. The reason: a non-interactive launch whose outcome is only in its
+transcript leaves nothing for the next session. If you intend this, use `--no-handoff`.
 
 `make work` claims the next admitted task that the session may take. It makes the prompt
 from:
@@ -364,8 +364,8 @@ the record. It goes to `state/quarantine/<id>.md`. It is never indexed or served
 owner gets a task that requires `human`, with the scan's excerpts and the commands to act.
 `amem quarantine list|show|release|drop` are the owner's commands. Release writes the
 entry into the record as it was written, with its author and all. Drop deletes the held
-write and its review from `state/quarantine`, and writes nothing to the record. There are
-two more gates:
+write from `state/quarantine`, and the reviewer's notes beside it. It writes nothing to
+the record. There are two more gates:
 
 - This gate counts the entries that an agent session supersedes. The limit is
   `max_supersedes_per_session` (`[gates]` in `grants.toml`, twenty by default). When a
@@ -857,8 +857,9 @@ It sends each recorded request again, up to `--limit`, or one `--turn`:
 - with only the model changed, and the answer not streamed;
 - through the egress, metered and under the spend limits.
 
-`--model` names the model of the candidate. `--provider` names the destination. `--auth`
-selects the route, and is `gateway` by default.
+`--model` names the model of the candidate. `--auth` is `gateway` by default. Then the
+calls go to the gateway, as the text below says. With `--auth key`, `--provider` must name
+the destination that the session used.
 
 It compares the tools that the candidate asks for with the tools that the upstream
 returned. Where both answered in text, the overlap of the texts decides. `amem replay`
@@ -1115,10 +1116,10 @@ hundreds of millions of cached tokens. Bare Claude Code does not reach that gate
 all, because the launcher's egress is what folds its system message.
 
 That is the claim of the paper in one table. With the record, the harness gives every
-answer in much less time, and on fewer tokens, than a search for it. Claude Code on a Max
-login used less than a tenth of the time (34 against 391 seconds) and a third of the
-tokens (294k against 978k). Without the record, the harness gives nothing, or it
-rediscovers the answers at a cost, and only where a public source exists.
+answer in much less time, and on fewer tokens, than a search for it. On a Max login,
+Claude Code used less than a tenth of the time: 34 against 391 seconds. It used less than
+a third of the tokens: 294k against 978k. Without the record, the harness gives nothing,
+or it rediscovers the answers at a cost, and only where a public source exists.
 
 ```sh
 scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
@@ -1126,11 +1127,11 @@ scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex,claude --a
 ```
 xAI is also a destination. Any OpenAI-shaped harness reaches the Grok models with
 `--provider xai` and `XAI_API_KEY`. Grok Build (`grok`), the harness of xAI, is a harness
-of its own in the table above. `command` is not a harness. It is a program:
-the first argument after `--` runs as given, in the sandbox. Its environment has the
-egress and the memory server, and nothing else is configured. Thus a Gofannon agent, which
-is ordinary Python that calls a gateway, runs with the same confinement and metering as a
-harness:
+of its own, in the table under [Confined: `amem launch`](#confined-amem-launch). `command`
+is not a harness. It is a program: the first argument after `--` runs as given, in the
+sandbox. Its environment has the egress and the memory server, and nothing else is
+configured. Thus a Gofannon agent, which is ordinary Python that calls a gateway, runs
+with the same confinement and metering as a harness:
 
 ```sh
 make launch HARNESS=command AUTH=gateway ARGS='python3 agent.py'
@@ -1378,15 +1379,16 @@ read of an entry file becomes a `get`. The hook refuses a search over the projec
 workspace. Thus the launcher includes the projection in their workspace. If it did not,
 the model would use a shell instead, which the hook does not see.
 
-Each hook runs `amem` in the sandbox, at `/opt/memory/memory`. The binary reads the event
-and the tail of the transcript, and leaves a note in an outbox in the private home. When
-the session ends, the launcher files the notes as handoffs. Each has a mark that says
-that the hook left it, not the agent, and it points to the full transcript.
+Each hook runs `amem` in the sandbox: at `/opt/memory/memory` under namespaces and in the
+harness image, and at its host path under Seatbelt. The binary reads the event and the
+tail of the transcript, and leaves a note in an outbox in the private home. When the
+session ends, the launcher files the notes as handoffs. Each has a mark that says that the
+hook left it, not the agent, and it points to the full transcript.
 
 The launcher always files a note from before compaction, because its content is no longer
 in the context of the harness. It files a note from session end only when the session left
 no handoff of its own. This note is the handoff of last resort. Thus a prompted launch
-where the agent wrote no handoff does not exit 4 when a hook filed this note.
+where the agent wrote no handoff does not exit 4 when a hook filed a note.
 
 Transcripts stay where the harness keeps them, under the private home in the state of the
 record. Thus nothing is lost, also when the launcher files no note. The hook reads all
@@ -1513,7 +1515,7 @@ make launch BACKEND=wslc PROMPT='say pong'    # prompted
 make work BACKEND=wslc                        # a task from the ledger
 ```
 
-The session VM has two containers:
+The session VM has two containers, and two more for the gateway with `--auth gateway`:
 
 - The egress container runs the Linux `amem`, with your record mounted in. It has the
   only route outside. It opens the memory, serves the egress on a socket in a shared
@@ -1527,7 +1529,8 @@ login directories (`~/.claude`, `~/.codex`, `~/.gemini`) go into the egress cont
 read-only. The egress container copies the one file that the harness needs into the
 private home. Keys and `GH_TOKEN` go in as environment. The session VM cannot reach
 LiteLLM on the loopback of this machine. Thus `--auth gateway` runs a gateway of its own in
-the VM, as [The gateway inside the VM](#the-gateway-inside-the-vm) says.
+the VM, as [The gateway inside the VM](#the-gateway-inside-the-vm) says. That gateway
+replaces `LLMAO_URL` and `LLMAO_KEY`, also when they name a remote gateway.
 
 `--unconfined` runs the same configuration without namespaces, with the egress on a TCP
 port. It is for platforms that have no sandbox backend. macOS gets Seatbelt later.

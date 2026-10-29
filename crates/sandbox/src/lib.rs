@@ -6,7 +6,7 @@
 //! on loopback that forwards to the socket, and the egress is the only process with the
 //! network.
 //!
-//! Eight harnesses are known. Each needs three things from the launcher, and the adapter
+//! Ten harnesses are known. Each needs three things from the launcher, and the adapter
 //! for each is the `setup_*` function below:
 //!
 //! | Harness | Model calls | Memory over MCP | Config the launcher owns |
@@ -17,6 +17,8 @@
 //! | Antigravity CLI | `GOOGLE_GEMINI_BASE_URL`; a login tunnels | `mcpServers.<id>.serverUrl` | `~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/` |
 //! | Qwen Code | `OPENAI_BASE_URL`; key only | `mcpServers.<id>.httpUrl` | `~/.qwen/settings.json` |
 //! | Grok Build | `GROK_XAI_API_BASE_URL`; a login tunnels | `mcp_servers.<id>.url` | `~/.grok/config.toml` |
+//! | Muse Code | `--base-url` on `exec` | `mcp_servers.<id>`, `streamable_http` | `~/.config/muse/settings.json` |
+//! | pi | `baseUrl` of a provider of its own | `mcpServers.<id>.url` | `~/.pi/agent/models.json`, `mcp.json`, `extensions/` |
 //! | Copilot CLI | no override; `HTTPS_PROXY` to the egress, which tunnels to allowed hosts | `mcp-config.json` | `COPILOT_HOME` |
 //! | OpenCode | `provider.<id>.options.baseURL` | `mcp.<id>.url` | `XDG_CONFIG_HOME/opencode/opencode.json` |
 //!
@@ -469,7 +471,7 @@ pub struct Request<'a> {
     pub home: &'a Path,
     /// The egress unix socket on the host.
     pub egress_socket: &'a Path,
-    /// The `memory` binary on the host, mounted in for the relay.
+    /// The `amem` binary on the host, mounted in for the relay.
     pub memory_binary: &'a Path,
     /// The destination's ceiling, which caps the session's handling.
     pub destination_ceiling: Label,

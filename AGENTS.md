@@ -38,9 +38,16 @@ before you override the instruction.
   counts as Markdown. The hook and CI do not run `make check` for such a change, because
   nothing builds from those files. `scripts/docs-only.sh` decides which changes are of
   this type. Its test holds the premise that no crate or tap embeds those files or reads
-  them. One script reads one of them: act 11 of the demo (`scripts/demo/11-limits.sh`)
-  prints the two lists at the top of `README.md`. Thus, if you change those lists, run
-  that act.
+  them. Some scripts read them, and no check runs these scripts:
+
+  - `scripts/seed-corpus.py` seeds the demo record from `docs/` and
+    `examples/decisions/` (`make demo`). `golden/docs.toml` and `evals/demo.toml` score
+    answers against that text.
+  - Act 11 of the demo (`scripts/demo/11-limits.sh`) prints the two lists at the top of
+    `README.md`.
+
+  If you change a heading in `docs/`, a decision in `examples/decisions/` or those two
+  lists, run the script that reads it.
 - **Show that a new assertion fails before you trust it.** Run it against the code as it
   was before your change. Put what it reported in the pull request. If a test only ever
   passed, nobody has shown that it tests anything. Assert the rule, not a bound on the
@@ -118,8 +125,7 @@ If the guard refuses something that this repository asks for, the guard has a bu
 the case to the test and fix the guard. Do not work around the bug. `.gitignore` ignores
 `.claude/settings.local.json` and `.claude/worktrees/`. Do not commit other files in
 `.claude/` unless they belong to the repository. An agent that is not Claude Code gets
-none of this. The same
-rules apply to that agent, and it learns them when it reads them.
+none of this. The same rules apply to that agent, and it learns them when it reads them.
 
 ## Project shape
 

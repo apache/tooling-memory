@@ -1,7 +1,7 @@
 # Golden questions over the three documents in docs/, seeded as the demo corpus by
 # scripts/seed-corpus.py, one entry per section. Answers name section titles, or parts
 # of them; any one is a hit. `keywords` is the query a person would write, standing in
-# for the one a model writes. Run: memory golden golden/docs.toml
+# for the one a model writes. Run: amem golden golden/docs.toml
 #
 # Add your own domain's suite beside this one; the format is the same.
 

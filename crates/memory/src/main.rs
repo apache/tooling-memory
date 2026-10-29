@@ -254,7 +254,7 @@ enum BackendArg {
     Auto,
     /// Native Linux namespaces, from this host's binaries.
     Namespaces,
-    /// Native Linux namespaces, pivoted into the unpacked harness image (`memory image
+    /// Native Linux namespaces, pivoted into the unpacked harness image (`amem image
     /// unpack` first). What `auto` picks on Linux once the image is unpacked.
     Image,
     /// WSL containers: the harness image in a session VM, through `wslc`.
@@ -1465,7 +1465,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
                     println!("{}", p.display());
                     Ok(())
                 }
-                None => Err("no unpacked image; run `memory image unpack`".into()),
+                None => Err("no unpacked image; run `amem image unpack`".into()),
             },
         },
         Command::Relay { .. } => unreachable!("handled in main"),
@@ -3385,7 +3385,7 @@ fn runner_for(backend: Backend, root: &Path) -> Result<Runner, Box<dyn std::erro
         Backend::Namespaces => Runner::Namespaces,
         Backend::Seatbelt => Runner::Seatbelt,
         Backend::Image => Runner::Image(
-            image::present(root).ok_or("no unpacked image; run `memory image unpack` first")?,
+            image::present(root).ok_or("no unpacked image; run `amem image unpack` first")?,
         ),
         Backend::None | Backend::Wslc => Runner::Unconfined(None),
     })

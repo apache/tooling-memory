@@ -430,7 +430,7 @@ mod on_windows {
             Provision::Present { id } => {
                 eprintln!(
                     "memory: {image} {} from this session's store; after a rebuild, \
-                     `memory wslc-api-check --refresh`",
+                     `amem wslc-api-check --refresh`",
                     id.get(..12).unwrap_or(&id)
                 );
                 Ok(())

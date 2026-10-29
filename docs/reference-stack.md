@@ -137,7 +137,7 @@ One Rust workspace. The table gives the planned shape. The last column says what
 | `ui` | The browser reader and curation page | wasm | `crates/reader`, the core crate for a browser, and `crates/web`, the pages of the web launcher |
 | `memoryd`, `memory-local` | The two binaries | native, Windows and Linux | One binary, `amem` (`crates/memory`) |
 
-These crates are in `crates/` too, and the plan does not name them:
+These crates are in `crates/` too, and the table above does not name them:
 
 - `client`: a typed MCP client for the memory server;
 - `fetch`: what the fetch tool does with a page;
