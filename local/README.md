@@ -72,9 +72,10 @@ permission prompts off. Nobody is there to answer them, and a task needs edits a
 commands. The sandbox is the boundary, and the working tree is what the harness can
 change. The harness prints the answer and exits with its exit code. A launch that leaves
 no handoff exits with code 4, unless the harness itself failed: then the launch exits with
-the code of the harness. A note that a hook files, before compaction or at session end,
-counts as a handoff. The reason: a non-interactive launch whose outcome is only in its
-transcript leaves nothing for the next session. If you intend this, use `--no-handoff`.
+the code of the harness. A note that a hook leaves, before compaction or at session end,
+counts as a handoff when the launcher files it. The reason: a non-interactive launch whose
+outcome is only in its transcript leaves nothing for the next session. If you intend this,
+use `--no-handoff`.
 
 `make work` claims the next admitted task that the session may take. It makes the prompt
 from:
@@ -364,8 +365,8 @@ the record. It goes to `state/quarantine/<id>.md`. It is never indexed or served
 owner gets a task that requires `human`, with the scan's excerpts and the commands to act.
 `amem quarantine list|show|release|drop` are the owner's commands. Release writes the
 entry into the record as it was written, with its author and all. Drop deletes the held
-write from `state/quarantine`, and the reviewer's notes beside it. It writes nothing to
-the record. There are two more gates:
+write from `state/quarantine`, and the verdict beside it. It writes nothing to the record.
+There are two more gates:
 
 - This gate counts the entries that an agent session supersedes. The limit is
   `max_supersedes_per_session` (`[gates]` in `grants.toml`, twenty by default). When a
@@ -853,7 +854,8 @@ decision contexts that carry its text, and the receipt lists them.
 `amem replay <session>` is the paper's frozen-context replay on those decision contexts.
 It sends each recorded request again, up to `--limit`, or one `--turn`:
 
-- to the same destination and path;
+- to the same path, at the destination that the session used, or at the gateway with
+  `--auth gateway`;
 - with only the model changed, and the answer not streamed;
 - through the egress, metered and under the spend limits.
 
@@ -1388,7 +1390,7 @@ hook left it, not the agent, and it points to the full transcript.
 The launcher always files a note from before compaction, because its content is no longer
 in the context of the harness. It files a note from session end only when the session left
 no handoff of its own. This note is the handoff of last resort. Thus a prompted launch
-where the agent wrote no handoff does not exit 4 when a hook filed a note.
+where the agent wrote no handoff does not exit 4 when the launcher filed a note.
 
 Transcripts stay where the harness keeps them, under the private home in the state of the
 record. Thus nothing is lost, also when the launcher files no note. The hook reads all
@@ -1515,7 +1517,8 @@ make launch BACKEND=wslc PROMPT='say pong'    # prompted
 make work BACKEND=wslc                        # a task from the ledger
 ```
 
-The session VM has two containers, and two more for the gateway with `--auth gateway`:
+The session VM has two containers. It has two more for the gateway, with `--auth gateway`
+or `--server-auth gateway`:
 
 - The egress container runs the Linux `amem`, with your record mounted in. It has the
   only route outside. It opens the memory, serves the egress on a socket in a shared
@@ -1528,9 +1531,10 @@ The host side only changes run requests into `wslc run`, and reports the exit co
 login directories (`~/.claude`, `~/.codex`, `~/.gemini`) go into the egress container
 read-only. The egress container copies the one file that the harness needs into the
 private home. Keys and `GH_TOKEN` go in as environment. The session VM cannot reach
-LiteLLM on the loopback of this machine. Thus `--auth gateway` runs a gateway of its own in
-the VM, as [The gateway inside the VM](#the-gateway-inside-the-vm) says. That gateway
-replaces `LLMAO_URL` and `LLMAO_KEY`, also when they name a remote gateway.
+LiteLLM on the loopback of this machine. Thus `--auth gateway` and `--server-auth gateway`
+run a gateway of their own in the VM, as [The gateway inside the
+VM](#the-gateway-inside-the-vm) says. That gateway replaces `LLMAO_URL` and `LLMAO_KEY`,
+also when they name a remote gateway.
 
 `--unconfined` runs the same configuration without namespaces, with the egress on a TCP
 port. It is for platforms that have no sandbox backend. macOS gets Seatbelt later.

@@ -2032,7 +2032,7 @@ fn record_reported_usage(p: &Prepared) {
     }
 }
 
-/// `memory usage`: the telemetry by destination, model and who counted.
+/// `amem usage`: the telemetry by destination, model and who counted.
 fn print_usage(rows: &[dm_egress::telemetry::Totals]) {
     if rows.is_empty() {
         println!("no model calls recorded");
@@ -2465,7 +2465,7 @@ async fn tap_cmd(root: &Path, op: TapOp) -> Fallible {
 }
 
 /// `mine` and the C API check.
-/// `memory mine`: a transcript read by a small model through the session's destination.
+/// `amem mine`: a transcript read by a small model through the session's destination.
 async fn mine_cmd(
     root: &Path,
     transcript: &Path,
@@ -2498,7 +2498,7 @@ async fn mine_cmd(
     Ok(())
 }
 
-/// `memory models`: the destination's own model list, as the web form's picker reads it.
+/// `amem models`: the destination's own model list, as the web form's picker reads it.
 async fn models_cmd(root: &Path, auth: AuthArg, provider: Option<String>) -> Fallible {
     let auth = AuthMode::from(auth);
     if auth == AuthMode::Subscription {
@@ -2992,7 +2992,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     std::process::exit(code);
 }
 
-/// The `memory inside` flags for a task run, after the run options.
+/// The `amem inside` flags for a task run, after the run options.
 fn work_inside_args(
     mut args: Vec<String>,
     domain: Option<&str>,
@@ -3277,7 +3277,7 @@ fn split_program(harness: Harness, args: Vec<String>) -> (Vec<String>, Vec<Strin
     }
 }
 
-/// The flags `memory inside` gets for a launch handed to the wslc backend.
+/// The flags `amem inside` gets for a launch handed to the wslc backend.
 fn inside_args_for_launch(
     prompt: Option<&str>,
     prompt_file: Option<&Path>,

@@ -46,8 +46,10 @@ before you override the instruction.
   - Act 11 of the demo (`scripts/demo/11-limits.sh`) prints the two lists at the top of
     `README.md`.
 
-  If you change a heading in `docs/`, a decision in `examples/decisions/` or those two
-  lists, run the script that reads it.
+  The demo seeds its record only once. So, after you change a file in `docs/` or
+  `examples/decisions/`, seed a new record with `make demo-ready RESET=1`. Then run
+  `make golden` and act 6 (`make demo-all ACTS=6`). After you change those two lists, run
+  act 11.
 - **Show that a new assertion fails before you trust it.** Run it against the code as it
   was before your change. Put what it reported in the pull request. If a test only ever
   passed, nobody has shown that it tests anything. Assert the rule, not a bound on the

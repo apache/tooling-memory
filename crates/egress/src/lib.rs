@@ -1534,7 +1534,7 @@ async fn debugged(
 
 /// Record the call once its usage is known, when the body has streamed through. A call
 /// that reported usage is recorded as such; a call the upstream refused is recorded by
-/// its status, so a refused key or an expired login shows up in `memory usage` rather
+/// its status, so a refused key or an expired login shows up in `amem usage` rather
 /// than vanishing; anything else, a listing say, is not a model call.
 /// A copy of a response as it streams through, up to a cap, for its decision context.
 fn tap<S>(

@@ -17,7 +17,7 @@
 //! | Antigravity CLI | `GOOGLE_GEMINI_BASE_URL`; a login tunnels | `mcpServers.<id>.serverUrl` | `~/.gemini/antigravity-cli/settings.json`, `~/.gemini/config/` |
 //! | Qwen Code | `OPENAI_BASE_URL`; key only | `mcpServers.<id>.httpUrl` | `~/.qwen/settings.json` |
 //! | Grok Build | `GROK_XAI_API_BASE_URL`; a login tunnels | `mcp_servers.<id>.url` | `~/.grok/config.toml` |
-//! | Muse Code | `--base-url` on `exec` | `mcp_servers.<id>`, `streamable_http` | `~/.config/muse/settings.json` |
+//! | Muse Code | `--base-url`, after the harness's arguments | `mcp_servers.<id>`, `streamable_http` | `~/.config/muse/settings.json` |
 //! | pi | `baseUrl` of a provider of its own | `mcpServers.<id>.url` | `~/.pi/agent/models.json`, `mcp.json`, `extensions/` |
 //! | Copilot CLI | no override; `HTTPS_PROXY` to the egress, which tunnels to allowed hosts | `mcp-config.json` | `COPILOT_HOME` |
 //! | OpenCode | `provider.<id>.options.baseURL` | `mcp.<id>.url` | `XDG_CONFIG_HOME/opencode/opencode.json` |
@@ -1151,7 +1151,7 @@ fn setup_codex(
             String::new()
         };
         format!(
-            r#"# written by memory launch; edits are overwritten
+            r#"# written by amem launch; edits are overwritten
 {base}show_raw_agent_reasoning = true
 
 [features]
@@ -1164,7 +1164,7 @@ url = "{relay}/mcp"
     } else {
         env.insert("DM_EGRESS_TOKEN".into(), "egress".into());
         format!(
-            r#"# written by memory launch; edits are overwritten
+            r#"# written by amem launch; edits are overwritten
 model_provider = "egress"
 # the reasoning an open model returns is kept in the rollout, so the record has the why
 show_raw_agent_reasoning = true
@@ -1456,7 +1456,7 @@ context_window = 131072
         }
     };
     let config = format!(
-        r#"# written by memory launch; edits are overwritten
+        r#"# written by amem launch; edits are overwritten
 [cli]
 auto_update = false
 
@@ -1594,7 +1594,7 @@ fn setup_pi(
     )?;
     let memory = at.memory_literal();
     let extension = format!(
-        r#"// written by memory launch; edits are overwritten. The launcher's hooks, as a pi
+        r#"// written by amem launch; edits are overwritten. The launcher's hooks, as a pi
 // extension: pi has none of its own, so the hook binary is run from here.
 import {{ spawnSync }} from "node:child_process";
 
