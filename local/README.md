@@ -1384,14 +1384,14 @@ the model would use a shell instead, which the hook does not see.
 Each hook runs `amem` in the sandbox: at `/opt/memory/memory` under namespaces and in the
 harness image, and at its host path under Seatbelt. The binary reads the event and the
 tail of the transcript, and leaves a note in an outbox in the private home. When the
-session ends, the launcher files the notes as handoffs. Each has a mark that says that the
-hook left it, not the agent, and it points to the full transcript.
+session ends, the launcher files the outbox notes as handoffs. Each has a mark that says
+that the hook left it, not the agent, and it points to the full transcript.
 
 The launcher always files an outbox note from before compaction, because its content is no
 longer in the context of the harness. It files an outbox note from session end only when
-the session left no handoff of its own. This note is the handoff of last resort. Thus a
-prompted launch where the agent wrote no handoff does not exit 4 when the launcher filed
-an outbox note.
+the session left no handoff of its own. This outbox note is the handoff of last resort.
+Thus a prompted launch where the agent wrote no handoff does not exit 4 when the launcher
+filed an outbox note.
 
 Transcripts stay where the harness keeps them, under the private home in the state of the
 record. Thus nothing is lost, also when the launcher files no outbox note. The hook reads

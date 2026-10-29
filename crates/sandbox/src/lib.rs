@@ -1,7 +1,7 @@
 //! Confinement for a harness: what it may see, and the one way out.
 //!
 //! A [`Plan`] says what goes into the sandbox: a root with the system's binaries read-only,
-//! a private home, the working tree, the memory binary, the egress socket, and nothing
+//! a private home, the working tree, the amem binary, the egress socket, and nothing
 //! else. The network namespace is empty. The harness reaches the egress through a relay
 //! on loopback that forwards to the socket, and the egress is the only process with the
 //! network.
@@ -376,7 +376,7 @@ pub struct Layout {
     pub home: PathBuf,
     /// The egress socket.
     pub socket: PathBuf,
-    /// The memory binary, which runs the relay and the hooks.
+    /// The amem binary, which runs the relay and the hooks.
     pub memory: PathBuf,
     /// The loopback address the relay listens on, as `host:port`.
     pub relay: String,
@@ -433,7 +433,7 @@ impl Layout {
         format!("{} hook {harness}", shell_word(&self.memory))
     }
 
-    /// The memory binary as a JSON, and so JavaScript, string literal.
+    /// The amem binary as a JSON, and so JavaScript, string literal.
     fn memory_literal(&self) -> String {
         serde_json::to_string(&self.memory.display().to_string()).unwrap_or_default()
     }
@@ -490,7 +490,7 @@ pub struct Request<'a> {
     /// OpenCode lists a custom provider's models, and cannot ask models.dev here.
     pub model: Option<&'a str>,
     /// The harness runs in the harness image rather than from this host's binaries: the
-    /// harness is at `/usr/local/bin/<name>`, the memory binary is already inside, and
+    /// harness is at `/usr/local/bin/<name>`, the amem binary is already inside, and
     /// nothing of the host's system is mounted. Set by the `wslc` backend.
     pub image: bool,
     /// Where the working tree appears inside, when not at its host path. The `wslc`
@@ -518,7 +518,7 @@ impl Request<'_> {
 pub const INSIDE_HOME: &str = "/home/user";
 /// The egress socket inside.
 pub const INSIDE_SOCKET: &str = "/run/memory/egress.sock";
-/// The memory binary inside. Outside `/usr`, which is mounted read-only before this.
+/// The amem binary inside. Outside `/usr`, which is mounted read-only before this.
 pub const INSIDE_MEMORY: &str = "/opt/memory/memory";
 /// The loopback address the relay listens on inside.
 pub const INSIDE_RELAY: &str = "127.0.0.1:4100";
@@ -840,7 +840,7 @@ fn provider_of(req: &Request<'_>) -> Result<String, Error> {
 ///
 /// Where the layout is the host's own, as Seatbelt's is, nothing is mounted and nothing
 /// hidden, but the tree is granted read-write: it may not sit in the read-only
-/// projection, nor hold the private home, the projection, the memory binary that runs
+/// projection, nor hold the private home, the projection, the amem binary that runs
 /// the hooks, or the egress socket.
 fn refuse_a_hidden_workdir(req: &Request<'_>, at: &Layout) -> Result<(), Error> {
     let inside = req.workdir_inside();
@@ -2830,14 +2830,14 @@ mod tests {
         ] {
             assert!(plugin.contains(needle), "{needle} in\n{plugin}");
         }
-        // driving it takes a fake memory binary, which is a shell script
+        // driving it takes a fake amem binary, which is a shell script
         #[cfg(unix)]
         if let Ok(node) = find_on_path("node") {
             drive_opencode_plugin(&node, &plugin);
         }
     }
 
-    /// The plugin under a node, against a fake memory binary that records what it is
+    /// The plugin under a node, against a fake amem binary that records what it is
     /// sent and refuses a tool call: a denial throws its reason; the turns arrive as
     /// events and the idle event writes the transcript and leaves the session-end note
     /// without awaiting anything, since OpenCode's run exits on idle; a session id is a

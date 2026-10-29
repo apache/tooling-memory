@@ -685,7 +685,7 @@ mod tests {
             let mut m = mount(path, false);
             let mut bad = plan_with(Vec::new());
             if file {
-                // the home as the memory binary's literal
+                // the home as the amem binary's literal
                 bad.layout.memory = PathBuf::from(path);
                 m.read_only = true;
             }
