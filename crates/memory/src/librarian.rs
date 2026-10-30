@@ -12,7 +12,7 @@ use dm_server::reads;
 use dm_server::Memory;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// What a proposal asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -107,13 +107,18 @@ fn source_file(source: &str, root: &Path) -> Option<std::path::PathBuf> {
     {
         return None;
     }
+    // a source names a file in the working tree: a path that is absolute, climbs out of
+    // the tree, or is a link that leads out of it names nothing the librarian may look at
     let p = Path::new(rel);
-    let full = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        root.join(p)
-    };
-    full.is_file().then_some(full)
+    if !p
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return None;
+    }
+    let full = root.join(p).canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    (full.starts_with(&root) && full.is_file()).then_some(full)
 }
 
 /// Whether a source file changed after the entry was written: the source-change trigger.
@@ -442,6 +447,36 @@ pub(crate) mod tests {
             "dr19 does the wiki stay on moinmoin"
         );
         assert_eq!(Kind::Resummarise.name(), "resummarise");
+    }
+
+    #[test]
+    fn a_source_names_a_file_in_the_tree_and_nothing_outside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("in.md"), "x").unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        assert!(source_file("file:in.md", &tree).is_some());
+        assert!(source_file("in.md", &tree).is_some());
+        for s in [
+            outside.display().to_string(),
+            format!("file:{}", outside.display()),
+            "file:../outside.txt".to_string(),
+            "../outside.txt".to_string(),
+            "file:./x/../../outside.txt".to_string(),
+        ] {
+            assert_eq!(source_file(&s, &tree), None, "{s}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, tree.join("link.txt")).unwrap();
+            assert_eq!(
+                source_file("file:link.txt", &tree),
+                None,
+                "a link out of the tree"
+            );
+        }
     }
 
     #[test]
