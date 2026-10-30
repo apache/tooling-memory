@@ -137,6 +137,20 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: make wasm-check
 
+  # The Markdown the demo reads, checked as the demo reads it (scripts/corpus-check.sh).
+  # It runs on every change, a docs-only one included: docs/ and examples/decisions/ are
+  # the demo's record, and a heading renamed there breaks a golden question or an eval.
+  corpus:
+    name: corpus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: make corpus-check
+
   # Advisories, licences, duplicate versions, sources. Configured in deny.toml. The
   # cargo-deny action is not on the ASF allow-list, so the tool is installed instead.
   deny:

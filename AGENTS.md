@@ -38,13 +38,19 @@ before you override the instruction.
   counts as Markdown. The hook and CI do not run `make check` for such a change, because
   nothing builds from those files. `scripts/docs-only.sh` decides which changes are of
   this type. Its test holds the premise that no crate or tap embeds those files or reads
-  them. Some scripts read them, and no check runs these scripts:
+  them. Some scripts read them:
 
   - `scripts/seed-corpus.py` seeds the demo record from `docs/` and
     `examples/decisions/` (`make demo`). `golden/docs.toml` and `evals/demo.toml` score
     answers against that text.
   - Act 11 of the demo (`scripts/demo/11-limits.sh`) prints the two lists at the top of
     `README.md`.
+
+  `make corpus-check` (`scripts/corpus-check.sh`) seeds a scratch record from those
+  files. It fails when a golden question or an eval task names an entry that the record
+  does not hold, when the keywords of a golden question do not find its answer, or when
+  act 11 does not find its two lists. CI runs it on every change, a docs-only change
+  included. It does not run a harness, so it does not show what a model answers.
 
   The demo seeds its record only once. So, after you change a file in `docs/` or
   `examples/decisions/`, seed a new record with `make demo-ready RESET=1`. Then run

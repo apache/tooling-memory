@@ -1,7 +1,9 @@
 # An evaluation set over the demo record: questions whose answers live in the record and
 # nowhere else, so a harness without memory can only guess. `scripts/eval.py` runs each
 # task under each condition and grades the answer against `expect`, a case-insensitive
-# regular expression that the answer must match.
+# regular expression that the answer must match. `answers` names the entries that hold
+# the answer, by title or part of one, as in golden/docs.toml; scripts/corpus-check.sh
+# fails when the record holds none of them.
 #
 #   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
 #   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex --auth gateway --model qwen3.8-27b
@@ -18,6 +20,7 @@ preamble = "If a memory server is attached to this session, search it and read i
 
 [[task]]
 id = "dr19-decision"
+answers = ["DR-19: Does the wiki stay on MoinMoin?: Status"]
 prompt = "What did DR-19 decide about the wiki staying on MoinMoin? Answer in one or two sentences from what you know; do not browse the web."
 # "no decision" alone also matches a refusal ("no decision entries recorded"), so only
 # the record's own answer counts: proposed, not yet taken, no final decision
@@ -25,11 +28,13 @@ expect = "(not (yet )?(been )?taken|no final decision|(hasn't|has not) (yet )?(m
 
 [[task]]
 id = "dr19-spike"
+answers = ["DR-19: Does the wiki stay on MoinMoin?: What settles it"]
 prompt = "Which spike in the work plan would settle DR-19, the question of whether the wiki stays on MoinMoin? Name it. Do not browse the web."
 expect = "S2"
 
 [[task]]
 id = "asf-pressures"
+answers = ["Seeding a Foundation: 10. What the Foundation taught the design"]
 prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What the Foundation taught the design' list? Give the number."
 # the part cites "paper §6" and another part is "6. Trust and review", so a six or 6
 # counts unless it is a section number, a link anchor, or the end of a range or a list of
@@ -39,6 +44,7 @@ expect = "(?<![§#–-])(?<!§ )(?<!section )(?<!part )\\b(six|6)\\b(?![–-])(?
 
 [[task]]
 id = "committers-gate"
+answers = ["Seeding a Foundation: 6. Trust and review"]
 prompt = "In the 'Seeding a Foundation' notes on trust and review, who is the promotion gate? One sentence."
 # the gate is named people that domain policy authorises, under PMC oversight; the case
 # study gives committers sampled review, so "committers" is no longer the answer, and
