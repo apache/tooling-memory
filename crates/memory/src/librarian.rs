@@ -310,11 +310,16 @@ fn survey_entry(
             kind: Kind::Verify,
             entries: vec![id.clone()],
             why,
-            body: format!(
-                "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}` and say in its body what changed and how you know. If it holds, also call `promote` with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff."
-            ),
+            body: verify_body(id),
         });
     }
+}
+
+/// The task that has a curator check a stale entry and correct or re-date it.
+fn verify_body(id: &str) -> String {
+    format!(
+        "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}`: its body says what holds now, and its `source` names what shows it. Say what changed and how you know in your handoff, not in the entry, so whoever checks the entry judges it on its sources first. If it holds, also call `promote` with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff."
+    )
 }
 
 /// Live entries that share a title, once normalised, are merge candidates.
@@ -474,5 +479,16 @@ mod tests {
         assert_eq!(source, "file:notes.md");
         assert!(source_file("https://x/y", dir.path()).is_none());
         assert!(source_file("mem-t-2", dir.path()).is_none());
+    }
+
+    #[test]
+    fn a_corrected_entry_leaves_the_reasoning_to_the_handoff() {
+        let body = verify_body("mem-t-1");
+        assert!(
+            body.contains("how you know in your handoff, not in the entry"),
+            "{body}"
+        );
+        assert!(!body.contains("in its body"), "{body}");
+        assert!(body.contains("one sentence of why"), "{body}");
     }
 }
