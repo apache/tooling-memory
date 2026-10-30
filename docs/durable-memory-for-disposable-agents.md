@@ -162,7 +162,7 @@ The full record, with citations, lineage, and supersession, is in [Appendix A](#
 | **Decision** | Best. It records context, options, choice, and rationale, like an architecture decision record, and the reason stays true after the details change. A new decision supersedes it; it never expires |
 | **Fact** | Fast. It carries a review date |
 | **Convention** | Needs a named owner; an ownerless one is flagged within days |
-| **Method** | A convention about how to work: a strategy agents reuse ([§10](#10-evolving-the-system)). Like any convention it needs an owner, and it is reviewed more strictly |
+| **Method** | A convention about how to work: a strategy agents reuse ([§10](#10-evolving-the-system)). Like any convention it needs an owner, and it is reviewed more strictly. It cites the facts and decisions it relies on and does not restate them. Each cited fact keeps its own review date and each cited entry its own trust tier, and a failure can be traced to the method or to what it cites [[79]](#ref-79) |
 
 A T0 for one domain:
 
@@ -360,6 +360,8 @@ Curators are a standing fleet of cheap-model agents. They:
 
 Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Curation is budgeted like any other work, with a protected floor, so curation and delivery cannot starve each other.
 
+People's corrections join the queue too. A correction of an agent's output and a rejected or reverted result are outcome events on the task ([Appendix C](#appendix-c-ledger-semantics)); a person's answer to an escalation is an event on the escalated task, or on a sign-off task whose match is a person ([§8](#decomposition)). The curator sorts each by one question: could the agent have reached the right answer from what its permission filter admitted ([§6](#access-control)), whether or not it read it? If it could, the method is at fault, and the fix is a candidate change in `dom-platform` ([§10](#10-evolving-the-system)). If it could not, knowledge is missing, and the fix is an entry in the domain. If the people correcting it disagree, it is neither, and the question goes to the people who own the policy the disputed question falls under ([§7](#7-the-policy-stack)). Sorting by the form of a correction, information against redirection, does not work, because a correction of either form can be any of the three [[79]](#ref-79).
+
 **Curator, historian, steward.** The historian ([§3](#3-memory)) records what happened; the curator looks after what is kept. "Curator" is the cross-industry name for that work: digital curation is "the management and preservation of digital data/information over the long-term" [[9]](#ref-9), and the work's output here is the curated tier. In data governance the accountable person is the data steward [[10]](#ref-10), which here is the domain owner; curators work under the owner's policy.
 
 A summary keeps the provenance, tier, and classification of what it summarises. A consolidation that drops where a claim came from would let a raw or restricted claim pass as a curated, public one, so the curator's outputs follow the derivation rules of [§4](#4-trust-and-handling).
@@ -383,6 +385,7 @@ Auditors are agents whose only job is checking curators. They:
 
 - run on a different base model and prompt lineage, to reduce shared blind spots;
 - sample summaries against the entries they summarise;
+- judge each change against the entries it draws on before they see the curator's reasoning, so they do not start from the curator's argument; [[79]](#ref-79) gives its reviewer the diff alone. A changed entry states its claim and cites its sources, and the reasoning stays out of its body: in the curator's handoff and transcript, and in the why that a promotion carries;
 - hunt contradictions between entries;
 - watch the canary entries;
 - share no writable state with curators.
@@ -717,7 +720,7 @@ Decisions need deadlines as much as searches do. Each unit sets response bounds 
 
 # 10. Evolving the System
 
-**Why.** The quickest way to make every agent better is to improve the instructions, tools, and methods they all load. That same shared path is also the quickest way to spread a mistake or an exploit to all of them.
+**Why.** The quickest way to make every agent better is to improve the instructions, tools, and methods they all load. That same shared path is also the quickest way to spread a mistake or an exploit to all of them, and plain-text methods travel fast: in one deployment, where anyone and the agents themselves may write them, the community wrote thousands [[80]](#ref-80).
 
 ## The platform is a domain
 
@@ -881,6 +884,8 @@ Other systems that write to a personal domain (a harness, an assistant, an emplo
 
 One catch: an entry about the person, written in a session that read restricted material, carries that label. It can then leave only through the institution's guard. So anything meant for the person's domain should be written in a session that read nothing above the person's level.
 
+Personal memory is wanted at scale. At Meta a personal workspace of this kind, a root file of identity and active work with project detail loaded on demand, reached 63,000 installs and about 10,000 daily users within three months [[80]](#ref-80). Meta's next step is a team layer fed from the personal workspaces. In this design that step crosses from a person's domain into a team's: the person chooses, entry by entry, what to offer, and the team domain's owner admits it, raw, as any import ([§4](#4-trust-and-handling)).
+
 When a grant ends, the institution's views are dropped with receipts. What the person wrote into the institution's domains stays there under their identifier.
 
 ## Models and tools
@@ -931,7 +936,7 @@ The design combines recent agent-memory research with decades of systems practic
 
 | Area | Builds on |
 |---|---|
-| **Memory** | Operating-system tiers (MemGPT [[18]](#ref-18)); reflection (Generative Agents [[19]](#ref-19)); experience distillation (ExpeL [[20]](#ref-20), A-Mem [[21]](#ref-21)); agent-written skills (Voyager [[22]](#ref-22)); memory as a write, manage, read loop on shared substrates [[23]](#ref-23), [[24]](#ref-24); event sourcing [[25]](#ref-25), [[26]](#ref-26); decision records [[27]](#ref-27); organisational memory [[28]](#ref-28) |
+| **Memory** | Operating-system tiers (MemGPT [[18]](#ref-18)); reflection (Generative Agents [[19]](#ref-19)); experience distillation (ExpeL [[20]](#ref-20), A-Mem [[21]](#ref-21)); agent-written skills (Voyager [[22]](#ref-22)); memory as a write, manage, read loop on shared substrates [[23]](#ref-23), [[24]](#ref-24); event sourcing [[25]](#ref-25), [[26]](#ref-26); decision records [[27]](#ref-27); organisational memory [[28]](#ref-28); personal workspaces with progressive disclosure, at scale [[80]](#ref-80) |
 | **Trust** | Not transitive [[6]](#ref-6); typed by purpose [[7]](#ref-7); lossy propagation, separate distrust [[29]](#ref-29); provenance and lineage in W3C PROV [[30]](#ref-30); authority collapse [[8]](#ref-8); separation of privilege [[31]](#ref-31) |
 | **Safety** | Indirect prompt injection [[32]](#ref-32); memory poisoning through queries (MINJA [[33]](#ref-33)) and stores (AgentPoison [[34]](#ref-34)), largely missed by injection defences [[35]](#ref-35); OWASP's agentic top risks [[36]](#ref-36); failure modes of governed shared memory [[37]](#ref-37); retrieved content as data, never control flow (CaMeL [[38]](#ref-38)) |
 | **Retrieval and access** | Authorisation compiled into the query (OPA [[39]](#ref-39), Zanzibar [[40]](#ref-40)); the Model Context Protocol as today's binding [[41]](#ref-41) |
@@ -939,7 +944,7 @@ The design combines recent agent-memory research with decades of systems practic
 | **Coordination** | Blackboards (Hearsay-II [[45]](#ref-45)) and tuple spaces (Linda [[46]](#ref-46)); stigmergy [[47]](#ref-47), [[48]](#ref-48); leases [[49]](#ref-49); bounded contexts [[50]](#ref-50) and data mesh [[51]](#ref-51); hierarchical task networks [[52]](#ref-52); critical-path priority [[53]](#ref-53); the contract net, without the bidding [[54]](#ref-54) |
 | **Measurement and evaluation** | SRE [[55]](#ref-55); token cost as an axis (Mem0 [[56]](#ref-56), LoCoMo [[57]](#ref-57)); long-horizon benchmarks (LongMemEval [[58]](#ref-58)); silent vendor drift [[59]](#ref-59); NIST AI RMF [[60]](#ref-60) and ISO/IEC 42001 [[61]](#ref-61); OpenTelemetry [[62]](#ref-62) and Inspect [[63]](#ref-63) as carriers; the paired noise-floor protocol [[64]](#ref-64) |
 | **Seeding** | Co-change coupling [[65]](#ref-65); fixes linked to their causes [[66]](#ref-66) |
-| **Self-improvement** | Self-evolving harnesses (SEAGym [[67]](#ref-67)); offline distillation, online retrieval (EvolveR [[68]](#ref-68)); gated archives (Darwin Gödel Machine [[69]](#ref-69)); co-evolving evaluators [[70]](#ref-70); agents designed as code [[71]](#ref-71). This design adds human review, a manifest check, and a perimeter outside the loop |
+| **Self-improvement** | Self-evolving harnesses (SEAGym [[67]](#ref-67)); offline distillation, online retrieval (EvolveR [[68]](#ref-68)); gated archives (Darwin Gödel Machine [[69]](#ref-69)); co-evolving evaluators [[70]](#ref-70); agents designed as code [[71]](#ref-71); in production, an expert-knowledge agent improved by edits to text files from expert corrections, checked by blind replay and a fresh-context reviewer (Meta [[79]](#ref-79)). This design adds a manifest check and a perimeter outside the loop. Like [[79]](#ref-79), it keeps a person's review in the loop, for every change that reaches every task and every change to the evaluation suites ([§10](#the-loop-and-its-gates)) |
 | **Long timescales** | Dated authorities (RFC 4151 [[11]](#ref-11)); names never reassigned (RFC 8141 [[72]](#ref-72)); stable internal IDs (SCIM [[73]](#ref-73)); issuer and subject (OpenID Connect [[12]](#ref-12)); identifiers free of organisational names [[13]](#ref-13) |
 
 **Organisational cybernetics.** Beer's Viable System Model [[74]](#ref-74), [[75]](#ref-75) names the functions an organisation needs to stay viable, and stresses the exchange between them and adaptation to a changing environment [[76]](#ref-76). It is a useful check on the design, and it shows where the design stops. The design supplies mechanisms; most of what makes an organisation viable comes from people the deployment appoints:
@@ -1119,6 +1124,10 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-78"></a>[78] Wiener, N. (1948). *Cybernetics: Or Control and Communication in the Animal and the Machine*. Technology Press and Wiley. Reissued by MIT Press, 2019. https://doi.org/10.7551/mitpress/11810.001.0001
 
+<a id="ref-79"></a>[79] Sengar, S., Nawrocki, J., Shah, J., & Kommireddi, P. (2026). An Organizational Second Brain: Building an AI That Learns From Experts. Engineering at Meta, 2 September 2026. https://engineering.fb.com/2026/09/02/ml-applications/organizational-second-brain-ai-learns-from-experts/
+
+<a id="ref-80"></a>[80] Analytics at Meta (2026). How We Built an AI Second Brain for 60K Knowledge Workers. Medium, 29 April 2026. https://medium.com/@AnalyticsAtMeta/how-we-built-an-ai-second-brain-for-60k-knowledge-workers-78c507dd795b
+
 ---
 
 # Appendix A: Interface
@@ -1194,7 +1203,7 @@ A new deployment starts on top of existing knowledge: repositories, tickets, rev
 
 **Seeding is ordinary import, at scale.** Nothing enters a trusted tier because it is old or looks authoritative. Sources land raw with provenance and earn promotion through the normal gates ([§4](#4-trust-and-handling)). A wrong seed is the hardest corruption to find later.
 
-**Two speeds.** Indexing is cheap and distillation costs model time. So index everything at once as a raw searchable layer that cites the originals, and distil selectively. Known-item lookup works from day one; understanding builds where it is needed. Zero-result queries mark where to distil next; history nobody asks about is indexed and never distilled, which is the right outcome.
+**Two speeds.** Indexing is cheap and distillation costs model time. So index everything at once as a raw searchable layer that cites the originals, and distil selectively. Known-item lookup works from day one; understanding builds where it is needed. Zero-result queries mark where to distil next; history nobody asks about is indexed and never distilled, which is the right outcome. Value in the first session matters: one personal deployment builds a first workspace from the user's recent activity in a single session, and found that this removed the largest barrier to adoption [[80]](#ref-80). What such a bootstrap writes is model output and lands raw.
 
 **Backfill is replay.** Build the live taps first, then run history through the same pipeline, oldest first. The pipeline itself is a `dom-platform` artifact.
 
