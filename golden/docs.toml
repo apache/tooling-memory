@@ -53,8 +53,13 @@ answers = ["A policy stack for a federation"]
 keywords = "policy stack federation"
 
 [[question]]
-ask = "What do trust tiers mean, and how does an entry move between them?"
-answers = ["Promotion", "Four questions, four labels"]
+ask = "What do the trust tiers mean?"
+answers = ["Four questions, four labels"]
+keywords = "trust tier raw curated verified"
+
+[[question]]
+ask = "How does an entry move from one trust tier to the next?"
+answers = ["Promotion"]
 keywords = "raw curated promotion tier"
 
 [[question]]

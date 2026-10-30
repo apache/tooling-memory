@@ -281,7 +281,7 @@ model.
 
 **6.1 With and without.** Both runs use the same four questions, the same harness, the
 same model and the same sandbox. With this memory: 4 of 4. With an empty memory: 0 of 4.
-These counts are for the questions as they were on 9 October; two of them changed with
+These counts are for the questions as they were on 12 October; two of them changed with
 the case study since.
 Codex searches, finds nothing, and says so or gives a wrong answer. With memory, it
 finished in 71 seconds against 126. It wrote less than half as much: about 1,600 tokens

@@ -6,8 +6,10 @@
 #   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
 #   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex --auth gateway --model qwen3.8-27b
 #
-# Seed a fresh record first: make demo-ready RESET=1 DEMO_ROOT=$HOME/memory-demo2. An
-# existing record keeps the text it was seeded with, and RESET=1 removes the whole root.
+# Seed a fresh record first. An existing record keeps the text it was seeded with, and
+# RESET=1 removes the whole root:
+#
+#   make demo-ready RESET=1 DEMO_ROOT=$HOME/memory-demo2
 
 # Put in front of every prompt, under every condition alike. A harness given a memory
 # server does not always think to ask it; a task run says so in its prompt, and so does
@@ -29,9 +31,10 @@ expect = "S2"
 [[task]]
 id = "asf-pressures"
 prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What the Foundation taught the design' list? Give the number."
-# the part cites "paper §6" and another part is "6. Trust and review", so a bare "6" is
-# not enough: the number stands on a line of its own, or it counts the pressures
-expect = "(?m)^\\W*(six|6)\\W*$|\\b(six|6)\\b\\W*(\\w+\\W+)?pressures\\b"
+# the part cites "paper §6" and another part is "6. Trust and review", so a six or 6
+# counts unless it is one of those two section numbers. The table in part 6 also has six
+# rows, so a model that counts the wrong table passes too; no pattern can tell
+expect = "(?<!§)(?<!§ )(?<!section )(?<!part )\\b(six|6)\\b(?!\\s*\\.\\s*trust)"
 
 [[task]]
 id = "committers-gate"
@@ -39,4 +42,4 @@ prompt = "In the 'Seeding a Foundation' notes on trust and review, who is the pr
 # the gate is named people that domain policy authorises, under PMC oversight; the case
 # study gives committers sampled review, so "committers" is no longer the answer, and
 # "the PMC" is what a model guesses about Apache with no record at all
-expect = "named (people|individuals|persons)|(people|persons|individuals|reviewers)\\b[^.]{0,40}\\b(domain('s)? )?policy[^.]{0,15}authori[sz]|(people|persons|individuals|reviewers)\\b[^.]{0,20}authori[sz]ed by (the )?domain('s)? policy|policy-authori[sz]ed (people|individuals|persons|reviewers)"
+expect = "named[*_ ]+(people|persons?|individuals?|reviewers?|maintainers|humans)[^.]{0,40}\\bdomain('s)?[*_]* policy|(people|persons?|individuals?|reviewers?|maintainers|humans)\\b[^.]{0,40}\\bdomain('s)?[*_]* policy[^.]{0,15}authori[sz]|(people|persons?|individuals?|reviewers?|maintainers|humans)\\b[^.]{0,30}authori[sz]ed by [*_]*(the )?domain('s)?[*_]* policy|policy-authori[sz]ed (people|persons?|individuals?|reviewers?|maintainers|humans)"
