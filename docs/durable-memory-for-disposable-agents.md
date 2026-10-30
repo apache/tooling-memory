@@ -163,6 +163,7 @@ The full record, with citations, lineage, and supersession, is in [Appendix A](#
 | **Fact** | Fast. It carries a review date |
 | **Convention** | Needs a named owner; an ownerless one is flagged within days |
 | **Method** | A convention about how to work: a strategy agents reuse ([§10](#10-evolving-the-system)). Like any convention it needs an owner, and it is reviewed more strictly. It cites the facts and decisions it relies on and does not restate them. Each cited fact keeps its own review date and each cited entry its own trust tier, and a failure can be traced to the method or to what it cites [[79]](#ref-79) |
+| **Handoff** | Fastest. It serves the work it hands over. When nothing live still reaches it, the curator lifts what lasts into other entries and the handoff leaves search and the views built on the search index, T0 included. It is not demoted, and `get` still serves it ([Appendix C](#endings)) |
 
 A T0 for one domain:
 
@@ -387,6 +388,7 @@ Auditors are agents whose only job is checking curators. They:
 - sample summaries against the entries they summarise;
 - judge each change against the entries it draws on before they see the curator's reasoning, so they do not start from the curator's argument; [[79]](#ref-79) gives its reviewer the diff alone. A changed entry states its claim and cites its sources, and the reasoning stays out of its body: in the curator's handoff and transcript, and in the why that a promotion carries;
 - hunt contradictions between entries;
+- sample handoffs that left search for what the curator did not lift;
 - watch the canary entries;
 - share no writable state with curators.
 
@@ -1298,6 +1300,8 @@ The historian is the ledger's authoritative store. The current task table is a p
 - An invalidated parent invalidates its live children. An invalidated dependency re-triages its dependents.
 - A holder learns of either from its next heartbeat, stops, and writes a handoff.
 - Tasks blocked past a bound alert. Tasks the world has moved past are invalidated as obsolete.
+- A task is live until it is done or invalidated. A handoff leaves search and the views built on the search index, T0 included, only when nothing live still reaches it: no task in its chain ([§4](#4-trust-and-handling)) is live; no request filed from the chain's tap item is live in any domain; and, for a chain that came from a tap, the tap has posted the chain's result upstream, or will not because the result is above the tap's ceiling. Ending its own task is not enough. The handoff is not demoted, and `get` still serves it, so a task filed for a reopened item reaches it through the predecessor that task cites.
+- Before a handoff leaves search, the curator lifts what lasts. A lifted entry is the curator's, cites the handoff, carries at least the handoff's label, and lands raw; it is promoted through the normal gates ([§4](#4-trust-and-handling)), a lifted method goes to `dom-platform` as a candidate ([§10](#10-evolving-the-system)). Auditors sample handoffs that left search for what the curator did not lift ([§5](#auditors)).
 
 ### Taps
 
