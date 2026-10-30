@@ -54,13 +54,13 @@ keywords = "policy stack federation"
 
 [[question]]
 ask = "What do trust tiers mean, and how does an entry move between them?"
-answers = ["Promotion"]
+answers = ["Promotion", "Four questions, four labels"]
 keywords = "raw curated promotion tier"
 
 [[question]]
 ask = "How does the read path start small, with summaries before bodies?"
 answers = ["Disposable Agents: Search"]
-keywords = "search read path summaries get"
+keywords = "search read path summary get"
 
 [[question]]
 ask = "How does the system detect a vendor changing a model behind a stable name?"
