@@ -990,13 +990,23 @@ impl Memory {
     /// Promote an entry: to curated at once where the policy allows it, by anyone but
     /// its author; to verified only by proposal, which files a task for a person to
     /// approve with [`Memory::approve`]. The entry is never edited in place: a
-    /// promotion is a new version of it, the old one kept in its history.
+    /// promotion is a new version of it, the old one kept in its history. Every
+    /// promotion says why, and the why is kept on the ledger, never in the entry: a
+    /// promotion to curated leaves a completed task that holds it, a proposal to
+    /// verified carries it in its body.
     ///
     /// # Errors
     ///
     /// [`Error::NotFound`] for an entry this session cannot read, [`Error::Denied`]
-    /// when the policy refuses or the entry is already at or above the tier.
+    /// for an empty why, or when the policy refuses or the entry is already at or
+    /// above the tier.
     pub async fn promote(&self, id: &str, to: TrustTier, why: &str) -> Result<Promotion, Error> {
+        let why = why.trim();
+        if why.is_empty() {
+            return Err(Error::Denied(
+                "a promotion says why: what was checked, and against what".into(),
+            ));
+        }
         let f = self.session_filter()?;
         if self.index.lock().await.meta(id, &f)?.is_none() {
             return Err(Error::NotFound(id.to_string()));
@@ -1018,7 +1028,9 @@ impl Memory {
             return Err(Error::Denied(d.reason));
         }
         if to != TrustTier::Verified {
-            return self.set_tier(entry, to).await;
+            let promoted = self.set_tier(entry.clone(), to).await?;
+            self.record_promotion(&entry, to, why).await?;
+            return Ok(promoted);
         }
         let created = self
             .file_own(TaskSpec {
@@ -1094,6 +1106,56 @@ impl Memory {
         .await?;
         l.complete(task_id, &self.author, &id).await?;
         Ok(promoted)
+    }
+
+    /// The record of a promotion made at once: a task the promoter files and completes
+    /// in one step, its body the why and its handoff the entry, so an auditor finds the
+    /// reason beside the change and not in it. A record is not work to triage, so the
+    /// promoter admits it where the domain would leave it proposed.
+    async fn record_promotion(&self, entry: &Entry, to: TrustTier, why: &str) -> Result<(), Error> {
+        let id = &entry.front.id;
+        let mut l = self.ledger.lock().await;
+        let created = self
+            .file_in(
+                &mut l,
+                TaskSpec {
+                    domain: entry.front.domain.clone(),
+                    title: format!(
+                        "Promoted: {to} for {}",
+                        entry.front.title.as_deref().unwrap_or(id)
+                    ),
+                    body: format!(
+                        "`{}` promoted `{id}`, written by `{}`, to {to}.\n\n{why}",
+                        self.author, entry.front.author
+                    ),
+                    requirements: Vec::new(),
+                    depends_on: Vec::new(),
+                    origin: Some(format!("promoted:{id}")),
+                    upstream_event: Some(to.to_string()),
+                    created_by: String::new(),
+                    classification: entry.front.classification,
+                    priority: -1,
+                },
+                Filing::Own,
+                None,
+            )
+            .await?;
+        if created.deduplicated {
+            return Ok(());
+        }
+        let task = created.task;
+        if task.status == dm_ledger::Status::Proposed {
+            l.admit(&task.id).await?;
+        }
+        l.claim(
+            &task.id,
+            &self.author,
+            Duration::minutes(5),
+            &task.spec.requirements,
+        )
+        .await?;
+        l.complete(&task.id, &self.author, id).await?;
+        Ok(())
     }
 
     fn decide_promotion(
@@ -2696,6 +2758,61 @@ mod tests {
             .filter(|p| p.to_string_lossy().contains(&theirs))
             .count();
         assert!(versions >= 2, "the raw version is kept: {versions}");
+    }
+
+    #[tokio::test]
+    async fn a_promotion_to_curated_leaves_its_why_on_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:librarian");
+        agent
+            .promote(&theirs, TrustTier::Curated, "checked against the tree")
+            .await
+            .unwrap();
+        let done = agent
+            .tasks(None, dm_ledger::Status::Completed)
+            .await
+            .unwrap();
+        let origin = format!("promoted:{theirs}");
+        let record = done
+            .iter()
+            .find(|t| t.spec.origin.as_deref() == Some(origin.as_str()))
+            .unwrap_or_else(|| panic!("no completed record of the promotion: {done:?}"));
+        assert!(
+            record.spec.body.contains("checked against the tree"),
+            "{}",
+            record.spec.body
+        );
+        assert_eq!(record.spec.created_by, "agent:librarian");
+        assert_eq!(record.handoff.as_deref(), Some(theirs.as_str()));
+        // the why is kept beside the entry, not in it
+        assert!(!agent
+            .get(&theirs)
+            .await
+            .unwrap()
+            .body
+            .contains("checked against the tree"));
+    }
+
+    #[tokio::test]
+    async fn a_promotion_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:librarian");
+        for to in [TrustTier::Curated, TrustTier::Verified] {
+            let err = agent.promote(&theirs, to, " ").await.unwrap_err();
+            assert!(err.to_string().contains("why"), "{to}: {err}");
+        }
+        assert_eq!(
+            agent.get(&theirs).await.unwrap().front.trust_tier,
+            TrustTier::Raw
+        );
     }
 
     fn walk(dir: &Path) -> Vec<PathBuf> {

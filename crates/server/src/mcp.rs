@@ -194,9 +194,9 @@ pub struct PromoteParams {
     pub id: String,
     /// `curated` or `verified`.
     pub to: String,
-    /// One sentence of why: what was checked, and against what.
-    #[serde(default)]
-    pub why: Option<String>,
+    /// One sentence of why: what was checked, and against what. Required: the ledger
+    /// keeps it beside the entry.
+    pub why: String,
 }
 
 /// Parameters of `write`.
@@ -665,7 +665,7 @@ impl McpServer {
             .ok_or_else(|| McpError::invalid_params("to: curated or verified", None))?;
         let r = self
             .memory
-            .promote(&p.id, to, p.why.as_deref().unwrap_or(""))
+            .promote(&p.id, to, &p.why)
             .await
             .map_err(mcp_err)?;
         ok(serde_json::to_value(r).unwrap_or_default())

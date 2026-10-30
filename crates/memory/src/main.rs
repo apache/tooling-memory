@@ -601,8 +601,8 @@ enum Command {
         /// curated or verified.
         #[arg(long)]
         to: String,
-        /// What was checked, and against what.
-        #[arg(long, default_value = "")]
+        /// What was checked, and against what. Required: the ledger keeps it.
+        #[arg(long)]
         why: String,
     },
     /// Approve a proposal to promote an entry to verified. The approver did not
