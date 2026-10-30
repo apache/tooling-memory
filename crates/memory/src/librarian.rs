@@ -318,7 +318,7 @@ fn survey_entry(
 /// The task that has a curator check a stale entry and correct or re-date it.
 fn verify_body(id: &str) -> String {
     format!(
-        "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}`: its body says what holds now, and its `source` names what shows it. Say what changed and how you know in your handoff, not in the entry, so whoever checks the entry judges it on its sources first. If it holds, also call `promote` with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff."
+        "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}`: its body says what holds now, and its `source` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If it holds, also call `promote` with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff that names the entry you wrote and the one it supersedes, and says what you found and how you know; keep that out of the entry, so whoever checks it judges it on its sources first."
     )
 }
 
@@ -414,7 +414,7 @@ pub async fn file(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -484,11 +484,34 @@ mod tests {
     #[test]
     fn a_corrected_entry_leaves_the_reasoning_to_the_handoff() {
         let body = verify_body("mem-t-1");
-        assert!(
-            body.contains("how you know in your handoff, not in the entry"),
-            "{body}"
-        );
-        assert!(!body.contains("in its body"), "{body}");
+        reasoning_goes_to_the_handoff(&body);
         assert!(body.contains("one sentence of why"), "{body}");
+    }
+
+    /// The rule both curation tasks that correct an entry follow: every sentence that asks
+    /// for the reasoning sends it to the handoff and none sends it to a body; the entry's
+    /// evidence is its `source`, in a form the librarian resolves; and the handoff names the
+    /// entry written, so the reasoning can be found from it.
+    pub(crate) fn reasoning_goes_to_the_handoff(body: &str) {
+        let asks: Vec<&str> = body
+            .split_inclusive(['.', ';'])
+            .filter(|s| s.contains("how you know"))
+            .collect();
+        assert!(!asks.is_empty(), "nothing asks for the reasoning: {body}");
+        for s in asks {
+            assert!(
+                s.contains("handoff"),
+                "the reasoning is not sent to the handoff: {s}"
+            );
+            assert!(!s.contains("body"), "the reasoning is sent to a body: {s}");
+        }
+        assert!(
+            body.contains("`source`") && body.contains("`file:<path>`"),
+            "the evidence and its form are not named: {body}"
+        );
+        assert!(
+            body.contains("names the entry you wrote"),
+            "the handoff is not tied to the entry: {body}"
+        );
     }
 }

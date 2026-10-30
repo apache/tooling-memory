@@ -248,7 +248,7 @@ pub async fn hunt(
 /// The task that has a curator settle a contradiction the checker found.
 fn reconcile_body(model: &str, c: &Contradiction) -> String {
     format!(
-        "The checker, on {model}, found `{}` and `{}` at odds: {}\n\nRead both with `get`. Find out which is right, from the record and the working tree. `write` the corrected entry with `supersedes` naming the wrong one: its body says what is right, and its `source` names what shows it. Say what was wrong and how you know in your handoff, not in the entry, so whoever checks the entry judges it on its sources first; if both are right about different things, give each a title that says which. Change no facts you cannot verify. Leave a handoff.",
+        "The checker, on {model}, found `{}` and `{}` at odds: {}\n\nRead both with `get`. Find out which is right, from the record and the working tree. `write` the corrected entry with `supersedes` naming the wrong one: its body says what is right, and its `source` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If both are right about different things, give each a title that says which. Change no facts you cannot verify. Leave a handoff that names the entry you wrote and the one it supersedes, and says what was wrong and how you know; keep that out of the entry, so whoever checks it judges it on its sources first.",
         c.a,
         c.b,
         if c.why.is_empty() { "no claim named" } else { &c.why }
@@ -367,11 +367,6 @@ mod tests {
             b: "mem-t-2".into(),
             why: "one says MoinMoin stays, the other that it went".into(),
         };
-        let body = reconcile_body("m", &c);
-        assert!(
-            body.contains("how you know in your handoff, not in the entry"),
-            "{body}"
-        );
-        assert!(!body.contains("in its body"), "{body}");
+        crate::librarian::tests::reasoning_goes_to_the_handoff(&reconcile_body("m", &c));
     }
 }
