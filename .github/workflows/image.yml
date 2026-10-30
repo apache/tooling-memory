@@ -84,6 +84,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build the amem binary
+        # staged as `memory`: the Dockerfile copies that file to /opt/memory/memory
         run: cargo build --release --locked -p amem && cp target/release/amem images/harness/memory
       - name: Build the image
         run: docker build --pull -t harness:${{ github.sha }} images/harness

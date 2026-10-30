@@ -1,8 +1,8 @@
 # The harness image: every harness `amem launch` knows but Antigravity, at pinned versions
-# (Muse Code by its release channel), on one base, with the memory binary where the sandbox
-# expects it, and Python for workloads that are programs rather than harnesses, such as a
-# Gofannon agent. The same image on every machine is the point; nothing here depends on what
-# a developer's WSL or laptop contains.
+# (Muse Code by its release channel), on one base, with the amem binary at
+# /opt/memory/memory, where the sandbox expects it, and Python for workloads that are
+# programs rather than harnesses, such as a Gofannon agent. The same image on every machine
+# is the point; nothing here depends on what a developer's WSL or laptop contains.
 #
 # Build with `make image`, which copies the release binary in beside this file.
 FROM ubuntu:24.04

@@ -398,9 +398,10 @@ nothing already in the log.
 record. 304 entries are live: all except the four superseded entries and the one erased
 entry. It replays 172 ledger events. Nothing is behind the log.
 
-**10.3 Exported at a label.** You mark one note public. A public export carries that one
-entry. An internal export carries all 309 entries of `dom-demo`, with the superseded
-ones, but not the platform's domain. The entry erased in 1.4 is in neither export.
+**10.3 Exported at a label.** You write one new note, marked public. A public export
+carries that one entry. An internal export carries all 309 entries of `dom-demo`: the 304
+live, the new note, and the four superseded, but not the platform's domain. The entry
+erased in 1.4 is in neither export.
 
 **10.4 Imported elsewhere.** A second record, under another owner and domain, imports the
 internal bundle: 309 entries. A search of it for DR-19 finds 10 hits.

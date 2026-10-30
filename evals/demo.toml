@@ -27,8 +27,8 @@ expect = "S2"
 
 [[task]]
 id = "asf-pressures"
-prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What ASF stresses that the paper had to answer' list? Give the number."
-expect = "\\b(five|5)\\b"
+prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What the Foundation taught the design' list? Give the number."
+expect = "\\b(six|6)\\b"
 
 [[task]]
 id = "committers-gate"
