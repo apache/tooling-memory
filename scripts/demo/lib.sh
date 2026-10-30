@@ -4,7 +4,7 @@
 set -eu
 root=${1:?demo root}
 here=$(cd "$(dirname "$0")/../.." && pwd)
-memory="$here/target/release/amem"
+memory=${AMEM:-$here/target/release/amem}
 [ -x "$memory" ] || { echo "build first: make build" >&2; exit 2; }
 [ -f "$root/grants.toml" ] || { echo "no record at $root: run the first act, make demo" >&2; exit 2; }
 a() { "$memory" --root "$root" "$@"; }
