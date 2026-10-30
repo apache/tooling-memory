@@ -108,7 +108,7 @@ def lease_for(t, seconds, now):
     """Hold `t` for `seconds` from `now` on the monotonic clock; `lease_until` is the
     same moment on the wall clock, for the caller to read."""
     t["_deadline"] = now + seconds
-    t["lease_until"] = time.time() + seconds
+    t["lease_until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
 
 
 class Fake:
@@ -208,7 +208,7 @@ class Fake:
         t["holder"] = None if FLAW == "no-holder" else "human:fake:owner"
         lease_for(t, lease, now)
         t["attempts"] += 1
-        return {"task": t, "lease_until": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t["lease_until"]))}
+        return {"task": t, "lease_until": t["lease_until"]}
 
     def tool(self, name, a):
         # leases are timed on the monotonic clock: a wall clock that steps back (WSL2's

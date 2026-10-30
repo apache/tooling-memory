@@ -16,7 +16,11 @@
 use dm_core::{Entry, EntryType, Label, ReadFilter, Status, TrustTier};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use std::path::Path;
-use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime};
+use time::{
+    format_description::{well_known::Rfc3339, BorrowedFormatItem},
+    macros::format_description,
+    Date, OffsetDateTime, UtcOffset,
+};
 
 /// What can go wrong at the index.
 #[derive(Debug, thiserror::Error)]
@@ -114,8 +118,21 @@ CREATE INDEX IF NOT EXISTS entries_origin ON entries (origin);
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5 (
     id UNINDEXED, title, summary, body, tokenize = 'porter unicode61'
 );
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '2');
 ";
+
+/// `created` as the index holds it: UTC, with all nine digits of the fraction, so that
+/// text order is time order. RFC 3339 as written is not: `10:00:00Z` sorts after
+/// `10:00:00.5Z`, `.15Z` before `.1Z`, and an offset other than UTC by its local hour.
+/// Schema 1 held the written text; opening such an index rewrites it.
+const SORTABLE: &[BorrowedFormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z");
+
+fn sortable(at: OffsetDateTime) -> String {
+    at.to_offset(UtcOffset::UTC)
+        .format(SORTABLE)
+        .unwrap_or_else(|_| String::from("1970-01-01T00:00:00.000000000Z"))
+}
 
 const HIT_COLUMNS: &str =
     "e.id, e.domain, e.entry_type, e.tier_rank, e.label_rank, e.title, e.summary, e.review_by";
@@ -265,7 +282,39 @@ impl Index {
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;",
         )?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Index { conn })
+        let mut ix = Index { conn };
+        ix.upgrade()?;
+        Ok(ix)
+    }
+
+    /// Bring an index written at schema 1 to schema 2: every `created` rewritten as
+    /// [`SORTABLE`]. A value that does not parse is left for the read to report.
+    fn upgrade(&mut self) -> Result<(), Error> {
+        let schema: String =
+            self.conn
+                .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| {
+                    r.get(0)
+                })?;
+        if schema != "1" {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, created FROM entries")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for (id, created) in rows {
+            if let Ok(at) = OffsetDateTime::parse(&created, &Rfc3339) {
+                tx.execute(
+                    "UPDATE entries SET created = ?1 WHERE id = ?2",
+                    params![sortable(at), id],
+                )?;
+            }
+        }
+        tx.execute("UPDATE meta SET value = '2' WHERE key = 'schema'", [])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Index an entry, replacing whatever the index held for its id.
@@ -282,10 +331,7 @@ impl Index {
 
     fn upsert_in(tx: &rusqlite::Transaction<'_>, entry: &Entry) -> Result<(), Error> {
         let f = &entry.front;
-        let created = f
-            .created
-            .format(&Rfc3339)
-            .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"));
+        let created = sortable(f.created);
         let review_by = f.review_by.map(|d| d.to_string());
         tx.execute(
             "INSERT OR REPLACE INTO entries
@@ -922,6 +968,66 @@ mod tests {
                 .unwrap()),
             vec!["mem-a-old", "mem-a-fact"]
         );
+    }
+
+    // as RFC 3339 text, each of these sorts out of time order against another: a shorter
+    // fraction, no fraction, and an offset other than UTC
+    const WITHIN_A_SECOND: [(&str, OffsetDateTime); 4] = [
+        ("mem-a-whole", datetime!(2026-10-01 10:00:00 UTC)),
+        ("mem-a-tenth", datetime!(2026-10-01 10:00:00.1 UTC)),
+        ("mem-a-tenth-and", datetime!(2026-10-01 10:00:00.15 UTC)),
+        ("mem-a-paris", datetime!(2026-10-01 10:59:59 +01:00)),
+    ];
+    const NEWEST_FIRST: [&str; 4] = [
+        "mem-a-tenth-and",
+        "mem-a-tenth",
+        "mem-a-whole",
+        "mem-a-paris",
+    ];
+
+    fn within_a_second() -> Index {
+        let mut ix = Index::in_memory().unwrap();
+        for (id, created) in WITHIN_A_SECOND {
+            let mut e = entry("dom-a", id, id, "Body.\n");
+            e.front.created = created;
+            ix.upsert(&e).unwrap();
+        }
+        ix
+    }
+
+    #[test]
+    fn list_is_newest_first_within_a_second_and_across_offsets() {
+        let ix = within_a_second();
+        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), NEWEST_FIRST);
+    }
+
+    #[test]
+    fn an_index_at_schema_1_is_rewritten_in_time_order() {
+        let mut ix = within_a_second();
+        // what schema 1 wrote: the frontmatter's RFC 3339 text as it stands
+        for (id, created) in WITHIN_A_SECOND {
+            ix.conn
+                .execute(
+                    "UPDATE entries SET created = ?1 WHERE id = ?2",
+                    params![created.format(&Rfc3339).unwrap(), id],
+                )
+                .unwrap();
+        }
+        ix.conn
+            .execute("UPDATE meta SET value = '1' WHERE key = 'schema'", [])
+            .unwrap();
+        assert_ne!(ids(&ix.list(&any(), None, 10).unwrap()), NEWEST_FIRST);
+        ix.upgrade().unwrap();
+        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), NEWEST_FIRST);
+        let schema: String = ix
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(schema, "2");
+        let m = ix.meta("mem-a-paris", &any()).unwrap().unwrap();
+        assert_eq!(m.created, datetime!(2026-10-01 09:59:59 UTC));
     }
 
     #[test]

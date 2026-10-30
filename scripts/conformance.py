@@ -650,17 +650,28 @@ class Run:
             t2 = task_of(s.call("create_task", title=f"Left behind {self.only}", body="Claimed, then abandoned.", domain=d), "create_task")
             tid2 = t2["id"]
             s.call("admit_task", id=tid2)
-            t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease)
+            got = s.call("claim_next", domain=d, lease_seconds=lease)
+            t = self.claimed(got, "claim_next", lease)
+            first = when(str(got.get("lease_until", "")))
             self.check(t.get("id") == tid2, "the second task was not claimed")
-            print(f"   holding the lease across {lease}s with one heartbeat, then letting it lapse")
+            print(f"   holding the lease past {lease}s with one heartbeat, then letting it lapse")
+            # the heartbeat renews for twice the lease, so the check after it stands clear
+            # of both ends: the first lease lapsed a quarter of a lease before, and the
+            # renewed one has more than a lease to run. A stalled call or a clock that
+            # steps a few seconds moves neither end past the check
             time.sleep(lease * 0.5)
-            s.call("heartbeat", id=tid2, lease_seconds=lease)
-            time.sleep(lease * 0.7)
+            beat = task_of(s.call("heartbeat", id=tid2, lease_seconds=2 * lease), "heartbeat")
+            renewed = when(str(beat.get("lease_until", "")))
+            self.check(
+                first is not None and renewed is not None and renewed - first >= lease,
+                f"heartbeat did not renew it: lease_until went from {first} to {renewed}",
+            )
+            time.sleep(lease * 0.75)
             self.check(
                 task_of(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next") is None,
                 "a renewed lease lapsed where the first one would have: heartbeat did not renew it",
             )
-            time.sleep(lease + 2)
+            time.sleep(lease * 1.25 + 5)
             s.refused("heartbeat", id=tid2, lease_seconds=lease)
             s.refused("complete", id=tid2, handoff=h)
             t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease, "the task whose lease lapsed")

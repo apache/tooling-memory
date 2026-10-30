@@ -270,10 +270,26 @@ pub struct Memory {
     playback: OnceLock<std::sync::Arc<tape::Playback>>,
     /// This session's own tape, as it is kept.
     recording: Mutex<tape::Recording>,
+    /// When this service last stamped a write; see [`next_stamp`].
+    last_stamp: Mutex<OffsetDateTime>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The time to stamp a write with: `now`, or a nanosecond after the last stamp when the
+/// clock reads no later than that. A system clock can step back (a VM's does, when the
+/// host resyncs it), and a write made after another must not be dated before it, or
+/// newest-first puts it second.
+fn next_stamp(last: &mut OffsetDateTime, now: OffsetDateTime) -> OffsetDateTime {
+    let at = if now > *last {
+        now
+    } else {
+        *last + Duration::nanoseconds(1)
+    };
+    *last = at;
+    at
 }
 
 /// What a fan-out filed: the subagent tasks, the ones it did not file because the same
@@ -394,6 +410,7 @@ impl Memory {
             tools: OnceLock::new(),
             playback: OnceLock::new(),
             recording: Mutex::new(tape::Recording::default()),
+            last_stamp: Mutex::new(OffsetDateTime::UNIX_EPOCH),
         })
     }
 
@@ -910,7 +927,7 @@ impl Memory {
                 .classification_for_write(&domain, req.classification, &s)
                 .ok_or_else(|| Error::Denied(format!("domain {domain} is not granted")))?
         };
-        let now = OffsetDateTime::now_utc();
+        let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
         // facts decay fast and carry mandatory review dates (the paper, §4): one written
         // without a date gets one ninety days out, which the librarian enforces
         let review_by = req.review_by.or_else(|| {
@@ -2318,6 +2335,19 @@ mod tests {
 
     fn mem(dir: &Path) -> Memory {
         Memory::init(dir, "human:test:me", "dom-me").unwrap()
+    }
+
+    #[test]
+    fn a_stamp_never_goes_back_when_the_clock_does() {
+        let t = time::macros::datetime!(2026-10-01 10:00:00 UTC);
+        let mut last = OffsetDateTime::UNIX_EPOCH;
+        assert_eq!(next_stamp(&mut last, t), t);
+        let stepped_back = next_stamp(&mut last, t - Duration::seconds(3));
+        assert!(stepped_back > t, "{stepped_back} is not after {t}");
+        let same = next_stamp(&mut last, stepped_back);
+        assert!(same > stepped_back, "{same} is not after {stepped_back}");
+        let later = t + Duration::seconds(1);
+        assert_eq!(next_stamp(&mut last, later), later);
     }
 
     fn req(body: &str) -> WriteRequest {
