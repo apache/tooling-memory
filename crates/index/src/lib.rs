@@ -14,13 +14,9 @@
 //! (Solr, Tantivy) would implement the same methods; the surface is what matters.
 
 use dm_core::{Entry, EntryType, Label, ReadFilter, Status, TrustTier};
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
 use std::path::Path;
-use time::{
-    format_description::{well_known::Rfc3339, BorrowedFormatItem},
-    macros::format_description,
-    Date, OffsetDateTime, UtcOffset,
-};
+use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime};
 
 /// What can go wrong at the index.
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +98,8 @@ CREATE TABLE IF NOT EXISTS entries (
     entry_type     TEXT NOT NULL,
     author         TEXT NOT NULL,
     created        TEXT NOT NULL,
+    created_unix   INTEGER,
+    created_nanos  INTEGER,
     review_by      TEXT,
     tier_rank      INTEGER NOT NULL,
     label_rank     INTEGER NOT NULL,
@@ -118,20 +116,19 @@ CREATE INDEX IF NOT EXISTS entries_origin ON entries (origin);
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5 (
     id UNINDEXED, title, summary, body, tokenize = 'porter unicode61'
 );
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '2');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
 ";
 
-/// `created` as the index holds it: UTC, with all nine digits of the fraction, so that
-/// text order is time order. RFC 3339 as written is not: `10:00:00Z` sorts after
-/// `10:00:00.5Z`, `.15Z` before `.1Z`, and an offset other than UTC by its local hour.
-/// Schema 1 held the written text; opening such an index rewrites it.
-const SORTABLE: &[BorrowedFormatItem<'_>] =
-    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z");
+/// The order of `created`: whole seconds since the Unix epoch, then the nanoseconds within
+/// that second. `created` itself is the frontmatter's RFC 3339 text, which does not sort
+/// as text: `10:00:00Z` sorts after `10:00:00.5Z`, `.15Z` before `.1Z`, and an offset other
+/// than UTC by its local hour. Both are integers, so a year at either end of what the
+/// frontmatter accepts still has a place. An older binary writes rows without them;
+/// [`Index::sort_keys`] fills those in on the next open.
+const NEWEST_FIRST: &str = "e.created_unix DESC, e.created_nanos DESC";
 
-fn sortable(at: OffsetDateTime) -> String {
-    at.to_offset(UtcOffset::UTC)
-        .format(SORTABLE)
-        .unwrap_or_else(|_| String::from("1970-01-01T00:00:00.000000000Z"))
+fn sort_key(at: OffsetDateTime) -> (i64, i64) {
+    (at.unix_timestamp(), i64::from(at.nanosecond()))
 }
 
 const HIT_COLUMNS: &str =
@@ -283,38 +280,78 @@ impl Index {
         )?;
         conn.execute_batch(SCHEMA)?;
         let mut ix = Index { conn };
-        ix.upgrade()?;
+        ix.sort_keys()?;
         Ok(ix)
     }
 
-    /// Bring an index written at schema 1 to schema 2: every `created` rewritten as
-    /// [`SORTABLE`]. A value that does not parse is left for the read to report.
-    fn upgrade(&mut self) -> Result<(), Error> {
-        let schema: String =
-            self.conn
-                .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| {
-                    r.get(0)
-                })?;
-        if schema != "1" {
+    /// Give every row its sort key: add the columns to an index made before they existed,
+    /// and fill in the rows written without them. Looks first without a lock, so an open
+    /// with nothing to do writes nothing; the work itself holds the write lock from its
+    /// first read, so two processes opening at once do it once.
+    fn sort_keys(&mut self) -> Result<(), Error> {
+        if self.sort_keys_done()? {
             return Ok(());
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'created_unix'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has == 0 {
+            tx.execute_batch(
+                "ALTER TABLE entries ADD COLUMN created_unix INTEGER;
+                 ALTER TABLE entries ADD COLUMN created_nanos INTEGER;",
+            )?;
+        }
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS entries_created ON entries (created_unix, created_nanos);",
+        )?;
         let rows: Vec<(String, String)> = {
-            let mut stmt = tx.prepare("SELECT id, created FROM entries")?;
+            let mut stmt =
+                tx.prepare("SELECT id, created FROM entries WHERE created_unix IS NULL")?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<Result<_, _>>()?
         };
         for (id, created) in rows {
+            // a value that does not parse is left for the read to report as a bad row
             if let Ok(at) = OffsetDateTime::parse(&created, &Rfc3339) {
+                let (unix, nanos) = sort_key(at);
                 tx.execute(
-                    "UPDATE entries SET created = ?1 WHERE id = ?2",
-                    params![sortable(at), id],
+                    "UPDATE entries SET created_unix = ?1, created_nanos = ?2 WHERE id = ?3",
+                    params![unix, nanos, id],
                 )?;
             }
         }
-        tx.execute("UPDATE meta SET value = '2' WHERE key = 'schema'", [])?;
         tx.commit()?;
         Ok(())
+    }
+
+    fn sort_keys_done(&self) -> Result<bool, Error> {
+        let has: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'created_unix'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has == 0 {
+            return Ok(false);
+        }
+        let indexed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'entries_created'",
+            [],
+            |r| r.get(0),
+        )?;
+        let missing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM entries WHERE created_unix IS NULL LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(indexed == 1 && missing.is_none())
     }
 
     /// Index an entry, replacing whatever the index held for its id.
@@ -331,13 +368,17 @@ impl Index {
 
     fn upsert_in(tx: &rusqlite::Transaction<'_>, entry: &Entry) -> Result<(), Error> {
         let f = &entry.front;
-        let created = sortable(f.created);
+        let created = f
+            .created
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"));
         let review_by = f.review_by.map(|d| d.to_string());
+        let (created_unix, created_nanos) = sort_key(f.created);
         tx.execute(
             "INSERT OR REPLACE INTO entries
              (id, domain, entry_type, author, created, review_by, tier_rank, label_rank,
-              status, supersedes, origin, title, summary, digest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              status, supersedes, origin, title, summary, digest, created_unix, created_nanos)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 f.id,
                 f.domain,
@@ -353,6 +394,8 @@ impl Index {
                 entry.title(),
                 entry.summary(),
                 dm_core::digest(&entry.render()),
+                created_unix,
+                created_nanos,
             ],
         )?;
         tx.execute("DELETE FROM entries_fts WHERE id = ?1", params![f.id])?;
@@ -497,7 +540,7 @@ impl Index {
             "SELECT {HIT_COLUMNS}, bm25(entries_fts, 0.0, 10.0, 5.0, 1.0) AS score
              FROM entries_fts f JOIN entries e ON e.id = f.id
              WHERE entries_fts MATCH ?1{where_sql}
-             ORDER BY score, e.created DESC
+             ORDER BY score, {NEWEST_FIRST}
              LIMIT {}",
             limit.max(1)
         );
@@ -546,7 +589,7 @@ impl Index {
         values.insert(0, kind.map_or_else(String::new, |k| k.to_string()).into());
         let sql = format!(
             "SELECT {HIT_COLUMNS} FROM entries e WHERE 1 = 1{kind_sql}{where_sql}
-             ORDER BY e.created DESC LIMIT {}",
+             ORDER BY {NEWEST_FIRST} LIMIT {}",
             limit.max(1)
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -570,7 +613,7 @@ impl Index {
         let sql = format!(
             "SELECT {HIT_COLUMNS} FROM entries e
              WHERE e.review_by IS NOT NULL AND e.review_by <= ?1{where_sql}
-             ORDER BY e.review_by, e.created LIMIT {}",
+             ORDER BY e.review_by, e.created_unix, e.created_nanos LIMIT {}",
             limit.max(1)
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -598,7 +641,7 @@ impl Index {
              )
              SELECT e.id FROM chain c JOIN entries e ON e.id = c.id
              WHERE e.status IS NULL{where_sql}
-             ORDER BY c.depth DESC, e.created DESC LIMIT 1"
+             ORDER BY c.depth DESC, {NEWEST_FIRST} LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params_from_iter(values))?;
@@ -978,18 +1021,18 @@ mod tests {
         ("mem-a-tenth-and", datetime!(2026-10-01 10:00:00.15 UTC)),
         ("mem-a-paris", datetime!(2026-10-01 10:59:59 +01:00)),
     ];
-    const NEWEST_FIRST: [&str; 4] = [
+    const IN_TIME_ORDER: [&str; 4] = [
         "mem-a-tenth-and",
         "mem-a-tenth",
         "mem-a-whole",
         "mem-a-paris",
     ];
 
-    fn within_a_second() -> Index {
+    fn holding(at: &[(&str, OffsetDateTime)]) -> Index {
         let mut ix = Index::in_memory().unwrap();
-        for (id, created) in WITHIN_A_SECOND {
+        for (id, created) in at {
             let mut e = entry("dom-a", id, id, "Body.\n");
-            e.front.created = created;
+            e.front.created = *created;
             ix.upsert(&e).unwrap();
         }
         ix
@@ -997,37 +1040,53 @@ mod tests {
 
     #[test]
     fn list_is_newest_first_within_a_second_and_across_offsets() {
-        let ix = within_a_second();
-        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), NEWEST_FIRST);
+        let ix = holding(&WITHIN_A_SECOND);
+        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), IN_TIME_ORDER);
     }
 
     #[test]
-    fn an_index_at_schema_1_is_rewritten_in_time_order() {
-        let mut ix = within_a_second();
-        // what schema 1 wrote: the frontmatter's RFC 3339 text as it stands
-        for (id, created) in WITHIN_A_SECOND {
-            ix.conn
-                .execute(
-                    "UPDATE entries SET created = ?1 WHERE id = ?2",
-                    params![created.format(&Rfc3339).unwrap(), id],
-                )
-                .unwrap();
+    fn a_created_at_either_end_of_the_years_is_indexed_ordered_and_read_back() {
+        // each is a year the frontmatter accepts whose UTC instant is a year outside it
+        let ends = [
+            ("mem-a-late", datetime!(9999-12-31 23:30:00 -01:00)),
+            ("mem-a-early", datetime!(0000-01-01 00:30:00 +01:00)),
+            ("mem-a-now", datetime!(2026-10-01 10:00:00 UTC)),
+        ];
+        let ix = holding(&ends);
+        assert_eq!(
+            ids(&ix.list(&any(), None, 10).unwrap()),
+            ["mem-a-late", "mem-a-now", "mem-a-early"]
+        );
+        for (id, created) in ends {
+            let m = ix.meta(id, &any()).unwrap().unwrap();
+            assert_eq!(m.created, created, "{id}");
         }
+    }
+
+    #[test]
+    fn an_index_from_before_the_sort_key_gets_it_on_open() {
+        let mut ix = holding(&WITHIN_A_SECOND);
+        // the table as an index made before the columns existed has it, and a row as an
+        // older binary writes one: no sort key
         ix.conn
-            .execute("UPDATE meta SET value = '1' WHERE key = 'schema'", [])
+            .execute_batch(
+                "DROP INDEX entries_created;
+                 ALTER TABLE entries DROP COLUMN created_unix;
+                 ALTER TABLE entries DROP COLUMN created_nanos;",
+            )
             .unwrap();
-        assert_ne!(ids(&ix.list(&any(), None, 10).unwrap()), NEWEST_FIRST);
-        ix.upgrade().unwrap();
-        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), NEWEST_FIRST);
-        let schema: String = ix
-            .conn
-            .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| {
-                r.get(0)
-            })
+        ix.sort_keys().unwrap();
+        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), IN_TIME_ORDER);
+        ix.conn
+            .execute(
+                "UPDATE entries SET created_unix = NULL, created_nanos = NULL",
+                [],
+            )
             .unwrap();
-        assert_eq!(schema, "2");
-        let m = ix.meta("mem-a-paris", &any()).unwrap().unwrap();
-        assert_eq!(m.created, datetime!(2026-10-01 09:59:59 UTC));
+        assert_ne!(ids(&ix.list(&any(), None, 10).unwrap()), IN_TIME_ORDER);
+        ix.sort_keys().unwrap();
+        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), IN_TIME_ORDER);
+        assert!(ix.sort_keys_done().unwrap());
     }
 
     #[test]

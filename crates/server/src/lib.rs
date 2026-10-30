@@ -278,12 +278,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// How far back the clock may step and still have this service's writes dated after the
+/// last one. A VM's clock steps back by seconds when the host resyncs it; a clock that
+/// was wrong by more than this was wrong, and writes go back to it.
+const STAMP_STEP: Duration = Duration::minutes(1);
+
 /// The time to stamp a write with: `now`, or a nanosecond after the last stamp when the
-/// clock reads no later than that. A system clock can step back (a VM's does, when the
-/// host resyncs it), and a write made after another must not be dated before it, or
-/// newest-first puts it second.
+/// clock reads no later than that and no more than [`STAMP_STEP`] before it. A write
+/// this service makes after another must not be dated before it, or newest-first puts
+/// it second. The last stamp is this service's own, so writes from another process on
+/// the same record are ordered by their own clocks.
 fn next_stamp(last: &mut OffsetDateTime, now: OffsetDateTime) -> OffsetDateTime {
-    let at = if now > *last {
+    let at = if now > *last || *last - now > STAMP_STEP {
         now
     } else {
         *last + Duration::nanoseconds(1)
@@ -2339,15 +2345,29 @@ mod tests {
 
     #[test]
     fn a_stamp_never_goes_back_when_the_clock_does() {
+        let ns = Duration::nanoseconds;
         let t = time::macros::datetime!(2026-10-01 10:00:00 UTC);
         let mut last = OffsetDateTime::UNIX_EPOCH;
         assert_eq!(next_stamp(&mut last, t), t);
-        let stepped_back = next_stamp(&mut last, t - Duration::seconds(3));
-        assert!(stepped_back > t, "{stepped_back} is not after {t}");
-        let same = next_stamp(&mut last, stepped_back);
-        assert!(same > stepped_back, "{same} is not after {stepped_back}");
+        assert_eq!(next_stamp(&mut last, t - Duration::seconds(3)), t + ns(1));
+        assert_eq!(next_stamp(&mut last, t), t + ns(2));
         let later = t + Duration::seconds(1);
         assert_eq!(next_stamp(&mut last, later), later);
+        // a clock that read an hour ahead once and was then put right: back to the clock
+        let corrected = later - Duration::hours(1);
+        assert_eq!(next_stamp(&mut last, corrected), corrected);
+    }
+
+    #[tokio::test]
+    async fn a_write_after_a_clock_step_back_is_dated_after_the_last_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        // as if the clock read 30 seconds later at the last write than it does now
+        let ahead = OffsetDateTime::now_utc() + Duration::seconds(30);
+        *lock(&m.last_stamp) = ahead;
+        let w = m.write(req("Written after the step.\n")).await.unwrap();
+        let e = m.store.get("dom-me", &w.id).await.unwrap().unwrap();
+        assert_eq!(e.front.created, ahead + Duration::nanoseconds(1));
     }
 
     fn req(body: &str) -> WriteRequest {

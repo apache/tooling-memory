@@ -43,6 +43,7 @@ run search-bodies search-bodies --operator "python3 $fake operator"
 run second-claim second-claim
 run lease-forever lease-forever
 run heartbeat-noop heartbeat-noop
+run heartbeat-lies heartbeat-lies
 run release-lies release-lies
 run complete-anyone complete-anyone
 run no-holder no-holder
@@ -83,7 +84,8 @@ expect search-everything 1 '5 of 7 steps passed; FAILED: 4, 7' 'search for a wor
 expect search-bodies 1 '6 of 7 steps passed; FAILED: 4' 'search at summary depth returned a body'
 expect second-claim 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'a second claim_next while the lease holds returned a task'
 expect lease-forever 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat {"id": "task-fake-0004", "lease_seconds": 2} was answered, not refused'
-expect heartbeat-noop 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat did not renew it'
+expect heartbeat-noop 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat did not renew it: lease_until went from'
+expect heartbeat-lies 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'a renewed lease lapsed where the first one would have'
 expect release-lies 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'expecting the released task back from the pool'
 expect complete-anyone 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'complete {"id": "task-fake-0004", "handoff": "mem-fake-0002"} was answered, not refused'
 expect no-holder 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'the claimed task names no holder'

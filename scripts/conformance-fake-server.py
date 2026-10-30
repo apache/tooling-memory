@@ -15,6 +15,7 @@ could have, so the test can show which step of conformance.py catches it:
     second-claim        claim_next hands out a task somebody holds
     lease-forever       a lapsed lease is still renewed, and the task not returned
     heartbeat-noop      heartbeat answers but does not extend the lease
+    heartbeat-lies      heartbeat reports a renewed lease_until but does not extend the lease
     release-lies        release answers admitted and leaves the task claimed
     complete-anyone     complete works on a task nobody holds
     no-holder           a claim records no holder
@@ -269,7 +270,10 @@ class Fake:
             t = self.task(a["id"])
             if t["status"] != "claimed" or (t["_deadline"] < now and FLAW != "lease-forever"):
                 raise Refused("the lease is not held: it expired or was never yours")
-            if FLAW != "heartbeat-noop":
+            if FLAW == "heartbeat-lies":
+                seconds = a.get("lease_seconds") or 1800
+                t["lease_until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+            elif FLAW != "heartbeat-noop":
                 lease_for(t, a.get("lease_seconds") or 1800, now)
             return {"task": t}
         if name == "complete":

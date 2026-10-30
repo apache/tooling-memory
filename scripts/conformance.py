@@ -655,12 +655,14 @@ class Run:
             first = when(str(got.get("lease_until", "")))
             self.check(t.get("id") == tid2, "the second task was not claimed")
             print(f"   holding the lease past {lease}s with one heartbeat, then letting it lapse")
-            # the heartbeat renews for twice the lease, so the check after it stands clear
-            # of both ends: the first lease lapsed a quarter of a lease before, and the
-            # renewed one has more than a lease to run. A stalled call or a clock that
-            # steps a few seconds moves neither end past the check
+            # the heartbeat renews for three leases, so each check stands clear of the ends
+            # it sits between, by a quarter of a lease or more: the renewal moves
+            # lease_until on by two and a half leases against the one asked for; the claim
+            # check falls after the first lease lapsed and two leases before the renewed one
+            # does; and the lapse check comes a lease after that. A stalled call, or a
+            # server clock that steps by less than those margins, moves no end past a check
             time.sleep(lease * 0.5)
-            beat = task_of(s.call("heartbeat", id=tid2, lease_seconds=2 * lease), "heartbeat")
+            beat = task_of(s.call("heartbeat", id=tid2, lease_seconds=3 * lease), "heartbeat")
             renewed = when(str(beat.get("lease_until", "")))
             self.check(
                 first is not None and renewed is not None and renewed - first >= lease,
@@ -671,7 +673,7 @@ class Run:
                 task_of(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next") is None,
                 "a renewed lease lapsed where the first one would have: heartbeat did not renew it",
             )
-            time.sleep(lease * 1.25 + 5)
+            time.sleep(lease * 3.25)
             s.refused("heartbeat", id=tid2, lease_seconds=lease)
             s.refused("complete", id=tid2, handoff=h)
             t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease, "the task whose lease lapsed")
