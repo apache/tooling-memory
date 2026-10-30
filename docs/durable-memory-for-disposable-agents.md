@@ -632,6 +632,8 @@ Most work already arrives in issue trackers, ticket queues, and incident tools. 
 - **Ownership** does not move. The tracker stays canonical for the item, the ledger for the task, and the tracker's owner closes the item; the fleet only proposes.
 - **Replays are safe.** Taps are idempotent on origin, so replaying a tracker's history creates nothing twice.
 
+Some items belong to more than one domain: a meeting that covers three projects, a mailing list that spans components. The item stays with the domain the registry names, and that domain's triage finds the parts another domain owns. For each such part the orchestrator files a request task on the owner's ledger, as for any work [across domains](#across-domains), and the owner triages it against its own rubric. Triage may score the content (names, people, explicit mentions [[80]](#ref-80)) to propose the owner, but the score never decides alone, because content can be written to steer its own routing; a close call between candidate owners goes to the owner of the item's domain. The request is filed by a session that read the item, so it carries at least the item's label, and only a guard can lower that ([§4](#4-trust-and-handling)). [Appendix C](#appendix-c-ledger-semantics) gives the rules.
+
 ## Across domains
 
 Domains work together the way services do. When `dom-a` needs something `dom-b` owns, its orchestrator:
@@ -1305,12 +1307,16 @@ The historian is the ledger's authoritative store. The current task table is a p
 
 ### Taps
 
-- Admission deduplicates on `origin` among a domain's live tasks, so one item is one live task. An issue and the change that fixes it are related tasks, not one.
+- Admission deduplicates on `origin` among a domain's live tasks, so one item is one live task. An issue and the change that fixes it are related tasks, not one. A request for a part of an item that belongs to more than one domain ([§8](#taps)) is the exception: dedup is on `origin` plus a hash of the part, so each part is one request.
 - An upstream close invalidates a live task and confirms a finished one. A reopen creates a new task citing its predecessor.
 - Taps are idempotent on origin and upstream event, and the origin index keeps every origin it has seen.
 - Taps reconcile by pull on a schedule. A webhook may hasten a pull but is never relied on.
 - When the registry moves a repository to another domain, its live tasks move with it.
 - Outbound writes carry the fleet's identity, which is how a tap ignores its own echoes.
+- A request for another domain's part of an item cites the item as its `origin` and says which part it is. For raw reach ([§4](#4-trust-and-handling)) it counts as a task created from the item. Its label is at least the item's, so only sessions whose handling covers that label can claim it. For other sessions, the filing session proposes a `declassify` that carries only the part ([§4](#4-trust-and-handling)). Once a guard approves it, a session that has read only the declassified entry files a new request with the same `origin` that cites it, its part hash taken over the declassified text. The item's domain flags the original request, and the receiving domain invalidates it as obsolete; a holder stops at its next heartbeat. A receiving session follows the citation only where its own grants allow.
+- When the item closes upstream, its own domain's task is invalidated or confirmed as above. A request filed from it in another domain is only flagged, and that domain decides whether to invalidate it.
+- The item's domain policy caps the requests filed from one item, so one item cannot fan out across every domain's ledger. Parts over the cap go to the owner of the item's domain.
+- A request the receiver invalidates as invalid, because the part is not its own, counts as a misroute. When one source keeps sending parts to the same other domain, the curator proposes a registry change, and a person decides it.
 
 ### Delegation
 
