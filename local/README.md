@@ -1086,6 +1086,8 @@ it left. Thus the script measures all conditions in the same way. The results go
 condition, the input, cached and output tokens, and the seconds.
 
 We measured on 9 October over the demo record, with four questions for each condition.
+Since then, the case study changed, and two tasks changed with it: `asf-pressures` and
+`committers-gate`. The results below are for the tasks as they were on 9 October.
 
 Claude Code on a Max login:
 

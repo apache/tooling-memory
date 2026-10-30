@@ -6,7 +6,7 @@
 #   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
 #   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex --auth gateway --model qwen3.8-27b
 #
-# Seed the record first: scripts/demo.sh ~/memory-demo2 <markdown-dir>...
+# Seed the record first: make demo-ready DEMO_ROOT=~/memory-demo2
 
 # Put in front of every prompt, under every condition alike. A harness given a memory
 # server does not always think to ask it; a task run says so in its prompt, and so does
@@ -28,9 +28,13 @@ expect = "S2"
 [[task]]
 id = "asf-pressures"
 prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What the Foundation taught the design' list? Give the number."
-expect = "\\b(six|6)\\b"
+# the part cites "paper §6" and another part is "6. Trust and review", so a bare "6" is
+# not enough: the number leads the answer, or it counts the pressures
+expect = "^\\W*(six|6)\\b|\\b(six|6) (pressures|rows)\\b"
 
 [[task]]
 id = "committers-gate"
 prompt = "In the 'Seeding a Foundation' notes on trust and review, who is the promotion gate? One sentence."
-expect = "committer"
+# the gate is named people that domain policy authorises, under PMC oversight; the case
+# study gives committers sampled review, so "committers" is no longer the answer
+expect = "(named people|authori[sz]ed by (the )?domain policy|PMC)"

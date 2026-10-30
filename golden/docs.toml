@@ -8,14 +8,14 @@
 domain = "dom-demo"
 
 [[question]]
-ask = "How does recall decide between pushing sections and letting the caller pull, and what does the paper say about caller-executed recall?"
-answers = ["Serving bindings"]
-keywords = "recall caller-executed sampling deputy"
+ask = "What does the recall deputy do, and why can a low-privilege caller not launder reads through it?"
+answers = ["The recall deputy"]
+keywords = "recall deputy brief caller filter"
 
 [[question]]
 ask = "Who pays for recall at a foundation, and which principals get it server-side?"
-answers = ["Serving, identity, and who pays"]
-keywords = "recall committer public tier caller-executed"
+answers = ["Serving and who pays"]
+keywords = "recall committer server-side budget"
 
 [[question]]
 ask = "Why is the domain the partition key everywhere?"
@@ -24,8 +24,8 @@ keywords = "domain partition key"
 
 [[question]]
 ask = "What label does an entry get when a session writes after reading restricted material?"
-answers = ["Information flow"]
-keywords = "write inherit label classification"
+answers = ["Labels and flow"]
+keywords = "write label rises restricted classification"
 
 [[question]]
 ask = "What happens when an entry must be erased, and what remains in its place?"
@@ -33,9 +33,9 @@ answers = ["Erasure"]
 keywords = "erasure stub receipt"
 
 [[question]]
-ask = "How is a rogue or defective librarian contained?"
-answers = ["Containing the librarian"]
-keywords = "librarian contain audit tombstone"
+ask = "How is a wrong or compromised curator contained?"
+answers = ["Containing the Curator"]
+keywords = "curator contain auditors reversible diff"
 
 [[question]]
 ask = "Which three uses does WebAssembly have in the stack?"
@@ -54,23 +54,23 @@ keywords = "policy stack federation"
 
 [[question]]
 ask = "What do trust tiers mean, and how does an entry move between them?"
-answers = ["Tiers"]
-keywords = "trust tier raw curated promotion"
+answers = ["Promotion"]
+keywords = "raw curated promotion tier"
 
 [[question]]
-ask = "What is progressive disclosure in retrieval?"
-answers = ["Progressive disclosure"]
-keywords = "progressive disclosure summaries"
+ask = "How does the read path start small, with summaries before bodies?"
+answers = ["Disposable Agents: Search"]
+keywords = "search read path summaries get"
 
 [[question]]
-ask = "How does the system detect a vendor changing a model without announcing it?"
-answers = ["Detecting unadvertised vendor change"]
-keywords = "vendor change pin drift"
+ask = "How does the system detect a vendor changing a model behind a stable name?"
+answers = ["Vendor changes nobody announced"]
+keywords = "vendor model probe detector drift"
 
 [[question]]
 ask = "What can a task's requirements field be abused for, and what guards it?"
-answers = ["The task fabric"]
-keywords = "task requirements inflation admission"
+answers = ["A task's life"]
+keywords = "task requirements guard admission"
 
 [[question]]
 ask = "Which sources become entries at the foundation, and how do they get there?"
