@@ -3619,6 +3619,137 @@ mod tests {
             (&a.spec.why, &a.spec.by, a.spec.tier, a.at),
             (&b.spec.why, &b.spec.by, b.spec.tier, b.at)
         );
+        // landing sets the origin, so the text here is not the bundle's: the record
+        // names the version as it landed, or it reads as a promotion that never landed
+        assert!(
+            after[0].landed,
+            "the restored record names the landed version"
+        );
+        assert_eq!(
+            a.spec.new_digest,
+            dm_core::digest(&there.get(landed).await.unwrap().render())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_record_is_at_least_as_classified_as_its_entry_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("The public fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(&id, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, bundle.path())
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        mem(home.path());
+        // a domain whose default is internal raises a public entry to internal on import
+        grant_domain(home.path(), "dom-x");
+        let there = Memory::open(home.path()).unwrap();
+        let im = there.import(bundle.path(), Some("dom-x")).await.unwrap();
+        let landed = &im.landed[&id];
+        assert_eq!(
+            there.get(landed).await.unwrap().front.classification,
+            Label::Internal
+        );
+        let after = there.promotions(landed).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].record.spec.classification,
+            Label::Internal,
+            "the record is raised with its entry"
+        );
+    }
+
+    /// An import whose ledger fails after the entries landed owes their records; the next
+    /// import skips the entries, since they are here, and restores the records.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_import_restores_the_records_the_first_could_not() {
+        let (_dir, _owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        let home = tempfile::tempdir().unwrap();
+        mem(home.path());
+        // a session opened on a ledger it cannot write
+        let kept = ledger_read_only(home.path());
+        let failing = Memory::open(home.path()).unwrap();
+        let failed = failing.import(bundle.path(), None).await;
+        drop(failing);
+        put_back(kept);
+        // the log and the shared memory the failing session made took the file's mode
+        for name in ["ledger.db-wal", "ledger.db-shm"] {
+            use std::os::unix::fs::PermissionsExt;
+            let path = home.path().join("state").join(name);
+            if path.exists() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        assert!(
+            matches!(failed, Err(Error::Ledger(_))),
+            "the ledger could not take the records: {failed:?}"
+        );
+        let there = Memory::open(home.path()).unwrap();
+        assert_eq!(
+            there.get(&id).await.unwrap().front.trust_tier,
+            TrustTier::Curated,
+            "but the entry landed"
+        );
+        assert!(there.promotions(&id).await.unwrap().is_empty());
+        let again = there.import(bundle.path(), None).await.unwrap();
+        assert_eq!(again.skipped, vec![id.clone()], "the entry is here already");
+        assert_eq!(again.promotions.len(), 1, "{again:?}");
+        let after = there.promotions(&id).await.unwrap();
+        assert_eq!(after.len(), 1, "its record is here now: {after:?}");
+        assert_eq!(after[0].record.spec.why, WHY);
+        assert!(after[0].landed);
+        let third = there.import(bundle.path(), None).await.unwrap();
+        assert_eq!(there.promotions(&id).await.unwrap().len(), 1, "{third:?}");
+    }
+
+    /// A record is restored for an entry that is here, and for no other: one refused
+    /// because its text was erased here keeps its erased why.
+    #[tokio::test]
+    async fn no_record_is_restored_for_an_entry_that_is_not_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let kept = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let gone = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        lib.promote(&kept, TrustTier::Curated, WHY).await.unwrap();
+        lib.promote(&gone, TrustTier::Curated, &format!("tried {marker}"))
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, bundle.path())
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        there.import(bundle.path(), None).await.unwrap();
+        there.erase(&gone, Reason::Requested).await.unwrap();
+        let again = there.import(bundle.path(), None).await.unwrap();
+        assert_eq!(again.erased, vec![gone.clone()]);
+        assert!(
+            again.promotions.iter().all(|r| r.spec.entry == kept),
+            "a record about an entry that is not here is left out: {again:?}"
+        );
+        the_ledger_keeps_no_why(home.path(), &gone, marker).await;
     }
 
     #[tokio::test]

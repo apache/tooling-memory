@@ -116,9 +116,10 @@ pub struct Imported {
     pub excerpts: usize,
     /// Where the bundle came from: `bundle:<exporter>/<domain>`.
     pub from: String,
-    /// The promotion records to restore with the entries written, each moved to the entry
-    /// as it landed: from the same owner's bundle only. Another owner's entries land raw,
-    /// and the reasons for the tier they lost are left behind.
+    /// The promotion records to restore, each moved to its entry as it stands here: the
+    /// entries written, and those skipped because they are here already, whose records
+    /// an earlier import may not have reached. From the same owner's bundle only. Another
+    /// owner's entries land raw, and the reasons for the tier they lost are left behind.
     pub promotions: Vec<PromotionRecord>,
 }
 
@@ -196,17 +197,41 @@ fn carried_promotions(src: &Path, manifest: &Manifest) -> Result<Vec<PromotionRe
     Ok(records)
 }
 
-/// The records to restore: those about an entry written, moved to it as it landed.
+/// An entry of the bundle as it stands here after the import: written now, or here
+/// already from before. Its records are moved to it.
+struct Placed {
+    /// The id the bundle names it by.
+    bundle_id: String,
+    /// The id it has here.
+    here: String,
+    /// The digest of its text in the bundle.
+    bundle_digest: String,
+    /// The digest of its text here: not the bundle's, since landing sets the origin and
+    /// may change the id, the domain and the classification.
+    digest: String,
+    /// Its classification here, which an import may have raised to the domain's default.
+    classification: Label,
+}
+
+/// The records to restore: those about an entry that is here, moved to it as it stands.
+/// A record of the version the bundle carries names the version as it landed, so it
+/// reads as landed; a record is at least as classified as its entry, as the ledger keeps
+/// it. A record about an entry that is not here, refused or never written, is left out.
 fn landed_promotions(
     carried: Vec<PromotionRecord>,
-    landed: &BTreeMap<String, String>,
+    placed: &[Placed],
     into_domain: &str,
 ) -> Vec<PromotionRecord> {
     carried
         .into_iter()
         .filter_map(|mut r| {
-            r.spec.entry = landed.get(&r.spec.entry)?.clone();
+            let p = placed.iter().find(|p| p.bundle_id == r.spec.entry)?;
+            r.spec.entry.clone_from(&p.here);
             r.spec.domain = into_domain.to_string();
+            if r.spec.new_digest == p.bundle_digest {
+                r.spec.new_digest.clone_from(&p.digest);
+            }
+            r.spec.classification = r.spec.classification.max(p.classification);
             Some(r)
         })
         .collect()
@@ -306,6 +331,84 @@ async fn is_own(store: &Store, domain: &str, id: Option<&str>) -> Result<bool, E
     }
 }
 
+/// The id a bundle entry with `origin` has here, when it is here: this domain's own,
+/// come back in a bundle it left in (`home` is the prefix of such an origin), or one a
+/// previous import landed, known by its origin.
+async fn present_here(
+    store: &Store,
+    index: &Index,
+    into_domain: &str,
+    origin: &str,
+    home: &str,
+) -> Result<Option<String>, Error> {
+    let own = origin.strip_prefix(home);
+    if is_own(store, into_domain, own).await? {
+        return Ok(own.map(str::to_string));
+    }
+    Ok(index.by_origin(into_domain, origin)?)
+}
+
+/// Where a bundle entry that is here already stands, for its records to be moved to:
+/// `None` for an erased one, whose records keep nothing of it.
+async fn placed_here(
+    store: &Store,
+    into_domain: &str,
+    bundle_id: &str,
+    here: String,
+    bundle_digest: String,
+) -> Result<Option<Placed>, Error> {
+    let Some(e) = store.get(into_domain, &here).await? else {
+        return Ok(None);
+    };
+    if e.front.status == Some(dm_core::Status::Erased) {
+        return Ok(None);
+    }
+    Ok(Some(Placed {
+        bundle_id: bundle_id.to_string(),
+        here,
+        bundle_digest,
+        digest: digest(&e.render()),
+        classification: e.front.classification,
+    }))
+}
+
+/// Pass one of an import: every path and digest, before anything is written, so a bundle
+/// with one bad entry is refused whole and a partial import never happens. Text this
+/// domain erased is known by its digest and is not an error, the bundle being older than
+/// the erasure: it is named on `out` and left out. The manifest's word on the labels must
+/// be the entries' own, erased ones included: a line or a highest that understates is
+/// refused whole. Returns each entry to land with the digest of its text in the bundle,
+/// which its records name.
+fn check_entries(
+    src: &Path,
+    manifest: &Manifest,
+    erased: &HashSet<String>,
+    out: &mut Imported,
+) -> Result<Vec<(Entry, String)>, Error> {
+    let mut checked: Vec<(Entry, String)> = Vec::with_capacity(manifest.entries.len());
+    let mut inside: Vec<(String, Label)> = Vec::with_capacity(manifest.entries.len());
+    for m in &manifest.entries {
+        plain_name(&m.path)?;
+        let path = src.join(&m.path);
+        let text = std::fs::read_to_string(&path).map_err(io(&path))?;
+        if digest(&text) != m.digest {
+            return Err(Error::Invalid(format!(
+                "{} does not match its manifest digest",
+                m.path
+            )));
+        }
+        let entry = Entry::parse(&text)?;
+        inside.push((entry.front.id.clone(), entry.front.classification));
+        if erased.contains(&m.digest) || erased.contains(&body_digest(&entry.body)) {
+            out.erased.push(m.id.clone());
+            continue;
+        }
+        checked.push((entry, m.digest.clone()));
+    }
+    manifest.check(&inside)?;
+    Ok(checked)
+}
+
 /// Import a bundle from `src` into `into_domain`. `owner` is this record's owner; a bundle
 /// the same owner exported keeps its trust tiers, every other bundle lands at raw. An
 /// entry whose text's digest, or whose trimmed body's, is in `erased`, what this
@@ -335,38 +438,12 @@ pub async fn import(
     format_read(&manifest)?;
     let same_owner = manifest.exported_by == owner;
 
-    // Pass one: every path and digest, before anything is written. A bundle with one bad
-    // entry is refused whole, so a partial import never happens. Text this domain erased
-    // is known by its digest and is not an error: the bundle is older than the erasure.
     let mut out = Imported {
         from: format!("bundle:{}/{}", manifest.exported_by, manifest.domain),
         ..Imported::default()
     };
-    let mut checked: Vec<Entry> = Vec::with_capacity(manifest.entries.len());
-    let mut inside: Vec<(String, Label)> = Vec::with_capacity(manifest.entries.len());
-    for m in &manifest.entries {
-        plain_name(&m.path)?;
-        let path = src.join(&m.path);
-        let text = std::fs::read_to_string(&path).map_err(io(&path))?;
-        if digest(&text) != m.digest {
-            return Err(Error::Invalid(format!(
-                "{} does not match its manifest digest",
-                m.path
-            )));
-        }
-        let entry = Entry::parse(&text)?;
-        inside.push((entry.front.id.clone(), entry.front.classification));
-        if erased.contains(&m.digest) || erased.contains(&body_digest(&entry.body)) {
-            out.erased.push(m.id.clone());
-            continue;
-        }
-        checked.push(entry);
-    }
+    let checked = check_entries(src, &manifest, erased, &mut out)?;
     let carried = carried_promotions(src, &manifest)?;
-    // the manifest's word on the labels must be the entries' own, erased ones included,
-    // and the records', before anything lands: a line or a highest that understates is
-    // refused whole
-    manifest.check(&inside)?;
 
     // Pass two: land what is new. An entry is already here when a previous import landed
     // it, known by its origin, or when it is this domain's own, come back in a bundle it
@@ -375,16 +452,22 @@ pub async fn import(
     // this domain holds is skipped, not landed as a version, since the record's versions
     // are written here and a bundle is a copy.
     let home = format!("bundle:{owner}/{into_domain}/");
-    for mut entry in checked {
+    let mut placed: Vec<Placed> = Vec::with_capacity(checked.len());
+    for (mut entry, bundle_digest) in checked {
         let origin = entry.front.origin.clone().unwrap_or_else(|| {
             format!(
                 "bundle:{}/{}/{}",
                 manifest.exported_by, manifest.domain, entry.front.id
             )
         });
-        if is_own(store, into_domain, origin.strip_prefix(&home)).await?
-            || index.by_origin(into_domain, &origin)?.is_some()
-        {
+        if let Some(here) = present_here(store, index, into_domain, &origin, &home).await? {
+            // its records may still be owed, when the import that landed it stopped
+            // before they were restored; what is here says what they are about
+            if same_owner {
+                placed.extend(
+                    placed_here(store, into_domain, &entry.front.id, here, bundle_digest).await?,
+                );
+            }
             out.skipped.push(entry.front.id.clone());
             continue;
         }
@@ -413,11 +496,18 @@ pub async fn import(
                 index.upsert(&old)?;
             }
         }
-        out.landed.insert(bundle_id, entry.front.id.clone());
+        out.landed.insert(bundle_id.clone(), entry.front.id.clone());
         out.written.push(entry.front.id.clone());
+        placed.push(Placed {
+            bundle_id,
+            here: entry.front.id.clone(),
+            bundle_digest,
+            digest: digest(&entry.render()),
+            classification: entry.front.classification,
+        });
     }
     if same_owner {
-        out.promotions = landed_promotions(carried, &out.landed, into_domain);
+        out.promotions = landed_promotions(carried, &placed, into_domain);
     }
     Ok(out)
 }
@@ -469,5 +559,65 @@ mod tests {
         written
             .check(&[(entry.front.id.clone(), Label::Restricted)])
             .unwrap();
+    }
+
+    /// A record about an entry that the export lists but does not write, since the
+    /// record no longer holds its text, stays home even within the bound: a bundle
+    /// carries records of its entries alone.
+    #[tokio::test]
+    async fn a_record_of_an_entry_left_home_is_not_carried_even_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_dir(dir.path()).unwrap();
+        let entry = Entry::parse(HELD).unwrap();
+        store.put(&entry).await.unwrap();
+        let hit = |id: &str| Hit {
+            id: id.into(),
+            domain: "dom-a".into(),
+            entry_type: entry.front.entry_type,
+            trust_tier: entry.front.trust_tier,
+            classification: Label::Public,
+            title: "Held".into(),
+            summary: "Held.".into(),
+            score: 0.0,
+            review_due: false,
+        };
+        let record = |id: &str| PromotionRecord {
+            spec: dm_ledger::PromotionSpec {
+                domain: "dom-a".into(),
+                entry: id.into(),
+                tier: TrustTier::Curated,
+                by: "agent:librarian".into(),
+                author: "human:test:me".into(),
+                why: format!("why {id} was promoted"),
+                classification: Label::Public,
+                digest: "d0".into(),
+                new_digest: "d1".into(),
+            },
+            why_erased: false,
+            at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        let dest = tempfile::tempdir().unwrap();
+        let ex = export(
+            &store,
+            vec![hit(&entry.front.id), hit("mem-a-gone0001")],
+            "dom-a",
+            Label::Restricted,
+            "memory:test:me",
+            dest.path(),
+            vec![record(&entry.front.id), record("mem-a-gone0001")],
+        )
+        .await
+        .unwrap();
+        let carried = ex
+            .manifest
+            .promotions
+            .as_ref()
+            .expect("the held entry's record is carried");
+        assert_eq!(carried.records.len(), 1, "{carried:?}");
+        assert_eq!(carried.records[0].entry, entry.front.id);
+        let text = std::fs::read_to_string(dest.path().join(PROMOTIONS_FILE)).unwrap();
+        assert!(!text.contains("mem-a-gone0001"), "{text}");
+        let records = carried_promotions(dest.path(), &ex.manifest).unwrap();
+        assert_eq!(records.len(), 1);
     }
 }
