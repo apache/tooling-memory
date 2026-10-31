@@ -2241,8 +2241,8 @@ impl Memory {
         self.finish_erasure(&domain, id, receipt).await
     }
 
-    /// The steps of an erasure after the record's: the citing entries, the ledger's
-    /// whys, the index, the served bundles and every render; then the receipt, closed.
+    /// The steps of an erasure after the record's: the citing entries, the index, the
+    /// served bundles, every render and the ledger's whys; then the receipt, closed.
     async fn finish_erasure(
         &self,
         domain: &str,
@@ -2255,14 +2255,6 @@ impl Memory {
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         receipt.flagged = self.flag_citers(id).await?;
-        // the whys of its promotions are the entry's text too; who promoted what stays
-        let scrubbed = self
-            .ledger
-            .lock()
-            .await
-            .scrub_promotions(domain, id)
-            .await?;
-        receipt.promotion_whys_removed = scrubbed.records;
         {
             let mut ix = self.index.lock().await;
             ix.remove(id)?;
@@ -2274,6 +2266,16 @@ impl Memory {
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
         let missed = self.erase_from_projections(domain, id);
+        // the whys of its promotions are the entry's text too; who promoted what stays.
+        // Last of the steps, since a ledger another connection holds stops here: the
+        // index and the renders are clean by then, and the receipt stays unfinished
+        let scrubbed = self
+            .ledger
+            .lock()
+            .await
+            .scrub_promotions(domain, id)
+            .await?;
+        receipt.promotion_whys_removed = scrubbed.records;
         close_receipt(&mut receipt, missed);
         receipt.unresolved.extend(scrubbed.beyond_reach);
         self.store.put_receipt(&receipt).await?;
@@ -3279,6 +3281,44 @@ mod tests {
         the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
         owner.reindex().await.unwrap();
         the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
+    }
+
+    #[tokio::test]
+    async fn an_erasure_the_ledger_holds_up_still_takes_the_text_out_of_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let secret = owner
+            .write(req("The vault opens with passphrase-Qz7xx.\n"))
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(&secret, TrustTier::Curated, "tried it on the vault")
+            .await
+            .unwrap();
+        // a reader mid-query on the ledger: its log cannot be folded into the file
+        let reader = rusqlite::Connection::open(dir.path().join(LEDGER_FILE)).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM events;")
+            .unwrap();
+        let held = owner.erase(&secret, Reason::Requested).await;
+        assert!(
+            matches!(held, Err(Error::Ledger(dm_ledger::Error::Held(_)))),
+            "{held:?}"
+        );
+        let found = owner.search("vault opens", None, 10).await.unwrap();
+        assert!(
+            found.iter().all(|h| h.id != secret),
+            "the erased text is still searchable: {found:?}"
+        );
+        assert!(
+            !owner.receipt(&secret).await.unwrap().unwrap().is_finished(),
+            "the receipt says the erasure is owed"
+        );
+        reader.execute_batch("COMMIT;").unwrap();
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
+        assert_eq!(receipt.promotion_whys_removed, 1);
     }
 
     #[tokio::test]

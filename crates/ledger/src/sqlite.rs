@@ -117,6 +117,7 @@ impl Db {
         if has_posted == 0 {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN posted_to TEXT;")?;
         }
+        migrate_promotions(&conn)?;
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -202,13 +203,16 @@ impl Db {
         Ok(true)
     }
 
-    /// Remove the why from an entry's promotion events and rows in one transaction, then
-    /// rebuild the file and fold the log into it, so the old text is in neither. Returns
-    /// how many records of the entry hold no why now.
+    /// Remove the why from an entry's promotion events and rows in one transaction, with
+    /// the space they leave overwritten, then fold the log into the file, so the old text
+    /// is in neither. Returns how many records of the entry hold no why now.
     pub(crate) fn scrub_promotions(&mut self, domain: &str, entry: &str) -> Result<usize, Error> {
         let key = crate::promotion_key(entry);
         let n: i64 = {
             let mut conn = self.conn();
+            // what an update frees is overwritten with zeros, here and nowhere else: the
+            // rest of the ledger's writes need not pay for it
+            conn.pragma_update(None, "secure_delete", true)?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let events: Vec<(i64, String)> = {
                 let mut stmt = tx.prepare(
@@ -236,18 +240,11 @@ impl Db {
                 |r| r.get(0),
             )?;
             tx.commit()?;
+            conn.pragma_update(None, "secure_delete", false)?;
             n
         };
-        self.compact()?;
+        checkpoint(&self.conn())?;
         Ok(usize::try_from(n).unwrap_or(0))
-    }
-
-    /// Rebuild the file without the free space old text sat in, and fold the log into it.
-    fn compact(&self) -> Result<(), Error> {
-        let conn = self.conn();
-        checkpoint(&conn)?;
-        conn.execute_batch("VACUUM;")?;
-        checkpoint(&conn)
     }
 
     pub(crate) fn promotions(
@@ -436,6 +433,33 @@ impl Db {
         tx.commit()?;
         Ok(n)
     }
+}
+
+/// A ledger whose promotions table 41e0bc5 made has neither `new_digest` nor
+/// `why_erased`, and its index lacks the promoter, so a second promoter of a version would
+/// be refused. The columns are added, empty and false, and the index made again.
+fn migrate_promotions(conn: &Connection) -> Result<(), Error> {
+    let has = |column: &str| -> Result<bool, Error> {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('promotions') WHERE name = ?1",
+            [column],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    };
+    if has("new_digest")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE promotions ADD COLUMN new_digest TEXT NOT NULL DEFAULT '';
+         ALTER TABLE promotions ADD COLUMN why_erased INTEGER NOT NULL DEFAULT 0;
+         DROP INDEX IF EXISTS promotions_version;
+         CREATE UNIQUE INDEX promotions_version
+             ON promotions (domain, entry, tier, digest, promoter);
+         COMMIT;",
+    )?;
+    Ok(())
 }
 
 /// Fold the write-ahead log into the file and truncate it, waiting a little for a reader

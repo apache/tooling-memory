@@ -479,6 +479,13 @@ its why in the body of its approval task. When the owner erases the entry, the l
 why. It keeps who promoted which version, to which tier, and when. The erasure receipt
 gives the number of whys it removed (`promotion_whys_removed`).
 
+A ledger made by a build of the `feat/promotion-why` branch before this change needs one
+step. Commit 41e0bc5 made a `promotions` table with fewer columns. A SQLite ledger gets
+the new columns the next time it opens. On PostgreSQL, drop the `promotions` table in each
+domain schema, and then run `amem reindex`. The next connect makes the tables again, and
+the reindex fills them from the ledger's events. Commit 9944964 kept each why in a
+completed `promoted:` task. Those tasks stay as they are.
+
 When an entry holds, the librarian's verify task now ends in such a proposal. The rules
 are Rego, in the built-in policy. Each step is a logged decision. A promotion is a new
 version of the entry, and the history of the entry keeps the old version. This is the

@@ -251,7 +251,9 @@ pub struct PromotionSpec {
     /// The digest of the version of the entry that was promoted.
     pub digest: String,
     /// The digest of the version the promotion writes, so a record whose version never
-    /// reached the record can be told from one whose version did.
+    /// reached the record can be told from one whose version did. Empty in a record from
+    /// before it was kept.
+    #[serde(default)]
     pub new_digest: String,
 }
 
@@ -1643,7 +1645,8 @@ mod tests {
 
     const SECRET: &str = "passphrase-Qz7xx";
 
-    /// Two promotions of `mem-a-1` whose whys quote its secret, and one of `mem-a-2`.
+    /// Two promotions of `mem-a-1` whose whys quote its secret, one of `mem-a-2`, and one
+    /// of an entry with the same id in `dom-b`, which is another entry.
     async fn promotions_that_quote_a_secret(l: &mut Ledger) -> Vec<PromotionSpec> {
         let first = PromotionSpec {
             why: format!("the vault opens with {SECRET}, as it says"),
@@ -1655,10 +1658,23 @@ mod tests {
             ..first.clone()
         };
         let other = promotion("mem-a-2", "d9");
-        for p in [&first, &second, &other] {
+        let elsewhere = PromotionSpec {
+            domain: "dom-b".into(),
+            why: "dom-b's own reading of its own entry".into(),
+            ..promotion("mem-a-1", "d1")
+        };
+        for p in [&first, &second, &other, &elsewhere] {
             assert!(l.record_promotion(p).await.unwrap());
         }
-        vec![first, second, other]
+        vec![first, second, other, elsewhere]
+    }
+
+    /// The records of `entry` in `domain` are exactly `spec`, why and all.
+    async fn kept_whole(l: &Ledger, domain: &str, entry: &str, spec: &PromotionSpec) {
+        let got = l.promotions(domain, entry).await.unwrap();
+        assert_eq!(got.len(), 1, "{domain}/{entry}: {got:?}");
+        assert_eq!(&got[0].spec, spec, "{domain}/{entry} keeps its why");
+        assert!(!got[0].why_erased);
     }
 
     async fn an_erasure_takes_the_why_and_a_replay_keeps_it_out(b: &Site) {
@@ -1691,12 +1707,8 @@ mod tests {
         specs: &[PromotionSpec],
         kept: &[PromotionRecord],
     ) {
-        let untouched = l.promotions("dom-a", "mem-a-2").await.unwrap();
-        assert_eq!(
-            untouched[0].spec, specs[2],
-            "another entry's record is kept"
-        );
-        assert!(!untouched[0].why_erased);
+        kept_whole(l, "dom-a", "mem-a-2", &specs[2]).await;
+        kept_whole(l, "dom-b", "mem-a-1", &specs[3]).await;
         assert!(
             !b.payloads().await.iter().any(|p| p.contains(SECRET)),
             "the log no longer holds the why"
@@ -1707,6 +1719,9 @@ mod tests {
             kept,
             "replay keeps it out"
         );
+        // and replay brings back every other why, in this domain and the other
+        kept_whole(l, "dom-a", "mem-a-2", &specs[2]).await;
+        kept_whole(l, "dom-b", "mem-a-1", &specs[3]).await;
         let again = l.scrub_promotions("dom-a", "mem-a-1").await.unwrap();
         assert_eq!(again.records, 2, "running it again counts what is scrubbed");
     }
@@ -1728,17 +1743,88 @@ mod tests {
     #[tokio::test]
     async fn on_sqlite_an_erased_why_leaves_no_bytes_in_the_files() {
         let dir = tempfile::tempdir().unwrap();
-        let mut l = Ledger::open(&dir.path().join("ledger.db")).unwrap();
-        promotions_that_quote_a_secret(&mut l).await;
-        assert!(
-            file_holding(dir.path(), SECRET).is_some(),
-            "the files held it"
+        let file = dir.path().join("ledger.db");
+        let mut l = Ledger::open(&file).unwrap();
+        // long enough to spill onto pages of its own, which an update frees and does not
+        // overwrite
+        let why = format!("{SECRET} {}", "and so on ".repeat(900));
+        let long = PromotionSpec {
+            why,
+            ..promotion("mem-a-1", "d1")
+        };
+        assert!(l.record_promotion(&long).await.unwrap());
+        // in the file itself, not only in the log
+        rusqlite::Connection::open(&file)
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(
+            file_holding(dir.path(), SECRET),
+            Some(file.clone()),
+            "the file held it"
         );
         let scrubbed = l.scrub_promotions("dom-a", "mem-a-1").await.unwrap();
         assert!(scrubbed.beyond_reach.is_empty());
         if let Some(f) = file_holding(dir.path(), SECRET) {
             panic!("{} still holds the erased why", f.display());
         }
+    }
+
+    #[test]
+    fn a_promoted_payload_from_before_the_new_digest_still_parses() {
+        let old = r#"{"kind":"promoted","domain":"dom-a","entry":"mem-a-1","tier":"curated","by":"agent:librarian","author":"human:test:me","why":"checked","classification":"internal","digest":"d1"}"#;
+        let Event::Promoted { spec, why_erased } = Event::parse("promotion:mem-a-1", old).unwrap()
+        else {
+            panic!("not a promotion");
+        };
+        assert_eq!(spec.new_digest, "");
+        assert!(!why_erased);
+    }
+
+    /// A ledger file whose promotions table is as 41e0bc5 made it: no `new_digest`, no
+    /// `why_erased`, and an index without the promoter, holding one record.
+    fn ledger_from_41e0bc5(file: &Path) {
+        let c = rusqlite::Connection::open(file).unwrap();
+        c.execute_batch(
+            r#"CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                 kind TEXT NOT NULL, at TEXT NOT NULL, payload TEXT NOT NULL);
+             CREATE TABLE promotions (seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 domain TEXT NOT NULL, entry TEXT NOT NULL, tier TEXT NOT NULL,
+                 promoter TEXT NOT NULL, author TEXT NOT NULL, why TEXT NOT NULL,
+                 label_rank INTEGER NOT NULL, digest TEXT NOT NULL, at TEXT NOT NULL);
+             CREATE UNIQUE INDEX promotions_version ON promotions (domain, entry, tier, digest);
+             INSERT INTO events (task_id, kind, at, payload) VALUES ('promotion:mem-a-1',
+                 'promoted', '2026-10-01T10:00:00Z',
+                 '{"kind":"promoted","domain":"dom-a","entry":"mem-a-1","tier":"curated","by":"agent:librarian","author":"human:test:me","why":"checked","classification":"internal","digest":"d1"}');
+             INSERT INTO promotions (domain, entry, tier, promoter, author, why, label_rank,
+                 digest, at) VALUES ('dom-a', 'mem-a-1', 'curated', 'agent:librarian',
+                 'human:test:me', 'checked', 1, 'd1', '2026-10-01T10:00:00Z');"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn on_sqlite_a_ledger_from_41e0bc5_is_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ledger.db");
+        ledger_from_41e0bc5(&file);
+        let mut l = Ledger::open(&file).unwrap();
+        let old = l.promotions("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].spec.new_digest, "");
+        let second = PromotionSpec {
+            by: "agent:checker".into(),
+            ..promotion("mem-a-1", "d1")
+        };
+        assert!(
+            l.record_promotion(&second).await.unwrap(),
+            "the index has the promoter now"
+        );
+        assert_eq!(l.rebuild().await.unwrap(), 2);
+        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap().len(), 2);
+        assert!(l.scrub_promotions("dom-a", "mem-a-1").await.is_ok());
     }
 
     async fn a_promotion_record_is_no_task(b: &Site) {
