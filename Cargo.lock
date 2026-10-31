@@ -1092,6 +1092,7 @@ dependencies = [
  "axum",
  "bytes",
  "dm-core",
+ "dm-index",
  "dm-ledger",
  "dm-server",
  "futures-util",

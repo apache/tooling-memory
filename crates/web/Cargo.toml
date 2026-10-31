@@ -23,6 +23,7 @@ time = { version = "0.3.55", features = ["formatting", "parsing", "serde-well-kn
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time", "fs"] }
 
 [dev-dependencies]
+dm-index = { version = "0.1.0", path = "../index" }
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30"
 

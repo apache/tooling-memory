@@ -221,10 +221,10 @@ macro_rules! session {
 #[derive(Clone)]
 struct App {
     config: Config,
-    /// The granted domains and the handling, as the grants said at start: what a bundle
-    /// request is checked against before any session is opened.
-    domains: Arc<Vec<String>>,
-    handling: dm_core::Label,
+    /// The board's session for its life: the handles, the session id for the read and
+    /// write logs, and the read scope. Each request gets a view of it with a label of
+    /// its own ([`App::session`]).
+    memory: Arc<Memory>,
     sessions: Arc<Mutex<BTreeMap<String, Arc<Session>>>>,
     /// Bundle exports run one at a time: each replaces a directory by renaming.
     exports: Arc<tokio::sync::Mutex<()>>,
@@ -492,12 +492,13 @@ async fn session_status(State(app): State<App>, Path(id): Path<String>) -> Respo
 }
 
 impl App {
-    /// A session of the board's own for one request. The browser is the owner, a person,
-    /// so a task addressed to a person, one that requires `human`, is one it may claim.
-    /// What one request reads raises the label of that request only: a listing does not
-    /// classify what a later request files or writes, as one long-lived session would.
+    /// The board's session for one request: the same handles and session id as every
+    /// other request, so what the board reads and then writes is joined in the logs,
+    /// with a label of its own. What one request reads raises the label of that request
+    /// only: a listing does not classify what a later request files or writes, as one
+    /// long-lived label would.
     fn session(&self) -> Result<Memory, dm_server::Error> {
-        Ok(Memory::open(&self.config.root)?.with_manifest(vec!["human".into()]))
+        self.memory.for_request()
     }
 
     fn start(&self, req: &NewSession) -> Result<Arc<Session>, Error> {
@@ -1104,7 +1105,7 @@ async fn reader_asset(Path(name): Path<String>) -> Response {
 
 /// The domains the record grants, for the reader's picker.
 async fn domains(State(app): State<App>) -> Json<Vec<String>> {
-    Json(app.domains.to_vec())
+    Json(app.memory.domains())
 }
 
 /// A bundle file name: letters, digits, dot, underscore and hyphen, not starting with a
@@ -1138,16 +1139,17 @@ fn admit_bundle_request(
     if !plain_file_name(file) {
         return Err((StatusCode::NOT_FOUND, "no such file".into()));
     }
-    if !app.domains.iter().any(|d| d == domain) {
+    if !app.memory.domains().iter().any(|d| d == domain) {
         return Err((
             StatusCode::FORBIDDEN,
             format!("domain {domain} is not granted"),
         ));
     }
-    if label > app.handling {
+    let handling = app.memory.grants().handling;
+    if label > handling {
         return Err((
             StatusCode::FORBIDDEN,
-            format!("{label} is above the handling {}", app.handling),
+            format!("{label} is above the handling {handling}"),
         ));
     }
     Ok(label)
@@ -1257,16 +1259,13 @@ async fn bundle_file(
 ///
 /// When the record cannot be opened.
 pub fn router(config: Config) -> Result<Router, Error> {
-    // the record must open at start; each request then opens a session of its own
-    let memory = Memory::open(&config.root)?;
-    let granted = Arc::new(memory.domains());
-    let handling = memory.grants().handling;
-    drop(memory);
+    // the browser is the owner, a person: a task addressed to a person, one that
+    // requires `human`, is one the board may claim
+    let memory = Arc::new(Memory::open(&config.root)?.with_manifest(vec!["human".into()]));
     let access = config.access.clone();
     let app = App {
         config,
-        domains: granted,
-        handling,
+        memory,
         sessions: Arc::new(Mutex::new(BTreeMap::new())),
         exports: Arc::new(tokio::sync::Mutex::new(())),
         companion: Arc::new(companion::Companion::default()),
@@ -2064,6 +2063,129 @@ mod tests {
             file("After the listing").await,
             "public",
             "a listing in one request classified a filing in a later one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_on_the_board_is_joined_to_what_a_later_board_request_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let owner = Memory::open(&dir.path().join("memory")).unwrap();
+        let poison = owner
+            .write(dm_server::WriteRequest {
+                body: "Something.\n".into(),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        let (status, body) = http(addr, "GET", &format!("/api/entry/{poison}"), None).await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) =
+            http(addr, "POST", "/api/tasks", Some(r#"{"title":"Sign off"}"#)).await;
+        assert_eq!(status, 200, "{body}");
+        let id = serde_json::from_str::<Value>(&body).unwrap()["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for step in ["admit", "claim"] {
+            let (status, body) = http(addr, "POST", &format!("/api/tasks/{id}/{step}"), None).await;
+            assert_eq!(status, 200, "{step}: {body}");
+        }
+        let (status, body) = http(
+            addr,
+            "POST",
+            &format!("/api/tasks/{id}/complete"),
+            Some(r#"{"handoff":"Done, after reading."}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let handoff = serde_json::from_str::<Value>(&body).unwrap()["handoff"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let t = owner.taint(&poison);
+        assert_eq!(
+            t.readers.len(),
+            1,
+            "the board reads as one session: {:?}",
+            t.readers
+        );
+        assert_eq!(
+            t.written,
+            vec![handoff],
+            "the handoff the board wrote after reading the entry follows from the read"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_board_answers_while_a_rebuild_holds_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let root = dir.path().join("memory");
+        let owner = Memory::open(&root).unwrap();
+        let id = owner
+            .write(dm_server::WriteRequest {
+                body: "Kept.\n".into(),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        let entry = owner.get(&id).await.unwrap();
+        drop(owner);
+        // a reindex in another process holds the index for writing until it has been
+        // given every entry; the board polls meanwhile
+        let (give, given) = std::sync::mpsc::channel::<()>();
+        let (held, holding) = std::sync::mpsc::channel::<()>();
+        let path = root.join(dm_server::INDEX_FILE);
+        let rebuild = std::thread::spawn(move || {
+            let mut ix = dm_index::Index::open(&path).unwrap();
+            let mut pending = Some(entry);
+            ix.rebuild(std::iter::from_fn(move || {
+                let _ = held.send(());
+                given.recv().ok()?;
+                pending.take()
+            }))
+            .unwrap()
+        });
+        holding.recv().unwrap();
+        let started = std::time::Instant::now();
+        for path in ["/api/tasks", "/api/entries"] {
+            let (status, body) = http(addr, "GET", path, None).await;
+            assert_eq!(status, 200, "{path} while the index is held: {body}");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "the board waited on the index: {:?}",
+            started.elapsed()
+        );
+        give.send(()).unwrap();
+        drop(give);
+        assert_eq!(rebuild.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_board_s_read_scope_is_decided_once_not_once_per_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let log = dir.path().join("memory/state/decisions.jsonl");
+        let lines = || {
+            std::fs::read_to_string(&log)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        let (status, _) = http(addr, "GET", "/api/tasks", None).await;
+        assert_eq!(status, 200);
+        let after_one = lines();
+        for _ in 0..5 {
+            let (status, _) = get_json(addr, "/api/tasks").await;
+            assert_eq!(status, 200);
+        }
+        assert_eq!(
+            lines(),
+            after_one,
+            "a board poll logged a decision; the read scope is decided once for the board"
         );
     }
 

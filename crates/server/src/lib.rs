@@ -30,7 +30,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -236,10 +236,12 @@ pub struct Memory {
     manifest: Vec<String>,
     session_id: String,
     store: Store,
-    index: AsyncMutex<Index>,
-    ledger: AsyncMutex<Ledger>,
+    /// The handles a long-lived surface shares between its requests ([`Memory::for_request`]):
+    /// the index, the ledger, the read log and the policy in force.
+    index: Arc<AsyncMutex<Index>>,
+    ledger: Arc<AsyncMutex<Ledger>>,
     session: Mutex<Session>,
-    reads: reads::ReadLog,
+    reads: Arc<reads::ReadLog>,
     /// The recall deputy, held weakly: it lives as long as the launcher that built it.
     deputy: OnceLock<Weak<dyn recall::Deputy>>,
     /// Whether this session has issued two gets inside one turn.
@@ -253,7 +255,7 @@ pub struct Memory {
     /// Entries this session wrote, and how many of them were handoffs.
     written: (AtomicUsize, AtomicUsize),
     /// The checkable perimeter: admission and the gates, as Rego over the grants.
-    policy: std::sync::RwLock<std::sync::Arc<Policy>>,
+    policy: Arc<std::sync::RwLock<std::sync::Arc<Policy>>>,
     /// The task this session holds, when the launcher runs it on one: what it files
     /// from is judged against that task's requirements.
     held: OnceLock<String>,
@@ -375,24 +377,69 @@ impl Memory {
             author: grants.owner.clone(),
             grants,
             manifest: Vec::new(),
-            reads,
+            reads: Arc::new(reads),
             session_id,
             store,
-            index: AsyncMutex::new(index),
-            ledger: AsyncMutex::new(ledger),
+            index: Arc::new(AsyncMutex::new(index)),
+            ledger: Arc::new(AsyncMutex::new(ledger)),
             session: Mutex::new(session),
             deputy: OnceLock::new(),
             fan_out: Mutex::new(recall::FanOut::default()),
             cache: Mutex::new(recall::Cache::default()),
             projection: None,
             written: (AtomicUsize::new(0), AtomicUsize::new(0)),
-            policy: std::sync::RwLock::new(std::sync::Arc::new(policy)),
+            policy: Arc::new(std::sync::RwLock::new(std::sync::Arc::new(policy))),
             held: OnceLock::new(),
             superseded: AtomicUsize::new(0),
             scope: OnceLock::new(),
             contexts_kept: AtomicUsize::new(0),
             tools: OnceLock::new(),
             playback: OnceLock::new(),
+            recording: Mutex::new(tape::Recording::default()),
+        })
+    }
+
+    /// This session, for one request of a surface that lives longer than a request
+    /// does, as the board does. The record, the index, the ledger, the policy in force,
+    /// the read log and the session id are this session's, shared: a read here and a
+    /// write in a later request carry the same session id, which is what joins them
+    /// for lineage. The label is the request's own: it starts at the bottom and rises
+    /// with what this request reads, so what one request lists does not classify what a
+    /// later one files. The read scope is this session's too, asked of the policy and
+    /// logged once, here, rather than once per request. The grants, the author, the
+    /// manifest, the held task, the tools and the projection carry over; the tallies a
+    /// session keeps of its own doing, what it wrote and superseded, start at zero.
+    ///
+    /// # Errors
+    ///
+    /// When the policy fails to give the read scope.
+    pub fn for_request(&self) -> Result<Memory, Error> {
+        let scope = self.session_filter()?;
+        let mut session = self.grants.session();
+        session.handling = session.handling.min(scope.handling);
+        Ok(Memory {
+            root: self.root.clone(),
+            grants: self.grants.clone(),
+            author: self.author.clone(),
+            manifest: self.manifest.clone(),
+            session_id: self.session_id.clone(),
+            store: self.store.clone(),
+            index: Arc::clone(&self.index),
+            ledger: Arc::clone(&self.ledger),
+            session: Mutex::new(session),
+            reads: Arc::clone(&self.reads),
+            deputy: self.deputy.clone(),
+            fan_out: Mutex::new(recall::FanOut::default()),
+            cache: Mutex::new(recall::Cache::default()),
+            projection: self.projection.clone(),
+            written: (AtomicUsize::new(0), AtomicUsize::new(0)),
+            policy: Arc::clone(&self.policy),
+            held: self.held.clone(),
+            superseded: AtomicUsize::new(0),
+            scope: OnceLock::from(scope),
+            contexts_kept: AtomicUsize::new(0),
+            tools: self.tools.clone(),
+            playback: self.playback.clone(),
             recording: Mutex::new(tape::Recording::default()),
         })
     }
@@ -4565,6 +4612,42 @@ mod tests {
             .unwrap()
             .task;
         (root, cont, child)
+    }
+
+    #[tokio::test]
+    async fn a_request_view_shares_the_session_id_and_starts_its_label_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        m.file_own(restricted("Rotate the signing key"))
+            .await
+            .unwrap();
+        for st in [Status::Proposed, Status::Admitted] {
+            m.tasks(None, st).await.unwrap();
+        }
+        assert_eq!(m.label(), Label::Restricted);
+        let first = m.for_request().unwrap();
+        assert_eq!(first.session_id(), m.session_id());
+        assert_eq!(
+            first.label(),
+            Label::Public,
+            "a view's label starts fresh, whatever the shared session read"
+        );
+        for st in [Status::Proposed, Status::Admitted] {
+            first.tasks(None, st).await.unwrap();
+        }
+        assert_eq!(first.label(), Label::Restricted);
+        let second = m.for_request().unwrap();
+        assert_eq!(second.label(), Label::Public, "a view's label is its own");
+        let t = second
+            .create_task(spec("Tidy the docs"))
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(t.spec.classification, Label::Public);
+        assert!(
+            first.get_task(&t.id).await.is_ok(),
+            "one ledger behind every view"
+        );
     }
 
     #[tokio::test]
