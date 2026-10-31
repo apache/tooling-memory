@@ -14,17 +14,17 @@ pub const BOARD: &str = include_str!("../static/board.html");
 /// The design tokens every page links: docs/design-book.html holds the same values.
 pub const TOKENS: &str = include_str!("../static/tokens.css");
 
-/// The reader's core, built from `crates/reader` by `make reader`: the JavaScript glue
-/// and the WebAssembly it loads.
+/// The reader's core, built from `crates/reader` by this crate's build script: the
+/// JavaScript glue and the WebAssembly it loads.
 pub fn reader_asset(name: &str) -> Option<(&'static str, &'static [u8])> {
     Some(match name {
         "dm_reader.js" => (
             "text/javascript",
-            include_bytes!("../static/reader/dm_reader.js"),
+            include_bytes!(concat!(env!("OUT_DIR"), "/reader/dm_reader.js")),
         ),
         "dm_reader_bg.wasm" => (
             "application/wasm",
-            include_bytes!("../static/reader/dm_reader_bg.wasm"),
+            include_bytes!(concat!(env!("OUT_DIR"), "/reader/dm_reader_bg.wasm")),
         ),
         _ => return None,
     })
@@ -78,6 +78,37 @@ mod tests {
         ("board.html", BOARD),
         ("reader.html", READER),
     ];
+
+    /// The reader the binary serves is what `crates/reader` and `crates/core` build to now:
+    /// the build script's work done again, against the sources as they are when the test
+    /// runs, and compared byte for byte. The nested build reuses the build script's
+    /// target directory, so when nothing changed it compiles nothing.
+    #[test]
+    fn the_embedded_reader_is_what_its_sources_build_to() {
+        use crate::reader_build::{build, Build, GLUE, WASM};
+        use std::path::Path;
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest.parent().and_then(Path::parent).unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let fresh = tempfile::tempdir().unwrap();
+        build(&Build {
+            workspace,
+            cargo: Path::new(env!("CARGO")),
+            rustc: Path::new(&rustc),
+            target_dir: &Path::new(env!("OUT_DIR")).join("reader-target"),
+            out: fresh.path(),
+        })
+        .unwrap();
+        for name in [GLUE, WASM] {
+            let built = std::fs::read(fresh.path().join(name)).unwrap();
+            let (_, served) = reader_asset(name).unwrap();
+            assert!(
+                served == built.as_slice(),
+                "the embedded {name} is not what the reader's sources build to now: a source \
+                 the reader compiles is missing from SOURCES in crates/web/build.rs"
+            );
+        }
+    }
 
     #[test]
     fn the_book_inlines_the_tokens_and_components_whole() {

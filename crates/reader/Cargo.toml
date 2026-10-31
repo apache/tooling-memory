@@ -15,7 +15,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9.42"
 time = { version = "0.3.55", features = ["formatting"] }
-wasm-bindgen = "0.2.129"
+# one release with the library that binds it (crates/web/Cargo.toml); change both together
+wasm-bindgen = "=0.2.129"
 
 [lints]
 workspace = true
