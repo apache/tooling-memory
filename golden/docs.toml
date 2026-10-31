@@ -54,7 +54,7 @@ keywords = "policy stack federation"
 
 [[question]]
 ask = "What do the trust tiers mean?"
-answers = ["Four questions, four labels"]
+answers = ["Four questions, four labels", "The record and its rules", "Words you'll hear"]
 keywords = "trust tier raw curated verified"
 
 [[question]]

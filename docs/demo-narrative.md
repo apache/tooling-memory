@@ -349,7 +349,8 @@ it would have done the same.
 **8.1 The tapes.** Sessions leave a tape: its prompt, harness and model, and what each
 memory tool call returned. A session that started with a prompt can run again. Act 6's
 four questions with memory used a session each, and left four. This one asked who the
-promotion gate is, and made 2 memory tool calls.
+promotion gate is, and made 2 memory tool calls. It is the question as it was on 12
+October.
 
 **8.2 The same model again.** The control, on qwen3.8-27b: the same tools in the same
 order as the tape. Its second call asked differently, for example with a different
