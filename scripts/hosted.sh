@@ -15,13 +15,19 @@ if [ -e "$out" ] && [ ! -e "$out/.amem-hosted" ] && [ -n "$(ls -A "$out")" ]; th
 fi
 # the reader's glue and wasm are not in the tree: dm-web's build script builds them into
 # its OUT_DIR, which cargo names in its messages. The debug build of amem, as e2e runs it.
-built=$(cargo build --manifest-path "$here/Cargo.toml" -p amem --message-format=json | python3 -c '
+# The messages go to a file, not a pipe, so a failed build stops here with its status;
+# rustc's diagnostics go to stderr as text.
+messages=$(mktemp)
+trap 'rm -f "$messages"' EXIT
+cargo build --manifest-path "$here/Cargo.toml" -p amem \
+    --message-format=json-render-diagnostics >"$messages"
+built=$(python3 -c '
 import json, sys
-for line in sys.stdin:
+for line in open(sys.argv[1]):
     m = json.loads(line)
     if m.get("reason") == "build-script-executed" and "#dm-web@" in m["package_id"]:
         print(m["out_dir"])
-')
+' "$messages")
 if [ -z "$built" ] || [ ! -s "$built/reader/dm_reader_bg.wasm" ]; then
     echo "no reader from the build of amem; see cargo's errors above" >&2
     exit 1
