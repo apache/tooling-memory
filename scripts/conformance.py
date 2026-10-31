@@ -656,16 +656,19 @@ class Run:
             self.check(t.get("id") == tid2, "the second task was not claimed")
             print(f"   holding the lease past {lease}s with one heartbeat, then letting it lapse")
             # the heartbeat renews for three leases, so each check stands clear of the ends
-            # it sits between, by a quarter of a lease or more: the renewal moves
-            # lease_until on by two and a half leases against the one asked for; the claim
+            # it sits between, by a quarter of a lease or more: a full renewal moves
+            # lease_until on by two and a half leases, and the check asks for two; the claim
             # check falls after the first lease lapsed and two leases before the renewed one
             # does; and the lapse check comes a lease after that. A stalled call, or a
             # server clock that steps by less than those margins, moves no end past a check
             time.sleep(lease * 0.5)
-            beat = task_of(s.call("heartbeat", id=tid2, lease_seconds=3 * lease), "heartbeat")
-            renewed = when(str(beat.get("lease_until", "")))
+            got = s.call("heartbeat", id=tid2, lease_seconds=3 * lease)
+            beat = task_of(got, "heartbeat")
+            until = got.get("lease_until") or beat.get("lease_until")
+            renewed = when(str(until or ""))
+            self.check(renewed is not None, f"heartbeat names no lease_until: {short(got)}")
             self.check(
-                first is not None and renewed is not None and renewed - first >= lease,
+                first is not None and renewed - first >= 2 * lease,
                 f"heartbeat did not renew it: lease_until went from {first} to {renewed}",
             )
             time.sleep(lease * 0.75)

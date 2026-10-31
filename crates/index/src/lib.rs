@@ -123,9 +123,23 @@ INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
 /// that second. `created` itself is the frontmatter's RFC 3339 text, which does not sort
 /// as text: `10:00:00Z` sorts after `10:00:00.5Z`, `.15Z` before `.1Z`, and an offset other
 /// than UTC by its local hour. Both are integers, so a year at either end of what the
-/// frontmatter accepts still has a place. An older binary writes rows without them;
-/// [`Index::sort_keys`] fills those in on the next open.
+/// frontmatter accepts still has a place. An older binary writes rows without them: the
+/// trigger [`SORT_KEY_TRIGGER`] fills those in from `created` as the row lands, to the
+/// millisecond, and [`Index::sort_keys`] fills in any left on the next open.
 const NEWEST_FIRST: &str = "e.created_unix DESC, e.created_nanos DESC";
+
+/// Lives in the file, so it fires for whichever binary inserts the row.
+const SORT_KEY_TRIGGER: &str = "
+CREATE TRIGGER IF NOT EXISTS entries_sort_key AFTER INSERT ON entries
+WHEN NEW.created_unix IS NULL
+BEGIN
+    UPDATE entries SET
+        created_unix = unixepoch(NEW.created),
+        created_nanos = min(999, CAST(
+            (unixepoch(NEW.created, 'subsec') - unixepoch(NEW.created)) * 1000 + 0.5
+            AS INTEGER)) * 1000000
+    WHERE id = NEW.id;
+END;";
 
 fn sort_key(at: OffsetDateTime) -> (i64, i64) {
     (at.unix_timestamp(), i64::from(at.nanosecond()))
@@ -309,20 +323,23 @@ impl Index {
         tx.execute_batch(
             "CREATE INDEX IF NOT EXISTS entries_created ON entries (created_unix, created_nanos);",
         )?;
+        tx.execute_batch(SORT_KEY_TRIGGER)?;
         let rows: Vec<(String, String)> = {
             let mut stmt =
                 tx.prepare("SELECT id, created FROM entries WHERE created_unix IS NULL")?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<Result<_, _>>()?
         };
-        for (id, created) in rows {
-            // a value that does not parse is left for the read to report as a bad row
-            if let Ok(at) = OffsetDateTime::parse(&created, &Rfc3339) {
-                let (unix, nanos) = sort_key(at);
-                tx.execute(
-                    "UPDATE entries SET created_unix = ?1, created_nanos = ?2 WHERE id = ?3",
-                    params![unix, nanos, id],
-                )?;
+        {
+            let mut update = tx.prepare(
+                "UPDATE entries SET created_unix = ?1, created_nanos = ?2 WHERE id = ?3",
+            )?;
+            for (id, created) in rows {
+                // a value that does not parse is left for the read to report as a bad row
+                if let Ok(at) = OffsetDateTime::parse(&created, &Rfc3339) {
+                    let (unix, nanos) = sort_key(at);
+                    update.execute(params![unix, nanos, id])?;
+                }
             }
         }
         tx.commit()?;
@@ -339,7 +356,9 @@ impl Index {
             return Ok(false);
         }
         let indexed: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'entries_created'",
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE (type = 'index' AND name = 'entries_created')
+                OR (type = 'trigger' AND name = 'entries_sort_key')",
             [],
             |r| r.get(0),
         )?;
@@ -351,7 +370,7 @@ impl Index {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(indexed == 1 && missing.is_none())
+        Ok(indexed == 2 && missing.is_none())
     }
 
     /// Index an entry, replacing whatever the index held for its id.
@@ -1047,15 +1066,17 @@ mod tests {
     #[test]
     fn a_created_at_either_end_of_the_years_is_indexed_ordered_and_read_back() {
         // each is a year the frontmatter accepts whose UTC instant is a year outside it
+        // and the second sorts after the first as text, though it is earlier
         let ends = [
             ("mem-a-late", datetime!(9999-12-31 23:30:00 -01:00)),
+            ("mem-a-late-paris", datetime!(9999-12-31 23:45:00 +01:00)),
             ("mem-a-early", datetime!(0000-01-01 00:30:00 +01:00)),
             ("mem-a-now", datetime!(2026-10-01 10:00:00 UTC)),
         ];
         let ix = holding(&ends);
         assert_eq!(
             ids(&ix.list(&any(), None, 10).unwrap()),
-            ["mem-a-late", "mem-a-now", "mem-a-early"]
+            ["mem-a-late", "mem-a-late-paris", "mem-a-now", "mem-a-early"]
         );
         for (id, created) in ends {
             let m = ix.meta(id, &any()).unwrap().unwrap();
@@ -1064,29 +1085,72 @@ mod tests {
     }
 
     #[test]
-    fn an_index_from_before_the_sort_key_gets_it_on_open() {
-        let mut ix = holding(&WITHIN_A_SECOND);
-        // the table as an index made before the columns existed has it, and a row as an
-        // older binary writes one: no sort key
-        ix.conn
-            .execute_batch(
-                "DROP INDEX entries_created;
-                 ALTER TABLE entries DROP COLUMN created_unix;
-                 ALTER TABLE entries DROP COLUMN created_nanos;",
-            )
-            .unwrap();
-        ix.sort_keys().unwrap();
-        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), IN_TIME_ORDER);
-        ix.conn
-            .execute(
-                "UPDATE entries SET created_unix = NULL, created_nanos = NULL",
-                [],
-            )
-            .unwrap();
-        assert_ne!(ids(&ix.list(&any(), None, 10).unwrap()), IN_TIME_ORDER);
-        ix.sort_keys().unwrap();
+    fn due_for_review_and_replaced_by_order_by_the_instant() {
+        let mut ix = Index::in_memory().unwrap();
+        for (id, created) in WITHIN_A_SECOND {
+            let mut e = entry("dom-a", id, id, "Body.\n");
+            e.front.created = created;
+            e.front.review_by = Some(date!(2026 - 10 - 01));
+            e.front.supersedes = Some("mem-a-first".into());
+            ix.upsert(&e).unwrap();
+        }
+        let mut oldest_first = IN_TIME_ORDER;
+        oldest_first.reverse();
+        assert_eq!(
+            ids(&ix
+                .due_for_review(&any(), date!(2026 - 10 - 01), 10)
+                .unwrap()),
+            oldest_first
+        );
+        assert_eq!(
+            ix.replaced_by("mem-a-first", &any()).unwrap().as_deref(),
+            Some(IN_TIME_ORDER[0])
+        );
+    }
+
+    /// A row as a binary from before the sort key writes it: the columns it names.
+    fn insert_as_before(conn: &Connection, id: &str, created: OffsetDateTime) {
+        conn.execute(
+            "INSERT OR REPLACE INTO entries
+             (id, domain, entry_type, author, created, review_by, tier_rank, label_rank,
+              status, supersedes, origin, title, summary, digest)
+             VALUES (?1, 'dom-a', 'fact', 'human:test:me', ?2, NULL, 0, 0,
+              NULL, NULL, NULL, ?1, '', '')",
+            params![id, created.format(&Rfc3339).unwrap()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_index_file_from_before_the_sort_key_is_ordered_on_open_and_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            let before = SCHEMA.replace(
+                "    created_unix   INTEGER,\n    created_nanos  INTEGER,\n",
+                "",
+            );
+            assert_ne!(before, SCHEMA);
+            conn.execute_batch(&before).unwrap();
+            for (id, created) in WITHIN_A_SECOND {
+                insert_as_before(&conn, id, created);
+            }
+        }
+        let ix = Index::open(&path).unwrap();
         assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), IN_TIME_ORDER);
         assert!(ix.sort_keys_done().unwrap());
+        // an older binary goes on writing to the file after a newer one opened it
+        insert_as_before(
+            &ix.conn,
+            "mem-a-later",
+            datetime!(2026-10-01 10:00:00.2 UTC),
+        );
+        assert_eq!(
+            ids(&ix.list(&any(), None, 10).unwrap())[0],
+            "mem-a-later",
+            "an older binary's row lands without the order"
+        );
     }
 
     #[test]
