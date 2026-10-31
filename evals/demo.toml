@@ -34,7 +34,10 @@ expect = "S2"
 
 [[task]]
 id = "asf-pressures"
-answers = ["Seeding a Foundation: 10. What the Foundation taught the design"]
+answers = ["What the Foundation taught the design"]
+# the number is not in the text: scripts/corpus-check.sh counts the lines of the answer
+# entry that match `counts`, and checks `expect` against that count
+counts = "^\\| \\*\\*"
 prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What the Foundation taught the design' list? Give the number."
 # the part cites "paper §6" and another part is "6. Trust and review", so a six or 6
 # counts unless it is a section number, a link anchor, or the end of a range or a list of
@@ -44,7 +47,7 @@ expect = "(?<![§#–-])(?<!§ )(?<!section )(?<!part )\\b(six|6)\\b(?![–-])(?
 
 [[task]]
 id = "committers-gate"
-answers = ["Seeding a Foundation: 6. Trust and review"]
+answers = ["Trust and review"]
 prompt = "In the 'Seeding a Foundation' notes on trust and review, who is the promotion gate? One sentence."
 # the gate is named people that domain policy authorises, under PMC oversight; the case
 # study gives committers sampled review, so "committers" is no longer the answer, and

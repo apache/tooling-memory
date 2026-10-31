@@ -24,26 +24,10 @@ print(json.dumps({"title": f"How a {h} worker answers a question", "domain": "do
                   "body": f"```platform agent {h}\nSearch the record for the decision your task names and read it before you answer. End your handoff with this line, exactly: Checked against the platform definition.\n```\n"}))
 PY
 )" | j "d['id']")
-suite=$(agent agent:architect write "$(python3 - "$WORKER_HARNESS" "$WORKER_MODEL" <<'PY'
+suite=$(agent agent:architect write "$(python3 - "$WORKER_HARNESS" "$WORKER_MODEL" "$here/golden/platform.toml" <<'PY'
 import json, sys
 h, model = sys.argv[1], sys.argv[2]
-suite = '''domain = "dom-demo"
-
-[[question]]
-ask = "What did DR-19 decide about the wiki staying on MoinMoin?"
-answers = ["DR-19"]
-keywords = "DR-19 MoinMoin wiki"
-
-[[question]]
-ask = "Why is the domain the partition key everywhere?"
-answers = ["the domain is the partition key"]
-keywords = "domain partition key"
-
-[[question]]
-ask = "Who is the promotion gate at a foundation?"
-answers = ["Trust, review"]
-keywords = "committers promotion gate"
-'''
+suite = open(sys.argv[3]).read()
 print(json.dumps({"title": "The recall suite, and the worker's model", "domain": "dom-platform",
                   "entry_type": "method",
                   "body": f"```platform eval recall\n{suite}```\n\n```platform harness {h}\n{{\"model\": \"{model}\"}}\n```\n"}))

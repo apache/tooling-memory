@@ -14,7 +14,7 @@ env:
 
 jobs:
   # Whether this push or pull request changes only Markdown outside the code, which cannot
-  # change what builds (scripts/docs-only.sh says which files those are). The jobs below skip on a yes; a job skipped by its
+  # change what builds (scripts/docs-only.sh says which files those are). The jobs below, all but `corpus`, skip on a yes; a job skipped by its
   # condition reports success, so a required check does not sit waiting for it. Anything
   # the diff cannot answer, a first push or a rewritten base, runs everything.
   changes:
