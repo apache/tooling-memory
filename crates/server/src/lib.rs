@@ -1023,6 +1023,15 @@ impl Memory {
         if !d.allow {
             return Err(Error::Denied(d.reason));
         }
+        if to == TrustTier::Verified {
+            let open = self
+                .ledger
+                .lock()
+                .await
+                .by_origin(&entry.front.domain, &format!("promote:{id}"), VERIFY_EVENT)
+                .await?;
+            self.not_anothers_proposal(open.as_ref())?;
+        }
         if to != TrustTier::Verified {
             return self.set_tier(entry, to).await;
         }
@@ -1046,9 +1055,30 @@ impl Memory {
                 priority: 3,
             })
             .await?;
+        // another process may have filed a proposal since the look above
+        if created.deduplicated {
+            self.not_anothers_proposal(Some(&created.task))?;
+        }
         Ok(Promotion::Proposed {
             task: Box::new(created.task),
         })
+    }
+
+    /// One open proposal to verify an entry at a time, and one proposer to it: the
+    /// ledger keeps one task per entry and [`Memory::approve`] knows only who filed it,
+    /// so a second principal's proposal merged into it would let that principal approve
+    /// what it proposed. The same principal proposing again gets its own task back, and
+    /// a closed one is no proposal.
+    fn not_anothers_proposal(&self, open: Option<&Task>) -> Result<(), Error> {
+        match open {
+            Some(t) if !t.status.is_terminal() && t.spec.created_by != self.author => {
+                Err(Error::Denied(format!(
+                    "`{}` has proposed this entry for verified already, in task {}. A second proposal is not filed: a person who did not propose it approves that task with `amem approve {}`, or invalidates it to decline",
+                    t.spec.created_by, t.id, t.id
+                )))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Approve a proposal to promote to verified: the person approving did not propose
@@ -2915,6 +2945,60 @@ mod tests {
             let (_, e) = owner.find(id).await.unwrap();
             assert_eq!(e.front.trust_tier, TrustTier::Raw, "{id}");
         }
+    }
+
+    #[tokio::test]
+    async fn no_proposer_approves_a_proposal_its_own_was_merged_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact worth verifying.\n").await;
+        let bob = Memory::open(dir.path())
+            .unwrap()
+            .with_author("human:test:bob");
+        // a proposal bob made, in whatever task it landed, is not bob's to approve; a
+        // proposal refused is not one bob made
+        match bob
+            .promote(&id, TrustTier::Verified, "I checked it too")
+            .await
+        {
+            Ok(Promotion::Proposed { task: landed }) => {
+                assert!(
+                    bob.approve(&landed.id).await.is_err(),
+                    "bob proposed {}, and approved it",
+                    landed.id
+                );
+            }
+            Ok(other) => panic!("verified is proposed, not set: {other:?}"),
+            Err(e) => assert!(e.to_string().contains(&task.id), "{e}"),
+        }
+        // the librarian asking again is the same proposal
+        let librarian = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:librarian");
+        let Promotion::Proposed { task: again } = librarian
+            .promote(&id, TrustTier::Verified, "still holds")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        assert_eq!(again.id, task.id);
+        // and a person who proposed nothing approves it
+        let alice = Memory::open(dir.path())
+            .unwrap()
+            .with_author("human:test:alice");
+        let r = alice.approve(&task.id).await.unwrap();
+        assert!(matches!(
+            r,
+            Promotion::Promoted {
+                tier: TrustTier::Verified,
+                ..
+            }
+        ));
+        assert_eq!(
+            owner.find(&id).await.unwrap().1.front.trust_tier,
+            TrustTier::Verified
+        );
     }
 
     #[tokio::test]
