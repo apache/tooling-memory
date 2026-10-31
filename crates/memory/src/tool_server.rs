@@ -128,31 +128,33 @@ impl Refusal {
         }
     }
 
+    /// A request without a handshake that names a version other than the one spoken
+    /// that way. The versions it lists are the ones such a request may name; the older
+    /// ones are reached through `initialize`, which the message says.
     fn unsupported(requested: &str) -> Refusal {
         Refusal {
             code: UNSUPPORTED_VERSION,
             message: format!(
-                "Unsupported protocol version {requested}; this server speaks {}",
-                supported().join(", ")
+                "Unsupported protocol version {requested}: a request without a handshake speaks {MODERN}; {} are reached through initialize",
+                LEGACY.join(", ")
             ),
-            data: Some(json!({"supported": supported(), "requested": requested})),
+            data: Some(json!({"supported": [MODERN], "requested": requested})),
         }
     }
 
     /// The JSON-RPC error. A stateless request learns what kind from the status too:
     /// malformed, at odds with its headers, or of a version not spoken is a 400, a
     /// method unknown a 404. After a handshake every error went with a 200 as before,
-    /// but headers at odds with the body, which are a 400 whoever sends them.
+    /// but headers at odds with the body and a body that is not one request, which are
+    /// a 400 whoever sends them.
     fn answer(self, era: Era, id: &Value) -> Response {
         let mut error = json!({"code": self.code, "message": self.message});
         if let Some(data) = self.data {
             error["data"] = data;
         }
         let status = match (era, self.code) {
-            (_, HEADER_MISMATCH)
-            | (Era::Stateless, -32602 | -32600 | -32021 | UNSUPPORTED_VERSION) => {
-                StatusCode::BAD_REQUEST
-            }
+            (_, HEADER_MISMATCH | -32600)
+            | (Era::Stateless, -32602 | -32021 | UNSUPPORTED_VERSION) => StatusCode::BAD_REQUEST,
             (Era::Stateless, -32601) => StatusCode::NOT_FOUND,
             _ => StatusCode::OK,
         };
@@ -215,13 +217,30 @@ fn checked(method: &str, params: &Value, headers: &HeaderMap) -> Result<(), Refu
     if header(headers, METHOD_HEADER)?.is_none() {
         return Err(Refusal::mismatch("Mcp-Method is missing".into()));
     }
-    if let Some(key) = named_by(method) {
-        let named = params[key].as_str().unwrap_or_default();
-        let sent = header(headers, NAME_HEADER)?
-            .ok_or_else(|| Refusal::mismatch("Mcp-Name is missing".into()))?;
-        if decode(&sent).as_deref() != Some(named) {
+    if named_by(method).is_some() && header(headers, NAME_HEADER)?.is_none() {
+        return Err(Refusal::mismatch("Mcp-Name is missing".into()));
+    }
+    Ok(())
+}
+
+/// Whether the method and name headers, where sent, say what the body says. Whoever
+/// sends them, a request whose headers name another method or tool than its body is
+/// refused: whatever routed on the headers acted on a different request than this one.
+/// A client of the handshake may leave them out.
+fn mirrored(method: &str, params: &Value, headers: &HeaderMap) -> Result<(), Refusal> {
+    if let Some(m) = header(headers, METHOD_HEADER)? {
+        if m != method {
             return Err(Refusal::mismatch(format!(
-                "Mcp-Name {sent} is not the {named} the body names"
+                "Mcp-Method {m} is not the {method} the body names"
+            )));
+        }
+    }
+    if let Some(sent) = header(headers, NAME_HEADER)? {
+        let named = named_by(method).and_then(|key| params[key].as_str());
+        if named.is_none() || decode(&sent).as_deref() != named {
+            return Err(Refusal::mismatch(format!(
+                "Mcp-Name {sent} is not the {} the body names",
+                named.unwrap_or("nothing")
             )));
         }
     }
@@ -296,6 +315,15 @@ async fn mcp(State(s): State<Arc<Served>>, headers: HeaderMap, body: String) -> 
         };
         return refused.answer(Era::Handshake, &Value::Null);
     };
+    if !msg.is_object() {
+        // one request a POST: a batch, or JSON that is no request, is not one
+        let refused = Refusal {
+            code: -32600,
+            message: "the body is not one JSON-RPC request".into(),
+            data: None,
+        };
+        return refused.answer(Era::Handshake, &Value::Null);
+    }
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let method = msg["method"].as_str().unwrap_or_default();
     if msg.get("id").is_none() {
@@ -304,17 +332,11 @@ async fn mcp(State(s): State<Arc<Served>>, headers: HeaderMap, body: String) -> 
     }
     let params = &msg["params"];
     let era = era(method, params, &headers);
-    // a method header that names another method than the body is refused whoever sends
-    // it: whatever routed on the header acted on a different request than this one
-    let mirrored = header(&headers, METHOD_HEADER).and_then(|m| match m {
-        Some(m) if m != method => Err(Refusal::mismatch(format!(
-            "Mcp-Method {m} is not the {method} the body names"
-        ))),
-        _ => Ok(()),
-    });
     let ready = match era {
-        Era::Stateless => mirrored.and_then(|()| checked(method, params, &headers)),
-        Era::Handshake => mirrored,
+        Era::Stateless => {
+            mirrored(method, params, &headers).and_then(|()| checked(method, params, &headers))
+        }
+        Era::Handshake => mirrored(method, params, &headers),
     };
     if let Err(refused) = ready {
         return refused.answer(era, &id);
@@ -562,11 +584,58 @@ mod tests {
         assert_eq!(status, 400, "{got}");
         assert_eq!(got["error"]["code"], -32022, "{got}");
         assert_eq!(got["error"]["data"]["requested"], "1900-01-01", "{got}");
-        assert_eq!(
-            got["error"]["data"]["supported"],
-            json!(mcp_meta::supported()),
-            "{got}"
-        );
+        // a stateless request is answered with the stateless versions only; the older
+        // ones are reached through initialize, which the message says
+        assert_eq!(got["error"]["data"]["supported"], json!([MODERN]), "{got}");
+        let said = got["error"]["message"].as_str().unwrap_or_default();
+        assert!(said.contains("initialize"), "{got}");
+        // a version with a handshake named in _meta is no stateless version either
+        let (mut r, mut h) = modern("tools/list", Value::Null);
+        r["params"]["_meta"][PROTOCOL_VERSION] = json!("2025-06-18");
+        h[0].1 = "2025-06-18".into();
+        let (status, got) = post_to(&app, &h, &r).await;
+        assert_eq!(status, 400, "{got}");
+        assert_eq!(got["error"]["code"], -32022, "{got}");
+        assert_eq!(got["error"]["data"]["supported"], json!([MODERN]), "{got}");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_one_request_is_refused_as_invalid() {
+        let app = app();
+        let one = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        for body in [json!([one]), json!([]), json!("tools/list"), json!(7)] {
+            let (status, got) = post_to(&app, &[], &body).await;
+            assert_eq!(status, 400, "{body}: {got}");
+            assert_eq!(got["error"]["code"], -32600, "{body}: {got}");
+            assert_eq!(got["id"], Value::Null, "{body}: {got}");
+        }
+    }
+
+    /// A name header at odds with the body is refused whoever sends it; without one, a
+    /// client of the handshake is served as before.
+    #[tokio::test]
+    async fn a_name_header_at_odds_with_the_body_is_refused_after_a_handshake_too() {
+        let app = app();
+        let call =
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": call_fetch()});
+        let method = (mcp_meta::METHOD_HEADER, "tools/call".to_string());
+        let other = (mcp_meta::NAME_HEADER, "search".to_string());
+        let version = (mcp_meta::VERSION_HEADER, "2025-06-18".to_string());
+        for headers in [
+            vec![method.clone(), other.clone()],
+            vec![method.clone(), other.clone(), version.clone()],
+            vec![other.clone()],
+        ] {
+            let (status, got) = post_to(&app, &headers, &call).await;
+            assert_eq!(status, 400, "{headers:?}: {got}");
+            assert_eq!(got["error"]["code"], mcp_meta::HEADER_MISMATCH, "{got}");
+        }
+        let same = (mcp_meta::NAME_HEADER, "=?base64?ZmV0Y2g=?=".to_string());
+        for headers in [vec![], vec![version, same]] {
+            let (status, got) = post_to(&app, &headers, &call).await;
+            assert_eq!(status, 200, "{headers:?}: {got}");
+            assert_eq!(got["result"]["isError"], true, "{got}");
+        }
     }
 
     /// Each way a 2026-07-28 request's headers fail its body, and what is answered.

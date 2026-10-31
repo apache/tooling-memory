@@ -201,36 +201,58 @@ fn learn(url: &str, era: Option<Era>) {
 
 /// What a tool server's answer to `server/discover` says it speaks. A result listing
 /// 2026-07-28 is that revision; one listing only revisions with a handshake, or that
-/// revision's refusal of the version naming only those, is one of them. Anything else
-/// no server of 2026-07-28 answers, so it comes from one before it that has no such
-/// method: an error status without one of that revision's errors, a method unknown,
-/// nothing at all.
+/// revision's refusal of the version naming only those, is one of them. A server from
+/// before it has no such method: it answers with a status of a request it cannot take
+/// ([`before`]) and none of that revision's errors, or with a success carrying
+/// "method not found", as `amem tool-server` did. Anything else says nothing of the
+/// revision, an error page, a limit, a refusal of the caller, and is not taken as one.
 ///
 /// # Errors
 ///
-/// That revision's refusal of the request itself, or a list of versions none of
-/// which this launcher speaks.
-fn era(content_type: &str, body: &str) -> Result<Era, String> {
-    let Ok(m) = message(content_type, body) else {
-        return Ok(Era::Handshake);
-    };
-    let listed = if let Some(e) = m.get("error") {
-        let code = e["code"].as_i64().unwrap_or_default();
-        if !MODERN_ERRORS.contains(&code) {
-            return Ok(Era::Handshake);
+/// That revision's refusal of the request itself, versions none of which this
+/// launcher speaks, or an answer that names no revision, with its status.
+fn era(status: u16, content_type: &str, body: &str) -> Result<Era, String> {
+    let m = message(content_type, body).ok();
+    let error = m.as_ref().and_then(|m| m.get("error"));
+    let code = error.and_then(|e| e["code"].as_i64());
+    if let (Some(e), Some(c)) = (error, code) {
+        if c == UNSUPPORTED_VERSION {
+            return named(&e["data"]["supported"], false);
         }
-        if code != UNSUPPORTED_VERSION {
+        if MODERN_ERRORS.contains(&c) {
             return Err(format!("the tool server refused server/discover: {e}"));
         }
-        &e["data"]["supported"]
-    } else {
-        &m["result"]["supportedVersions"]
-    };
-    let Some(listed) = listed.as_array() else {
-        return Ok(Era::Handshake);
-    };
-    let listed: Vec<&str> = listed.iter().filter_map(Value::as_str).collect();
-    if listed.contains(&MODERN) && m.get("error").is_none() {
+    }
+    let listed = m.as_ref().map(|m| &m["result"]["supportedVersions"]);
+    match listed {
+        Some(v) if (200..300).contains(&status) && v.is_array() => return named(v, true),
+        _ if (200..300).contains(&status) && code == Some(-32601) => return Ok(Era::Handshake),
+        _ if before(status) => return Ok(Era::Handshake),
+        _ => {}
+    }
+    let said: String = body.trim().chars().take(300).collect();
+    Err(format!(
+        "the tool server answered server/discover with {status} and named no MCP revision: {said}"
+    ))
+}
+
+/// A status a server from before 2026-07-28 answers a method it has no such thing as
+/// with: a bad request, not found, a method not allowed, and the 415 and 422 that rmcp's
+/// session servers answer a request they cannot read or one before `initialize` with.
+/// A refusal of the caller (401, 403), a limit (429), or a failure on the way (5xx) says
+/// nothing of the revision.
+fn before(status: u16) -> bool {
+    matches!(status, 400 | 404 | 405 | 415 | 422)
+}
+
+/// The revision a list of versions leaves: 2026-07-28 when it is listed and
+/// `stateless` allows it, else the handshake when a revision with one is listed.
+fn named(listed: &Value, stateless: bool) -> Result<Era, String> {
+    let listed: Vec<&str> = listed
+        .as_array()
+        .map(|l| l.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if stateless && listed.contains(&MODERN) {
         Ok(Era::Stateless)
     } else if listed.iter().any(|v| LEGACY.contains(v)) {
         Ok(Era::Handshake)
@@ -313,7 +335,7 @@ impl Server<'_> {
     async fn discover(&self) -> Result<Era, String> {
         let request = mcp_meta::request(1, "server/discover", Value::Null, "amem");
         let sent = self.post(&request, &mcp_meta::headers(&request)).await?;
-        era(&sent.content_type, &sent.body)
+        era(sent.status, &sent.content_type, &sent.body)
     }
 
     /// One `tools/call` of 2026-07-28: one request, no session.
@@ -412,6 +434,144 @@ pub async fn call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering::SeqCst};
+
+    /// A tool server of 2026-07-28 on loopback, counting what it is asked. Discovery is
+    /// answered with `discover` when set, a status, a content type and a body, and with
+    /// the version list otherwise; a call fails with a 502 while `failing` is set; the
+    /// handshake is refused.
+    #[derive(Default)]
+    struct Fake {
+        discover: Mutex<Option<(u16, &'static str, &'static str)>>,
+        failing: AtomicBool,
+        port: AtomicU16,
+        discovers: AtomicUsize,
+        handshakes: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    async fn fake(State(f): State<Arc<Fake>>, body: String) -> axum::response::Response {
+        let m: Value = serde_json::from_str(&body).unwrap_or_default();
+        match m["method"].as_str().unwrap_or_default() {
+            "server/discover" => {
+                f.discovers.fetch_add(1, SeqCst);
+                let set = *f.discover.lock().unwrap();
+                if let Some((status, kind, text)) = set {
+                    let status = StatusCode::from_u16(status).unwrap();
+                    return (status, [("content-type", kind)], text).into_response();
+                }
+                axum::Json(
+                    json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete",
+                    "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}}),
+                )
+                .into_response()
+            }
+            "tools/call" => {
+                f.calls.fetch_add(1, SeqCst);
+                if f.failing.load(SeqCst) {
+                    return (StatusCode::BAD_GATEWAY, "upstream down").into_response();
+                }
+                let page = format!("http://127.0.0.1:{}/page", f.port.load(SeqCst));
+                let text = json!({"answer": {"text": "ok"}, "reached": [page]}).to_string();
+                axum::Json(
+                    json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete",
+                    "content": [{"type": "text", "text": text}]}}),
+                )
+                .into_response()
+            }
+            _ => {
+                f.handshakes.fetch_add(1, SeqCst);
+                (StatusCode::BAD_REQUEST, "no handshake here").into_response()
+            }
+        }
+    }
+
+    /// A root whose fetch is hosted by a [`Fake`], the egress to it, and the fake.
+    async fn hosted_fetch(dir: &std::path::Path) -> (Egress, Arc<Memory>, Arc<Fake>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let f = Arc::new(Fake::default());
+        f.port.store(port, SeqCst);
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(fake))
+            .with_state(f.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = dir.join("m");
+        Memory::init(&root, "human:test:me", "dom-me").unwrap();
+        let mut g = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("grants.toml"))
+            .unwrap();
+        write!(
+            g,
+            "\n[taps.fetch]\ndomain = \"dom-me\"\ntool = true\nceiling = \"public\"\nhosts = [\"127.0.0.1\"]\nloopback = true\nhosted = \"http://127.0.0.1:{port}/mcp\"\n"
+        )
+        .unwrap();
+        let memory = Arc::new(Memory::open(&root).unwrap().without_read_log());
+        let egress = Egress::with_tool_servers(
+            memory.clone(),
+            HashMap::new(),
+            tool_servers(memory.grants()).unwrap(),
+            &dir.join("t.db"),
+        )
+        .unwrap();
+        (egress, memory, f)
+    }
+
+    async fn fetch(egress: &Egress, memory: &Arc<Memory>) -> Result<Answered, String> {
+        let args = "{\"url\": \"http://127.0.0.1:1/page\"}";
+        call(egress, memory.clone(), "fetch", "{}", args).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_a_server_speaks_is_asked_once_and_again_after_a_call_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (egress, memory, f) = hosted_fetch(dir.path()).await;
+        fetch(&egress, &memory).await.unwrap();
+        fetch(&egress, &memory).await.unwrap();
+        assert_eq!(f.discovers.load(SeqCst), 1);
+        assert_eq!(f.calls.load(SeqCst), 2);
+        f.failing.store(true, SeqCst);
+        let e = fetch(&egress, &memory).await.unwrap_err();
+        assert!(e.contains("502"), "{e}");
+        assert_eq!(f.discovers.load(SeqCst), 1);
+        f.failing.store(false, SeqCst);
+        fetch(&egress, &memory).await.unwrap();
+        assert_eq!(f.discovers.load(SeqCst), 2);
+        assert_eq!(f.handshakes.load(SeqCst), 0);
+    }
+
+    /// An answer to discovery that says nothing of the revision, an error page, a limit,
+    /// a refusal of the caller, is an error, and is not taken for a server from before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_to_discovery_that_names_no_revision_is_an_error_and_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (egress, memory, f) = hosted_fetch(dir.path()).await;
+        for (status, kind, body, says) in [
+            (502, "text/html", "<html>Bad Gateway</html>", "502"),
+            (429, "text/plain", "slow down", "429"),
+            (
+                200,
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"unauthorized"}}"#,
+                "unauthorized",
+            ),
+        ] {
+            *f.discover.lock().unwrap() = Some((status, kind, body));
+            let e = fetch(&egress, &memory).await.unwrap_err();
+            assert!(e.contains(says), "{status}: {e}");
+            assert_eq!(f.handshakes.load(SeqCst), 0, "{status}: {e}");
+        }
+        // none of them was kept as what the server speaks: the next answer is asked for
+        *f.discover.lock().unwrap() = None;
+        fetch(&egress, &memory).await.unwrap();
+        assert_eq!(f.discovers.load(SeqCst), 4);
+        assert_eq!(f.handshakes.load(SeqCst), 0);
+    }
 
     #[test]
     fn a_reply_is_read_from_json_or_an_event_stream() {
@@ -460,29 +620,49 @@ mod tests {
                 .to_string()
         };
         let j = "application/json";
-        assert_eq!(era(j, &result(json!(["2026-07-28"]))), Ok(Era::Stateless));
+        let ok = |kind: &str, body: &str| era(200, kind, body);
+        assert_eq!(ok(j, &result(json!(["2026-07-28"]))), Ok(Era::Stateless));
         let sse = format!("data: {}\n\n", result(json!(["2027-01-01", "2026-07-28"])));
-        assert_eq!(era("text/event-stream", &sse), Ok(Era::Stateless));
-        assert_eq!(era(j, &result(json!(["2025-11-25"]))), Ok(Era::Handshake));
+        assert_eq!(ok("text/event-stream", &sse), Ok(Era::Stateless));
+        assert_eq!(ok(j, &result(json!(["2025-11-25"]))), Ok(Era::Handshake));
         // refused for its version, naming only revisions with a handshake
         let older = json!({"supported": ["2025-06-18"], "requested": "2026-07-28"});
-        assert_eq!(era(j, &error(-32022, older)), Ok(Era::Handshake));
-        // a server from before: a method unknown, nothing, a refusal in words, no list
-        assert_eq!(era(j, &error(-32601, Value::Null)), Ok(Era::Handshake));
-        assert_eq!(era(j, ""), Ok(Era::Handshake));
-        assert_eq!(
-            era("text/plain", "Bad Request: Session not found"),
-            Ok(Era::Handshake)
-        );
-        let bare = json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string();
-        assert_eq!(era(j, &bare), Ok(Era::Handshake));
+        assert_eq!(era(400, j, &error(-32022, older)), Ok(Era::Handshake));
+        // a server from before: "method not found" in a success, as amem tool-server
+        // answered, or a status of a request it cannot take with no error of 2026-07-28
+        assert_eq!(ok(j, &error(-32601, Value::Null)), Ok(Era::Handshake));
+        for status in [400, 404, 405, 415, 422] {
+            assert_eq!(era(status, j, ""), Ok(Era::Handshake), "{status}");
+            let words = "Unexpected message, expect initialize request";
+            assert_eq!(era(status, "text/plain", words), Ok(Era::Handshake));
+        }
         // 2026-07-28 refusing the request itself, or versions none of which are spoken
-        let e = era(j, &error(-32020, Value::Null)).unwrap_err();
+        let e = era(400, j, &error(-32020, Value::Null)).unwrap_err();
         assert!(e.contains("refused"), "{e}");
-        let e = era(j, &result(json!(["2027-01-01"]))).unwrap_err();
+        let e = ok(j, &result(json!(["2027-01-01"]))).unwrap_err();
         assert!(e.contains("2027-01-01") && e.contains("2026-07-28"), "{e}");
-        let e = era(j, &error(-32022, json!({"supported": ["2027-01-01"]}))).unwrap_err();
+        let e = era(400, j, &error(-32022, json!({"supported": ["2027-01-01"]}))).unwrap_err();
         assert!(e.contains("2027-01-01"), "{e}");
+        // an answer that names no revision: an error page, a limit, a refusal of the
+        // caller, a success that is no answer to discovery
+        let page = "<html>".to_string() + &"Bad Gateway ".repeat(100) + "</html>";
+        let e = era(502, "text/html", &page).unwrap_err();
+        assert!(e.contains("502") && e.len() < 500, "{e}");
+        for (status, body) in [
+            (429, "slow down".to_string()),
+            (401, "a bearer token is required".to_string()),
+            (403, String::new()),
+            (503, String::new()),
+            (200, error(-32001, Value::Null)),
+            (
+                200,
+                json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+            ),
+            (202, String::new()),
+        ] {
+            let e = era(status, j, &body).unwrap_err();
+            assert!(e.contains(&status.to_string()), "{e}");
+        }
     }
 
     #[test]

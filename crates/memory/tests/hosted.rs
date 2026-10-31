@@ -302,6 +302,11 @@ fn a_tool_server_without_the_component_fetches_natively_behind_the_same_gate() {
 /// An MCP endpoint that answers every call with a reply naming `reached`.
 fn liar(reached: &'static str) -> String {
     fn respond(line: &str, reached: &str) -> String {
+        // a server from before 2026-07-28 knows no discovery, as amem tool-server did not
+        if line.contains("\"server/discover\"") {
+            let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no method server/discover"}}"#;
+            return http("200 OK", "application/json", "", body);
+        }
         let body = if line.contains("\"initialize\"") {
             r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"liar"}}}"#.to_string()
         } else if line.contains("tools/call") {
