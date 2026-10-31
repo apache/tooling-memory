@@ -1052,17 +1052,16 @@ impl Memory {
         let created = self
             .file_own(TaskSpec {
                 domain: entry.front.domain.clone(),
-                title: format!(
-                    "Approve: verified for {}",
-                    entry.front.title.as_deref().unwrap_or(id)
-                ),
+                // by id, not title: an erasure of the entry takes its title with it, and
+                // the task then has nothing of the entry to lose but the id a stub keeps
+                title: proposal_title(id),
                 body: format!(
                     "`{}` proposes that `{id}`, written by `{}`, be promoted to verified.\n\nRead it with `amem get {id}` and judge it first. Then read why it was proposed, on the ledger: `amem promotions {id}`. Approve with `amem approve <this task>` if it holds; a person who did not propose it approves, and an agent never does. Invalidate this task to decline.",
                     self.author, entry.front.author
                 ),
                 requirements: vec!["human".into()],
                 depends_on: Vec::new(),
-                origin: Some(format!("promote:{id}")),
+                origin: Some(proposal_origin(id)),
                 upstream_event: Some("verified".into()),
                 created_by: String::new(),
                 classification: entry.front.classification,
@@ -2228,6 +2227,7 @@ impl Memory {
                     flagged: Vec::new(),
                     unresolved: vec![erasure::UNFINISHED.into()],
                     promotion_whys_removed: 0,
+                    promotion_tasks_cleared: 0,
                 };
                 self.store.put_receipt(&pending).await?;
                 pending
@@ -2271,15 +2271,18 @@ impl Memory {
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
         let missed = self.erase_from_projections(domain, id);
-        // the whys of its promotions are the entry's text too; who promoted what stays.
+        // the whys of its promotions are the entry's text too, and so is what its
+        // approval tasks say of it; who promoted what stays, and so does each task's id.
         // Last of the steps, since a ledger another connection holds stops here: the
         // index and the renders are clean by then, and the receipt stays unfinished
-        let scrubbed = self
-            .ledger
-            .lock()
-            .await
-            .scrub_promotions(domain, id)
-            .await?;
+        let (cleared, scrubbed) = {
+            let mut l = self.ledger.lock().await;
+            let cleared = l
+                .scrub_tasks(domain, &proposal_origin(id), &proposal_redaction(id))
+                .await?;
+            (cleared, l.scrub_promotions(domain, id).await?)
+        };
+        receipt.promotion_tasks_cleared = cleared;
         receipt.promotion_whys_removed = scrubbed.records;
         close_receipt(&mut receipt, missed);
         receipt.unresolved.extend(scrubbed.beyond_reach);
@@ -2310,6 +2313,29 @@ impl Memory {
             }
         }
         Err(Error::NotFound(id.to_string()))
+    }
+}
+
+/// The origin of the approval tasks of proposals to promote `id` to verified.
+fn proposal_origin(id: &str) -> String {
+    format!("promote:{id}")
+}
+
+/// The title of an approval task: the entry by id, and nothing else of it.
+fn proposal_title(id: &str) -> String {
+    format!("Approve: verified for {id}")
+}
+
+/// What an erasure of `id` rewrites its approval tasks to: the id a stub keeps, and
+/// nothing of the entry's title, nor of the why a task filed before the ledger kept the
+/// why held in its body.
+fn proposal_redaction(id: &str) -> dm_ledger::Redaction {
+    dm_ledger::Redaction {
+        title: proposal_title(id),
+        body: format!(
+            "`{id}` was erased, and this proposal is closed with it. Nothing of the entry, nor of why it was proposed, is kept here."
+        ),
+        reason: format!("{id} was erased"),
     }
 }
 
@@ -3422,6 +3448,128 @@ mod tests {
         assert_eq!(receipt.promotion_whys_removed, 1);
         the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
         no_task_holds(&owner, marker).await;
+    }
+
+    /// The `created` payloads of every task in the ledger under `root`.
+    fn created_payloads(root: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(root.join(LEDGER_FILE)).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT payload FROM events WHERE kind = 'created'")
+            .unwrap();
+        let out: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        out
+    }
+
+    /// The approval tasks of `id`, whatever their status.
+    async fn approval_tasks(m: &Memory, id: &str) -> Vec<Task> {
+        all_tasks(m)
+            .await
+            .into_iter()
+            .filter(|t| t.spec.origin.as_deref() == Some(&proposal_origin(id)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_erasure_clears_the_approval_task_of_a_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(WriteRequest {
+                title: Some(format!("The vault opens with {marker}")),
+                ..req(&format!("Try {marker} on the vault.\n"))
+            })
+            .await
+            .unwrap()
+            .id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&secret, TrustTier::Verified, "checked it on the vault")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_eq!(
+            task.spec.title,
+            format!("Approve: verified for {secret}"),
+            "the task names the entry by id, not by title"
+        );
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
+        assert_eq!(receipt.promotion_tasks_cleared, 1);
+        no_task_holds(&owner, marker).await;
+        let kept = approval_tasks(&owner, &secret).await;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].id, task.id, "the task keeps its id");
+        assert_eq!(kept[0].status, Status::Invalidated, "and is closed");
+        assert_eq!(
+            kept[0].spec.created_by, "agent:librarian",
+            "who filed it stays"
+        );
+        assert!(
+            !created_payloads(dir.path())
+                .iter()
+                .any(|p| p.contains(marker)),
+            "its created event holds nothing of the entry"
+        );
+        owner.reindex().await.unwrap();
+        no_task_holds(&owner, marker).await;
+    }
+
+    /// A build from before the ledger kept the why filed the approval task with the
+    /// entry's title and the why in it, and recorded no promotion. An erasure after an
+    /// upgrade still takes both out, and the receipt says so.
+    #[tokio::test]
+    async fn an_erasure_clears_an_approval_task_filed_before_the_why_was_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(WriteRequest {
+                title: Some(format!("The vault opens with {marker}")),
+                ..req(&format!("Try {marker} on the vault.\n"))
+            })
+            .await
+            .unwrap()
+            .id;
+        // as origin/main files it: no record, the why in the body, the title in the title
+        let filed = librarian(dir.path())
+            .file_own(TaskSpec {
+                domain: "dom-me".into(),
+                title: format!("Approve: verified for The vault opens with {marker}"),
+                body: format!(
+                    "`agent:librarian` proposes that `{secret}`, written by `human:test:me`, be promoted to verified.\n\ntried {marker} on the vault\n\nRead it with `amem get {secret}`."
+                ),
+                requirements: vec!["human".into()],
+                depends_on: Vec::new(),
+                origin: Some(format!("promote:{secret}")),
+                upstream_event: Some("verified".into()),
+                created_by: String::new(),
+                classification: Label::Internal,
+                priority: 3,
+            })
+            .await
+            .unwrap()
+            .task;
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
+        assert_eq!(receipt.promotion_whys_removed, 0, "no record to scrub");
+        assert_eq!(receipt.promotion_tasks_cleared, 1, "but a task to clear");
+        no_task_holds(&owner, marker).await;
+        let kept = approval_tasks(&owner, &secret).await;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].id, filed.id);
+        assert_eq!(kept[0].status, Status::Invalidated);
+        assert!(
+            !created_payloads(dir.path())
+                .iter()
+                .any(|p| p.contains(marker)),
+            "its created event holds neither the title nor the why"
+        );
     }
 
     /// The owner's entry, promoted by the librarian with `why`, exported at `max`.

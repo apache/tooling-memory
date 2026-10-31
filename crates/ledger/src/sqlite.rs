@@ -5,7 +5,7 @@
 
 use crate::{
     claimable, parse_time, Error, Event, PromotionRecord, PromotionSpec, RawPromotion, RawTask,
-    Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+    Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::Path;
@@ -249,6 +249,48 @@ impl Db {
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
+    /// Rewrite the tasks filed from `origin` to the redaction, in their `created` events
+    /// and their rows, and invalidate the open ones, in one transaction with the space the
+    /// old text leaves overwritten; then rebuild the file and fold the log into it.
+    /// Returns how many tasks from that origin there are.
+    pub(crate) fn scrub_tasks(
+        &mut self,
+        at: OffsetDateTime,
+        domain: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<usize, Error> {
+        let n = {
+            let mut conn = self.conn();
+            conn.pragma_update(None, "secure_delete", true)?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tasks: Vec<(String, bool)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, status IN ('completed', 'invalidated') FROM tasks
+                     WHERE domain = ?1 AND origin = ?2 ORDER BY created",
+                )?;
+                let rows =
+                    stmt.query_map(params![domain, origin], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            for (id, terminal) in &tasks {
+                if !terminal {
+                    let closed = Event::Invalidated {
+                        reason: redaction.reason.clone(),
+                        superseded_by: None,
+                    };
+                    apply(&tx, id, at, &closed)?;
+                }
+                redact_task(&tx, id, redaction)?;
+            }
+            tx.commit()?;
+            conn.pragma_update(None, "secure_delete", false)?;
+            tasks.len()
+        };
+        compact(&self.conn())?;
+        Ok(n)
+    }
+
     pub(crate) fn promotions(
         &self,
         domain: &str,
@@ -460,6 +502,29 @@ fn migrate_promotions(conn: &Connection) -> Result<(), Error> {
          CREATE UNIQUE INDEX promotions_version
              ON promotions (domain, entry, tier, digest, promoter);
          COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// One task's `created` event and row, rewritten to the redaction.
+fn redact_task(conn: &Connection, id: &str, redaction: &Redaction) -> Result<(), Error> {
+    let events: Vec<(i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT seq, payload FROM events WHERE task_id = ?1 AND kind = 'created'")?;
+        let rows = stmt.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (seq, payload) in events {
+        if let Some(redacted) = crate::redact_created(id, &payload, redaction)? {
+            conn.execute(
+                "UPDATE events SET payload = ?2 WHERE seq = ?1",
+                params![seq, redacted],
+            )?;
+        }
+    }
+    conn.execute(
+        "UPDATE tasks SET title = ?2, body = ?3 WHERE id = ?1",
+        params![id, redaction.title, redaction.body],
     )?;
     Ok(())
 }

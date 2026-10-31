@@ -938,6 +938,7 @@ impl Memory {
             flagged: Vec::new(),
             unresolved: vec![erasure::UNFINISHED.into()],
             promotion_whys_removed: 0,
+            promotion_tasks_cleared: 0,
         };
         self.put_transcript_receipt(&pending).await?;
         Ok(pending)

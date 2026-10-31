@@ -210,6 +210,18 @@ pub struct Scrubbed {
     pub beyond_reach: Vec<String>,
 }
 
+/// What an erasure rewrites a task to when the task is about the erased entry: a title
+/// and a body that name the entry by its id and nothing else of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Redaction {
+    /// The title every task gets.
+    pub title: String,
+    /// The body every task gets.
+    pub body: String,
+    /// Why an open task is invalidated.
+    pub reason: String,
+}
+
 /// The result of filing a task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Created {
@@ -361,7 +373,23 @@ impl Event {
 
 /// What a PostgreSQL ledger keeps of a why after the rows are rewritten: the server, not
 /// the ledger, decides when old row versions and its log are gone.
-const POSTGRES_RESIDUE: &str = "the ledger's PostgreSQL server: old row versions and its write-ahead log keep a removed why until the server vacuums and recycles them";
+const POSTGRES_RESIDUE: &str = "the ledger's PostgreSQL server: old row versions and its write-ahead log keep removed text until the server vacuums and recycles them";
+
+/// A `created` event's payload with `redaction`'s title and body in place of its own;
+/// `None` when it holds them already, or is no `created` event.
+fn redact_created(id: &str, payload: &str, redaction: &Redaction) -> Result<Option<String>, Error> {
+    match Event::parse(id, payload)? {
+        Event::Created {
+            id: new_id,
+            mut spec,
+        } if spec.title != redaction.title || spec.body != redaction.body => {
+            spec.title.clone_from(&redaction.title);
+            spec.body.clone_from(&redaction.body);
+            Ok(Some(Event::Created { id: new_id, spec }.payload(id)?))
+        }
+        _ => Ok(None),
+    }
+}
 
 /// A `promoted` event's payload with its why removed, when the event is that domain's
 /// and holds a why; `None` when there is nothing to rewrite.
@@ -1114,6 +1142,26 @@ impl Ledger {
         })
     }
 
+    /// Rewrite the tasks filed from `origin` in `domain` for an erasure of what they are
+    /// about: each gets `redaction`'s title and body, in its `created` event and in the
+    /// projection, so no replay brings the old text back; each still open is invalidated.
+    /// The task's id, origin, who filed it and its history stay. Returns how many tasks
+    /// from that origin now hold the redaction. Running it again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`Error::Held`] when another connection holds the log the
+    /// old text is in.
+    pub async fn scrub_tasks(
+        &mut self,
+        domain: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<usize, Error> {
+        let now = self.now();
+        on_backend!(&mut self.backend, db => db.scrub_tasks(now, domain, origin, redaction))
+    }
+
     /// How many events the ledger holds.
     ///
     /// # Errors
@@ -1299,6 +1347,7 @@ mod tests {
         a_second_promoter_of_the_same_version_is_recorded,
         an_erasure_takes_the_why_and_a_replay_keeps_it_out,
         a_restored_record_keeps_its_time_and_its_erased_why,
+        an_erasure_rewrites_the_tasks_filed_from_an_origin,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1737,6 +1786,106 @@ mod tests {
         kept_whole(l, "dom-b", "mem-a-1", &specs[3]).await;
         let again = l.scrub_promotions("dom-a", "mem-a-1").await.unwrap();
         assert_eq!(again.records, 2, "running it again counts what is scrubbed");
+    }
+
+    /// The redaction an erasure of `mem-a-1` gives its tasks.
+    fn redaction() -> Redaction {
+        Redaction {
+            title: "Approve: verified for mem-a-1".into(),
+            body: "`mem-a-1` was erased.".into(),
+            reason: "the entry was erased".into(),
+        }
+    }
+
+    /// A task filed from `origin` on `event` whose title and body quote the secret.
+    fn task_quoting_the_secret(origin: &str, event: &str) -> TaskSpec {
+        TaskSpec {
+            title: format!("Approve: verified for The vault opens with {SECRET}"),
+            body: format!("proposed because {SECRET} opens it"),
+            origin: Some(origin.into()),
+            upstream_event: Some(event.into()),
+            ..spec("")
+        }
+    }
+
+    /// Three tasks: an open one and a completed one filed from `promote:mem-a-1`, and an
+    /// open one filed from `promote:mem-a-2`.
+    async fn tasks_quoting_the_secret(l: &mut Ledger) -> (Task, Task, Task) {
+        let open = admitted(l, task_quoting_the_secret("promote:mem-a-1", "verified")).await;
+        let done = admitted(l, task_quoting_the_secret("promote:mem-a-1", "again")).await;
+        claim(l, &done.id, "s1", mins(5)).await.unwrap();
+        l.complete(&done.id, "s1", "mem-a-1").await.unwrap();
+        let other = admitted(l, task_quoting_the_secret("promote:mem-a-2", "verified")).await;
+        (open, done, other)
+    }
+
+    async fn an_erasure_rewrites_the_tasks_filed_from_an_origin(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let (open, done, other) = tasks_quoting_the_secret(&mut l).await;
+        let scrubbed = l
+            .scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+            .await;
+        assert_eq!(scrubbed.unwrap(), 2);
+        the_tasks_hold_the_redaction(&l, &open, &done, &other).await;
+        let holding = b
+            .payloads()
+            .await
+            .iter()
+            .filter(|p| p.contains(SECRET))
+            .count();
+        assert_eq!(
+            holding, 1,
+            "the log holds the text in the other entry's task alone"
+        );
+        l.rebuild().await.unwrap();
+        the_tasks_hold_the_redaction(&l, &open, &done, &other).await;
+        let again = l
+            .scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+            .await;
+        assert_eq!(
+            again.unwrap(),
+            2,
+            "running it again counts what holds the redaction"
+        );
+    }
+
+    async fn the_tasks_hold_the_redaction(l: &Ledger, open: &Task, done: &Task, other: &Task) {
+        let open_now = l.get(&open.id).await.unwrap();
+        assert_eq!(
+            open_now.status,
+            Status::Invalidated,
+            "an open task is closed"
+        );
+        assert_eq!(open_now.reason.as_deref(), Some("the entry was erased"));
+        redacted(&open_now);
+        let done_now = l.get(&done.id).await.unwrap();
+        assert_eq!(
+            done_now.status,
+            Status::Completed,
+            "a closed task keeps its status"
+        );
+        assert_eq!(done_now.handoff.as_deref(), Some("mem-a-1"));
+        redacted(&done_now);
+        let other_now = l.get(&other.id).await.unwrap();
+        assert_eq!(
+            other_now.spec, other.spec,
+            "another entry's task is untouched"
+        );
+        assert_eq!(other_now.status, Status::Admitted);
+    }
+
+    /// The task holds the redaction and nothing else of the entry, and the rest of it
+    /// is as it was filed.
+    fn redacted(t: &Task) {
+        assert_eq!(t.spec.title, "Approve: verified for mem-a-1");
+        assert_eq!(t.spec.body, "`mem-a-1` was erased.");
+        assert_eq!(
+            t.spec.origin.as_deref(),
+            Some("promote:mem-a-1"),
+            "the origin stays"
+        );
+        assert_eq!(t.spec.created_by, "human:test:me", "who filed it stays");
+        assert_eq!(t.created, T0, "and when");
     }
 
     /// The first ledger file under `dir` whose bytes hold `needle`.

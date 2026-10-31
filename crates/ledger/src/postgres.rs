@@ -18,7 +18,7 @@
 
 use crate::{
     claimable, parse_time, Error, Event, PromotionRecord, PromotionSpec, RawPromotion, RawTask,
-    Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+    Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -393,6 +393,46 @@ impl Db {
         let n: i64 = row.try_get(0)?;
         tx.commit().await?;
         Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// Rewrite the tasks filed from `origin` to the redaction, in their `created` events
+    /// and their rows, and invalidate the open ones, in one transaction under the domain's
+    /// lock. Returns how many tasks from that origin there are.
+    pub(crate) async fn scrub_tasks(
+        &mut self,
+        at: OffsetDateTime,
+        domain: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<usize, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(0);
+        };
+        let tx = self.client.transaction().await?;
+        lock_domain(&tx, domain).await?;
+        let rows = tx
+            .query(
+                &format!(
+                    "SELECT id, status IN ('completed', 'invalidated') FROM {s}.tasks
+                     WHERE origin = $1 ORDER BY created FOR UPDATE"
+                ),
+                &[&origin],
+            )
+            .await?;
+        for row in &rows {
+            let id: String = row.try_get(0)?;
+            let terminal: bool = row.try_get(1)?;
+            if !terminal {
+                let closed = Event::Invalidated {
+                    reason: redaction.reason.clone(),
+                    superseded_by: None,
+                };
+                apply(&tx, &s, &id, at, &closed).await?;
+            }
+            redact_task(&tx, &s, &id, redaction).await?;
+        }
+        tx.commit().await?;
+        Ok(rows.len())
     }
 
     pub(crate) async fn promotions(
@@ -838,6 +878,41 @@ async fn rebuild_domain<C: GenericClient>(conn: &C, domain: &str, s: &str) -> Re
         n += 1;
     }
     Ok(n)
+}
+
+/// One task's `created` event and row, rewritten to the redaction.
+async fn redact_task<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    id: &str,
+    redaction: &Redaction,
+) -> Result<(), Error> {
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT seq, payload FROM {s}.events
+                 WHERE task_id = $1 AND kind = 'created' FOR UPDATE"
+            ),
+            &[&id],
+        )
+        .await?;
+    for row in &rows {
+        let seq: i64 = row.try_get(0)?;
+        let payload: String = row.try_get(1)?;
+        if let Some(redacted) = crate::redact_created(id, &payload, redaction)? {
+            conn.execute(
+                &format!("UPDATE {s}.events SET payload = $2 WHERE seq = $1"),
+                &[&seq, &redacted],
+            )
+            .await?;
+        }
+    }
+    conn.execute(
+        &format!("UPDATE {s}.tasks SET title = $2, body = $3 WHERE id = $1"),
+        &[&id, &redaction.title, &redaction.body],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Append the event and project it, in the caller's transaction.
