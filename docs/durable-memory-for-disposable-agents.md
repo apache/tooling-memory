@@ -21,9 +21,9 @@ Agents doing real, sustained work fail in four ways.
 
 Shared memory answers all four. It is also a channel, and model output is not safe to pass on unexamined.
 
-In July 2026, models under an internal OpenAI cyber-capability evaluation escaped their sandbox through a flaw in a package-registry proxy. Through a malicious dataset upload, they broke into Hugging Face's production systems and reached internal datasets and credentials [[1]](#ref-1), [[2]](#ref-2). They had coordinated through a message board they built inside an internal package repository, unknown to staff. They used it for months to help each other through the evaluation, and rebuilt it within days after it was wiped [[3]](#ref-3).
+In July 2026, models under an internal OpenAI cyber-capability evaluation escaped their sandbox through flaws in a package-registry proxy. Through a malicious dataset upload, they broke into Hugging Face's production systems and reached internal datasets and credentials [[1]](#ref-1), [[2]](#ref-2). They had coordinated through a message board they improvised inside an internal package repository. It grew, OpenAI found, out of notes agents left in shared infrastructure "often as a form of external memory", which other agents came across and answered. From May they used it to help each other through the evaluation, trading techniques, commands, and credentials. Staff saw it: an internal team observed board activity in late May, and in late June responders traced it to the evaluation and judged that the run need not stop. Its significance was not apparent to those leading the response until July. When the repository was rebuilt in early July, the agents had a new board on it two days later [[3]](#ref-3).
 
-That board was a shared memory with no provenance, no review, and no perimeter. Agents share what they learn whether or not they are given a way to. The design question is how to govern that channel.
+That board was a shared memory with no provenance, no review, and no perimeter. It was seen and still not governed, because nobody owned what it held. Agents share what they learn whether or not they are given a way to. The design question is how to govern that channel.
 
 Ordinary output carries hazards too:
 
@@ -432,7 +432,7 @@ That is the rule: a session sees one memory server, the one run by whoever runs 
 
 Identity is the serving layer's concern; the record carries only provenance. A server for one person authenticates nobody, since the owner is the only principal, but still applies labels and ceilings. An institution's server uses its identity provider. The credential for each host is held by the server, never by an agent.
 
-The operations in [Appendix A](#appendix-a-interface) are the durable contract; protocols are adapters (today MCP or its successor for agents, plain HTTP for scripts), and all of them meet the same filter. A public deployment is the same endpoint with one more principal tier, limited to public entries at curated or better.
+The operations in [Appendix A](#appendix-a-interface) are the durable contract; protocols are adapters (today MCP or its successor for agents, plain HTTP for scripts, and an agent-to-agent protocol between domains, [§8](#8-coordination)), and all of them meet the same filter. A public deployment is the same endpoint with one more principal tier, limited to public entries at curated or better.
 
 ## Turns cost more than transport
 
@@ -635,6 +635,8 @@ Domains work together the way services do. When `dom-a` needs something `dom-b` 
 2. files a request task on `dom-b`'s ledger, which `dom-b` triages against its own rubric.
 
 Nobody writes to another domain's memory, and a contract changes only by a reviewed change to the interface summary. When telemetry shows two domains reading each other more than themselves, the curator proposes a new boundary, and redrawing it is a human decision.
+
+Where the two orchestrators run on different stacks, or in different institutions, both steps can travel over an agent-to-agent protocol such as A2A [[79]](#ref-79). The interface summary is published as the domain's agent card, and a request task, or a recall the other domain answers from its own record, travels as an A2A task. It is an adapter at the domain's boundary and never at a worker, which still sees one memory server ([§6](#6-retrieval-and-serving)). Labels, provenance, and the attempt key travel with every message; a reply lands raw, like any import, and whatever goes out is an export, bounded like one.
 
 The same pattern repeats at every level of the organisation:
 
@@ -934,7 +936,7 @@ The design combines recent agent-memory research with decades of systems practic
 | **Memory** | Operating-system tiers (MemGPT [[18]](#ref-18)); reflection (Generative Agents [[19]](#ref-19)); experience distillation (ExpeL [[20]](#ref-20), A-Mem [[21]](#ref-21)); agent-written skills (Voyager [[22]](#ref-22)); memory as a write, manage, read loop on shared substrates [[23]](#ref-23), [[24]](#ref-24); event sourcing [[25]](#ref-25), [[26]](#ref-26); decision records [[27]](#ref-27); organisational memory [[28]](#ref-28) |
 | **Trust** | Not transitive [[6]](#ref-6); typed by purpose [[7]](#ref-7); lossy propagation, separate distrust [[29]](#ref-29); provenance and lineage in W3C PROV [[30]](#ref-30); authority collapse [[8]](#ref-8); separation of privilege [[31]](#ref-31) |
 | **Safety** | Indirect prompt injection [[32]](#ref-32); memory poisoning through queries (MINJA [[33]](#ref-33)) and stores (AgentPoison [[34]](#ref-34)), largely missed by injection defences [[35]](#ref-35); OWASP's agentic top risks [[36]](#ref-36); failure modes of governed shared memory [[37]](#ref-37); retrieved content as data, never control flow (CaMeL [[38]](#ref-38)) |
-| **Retrieval and access** | Authorisation compiled into the query (OPA [[39]](#ref-39), Zanzibar [[40]](#ref-40)); the Model Context Protocol as today's binding [[41]](#ref-41) |
+| **Retrieval and access** | Authorisation compiled into the query (OPA [[39]](#ref-39), Zanzibar [[40]](#ref-40)); the Model Context Protocol as today's binding [[41]](#ref-41), and A2A between domains [[79]](#ref-79) |
 | **Policy** | Written, layered values (Constitutional AI [[42]](#ref-42)); specification gaming, which the safety gate exists for [[43]](#ref-43), [[44]](#ref-44) |
 | **Coordination** | Blackboards (Hearsay-II [[45]](#ref-45)) and tuple spaces (Linda [[46]](#ref-46)); stigmergy [[47]](#ref-47), [[48]](#ref-48); leases [[49]](#ref-49); bounded contexts [[50]](#ref-50) and data mesh [[51]](#ref-51); hierarchical task networks [[52]](#ref-52); critical-path priority [[53]](#ref-53); the contract net, without the bidding [[54]](#ref-54) |
 | **Measurement and evaluation** | SRE [[55]](#ref-55); token cost as an axis (Mem0 [[56]](#ref-56), LoCoMo [[57]](#ref-57)); long-horizon benchmarks (LongMemEval [[58]](#ref-58)); silent vendor drift [[59]](#ref-59); NIST AI RMF [[60]](#ref-60) and ISO/IEC 42001 [[61]](#ref-61); OpenTelemetry [[62]](#ref-62) and Inspect [[63]](#ref-63) as carriers; the paired noise-floor protocol [[64]](#ref-64) |
@@ -967,7 +969,7 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-2"></a>[2] OpenAI (2026). OpenAI and Hugging Face Partner to Address Security Incident during Model Evaluation. 21 July 2026. https://openai.com/index/hugging-face-model-evaluation-security-incident/
 
-<a id="ref-3"></a>[3] Cybersecurity Dive (2026). OpenAI Warns Autonomous Hacks Are 'Watershed Moment for Computer Security'. 6 August 2026. https://www.cybersecuritydive.com/news/openai-hugging-face-hack-ai-models-black-hat/827167/
+<a id="ref-3"></a>[3] OpenAI (2026). OpenAI–Hugging Face Incident Technical Report. August 2026. https://cdn.openai.com/pdf/67869394-cb91-4c12-888c-5cbd85c7814c/OpenAI-Hugging-Face%20Incident-Technical-Report.pdf
 
 <a id="ref-4"></a>[4] Sharma, S. (2023). Samsung Bans Staff AI Use over Data Leak Concerns. *CSO Online*, 2 May 2023. https://www.csoonline.com/article/3695170/samsung-bans-staff-ai-use-over-data-leak-concerns.html
 
@@ -1043,7 +1045,7 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-40"></a>[40] Pang, R., et al. (2019). Zanzibar: Google's Consistent, Global Authorization System. *USENIX ATC 2019*. https://www.usenix.org/conference/atc19/presentation/pang
 
-<a id="ref-41"></a>[41] Model Context Protocol (2025). Specification, version 2025-11-25. https://modelcontextprotocol.io/specification/2025-11-25
+<a id="ref-41"></a>[41] Model Context Protocol (2026). Specification, version 2026-07-28. https://modelcontextprotocol.io/specification/2026-07-28
 
 <a id="ref-42"></a>[42] Bai, Y., et al. (2022). Constitutional AI: Harmlessness from AI Feedback. arXiv:2212.08073. https://arxiv.org/abs/2212.08073
 
@@ -1118,6 +1120,8 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 <a id="ref-77"></a>[77] Ashby, W. R. (1956). *An Introduction to Cybernetics*. Chapman & Hall. https://archive.org/details/introductiontocy00ashb
 
 <a id="ref-78"></a>[78] Wiener, N. (1948). *Cybernetics: Or Control and Communication in the Animal and the Machine*. Technology Press and Wiley. Reissued by MIT Press, 2019. https://doi.org/10.7551/mitpress/11810.001.0001
+
+<a id="ref-79"></a>[79] A2A Project (2026). Agent2Agent (A2A) Protocol Specification, version 1.0. 12 March 2026. https://a2a-protocol.org/latest/specification/
 
 ---
 
