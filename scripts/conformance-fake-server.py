@@ -17,6 +17,7 @@ could have, so the test can show which step of conformance.py catches it:
     heartbeat-noop      heartbeat answers but does not extend the lease
     heartbeat-lies      heartbeat reports a renewed lease_until but does not extend the lease
     heartbeat-short     heartbeat renews for half of what was asked
+    heartbeat-lies-short heartbeat reports what was asked but renews for a third of it
     release-lies        release answers admitted and leaves the task claimed
     complete-anyone     complete works on a task nobody holds
     no-holder           a claim records no holder
@@ -273,6 +274,10 @@ class Fake:
                 raise Refused("the lease is not held: it expired or was never yours")
             if FLAW == "heartbeat-lies":
                 seconds = a.get("lease_seconds") or 1800
+                t["lease_until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+            elif FLAW == "heartbeat-lies-short":
+                seconds = a.get("lease_seconds") or 1800
+                lease_for(t, seconds / 3, now)
                 t["lease_until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
             elif FLAW == "heartbeat-short":
                 lease_for(t, (a.get("lease_seconds") or 1800) * 0.55, now)

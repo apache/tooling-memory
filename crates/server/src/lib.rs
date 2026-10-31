@@ -287,7 +287,9 @@ const STAMP_STEP: Duration = Duration::minutes(1);
 /// clock reads no later than that and no more than [`STAMP_STEP`] before it. A write
 /// this service makes after another must not be dated before it, or newest-first puts
 /// it second. The last stamp is this service's own, so writes from another process on
-/// the same record are ordered by their own clocks.
+/// the same record are ordered by their own clocks. A stamp can run up to
+/// [`STAMP_STEP`] ahead of the clock, and a source file edited in that window has an
+/// mtime before the entry's `created`, so the librarian's source-change check misses it.
 fn next_stamp(last: &mut OffsetDateTime, now: OffsetDateTime) -> OffsetDateTime {
     let at = if now > *last || *last - now > STAMP_STEP {
         now
@@ -2353,6 +2355,14 @@ mod tests {
         assert_eq!(next_stamp(&mut last, t), t + ns(2));
         let later = t + Duration::seconds(1);
         assert_eq!(next_stamp(&mut last, later), later);
+        // a clock that reads the last stamp again
+        assert_eq!(next_stamp(&mut last, later), later + ns(1));
+        // a step back of a minute, the bound, then of a nanosecond more
+        let top = later + ns(1);
+        let minute = Duration::minutes(1);
+        assert_eq!(next_stamp(&mut last, top - minute), top + ns(1));
+        let past = top + ns(1) - minute - ns(1);
+        assert_eq!(next_stamp(&mut last, past), past);
         // a clock that read an hour ahead once and was then put right: back to the clock
         let corrected = later - Duration::hours(1);
         assert_eq!(next_stamp(&mut last, corrected), corrected);

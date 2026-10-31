@@ -1151,6 +1151,21 @@ mod tests {
             "mem-a-later",
             "an older binary's row lands without the order"
         );
+        // past the trigger's reach: SQLite reads no instant after the year 9999, and this
+        // one is in 10000 in UTC, so only the next open can key it
+        insert_as_before(
+            &ix.conn,
+            "mem-a-last",
+            datetime!(9999-12-31 23:30:00 -01:00),
+        );
+        assert!(!ix.sort_keys_done().unwrap());
+        drop(ix);
+        let ix = Index::open(&path).unwrap();
+        assert_eq!(
+            ids(&ix.list(&any(), None, 10).unwrap())[..2],
+            ["mem-a-last", "mem-a-later"],
+            "a row the trigger could not key stays unkeyed after the next open"
+        );
     }
 
     #[test]
