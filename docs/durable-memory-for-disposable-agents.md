@@ -266,9 +266,9 @@ Erasure follows lineage. Affected entries are withheld from retrieval while they
 
 **Why.** Shared memory is a channel from every agent to every other agent, over years. Whatever passes through it unchecked (a wrong fact, a leaked secret, a planted instruction, an exploit one agent stumbled on) reaches the whole fleet. Trust is also the part of knowledge systems that tends to come apart, because it has several dimensions and breaks when chained.
 
-- **Trust is not transitive.** Assuming it is silently widens what every party trusts [[7]](#ref-7).
-- **Trust is typed.** Trusting a source to recommend others differs from trusting its own work, and a chain holds only when each link is of the right kind [[8]](#ref-8).
-- **Summaries launder authority.** Consolidating memory tends to keep a claim but drop where it came from and how it may be used. Keeping those labels with the claim prevents the misuse that follows [[9]](#ref-9).
+- **Trust is not transitive.** Assuming it is silently widens what every party trusts [[6]](#ref-6).
+- **Trust is typed.** Trusting a source to recommend others differs from trusting its own work, and a chain holds only when each link is of the right kind [[7]](#ref-7).
+- **Summaries launder authority.** Consolidating memory tends to keep a claim but drop where it came from and how it may be used. Keeping those labels with the claim prevents the misuse that follows [[8]](#ref-8).
 
 ## Four questions, four labels
 
@@ -361,7 +361,7 @@ Curators are a standing fleet of cheap-model agents. They:
 
 Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Curation is budgeted like any other work, with a protected floor, so curation and delivery cannot starve each other.
 
-People's corrections join the queue too. A correction of an agent's output and a rejected or reverted result are outcome events on the task ([Appendix C](#appendix-c-ledger-semantics)); a person's answer to an escalation is an event on the escalated task, or on a sign-off task whose match is a person ([§8](#decomposition)). The curator sorts each by one question: could the agent have reached the right answer from what its permission filter admitted ([§6](#access-control)), whether or not it read it? If it could, the method is at fault, and the fix is a candidate change in `dom-platform` ([§10](#10-evolving-the-system)). If it could not, knowledge is missing, and the fix is an entry in the domain. If the people correcting it disagree, it is neither, and the question goes to the people who own the policy the disputed question falls under ([§7](#7-the-policy-stack)). Sorting by the form of a correction, information against redirection, is a poor guide, because a correction of either form can be any of the three; one industry deployment reports trying it and moving to the question above [[6]](#ref-6).
+People's corrections join the queue too. A correction of an agent's output and a rejected or reverted result are outcome events on the task ([Appendix C](#appendix-c-ledger-semantics)); a person's answer to an escalation is an event on the escalated task, or on a sign-off task whose match is a person ([§8](#decomposition)). The curator sorts each by one question: could the agent have reached the right answer from what its permission filter admitted ([§6](#access-control)), whether or not it read it? If it could, the method is at fault, and the fix is a candidate change in `dom-platform` ([§10](#10-evolving-the-system)). If it could not, knowledge is missing, and the fix is an entry in the domain. If the people correcting it disagree, it is neither, and the question goes to the people who own the policy the disputed question falls under ([§7](#7-the-policy-stack)). Sorting by the form of a correction, information against redirection, is a poor guide, because a correction of either form can be any of the three; one industry deployment reports trying it and moving to the question above [[9]](#ref-9).
 
 **Curator, historian, steward.** The historian ([§3](#3-memory)) records what happened; the curator looks after what is kept. "Curator" is the cross-industry name for that work: digital curation is "the management and preservation of digital data/information over the long-term" [[10]](#ref-10), and the work's output here is the curated tier. In data governance the accountable person is the data steward [[11]](#ref-11), which here is the domain owner; curators work under the owner's policy.
 
@@ -941,7 +941,7 @@ The design combines recent agent-memory research with decades of systems practic
 | Area | Builds on |
 |---|---|
 | **Memory** | Operating-system tiers (MemGPT [[20]](#ref-20)); reflection (Generative Agents [[21]](#ref-21)); experience distillation (ExpeL [[22]](#ref-22), A-Mem [[23]](#ref-23)); agent-written skills (Voyager [[24]](#ref-24)); memory as a write, manage, read loop on shared substrates [[25]](#ref-25), [[26]](#ref-26); event sourcing [[27]](#ref-27), [[28]](#ref-28); decision records [[29]](#ref-29); organisational memory [[30]](#ref-30) |
-| **Trust** | Not transitive [[7]](#ref-7); typed by purpose [[8]](#ref-8); lossy propagation, separate distrust [[31]](#ref-31); provenance and lineage in W3C PROV [[32]](#ref-32); authority collapse [[9]](#ref-9); separation of privilege [[33]](#ref-33) |
+| **Trust** | Not transitive [[6]](#ref-6); typed by purpose [[7]](#ref-7); lossy propagation, separate distrust [[31]](#ref-31); provenance and lineage in W3C PROV [[32]](#ref-32); authority collapse [[8]](#ref-8); separation of privilege [[33]](#ref-33) |
 | **Safety** | Indirect prompt injection [[34]](#ref-34); memory poisoning through queries (MINJA [[35]](#ref-35)) and stores (AgentPoison [[36]](#ref-36)), largely missed by injection defences [[37]](#ref-37); OWASP's agentic top risks [[38]](#ref-38); failure modes of governed shared memory [[39]](#ref-39); retrieved content as data, never control flow (CaMeL [[40]](#ref-40)) |
 | **Retrieval and access** | Authorisation compiled into the query (OPA [[41]](#ref-41), Zanzibar [[42]](#ref-42)); the Model Context Protocol as today's binding [[43]](#ref-43) |
 | **Policy** | Written, layered values (Constitutional AI [[44]](#ref-44)); specification gaming, which the safety gate exists for [[45]](#ref-45), [[46]](#ref-46) |
@@ -949,7 +949,7 @@ The design combines recent agent-memory research with decades of systems practic
 | **Measurement and evaluation** | SRE [[57]](#ref-57); token cost as an axis (Mem0 [[58]](#ref-58), LoCoMo [[59]](#ref-59)); long-horizon benchmarks (LongMemEval [[60]](#ref-60)); silent vendor drift [[61]](#ref-61); NIST AI RMF [[62]](#ref-62) and ISO/IEC 42001 [[63]](#ref-63); OpenTelemetry [[64]](#ref-64) and Inspect [[65]](#ref-65) as carriers; the paired noise-floor protocol [[66]](#ref-66) |
 | **Seeding** | Co-change coupling [[67]](#ref-67); fixes linked to their causes [[68]](#ref-68) |
 | **Self-improvement** | Self-evolving harnesses (SEAGym [[69]](#ref-69)); offline distillation, online retrieval (EvolveR [[70]](#ref-70)); gated archives (Darwin Gödel Machine [[71]](#ref-71)); co-evolving evaluators [[72]](#ref-72); agents designed as code [[73]](#ref-73). This design adds a manifest check and a perimeter outside the loop, and keeps a person's review in the loop for every change that reaches every task and every change to the evaluation suites ([§10](#the-loop-and-its-gates)) |
-| **Industry practice** | Examples of deployments that report on parts of this design, not authorities for it: an expert-knowledge agent improved by reviewed edits to text files, with corrections sorted by whether the agent could have reached the answer, a reviewer that sees only the diff, and blind replay [[6]](#ref-6); personal workspaces with progressive disclosure at scale, with skills as shared plain-text methods [[12]](#ref-12) |
+| **Industry practice** | Examples of deployments that report on parts of this design, not authorities for it: an expert-knowledge agent improved by reviewed edits to text files, with corrections sorted by whether the agent could have reached the answer, a reviewer that sees only the diff, and blind replay [[9]](#ref-9); personal workspaces with progressive disclosure at scale, with skills as shared plain-text methods [[12]](#ref-12) |
 | **Long timescales** | Dated authorities (RFC 4151 [[13]](#ref-13)); names never reassigned (RFC 8141 [[74]](#ref-74)); stable internal IDs (SCIM [[75]](#ref-75)); issuer and subject (OpenID Connect [[14]](#ref-14)); identifiers free of organisational names [[15]](#ref-15) |
 
 **Organisational cybernetics.** Beer's Viable System Model [[76]](#ref-76), [[77]](#ref-77) names the functions an organisation needs to stay viable, and stresses the exchange between them and adaptation to a changing environment [[78]](#ref-78). It is a useful check on the design, and it shows where the design stops. The design supplies mechanisms; most of what makes an organisation viable comes from people the deployment appoints:
@@ -983,13 +983,13 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-5"></a>[5] Spracklen, J., Wijewickrama, R., Sakib, A. H. M. N., Maiti, A., Viswanath, B., & Jadliwala, M. (2025). We Have a Package for You! A Comprehensive Analysis of Package Hallucinations by Code Generating LLMs. *USENIX Security 2025*. https://www.usenix.org/conference/usenixsecurity25/presentation/spracklen
 
-<a id="ref-6"></a>[6] Sengar, S., Nawrocki, J., Shah, J., & Kommireddi, P. (2026). An Organizational Second Brain: Building an AI That Learns From Experts. Engineering at Meta, 2 September 2026. https://engineering.fb.com/2026/09/02/ml-applications/organizational-second-brain-ai-learns-from-experts/
+<a id="ref-6"></a>[6] Christianson, B., & Harbison, W. S. (1997). Why Isn't Trust Transitive? *Security Protocols 1996*, LNCS 1189. Springer. https://doi.org/10.1007/3-540-62494-5_16
 
-<a id="ref-7"></a>[7] Christianson, B., & Harbison, W. S. (1997). Why Isn't Trust Transitive? *Security Protocols 1996*, LNCS 1189. Springer. https://doi.org/10.1007/3-540-62494-5_16
+<a id="ref-7"></a>[7] Jøsang, A., & Pope, S. (2005). Semantic Constraints for Trust Transitivity. *APCCM 2005*, CRPIT 43, 59–68. https://crpit.scem.westernsydney.edu.au/confpapers/CRPITV43Josang.pdf
 
-<a id="ref-8"></a>[8] Jøsang, A., & Pope, S. (2005). Semantic Constraints for Trust Transitivity. *APCCM 2005*, CRPIT 43, 59–68. https://crpit.scem.westernsydney.edu.au/confpapers/CRPITV43Josang.pdf
+<a id="ref-8"></a>[8] Zhan, Q., Zhang, R., Guo, S., Zhao, L., & Liu, Z. (2026). When Memory Becomes Authority: Benchmarking Authority Collapse at the Memory Consolidation Boundary. arXiv:2608.01679. https://arxiv.org/abs/2608.01679
 
-<a id="ref-9"></a>[9] Zhan, Q., Zhang, R., Guo, S., Zhao, L., & Liu, Z. (2026). When Memory Becomes Authority: Benchmarking Authority Collapse at the Memory Consolidation Boundary. arXiv:2608.01679. https://arxiv.org/abs/2608.01679
+<a id="ref-9"></a>[9] Sengar, S., Nawrocki, J., Shah, J., & Kommireddi, P. (2026). An Organizational Second Brain: Building an AI That Learns From Experts. Engineering at Meta, 2 September 2026. https://engineering.fb.com/2026/09/02/ml-applications/organizational-second-brain-ai-learns-from-experts/
 
 <a id="ref-10"></a>[10] Digital Curation Centre. What Is Digital Curation? https://www.dcc.ac.uk/about/digital-curation
 
