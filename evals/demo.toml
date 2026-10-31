@@ -36,8 +36,9 @@ expect = "S2"
 id = "asf-pressures"
 answers = ["What the Foundation taught the design"]
 # the number is not in the text: scripts/corpus-check.sh counts the lines of the answer
-# entry that match `counts`, and checks `expect` against that count
-counts = "^\\| \\*\\*"
+# entry that match `counts`, and checks `expect` against that count. A match is a table
+# row that follows another row and is not the separator: the data rows, bold or not
+counts = "(?<=\\|\n)\\|(?![\\s:|-]*$)"
 prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What the Foundation taught the design' list? Give the number."
 # the part cites "paper §6" and another part is "6. Trust and review", so a six or 6
 # counts unless it is a section number, a link anchor, or the end of a range or a list of

@@ -28,7 +28,7 @@ root=$work/record
 cd "$here"
 
 "$amem" --root "$root" init --owner human:demo:check --domain dom-demo >/dev/null
-python3 scripts/seed-corpus.py --root "$root" --memory "$amem" "$@" >"$work/seed.txt"
+python3 scripts/seed-corpus.py --strict --root "$root" --memory "$amem" "$@" >"$work/seed.txt"
 tail -n 1 "$work/seed.txt"
 
 for suite in docs platform acts; do
