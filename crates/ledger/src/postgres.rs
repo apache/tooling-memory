@@ -88,9 +88,11 @@ CREATE TABLE IF NOT EXISTS {s}.promotions (
     why        TEXT NOT NULL,
     label_rank BIGINT NOT NULL,
     digest     TEXT NOT NULL,
+    new_digest TEXT NOT NULL,
     at         TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS promotions_version ON {s}.promotions (entry, tier, digest);
+CREATE UNIQUE INDEX IF NOT EXISTS promotions_version
+    ON {s}.promotions (entry, tier, digest, promoter);
 ";
 
 /// The schema a domain's tables live in: `ledger_` and the domain with anything that is
@@ -281,8 +283,8 @@ impl Db {
         Ok(())
     }
 
-    /// Record a promotion unless that version of the entry was promoted to that tier
-    /// already. The domain's lock is held from the check to the commit, so two
+    /// Record a promotion unless that promoter promoted that version of the entry to that
+    /// tier already. The domain's lock is held from the check to the commit, so two
     /// processes recording the same promotion record it once.
     pub(crate) async fn record_promotion(
         &mut self,
@@ -294,9 +296,10 @@ impl Db {
         let seen = tx
             .query_opt(
                 &format!(
-                    "SELECT 1 FROM {s}.promotions WHERE entry = $1 AND tier = $2 AND digest = $3"
+                    "SELECT 1 FROM {s}.promotions
+                     WHERE entry = $1 AND tier = $2 AND digest = $3 AND promoter = $4"
                 ),
-                &[&spec.entry, &spec.tier.to_string(), &spec.digest],
+                &[&spec.entry, &spec.tier.to_string(), &spec.digest, &spec.by],
             )
             .await?
             .is_some();
@@ -339,7 +342,8 @@ impl Db {
                     why: r.try_get(5)?,
                     label_rank: r.try_get(6)?,
                     digest: r.try_get(7)?,
-                    at: r.try_get(8)?,
+                    new_digest: r.try_get(8)?,
+                    at: r.try_get(9)?,
                 }
                 .into_record()
             })
@@ -799,8 +803,8 @@ async fn insert_promotion<C: GenericClient>(
     conn.execute(
         &format!(
             "INSERT INTO {s}.promotions (domain, entry, tier, promoter, author, why,
-                label_rank, digest, at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+                label_rank, digest, new_digest, at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
         ),
         &[
             &p.domain,
@@ -811,6 +815,7 @@ async fn insert_promotion<C: GenericClient>(
             &p.why,
             &(p.classification as i64),
             &p.digest,
+            &p.new_digest,
             &crate::fmt_time(at),
         ],
     )

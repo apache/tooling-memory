@@ -347,6 +347,29 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
     }
 }
 
+#[test]
+fn promotions_says_why_an_entry_was_promoted() {
+    let mut d = step_init();
+    step_write(&mut d);
+    let why = "read it against the pilot's notes";
+    let promoted = json(&ok(
+        &d.root,
+        &["promote", &d.decision, "--to", "curated", "--why", why],
+        None,
+    ));
+    assert_eq!(promoted["tier"], "curated");
+    let records = json(&ok(&d.root, &["promotions", &d.decision], None));
+    let records = records.as_array().unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["why"], why);
+    assert_eq!(records[0]["tier"], "curated");
+    assert_eq!(records[0]["by"], "human:test:me");
+    assert_eq!(records[0]["landed"], true);
+    let none = json(&ok(&d.root, &["promotions", &d.handoff], None));
+    assert_eq!(none, serde_json::json!([]));
+    assert!(fails(&d.root, &["promotions", "mem-none"]).contains("not found"));
+}
+
 /// The first file under `root` whose bytes contain `needle`.
 fn holds(root: &Path, needle: &[u8]) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];

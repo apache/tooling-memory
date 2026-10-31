@@ -608,8 +608,9 @@ enum Command {
     /// Approve a proposal to promote an entry to verified. The approver did not
     /// propose it, and is a person.
     Approve { task: String },
-    /// Why each promotion of an entry was made, as JSON, oldest first. An auditor reads
-    /// it after judging the change, not before.
+    /// Why each promotion of an entry to curated was made, as JSON, oldest first. A
+    /// proposal to verified is not listed: its why is in its approval task. An auditor
+    /// reads it after judging the change, not before.
     Promotions { id: String },
     /// The models a destination lists, as JSON: what the web form offers to pick from.
     /// Routed as a launch would be, with the destination's credential; a login mode has

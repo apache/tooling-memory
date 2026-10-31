@@ -237,6 +237,9 @@ pub struct PromotionSpec {
     pub classification: Label,
     /// The digest of the version of the entry that was promoted.
     pub digest: String,
+    /// The digest of the version the promotion writes, so a record whose version never
+    /// reached the record can be told from one whose version did.
+    pub new_digest: String,
 }
 
 /// A promotion as the ledger holds it.
@@ -363,7 +366,7 @@ fn promotion_key(entry: &str) -> String {
 
 /// The columns of a promotion row, in the order both backends read them.
 const PROMOTION_COLUMNS: &str =
-    "domain, entry, tier, promoter, author, why, label_rank, digest, at";
+    "domain, entry, tier, promoter, author, why, label_rank, digest, new_digest, at";
 
 /// A promotion row as the database returns it, before the ledger has checked it.
 struct RawPromotion {
@@ -375,6 +378,7 @@ struct RawPromotion {
     why: String,
     label_rank: i64,
     digest: String,
+    new_digest: String,
     at: String,
 }
 
@@ -395,6 +399,7 @@ impl RawPromotion {
                 why: self.why,
                 classification: label_from_rank(&key, self.label_rank)?,
                 digest: self.digest,
+                new_digest: self.new_digest,
             },
             at: parse_time(&key, &self.at)?,
         })
@@ -996,9 +1001,10 @@ impl Ledger {
     }
 
     /// Record a promotion: one event, projected into the promotions and nowhere else.
-    /// Once per version: a second record of the same entry, tier and digest appends
-    /// nothing and returns false; another version of the same entry is a record of its
-    /// own.
+    /// Once per promoter and version: a second record of the same entry, tier, digest
+    /// and promoter appends nothing and returns false. Another version, or another
+    /// promoter of the same version, is a record of its own, so a record whose promotion
+    /// failed never stands in for a later one that did not.
     ///
     /// # Errors
     ///
@@ -1172,6 +1178,7 @@ mod tests {
         a_promotion_is_recorded_once_per_version,
         a_promotion_record_is_no_task,
         replay_keeps_the_promotions,
+        a_second_promoter_of_the_same_version_is_recorded,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1449,6 +1456,7 @@ mod tests {
             why: "checked against the tree".into(),
             classification: Label::Internal,
             digest: digest.into(),
+            new_digest: format!("{digest}-curated"),
         }
     }
 
@@ -1498,6 +1506,32 @@ mod tests {
         );
         assert!(l.promotions("dom-a", "mem-a-2").await.unwrap().is_empty());
         assert!(l.promotions("dom-b", "mem-a-1").await.unwrap().is_empty());
+    }
+
+    /// A promotion whose new version never landed leaves its record; a second promoter
+    /// of the same version is not that record, and is kept with its own why.
+    async fn a_second_promoter_of_the_same_version_is_recorded(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let first = promotion("mem-a-1", "d1");
+        assert!(l.record_promotion(&first).await.unwrap());
+        let second = PromotionSpec {
+            by: "agent:checker".into(),
+            why: "read it against the release notes".into(),
+            ..first.clone()
+        };
+        assert!(
+            l.record_promotion(&second).await.unwrap(),
+            "another promoter is another record"
+        );
+        let got: Vec<PromotionSpec> = l
+            .promotions("dom-a", "mem-a-1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.spec)
+            .collect();
+        assert_eq!(got, vec![first, second.clone()]);
+        assert!(!l.record_promotion(&second).await.unwrap(), "once each");
     }
 
     async fn a_promotion_record_is_no_task(b: &Site) {

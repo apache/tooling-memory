@@ -471,9 +471,11 @@ Verified is the review gate. Nobody sets it directly. It has two steps:
 
 Each promotion must say why. A promotion without a why is refused. The ledger keeps the
 why beside the entry, not in the entry. `amem promotions <id>` and the `promotions` memory
-tool show who promoted which version of the entry, to which tier, and why. An auditor
-reads the why after judging the change, not before. A session reads the why only if it can
-read the entry. A proposal to verified keeps its why in the body of its task.
+tool show who promoted which version of the entry to curated, and why. They also show if
+that version reached the record (`landed`). An auditor reads the why after judging the
+change, not before. A session reads the why only if it can read the entry. The why stays
+readable after the entry is replaced. A proposal to verified is not in this list: it keeps
+its why in the body of its approval task.
 
 When an entry holds, the librarian's verify task now ends in such a proposal. The rules
 are Rego, in the built-in policy. Each step is a logged decision. A promotion is a new

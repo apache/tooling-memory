@@ -186,6 +186,20 @@ pub enum Promotion {
     },
 }
 
+/// A promotion as [`Memory::promotions`] serves it: the ledger's record, and whether the
+/// version it writes is in the record now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PromotionView {
+    /// What the ledger keeps.
+    #[serde(flatten)]
+    pub record: dm_ledger::PromotionRecord,
+    /// Whether the version this promotion writes is the entry's current version or one
+    /// in its history. False for a promotion whose new version was never written. Two
+    /// promoters of one version write the same text, so this says the version landed,
+    /// not whose write it was.
+    pub landed: bool,
+}
+
 /// The record's policy entries, active, in every granted domain, at any tier: read
 /// through the index and the files the record keeps, so the policy can be compiled
 /// where no runtime is at hand. Policy is enforced whatever a session may read, so the
@@ -1110,18 +1124,23 @@ impl Memory {
         Ok(promoted)
     }
 
-    /// Why each promotion of an entry was made, oldest first: who moved which version
-    /// to which tier, and the reason they gave. Reading it is reading the entry: only
-    /// for an entry this session may read, and the session's label rises to the entry's
-    /// classification as a [`Memory::get`] would raise it. A record above what the
+    /// Why each promotion of an entry to curated was made, oldest first: who moved which
+    /// version to which tier, the reason they gave, and whether that version reached the
+    /// record. A proposal to verified is not here: its why is in the body of its
+    /// approval task. Reading it is reading the entry: only for an entry this session
+    /// may read, replaced or demoted ones included and erased ones never; the session's
+    /// label rises to the entry's classification as a [`Memory::get`] would raise it, and
+    /// to each record's; the read log says the entry was read. A record above what the
     /// session may handle is left out.
     ///
     /// # Errors
     ///
     /// [`Error::NotFound`] for an entry this session cannot read, or a store, index or
     /// ledger error.
-    pub async fn promotions(&self, id: &str) -> Result<Vec<dm_ledger::PromotionRecord>, Error> {
-        let f = self.session_filter()?;
+    pub async fn promotions(&self, id: &str) -> Result<Vec<PromotionView>, Error> {
+        let mut f = self.session_filter()?;
+        // why an entry was promoted outlives the version: replaced ones are read too
+        f.include_inactive = true;
         let Some(meta) = self.index.lock().await.meta(id, &f)? else {
             return Err(Error::NotFound(id.to_string()));
         };
@@ -1131,28 +1150,67 @@ impl Memory {
             .get(&domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        if !lock(&self.session).observe(entry.front.classification) {
+        if entry.front.status == Some(Status::Erased)
+            || !lock(&self.session).observe(entry.front.classification)
+        {
             return Err(Error::NotFound(id.to_string()));
         }
         let records = self.ledger.lock().await.promotions(&domain, id).await?;
+        let versions: HashSet<String> = self
+            .store
+            .digests(&domain, id)
+            .await?
+            .into_iter()
+            .map(|v| v.digest)
+            .collect();
+        let readable = self.readable_promotions(records, &versions);
+        let tokens = readable
+            .iter()
+            .map(|p| dm_core::approx_tokens(&p.record.spec.why))
+            .sum();
+        self.reads.served_ids(
+            "promotions",
+            None,
+            readable.len(),
+            tokens,
+            false,
+            None,
+            &[id.to_string()],
+        );
+        Ok(readable)
+    }
+
+    /// The records this session may handle, each raising its label, and whether the
+    /// version each writes is among `versions`.
+    fn readable_promotions(
+        &self,
+        records: Vec<dm_ledger::PromotionRecord>,
+        versions: &HashSet<String>,
+    ) -> Vec<PromotionView> {
         let mut session = lock(&self.session);
         let handling = session.handling;
         let mut readable = Vec::new();
         for r in records {
             if r.spec.classification <= handling {
                 session.observe(r.spec.classification);
-                readable.push(r);
+                let landed = versions.contains(&r.spec.new_digest);
+                readable.push(PromotionView { record: r, landed });
             }
         }
-        Ok(readable)
+        readable
     }
 
     /// The record of a promotion made at once, on the ledger and not in the entry: the
     /// version promoted, by whom, and why, so an auditor finds the reason beside the
-    /// change. Recorded once per version, so a retry adds nothing. It is classified as
+    /// change. Recorded once per promoter and version, so a retry adds nothing, and a
+    /// failed promotion's record never stands in for another promoter's. It carries the
+    /// digest of the version it writes as well as the one it promotes. It is classified as
     /// the entry is, or as this session's label if that is higher, since the why is the
     /// session's own text.
     async fn record_promotion(&self, entry: &Entry, to: TrustTier, why: &str) -> Result<(), Error> {
+        // the version set_tier will write, so a reader can tell whether it was
+        let mut promoted = entry.clone();
+        promoted.front.trust_tier = to;
         let spec = dm_ledger::PromotionSpec {
             domain: entry.front.domain.clone(),
             entry: entry.front.id.clone(),
@@ -1162,6 +1220,7 @@ impl Memory {
             why: why.to_string(),
             classification: entry.front.classification.max(self.label()),
             digest: dm_core::digest(&entry.render()),
+            new_digest: dm_core::digest(&promoted.render()),
         };
         self.ledger.lock().await.record_promotion(&spec).await?;
         Ok(())
@@ -2807,7 +2866,8 @@ mod tests {
         assert_eq!(after, before, "a promotion files no task");
         let records = agent.promotions(&theirs).await.unwrap();
         assert_eq!(records.len(), 1, "one record: {records:?}");
-        let r = &records[0].spec;
+        assert!(records[0].landed);
+        let r = &records[0].record.spec;
         assert_eq!(r.entry, theirs);
         assert_eq!(r.why, WHY);
         assert_eq!(r.tier, TrustTier::Curated);
@@ -2817,6 +2877,11 @@ mod tests {
             r.digest,
             dm_core::digest(&raw.render()),
             "the version promoted"
+        );
+        assert_eq!(
+            r.new_digest,
+            dm_core::digest(&agent.get(&theirs).await.unwrap().render()),
+            "the version written"
         );
     }
 
@@ -2901,24 +2966,36 @@ mod tests {
         assert_eq!(agent.promotions(&theirs).await.unwrap().len(), 1);
     }
 
+    /// `record/dom-me` read-only while `f` runs, so no version can be written there.
+    #[cfg(unix)]
+    async fn with_record_read_only<T>(root: &Path, f: impl std::future::Future<Output = T>) -> T {
+        use std::os::unix::fs::PermissionsExt;
+        let record = root.join("record").join("dom-me");
+        let perms = std::fs::metadata(&record).unwrap().permissions();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let out = f.await;
+        std::fs::set_permissions(&record, perms).unwrap();
+        out
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_promotion_whose_new_version_fails_can_be_made_again_with_one_record() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        let record = dir.path().join("record").join("dom-me");
-        let perms = std::fs::metadata(&record).unwrap().permissions();
-        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o555)).unwrap();
         let agent = librarian(dir.path());
-        let refused = agent.promote(&theirs, TrustTier::Curated, WHY).await;
-        std::fs::set_permissions(&record, perms).unwrap();
+        let refused =
+            with_record_read_only(dir.path(), agent.promote(&theirs, TrustTier::Curated, WHY))
+                .await;
         assert!(refused.is_err(), "the new version could not be written");
         assert_eq!(
             owner.get(&theirs).await.unwrap().front.trust_tier,
             TrustTier::Raw
         );
+        let pending = agent.promotions(&theirs).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].landed, "its version was never written");
         agent
             .promote(&theirs, TrustTier::Curated, WHY)
             .await
@@ -2927,15 +3004,55 @@ mod tests {
             owner.get(&theirs).await.unwrap().front.trust_tier,
             TrustTier::Curated
         );
+        let done = agent.promotions(&theirs).await.unwrap();
+        assert_eq!(done.len(), 1, "the retry records nothing twice");
+        assert!(done[0].landed, "its version is the entry's now");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_promoter_is_recorded_after_a_first_one_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let first = librarian(dir.path());
+        let refused =
+            with_record_read_only(dir.path(), first.promote(&theirs, TrustTier::Curated, WHY))
+                .await;
+        assert!(refused.is_err());
+        let checker = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:checker");
+        checker
+            .promote(
+                &theirs,
+                TrustTier::Curated,
+                "read it against the release notes",
+            )
+            .await
+            .unwrap();
+        let said: Vec<(String, String)> = checker
+            .promotions(&theirs)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.record.spec.by, p.record.spec.why))
+            .collect();
         assert_eq!(
-            agent.promotions(&theirs).await.unwrap().len(),
-            1,
-            "the retry records nothing twice"
+            said,
+            vec![
+                ("agent:librarian".to_string(), WHY.to_string()),
+                (
+                    "agent:checker".to_string(),
+                    "read it against the release notes".to_string()
+                ),
+            ],
+            "the second promoter's why is kept"
         );
     }
 
     #[tokio::test]
-    async fn reindex_keeps_the_promotions() {
+    async fn reindex_replays_the_promotions() {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
@@ -2946,11 +3063,108 @@ mod tests {
             .unwrap();
         let before = agent.promotions(&theirs).await.unwrap();
         assert_eq!(before.len(), 1);
+        // the projection's rows gone, the events kept: only a replay brings them back
+        rusqlite::Connection::open(dir.path().join(LEDGER_FILE))
+            .unwrap()
+            .execute("DELETE FROM promotions", [])
+            .unwrap();
+        assert!(agent.promotions(&theirs).await.unwrap().is_empty());
         agent.reindex().await.unwrap();
         assert_eq!(agent.promotions(&theirs).await.unwrap(), before);
         assert_eq!(
             librarian(dir.path()).promotions(&theirs).await.unwrap(),
             before
+        );
+    }
+
+    #[tokio::test]
+    async fn why_a_replaced_entry_was_promoted_can_still_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let old = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        librarian(dir.path())
+            .promote(&old, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let new = owner
+            .write(WriteRequest {
+                supersedes: Some(old.clone()),
+                ..req("The owner's fact, corrected.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let reader = librarian(dir.path());
+        let kept = reader.promotions(&old).await.unwrap();
+        assert_eq!(kept.len(), 1, "the why outlives the version it promoted");
+        assert_eq!(kept[0].record.spec.why, WHY);
+        assert!(kept[0].landed, "the promoted version is in the history");
+        assert!(reader.promotions(&new).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reading_why_an_entry_was_promoted_is_logged_as_a_read_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        librarian(dir.path())
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let reader = librarian(dir.path());
+        reader.promotions(&theirs).await.unwrap();
+        let after = reader
+            .write(req("Something learned from the why.\n"))
+            .await
+            .unwrap()
+            .id;
+        let t = owner.taint(&theirs);
+        assert!(
+            t.readers.contains(&reader.session_id().to_string()),
+            "{t:?}"
+        );
+        assert!(t.written.contains(&after), "{t:?}");
+    }
+
+    #[tokio::test]
+    async fn a_why_written_above_what_a_reader_may_handle_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let secret = owner
+            .write(WriteRequest {
+                classification: Some(Label::Restricted),
+                ..req("The restricted fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let public = owner
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("The public fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        // a librarian that has read restricted text writes its why at restricted
+        let lib = librarian(dir.path());
+        lib.get(&secret).await.unwrap();
+        assert_eq!(lib.label(), Label::Restricted);
+        lib.promote(&public, TrustTier::Curated, WHY).await.unwrap();
+        let capped = librarian(dir.path()).with_handling_cap(Label::Public);
+        assert!(
+            capped.promotions(&public).await.unwrap().is_empty(),
+            "a public reader does not get a restricted why"
+        );
+        assert_eq!(capped.label(), Label::Public, "and its label stays public");
+        let full = librarian(dir.path());
+        let got = full.promotions(&public).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].record.spec.classification, Label::Restricted);
+        assert_eq!(
+            full.label(),
+            Label::Restricted,
+            "reading the why raises the label to the why's"
         );
     }
 

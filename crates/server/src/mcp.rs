@@ -673,7 +673,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Why each promotion of an entry was made, oldest first: who promoted which version to which tier, and the reason they gave. As an auditor, read it after you have judged the change yourself, not before, so the reasons do not lead your judgement. Only for an entry you may read; reading it raises your label as a get does."
+        description = "Why each promotion of an entry to curated was made, oldest first: who promoted which version, the reason they gave, and whether that version reached the record (`landed`). A proposal to verified is not listed here: its why is in the body of its approval task (`get_task`). As an auditor, read it after you have judged the change yourself, not before, so the reasons do not lead your judgement. Only for an entry you may read, replaced ones included; reading it raises your label as a get does."
     )]
     async fn promotions(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
         let r = self.memory.promotions(&p.0.id).await.map_err(mcp_err)?;

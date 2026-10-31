@@ -57,9 +57,11 @@ CREATE TABLE IF NOT EXISTS promotions (
     why        TEXT NOT NULL,
     label_rank INTEGER NOT NULL,
     digest     TEXT NOT NULL,
+    new_digest TEXT NOT NULL,
     at         TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS promotions_version ON promotions (domain, entry, tier, digest);
+CREATE UNIQUE INDEX IF NOT EXISTS promotions_version
+    ON promotions (domain, entry, tier, digest, promoter);
 ";
 
 fn task_from_row(row: &Row<'_>) -> Result<Task, Error> {
@@ -157,8 +159,8 @@ impl Db {
         Ok(())
     }
 
-    /// Record a promotion unless that version of the entry was promoted to that tier
-    /// already. The check and the append are one transaction, taken for writing first.
+    /// Record a promotion unless that promoter promoted that version of the entry to that
+    /// tier already. The check and the append are one transaction, taken for writing first.
     pub(crate) fn record_promotion(
         &mut self,
         at: OffsetDateTime,
@@ -169,8 +171,15 @@ impl Db {
         let seen = tx
             .query_row(
                 "SELECT 1 FROM promotions
-                 WHERE domain = ?1 AND entry = ?2 AND tier = ?3 AND digest = ?4",
-                params![spec.domain, spec.entry, spec.tier.to_string(), spec.digest],
+                 WHERE domain = ?1 AND entry = ?2 AND tier = ?3 AND digest = ?4
+                   AND promoter = ?5",
+                params![
+                    spec.domain,
+                    spec.entry,
+                    spec.tier.to_string(),
+                    spec.digest,
+                    spec.by
+                ],
                 |_| Ok(()),
             )
             .optional()?
@@ -204,7 +213,8 @@ impl Db {
                 why: r.get(5)?,
                 label_rank: r.get(6)?,
                 digest: r.get(7)?,
-                at: r.get(8)?,
+                new_digest: r.get(8)?,
+                at: r.get(9)?,
             })
         })?;
         rows.map(|r| r?.into_record()).collect()
@@ -452,8 +462,8 @@ fn insert_task(
 fn insert_promotion(conn: &Connection, at: OffsetDateTime, p: &PromotionSpec) -> Result<(), Error> {
     conn.execute(
         "INSERT INTO promotions (domain, entry, tier, promoter, author, why, label_rank,
-            digest, at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            digest, new_digest, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             p.domain,
             p.entry,
@@ -463,6 +473,7 @@ fn insert_promotion(conn: &Connection, at: OffsetDateTime, p: &PromotionSpec) ->
             p.why,
             p.classification as i64,
             p.digest,
+            p.new_digest,
             crate::fmt_time(at),
         ],
     )?;
