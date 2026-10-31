@@ -257,21 +257,22 @@ pub struct Memory {
     /// The checkable perimeter: admission and the gates, as Rego over the grants.
     policy: Arc<std::sync::RwLock<std::sync::Arc<Policy>>>,
     /// The task this session holds, when the launcher runs it on one: what it files
-    /// from is judged against that task's requirements.
-    held: OnceLock<String>,
+    /// from is judged against that task's requirements. Shared by the views of a
+    /// session ([`Memory::for_request`]), as every count below that is kept per session.
+    held: Arc<OnceLock<String>>,
     /// How many entries this session has superseded: the blast-radius gate's count.
-    superseded: AtomicUsize,
+    superseded: Arc<AtomicUsize>,
     /// What this session may read, as the policy computed it once and the index applies
     /// inside every query.
     scope: OnceLock<ReadFilter>,
     /// How many decision contexts this session has kept.
-    contexts_kept: AtomicUsize,
+    contexts_kept: Arc<AtomicUsize>,
     /// The tools this session may call, when the launcher hosts them.
     tools: OnceLock<std::sync::Arc<dyn sources::Tools>>,
     /// The tape this session is re-enacting, when it is a re-run.
     playback: OnceLock<std::sync::Arc<tape::Playback>>,
     /// This session's own tape, as it is kept.
-    recording: Mutex<tape::Recording>,
+    recording: Arc<Mutex<tape::Recording>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -394,13 +395,13 @@ impl Memory {
             projection: None,
             written: (AtomicUsize::new(0), AtomicUsize::new(0)),
             policy: Arc::new(std::sync::RwLock::new(std::sync::Arc::new(policy))),
-            held: OnceLock::new(),
-            superseded: AtomicUsize::new(0),
+            held: Arc::new(OnceLock::new()),
+            superseded: Arc::new(AtomicUsize::new(0)),
             scope: OnceLock::new(),
-            contexts_kept: AtomicUsize::new(0),
+            contexts_kept: Arc::new(AtomicUsize::new(0)),
             tools: OnceLock::new(),
             playback: OnceLock::new(),
-            recording: Mutex::new(tape::Recording::default()),
+            recording: Arc::new(Mutex::new(tape::Recording::default())),
         })
     }
 
@@ -412,8 +413,10 @@ impl Memory {
     /// with what this request reads, so what one request lists does not classify what a
     /// later one files. The read scope is this session's too, asked of the policy and
     /// logged once, here, rather than once per request. The grants, the author, the
-    /// manifest, the held task, the tools and the projection carry over; the tallies a
-    /// session keeps of its own doing, what it wrote and superseded, start at zero.
+    /// manifest, the tools and the projection carry over. What is kept per session and
+    /// keyed by the session id is shared too, so a view counts with its session: the
+    /// held task, the supersede count the blast-radius gate reads, the tape and the
+    /// number of kept contexts. What this view wrote starts at zero.
     ///
     /// # Errors
     ///
@@ -439,13 +442,13 @@ impl Memory {
             projection: self.projection.clone(),
             written: (AtomicUsize::new(0), AtomicUsize::new(0)),
             policy: Arc::clone(&self.policy),
-            held: self.held.clone(),
-            superseded: AtomicUsize::new(0),
+            held: Arc::clone(&self.held),
+            superseded: Arc::clone(&self.superseded),
             scope: OnceLock::from(scope),
-            contexts_kept: AtomicUsize::new(0),
+            contexts_kept: Arc::clone(&self.contexts_kept),
             tools: self.tools.clone(),
             playback: self.playback.clone(),
-            recording: Mutex::new(tape::Recording::default()),
+            recording: Arc::clone(&self.recording),
         })
     }
 
@@ -5277,6 +5280,51 @@ mod tests {
             "{answer}"
         );
         assert_eq!(capped.label(), Label::Public);
+    }
+
+    #[tokio::test]
+    async fn the_views_of_a_session_count_supersedes_together() {
+        let dir = tempfile::tempdir().unwrap();
+        mem(dir.path());
+        let grants = dir.path().join("grants.toml");
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(
+            &grants,
+            text.replace(
+                "max_supersedes_per_session = 20",
+                "max_supersedes_per_session = 2",
+            ),
+        )
+        .unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:test");
+        let (first, second) = (agent.for_request().unwrap(), agent.for_request().unwrap());
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(first.write(req(&format!("Fact {i}.\n"))).await.unwrap().id);
+        }
+        for id in &ids[..2] {
+            first
+                .write(WriteRequest {
+                    supersedes: Some(id.clone()),
+                    ..req("Rewritten.\n")
+                })
+                .await
+                .unwrap();
+        }
+        let err = second
+            .write(WriteRequest {
+                supersedes: Some(ids[2].clone()),
+                ..req("Rewritten.\n")
+            })
+            .await
+            .expect_err("a view of the same session supersedes past the gate");
+        assert!(err.to_string().contains("blast radius"), "{err}");
+        agent.set_held_task("task-me-held");
+        assert_eq!(
+            second.held.get().map(String::as_str),
+            Some("task-me-held"),
+            "the held task is the session's, shared with its views"
+        );
     }
 
     #[tokio::test]
