@@ -325,30 +325,46 @@ def task_of(payload, what):
 
 
 def parse_manifest(text):
-    """The subset of YAML a manifest is written in: scalars at the top, and under
-    `entries`, a list of maps. The format is the contract, so the shape is known."""
+    """The subset of YAML a manifest is written in: scalars at the top; under `entries`, a
+    list of maps; and under `promotions`, when the bundle carries promotion records, a
+    map of `path`, `digest` and `records`, itself a list of maps. The format is the
+    contract, so the shape is known. Returns the top, the entries, and the promotions
+    block or None."""
     top = {}
     entries = []
-    in_entries = False
+    promotions = None
+    section = None
     for raw in text.splitlines():
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
         if not raw.startswith(" ") and not raw.startswith("-"):
             key, _, value = raw.partition(":")
-            in_entries = key.strip() == "entries"
-            if not in_entries:
+            section = key.strip() if key.strip() in ("entries", "promotions") else None
+            if section == "promotions":
+                promotions = {"records": []}
+            elif section is None:
                 top[key.strip()] = value.strip().strip("'\"")
             continue
-        if not in_entries:
+        if section is None:
             continue
         line = raw.lstrip()
+        if section == "entries":
+            items = entries
+        elif raw.startswith("  ") and not line.startswith("- ") and not raw.startswith("    "):
+            # a scalar of the promotions block itself, or the head of its records
+            key, _, value = line.partition(":")
+            if key.strip() != "records":
+                promotions[key.strip()] = value.strip().strip("'\"")
+            continue
+        else:
+            items = promotions["records"]
         if line.startswith("- "):
-            entries.append({})
+            items.append({})
             line = line[2:]
         key, _, value = line.partition(":")
-        check(entries, f"manifest: a field before the first entry: {raw!r}")
-        entries[-1][key.strip()] = value.strip().strip("'\"")
-    return top, entries
+        check(items, f"manifest: a field before the first item: {raw!r}")
+        items[-1][key.strip()] = value.strip().strip("'\"")
+    return top, entries, promotions
 
 
 def plain_name(path):
@@ -683,6 +699,51 @@ class Run:
         finally:
             s.close()
 
+    def check_promotions(self, bundle, top, promotions, listed):
+        """The promotion records a bundle carries, as its manifest's `promotions` block
+        lists them: the file is a plain name with the digest the block gives, holds one
+        JSON record per line of the block, and each is about an entry the manifest lists,
+        at the classification its line says, within max_label. Returns the lines, or none
+        when the bundle carries no records."""
+        if promotions is None:
+            return []
+        for key in ("path", "digest"):
+            self.check(promotions.get(key), f"the manifest's promotions block has no {key}")
+        path = promotions["path"]
+        self.check(plain_name(path), f"promotions path {path!r} is not a plain file name inside the bundle")
+        full = os.path.join(bundle, path)
+        self.check(os.path.isfile(full), f"the manifest names {path}, which the bundle lacks")
+        with open(full, "rb") as f:
+            text = f.read()
+        self.check(
+            hashlib.sha256(text).hexdigest() == promotions["digest"],
+            f"{path}: the digest is not the file's sha256",
+        )
+        try:
+            inside = json.loads(text.decode("utf-8"))
+        except ValueError as e:
+            self.check(False, f"{path} is not JSON: {e}")
+        self.check(isinstance(inside, list), f"{path} is not a list of records")
+        records = promotions["records"]
+        self.check(
+            len(inside) == len(records),
+            f"the manifest lists {len(records)} promotion records and {path} holds {len(inside)}",
+        )
+        for line, record in zip(records, inside):
+            for key in ("entry", "classification"):
+                self.check(line.get(key), f"a promotion line without {key}: {line}")
+            self.check(line["entry"] in listed, f"a promotion record is about {line['entry']}, which the manifest does not list")
+            self.check(line["classification"] in LABELS, f"{line['entry']}: record classification {line['classification']!r}")
+            self.check(
+                LABELS.index(line["classification"]) <= LABELS.index(top["max_label"]),
+                f"a promotion record of {line['entry']} is {line['classification']}, above max_label {top['max_label']}",
+            )
+            self.check(
+                record.get("entry") == line["entry"] and record.get("classification") == line["classification"],
+                f"a promotion record of {record.get('entry')} at {record.get('classification')} is listed as one of {line['entry']} at {line['classification']}",
+            )
+        return records
+
     # 6
     def step_export_import(self):
         if not self.opts.operator:
@@ -697,7 +758,7 @@ class Run:
             mpath = os.path.join(bundle, "manifest.yaml")
             self.check(os.path.isfile(mpath), "export wrote no manifest.yaml")
             with open(mpath, encoding="utf-8") as f:
-                top, lines = parse_manifest(f.read())
+                top, lines, promotions = parse_manifest(f.read())
             self.check(top.get("format") == BUNDLE_FORMAT, f"manifest format {top.get('format')!r}")
             self.check(top.get("domain") == d, f"manifest domain {top.get('domain')!r}, not {d}")
             for key in ("exported_at", "exported_by", "max_label", "highest_label"):
@@ -733,12 +794,18 @@ class Run:
                 )
                 if LABELS.index(m["classification"]) > LABELS.index(highest):
                     highest = m["classification"]
+            # the promotion records a bundle carries are lines of the manifest too: about
+            # an entry it lists, within the bound, and counted in the highest label
+            records = self.check_promotions(bundle, top, promotions, seen)
+            for r in records:
+                if LABELS.index(r["classification"]) > LABELS.index(highest):
+                    highest = r["classification"]
             self.check(
                 top["highest_label"] == highest,
                 f"manifest highest_label {top['highest_label']}, the lines say {highest}",
             )
             self.check(h in seen and dec in seen, "the bundle lacks the entries this run wrote")
-            print(f"   bundle of {len(lines)} entries, highest {highest}")
+            print(f"   bundle of {len(lines)} entries and {len(records)} promotion records, highest {highest}")
 
             s = self.session()
             try:

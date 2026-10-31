@@ -48,6 +48,7 @@ run complete-anyone complete-anyone
 run no-holder no-holder
 run import-trusts import-trusts --operator "python3 $fake operator"
 run highest-wrong highest-wrong --operator "python3 $fake operator"
+run records-uncounted records-uncounted --operator "python3 $fake operator"
 run reindex-forgets reindex-forgets --operator "python3 $fake operator" --drop-index "python3 $fake operator drop-index"
 run silent silent
 wait
@@ -89,6 +90,7 @@ expect complete-anyone 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'comple
 expect no-holder 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'the claimed task names no holder'
 expect import-trusts 1 '6 of 7 steps passed; FAILED: 6' 'import accepted an entry that does not match its digest'
 expect highest-wrong 1 '6 of 7 steps passed; FAILED: 6' 'the lines say'
+expect records-uncounted 1 '6 of 7 steps passed; FAILED: 6' 'the lines say internal'
 expect reindex-forgets 1 '6 of 7 steps passed; FAILED: 7' 'after reindex the ledger lost the completed task'
 # a server that never answers is reported, not waited on
 expect silent 1 '0 of 7 steps passed; not run: 6, 7; could not run: 2, 3, 4, 5; FAILED: 1' 'no reply within'
