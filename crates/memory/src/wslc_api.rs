@@ -49,7 +49,7 @@ pub(crate) struct Mounts {
     pub host_home: Option<(String, Vec<String>)>,
 }
 
-/// The egress container: this binary as `memory inside`, the record, the shared volume,
+/// The egress container: this binary as `amem inside`, the record, the shared volume,
 /// the logins read-only, and the session's bridge as its only way out.
 pub(crate) fn egress_spec(
     l: &Launch,
@@ -430,7 +430,7 @@ mod on_windows {
             Provision::Present { id } => {
                 eprintln!(
                     "memory: {image} {} from this session's store; after a rebuild, \
-                     `memory wslc-api-check --refresh`",
+                     `amem wslc-api-check --refresh`",
                     id.get(..12).unwrap_or(&id)
                 );
                 Ok(())

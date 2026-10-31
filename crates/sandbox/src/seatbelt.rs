@@ -15,7 +15,7 @@
 //! - a handful of devices, and the system read-only, [`SYSTEM`];
 //! - the metadata, and only that, of each directory above a grant, so a path can be
 //!   looked up through them; nothing in them can be listed or read;
-//! - the harness's install, the memory binary and the projection, read-only;
+//! - the harness's install, the amem binary and the projection, read-only;
 //! - the private home and the working tree, read and write;
 //! - the network: the egress socket, and the relay's port on loopback, and nothing else.
 //!
@@ -98,7 +98,7 @@ const DEVICES: &str = r#"
 /// How a grant may be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Access {
-    /// Read: the harness's install, the memory binary, the projection.
+    /// Read: the harness's install, the amem binary, the projection.
     Read,
     /// Read and write: the private home and the working tree.
     ReadWrite,
@@ -137,7 +137,7 @@ pub fn profile(plan: &Plan) -> Result<String, Error> {
     )
 }
 
-/// The plan's mounts as grants: the egress socket to connect to, the memory binary a
+/// The plan's mounts as grants: the egress socket to connect to, the amem binary a
 /// file to read, and each other mount a directory, read-only or read-write as mounted.
 fn grants(plan: &Plan) -> Result<Vec<Grant>, Error> {
     if plan.layout.backend != Backend::Seatbelt {
@@ -212,7 +212,7 @@ fn render(grants: &[Grant], relay: &str, host_home: Option<&Path>) -> Result<Str
     };
     rule(
         &mut out,
-        Some("the harness's install, the memory binary and the projection, read-only"),
+        Some("the harness's install, the amem binary and the projection, read-only"),
         "file-read*",
         &of(Access::Read)?,
     );
@@ -685,7 +685,7 @@ mod tests {
             let mut m = mount(path, false);
             let mut bad = plan_with(Vec::new());
             if file {
-                // the home as the memory binary's literal
+                // the home as the amem binary's literal
                 bad.layout.memory = PathBuf::from(path);
                 m.read_only = true;
             }

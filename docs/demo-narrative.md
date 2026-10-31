@@ -288,7 +288,8 @@ less cached input, the `c` figures: about 147,000 against 256,000. Cached tokens
 input that the provider has seen before in the session, and the provider charges less
 for them. These are amounts, not cost. The provider's prices decide whether the memory
 run was cheaper. The demo also measures the host's side: 7.4 seconds of CPU against
-10.3. In both runs, the same harness had a peak of about 166 MiB.
+10.3. In both runs, the same harness had a peak of about 166 MiB. These counts are for the
+questions as they were on 12 October; two of them changed with the case study since.
 
 ## Act 7 · The platform
 
@@ -348,7 +349,8 @@ it would have done the same.
 **8.1 The tapes.** Sessions leave a tape: its prompt, harness and model, and what each
 memory tool call returned. A session that started with a prompt can run again. Act 6's
 four questions with memory used a session each, and left four. This one asked who the
-promotion gate is, and made 2 memory tool calls.
+promotion gate is, and made 2 memory tool calls. It is the question as it was on 12
+October.
 
 **8.2 The same model again.** The control, on qwen3.8-27b: the same tools in the same
 order as the tape. Its second call asked differently, for example with a different
@@ -398,9 +400,10 @@ nothing already in the log.
 record. 304 entries are live: all except the four superseded entries and the one erased
 entry. It replays 172 ledger events. Nothing is behind the log.
 
-**10.3 Exported at a label.** You mark one note public. A public export carries that one
-entry. An internal export carries all 309 entries of `dom-demo`, with the superseded
-ones, but not the platform's domain. The entry erased in 1.4 is in neither export.
+**10.3 Exported at a label.** You write one new note, marked public. A public export
+carries that one entry. An internal export carries all 309 entries of `dom-demo`: the 304
+live, the new note, and the four superseded, but not the platform's domain. The entry
+erased in 1.4 is in neither export.
 
 **10.4 Imported elsewhere.** A second record, under another owner and domain, imports the
 internal bundle: 309 entries. A search of it for DR-19 finds 10 hits.

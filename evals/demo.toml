@@ -6,7 +6,10 @@
 #   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
 #   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex --auth gateway --model qwen3.8-27b
 #
-# Seed the record first: scripts/demo.sh ~/memory-demo2 <markdown-dir>...
+# Seed a fresh record first. An existing record keeps the text it was seeded with, and
+# RESET=1 removes the whole root:
+#
+#   make demo-ready RESET=1 DEMO_ROOT=$HOME/memory-demo2
 
 # Put in front of every prompt, under every condition alike. A harness given a memory
 # server does not always think to ask it; a task run says so in its prompt, and so does
@@ -27,10 +30,19 @@ expect = "S2"
 
 [[task]]
 id = "asf-pressures"
-prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What ASF stresses that the paper had to answer' list? Give the number."
-expect = "\\b(five|5)\\b"
+prompt = "In the 'Seeding a Foundation' notes, how many pressures does the part 'What the Foundation taught the design' list? Give the number."
+# the part cites "paper §6" and another part is "6. Trust and review", so a six or 6
+# counts unless it is a section number, a link anchor, or the end of a range or a list of
+# parts. The table in part 6 also has six rows, so a model that counts the wrong table
+# passes too; no pattern can tell
+expect = "(?<![§#–-])(?<!§ )(?<!section )(?<!part )\\b(six|6)\\b(?![–-])(?!\\s*[.)]?\\s*trust)"
 
 [[task]]
 id = "committers-gate"
 prompt = "In the 'Seeding a Foundation' notes on trust and review, who is the promotion gate? One sentence."
-expect = "committer"
+# the gate is named people that domain policy authorises, under PMC oversight; the case
+# study gives committers sampled review, so "committers" is no longer the answer, and
+# "the PMC" is what a model guesses about Apache with no record at all. The policy must be
+# the domain's, or one that authorises the people; "named people under the release
+# policy" names the wrong one
+expect = "named[*_ ]+(people|persons?|individuals?|reviewers?|approvers?|maintainers|humans?)[^.]{0,40}authori[sz]\\w*[^.]{0,25}\\bpolicy|named[*_ ]+(people|persons?|individuals?|reviewers?|approvers?|maintainers|humans?)[^.]{0,40}\\bdomain(['’]s)?[*_]* (memory )?policy|(people|persons?|individuals?|reviewers?|approvers?|maintainers|humans?)\\b[^.]{0,40}\\bdomain(['’]s)?[*_]* policy[^.]{0,15}authori[sz]|(people|persons?|individuals?|reviewers?|approvers?|maintainers|humans?)\\b[^.]{0,30}authori[sz]ed by [*_]*(the )?domain(['’]s)?[*_]* policy|policy-authori[sz]ed (people|persons?|individuals?|reviewers?|approvers?|maintainers|humans?)"
