@@ -187,7 +187,11 @@ pub struct Frontmatter {
     #[serde(default)]
     pub trust_tier: TrustTier,
     /// Decay clock, as a calendar date.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "calendar_date"
+    )]
     pub review_by: Option<time::Date>,
     /// The entry this one replaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +214,38 @@ pub struct Frontmatter {
     /// A title, when the body's first heading is not the right one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+/// `review_by` on disk: `2027-04-01`. An entry written before this was fixed holds the
+/// date as `time`'s own shape, a year and a day of the year, and still reads.
+mod calendar_date {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+    use time::{macros::format_description, Date};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Text(String),
+        YearAndDay(i32, u16),
+    }
+
+    pub(crate) fn serialize<S: Serializer>(date: &Option<Date>, s: S) -> Result<S::Ok, S::Error> {
+        match date {
+            Some(d) => s.collect_str(d),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Date>, D::Error> {
+        let parsed = match Option::<Shape>::deserialize(d)? {
+            None => return Ok(None),
+            Some(Shape::Text(s)) => Date::parse(&s, format_description!("[year]-[month]-[day]"))
+                .map_err(|e| D::Error::custom(format!("review_by {s:?}: {e}")))?,
+            Some(Shape::YearAndDay(year, day)) => Date::from_ordinal_date(year, day)
+                .map_err(|e| D::Error::custom(format!("review_by [{year}, {day}]: {e}")))?,
+        };
+        Ok(Some(parsed))
+    }
 }
 
 /// One entry: frontmatter plus a Markdown body.
@@ -397,6 +433,23 @@ mod tests {
         let back = Entry::parse(&text).unwrap();
         assert_eq!(e, back);
         assert_eq!(text, back.render());
+    }
+
+    #[test]
+    fn review_by_is_written_as_a_date_and_read_in_either_shape() {
+        let text = sample().render();
+        assert!(text.contains("\nreview_by: 2027-04-01\n"), "{text}");
+        // what a binary from before wrote: the year and the day of the year
+        let written = text.replace("review_by: 2027-04-01", "review_by:\n- 2027\n- 91");
+        let older = Entry::parse(&written).unwrap();
+        assert_eq!(older.front.review_by, Some(date!(2027 - 04 - 01)));
+        assert_eq!(older.render(), text);
+        let by_hand = text.replace("review_by: 2027-04-01", "review_by: '2027-04-01'");
+        assert_eq!(Entry::parse(&by_hand).unwrap(), sample());
+        for bad in ["2027-02-30", "[2027, 400]", "tomorrow", "[2027]"] {
+            let t = text.replace("review_by: 2027-04-01", &format!("review_by: {bad}"));
+            assert!(Entry::parse(&t).is_err(), "{bad}");
+        }
     }
 
     #[test]
