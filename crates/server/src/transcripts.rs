@@ -1780,7 +1780,9 @@ mod tests {
         let k = m.keep_transcript(keep("a.jsonl")).await.unwrap();
         let a = citing(&m, &k.session, &[2], "Handoff A.\n").await;
         let b = citing(&m, &k.session, &[2], "Handoff B.\n").await;
-        m.sweep_transcripts(OffsetDateTime::now_utc())
+        // a minute on, not now: a host clock that steps back (WSL2 does when it resyncs)
+        // would otherwise leave the transcript unexpired and nothing swept
+        m.sweep_transcripts(OffsetDateTime::now_utc() + Duration::minutes(1))
             .await
             .unwrap();
         let receipt = m.erase(&a, Reason::Mistaken).await.unwrap();
