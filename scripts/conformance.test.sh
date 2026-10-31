@@ -20,8 +20,9 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is needed for the conforma
 
 # run <name> <flaw> <args...>: one run of the script against the fake with that flaw, its
 # output and exit status kept under its name. The lease is 4 seconds, so each check of
-# step 5 has 2 seconds of margin: a machine busy with a build can hold a process back
-# that long, and at 2 seconds a stall of 2 failed a fake with no defect
+# step 5 has 2 seconds of margin or more: a machine busy with a build can hold a process
+# back that long. The runs start together, so a fake can take seconds to answer its first
+# request; a reply has 30 seconds, and only the run that must time out waits less
 run() {
     name=$1
     flaw=$2
@@ -29,7 +30,7 @@ run() {
     (
         status=0
         FLAW="$flaw" FAKE_STATE="$work/$name.json" \
-            python3 "$script" --stdio "python3 $fake" --lease 4 --timeout 5 "$@" \
+            python3 "$script" --stdio "python3 $fake" --lease 4 --timeout 30 "$@" \
             >"$work/$name.out" 2>&1 || status=$?
         echo "$status" >"$work/$name.status"
     ) &
@@ -54,7 +55,7 @@ run no-holder no-holder
 run import-trusts import-trusts --operator "python3 $fake operator"
 run highest-wrong highest-wrong --operator "python3 $fake operator"
 run reindex-forgets reindex-forgets --operator "python3 $fake operator" --drop-index "python3 $fake operator drop-index"
-run silent silent
+run silent silent --timeout 5
 wait
 
 failures=0

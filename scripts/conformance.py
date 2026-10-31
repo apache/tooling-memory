@@ -657,12 +657,12 @@ class Run:
             print(f"   holding the lease past {lease}s with one heartbeat, then letting it lapse")
             # the heartbeat renews for three leases, so each check stands clear of the ends
             # it sits between, by half a lease or more: a full renewal moves lease_until on
-            # by two and a half leases, and the check asks for two; the claim check falls a
-            # lease and a half after the first lease lapsed and a lease before the renewed
-            # one does, so a server that reports the renewal but holds the task for less
-            # than two leases of it fails there; and the lapse check comes a lease after the
-            # renewed one ends. A stalled call, or a server clock that steps by less than
-            # those margins, moves no end past a check
+            # by two and a half leases, and the check asks for two; the claim check falls two
+            # leases after the first lease lapsed and half a lease before the renewed one
+            # does, so a server that reports the renewal but holds the task for less than
+            # two and a half leases of the three fails there; and the lapse check comes a
+            # lease after the renewed one ends. A stalled call, or a server clock that steps
+            # by less than those margins, moves no end past a check
             time.sleep(lease * 0.5)
             got = s.call("heartbeat", id=tid2, lease_seconds=3 * lease)
             beat = task_of(got, "heartbeat")
@@ -673,12 +673,12 @@ class Run:
                 first is not None and renewed - first >= 2 * lease,
                 f"heartbeat did not renew it: lease_until went from {first} to {renewed}",
             )
-            time.sleep(lease * 2.0)
+            time.sleep(lease * 2.5)
             self.check(
                 task_of(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next") is None,
                 "a renewed lease lapsed where the first one would have: heartbeat did not renew it",
             )
-            time.sleep(lease * 2.0)
+            time.sleep(lease * 1.5)
             s.refused("heartbeat", id=tid2, lease_seconds=lease)
             s.refused("complete", id=tid2, handoff=h)
             t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease, "the task whose lease lapsed")
