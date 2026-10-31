@@ -994,14 +994,20 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] for an entry this session cannot read, [`Error::Denied`]
-    /// when the policy refuses or the entry is already at or above the tier.
+    /// [`Error::NotFound`] for an entry this session cannot read; for one it could read
+    /// that is no longer served, [`Error::Moved`] or [`Error::Gone`] as from
+    /// [`Memory::get`]; [`Error::Denied`] when the policy refuses, the entry is not live,
+    /// or the entry is already at or above the tier.
     pub async fn promote(&self, id: &str, to: TrustTier, why: &str) -> Result<Promotion, Error> {
         let f = self.session_filter()?;
         if self.index.lock().await.meta(id, &f)?.is_none() {
-            return Err(Error::NotFound(id.to_string()));
+            return Err(self.not_served(id, None).await);
         }
         let (_, entry) = self.find(id).await?;
+        // the index can lag the record: the record says whether it is live
+        if let Some(status) = entry.front.status {
+            return Err(not_live(id, status));
+        }
         if entry.front.trust_tier >= to {
             return Err(Error::Denied(format!(
                 "{id} is {} already",
@@ -1034,7 +1040,7 @@ impl Memory {
                 requirements: vec!["human".into()],
                 depends_on: Vec::new(),
                 origin: Some(format!("promote:{id}")),
-                upstream_event: Some("verified".into()),
+                upstream_event: Some(VERIFY_EVENT.into()),
                 created_by: String::new(),
                 classification: entry.front.classification,
                 priority: 3,
@@ -1047,12 +1053,14 @@ impl Memory {
 
     /// Approve a proposal to promote to verified: the person approving did not propose
     /// it, and the policy says so. The entry is promoted and the proposal task completed
-    /// by the approver, the entry its record.
+    /// by the approver, the entry its record. Only a live entry is approved: an erased
+    /// one has nothing left to check, a replaced one is reviewed as its successor, and
+    /// a demoted one was found wanting.
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for a task that is not a live promotion proposal or an
-    /// approval the policy refuses; a ledger or store error.
+    /// [`Error::Denied`] for a task that is not a live promotion proposal, an entry
+    /// that is not live, or an approval the policy refuses; a ledger or store error.
     pub async fn approve(&self, task_id: &str) -> Result<Promotion, Error> {
         let task = self.ledger.lock().await.get(task_id).await?;
         self.task_in_grants(&task)?;
@@ -1066,10 +1074,14 @@ impl Memory {
                 "{task_id} is not a promotion proposal"
             )));
         };
+        // the entry first: an erasure closes its proposal too, and the entry is the reason
+        let (_, entry) = self.find(id).await?;
+        if let Some(status) = entry.front.status {
+            return Err(not_live(id, status));
+        }
         if task.status.is_terminal() {
             return Err(Error::Denied(format!("{task_id} is {:?}", task.status)));
         }
-        let (_, entry) = self.find(id).await?;
         let d = self.decide_promotion(
             &entry,
             TrustTier::Verified,
@@ -2036,7 +2048,8 @@ impl Memory {
     /// the index, the served bundles; then the receipt again without that line. A run
     /// that stops short leaves that receipt, and the next run picks up where it stopped,
     /// keeping the first run's reason. Entries that cite the erased one are flagged for
-    /// review today rather than re-derived here. Exports already handed out, the
+    /// review today rather than re-derived here. An open proposal to verify the entry is
+    /// invalidated: nothing is left to approve. Exports already handed out, the
     /// transcripts of sessions that read the entry, and the queries in the read log are
     /// beyond reach and the receipt says so.
     ///
@@ -2104,12 +2117,25 @@ impl Memory {
                     .await?,
             );
         }
+        self.finish_erasure(&domain, id, receipt).await
+    }
+
+    /// The steps of an erasure after the record's: the citing entries, the open
+    /// proposal to verify it, the index, the served bundles and every render; then the
+    /// receipt, closed.
+    async fn finish_erasure(
+        &self,
+        domain: &str,
+        id: &str,
+        mut receipt: Receipt,
+    ) -> Result<Receipt, Error> {
         let stub = self
             .store
-            .get(&domain, id)
+            .get(domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         receipt.flagged = self.flag_citers(id).await?;
+        self.close_proposal(domain, id).await?;
         {
             let mut ix = self.index.lock().await;
             ix.remove(id)?;
@@ -2117,10 +2143,10 @@ impl Memory {
             ix.vacuum()?;
         }
         self.forget_pushed(id);
-        self.drop_bundles(&domain)?;
+        self.drop_bundles(domain)?;
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
-        let missed = self.erase_from_projections(&domain, id);
+        let missed = self.erase_from_projections(domain, id);
         close_receipt(&mut receipt, missed);
         self.store.put_receipt(&receipt).await?;
         self.refresh_projection_after_erasure().await;
@@ -2142,6 +2168,24 @@ impl Memory {
     }
 
     /// An entry by id across the granted domains, from the record, whatever its status.
+    /// Invalidate the open proposal to verify an entry that is gone, so the board stops
+    /// offering it. A proposal already closed is left as it is.
+    async fn close_proposal(&self, domain: &str, id: &str) -> Result<(), Error> {
+        let mut l = self.ledger.lock().await;
+        let origin = format!("promote:{id}");
+        if let Some(t) = l.by_origin(domain, &origin, VERIFY_EVENT).await? {
+            if !t.status.is_terminal() {
+                l.invalidate(
+                    &t.id,
+                    &format!("{id} was erased; nothing is left to verify"),
+                    None,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn find(&self, id: &str) -> Result<(String, Entry), Error> {
         for domain in self.domains() {
             if let Some(e) = self.store.get(&domain, id).await? {
@@ -2150,6 +2194,21 @@ impl Memory {
         }
         Err(Error::NotFound(id.to_string()))
     }
+}
+
+/// The upstream event of a proposal to promote an entry to verified, filed with origin
+/// `promote:<id>`; the ledger keeps one task per pair.
+const VERIFY_EVENT: &str = "verified";
+
+/// Why an entry that is not live is not promoted.
+fn not_live(id: &str, status: Status) -> Error {
+    Error::Denied(match status {
+        Status::Erased => format!("{id} is erased; nothing is left to verify"),
+        Status::Superseded => {
+            format!("{id} was replaced; review and promote its current version instead")
+        }
+        Status::Demoted => format!("{id} was demoted by curation and is not promoted"),
+    })
 }
 
 /// What an erasure here cannot reach, named on every receipt so nobody believes it did.
@@ -2781,6 +2840,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("verified"), "{err}");
+    }
+
+    /// An entry written by the owner and proposed for verified by the librarian: the
+    /// entry's id and the proposal task.
+    async fn proposed(dir: &Path, owner: &Memory, body: &str) -> (String, Task) {
+        let id = owner.write(req(body)).await.unwrap().id;
+        let librarian = Memory::open(dir).unwrap().with_author("agent:librarian");
+        let Promotion::Proposed { task } = librarian
+            .promote(&id, TrustTier::Verified, "checked against the tree")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed, not set")
+        };
+        (id, *task)
+    }
+
+    #[tokio::test]
+    async fn an_erased_entry_is_not_approved_and_its_stub_keeps_its_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact, then erased.\n").await;
+        owner.erase(&id, Reason::Mistaken).await.unwrap();
+        let err = owner.approve(&task.id).await.unwrap_err();
+        assert!(err.to_string().contains("erased"), "{err}");
+        let (_, stub) = owner.find(&id).await.unwrap();
+        assert_eq!(stub.front.status, Some(dm_core::Status::Erased));
+        assert_eq!(stub.front.trust_tier, TrustTier::Raw);
+        let err = owner
+            .promote(&id, TrustTier::Verified, "again")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("erased"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_erasure_closes_the_open_proposal_to_verify_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact, then erased.\n").await;
+        let (kept, _) = proposed(dir.path(), &owner, "A fact that stays.\n").await;
+        owner.erase(&id, Reason::Mistaken).await.unwrap();
+        let open = gate_tasks(&owner, &format!("promote:{id}")).await;
+        assert!(open.is_empty(), "the board offers {open:?}");
+        let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
+        assert_eq!(
+            gate_tasks(&owner, &format!("promote:{kept}")).await.len(),
+            1,
+            "another entry's proposal stays open"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_or_demoted_entry_is_not_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (old, replaced) = proposed(dir.path(), &owner, "Retries three times.\n").await;
+        owner
+            .write(WriteRequest {
+                supersedes: Some(old.clone()),
+                ..req("Retries five times.\n")
+            })
+            .await
+            .unwrap();
+        let err = owner.approve(&replaced.id).await.unwrap_err();
+        assert!(err.to_string().contains("replaced"), "{err}");
+        let (demoted, task) = proposed(dir.path(), &owner, "Found wanting.\n").await;
+        owner.store.demote("dom-me", &demoted).await.unwrap();
+        let err = owner.approve(&task.id).await.unwrap_err();
+        assert!(err.to_string().contains("demoted"), "{err}");
+        for id in [&old, &demoted] {
+            let (_, e) = owner.find(id).await.unwrap();
+            assert_eq!(e.front.trust_tier, TrustTier::Raw, "{id}");
+        }
     }
 
     #[tokio::test]
