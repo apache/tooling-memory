@@ -568,23 +568,71 @@ pub(crate) mod tests {
         assert!(body.contains("one sentence of why"), "{body}");
     }
 
+    #[test]
+    fn the_reasoning_check_refuses_reasons_put_in_the_entry() {
+        let good = verify_body("mem-t-1");
+        for (from, to) in [
+            (
+                "its body says what holds now",
+                "its body says what holds now and why you believe it",
+            ),
+            (
+                "its body says what holds now",
+                "its body says what holds now and what was wrong with the old one",
+            ),
+            (
+                "keep that out of the entry",
+                "put the same account in the entry's `summary`",
+            ),
+        ] {
+            let bad = good.replacen(from, to, 1);
+            assert_ne!(bad, good, "{from}");
+            let caught = std::panic::catch_unwind(|| reasoning_goes_to_the_handoff(&bad));
+            assert!(caught.is_err(), "not caught: {bad}");
+        }
+        // forbidding the reasons in the body is not asking for them there
+        let fine = good.replacen(
+            "keep that out of the entry",
+            "keep that out of the entry; keep how you know out of the body",
+            1,
+        );
+        reasoning_goes_to_the_handoff(&fine);
+    }
+
     /// The rule both curation tasks that correct an entry follow: every sentence that asks
-    /// for the reasoning sends it to the handoff and none sends it to a body; the entry's
+    /// for the reasoning sends it to the handoff or keeps it out; what the entry is told to
+    /// hold carries no reasons; the task says to keep them out of the entry; the entry's
     /// evidence is its `source`, in a form the librarian resolves; and the handoff names the
-    /// entry written, so the reasoning can be found from it.
+    /// entry written, so the reasoning can be found from it. A check on wording, so it
+    /// catches the wordings it knows, and its own test lists them.
     pub(crate) fn reasoning_goes_to_the_handoff(body: &str) {
-        let asks: Vec<&str> = body
-            .split_inclusive(['.', ';'])
+        const REASONS: [&str; 5] = ["how you know", "why", "wrong", "changed", "what you found"];
+        let sentences: Vec<&str> = body.split_inclusive(['.', ';']).collect();
+        let asks: Vec<&&str> = sentences
+            .iter()
             .filter(|s| s.contains("how you know"))
             .collect();
         assert!(!asks.is_empty(), "nothing asks for the reasoning: {body}");
         for s in asks {
             assert!(
-                s.contains("handoff"),
+                s.contains("handoff") || s.contains(" out of "),
                 "the reasoning is not sent to the handoff: {s}"
             );
-            assert!(!s.contains("body"), "the reasoning is sent to a body: {s}");
         }
+        for s in &sentences {
+            for held in ["its body", "`summary`"] {
+                if let Some(i) = s.find(held) {
+                    assert!(
+                        !REASONS.iter().any(|r| s[i..].contains(r)),
+                        "the entry is told to hold reasons: {s}"
+                    );
+                }
+            }
+        }
+        assert!(
+            body.contains("keep that out of the entry"),
+            "the task does not keep the reasons out of the entry: {body}"
+        );
         assert!(
             body.contains("`source`") && body.contains("`file:<path>`"),
             "the evidence and its form are not named: {body}"
