@@ -12,7 +12,7 @@ use dm_server::reads;
 use dm_server::Memory;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// What a proposal asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -107,13 +107,41 @@ fn source_file(source: &str, root: &Path) -> Option<std::path::PathBuf> {
     {
         return None;
     }
-    let p = Path::new(rel);
-    let full = if p.is_absolute() {
-        p.to_path_buf()
+    // a source names a file in the working tree, and only the real path, links followed,
+    // says whether it is still there
+    let full = root
+        .join(under_root(Path::new(rel), root)?)
+        .canonicalize()
+        .ok()?;
+    let root = root.canonicalize().ok()?;
+    (full.starts_with(&root) && full.is_file()).then_some(full)
+}
+
+/// A source's path relative to the root: a relative one that never climbs above it, or
+/// an absolute one inside it. Decided on the text, so a path that leaves the root is
+/// never looked up.
+fn under_root(p: &Path, root: &Path) -> Option<std::path::PathBuf> {
+    let rel = if p.is_absolute() {
+        match p.strip_prefix(root) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => p
+                .strip_prefix(root.canonicalize().ok()?)
+                .ok()?
+                .to_path_buf(),
+        }
     } else {
-        root.join(p)
+        p.to_path_buf()
     };
-    full.is_file().then_some(full)
+    let mut depth = 0usize;
+    for c in rel.components() {
+        match c {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => depth = depth.checked_sub(1)?,
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(rel)
 }
 
 /// Whether a source file changed after the entry was written: the source-change trigger.
@@ -178,6 +206,15 @@ pub async fn survey(
     domain: Option<&str>,
     options: &Options,
 ) -> Result<Survey, Box<dyn std::error::Error>> {
+    // a working tree that is not there turns off the source-change trigger for every
+    // entry, which a survey would otherwise report as nothing to verify
+    if let Some(r) = options.source_root.as_deref().filter(|r| !r.is_dir()) {
+        return Err(format!(
+            "the working tree {} is not a directory, so no `file:` source can be checked",
+            r.display()
+        )
+        .into());
+    }
     let domain = memory.resolve_domain(domain)?;
     let hits = memory.list(Some(&domain), None, options.limit).await?;
     let mut survey = Survey {
@@ -310,11 +347,16 @@ fn survey_entry(
             kind: Kind::Verify,
             entries: vec![id.clone()],
             why,
-            body: format!(
-                "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}` and say in its body what changed and how you know. If it holds, also call `promote` with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff."
-            ),
+            body: verify_body(id),
         });
     }
+}
+
+/// The task that has a curator check a stale entry and correct or re-date it.
+fn verify_body(id: &str) -> String {
+    format!(
+        "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}`: its body says what holds now, and its `source` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If it holds, also call `promote` with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff that names the entry you wrote and the one it supersedes, and says what you found and how you know; keep that out of the entry, so whoever checks it judges it on its sources first."
+    )
 }
 
 /// Live entries that share a title, once normalised, are merge candidates.
@@ -409,8 +451,9 @@ pub async fn file(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn a_summary_the_index_should_not_serve_is_named() {
@@ -437,6 +480,93 @@ mod tests {
             "dr19 does the wiki stay on moinmoin"
         );
         assert_eq!(Kind::Resummarise.name(), "resummarise");
+    }
+
+    #[test]
+    fn a_source_names_a_file_in_the_tree_and_nothing_outside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("in.md"), "x").unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        for s in [
+            "file:in.md".to_string(),
+            "in.md".to_string(),
+            "file:./in.md".to_string(),
+            "file:sub/../in.md".to_string(),
+            format!("file:{}", tree.join("in.md").display()),
+        ] {
+            assert!(source_file(&s, &tree).is_some(), "{s}");
+        }
+        for s in [
+            outside.display().to_string(),
+            format!("file:{}", outside.display()),
+            "file:../outside.txt".to_string(),
+            "../outside.txt".to_string(),
+            "file:sub/../../outside.txt".to_string(),
+            format!("file:{}/../outside.txt", tree.display()),
+        ] {
+            assert_eq!(source_file(&s, &tree), None, "{s}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // a link out of the tree, as the file, as a directory on the way, and to a
+            // sibling whose name the tree's is a prefix of
+            symlink(&outside, tree.join("link.txt")).unwrap();
+            std::fs::create_dir(dir.path().join("outdir")).unwrap();
+            std::fs::write(dir.path().join("outdir/o.txt"), "x").unwrap();
+            symlink(dir.path().join("outdir"), tree.join("ld")).unwrap();
+            std::fs::create_dir(dir.path().join("tree-evil")).unwrap();
+            std::fs::write(dir.path().join("tree-evil/x.txt"), "x").unwrap();
+            symlink(dir.path().join("tree-evil"), tree.join("le")).unwrap();
+            for s in ["file:link.txt", "file:ld/o.txt", "file:le/x.txt"] {
+                assert_eq!(source_file(s, &tree), None, "{s}");
+            }
+            // a tree reached through a link is still the tree
+            let alias = dir.path().join("alias");
+            symlink(&tree, &alias).unwrap();
+            assert!(
+                source_file("file:in.md", &alias).is_some(),
+                "through a link"
+            );
+        }
+    }
+
+    #[test]
+    fn under_the_root_is_decided_on_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let t = tree.display();
+        for s in [
+            "../x".to_string(),
+            "sub/../../x".to_string(),
+            "/etc/passwd".to_string(),
+            format!("{t}/../x"),
+            format!("{t}-evil/x"),
+        ] {
+            assert_eq!(under_root(Path::new(&s), &tree), None, "{s}");
+        }
+        assert_eq!(
+            under_root(Path::new("sub/../in.md"), &tree),
+            Some(PathBuf::from("sub/../in.md"))
+        );
+        assert_eq!(
+            under_root(&tree.join("in.md"), &tree),
+            Some(PathBuf::from("in.md"))
+        );
+        #[cfg(unix)]
+        {
+            // an absolute source given by the real path, the root by a link to it
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&tree, &alias).unwrap();
+            assert_eq!(
+                under_root(&tree.canonicalize().unwrap().join("in.md"), &alias),
+                Some(PathBuf::from("in.md"))
+            );
+        }
     }
 
     #[test]
@@ -474,5 +604,131 @@ mod tests {
         assert_eq!(source, "file:notes.md");
         assert!(source_file("https://x/y", dir.path()).is_none());
         assert!(source_file("mem-t-2", dir.path()).is_none());
+    }
+
+    #[test]
+    fn a_corrected_entry_leaves_the_reasoning_to_the_handoff() {
+        let body = verify_body("mem-t-1");
+        reasoning_goes_to_the_handoff(&body);
+        assert!(body.contains("one sentence of why"), "{body}");
+    }
+
+    #[test]
+    fn the_reasoning_check_refuses_reasons_put_in_the_entry() {
+        let good = verify_body("mem-t-1");
+        let held = "the entry is told to hold reasons";
+        for (from, to, rule) in [
+            (
+                "its body says what holds now",
+                "its body says what holds now and why you believe it",
+                held,
+            ),
+            (
+                "its body says what holds now",
+                "its body says what holds now and what was wrong with the old one",
+                held,
+            ),
+            (
+                "its body says what holds now",
+                "the body says what holds now, what you found and how you checked it",
+                held,
+            ),
+            (
+                "its body says what holds now",
+                "the entry's body explains why the old one was wrong",
+                held,
+            ),
+            (
+                "its body says what holds now",
+                "its body says what holds now. In the body, say how you know, drawing it out of the tree",
+                "not sent to the handoff",
+            ),
+            (
+                "keep that out of the entry",
+                "keep that out of the entry; put the same account in the entry's `summary`",
+                held,
+            ),
+            (
+                "keep that out of the entry",
+                "put the same account in the entry's `summary`",
+                held,
+            ),
+        ] {
+            let bad = good.replacen(from, to, 1);
+            assert_ne!(bad, good, "{to}");
+            let caught = std::panic::catch_unwind(|| reasoning_goes_to_the_handoff(&bad))
+                .expect_err(&format!("not caught: {to}"));
+            let said = caught
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default();
+            assert!(said.contains(rule), "{to}: caught for another reason: {said}");
+        }
+        // forbidding the reasons in the body is not asking for them there
+        let fine = good.replacen(
+            "keep that out of the entry",
+            "keep that out of the entry; keep how you know out of the body",
+            1,
+        );
+        reasoning_goes_to_the_handoff(&fine);
+    }
+
+    /// The rule both curation tasks that correct an entry follow: every sentence that asks
+    /// for the reasoning sends it to the handoff or keeps it out; what the entry is told to
+    /// hold carries no reasons; the task says to keep them out of the entry; the entry's
+    /// evidence is its `source`, in a form the librarian resolves; and the handoff names the
+    /// entry written, so the reasoning can be found from it. A check on wording, so it
+    /// catches the wordings it knows, and its own test lists them.
+    pub(crate) fn reasoning_goes_to_the_handoff(body: &str) {
+        const REASONS: [&str; 6] = [
+            "how you know",
+            "why",
+            "wrong",
+            "changed",
+            "what you found",
+            "account",
+        ];
+        let sentences: Vec<&str> = body.split_inclusive(['.', ';']).collect();
+        let asks: Vec<&&str> = sentences
+            .iter()
+            .filter(|s| s.contains("how you know"))
+            .collect();
+        assert!(!asks.is_empty(), "nothing asks for the reasoning: {body}");
+        for s in asks {
+            assert!(
+                s.contains("handoff")
+                    || s.contains(" out of the entry")
+                    || s.contains(" out of the body"),
+                "the reasoning is not sent to the handoff: {s}"
+            );
+        }
+        // what the entry is told to hold: the rest of the sentence from where it names the
+        // body or the summary, and the clause that names it; a sentence that keeps the
+        // reasons out of the entry is not telling it to hold them
+        let keeps_out = |s: &str| s.contains(" out of the entry") || s.contains(" out of the body");
+        for s in sentences.iter().filter(|s| !keeps_out(s)) {
+            for held in ["body", "`summary`"] {
+                let Some(i) = s.find(held) else { continue };
+                let clause = s.split([',', ':']).find(|c| c.contains(held)).unwrap_or("");
+                assert!(
+                    !REASONS
+                        .iter()
+                        .any(|r| s[i..].contains(r) || clause.contains(r)),
+                    "the entry is told to hold reasons: {s}"
+                );
+            }
+        }
+        assert!(
+            body.contains("keep that out of the entry"),
+            "the task does not keep the reasons out of the entry: {body}"
+        );
+        assert!(
+            body.contains("`source`") && body.contains("`file:<path>`"),
+            "the evidence and its form are not named: {body}"
+        );
+        assert!(
+            body.contains("names the entry you wrote"),
+            "the handoff is not tied to the entry: {body}"
+        );
     }
 }
