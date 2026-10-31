@@ -1282,10 +1282,10 @@ fn main() {
         match outbox {
             Some(outbox) => {
                 if let Err(e) = hooks::run(&outbox, harness) {
-                    eprintln!("memory hook: {e}");
+                    eprintln!("amem: hook: {e}");
                 }
             }
-            None => eprintln!("memory hook: no MEMORY_OUTBOX and no HOME"),
+            None => eprintln!("amem: hook: no MEMORY_OUTBOX and no HOME"),
         }
         std::process::exit(0);
     }
