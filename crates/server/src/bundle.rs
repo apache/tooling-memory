@@ -6,14 +6,18 @@
 //!
 //! Import is the mirror. Every entry lands at trust raw unless the same owner exported it,
 //! keeps its provenance and classification, and is keyed on origin so a second import
-//! creates nothing twice. A manifest path that is not a plain file name is refused before
+//! creates nothing twice. Why its entries were promoted travels with them: the records
+//! about entries exported, at or below the bound, in a file the manifest holds the digest
+//! of; an import keeps them where it keeps the tiers, from the same owner, and leaves them
+//! behind where the entries land raw. A manifest path that is not a plain file name is refused before
 //! anything is read, and an entry whose digest does not match its manifest line is
 //! refused before anything is written.
 
 use dm_core::erasure::body_digest;
-use dm_core::manifest::{Manifest, ManifestEntry};
+use dm_core::manifest::{Manifest, ManifestEntry, ManifestPromotion, ManifestPromotions};
 use dm_core::{digest, Entry, Label, ReadFilter, TrustTier};
 use dm_index::{Hit, Index};
+use dm_ledger::PromotionRecord;
 use dm_store::Store;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -112,6 +116,100 @@ pub struct Imported {
     pub excerpts: usize,
     /// Where the bundle came from: `bundle:<exporter>/<domain>`.
     pub from: String,
+    /// The promotion records to restore with the entries written, each moved to the entry
+    /// as it landed: from the same owner's bundle only. Another owner's entries land raw,
+    /// and the reasons for the tier they lost are left behind.
+    pub promotions: Vec<PromotionRecord>,
+}
+
+/// Where a bundle carries the promotion records of its entries.
+pub const PROMOTIONS_FILE: &str = "promotions.json";
+
+/// Refuse a manifest path that is not a plain file name in the bundle's directory.
+fn plain_name(path: &str) -> Result<(), Error> {
+    if path.contains(['/', '\\']) || path.starts_with('.') || path.is_empty() {
+        return Err(Error::Invalid(format!(
+            "manifest path {path:?} is not a plain file name"
+        )));
+    }
+    Ok(())
+}
+
+/// Write the records about entries the manifest lists, at or below its bound, and list
+/// them in it. Nothing is written when there are none.
+async fn carry_promotions(
+    manifest: &mut Manifest,
+    records: Vec<PromotionRecord>,
+    dest: &Path,
+) -> Result<(), Error> {
+    let carried: Vec<PromotionRecord> = records
+        .into_iter()
+        .filter(|r| {
+            r.spec.classification <= manifest.max_label
+                && manifest.entries.iter().any(|e| e.id == r.spec.entry)
+        })
+        .collect();
+    if carried.is_empty() {
+        return Ok(());
+    }
+    let text = serde_json::to_string_pretty(&carried)
+        .map_err(|e| Error::Invalid(format!("promotion records: {e}")))?;
+    let path = dest.join(PROMOTIONS_FILE);
+    tokio::fs::write(&path, &text).await.map_err(io(&path))?;
+    manifest.set_promotions(ManifestPromotions {
+        path: PROMOTIONS_FILE.into(),
+        digest: digest(&text),
+        records: carried
+            .iter()
+            .map(|r| ManifestPromotion {
+                entry: r.spec.entry.clone(),
+                classification: r.spec.classification,
+            })
+            .collect(),
+    })?;
+    Ok(())
+}
+
+/// The promotion records a bundle carries, checked before anything is written: a plain
+/// file name, its digest, and one record per manifest line, about the entry and at the
+/// label the line says. A bundle with one bad record is refused whole.
+fn carried_promotions(src: &Path, manifest: &Manifest) -> Result<Vec<PromotionRecord>, Error> {
+    let Some(listed) = &manifest.promotions else {
+        return Ok(Vec::new());
+    };
+    plain_name(&listed.path)?;
+    let path = src.join(&listed.path);
+    let text = std::fs::read_to_string(&path).map_err(io(&path))?;
+    if digest(&text) != listed.digest {
+        return Err(Error::Invalid(format!(
+            "{} does not match its manifest digest",
+            listed.path
+        )));
+    }
+    let records: Vec<PromotionRecord> =
+        serde_json::from_str(&text).map_err(|e| Error::Invalid(format!("{}: {e}", listed.path)))?;
+    let inside: Vec<(String, Label)> = records
+        .iter()
+        .map(|r| (r.spec.entry.clone(), r.spec.classification))
+        .collect();
+    manifest.check_promotions(&inside)?;
+    Ok(records)
+}
+
+/// The records to restore: those about an entry written, moved to it as it landed.
+fn landed_promotions(
+    carried: Vec<PromotionRecord>,
+    landed: &BTreeMap<String, String>,
+    into_domain: &str,
+) -> Vec<PromotionRecord> {
+    carried
+        .into_iter()
+        .filter_map(|mut r| {
+            r.spec.entry = landed.get(&r.spec.entry)?.clone();
+            r.spec.domain = into_domain.to_string();
+            Some(r)
+        })
+        .collect()
 }
 
 /// Where the binary keeps the bundles it serves, under the root's state.
@@ -149,7 +247,8 @@ pub fn export_scope(
     Ok(scoped)
 }
 
-/// Export `hits`, the entries [`export_scope`] listed for `domain`, into `dest`. The
+/// Export `hits`, the entries [`export_scope`] listed for `domain`, into `dest`, with
+/// the `promotions` of those exported at or below the bound. The
 /// index is consulted before this is called and never held across the record reads,
 /// so the export can run on any executor thread. The manifest's word on each entry's
 /// label is the record's, read from the text written, not the index's, which can lag
@@ -166,6 +265,7 @@ pub async fn export(
     max_label: Label,
     exported_by: &str,
     dest: &Path,
+    promotions: Vec<PromotionRecord>,
 ) -> Result<Exported, Error> {
     tokio::fs::create_dir_all(dest).await.map_err(io(dest))?;
     let mut manifest = Manifest::new(domain, exported_by, max_label);
@@ -184,6 +284,7 @@ pub async fn export(
             classification,
         })?;
     }
+    carry_promotions(&mut manifest, promotions, dest).await?;
     let mpath = dest.join("manifest.yaml");
     tokio::fs::write(&mpath, manifest.to_yaml())
         .await
@@ -244,12 +345,7 @@ pub async fn import(
     let mut checked: Vec<Entry> = Vec::with_capacity(manifest.entries.len());
     let mut inside: Vec<(String, Label)> = Vec::with_capacity(manifest.entries.len());
     for m in &manifest.entries {
-        if m.path.contains(['/', '\\']) || m.path.starts_with('.') || m.path.is_empty() {
-            return Err(Error::Invalid(format!(
-                "manifest path {:?} is not a plain file name",
-                m.path
-            )));
-        }
+        plain_name(&m.path)?;
         let path = src.join(&m.path);
         let text = std::fs::read_to_string(&path).map_err(io(&path))?;
         if digest(&text) != m.digest {
@@ -266,8 +362,10 @@ pub async fn import(
         }
         checked.push(entry);
     }
+    let carried = carried_promotions(src, &manifest)?;
     // the manifest's word on the labels must be the entries' own, erased ones included,
-    // before anything lands: a line or a highest that understates is refused whole
+    // and the records', before anything lands: a line or a highest that understates is
+    // refused whole
     manifest.check(&inside)?;
 
     // Pass two: land what is new. An entry is already here when a previous import landed
@@ -318,6 +416,9 @@ pub async fn import(
         out.landed.insert(bundle_id, entry.front.id.clone());
         out.written.push(entry.front.id.clone());
     }
+    if same_owner {
+        out.promotions = landed_promotions(carried, &out.landed, into_domain);
+    }
     Ok(out)
 }
 
@@ -355,6 +456,7 @@ mod tests {
             Label::Restricted,
             "memory:test:me",
             dest.path(),
+            Vec::new(),
         )
         .await
         .unwrap();

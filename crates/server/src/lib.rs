@@ -2146,6 +2146,9 @@ impl Memory {
         let scope = bundle::export_scope(&self.session_filter()?, &domain, max_label)?;
         // the index is read and released before the record is, so the future is Send
         let hits = self.index.lock().await.list(&scope, None, usize::MAX / 2)?;
+        let promotions = self
+            .promotions_to_carry(&domain, &hits, scope.handling)
+            .await?;
         let ex = bundle::export(
             &self.store,
             hits,
@@ -2153,6 +2156,7 @@ impl Memory {
             max_label,
             &self.grants.owner,
             dest,
+            promotions,
         )
         .await?;
         self.export_excerpts(&domain, &ex.manifest.entries, max_label, dest)
@@ -2401,8 +2405,28 @@ impl Memory {
         Ok(())
     }
 
+    /// The promotion records of `hits`, at or below `bound`, for an export to carry.
+    async fn promotions_to_carry(
+        &self,
+        domain: &str,
+        hits: &[Hit],
+        bound: Label,
+    ) -> Result<Vec<dm_ledger::PromotionRecord>, Error> {
+        let l = self.ledger.lock().await;
+        let mut out = Vec::new();
+        for h in hits {
+            out.extend(
+                l.promotions(domain, &h.id)
+                    .await?
+                    .into_iter()
+                    .filter(|r| r.spec.classification <= bound),
+            );
+        }
+        Ok(out)
+    }
+
     /// Import a bundle into a granted domain. Entries land raw unless this owner
-    /// exported them.
+    /// exported them; then why they were promoted lands with them, on the ledger.
     ///
     /// # Errors
     ///
@@ -2450,6 +2474,12 @@ impl Memory {
         imported.excerpts = self
             .restore_excerpts(&domain, carried, &imported, default, &erased)
             .await?;
+        {
+            let mut l = self.ledger.lock().await;
+            for r in &imported.promotions {
+                l.restore_promotion(r).await?;
+            }
+        }
         self.refresh_projection().await;
         Ok(imported)
     }
@@ -3392,6 +3422,193 @@ mod tests {
         assert_eq!(receipt.promotion_whys_removed, 1);
         the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
         no_task_holds(&owner, marker).await;
+    }
+
+    /// The owner's entry, promoted by the librarian with `why`, exported at `max`.
+    async fn promoted_then_exported(
+        why: &str,
+        max: Label,
+    ) -> (tempfile::TempDir, Memory, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        librarian(dir.path())
+            .promote(&id, TrustTier::Curated, why)
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner.export(None, max, bundle.path()).await.unwrap();
+        (dir, owner, id, bundle)
+    }
+
+    /// The first file in a bundle whose text holds `needle`.
+    fn bundle_holds(bundle: &Path, needle: &str) -> Option<PathBuf> {
+        walk(bundle).into_iter().find(|p| {
+            std::fs::read(p)
+                .unwrap()
+                .windows(needle.len())
+                .any(|w| w == needle.as_bytes())
+        })
+    }
+
+    #[tokio::test]
+    async fn a_same_owner_import_keeps_why_its_entries_were_promoted() {
+        let (_dir, owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        let before = owner.promotions(&id).await.unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        let im = there.import(bundle.path(), None).await.unwrap();
+        let landed = &im.landed[&id];
+        assert_eq!(
+            there.get(landed).await.unwrap().front.trust_tier,
+            TrustTier::Curated,
+            "the same owner keeps the tier"
+        );
+        let after = there.promotions(landed).await.unwrap();
+        assert_eq!(after.len(), 1, "and why it was given: {after:?}");
+        let (b, a) = (&before[0].record, &after[0].record);
+        assert_eq!(
+            (&a.spec.why, &a.spec.by, a.spec.tier, a.at),
+            (&b.spec.why, &b.spec.by, b.spec.tier, b.at)
+        );
+    }
+
+    #[tokio::test]
+    async fn another_owner_s_import_lands_raw_without_the_whys() {
+        let (_dir, _owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        let home = tempfile::tempdir().unwrap();
+        let there = Memory::init(home.path(), "human:test:bob", "dom-me").unwrap();
+        let im = there.import(bundle.path(), None).await.unwrap();
+        let landed = &im.landed[&id];
+        assert_eq!(
+            there.get(landed).await.unwrap().front.trust_tier,
+            TrustTier::Raw
+        );
+        assert!(
+            there.promotions(landed).await.unwrap().is_empty(),
+            "the tier is not kept, and neither are the reasons for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_promotion_record_refuses_the_bundle() {
+        let (_dir, _owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        let file = bundle.path().join("promotions.json");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains(WHY), "{text}");
+        std::fs::write(&file, text.replace(WHY, "a why nobody gave")).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        let refused = there.import(bundle.path(), None).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(there.get(&id).await.is_err(), "nothing landed");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_from_before_records_were_carried_still_imports() {
+        let (_dir, _owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        // as a build from before records were carried wrote it: no file, no field
+        let mpath = bundle.path().join("manifest.yaml");
+        let mut m =
+            dm_core::manifest::Manifest::from_yaml(&std::fs::read_to_string(&mpath).unwrap())
+                .unwrap();
+        m.promotions = None;
+        std::fs::write(&mpath, m.to_yaml()).unwrap();
+        std::fs::remove_file(bundle.path().join(bundle::PROMOTIONS_FILE)).unwrap();
+        assert!(!std::fs::read_to_string(&mpath)
+            .unwrap()
+            .contains("promotions"));
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        let im = there.import(bundle.path(), None).await.unwrap();
+        let landed = &im.landed[&id];
+        assert_eq!(
+            there.get(landed).await.unwrap().front.trust_tier,
+            TrustTier::Curated
+        );
+        assert!(there.promotions(landed).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_why_above_the_bound_or_for_an_entry_left_home_is_not_exported() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let secret = owner
+            .write(WriteRequest {
+                classification: Some(Label::Restricted),
+                ..req("The restricted fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let public = owner
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("The public fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        lib.promote(&secret, TrustTier::Curated, "the restricted entry's why")
+            .await
+            .unwrap();
+        // read at restricted, so the why it gives next is restricted too
+        lib.get(&secret).await.unwrap();
+        lib.promote(&public, TrustTier::Curated, "a why given at restricted")
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        let ex = owner
+            .export(None, Label::Internal, bundle.path())
+            .await
+            .unwrap();
+        assert!(ex.manifest.entries.iter().any(|e| e.id == public));
+        for why in ["the restricted entry's why", "a why given at restricted"] {
+            assert_eq!(bundle_holds(bundle.path(), why), None, "{why}");
+        }
+        assert_eq!(ex.manifest.highest_label, Label::Public);
+    }
+
+    #[tokio::test]
+    async fn an_erased_why_stays_erased_in_an_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let kept = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let lib = librarian(dir.path());
+        lib.promote(&secret, TrustTier::Curated, &format!("tried {marker}"))
+            .await
+            .unwrap();
+        lib.promote(&kept, TrustTier::Curated, WHY).await.unwrap();
+        owner.erase(&secret, Reason::Requested).await.unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, bundle.path())
+            .await
+            .unwrap();
+        assert_eq!(bundle_holds(bundle.path(), marker), None);
+        let carried: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle.path().join("promotions.json")).unwrap(),
+        )
+        .unwrap();
+        let of = |id: &str| {
+            carried
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["entry"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("no record of {id}: {carried}"))
+        };
+        assert_eq!(of(&secret)["why_erased"], true);
+        assert_eq!(of(&secret)["why"], "");
+        assert_eq!(of(&kept)["why"], WHY);
     }
 
     #[tokio::test]

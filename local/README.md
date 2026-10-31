@@ -478,7 +478,11 @@ the proposer and the author, and points to `amem promotions <id>`, but does not 
 why. An auditor reads the why after judging the change, not before. A session reads the
 why only if it can read the entry. The why stays readable after the entry is replaced. When the owner erases the entry, the ledger removes each
 why. It keeps who promoted which version, to which tier, and when. The erasure receipt
-gives the number of whys it removed (`promotion_whys_removed`).
+gives the number of whys it removed (`promotion_whys_removed`). An export carries the records of the
+entries it exports, at or below its label bound, in `promotions.json`. The manifest holds
+the digest of that file, so an import refuses a changed record. An import of the same
+owner's bundle keeps the tiers and the records. An import of another owner's bundle
+lands the entries raw and leaves the records out.
 
 A ledger made by a build of the `feat/promotion-why` branch before this change needs one
 step. Commit 41e0bc5 made a `promotions` table with fewer columns. A SQLite ledger gets

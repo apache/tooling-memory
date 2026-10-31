@@ -303,6 +303,7 @@ impl Db {
         &mut self,
         at: OffsetDateTime,
         spec: &PromotionSpec,
+        why_erased: bool,
     ) -> Result<bool, Error> {
         let tx = self.client.transaction().await?;
         let s = ensure_domain(&tx, &spec.domain).await?;
@@ -330,7 +331,7 @@ impl Db {
             at,
             &Event::Promoted {
                 spec: spec.clone(),
-                why_erased: false,
+                why_erased,
             },
         )
         .await?;

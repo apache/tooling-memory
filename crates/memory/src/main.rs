@@ -4752,11 +4752,12 @@ async fn bundle_cmd(m: &Memory, command: Command) -> Fallible {
             let im = m.import(&src, domain.as_deref()).await?;
             println!(
                 "imported {} entries with {} transcript excerpts, skipped {} already present, \
-                 refused {} erased here",
+                 refused {} erased here, restored {} promotion records",
                 im.written.len(),
                 im.excerpts,
                 im.skipped.len(),
-                im.erased.len()
+                im.erased.len(),
+                im.promotions.len()
             );
             Ok(())
         }

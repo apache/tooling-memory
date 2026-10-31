@@ -1065,7 +1065,19 @@ impl Ledger {
     /// A database error.
     pub async fn record_promotion(&mut self, spec: &PromotionSpec) -> Result<bool, Error> {
         let now = self.now();
-        on_backend!(&mut self.backend, db => db.record_promotion(now, spec))
+        on_backend!(&mut self.backend, db => db.record_promotion(now, spec, false))
+    }
+
+    /// Record a promotion another ledger kept, as it was there: its time, and whether its
+    /// why was erased. An import of a bundle the same owner exported calls this, after
+    /// moving the record to the entry as it landed here. Once, as
+    /// [`Ledger::record_promotion`] is.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn restore_promotion(&mut self, record: &PromotionRecord) -> Result<bool, Error> {
+        on_backend!(&mut self.backend, db => db.record_promotion(record.at, &record.spec, record.why_erased))
     }
 
     /// The promotions of an entry in a domain, oldest first.
@@ -1286,6 +1298,7 @@ mod tests {
         replay_keeps_the_promotions,
         a_second_promoter_of_the_same_version_is_recorded,
         an_erasure_takes_the_why_and_a_replay_keeps_it_out,
+        a_restored_record_keeps_its_time_and_its_erased_why,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1825,6 +1838,37 @@ mod tests {
         assert_eq!(l.rebuild().await.unwrap(), 2);
         assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap().len(), 2);
         assert!(l.scrub_promotions("dom-a", "mem-a-1").await.is_ok());
+    }
+
+    async fn a_restored_record_keeps_its_time_and_its_erased_why(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let then = T0 - Duration::days(30);
+        let records = [
+            PromotionRecord {
+                spec: promotion("mem-a-1", "d1"),
+                why_erased: false,
+                at: then,
+            },
+            PromotionRecord {
+                spec: PromotionSpec {
+                    why: String::new(),
+                    ..promotion("mem-a-1", "d0")
+                },
+                why_erased: true,
+                at: then - Duration::days(1),
+            },
+        ];
+        for r in &records {
+            assert!(l.restore_promotion(r).await.unwrap());
+            assert!(!l.restore_promotion(r).await.unwrap(), "once");
+        }
+        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap(), records);
+        l.rebuild().await.unwrap();
+        assert_eq!(
+            l.promotions("dom-a", "mem-a-1").await.unwrap(),
+            records,
+            "a replay keeps both"
+        );
     }
 
     async fn a_promotion_record_is_no_task(b: &Site) {

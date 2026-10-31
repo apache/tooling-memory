@@ -167,6 +167,7 @@ impl Db {
         &mut self,
         at: OffsetDateTime,
         spec: &PromotionSpec,
+        why_erased: bool,
     ) -> Result<bool, Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -196,7 +197,7 @@ impl Db {
             at,
             &Event::Promoted {
                 spec: spec.clone(),
-                why_erased: false,
+                why_erased,
             },
         )?;
         tx.commit()?;
