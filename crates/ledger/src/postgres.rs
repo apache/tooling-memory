@@ -77,7 +77,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS tasks_origin ON {s}.tasks (origin, upstream_ev
 ";
 
 /// One domain's promotions, created in its schema with the rest, and added at connect to
-/// a schema made before promotions were recorded. `{s}` is the quoted schema name.
+/// a schema made before promotions were recorded. A table an earlier shape made gets
+/// each column it lacks, so the statements hold for every shape; the index is
+/// [`PROMOTION_INDEX`], made again when the one there lacks the promoter. `{s}` is the
+/// quoted schema name.
 const PROMOTION_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS {s}.promotions (
     seq        BIGSERIAL PRIMARY KEY,
@@ -89,12 +92,47 @@ CREATE TABLE IF NOT EXISTS {s}.promotions (
     why        TEXT NOT NULL,
     label_rank BIGINT NOT NULL,
     digest     TEXT NOT NULL,
-    new_digest TEXT NOT NULL,
+    new_digest TEXT NOT NULL DEFAULT '',
     at         TEXT NOT NULL,
     why_erased BIGINT NOT NULL DEFAULT 0
 );
+ALTER TABLE {s}.promotions ADD COLUMN IF NOT EXISTS new_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE {s}.promotions ADD COLUMN IF NOT EXISTS why_erased BIGINT NOT NULL DEFAULT 0;
+";
+
+/// The key a promotion is kept once under. `{s}` is the quoted schema name.
+const PROMOTION_INDEX: &str = "
 CREATE UNIQUE INDEX IF NOT EXISTS promotions_version
     ON {s}.promotions (entry, tier, digest, promoter);
+";
+
+/// Whether the promotions table `$1` names (`<schema>.promotions`, quoted) has an index
+/// `promotions_version` that the promoter is part of.
+const INDEX_HAS_PROMOTER: &str = "
+SELECT EXISTS (
+    SELECT 1 FROM pg_index i
+    JOIN pg_class ic ON ic.oid = i.indexrelid
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+    WHERE i.indrelid = to_regclass($1) AND ic.relname = 'promotions_version'
+      AND a.attname = 'promoter')
+";
+
+/// The domains whose promotions table is missing, lacks a column, or is keyed without
+/// the promoter: what a connect migrates, and nothing else.
+const DOMAINS_TO_MIGRATE: &str = "
+SELECT d.domain FROM public.ledger_domains d
+LEFT JOIN pg_class c ON c.oid = to_regclass(d.schema || '.promotions')
+WHERE c.oid IS NULL
+   OR NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid
+                  AND a.attname = 'new_digest' AND NOT a.attisdropped)
+   OR NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid
+                  AND a.attname = 'why_erased' AND NOT a.attisdropped)
+   OR NOT EXISTS (SELECT 1 FROM pg_index i
+                  JOIN pg_class ic ON ic.oid = i.indexrelid
+                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+                  WHERE i.indrelid = c.oid AND ic.relname = 'promotions_version'
+                    AND a.attname = 'promoter')
+ORDER BY d.domain
 ";
 
 /// The schema a domain's tables live in: `ledger_` and the domain with anything that is
@@ -169,17 +207,11 @@ impl Db {
     }
 
     /// Give a promotions table to each domain schema made before promotions were
-    /// recorded: one catalog query finds them, and only those are locked and migrated,
-    /// so a connect costs nothing per domain that has its table.
+    /// recorded, and its missing columns and key to one an earlier shape made: one
+    /// catalog query finds them, and only those are locked and migrated, so a connect
+    /// costs nothing per domain whose table is as it should be.
     async fn add_promotion_tables(&mut self) -> Result<(), Error> {
-        let rows = self
-            .client
-            .query(
-                "SELECT domain FROM public.ledger_domains
-                 WHERE to_regclass(schema || '.promotions') IS NULL ORDER BY domain",
-                &[],
-            )
-            .await?;
+        let rows = self.client.query(DOMAINS_TO_MIGRATE, &[]).await?;
         if rows.is_empty() {
             return Ok(());
         }
@@ -307,9 +339,8 @@ impl Db {
     ) -> Result<bool, Error> {
         let tx = self.client.transaction().await?;
         let s = ensure_domain(&tx, &spec.domain).await?;
-        // a schema an older binary made has none
-        tx.batch_execute(&PROMOTION_TABLE.replace("{s}", &s))
-            .await?;
+        // a schema an older binary made has no table, or one of an earlier shape
+        ensure_promotion_table(&tx, &s).await?;
         let seen = tx
             .query_opt(
                 &format!(
@@ -758,8 +789,26 @@ async fn ensure_promotions<C: GenericClient>(conn: &C, domain: &str) -> Result<(
         )
         .await?;
     let s: String = row.try_get(0)?;
-    conn.batch_execute(&PROMOTION_TABLE.replace("{s}", &s))
+    ensure_promotion_table(conn, &s).await
+}
+
+/// Make schema `s`'s promotions table if it is not there, give it each column it lacks,
+/// and make its key again when the one there lacks the promoter. The caller holds the
+/// domain's lock.
+async fn ensure_promotion_table<C: GenericClient>(conn: &C, s: &str) -> Result<(), Error> {
+    conn.batch_execute(&PROMOTION_TABLE.replace("{s}", s))
         .await?;
+    let row = conn
+        .query_one(INDEX_HAS_PROMOTER, &[&format!("{s}.promotions")])
+        .await?;
+    let keyed_by_promoter: bool = row.try_get(0)?;
+    if !keyed_by_promoter {
+        conn.batch_execute(&format!(
+            "DROP INDEX IF EXISTS {s}.promotions_version;{}",
+            PROMOTION_INDEX.replace("{s}", s)
+        ))
+        .await?;
+    }
     Ok(())
 }
 
@@ -779,9 +828,10 @@ async fn ensure_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<Strin
     }
     let s = schema_for(domain);
     conn.batch_execute(&format!(
-        "CREATE SCHEMA IF NOT EXISTS {s};{}{}",
+        "CREATE SCHEMA IF NOT EXISTS {s};{}{}{}",
         DOMAIN_TABLES.replace("{s}", &s),
-        PROMOTION_TABLE.replace("{s}", &s)
+        PROMOTION_TABLE.replace("{s}", &s),
+        PROMOTION_INDEX.replace("{s}", &s)
     ))
     .await?;
     conn.execute(

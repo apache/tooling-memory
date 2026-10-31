@@ -1950,48 +1950,108 @@ mod tests {
         assert!(!why_erased);
     }
 
-    /// A ledger file whose promotions table is as 41e0bc5 made it: no `new_digest`, no
-    /// `why_erased`, and an index without the promoter, holding one record.
-    fn ledger_from_41e0bc5(file: &Path) {
-        let c = rusqlite::Connection::open(file).unwrap();
-        c.execute_batch(
-            r#"CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
-                 kind TEXT NOT NULL, at TEXT NOT NULL, payload TEXT NOT NULL);
-             CREATE TABLE promotions (seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    /// The shapes the promotions table had before this one, each a commit of the branch:
+    /// 41e0bc5 had neither `new_digest` nor `why_erased` and an index without the
+    /// promoter; 088f890 and 9db9e03 had `new_digest` and the promoter in the index, and
+    /// no `why_erased`.
+    const OLD_SHAPES: [&str; 2] = ["41e0bc5", "088f890"];
+
+    /// The `promotions` table and its index as `shape` made them, in SQLite's dialect
+    /// (`domain` leads the index) or PostgreSQL's (`{s}` the schema, no `domain`).
+    fn old_promotions_table(shape: &str, s: Option<&str>) -> String {
+        let (table, dot) = s.map_or(("promotions".to_string(), String::new()), |s| {
+            (format!("{s}.promotions"), format!("{s}."))
+        });
+        let (new_digest, key) = match (shape, s) {
+            ("41e0bc5", None) => ("", "domain, entry, tier, digest"),
+            ("41e0bc5", Some(_)) => ("", "entry, tier, digest"),
+            (_, None) => (
+                "new_digest TEXT NOT NULL,",
+                "domain, entry, tier, digest, promoter",
+            ),
+            (_, Some(_)) => ("new_digest TEXT NOT NULL,", "entry, tier, digest, promoter"),
+        };
+        let serial = if s.is_some() {
+            "BIGSERIAL PRIMARY KEY"
+        } else {
+            "INTEGER PRIMARY KEY AUTOINCREMENT"
+        };
+        let new_digest_value = if new_digest.is_empty() { "" } else { "'', " };
+        let new_digest_column = if new_digest.is_empty() {
+            ""
+        } else {
+            "new_digest, "
+        };
+        format!(
+            "CREATE TABLE {table} (seq {serial},
                  domain TEXT NOT NULL, entry TEXT NOT NULL, tier TEXT NOT NULL,
                  promoter TEXT NOT NULL, author TEXT NOT NULL, why TEXT NOT NULL,
-                 label_rank INTEGER NOT NULL, digest TEXT NOT NULL, at TEXT NOT NULL);
-             CREATE UNIQUE INDEX promotions_version ON promotions (domain, entry, tier, digest);
-             INSERT INTO events (task_id, kind, at, payload) VALUES ('promotion:mem-a-1',
+                 label_rank BIGINT NOT NULL, digest TEXT NOT NULL, {new_digest} at TEXT NOT NULL);
+             CREATE UNIQUE INDEX promotions_version ON {table} ({key});
+             INSERT INTO {dot}events (task_id, kind, at, payload) VALUES ('promotion:mem-a-1',
                  'promoted', '2026-10-01T10:00:00Z',
-                 '{"kind":"promoted","domain":"dom-a","entry":"mem-a-1","tier":"curated","by":"agent:librarian","author":"human:test:me","why":"checked","classification":"internal","digest":"d1"}');
-             INSERT INTO promotions (domain, entry, tier, promoter, author, why, label_rank,
-                 digest, at) VALUES ('dom-a', 'mem-a-1', 'curated', 'agent:librarian',
-                 'human:test:me', 'checked', 1, 'd1', '2026-10-01T10:00:00Z');"#,
+                 '{{\"kind\":\"promoted\",\"domain\":\"dom-a\",\"entry\":\"mem-a-1\",\"tier\":\"curated\",\"by\":\"agent:librarian\",\"author\":\"human:test:me\",\"why\":\"checked\",\"classification\":\"internal\",\"digest\":\"d1\"}}');
+             INSERT INTO {table} (domain, entry, tier, promoter, author, why, label_rank,
+                 digest, {new_digest_column}at) VALUES ('dom-a', 'mem-a-1', 'curated', 'agent:librarian',
+                 'human:test:me', 'checked', 1, 'd1', {new_digest_value}'2026-10-01T10:00:00Z');"
         )
+    }
+
+    /// A ledger file whose promotions table is as `shape` made it, holding one record.
+    fn ledger_of_shape(file: &Path, shape: &str) {
+        let c = rusqlite::Connection::open(file).unwrap();
+        c.execute_batch(&format!(
+            "CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                 kind TEXT NOT NULL, at TEXT NOT NULL, payload TEXT NOT NULL);
+             {}",
+            old_promotions_table(shape, None)
+        ))
         .unwrap();
     }
 
     #[tokio::test]
-    async fn on_sqlite_a_ledger_from_41e0bc5_is_migrated() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ledger.db");
-        ledger_from_41e0bc5(&file);
-        let mut l = Ledger::open(&file).unwrap();
-        let old = l.promotions("dom-a", "mem-a-1").await.unwrap();
-        assert_eq!(old.len(), 1);
-        assert_eq!(old[0].spec.new_digest, "");
+    async fn on_sqlite_a_ledger_of_each_old_shape_is_migrated() {
+        for shape in OLD_SHAPES {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("ledger.db");
+            ledger_of_shape(&file, shape);
+            let l = Ledger::open(&file).unwrap();
+            the_migrated_ledger_works(l, shape).await;
+        }
+    }
+
+    /// Reading, a second promoter of the old version, a rebuild and a scrub all work on
+    /// a ledger of an old shape once it is opened.
+    async fn the_migrated_ledger_works(mut l: Ledger, shape: &str) {
+        let old = l
+            .promotions("dom-a", "mem-a-1")
+            .await
+            .unwrap_or_else(|e| panic!("{shape}: {e}"));
+        assert_eq!(old.len(), 1, "{shape}");
+        assert_eq!(old[0].spec.new_digest, "", "{shape}");
+        assert!(!old[0].why_erased, "{shape}");
         let second = PromotionSpec {
             by: "agent:checker".into(),
             ..promotion("mem-a-1", "d1")
         };
         assert!(
-            l.record_promotion(&second).await.unwrap(),
-            "the index has the promoter now"
+            l.record_promotion(&second)
+                .await
+                .unwrap_or_else(|e| panic!("{shape}: {e}")),
+            "{shape}: the index has the promoter now"
         );
-        assert_eq!(l.rebuild().await.unwrap(), 2);
-        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap().len(), 2);
-        assert!(l.scrub_promotions("dom-a", "mem-a-1").await.is_ok());
+        assert_eq!(l.rebuild().await.unwrap(), 2, "{shape}");
+        assert_eq!(
+            l.promotions("dom-a", "mem-a-1").await.unwrap().len(),
+            2,
+            "{shape}"
+        );
+        let scrubbed = l.scrub_promotions("dom-a", "mem-a-1").await;
+        assert_eq!(
+            scrubbed.unwrap_or_else(|e| panic!("{shape}: {e}")).records,
+            2,
+            "{shape}"
+        );
     }
 
     async fn a_restored_record_keeps_its_time_and_its_erased_why(b: &Site) {
@@ -2526,6 +2586,80 @@ mod tests {
             0,
             "a record is not routed as a task"
         );
+    }
+
+    /// A connected ledger on a server whose `dom-a` schema has a promotions table of
+    /// `shape`, holding the one old record and no other event, and a client on the server.
+    async fn pg_domain_of_shape(
+        server: &PgServer,
+        shape: &str,
+    ) -> (Ledger, tokio_postgres::Client) {
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        admitted(&mut l, spec("Makes the schema")).await;
+        drop(l);
+        let s = crate::postgres::schema_for("dom-a");
+        let c = pg_client(server).await;
+        c.batch_execute(&format!(
+            "DROP TABLE {s}.promotions; DELETE FROM {s}.events; DELETE FROM {s}.tasks;
+             DELETE FROM public.ledger_tasks; {}",
+            old_promotions_table(shape, Some(&s))
+        ))
+        .await
+        .unwrap();
+        (Ledger::connect(server.url()).await.unwrap(), c)
+    }
+
+    /// A domain schema of each old shape is migrated when the ledger connects.
+    #[tokio::test]
+    async fn on_postgres_a_domain_of_each_old_shape_is_migrated_at_connect() {
+        for shape in OLD_SHAPES {
+            let Some(server) = PgServer::start().await.unwrap() else {
+                return;
+            };
+            let (l, _c) = pg_domain_of_shape(&server, shape).await;
+            the_migrated_ledger_works(l, shape).await;
+        }
+    }
+
+    /// A domain schema of an old shape made after this ledger connected is migrated where
+    /// a record, a rebuild or a scrub reaches it.
+    #[tokio::test]
+    async fn on_postgres_a_domain_of_an_old_shape_made_after_connect_is_migrated() {
+        for shape in OLD_SHAPES {
+            let Some(server) = PgServer::start().await.unwrap() else {
+                return;
+            };
+            let (mut l, c) = pg_domain_of_shape(&server, shape).await;
+            let s = crate::postgres::schema_for("dom-a");
+            let back_to_old = format!(
+                "DROP TABLE {s}.promotions; DELETE FROM {s}.events; {}",
+                old_promotions_table(shape, Some(&s))
+            );
+            c.batch_execute(&back_to_old).await.unwrap();
+            let second = PromotionSpec {
+                by: "agent:checker".into(),
+                ..promotion("mem-a-1", "d1")
+            };
+            assert!(
+                l.record_promotion(&second).await.unwrap(),
+                "{shape}: record"
+            );
+            assert_eq!(
+                l.promotions("dom-a", "mem-a-1").await.unwrap().len(),
+                2,
+                "{shape}"
+            );
+            c.batch_execute(&back_to_old).await.unwrap();
+            assert_eq!(l.rebuild().await.unwrap(), 1, "{shape}: rebuild");
+            assert_eq!(
+                l.promotions("dom-a", "mem-a-1").await.unwrap().len(),
+                1,
+                "{shape}"
+            );
+            c.batch_execute(&back_to_old).await.unwrap();
+            let scrubbed = l.scrub_promotions("dom-a", "mem-a-1").await;
+            assert_eq!(scrubbed.unwrap().records, 1, "{shape}: scrub");
+        }
     }
 
     /// Connecting migrates only a schema that lacks the promotions table, so a domain

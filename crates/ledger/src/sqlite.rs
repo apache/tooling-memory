@@ -481,7 +481,9 @@ impl Db {
 
 /// A ledger whose promotions table 41e0bc5 made has neither `new_digest` nor
 /// `why_erased`, and its index lacks the promoter, so a second promoter of a version would
-/// be refused. The columns are added, empty and false, and the index made again.
+/// be refused; one 088f890 made has `new_digest` and the promoter, and no `why_erased`.
+/// Each column that is missing is added, empty or false, and the index is made again
+/// when it lacks the promoter.
 fn migrate_promotions(conn: &Connection) -> Result<(), Error> {
     let has = |column: &str| -> Result<bool, Error> {
         let n: i64 = conn.query_row(
@@ -491,18 +493,32 @@ fn migrate_promotions(conn: &Connection) -> Result<(), Error> {
         )?;
         Ok(n > 0)
     };
-    if has("new_digest")? {
-        return Ok(());
+    // each column on its own: a ledger from between the two shapes has one and not the
+    // other
+    if !has("new_digest")? {
+        conn.execute_batch(
+            "ALTER TABLE promotions ADD COLUMN new_digest TEXT NOT NULL DEFAULT '';",
+        )?;
     }
-    conn.execute_batch(
-        "BEGIN;
-         ALTER TABLE promotions ADD COLUMN new_digest TEXT NOT NULL DEFAULT '';
-         ALTER TABLE promotions ADD COLUMN why_erased INTEGER NOT NULL DEFAULT 0;
-         DROP INDEX IF EXISTS promotions_version;
-         CREATE UNIQUE INDEX promotions_version
-             ON promotions (domain, entry, tier, digest, promoter);
-         COMMIT;",
+    if !has("why_erased")? {
+        conn.execute_batch(
+            "ALTER TABLE promotions ADD COLUMN why_erased INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    let keyed_by_promoter: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_index_info('promotions_version') WHERE name = 'promoter'",
+        [],
+        |r| r.get(0),
     )?;
+    if keyed_by_promoter == 0 {
+        conn.execute_batch(
+            "BEGIN;
+             DROP INDEX IF EXISTS promotions_version;
+             CREATE UNIQUE INDEX promotions_version
+                 ON promotions (domain, entry, tier, digest, promoter);
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 

@@ -488,11 +488,11 @@ the digest of that file, so an import refuses a changed record. An import of the
 owner's bundle keeps the tiers and the records. An import of another owner's bundle
 lands the entries raw and leaves the records out.
 
-A ledger made by a build of the `feat/promotion-why` branch before this change needs one
-step. Commit 41e0bc5 made a `promotions` table with fewer columns. A SQLite ledger gets
-the new columns the next time it opens. On PostgreSQL, drop the `promotions` table in each
-domain schema, and then run `amem reindex`. The next connect makes the tables again, and
-the reindex fills them from the ledger's events. Commit 9944964 kept each why in a
+A ledger made by a build of the `feat/promotion-why` branch before this change needs no
+step. Commits 41e0bc5 and 088f890 made a `promotions` table with fewer columns, and the
+first with a key without the promoter. A SQLite ledger gets each missing column and the
+key the next time it opens. A PostgreSQL ledger gets them the next time a process
+connects, in each domain schema that lacks them. Commit 9944964 kept each why in a
 completed `promoted:` task. Those tasks stay as they are.
 
 When an entry holds, the librarian's verify task now ends in such a proposal. The rules
