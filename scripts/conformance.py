@@ -848,6 +848,9 @@ def main(argv):
     opts = p.parse_args(argv)
     if opts.lease < 1:
         p.error("--lease must be at least 1")
+    # step 5's heartbeat asks for three leases, and the surface grants at most a day
+    if opts.lease > 28800:
+        p.error("--lease must be at most 28800, a third of the surface's ceiling of a day")
 
     run = Run(opts)
     passed, failed, not_run, blocked = 0, [], [], []

@@ -114,6 +114,10 @@ esac
 status=0
 python3 "$script" >/dev/null 2>&1 || status=$?
 [ "$status" = 2 ] || { printf 'no transport given: exit %s, wanted 2\n' "$status" >&2; failures=$((failures + 1)); }
+# and so is a lease whose heartbeat of three would ask past the surface's ceiling of a day
+status=0
+python3 "$script" --stdio "/nonexistent/server" --lease 28801 >/dev/null 2>&1 || status=$?
+[ "$status" = 2 ] || { printf 'a lease above 28800: exit %s, wanted 2\n' "$status" >&2; failures=$((failures + 1)); }
 
 if [ "$failures" -ne 0 ]; then
     printf '%s conformance test(s) failed\n' "$failures" >&2
