@@ -468,7 +468,10 @@ Verified is the review gate. Nobody sets it directly. It has two steps:
    requires a person.
 2. A person who did not propose it approves it, with `amem approve <task>`. An agent never
    approves. The approval is of the version the proposal named: if the entry changed
-   since, `approve` refuses it, and the proposer proposes the entry as it stands.
+   since, `approve` refuses it, and a proposer, any proposer, proposes the entry as it
+   stands. The ledger keeps one approval task per entry; the proposal is the record on
+   the ledger, and a task with no record behind it approves nothing. Only `promote` files
+   a task with a `promote:` origin.
 
 Each promotion must say why. A promotion without a why is refused. The ledger keeps the
 why beside the entry, not in the entry. `amem promotions <id>` and the `promotions` memory

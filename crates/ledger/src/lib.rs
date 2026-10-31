@@ -201,12 +201,14 @@ pub struct Task {
     pub posted_to: Option<String>,
 }
 
-/// What an erasure did to an entry's promotion records.
+/// What an erasure did to an entry's promotion records and approval tasks.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scrubbed {
     /// How many records of the entry hold no why now.
     pub records: usize,
-    /// Copies of the why the ledger could not remove, named so nobody believes it did.
+    /// How many tasks filed from the entry's origin hold the redaction now.
+    pub tasks: usize,
+    /// Copies of the text the ledger could not remove, named so nobody believes it did.
     pub beyond_reach: Vec<String>,
 }
 
@@ -375,20 +377,36 @@ impl Event {
 /// the ledger, decides when old row versions and its log are gone.
 const POSTGRES_RESIDUE: &str = "the ledger's PostgreSQL server: old row versions and its write-ahead log keep removed text until the server vacuums and recycles them";
 
-/// A `created` event's payload with `redaction`'s title and body in place of its own;
-/// `None` when it holds them already, or is no `created` event.
-fn redact_created(id: &str, payload: &str, redaction: &Redaction) -> Result<Option<String>, Error> {
-    match Event::parse(id, payload)? {
+/// A task event's payload with the redaction in place of its free text: a `created`
+/// event's title and body, an `invalidated` event's reason, and the handoff of a
+/// `handoff_left` or `completed` event, each text a person may have put the entry's text
+/// in. `None` when it holds the redaction already, or carries no text.
+fn redact_event(id: &str, payload: &str, redaction: &Redaction) -> Result<Option<String>, Error> {
+    let redacted = match Event::parse(id, payload)? {
         Event::Created {
             id: new_id,
             mut spec,
         } if spec.title != redaction.title || spec.body != redaction.body => {
             spec.title.clone_from(&redaction.title);
             spec.body.clone_from(&redaction.body);
-            Ok(Some(Event::Created { id: new_id, spec }.payload(id)?))
+            Event::Created { id: new_id, spec }
         }
-        _ => Ok(None),
-    }
+        Event::Invalidated {
+            reason,
+            superseded_by,
+        } if reason != redaction.reason => Event::Invalidated {
+            reason: redaction.reason.clone(),
+            superseded_by,
+        },
+        Event::HandoffLeft { handoff } if handoff != redaction.reason => Event::HandoffLeft {
+            handoff: redaction.reason.clone(),
+        },
+        Event::Completed { handoff } if handoff != redaction.reason => Event::Completed {
+            handoff: redaction.reason.clone(),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(redacted.payload(id)?))
 }
 
 /// A `promoted` event's payload with its why removed, when the event is that domain's
@@ -1132,21 +1150,20 @@ impl Ledger {
     /// old text is in.
     pub async fn scrub_promotions(&mut self, domain: &str, entry: &str) -> Result<Scrubbed, Error> {
         let records = on_backend!(&mut self.backend, db => db.scrub_promotions(domain, entry))?;
-        let beyond_reach = match self.backend {
-            Backend::Sqlite(_) => Vec::new(),
-            Backend::Postgres(_) => vec![POSTGRES_RESIDUE.to_string()],
-        };
         Ok(Scrubbed {
             records,
-            beyond_reach,
+            tasks: 0,
+            beyond_reach: self.beyond_reach(),
         })
     }
 
     /// Rewrite the tasks filed from `origin` in `domain` for an erasure of what they are
-    /// about: each gets `redaction`'s title and body, in its `created` event and in the
-    /// projection, so no replay brings the old text back; each still open is invalidated.
-    /// The task's id, origin, who filed it and its history stay. Returns how many tasks
-    /// from that origin now hold the redaction. Running it again changes nothing.
+    /// about: each gets `redaction`'s title and body in its `created` event and in the
+    /// projection, its reason for being invalidated and the handoffs left on it or that
+    /// closed it become the redaction's reason, so no replay brings the old text back;
+    /// each still open is invalidated. The task's id, origin, who filed it and its history
+    /// stay. Returns how many tasks from that origin now hold the redaction. Running it
+    /// again changes nothing.
     ///
     /// # Errors
     ///
@@ -1160,6 +1177,41 @@ impl Ledger {
     ) -> Result<usize, Error> {
         let now = self.now();
         on_backend!(&mut self.backend, db => db.scrub_tasks(now, domain, origin, redaction))
+    }
+
+    /// Both scrubs of an erasure, [`Ledger::scrub_promotions`] of `entry` and
+    /// [`Ledger::scrub_tasks`] of `origin`, in one transaction, and on SQLite one rebuild
+    /// of the file after them, and none when nothing was left to rewrite.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`Error::Held`] when another connection holds the log the
+    /// old text is in.
+    pub async fn scrub_entry(
+        &mut self,
+        domain: &str,
+        entry: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<Scrubbed, Error> {
+        let now = self.now();
+        let (records, tasks) = on_backend!(
+            &mut self.backend,
+            db => db.scrub_entry(now, domain, entry, origin, redaction)
+        )?;
+        Ok(Scrubbed {
+            records,
+            tasks,
+            beyond_reach: self.beyond_reach(),
+        })
+    }
+
+    /// What a scrub on this backend cannot remove.
+    fn beyond_reach(&self) -> Vec<String> {
+        match self.backend {
+            Backend::Sqlite(_) => Vec::new(),
+            Backend::Postgres(_) => vec![POSTGRES_RESIDUE.to_string()],
+        }
     }
 
     /// How many events the ledger holds.
@@ -1348,6 +1400,7 @@ mod tests {
         an_erasure_takes_the_why_and_a_replay_keeps_it_out,
         a_restored_record_keeps_its_time_and_its_erased_why,
         an_erasure_rewrites_the_tasks_filed_from_an_origin,
+        an_erasure_takes_the_reason_and_the_handoff_of_the_tasks_too,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1864,7 +1917,11 @@ mod tests {
             Status::Completed,
             "a closed task keeps its status"
         );
-        assert_eq!(done_now.handoff.as_deref(), Some("mem-a-1"));
+        assert_eq!(
+            done_now.handoff.as_deref(),
+            Some("the entry was erased"),
+            "the handoff is free text, and goes with the rest"
+        );
         redacted(&done_now);
         let other_now = l.get(&other.id).await.unwrap();
         assert_eq!(
@@ -1886,6 +1943,69 @@ mod tests {
         );
         assert_eq!(t.spec.created_by, "human:test:me", "who filed it stays");
         assert_eq!(t.created, T0, "and when");
+    }
+
+    /// The reason a proposal was declined for, and the handoffs left on or closing a
+    /// task, are free text an approver can quote the entry in: the scrub takes them too,
+    /// in the events, in the rows and after a replay.
+    async fn an_erasure_takes_the_reason_and_the_handoff_of_the_tasks_too(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let declined = admitted(
+            &mut l,
+            task_quoting_the_secret("promote:mem-a-1", "verified"),
+        )
+        .await;
+        l.invalidate(
+            &declined.id,
+            &format!("declined: {SECRET} no longer opens it"),
+            None,
+        )
+        .await
+        .unwrap();
+        let left = admitted(&mut l, task_quoting_the_secret("promote:mem-a-1", "again")).await;
+        claim(&mut l, &left.id, "s1", mins(5)).await.unwrap();
+        l.release(&left.id, "s1", Some(&format!("left: {SECRET}")))
+            .await
+            .unwrap();
+        claim(&mut l, &left.id, "s2", mins(5)).await.unwrap();
+        l.complete(&left.id, "s2", &format!("done: {SECRET}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            l.scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+                .await
+                .unwrap(),
+            2
+        );
+        the_reason_and_the_handoff_hold_the_redaction(b, &l, &declined, &left).await;
+        l.rebuild().await.unwrap();
+        the_reason_and_the_handoff_hold_the_redaction(b, &l, &declined, &left).await;
+    }
+
+    async fn the_reason_and_the_handoff_hold_the_redaction(
+        b: &Site,
+        l: &Ledger,
+        declined: &Task,
+        left: &Task,
+    ) {
+        let declined_now = l.get(&declined.id).await.unwrap();
+        assert_eq!(declined_now.status, Status::Invalidated);
+        assert_eq!(
+            declined_now.reason.as_deref(),
+            Some("the entry was erased"),
+            "the reason"
+        );
+        let left_now = l.get(&left.id).await.unwrap();
+        assert_eq!(left_now.status, Status::Completed);
+        assert_eq!(
+            left_now.handoff.as_deref(),
+            Some("the entry was erased"),
+            "the handoff"
+        );
+        assert!(
+            !b.payloads().await.iter().any(|p| p.contains(SECRET)),
+            "no event holds the text"
+        );
     }
 
     /// The first ledger file under `dir` whose bytes hold `needle`.

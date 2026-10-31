@@ -348,26 +348,50 @@ async fn present_here(
     Ok(index.by_origin(into_domain, origin)?)
 }
 
+/// How a bundle entry that is here already would have landed: what the import sets on an
+/// entry it writes, so the text here can be compared with the bundle's.
+struct Landing<'a> {
+    origin: &'a str,
+    here: &'a str,
+    default_classification: Label,
+}
+
 /// Where a bundle entry that is here already stands, for its records to be moved to:
-/// `None` for an erased one, whose records keep nothing of it.
+/// only when what is here is this very text, landed as the import lands one, origin,
+/// domain, id and classification set. A record is of a version, and the bundle's version
+/// of the entry need not be the one here: another export of the entry, or a bundle
+/// written by hand, carries a text of its own, and its records stay out. `None` too for
+/// an erased one, whose records keep nothing of it.
 async fn placed_here(
     store: &Store,
     into_domain: &str,
-    bundle_id: &str,
-    here: String,
+    entry: &Entry,
+    landing: &Landing<'_>,
     bundle_digest: String,
 ) -> Result<Option<Placed>, Error> {
-    let Some(e) = store.get(into_domain, &here).await? else {
+    let Some(e) = store.get(into_domain, landing.here).await? else {
         return Ok(None);
     };
     if e.front.status == Some(dm_core::Status::Erased) {
         return Ok(None);
     }
+    let mut as_landed = entry.clone();
+    as_landed.front.origin = Some(landing.origin.to_string());
+    as_landed.front.domain = into_domain.to_string();
+    as_landed.front.id = landing.here.to_string();
+    as_landed.front.classification = as_landed
+        .front
+        .classification
+        .max(landing.default_classification);
+    let digest_here = digest(&e.render());
+    if digest(&as_landed.render()) != digest_here {
+        return Ok(None);
+    }
     Ok(Some(Placed {
-        bundle_id: bundle_id.to_string(),
-        here,
+        bundle_id: entry.front.id.clone(),
+        here: landing.here.to_string(),
         bundle_digest,
-        digest: digest(&e.render()),
+        digest: digest_here,
         classification: e.front.classification,
     }))
 }
@@ -462,11 +486,16 @@ pub async fn import(
         });
         if let Some(here) = present_here(store, index, into_domain, &origin, &home).await? {
             // its records may still be owed, when the import that landed it stopped
-            // before they were restored; what is here says what they are about
+            // before they were restored: only when what is here is this very text as
+            // the import would land it, since a record is of a version
             if same_owner {
-                placed.extend(
-                    placed_here(store, into_domain, &entry.front.id, here, bundle_digest).await?,
-                );
+                let landed = Landing {
+                    origin: &origin,
+                    here: &here,
+                    default_classification,
+                };
+                placed
+                    .extend(placed_here(store, into_domain, &entry, &landed, bundle_digest).await?);
             }
             out.skipped.push(entry.front.id.clone());
             continue;

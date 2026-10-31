@@ -381,54 +381,16 @@ impl Db {
         let Some(s) = self.schema(domain).await? else {
             return Ok(0);
         };
-        let key = crate::promotion_key(entry);
         let tx = self.client.transaction().await?;
         ensure_promotions(&tx, domain).await?;
-        let rows = tx
-            .query(
-                &format!(
-                    "SELECT seq, payload FROM {s}.events
-                     WHERE task_id = $1 AND kind = 'promoted' FOR UPDATE"
-                ),
-                &[&key],
-            )
-            .await?;
-        for row in &rows {
-            let seq: i64 = row.try_get(0)?;
-            let payload: String = row.try_get(1)?;
-            if let Some(scrubbed) = crate::scrub_payload(&key, domain, &payload)? {
-                tx.execute(
-                    &format!("UPDATE {s}.events SET payload = $2 WHERE seq = $1"),
-                    &[&seq, &scrubbed],
-                )
-                .await?;
-            }
-        }
-        tx.execute(
-            &format!(
-                "UPDATE {s}.promotions SET why = '', why_erased = 1
-                 WHERE domain = $1 AND entry = $2"
-            ),
-            &[&domain, &entry],
-        )
-        .await?;
-        let row = tx
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*) FROM {s}.promotions
-                     WHERE domain = $1 AND entry = $2 AND why_erased = 1"
-                ),
-                &[&domain, &entry],
-            )
-            .await?;
-        let n: i64 = row.try_get(0)?;
+        let n = scrub_promotions_in(&tx, &s, domain, entry).await?;
         tx.commit().await?;
-        Ok(usize::try_from(n).unwrap_or(0))
+        Ok(n)
     }
 
-    /// Rewrite the tasks filed from `origin` to the redaction, in their `created` events
-    /// and their rows, and invalidate the open ones, in one transaction under the domain's
-    /// lock. Returns how many tasks from that origin there are.
+    /// Rewrite the tasks filed from `origin` to the redaction, in their events and their
+    /// rows, and invalidate the open ones, in one transaction under the domain's lock.
+    /// Returns how many tasks from that origin there are.
     pub(crate) async fn scrub_tasks(
         &mut self,
         at: OffsetDateTime,
@@ -441,29 +403,30 @@ impl Db {
         };
         let tx = self.client.transaction().await?;
         lock_domain(&tx, domain).await?;
-        let rows = tx
-            .query(
-                &format!(
-                    "SELECT id, status IN ('completed', 'invalidated') FROM {s}.tasks
-                     WHERE origin = $1 ORDER BY created FOR UPDATE"
-                ),
-                &[&origin],
-            )
-            .await?;
-        for row in &rows {
-            let id: String = row.try_get(0)?;
-            let terminal: bool = row.try_get(1)?;
-            if !terminal {
-                let closed = Event::Invalidated {
-                    reason: redaction.reason.clone(),
-                    superseded_by: None,
-                };
-                apply(&tx, &s, &id, at, &closed).await?;
-            }
-            redact_task(&tx, &s, &id, redaction).await?;
-        }
+        let n = scrub_tasks_in(&tx, &s, at, origin, redaction).await?;
         tx.commit().await?;
-        Ok(rows.len())
+        Ok(n)
+    }
+
+    /// Both scrubs of an erasure in one transaction under the domain's lock. Returns the
+    /// records that hold no why now and the tasks from the origin.
+    pub(crate) async fn scrub_entry(
+        &mut self,
+        at: OffsetDateTime,
+        domain: &str,
+        entry: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<(usize, usize), Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok((0, 0));
+        };
+        let tx = self.client.transaction().await?;
+        ensure_promotions(&tx, domain).await?;
+        let records = scrub_promotions_in(&tx, &s, domain, entry).await?;
+        let tasks = scrub_tasks_in(&tx, &s, at, origin, redaction).await?;
+        tx.commit().await?;
+        Ok((records, tasks))
     }
 
     pub(crate) async fn promotions(
@@ -930,7 +893,93 @@ async fn rebuild_domain<C: GenericClient>(conn: &C, domain: &str, s: &str) -> Re
     Ok(n)
 }
 
-/// One task's `created` event and row, rewritten to the redaction.
+/// The scrub of an entry's promotions in schema `s`, in the caller's transaction: the why
+/// leaves its events and its rows. Returns how many records of the entry hold no why now.
+async fn scrub_promotions_in<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    domain: &str,
+    entry: &str,
+) -> Result<usize, Error> {
+    let key = crate::promotion_key(entry);
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT seq, payload FROM {s}.events
+                 WHERE task_id = $1 AND kind = 'promoted' FOR UPDATE"
+            ),
+            &[&key],
+        )
+        .await?;
+    for row in &rows {
+        let seq: i64 = row.try_get(0)?;
+        let payload: String = row.try_get(1)?;
+        if let Some(scrubbed) = crate::scrub_payload(&key, domain, &payload)? {
+            conn.execute(
+                &format!("UPDATE {s}.events SET payload = $2 WHERE seq = $1"),
+                &[&seq, &scrubbed],
+            )
+            .await?;
+        }
+    }
+    conn.execute(
+        &format!(
+            "UPDATE {s}.promotions SET why = '', why_erased = 1
+             WHERE domain = $1 AND entry = $2 AND (why_erased = 0 OR why != '')"
+        ),
+        &[&domain, &entry],
+    )
+    .await?;
+    let row = conn
+        .query_one(
+            &format!(
+                "SELECT COUNT(*) FROM {s}.promotions
+                 WHERE domain = $1 AND entry = $2 AND why_erased = 1"
+            ),
+            &[&domain, &entry],
+        )
+        .await?;
+    let n: i64 = row.try_get(0)?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
+/// The scrub of the tasks filed from `origin` in schema `s`, in the caller's transaction:
+/// each is rewritten to the redaction and the open ones are invalidated. Returns how many
+/// tasks there are from that origin.
+async fn scrub_tasks_in<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    at: OffsetDateTime,
+    origin: &str,
+    redaction: &Redaction,
+) -> Result<usize, Error> {
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT id, status IN ('completed', 'invalidated') FROM {s}.tasks
+                 WHERE origin = $1 ORDER BY created FOR UPDATE"
+            ),
+            &[&origin],
+        )
+        .await?;
+    for row in &rows {
+        let id: String = row.try_get(0)?;
+        let terminal: bool = row.try_get(1)?;
+        if !terminal {
+            let closed = Event::Invalidated {
+                reason: redaction.reason.clone(),
+                superseded_by: None,
+            };
+            apply(conn, s, &id, at, &closed).await?;
+        }
+        redact_task(conn, s, &id, redaction).await?;
+    }
+    Ok(rows.len())
+}
+
+/// One task's events and row, rewritten to the redaction: the title and body it was
+/// filed with, the reason it was invalidated for, and the handoffs left on it or that
+/// closed it, each free text an approver may have put the entry's text in.
 async fn redact_task<C: GenericClient>(
     conn: &C,
     s: &str,
@@ -939,17 +988,14 @@ async fn redact_task<C: GenericClient>(
 ) -> Result<(), Error> {
     let rows = conn
         .query(
-            &format!(
-                "SELECT seq, payload FROM {s}.events
-                 WHERE task_id = $1 AND kind = 'created' FOR UPDATE"
-            ),
+            &format!("SELECT seq, payload FROM {s}.events WHERE task_id = $1 FOR UPDATE"),
             &[&id],
         )
         .await?;
     for row in &rows {
         let seq: i64 = row.try_get(0)?;
         let payload: String = row.try_get(1)?;
-        if let Some(redacted) = crate::redact_created(id, &payload, redaction)? {
+        if let Some(redacted) = crate::redact_event(id, &payload, redaction)? {
             conn.execute(
                 &format!("UPDATE {s}.events SET payload = $2 WHERE seq = $1"),
                 &[&seq, &redacted],
@@ -958,8 +1004,13 @@ async fn redact_task<C: GenericClient>(
         }
     }
     conn.execute(
-        &format!("UPDATE {s}.tasks SET title = $2, body = $3 WHERE id = $1"),
-        &[&id, &redaction.title, &redaction.body],
+        &format!(
+            "UPDATE {s}.tasks SET title = $2, body = $3,
+                reason = CASE WHEN reason IS NULL THEN NULL ELSE $4 END,
+                handoff = CASE WHEN handoff IS NULL THEN NULL ELSE $4 END
+             WHERE id = $1"
+        ),
+        &[&id, &redaction.title, &redaction.body, &redaction.reason],
     )
     .await?;
     Ok(())

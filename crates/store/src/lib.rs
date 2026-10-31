@@ -79,6 +79,21 @@ pub enum Error {
         /// The id asked for.
         id: String,
     },
+    /// Asked to write a version with text over an entry that was erased: the stub stays,
+    /// whatever a writer that read the entry before the erasure still holds of it.
+    #[error("entry {id} in {domain} is erased: no version with text is written over its stub")]
+    Erased {
+        /// The domain of the stub.
+        domain: String,
+        /// Its id.
+        id: String,
+    },
+}
+
+/// Whether `text`, the current version of an entry, is an erased stub. Text that is not
+/// an entry is not one: the write is then refused or accepted elsewhere.
+fn is_erased(text: &str) -> bool {
+    Entry::parse(text).is_ok_and(|e| e.front.status == Some(Status::Erased))
 }
 
 /// The outcome of a write.
@@ -227,7 +242,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`Error::BadName`] for a domain or id that cannot be a path, or a backend error.
+    /// [`Error::BadName`] for a domain or id that cannot be a path, [`Error::Erased`] for
+    /// a version with text over an erased entry's stub, or a backend error.
     pub async fn put(&self, entry: &Entry) -> Result<Written, Error> {
         let domain = entry.front.domain.as_str();
         let id = entry.front.id.as_str();
@@ -242,6 +258,15 @@ impl Store {
                 digest: new_digest,
                 archived: None,
                 changed: false,
+            });
+        }
+        // an erasure is for good: a writer that read the entry before it, and now writes
+        // a version of what it read, would bring the text back over the stub
+        if entry.front.status != Some(Status::Erased) && previous.as_deref().is_some_and(is_erased)
+        {
+            return Err(Error::Erased {
+                domain: domain.to_string(),
+                id: id.to_string(),
             });
         }
 
@@ -652,6 +677,47 @@ mod tests {
         assert_eq!(w.digest, digest(&e.render()));
         assert_eq!(s.get("dom-a", "mem-a-1").await.unwrap(), Some(e));
         assert_eq!(s.get("dom-a", "mem-a-9").await.unwrap(), None);
+    }
+
+    /// A writer that read an entry before its erasure, and writes a version of what it
+    /// read after, is refused: the stub stays, and so does the history as the erasure
+    /// left it. A later erased version, the stub again under another reason, is written.
+    #[tokio::test]
+    async fn no_version_with_text_is_written_over_an_erased_stub() {
+        let s = Store::in_memory().unwrap();
+        let e = entry(
+            "dom-a",
+            "mem-a-1",
+            "The vault opens with passphrase-Qz7xx.\n",
+        );
+        s.put(&e).await.unwrap();
+        let before = e.clone();
+        let mut stub = entry("dom-a", "mem-a-1", "");
+        stub.front.status = Some(Status::Erased);
+        s.put(&stub).await.unwrap();
+        let mut promoted = before;
+        promoted.front.trust_tier = TrustTier::Verified;
+        let refused = s.put(&promoted).await;
+        assert!(
+            matches!(&refused, Err(Error::Erased { id, .. }) if id == "mem-a-1"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            s.get("dom-a", "mem-a-1").await.unwrap(),
+            Some(stub.clone()),
+            "the stub stays"
+        );
+        assert_eq!(
+            s.digests("dom-a", "mem-a-1").await.unwrap().len(),
+            2,
+            "and no version was added"
+        );
+        let mut again = stub.clone();
+        again.front.title = Some("erased".into());
+        assert!(
+            s.put(&again).await.unwrap().changed,
+            "a stub over a stub is written"
+        );
     }
 
     #[tokio::test]

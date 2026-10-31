@@ -209,50 +209,15 @@ impl Db {
     /// fold the log into it, so the old text is in neither. Returns how many records of
     /// the entry hold no why now.
     pub(crate) fn scrub_promotions(&mut self, domain: &str, entry: &str) -> Result<usize, Error> {
-        let key = crate::promotion_key(entry);
-        let n: i64 = {
-            let mut conn = self.conn();
-            // what an update frees is overwritten with zeros, here and nowhere else: the
-            // rest of the ledger's writes need not pay for it
-            conn.pragma_update(None, "secure_delete", true)?;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let events: Vec<(i64, String)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT seq, payload FROM events WHERE task_id = ?1 AND kind = 'promoted'",
-                )?;
-                let rows = stmt.query_map(params![key], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                rows.collect::<Result<_, _>>()?
-            };
-            for (seq, payload) in events {
-                if let Some(scrubbed) = crate::scrub_payload(&key, domain, &payload)? {
-                    tx.execute(
-                        "UPDATE events SET payload = ?2 WHERE seq = ?1",
-                        params![seq, scrubbed],
-                    )?;
-                }
-            }
-            tx.execute(
-                "UPDATE promotions SET why = '', why_erased = 1 WHERE domain = ?1 AND entry = ?2",
-                params![domain, entry],
-            )?;
-            let n = tx.query_row(
-                "SELECT COUNT(*) FROM promotions
-                 WHERE domain = ?1 AND entry = ?2 AND why_erased = 1",
-                params![domain, entry],
-                |r| r.get(0),
-            )?;
-            tx.commit()?;
-            conn.pragma_update(None, "secure_delete", false)?;
-            n
-        };
-        compact(&self.conn())?;
-        Ok(usize::try_from(n).unwrap_or(0))
+        let (n, changed) = self.scrubbing(|tx| scrub_promotions_in(tx, domain, entry))?;
+        self.compact_if(changed)?;
+        Ok(n)
     }
 
-    /// Rewrite the tasks filed from `origin` to the redaction, in their `created` events
-    /// and their rows, and invalidate the open ones, in one transaction with the space the
-    /// old text leaves overwritten; then rebuild the file and fold the log into it.
-    /// Returns how many tasks from that origin there are.
+    /// Rewrite the tasks filed from `origin` to the redaction, in their events and their
+    /// rows, and invalidate the open ones, in one transaction with the space the old text
+    /// leaves overwritten; then rebuild the file and fold the log into it. Returns how
+    /// many tasks from that origin there are.
     pub(crate) fn scrub_tasks(
         &mut self,
         at: OffsetDateTime,
@@ -260,35 +225,55 @@ impl Db {
         origin: &str,
         redaction: &Redaction,
     ) -> Result<usize, Error> {
-        let n = {
-            let mut conn = self.conn();
-            conn.pragma_update(None, "secure_delete", true)?;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let tasks: Vec<(String, bool)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT id, status IN ('completed', 'invalidated') FROM tasks
-                     WHERE domain = ?1 AND origin = ?2 ORDER BY created",
-                )?;
-                let rows =
-                    stmt.query_map(params![domain, origin], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                rows.collect::<Result<_, _>>()?
-            };
-            for (id, terminal) in &tasks {
-                if !terminal {
-                    let closed = Event::Invalidated {
-                        reason: redaction.reason.clone(),
-                        superseded_by: None,
-                    };
-                    apply(&tx, id, at, &closed)?;
-                }
-                redact_task(&tx, id, redaction)?;
-            }
-            tx.commit()?;
-            conn.pragma_update(None, "secure_delete", false)?;
-            tasks.len()
-        };
-        compact(&self.conn())?;
+        let (n, changed) =
+            self.scrubbing(|tx| scrub_tasks_in(tx, at, domain, origin, redaction))?;
+        self.compact_if(changed)?;
         Ok(n)
+    }
+
+    /// Both scrubs of an erasure in one transaction, and one rebuild of the file after
+    /// them when either rewrote anything. Returns the records that hold no why now and
+    /// the tasks from the origin.
+    pub(crate) fn scrub_entry(
+        &mut self,
+        at: OffsetDateTime,
+        domain: &str,
+        entry: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<(usize, usize), Error> {
+        let ((records, tasks), changed) = self.scrubbing(|tx| {
+            let (records, changed_records) = scrub_promotions_in(tx, domain, entry)?;
+            let (tasks, changed_tasks) = scrub_tasks_in(tx, at, domain, origin, redaction)?;
+            Ok(((records, tasks), changed_records + changed_tasks))
+        })?;
+        self.compact_if(changed)?;
+        Ok((records, tasks))
+    }
+
+    /// Run `scrub` in one transaction taken for writing, with what an update frees
+    /// overwritten with zeros, here and nowhere else: the rest of the ledger's writes need
+    /// not pay for it. Returns what `scrub` returned and how many rows it rewrote.
+    fn scrubbing<T>(
+        &mut self,
+        scrub: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(T, usize), Error>,
+    ) -> Result<(T, usize), Error> {
+        let mut conn = self.conn();
+        conn.pragma_update(None, "secure_delete", true)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let out = scrub(&tx)?;
+        tx.commit()?;
+        conn.pragma_update(None, "secure_delete", false)?;
+        Ok(out)
+    }
+
+    /// Rebuild the file and fold the log into it when a scrub rewrote anything; a scrub
+    /// that found everything rewritten already leaves the file as it is.
+    fn compact_if(&self, changed: usize) -> Result<(), Error> {
+        if changed == 0 {
+            return Ok(());
+        }
+        compact(&self.conn())
     }
 
     pub(crate) fn promotions(
@@ -522,27 +507,105 @@ fn migrate_promotions(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-/// One task's `created` event and row, rewritten to the redaction.
-fn redact_task(conn: &Connection, id: &str, redaction: &Redaction) -> Result<(), Error> {
+/// The scrub of an entry's promotions, in the caller's transaction: the why leaves its
+/// events and its rows. Returns how many records of the entry hold no why now, and how
+/// many rows this call rewrote.
+fn scrub_promotions_in(
+    tx: &Connection,
+    domain: &str,
+    entry: &str,
+) -> Result<(usize, usize), Error> {
+    let key = crate::promotion_key(entry);
     let events: Vec<(i64, String)> = {
-        let mut stmt = conn
-            .prepare("SELECT seq, payload FROM events WHERE task_id = ?1 AND kind = 'created'")?;
+        let mut stmt =
+            tx.prepare("SELECT seq, payload FROM events WHERE task_id = ?1 AND kind = 'promoted'")?;
+        let rows = stmt.query_map(params![key], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut changed = 0;
+    for (seq, payload) in events {
+        if let Some(scrubbed) = crate::scrub_payload(&key, domain, &payload)? {
+            changed += tx.execute(
+                "UPDATE events SET payload = ?2 WHERE seq = ?1",
+                params![seq, scrubbed],
+            )?;
+        }
+    }
+    changed += tx.execute(
+        "UPDATE promotions SET why = '', why_erased = 1
+         WHERE domain = ?1 AND entry = ?2 AND (why_erased = 0 OR why != '')",
+        params![domain, entry],
+    )?;
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM promotions WHERE domain = ?1 AND entry = ?2 AND why_erased = 1",
+        params![domain, entry],
+        |r| r.get(0),
+    )?;
+    Ok((usize::try_from(n).unwrap_or(0), changed))
+}
+
+/// The scrub of the tasks filed from `origin`, in the caller's transaction: each is
+/// rewritten to the redaction and the open ones are invalidated. Returns how many tasks
+/// there are from that origin, and how many rows this call rewrote.
+fn scrub_tasks_in(
+    tx: &Connection,
+    at: OffsetDateTime,
+    domain: &str,
+    origin: &str,
+    redaction: &Redaction,
+) -> Result<(usize, usize), Error> {
+    let tasks: Vec<(String, bool)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, status IN ('completed', 'invalidated') FROM tasks
+             WHERE domain = ?1 AND origin = ?2 ORDER BY created",
+        )?;
+        let rows = stmt.query_map(params![domain, origin], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut changed = 0;
+    for (id, terminal) in &tasks {
+        if !terminal {
+            let closed = Event::Invalidated {
+                reason: redaction.reason.clone(),
+                superseded_by: None,
+            };
+            apply(tx, id, at, &closed)?;
+            changed += 1;
+        }
+        changed += redact_task(tx, id, redaction)?;
+    }
+    Ok((tasks.len(), changed))
+}
+
+/// One task's events and row, rewritten to the redaction: the title and body it was
+/// filed with, the reason it was invalidated for, and the handoffs left on it or that
+/// closed it, each free text an approver may have put the entry's text in. Returns how
+/// many rows changed.
+fn redact_task(conn: &Connection, id: &str, redaction: &Redaction) -> Result<usize, Error> {
+    let events: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT seq, payload FROM events WHERE task_id = ?1")?;
         let rows = stmt.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<Result<_, _>>()?
     };
+    let mut changed = 0;
     for (seq, payload) in events {
-        if let Some(redacted) = crate::redact_created(id, &payload, redaction)? {
-            conn.execute(
+        if let Some(redacted) = crate::redact_event(id, &payload, redaction)? {
+            changed += conn.execute(
                 "UPDATE events SET payload = ?2 WHERE seq = ?1",
                 params![seq, redacted],
             )?;
         }
     }
-    conn.execute(
-        "UPDATE tasks SET title = ?2, body = ?3 WHERE id = ?1",
-        params![id, redaction.title, redaction.body],
+    changed += conn.execute(
+        "UPDATE tasks SET title = ?2, body = ?3,
+            reason = CASE WHEN reason IS NULL THEN NULL ELSE ?4 END,
+            handoff = CASE WHEN handoff IS NULL THEN NULL ELSE ?4 END
+         WHERE id = ?1 AND (title != ?2 OR body != ?3
+            OR reason IS NOT ?4 AND reason IS NOT NULL
+            OR handoff IS NOT ?4 AND handoff IS NOT NULL)",
+        params![id, redaction.title, redaction.body, redaction.reason],
     )?;
-    Ok(())
+    Ok(changed)
 }
 
 /// Rebuild the file without the free space old text sat in, and fold the log into it:
