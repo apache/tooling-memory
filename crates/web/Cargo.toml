@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "A web terminal on the launcher: sessions in pseudo-terminals, streamed to a browser, with a reading pane over the record"
+# build.rs reads the workspace's Cargo.lock and builds crates/reader, and a package
+# tarball has neither
+publish = false
 
 [dependencies]
 axum = { version = "0.8", features = ["ws", "json", "http1", "tokio", "query"] }
