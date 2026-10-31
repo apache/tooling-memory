@@ -471,11 +471,12 @@ Verified is the review gate. Nobody sets it directly. It has two steps:
 
 Each promotion must say why. A promotion without a why is refused. The ledger keeps the
 why beside the entry, not in the entry. `amem promotions <id>` and the `promotions` memory
-tool show who promoted which version of the entry to curated, and why. They also show if
-that version reached the record (`landed`). An auditor reads the why after judging the
-change, not before. A session reads the why only if it can read the entry. The why stays
-readable after the entry is replaced. A proposal to verified is not in this list: it keeps
-its why in the body of its approval task. When the owner erases the entry, the ledger removes each
+tool show who promoted which version of the entry to which tier, and why. They also show
+if that version reached the record (`landed`). A proposal to verified is in the list from
+when it is made. It lands when a person approves it. Its approval task names the entry,
+the proposer and the author, and points to `amem promotions <id>`, but does not hold the
+why. An auditor reads the why after judging the change, not before. A session reads the
+why only if it can read the entry. The why stays readable after the entry is replaced. When the owner erases the entry, the ledger removes each
 why. It keeps who promoted which version, to which tier, and when. The erasure receipt
 gives the number of whys it removed (`promotion_whys_removed`).
 

@@ -1005,10 +1005,10 @@ impl Memory {
     /// its author; to verified only by proposal, which files a task for a person to
     /// approve with [`Memory::approve`]. The entry is never edited in place: a
     /// promotion is a new version of it, the old one kept in its history. Every
-    /// promotion says why, and the why is kept on the ledger, never in the entry: a
-    /// promotion to curated is recorded there before its new version is written, and
-    /// [`Memory::promotions`] reads it back; a proposal to verified carries it in its
-    /// body.
+    /// promotion says why, and the why is kept on the ledger, never in the entry nor in
+    /// a task: a promotion is recorded there before its new version is written or its
+    /// proposal filed, and [`Memory::promotions`] reads it back. A proposal's task names
+    /// the entry, the proposer and the author, and points there.
     ///
     /// # Errors
     ///
@@ -1042,10 +1042,11 @@ impl Memory {
         if !d.allow {
             return Err(Error::Denied(d.reason));
         }
+        // the record first: a promotion the ledger cannot keep is not made, and one whose
+        // new version fails is made again with the record it already has. A proposal to
+        // verified is recorded the same way, and lands when a person approves it
+        self.record_promotion(&entry, to, why).await?;
         if to != TrustTier::Verified {
-            // the record first: a promotion the ledger cannot keep is not made, and one
-            // whose new version fails is made again with the record it already has
-            self.record_promotion(&entry, to, why).await?;
             return self.set_tier(entry, to).await;
         }
         let created = self
@@ -1056,7 +1057,7 @@ impl Memory {
                     entry.front.title.as_deref().unwrap_or(id)
                 ),
                 body: format!(
-                    "`{}` proposes that `{id}`, written by `{}`, be promoted to verified.\n\n{why}\n\nRead it with `amem get {id}`. Approve with `amem approve <this task>` if it holds; a person who did not propose it approves, and an agent never does. Invalidate this task to decline.",
+                    "`{}` proposes that `{id}`, written by `{}`, be promoted to verified.\n\nRead it with `amem get {id}` and judge it first. Then read why it was proposed, on the ledger: `amem promotions {id}`. Approve with `amem approve <this task>` if it holds; a person who did not propose it approves, and an agent never does. Invalidate this task to decline.",
                     self.author, entry.front.author
                 ),
                 requirements: vec!["human".into()],
@@ -1124,10 +1125,10 @@ impl Memory {
         Ok(promoted)
     }
 
-    /// Why each promotion of an entry to curated was made, oldest first: who moved which
-    /// version to which tier, the reason they gave, and whether that version reached the
-    /// record. A proposal to verified is not here: its why is in the body of its
-    /// approval task. Reading it is reading the entry: only for an entry this session
+    /// Why each promotion of an entry was made, oldest first: who moved which version to
+    /// which tier, the reason they gave, and whether that version reached the record. A
+    /// proposal to verified is here from when it is made, and lands when a person
+    /// approves it. Reading it is reading the entry: only for an entry this session
     /// may read, replaced or demoted ones included and erased ones never; the session's
     /// label rises to the entry's classification as a [`Memory::get`] would raise it, and
     /// to each record's; the read log says the entry was read. A record above what the
@@ -3319,6 +3320,78 @@ mod tests {
         let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
         assert!(receipt.is_finished());
         assert_eq!(receipt.promotion_whys_removed, 1);
+    }
+
+    /// No task, whatever its status, holds `text` in its title or its body.
+    async fn no_task_holds(m: &Memory, text: &str) {
+        for t in all_tasks(m).await {
+            assert!(
+                !t.spec.title.contains(text) && !t.spec.body.contains(text),
+                "a task holds {text:?}: {t:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proposal_to_verified_is_recorded_and_its_approval_lands_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner
+            .write(req("A fact worth verifying.\n"))
+            .await
+            .unwrap()
+            .id;
+        let why = "checked against the tree and the release notes";
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&id, TrustTier::Verified, why)
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed, not set")
+        };
+        let proposed = owner.promotions(&id).await.unwrap();
+        assert_eq!(proposed.len(), 1, "{proposed:?}");
+        let r = &proposed[0].record.spec;
+        assert_eq!(
+            (r.tier, r.why.as_str(), r.by.as_str()),
+            (TrustTier::Verified, why, "agent:librarian")
+        );
+        assert!(!proposed[0].landed, "not until a person approves it");
+        assert!(
+            task.spec.body.contains(&format!("amem promotions {id}")),
+            "{}",
+            task.spec.body
+        );
+        no_task_holds(&owner, why).await;
+        owner.approve(&task.id).await.unwrap();
+        let approved = owner.promotions(&id).await.unwrap();
+        assert_eq!(approved.len(), 1);
+        assert!(approved[0].landed, "the approval lands it");
+        no_task_holds(&owner, why).await;
+    }
+
+    #[tokio::test]
+    async fn an_erasure_takes_the_why_of_a_proposal_to_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(
+                &secret,
+                TrustTier::Verified,
+                &format!("tried {marker} on the vault"),
+            )
+            .await
+            .unwrap();
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert_eq!(receipt.promotion_whys_removed, 1);
+        the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
+        no_task_holds(&owner, marker).await;
     }
 
     #[tokio::test]
