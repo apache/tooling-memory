@@ -737,7 +737,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Fan a held task out: file one task per item as its subagents' work, and a continuation that resumes the parent when they are done, with their handoffs in its prompt. Filing the same prompt twice is one task."
+        description = "Fan a held task out: file one task per item as its subagents' work, and a continuation that resumes the parent when they are done, with their handoffs in its prompt. Filing the same prompt twice is one task: an item asked for before in this chain comes back in `existing`, and `withheld` counts the items held back because the chain holds them in work this session may not read."
     )]
     async fn fan_out(&self, p: Parameters<FanOutParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -747,7 +747,10 @@ impl McpServer {
             .fan_out(&p.parent, &items)
             .await
             .map_err(mcp_err)?;
-        ok(json!({ "children": f.children, "continuation": f.continuation }))
+        ok(json!({
+            "children": f.children, "existing": f.existing, "withheld": f.withheld,
+            "continuation": f.continuation,
+        }))
     }
 
     #[tool(
@@ -1501,6 +1504,56 @@ mod tests {
             absent.message.replace("task-me-none", "<id>")
         );
         assert_eq!(s.memory.label(), dm_core::Label::Public);
+    }
+
+    #[tokio::test]
+    async fn a_spawn_asked_for_again_over_mcp_comes_back_in_existing() {
+        let (_dir, s) = server().await;
+        let parent = s
+            .memory
+            .create_task(dm_ledger::TaskSpec {
+                domain: "dom-me".into(),
+                title: "Root".into(),
+                body: "Do it.".into(),
+                requirements: vec![],
+                depends_on: vec![],
+                origin: None,
+                upstream_event: None,
+                created_by: String::new(),
+                classification: dm_core::Label::Public,
+                priority: 0,
+            })
+            .await
+            .unwrap()
+            .task;
+        let ask = || {
+            Parameters(FanOutParams {
+                parent: parent.id.clone(),
+                items: vec![FanOutItem {
+                    title: "Rotate".into(),
+                    body: "Rotate it.".into(),
+                }],
+            })
+        };
+        let first = payload(&s.fan_out(ask()).await.unwrap());
+        let child = first["children"][0]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            first["existing"].as_array().map(Vec::len),
+            Some(0),
+            "{first}"
+        );
+        assert_eq!(first["withheld"], 0, "{first}");
+        let again = payload(&s.fan_out(ask()).await.unwrap());
+        assert_eq!(
+            again["children"].as_array().map(Vec::len),
+            Some(0),
+            "{again}"
+        );
+        assert_eq!(
+            again["existing"][0]["id"], child,
+            "a spawn asked for again comes back as the earlier task: {again}"
+        );
+        assert!(again["continuation"].is_null(), "{again}");
     }
 
     #[tokio::test]
