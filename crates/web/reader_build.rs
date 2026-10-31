@@ -174,7 +174,27 @@ fn nested_env(outer: &[(OsString, OsString)], target_dir: &Path) -> Vec<(OsStrin
         }
     }
     env.push(("CARGO_BUILD_BUILD_DIR".into(), target_dir.into()));
+    if let Some(home) = cargo_home(outer) {
+        let mut flag = OsString::from("--remap-path-prefix=");
+        flag.push(home);
+        flag.push("=/cargo");
+        env.push(("CARGO_ENCODED_RUSTFLAGS".into(), flag));
+    }
     env
+}
+
+/// Where cargo keeps the registry's sources, whose paths reach the wasm in panic
+/// locations: `CARGO_HOME`, or `.cargo` in the home directory. The nested build names it
+/// `/cargo`, so the wasm says nothing of the machine that built it and is the same on
+/// every one. The workspace's own paths are relative already, and the standard
+/// library's are `/rustc/<commit>`.
+fn cargo_home(outer: &[(OsString, OsString)]) -> Option<PathBuf> {
+    let var = |name: &str| outer.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    var("CARGO_HOME").map(PathBuf::from).or_else(|| {
+        var("HOME")
+            .or_else(|| var("USERPROFILE"))
+            .map(|home| Path::new(home).join(".cargo"))
+    })
 }
 
 /// The nested cargo, with an environment of its own built from `outer`. A build script
@@ -354,6 +374,26 @@ version = "0.2.130"
                 "CARGO_BUILD_BUILD_DIR".to_string(),
                 "/ws/target/reader-wasm".to_string()
             )]
+        );
+    }
+
+    #[test]
+    fn the_cargo_home_is_one_name_in_the_wasm() {
+        let flags = |outer: &[(&str, &str)]| -> Vec<String> {
+            let (vars, _) = nested(outer);
+            vars.into_iter()
+                .filter(|(k, _)| k == "CARGO_ENCODED_RUSTFLAGS")
+                .map(|(_, v)| v)
+                .collect()
+        };
+        let home = Path::new("/h").join(".cargo");
+        assert_eq!(
+            flags(&[("HOME", "/h"), ("RUSTFLAGS", "--remap-path-prefix=/x=/y")]),
+            [format!("--remap-path-prefix={}=/cargo", home.display())]
+        );
+        assert_eq!(
+            flags(&[("CARGO_HOME", "/c"), ("HOME", "/h")]),
+            ["--remap-path-prefix=/c=/cargo"]
         );
     }
 
