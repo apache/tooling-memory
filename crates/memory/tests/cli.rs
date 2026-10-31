@@ -387,6 +387,40 @@ fn an_erasure_takes_the_proposal_to_verify_the_entry_off_the_board() {
     assert!(err.contains("erased"), "{err}");
 }
 
+#[test]
+fn a_declined_proposal_is_not_printed_as_proposed_again() {
+    let d = step_init();
+    let id = id_of(&ok(
+        &d.root,
+        &["write", "--title", "A fact"],
+        Some("A fact a person declines.\n"),
+    ));
+    let proposal = json(&ok(
+        &d.root,
+        &["promote", &id, "--to", "verified", "--why", "checked"],
+        None,
+    ));
+    let task = proposal["task"]["id"].as_str().unwrap().to_string();
+    ok(
+        &d.root,
+        &["task", "invalidate", &task, "--reason", "does not hold"],
+        None,
+    );
+    let out = memory(
+        &d.root,
+        &["promote", &id, "--to", "verified", "--why", "again"],
+        None,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("proposed"),
+        "nothing was filed, and the command says: {stdout}"
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&task), "{stderr}");
+}
+
 /// The first file under `root` whose bytes contain `needle`.
 fn holds(root: &Path, needle: &[u8]) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];

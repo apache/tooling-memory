@@ -820,6 +820,16 @@ impl Ledger {
         }
     }
 
+    /// The domain's tasks with an `origin`, of every upstream event and status, oldest
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the ledger did not write.
+    pub async fn with_origin(&self, domain: &str, origin: &str) -> Result<Vec<Task>, Error> {
+        on_backend!(&self.backend, db => db.with_origin(domain, origin))
+    }
+
     /// The tasks filed from `parent`: the subagent tasks a run of it asked for
     /// (`origin` `task:<parent>`), its continuations (`continues:<parent>`) and its
     /// retries (`retries:<parent>`), oldest first.
@@ -1393,6 +1403,16 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_none(), "{none:?}");
+        let all = l.with_origin(dom, "github:apache/x#12").await.unwrap();
+        assert_eq!(
+            all.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec![first.id.as_str()]
+        );
+        assert!(l
+            .with_origin(dom, "github:apache/x#13")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// The same issue filed into another domain is that domain's task: dedup is scoped
