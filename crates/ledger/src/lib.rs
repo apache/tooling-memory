@@ -1766,6 +1766,11 @@ mod tests {
             ..promotion("mem-a-1", "d1")
         };
         assert!(l.record_promotion(&long).await.unwrap());
+        // and buried under later records, so the pages it sat on are deep in the file
+        for n in 0..40 {
+            let later = promotion(&format!("mem-a-{}", n + 2), "d1");
+            assert!(l.record_promotion(&later).await.unwrap());
+        }
         // in the file itself, not only in the log
         rusqlite::Connection::open(&file)
             .unwrap()

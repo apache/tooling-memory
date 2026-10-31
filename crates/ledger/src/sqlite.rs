@@ -205,8 +205,9 @@ impl Db {
     }
 
     /// Remove the why from an entry's promotion events and rows in one transaction, with
-    /// the space they leave overwritten, then fold the log into the file, so the old text
-    /// is in neither. Returns how many records of the entry hold no why now.
+    /// the space they leave overwritten, then rebuild the file without that space and
+    /// fold the log into it, so the old text is in neither. Returns how many records of
+    /// the entry hold no why now.
     pub(crate) fn scrub_promotions(&mut self, domain: &str, entry: &str) -> Result<usize, Error> {
         let key = crate::promotion_key(entry);
         let n: i64 = {
@@ -244,7 +245,7 @@ impl Db {
             conn.pragma_update(None, "secure_delete", false)?;
             n
         };
-        checkpoint(&self.conn())?;
+        compact(&self.conn())?;
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
@@ -461,6 +462,16 @@ fn migrate_promotions(conn: &Connection) -> Result<(), Error> {
          COMMIT;",
     )?;
     Ok(())
+}
+
+/// Rebuild the file without the free space old text sat in, and fold the log into it:
+/// the log first, so the rebuild reads the tables as they stand; then again, since the
+/// rebuild itself went through the log. `secure_delete` alone is not enough: a why long
+/// enough for overflow pages, with records written after it, left its text in the file.
+fn compact(conn: &Connection) -> Result<(), Error> {
+    checkpoint(conn)?;
+    conn.execute_batch("VACUUM;")?;
+    checkpoint(conn)
 }
 
 /// Fold the write-ahead log into the file and truncate it, waiting a little for a reader
