@@ -893,7 +893,8 @@ impl Memory {
     }
 
     /// Write an entry at raw trust, attributed to this session's author, classified at
-    /// least as high as what the session has read.
+    /// least as high as what the session has read. An entry it replaces has its open
+    /// proposals to verify closed, since its successor is what is reviewed now.
     ///
     /// # Errors
     ///
@@ -940,8 +941,12 @@ impl Memory {
         self.gate(&entry).await?;
         self.put_logged(&entry).await?;
         self.index_put(&entry).await?;
-        if entry.front.supersedes.is_some() {
+        if let Some(old) = &entry.front.supersedes {
             self.superseded.fetch_add(1, Ordering::Relaxed);
+            // approve refuses a replaced entry anyway: a ledger another connection holds
+            // leaves the proposal on the board rather than failing a write already made
+            let why = format!("{old} was replaced by {}; propose that one", entry.front.id);
+            let _ = self.close_proposals(&domain, old, &why).await;
         }
         reads::wrote(
             &self.root,
@@ -3381,6 +3386,28 @@ mod tests {
             .is_err());
         let after = owner.ledger.lock().await.get(&task.id).await.unwrap();
         assert_eq!(after.status, Status::Proposed, "bob's refusal admitted it");
+    }
+
+    #[tokio::test]
+    async fn replacing_an_entry_closes_the_proposal_to_verify_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (old, task) = proposed(dir.path(), &owner, "Retries three times.\n").await;
+        let new = owner
+            .write(WriteRequest {
+                supersedes: Some(old.clone()),
+                ..req("Retries five times.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
+        assert!(
+            closed.reason.as_deref().is_some_and(|r| r.contains(&new)),
+            "{:?}",
+            closed.reason
+        );
     }
 
     #[tokio::test]
