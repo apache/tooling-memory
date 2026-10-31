@@ -446,7 +446,13 @@ mod tests {
         assert_eq!(older.render(), text);
         let by_hand = text.replace("review_by: 2027-04-01", "review_by: '2027-04-01'");
         assert_eq!(Entry::parse(&by_hand).unwrap(), sample());
-        for bad in ["2027-02-30", "[2027, 400]", "tomorrow", "[2027]"] {
+        for bad in [
+            "2027-02-30",
+            "2027-04-01T00:00:00Z",
+            "[2027, 400]",
+            "tomorrow",
+            "[2027]",
+        ] {
             let t = text.replace("review_by: 2027-04-01", &format!("review_by: {bad}"));
             assert!(Entry::parse(&t).is_err(), "{bad}");
         }

@@ -242,6 +242,30 @@ impl Memory {
         read(&self.root, &domain, from)
     }
 
+    /// Whether the record holds `id` as the text the log took `digest` of. The stored
+    /// text, not a render of the entry, which can differ when the format writes a field
+    /// anew.
+    async fn stored_as(&self, domain: &str, id: &str, digest: &str) -> Result<bool, Error> {
+        let text = self.store.get_text(domain, id).await?;
+        Ok(text.as_deref().map(dm_core::digest).as_deref() == Some(digest))
+    }
+
+    /// What the record holds and the log never named, written before the log was kept:
+    /// it is indexed as the record has it, since the log starts where it starts.
+    async fn unnamed(
+        &self,
+        domain: &str,
+        named: impl Fn(&str) -> bool,
+    ) -> Result<Vec<Entry>, Error> {
+        let mut out = Vec::new();
+        for id in self.store.list(domain).await? {
+            if !named(&id) {
+                out.extend(self.store.get(domain, &id).await?);
+            }
+        }
+        Ok(out)
+    }
+
     /// The materializer: build the domain's index from its log and the record, and
     /// replay the ledger's events into its projection. What the log says is live is
     /// indexed at the version the record holds; an entry the record holds at another
@@ -268,7 +292,7 @@ impl Memory {
             let held = self.store.get(&domain, &id).await?;
             match (now, held) {
                 (Some((digest, _)), Some(e)) => {
-                    if dm_core::digest(&e.render()) != digest {
+                    if !self.stored_as(&domain, &id, &digest).await? {
                         out.behind.push(id.clone());
                     }
                     if e.is_active() {
@@ -280,18 +304,9 @@ impl Memory {
                 (None, _) => {}
             }
         }
-        // what the record holds and the log never named, written before the log was
-        // kept, is indexed as the record has it: the log starts where it starts
-        for id in self.store.list(&domain).await? {
-            if !named.contains_key(&id) {
-                if let Some(e) = self.store.get(&domain, &id).await? {
-                    if e.is_active() {
-                        out.live += 1;
-                    }
-                    entries.push(e);
-                }
-            }
-        }
+        let unnamed = self.unnamed(&domain, |id| named.contains_key(id)).await?;
+        out.live += unnamed.iter().filter(|e| e.is_active()).count();
+        entries.extend(unnamed);
         self.index.lock().await.rebuild_domain(&domain, entries)?;
         out.ledger_events = self.ledger.lock().await.rebuild().await?;
         Ok(out)
@@ -409,5 +424,42 @@ mod tests {
         assert_eq!(m.materialize(None).await.unwrap().behind, [b]);
         let agent = Memory::open(dir.path()).unwrap().with_author("agent:test");
         assert!(agent.log(None, 0).is_err() && agent.materialize(None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_record_an_older_binary_wrote_is_not_behind_the_log_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let id = m
+            .write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap()
+            .id;
+        let date = m
+            .store
+            .get("dom-me", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .front
+            .review_by
+            .unwrap();
+        // what a binary from before wrote: review_by as the year and the day of the year,
+        // and the log naming the digest of that text
+        let path = dir.path().join(format!("record/dom-me/{id}.md"));
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            &format!("review_by: {date}\n"),
+            &format!("review_by:\n- {}\n- {}\n", date.year(), date.ordinal()),
+        );
+        assert!(text.contains("\n- "), "{text}");
+        std::fs::write(&path, &text).unwrap();
+        let put = Change::Put {
+            id: id.clone(),
+            digest: dm_core::digest(&text),
+            active: true,
+        };
+        append(dir.path(), "dom-me", "human:test:me", put).unwrap();
+        let done = m.materialize(None).await.unwrap();
+        assert!(done.behind.is_empty(), "{done:?}");
     }
 }
