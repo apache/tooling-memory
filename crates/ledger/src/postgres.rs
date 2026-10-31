@@ -1,20 +1,25 @@
-//! The PostgreSQL backend: the same two tables and the same events, on a server several
+//! The PostgreSQL backend: the same tables and the same events, on a server several
 //! processes can share. One connection, driven by a task of its own.
 //!
 //! One schema per domain, as the reference stack partitions everything by domain: a
-//! domain's `events` and `tasks` live in a schema of their own, created when the domain
-//! files its first task, so a domain's queue is a table no other domain's claims touch
-//! and a domain can be moved, backed up or dropped as a unit. Two tables in `public`
-//! route the rest: `ledger_domains`, each domain and its schema, and `ledger_tasks`,
-//! each task id and its domain, written in the transaction that files the task, so an
-//! operation by id finds its schema in one lookup.
+//! domain's `events`, `tasks` and `promotions` live in a schema of their own, created
+//! when the domain files its first task or records its first promotion, so a domain's
+//! queue is a table no other domain's claims touch and a domain can be moved, backed up
+//! or dropped as a unit. Two tables in `public` route the rest: `ledger_domains`, each
+//! domain and its schema, and `ledger_tasks`, each task id and its domain, written in
+//! the transaction that files the task, so an operation by id finds its schema in one
+//! lookup. A promotion is no task and has no route there: it names its domain, and is
+//! read by domain.
 //!
 //! Times are stored as the RFC 3339 text the SQLite backend stores, so a row reads back
 //! exactly as it was written and a replay produces the same projection on either side.
 //! A claim takes its candidates `FOR UPDATE SKIP LOCKED`, so two claimers on two
 //! connections cannot both win the same task.
 
-use crate::{claimable, parse_time, Error, Event, RawTask, Status, Task, TaskSpec, TASK_COLUMNS};
+use crate::{
+    claimable, parse_time, Error, Event, PromotionRecord, PromotionSpec, RawPromotion, RawTask,
+    Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use time::OffsetDateTime;
@@ -68,6 +73,24 @@ CREATE TABLE IF NOT EXISTS {s}.tasks (
 CREATE INDEX IF NOT EXISTS tasks_queue ON {s}.tasks (status, priority DESC, created);
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_origin ON {s}.tasks (origin, upstream_event)
     WHERE origin IS NOT NULL AND upstream_event IS NOT NULL;
+";
+
+/// One domain's promotions, created in its schema with the rest, and added at connect to
+/// a schema made before promotions were recorded. `{s}` is the quoted schema name.
+const PROMOTION_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS {s}.promotions (
+    seq        BIGSERIAL PRIMARY KEY,
+    domain     TEXT NOT NULL,
+    entry      TEXT NOT NULL,
+    tier       TEXT NOT NULL,
+    promoter   TEXT NOT NULL,
+    author     TEXT NOT NULL,
+    why        TEXT NOT NULL,
+    label_rank BIGINT NOT NULL,
+    digest     TEXT NOT NULL,
+    at         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS promotions_version ON {s}.promotions (entry, tier, digest);
 ";
 
 /// The schema a domain's tables live in: `ledger_` and the domain with anything that is
@@ -137,7 +160,21 @@ impl Db {
             known: Mutex::new(HashMap::new()),
         };
         db.migrate_shared_tables().await?;
+        db.add_promotion_tables().await?;
         Ok(db)
+    }
+
+    /// Give every domain's schema its promotions table, under the domain's lock, so a
+    /// schema made before promotions were recorded has one.
+    async fn add_promotion_tables(&mut self) -> Result<(), Error> {
+        let schemas = self.schemas().await?;
+        let tx = self.client.transaction().await?;
+        for (domain, s) in &schemas {
+            lock_domain(&tx, domain).await?;
+            tx.batch_execute(&PROMOTION_TABLE.replace("{s}", s)).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     fn cached(&self, domain: &str) -> Option<String> {
@@ -242,6 +279,71 @@ impl Db {
             self.remember(&spec.domain, &s);
         }
         Ok(())
+    }
+
+    /// Record a promotion unless that version of the entry was promoted to that tier
+    /// already. The domain's lock is held from the check to the commit, so two
+    /// processes recording the same promotion record it once.
+    pub(crate) async fn record_promotion(
+        &mut self,
+        at: OffsetDateTime,
+        spec: &PromotionSpec,
+    ) -> Result<bool, Error> {
+        let tx = self.client.transaction().await?;
+        let s = ensure_domain(&tx, &spec.domain).await?;
+        let seen = tx
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {s}.promotions WHERE entry = $1 AND tier = $2 AND digest = $3"
+                ),
+                &[&spec.entry, &spec.tier.to_string(), &spec.digest],
+            )
+            .await?
+            .is_some();
+        if seen {
+            return Ok(false);
+        }
+        let key = crate::promotion_key(&spec.entry);
+        apply(&tx, &s, &key, at, &Event::Promoted(spec.clone())).await?;
+        tx.commit().await?;
+        self.remember(&spec.domain, &s);
+        Ok(true)
+    }
+
+    pub(crate) async fn promotions(
+        &self,
+        domain: &str,
+        entry: &str,
+    ) -> Result<Vec<PromotionRecord>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT {PROMOTION_COLUMNS} FROM {s}.promotions
+                     WHERE domain = $1 AND entry = $2 ORDER BY seq"
+                ),
+                &[&domain, &entry],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                RawPromotion {
+                    domain: r.try_get(0)?,
+                    entry: r.try_get(1)?,
+                    tier: r.try_get(2)?,
+                    promoter: r.try_get(3)?,
+                    author: r.try_get(4)?,
+                    why: r.try_get(5)?,
+                    label_rank: r.try_get(6)?,
+                    digest: r.try_get(7)?,
+                    at: r.try_get(8)?,
+                }
+                .into_record()
+            })
+            .collect()
     }
 
     /// The id of the task claimed, if any candidate qualified. The candidates are read
@@ -501,14 +603,21 @@ impl Db {
     }
 }
 
-/// Make a domain's schema and tables if they are not there, under a lock on the domain
-/// so two processes filing a domain's first task do not race to create it.
-async fn ensure_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<String, Error> {
+/// Take a domain's lock until the transaction ends.
+async fn lock_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<(), Error> {
     conn.execute(
         "SELECT pg_advisory_xact_lock(hashtext('ledger_domain:' || $1))",
         &[&domain],
     )
     .await?;
+    Ok(())
+}
+
+/// Make a domain's schema and tables if they are not there, under a lock on the domain
+/// so two processes filing a domain's first task do not race to create it. The lock is
+/// held until the caller's transaction ends.
+async fn ensure_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<String, Error> {
+    lock_domain(conn, domain).await?;
     let known = conn
         .query_opt(
             "SELECT schema FROM public.ledger_domains WHERE domain = $1",
@@ -520,8 +629,9 @@ async fn ensure_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<Strin
     }
     let s = schema_for(domain);
     conn.batch_execute(&format!(
-        "CREATE SCHEMA IF NOT EXISTS {s};{}",
-        DOMAIN_TABLES.replace("{s}", &s)
+        "CREATE SCHEMA IF NOT EXISTS {s};{}{}",
+        DOMAIN_TABLES.replace("{s}", &s),
+        PROMOTION_TABLE.replace("{s}", &s)
     ))
     .await?;
     conn.execute(
@@ -592,6 +702,8 @@ async fn awaits_continuation<C: GenericClient>(conn: &C, s: &str, id: &str) -> R
 /// Drop one domain's projection and replay its events into it.
 async fn rebuild_domain<C: GenericClient>(conn: &C, domain: &str, s: &str) -> Result<u64, Error> {
     conn.execute(&format!("DELETE FROM {s}.tasks"), &[]).await?;
+    conn.execute(&format!("DELETE FROM {s}.promotions"), &[])
+        .await?;
     conn.execute(
         "DELETE FROM public.ledger_tasks WHERE domain = $1",
         &[&domain],
@@ -677,6 +789,35 @@ async fn insert_task<C: GenericClient>(
     Ok(())
 }
 
+/// The row a `Promoted` event projects to. No route: a promotion is read by its domain.
+async fn insert_promotion<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    at: OffsetDateTime,
+    p: &PromotionSpec,
+) -> Result<(), Error> {
+    conn.execute(
+        &format!(
+            "INSERT INTO {s}.promotions (domain, entry, tier, promoter, author, why,
+                label_rank, digest, at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        ),
+        &[
+            &p.domain,
+            &p.entry,
+            &p.tier.to_string(),
+            &p.by,
+            &p.author,
+            &p.why,
+            &(p.classification as i64),
+            &p.digest,
+            &crate::fmt_time(at),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Update the projection for one event. Replay calls this and nothing else.
 async fn project<C: GenericClient>(
     conn: &C,
@@ -692,6 +833,7 @@ async fn project<C: GenericClient>(
     };
     let (sql, args): (&str, Vec<&(dyn ToSql + Sync)>) = match event {
         Event::Created { id: new_id, spec } => return insert_task(conn, s, new_id, at, spec).await,
+        Event::Promoted(p) => return insert_promotion(conn, s, at, p).await,
         Event::Admitted => ("SET status = 'admitted' WHERE id = $1", vec![&id]),
         Event::Claimed { holder, .. } => (
             "SET status = 'claimed', holder = $2, lease_until = $3,

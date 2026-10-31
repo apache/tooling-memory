@@ -426,6 +426,7 @@ const READS: &[&str] = &[
     "t0",
     "recall",
     "transcript_turn",
+    "promotions",
     "task_tree",
     "get_task",
     "list_tasks",
@@ -669,6 +670,14 @@ impl McpServer {
             .await
             .map_err(mcp_err)?;
         ok(serde_json::to_value(r).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Why each promotion of an entry was made, oldest first: who promoted which version to which tier, and the reason they gave. As an auditor, read it after you have judged the change yourself, not before, so the reasons do not lead your judgement. Only for an entry you may read; reading it raises your label as a get does."
+    )]
+    async fn promotions(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+        let r = self.memory.promotions(&p.0.id).await.map_err(mcp_err)?;
+        ok(json!({ "promotions": r }))
     }
 
     #[tool(
@@ -1071,6 +1080,7 @@ mod tests {
             "fan_out",
             "task_tree",
             "retry_task",
+            "promotions",
         ] {
             assert!(
                 names.contains(&expected),

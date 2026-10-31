@@ -992,8 +992,9 @@ impl Memory {
     /// approve with [`Memory::approve`]. The entry is never edited in place: a
     /// promotion is a new version of it, the old one kept in its history. Every
     /// promotion says why, and the why is kept on the ledger, never in the entry: a
-    /// promotion to curated leaves a completed task that holds it, a proposal to
-    /// verified carries it in its body.
+    /// promotion to curated is recorded there before its new version is written, and
+    /// [`Memory::promotions`] reads it back; a proposal to verified carries it in its
+    /// body.
     ///
     /// # Errors
     ///
@@ -1028,9 +1029,10 @@ impl Memory {
             return Err(Error::Denied(d.reason));
         }
         if to != TrustTier::Verified {
-            let promoted = self.set_tier(entry.clone(), to).await?;
+            // the record first: a promotion the ledger cannot keep is not made, and one
+            // whose new version fails is made again with the record it already has
             self.record_promotion(&entry, to, why).await?;
-            return Ok(promoted);
+            return self.set_tier(entry, to).await;
         }
         let created = self
             .file_own(TaskSpec {
@@ -1108,53 +1110,60 @@ impl Memory {
         Ok(promoted)
     }
 
-    /// The record of a promotion made at once: a task the promoter files and completes
-    /// in one step, its body the why and its handoff the entry, so an auditor finds the
-    /// reason beside the change and not in it. A record is not work to triage, so the
-    /// promoter admits it where the domain would leave it proposed.
+    /// Why each promotion of an entry was made, oldest first: who moved which version
+    /// to which tier, and the reason they gave. Reading it is reading the entry: only
+    /// for an entry this session may read, and the session's label rises to the entry's
+    /// classification as a [`Memory::get`] would raise it. A record above what the
+    /// session may handle is left out.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an entry this session cannot read, or a store, index or
+    /// ledger error.
+    pub async fn promotions(&self, id: &str) -> Result<Vec<dm_ledger::PromotionRecord>, Error> {
+        let f = self.session_filter()?;
+        let Some(meta) = self.index.lock().await.meta(id, &f)? else {
+            return Err(Error::NotFound(id.to_string()));
+        };
+        let domain = meta.hit.domain;
+        let entry = self
+            .store
+            .get(&domain, id)
+            .await?
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        if !lock(&self.session).observe(entry.front.classification) {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        let records = self.ledger.lock().await.promotions(&domain, id).await?;
+        let mut session = lock(&self.session);
+        let handling = session.handling;
+        let mut readable = Vec::new();
+        for r in records {
+            if r.spec.classification <= handling {
+                session.observe(r.spec.classification);
+                readable.push(r);
+            }
+        }
+        Ok(readable)
+    }
+
+    /// The record of a promotion made at once, on the ledger and not in the entry: the
+    /// version promoted, by whom, and why, so an auditor finds the reason beside the
+    /// change. Recorded once per version, so a retry adds nothing. It is classified as
+    /// the entry is, or as this session's label if that is higher, since the why is the
+    /// session's own text.
     async fn record_promotion(&self, entry: &Entry, to: TrustTier, why: &str) -> Result<(), Error> {
-        let id = &entry.front.id;
-        let mut l = self.ledger.lock().await;
-        let created = self
-            .file_in(
-                &mut l,
-                TaskSpec {
-                    domain: entry.front.domain.clone(),
-                    title: format!(
-                        "Promoted: {to} for {}",
-                        entry.front.title.as_deref().unwrap_or(id)
-                    ),
-                    body: format!(
-                        "`{}` promoted `{id}`, written by `{}`, to {to}.\n\n{why}",
-                        self.author, entry.front.author
-                    ),
-                    requirements: Vec::new(),
-                    depends_on: Vec::new(),
-                    origin: Some(format!("promoted:{id}")),
-                    upstream_event: Some(to.to_string()),
-                    created_by: String::new(),
-                    classification: entry.front.classification,
-                    priority: -1,
-                },
-                Filing::Own,
-                None,
-            )
-            .await?;
-        if created.deduplicated {
-            return Ok(());
-        }
-        let task = created.task;
-        if task.status == dm_ledger::Status::Proposed {
-            l.admit(&task.id).await?;
-        }
-        l.claim(
-            &task.id,
-            &self.author,
-            Duration::minutes(5),
-            &task.spec.requirements,
-        )
-        .await?;
-        l.complete(&task.id, &self.author, id).await?;
+        let spec = dm_ledger::PromotionSpec {
+            domain: entry.front.domain.clone(),
+            entry: entry.front.id.clone(),
+            tier: to,
+            by: self.author.clone(),
+            author: entry.front.author.clone(),
+            why: why.to_string(),
+            classification: entry.front.classification.max(self.label()),
+            digest: dm_core::digest(&entry.render()),
+        };
+        self.ledger.lock().await.record_promotion(&spec).await?;
         Ok(())
     }
 
@@ -2760,41 +2769,225 @@ mod tests {
         assert!(versions >= 2, "the raw version is kept: {versions}");
     }
 
+    const WHY: &str = "checked against the tree";
+
+    /// A session of the librarian, which did not write the owner's entries.
+    fn librarian(dir: &Path) -> Memory {
+        Memory::open(dir).unwrap().with_author("agent:librarian")
+    }
+
+    /// Every task in the session's domain, whatever its status.
+    async fn all_tasks(m: &Memory) -> Vec<Task> {
+        let mut out = Vec::new();
+        for st in [
+            Status::Proposed,
+            Status::Admitted,
+            Status::Claimed,
+            Status::Completed,
+            Status::Invalidated,
+        ] {
+            out.extend(m.tasks(None, st).await.unwrap());
+        }
+        out
+    }
+
     #[tokio::test]
-    async fn a_promotion_to_curated_leaves_its_why_on_the_ledger() {
+    async fn a_promotion_to_curated_is_recorded_on_the_ledger_and_is_no_task() {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        let agent = Memory::open(dir.path())
-            .unwrap()
-            .with_author("agent:librarian");
+        let raw = owner.get(&theirs).await.unwrap();
+        let agent = librarian(dir.path());
+        let before = all_tasks(&agent).await;
         agent
-            .promote(&theirs, TrustTier::Curated, "checked against the tree")
+            .promote(&theirs, TrustTier::Curated, WHY)
             .await
             .unwrap();
-        let done = agent
-            .tasks(None, dm_ledger::Status::Completed)
-            .await
-            .unwrap();
-        let origin = format!("promoted:{theirs}");
-        let record = done
-            .iter()
-            .find(|t| t.spec.origin.as_deref() == Some(origin.as_str()))
-            .unwrap_or_else(|| panic!("no completed record of the promotion: {done:?}"));
-        assert!(
-            record.spec.body.contains("checked against the tree"),
-            "{}",
-            record.spec.body
+        let after = all_tasks(&agent).await;
+        assert_eq!(after, before, "a promotion files no task");
+        let records = agent.promotions(&theirs).await.unwrap();
+        assert_eq!(records.len(), 1, "one record: {records:?}");
+        let r = &records[0].spec;
+        assert_eq!(r.entry, theirs);
+        assert_eq!(r.why, WHY);
+        assert_eq!(r.tier, TrustTier::Curated);
+        assert_eq!(r.by, "agent:librarian");
+        assert_eq!(r.author, "human:test:me");
+        assert_eq!(
+            r.digest,
+            dm_core::digest(&raw.render()),
+            "the version promoted"
         );
-        assert_eq!(record.spec.created_by, "agent:librarian");
-        assert_eq!(record.handoff.as_deref(), Some(theirs.as_str()));
-        // the why is kept beside the entry, not in it
-        assert!(!agent
-            .get(&theirs)
+    }
+
+    #[tokio::test]
+    async fn a_promotion_moves_only_the_tier_and_keeps_the_why_out_of_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner
+            .write(WriteRequest {
+                title: Some("The owner's fact".into()),
+                summary: Some("What the owner found.".into()),
+                source: vec!["https://example.org/fact".into()],
+                ..req("The owner's fact.\n")
+            })
             .await
             .unwrap()
-            .body
-            .contains("checked against the tree"));
+            .id;
+        let old = owner.get(&theirs).await.unwrap();
+        librarian(dir.path())
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let new = owner.get(&theirs).await.unwrap();
+        assert_eq!(new.front.trust_tier, TrustTier::Curated);
+        let mut front = new.front.clone();
+        front.trust_tier = old.front.trust_tier;
+        assert_eq!(front, old.front, "nothing but the tier moves");
+        assert_eq!(new.body, old.body);
+        assert!(
+            !new.render().contains(WHY),
+            "the why is kept beside the entry"
+        );
+    }
+
+    /// The ledger's files made read-only, so a session opened on them cannot write
+    /// there; the permissions they had, to put back.
+    #[cfg(unix)]
+    fn ledger_read_only(root: &Path) -> Vec<(PathBuf, std::fs::Permissions)> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut kept = Vec::new();
+        for name in ["ledger.db", "ledger.db-wal", "ledger.db-shm"] {
+            let path = root.join("state").join(name);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            kept.push((path.clone(), meta.permissions()));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        assert!(!kept.is_empty(), "no ledger files under {}", root.display());
+        kept
+    }
+
+    #[cfg(unix)]
+    fn put_back(kept: Vec<(PathBuf, std::fs::Permissions)>) {
+        for (path, perms) in kept {
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_ledger_that_fails_stops_the_promotion_before_the_tier_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let kept = ledger_read_only(dir.path());
+        let refused = librarian(dir.path())
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await;
+        put_back(kept);
+        assert!(refused.is_err(), "the record could not be written");
+        assert_eq!(
+            owner.get(&theirs).await.unwrap().front.trust_tier,
+            TrustTier::Raw,
+            "no promotion without its record"
+        );
+        let agent = librarian(dir.path());
+        agent
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        assert_eq!(agent.promotions(&theirs).await.unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_promotion_whose_new_version_fails_can_be_made_again_with_one_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let record = dir.path().join("record").join("dom-me");
+        let perms = std::fs::metadata(&record).unwrap().permissions();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let agent = librarian(dir.path());
+        let refused = agent.promote(&theirs, TrustTier::Curated, WHY).await;
+        std::fs::set_permissions(&record, perms).unwrap();
+        assert!(refused.is_err(), "the new version could not be written");
+        assert_eq!(
+            owner.get(&theirs).await.unwrap().front.trust_tier,
+            TrustTier::Raw
+        );
+        agent
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        assert_eq!(
+            owner.get(&theirs).await.unwrap().front.trust_tier,
+            TrustTier::Curated
+        );
+        assert_eq!(
+            agent.promotions(&theirs).await.unwrap().len(),
+            1,
+            "the retry records nothing twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_keeps_the_promotions() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let agent = librarian(dir.path());
+        agent
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let before = agent.promotions(&theirs).await.unwrap();
+        assert_eq!(before.len(), 1);
+        agent.reindex().await.unwrap();
+        assert_eq!(agent.promotions(&theirs).await.unwrap(), before);
+        assert_eq!(
+            librarian(dir.path()).promotions(&theirs).await.unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_why_an_entry_was_promoted_is_reading_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let secret = owner
+            .write(WriteRequest {
+                classification: Some(Label::Restricted),
+                ..req("The restricted fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(&secret, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let capped = librarian(dir.path()).with_handling_cap(Label::Public);
+        assert!(
+            matches!(capped.promotions(&secret).await, Err(Error::NotFound(_))),
+            "a session that may not read the entry may not read why it was promoted"
+        );
+        assert_eq!(capped.label(), Label::Public, "and its label does not rise");
+        assert!(matches!(
+            capped.promotions("mem-none").await,
+            Err(Error::NotFound(_))
+        ));
+        let full = librarian(dir.path());
+        assert_eq!(full.label(), Label::Public);
+        assert_eq!(full.promotions(&secret).await.unwrap().len(), 1);
+        assert_eq!(
+            full.label(),
+            Label::Restricted,
+            "the label rises as a get's does"
+        );
     }
 
     #[tokio::test]

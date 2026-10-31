@@ -460,7 +460,7 @@ curated in two ways:
 - A write that supersedes an entry lands curated when the session holds a librarian's task
   or the checker's task.
 - Anyone except the entry's author can mark the entry curated, with the `promote` memory
-  tool or with `amem promote <id> --to curated`.
+  tool or with `amem promote <id> --to curated --why "<what you checked>"`.
 
 Verified is the review gate. Nobody sets it directly. It has two steps:
 
@@ -468,6 +468,12 @@ Verified is the review gate. Nobody sets it directly. It has two steps:
    requires a person.
 2. A person who did not propose it approves it, with `amem approve <task>`. An agent never
    approves.
+
+Each promotion must say why. A promotion without a why is refused. The ledger keeps the
+why beside the entry, not in the entry. `amem promotions <id>` and the `promotions` memory
+tool show who promoted which version of the entry, to which tier, and why. An auditor
+reads the why after judging the change, not before. A session reads the why only if it can
+read the entry. A proposal to verified keeps its why in the body of its task.
 
 When an entry holds, the librarian's verify task now ends in such a proposal. The rules
 are Rego, in the built-in policy. Each step is a logged decision. A promotion is a new

@@ -1,4 +1,5 @@
-//! The task ledger: tasks, leases, handoffs, origin dedup.
+//! The task ledger: tasks, leases, handoffs, origin dedup, and the record of why each
+//! entry was promoted.
 //!
 //! The ledger is event-sourced. Every operation appends one event to an append-only
 //! table and updates a projection of current task state in the same transaction. The
@@ -22,6 +23,11 @@
 //!   ledger alike. An expired lease makes the task claimable again; the stale holder's
 //!   heartbeat, release, and complete are refused.
 //!
+//! A promotion is recorded on the same log, as an event of its own under the key
+//! `promotion:<entry>`, and projected into a table of its own. It is no task: nothing
+//! claims it, lists it, or reads it as delivered work. It is kept once per version of the
+//! entry, and a rebuild replays it with the rest.
+//!
 //! Time comes from a clock the ledger owns, so tests can move it.
 
 mod postgres;
@@ -29,7 +35,7 @@ mod sqlite;
 #[cfg(any(test, feature = "pg-test"))]
 pub mod testing;
 
-use dm_core::Label;
+use dm_core::{Label, TrustTier};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
@@ -210,6 +216,40 @@ pub struct Claim {
     pub lease_until: OffsetDateTime,
 }
 
+/// What a promotion records: which version of an entry was moved to which tier, by
+/// whom, and why. A record of a change already judged, not work: it is no task, and no
+/// query over tasks returns it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionSpec {
+    /// The domain the entry lives in, whose ledger keeps the record.
+    pub domain: String,
+    /// The entry promoted.
+    pub entry: String,
+    /// The tier it was promoted to.
+    pub tier: TrustTier,
+    /// Who promoted it, system-qualified.
+    pub by: String,
+    /// Who wrote the entry.
+    pub author: String,
+    /// Why: what was checked, and against what.
+    pub why: String,
+    /// How sensitive the record is: at least the entry's classification.
+    pub classification: Label,
+    /// The digest of the version of the entry that was promoted.
+    pub digest: String,
+}
+
+/// A promotion as the ledger holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionRecord {
+    /// What was recorded.
+    #[serde(flatten)]
+    pub spec: PromotionSpec,
+    /// When.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
 type Clock = Box<dyn Fn() -> OffsetDateTime + Send + Sync>;
 
 /// One appended event, as replay reads it.
@@ -253,6 +293,8 @@ enum Event {
         priority: i64,
         why: String,
     },
+    /// An entry was promoted, and why. Appended under [`promotion_key`], never a task id.
+    Promoted(PromotionSpec),
 }
 
 impl Event {
@@ -269,6 +311,7 @@ impl Event {
             Event::Invalidated { .. } => "invalidated",
             Event::Posted { .. } => "posted",
             Event::Rescored { .. } => "rescored",
+            Event::Promoted(_) => "promoted",
         }
     }
 
@@ -309,6 +352,52 @@ fn label_from_rank(id: &str, rank: i64) -> Result<Label, Error> {
             id: id.to_string(),
             what: format!("label rank {other}"),
         }),
+    }
+}
+
+/// The key a promotion's events are appended under. A task id starts `task-`, so the two
+/// never meet.
+fn promotion_key(entry: &str) -> String {
+    format!("promotion:{entry}")
+}
+
+/// The columns of a promotion row, in the order both backends read them.
+const PROMOTION_COLUMNS: &str =
+    "domain, entry, tier, promoter, author, why, label_rank, digest, at";
+
+/// A promotion row as the database returns it, before the ledger has checked it.
+struct RawPromotion {
+    domain: String,
+    entry: String,
+    tier: String,
+    promoter: String,
+    author: String,
+    why: String,
+    label_rank: i64,
+    digest: String,
+    at: String,
+}
+
+impl RawPromotion {
+    fn into_record(self) -> Result<PromotionRecord, Error> {
+        let key = promotion_key(&self.entry);
+        let tier = self.tier.parse::<TrustTier>().map_err(|_| Error::BadRow {
+            id: key.clone(),
+            what: format!("tier {:?}", self.tier),
+        })?;
+        Ok(PromotionRecord {
+            spec: PromotionSpec {
+                domain: self.domain,
+                entry: self.entry,
+                tier,
+                by: self.promoter,
+                author: self.author,
+                why: self.why,
+                classification: label_from_rank(&key, self.label_rank)?,
+                digest: self.digest,
+            },
+            at: parse_time(&key, &self.at)?,
+        })
     }
 }
 
@@ -906,6 +995,32 @@ impl Ledger {
         on_backend!(&self.backend, db => db.dependents(id))
     }
 
+    /// Record a promotion: one event, projected into the promotions and nowhere else.
+    /// Once per version: a second record of the same entry, tier and digest appends
+    /// nothing and returns false; another version of the same entry is a record of its
+    /// own.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn record_promotion(&mut self, spec: &PromotionSpec) -> Result<bool, Error> {
+        let now = self.now();
+        on_backend!(&mut self.backend, db => db.record_promotion(now, spec))
+    }
+
+    /// The promotions of an entry in a domain, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the ledger did not write.
+    pub async fn promotions(
+        &self,
+        domain: &str,
+        entry: &str,
+    ) -> Result<Vec<PromotionRecord>, Error> {
+        on_backend!(&self.backend, db => db.promotions(domain, entry))
+    }
+
     /// How many events the ledger holds.
     ///
     /// # Errors
@@ -1054,6 +1169,9 @@ mod tests {
         a_task_waits_on_its_continuation,
         a_task_closes_with_its_continuation,
         a_continuation_given_up_on_gives_its_task_back,
+        a_promotion_is_recorded_once_per_version,
+        a_promotion_record_is_no_task,
+        replay_keeps_the_promotions,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1319,6 +1437,140 @@ mod tests {
         ));
         l.invalidate(&dead.id, "a dead end", None).await.unwrap();
         claim(&mut l, &parent.id, "s1", mins(5)).await.unwrap();
+    }
+
+    fn promotion(entry: &str, digest: &str) -> PromotionSpec {
+        PromotionSpec {
+            domain: "dom-a".into(),
+            entry: entry.into(),
+            tier: TrustTier::Curated,
+            by: "agent:librarian".into(),
+            author: "human:test:me".into(),
+            why: "checked against the tree".into(),
+            classification: Label::Internal,
+            digest: digest.into(),
+        }
+    }
+
+    async fn a_promotion_is_recorded_once_per_version(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let first = promotion("mem-a-1", "d1");
+        assert!(l.record_promotion(&first).await.unwrap(), "a new record");
+        let events = l.event_count().await.unwrap();
+        assert_eq!(events, 1, "one event for one record");
+        assert!(
+            !l.record_promotion(&first).await.unwrap(),
+            "the same version again is not new"
+        );
+        assert_eq!(
+            l.event_count().await.unwrap(),
+            events,
+            "and appends nothing"
+        );
+        *now.lock().unwrap() = T0 + mins(1);
+        a_new_version_is_a_new_record(&mut l, first).await;
+    }
+
+    async fn a_new_version_is_a_new_record(l: &mut Ledger, first: PromotionSpec) {
+        let again = PromotionSpec {
+            digest: "d2".into(),
+            why: "the id came back at raw and was checked again".into(),
+            ..first.clone()
+        };
+        assert!(
+            l.record_promotion(&again).await.unwrap(),
+            "a new version is a new record"
+        );
+        let got = l.promotions("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(
+            got,
+            vec![
+                PromotionRecord {
+                    spec: first,
+                    at: T0
+                },
+                PromotionRecord {
+                    spec: again,
+                    at: T0 + mins(1)
+                },
+            ],
+            "every field kept, oldest first"
+        );
+        assert!(l.promotions("dom-a", "mem-a-2").await.unwrap().is_empty());
+        assert!(l.promotions("dom-b", "mem-a-1").await.unwrap().is_empty());
+    }
+
+    async fn a_promotion_record_is_no_task(b: &Site) {
+        let mut l = b.open().await;
+        let parent = admitted(&mut l, spec("A task beside it")).await;
+        assert!(l
+            .record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap());
+        only_the_task_is_listed(&l, &parent).await;
+        no_task_query_finds_the_record(&mut l, &parent).await;
+    }
+
+    async fn only_the_task_is_listed(l: &Ledger, parent: &Task) {
+        for st in [
+            Status::Proposed,
+            Status::Admitted,
+            Status::Claimed,
+            Status::Completed,
+            Status::Invalidated,
+        ] {
+            let ids: Vec<String> = l
+                .list("dom-a", st)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            let expected = if st == Status::Admitted {
+                vec![parent.id.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(ids, expected, "{st:?}");
+        }
+    }
+
+    async fn no_task_query_finds_the_record(l: &mut Ledger, parent: &Task) {
+        assert!(l.unposted("dom-a").await.unwrap().is_empty());
+        assert!(l.dependents("promotion:mem-a-1").await.unwrap().is_empty());
+        assert!(l.filed_from("mem-a-1").await.unwrap().is_empty());
+        assert!(matches!(
+            l.get("promotion:mem-a-1").await,
+            Err(Error::NotFound(_))
+        ));
+        let c = next(l, "s1", mins(5)).await.unwrap();
+        assert_eq!(c.task.id, parent.id);
+        assert!(
+            next(l, "s1", mins(5)).await.is_none(),
+            "nothing else to claim"
+        );
+    }
+
+    async fn replay_keeps_the_promotions(b: &Site) {
+        let mut l = b.open().await;
+        admitted(&mut l, spec("A task beside it")).await;
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        l.record_promotion(&promotion("mem-a-1", "d2"))
+            .await
+            .unwrap();
+        let before = l.promotions("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(l.rebuild().await.unwrap(), 4);
+        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap(), before);
+        assert!(
+            !l.record_promotion(&promotion("mem-a-1", "d1"))
+                .await
+                .unwrap(),
+            "replay keeps what makes a record new"
+        );
+        assert_eq!(l.list("dom-a", Status::Admitted).await.unwrap().len(), 1);
     }
 
     async fn invalidate_is_terminal(l: &mut Ledger, t: &Task) {
@@ -1713,6 +1965,42 @@ mod tests {
         // and a second connect finds nothing left to move
         let again = Ledger::connect(server.url()).await.unwrap();
         assert_eq!(again.event_count().await.unwrap(), 3);
+    }
+
+    /// A domain whose schema was made before promotions were recorded has no table for
+    /// them; connecting adds it, and a promotion there is kept.
+    #[tokio::test]
+    async fn on_postgres_a_domain_from_before_promotions_gets_their_table() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        let t = admitted(&mut l, spec("Old")).await;
+        drop(l);
+        let s = crate::postgres::schema_for("dom-a");
+        let c = pg_client(&server).await;
+        c.batch_execute(&format!("DROP TABLE IF EXISTS {s}.promotions"))
+            .await
+            .unwrap();
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        assert!(l
+            .record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap());
+        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap().len(), 1);
+        assert_eq!(l.get(&t.id).await.unwrap().status, Status::Admitted);
+        let routed = c
+            .query_one(
+                "SELECT COUNT(*) FROM public.ledger_tasks WHERE id LIKE 'promotion:%'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            routed.get::<_, i64>(0),
+            0,
+            "a record is not routed as a task"
+        );
     }
 
     #[tokio::test]

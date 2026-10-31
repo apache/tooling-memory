@@ -3,7 +3,10 @@
 //! The connection sits behind a mutex so the ledger is `Sync`; the server holds the whole
 //! ledger under an async lock, so the mutex is never contended.
 
-use crate::{claimable, parse_time, Error, Event, RawTask, Status, Task, TaskSpec, TASK_COLUMNS};
+use crate::{
+    claimable, parse_time, Error, Event, PromotionRecord, PromotionSpec, RawPromotion, RawTask,
+    Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -44,6 +47,19 @@ CREATE INDEX IF NOT EXISTS tasks_queue ON tasks (domain, status, priority DESC, 
 DROP INDEX IF EXISTS tasks_origin;
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_domain_origin ON tasks (domain, origin, upstream_event)
     WHERE origin IS NOT NULL AND upstream_event IS NOT NULL;
+CREATE TABLE IF NOT EXISTS promotions (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain     TEXT NOT NULL,
+    entry      TEXT NOT NULL,
+    tier       TEXT NOT NULL,
+    promoter   TEXT NOT NULL,
+    author     TEXT NOT NULL,
+    why        TEXT NOT NULL,
+    label_rank INTEGER NOT NULL,
+    digest     TEXT NOT NULL,
+    at         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS promotions_version ON promotions (domain, entry, tier, digest);
 ";
 
 fn task_from_row(row: &Row<'_>) -> Result<Task, Error> {
@@ -139,6 +155,59 @@ impl Db {
         apply(&tx, id, at, event)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Record a promotion unless that version of the entry was promoted to that tier
+    /// already. The check and the append are one transaction, taken for writing first.
+    pub(crate) fn record_promotion(
+        &mut self,
+        at: OffsetDateTime,
+        spec: &PromotionSpec,
+    ) -> Result<bool, Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let seen = tx
+            .query_row(
+                "SELECT 1 FROM promotions
+                 WHERE domain = ?1 AND entry = ?2 AND tier = ?3 AND digest = ?4",
+                params![spec.domain, spec.entry, spec.tier.to_string(), spec.digest],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if seen {
+            return Ok(false);
+        }
+        let key = crate::promotion_key(&spec.entry);
+        apply(&tx, &key, at, &Event::Promoted(spec.clone()))?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn promotions(
+        &self,
+        domain: &str,
+        entry: &str,
+    ) -> Result<Vec<PromotionRecord>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PROMOTION_COLUMNS} FROM promotions WHERE domain = ?1 AND entry = ?2
+             ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map(params![domain, entry], |r| {
+            Ok(RawPromotion {
+                domain: r.get(0)?,
+                entry: r.get(1)?,
+                tier: r.get(2)?,
+                promoter: r.get(3)?,
+                author: r.get(4)?,
+                why: r.get(5)?,
+                label_rank: r.get(6)?,
+                digest: r.get(7)?,
+                at: r.get(8)?,
+            })
+        })?;
+        rows.map(|r| r?.into_record()).collect()
     }
 
     /// The id of the task claimed, if any candidate qualified.
@@ -283,7 +352,7 @@ impl Db {
     pub(crate) fn rebuild(&mut self) -> Result<u64, Error> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        tx.execute_batch("DELETE FROM tasks;")?;
+        tx.execute_batch("DELETE FROM tasks; DELETE FROM promotions;")?;
         let events: Vec<(String, String, String)> = {
             let mut stmt = tx.prepare("SELECT task_id, at, payload FROM events ORDER BY seq")?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
@@ -379,9 +448,31 @@ fn insert_task(
     Ok(())
 }
 
+/// The row a `Promoted` event projects to.
+fn insert_promotion(conn: &Connection, at: OffsetDateTime, p: &PromotionSpec) -> Result<(), Error> {
+    conn.execute(
+        "INSERT INTO promotions (domain, entry, tier, promoter, author, why, label_rank,
+            digest, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            p.domain,
+            p.entry,
+            p.tier.to_string(),
+            p.by,
+            p.author,
+            p.why,
+            p.classification as i64,
+            p.digest,
+            crate::fmt_time(at),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Update the projection for one event. Replay calls this and nothing else.
 fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Result<(), Error> {
     match event {
+        Event::Promoted(p) => insert_promotion(conn, at, p)?,
         Event::Created { id: new_id, spec } => insert_task(conn, new_id, at, spec)?,
         Event::Admitted => {
             conn.execute(
