@@ -2037,6 +2037,60 @@ mod tests {
         );
     }
 
+    /// Connecting migrates only a schema that lacks the promotions table, so a domain
+    /// another process holds does not hold up the connect.
+    #[tokio::test]
+    async fn on_postgres_connect_waits_on_no_domain_that_has_its_table() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        admitted(&mut l, spec("In a")).await;
+        drop(l);
+        let holder = pg_client(&server).await;
+        holder
+            .execute(
+                "SELECT pg_advisory_lock(hashtext('ledger_domain:' || $1))",
+                &[&"dom-a"],
+            )
+            .await
+            .unwrap();
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Ledger::connect(server.url()),
+        )
+        .await;
+        assert!(
+            connected.is_ok(),
+            "connect waited on a domain that needed nothing"
+        );
+    }
+
+    /// A domain schema an older binary made after this ledger connected has no
+    /// promotions table; reading, recording and rebuilding there still work.
+    #[tokio::test]
+    async fn on_postgres_a_schema_without_the_table_made_after_connect_still_works() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        admitted(&mut l, spec("In a")).await;
+        let c = pg_client(&server).await;
+        let drop_table = format!(
+            "DROP TABLE {}.promotions",
+            crate::postgres::schema_for("dom-a")
+        );
+        c.batch_execute(&drop_table).await.unwrap();
+        assert!(l.promotions("dom-a", "mem-a-1").await.unwrap().is_empty());
+        assert!(l
+            .record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap());
+        c.batch_execute(&drop_table).await.unwrap();
+        assert_eq!(l.rebuild().await.unwrap(), 3);
+        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn every_transition_is_a_span_with_the_task_as_it_stands() {
         use opentelemetry::Value;

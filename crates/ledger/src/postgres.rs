@@ -23,6 +23,7 @@ use crate::{
 use std::collections::HashMap;
 use std::sync::Mutex;
 use time::OffsetDateTime;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, GenericClient, NoTls, Row};
 
@@ -166,14 +167,25 @@ impl Db {
         Ok(db)
     }
 
-    /// Give every domain's schema its promotions table, under the domain's lock, so a
-    /// schema made before promotions were recorded has one.
+    /// Give a promotions table to each domain schema made before promotions were
+    /// recorded: one catalog query finds them, and only those are locked and migrated,
+    /// so a connect costs nothing per domain that has its table.
     async fn add_promotion_tables(&mut self) -> Result<(), Error> {
-        let schemas = self.schemas().await?;
+        let rows = self
+            .client
+            .query(
+                "SELECT domain FROM public.ledger_domains
+                 WHERE to_regclass(schema || '.promotions') IS NULL ORDER BY domain",
+                &[],
+            )
+            .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
         let tx = self.client.transaction().await?;
-        for (domain, s) in &schemas {
-            lock_domain(&tx, domain).await?;
-            tx.batch_execute(&PROMOTION_TABLE.replace("{s}", s)).await?;
+        for row in &rows {
+            let domain: String = row.try_get(0)?;
+            ensure_promotions(&tx, &domain).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -293,6 +305,9 @@ impl Db {
     ) -> Result<bool, Error> {
         let tx = self.client.transaction().await?;
         let s = ensure_domain(&tx, &spec.domain).await?;
+        // a schema an older binary made has none
+        tx.batch_execute(&PROMOTION_TABLE.replace("{s}", &s))
+            .await?;
         let seen = tx
             .query_opt(
                 &format!(
@@ -321,7 +336,7 @@ impl Db {
         let Some(s) = self.schema(domain).await? else {
             return Ok(Vec::new());
         };
-        let rows = self
+        let rows = match self
             .client
             .query(
                 &format!(
@@ -330,7 +345,13 @@ impl Db {
                 ),
                 &[&domain, &entry],
             )
-            .await?;
+            .await
+        {
+            Ok(rows) => rows,
+            // a schema an older binary made has no table, and so no promotions
+            Err(e) if e.code() == Some(&SqlState::UNDEFINED_TABLE) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
         rows.iter()
             .map(|r| {
                 RawPromotion {
@@ -617,6 +638,23 @@ async fn lock_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<(), Err
     Ok(())
 }
 
+/// Give a domain's schema its promotions table if it has none, under the domain's lock,
+/// held until the caller's transaction ends. The schema's name comes from the routing
+/// table, read under the lock.
+async fn ensure_promotions<C: GenericClient>(conn: &C, domain: &str) -> Result<(), Error> {
+    lock_domain(conn, domain).await?;
+    let row = conn
+        .query_one(
+            "SELECT schema FROM public.ledger_domains WHERE domain = $1",
+            &[&domain],
+        )
+        .await?;
+    let s: String = row.try_get(0)?;
+    conn.batch_execute(&PROMOTION_TABLE.replace("{s}", &s))
+        .await?;
+    Ok(())
+}
+
 /// Make a domain's schema and tables if they are not there, under a lock on the domain
 /// so two processes filing a domain's first task do not race to create it. The lock is
 /// held until the caller's transaction ends.
@@ -705,6 +743,8 @@ async fn awaits_continuation<C: GenericClient>(conn: &C, s: &str, id: &str) -> R
 
 /// Drop one domain's projection and replay its events into it.
 async fn rebuild_domain<C: GenericClient>(conn: &C, domain: &str, s: &str) -> Result<u64, Error> {
+    // a schema an older binary made after this process connected has no promotions table
+    ensure_promotions(conn, domain).await?;
     conn.execute(&format!("DELETE FROM {s}.tasks"), &[]).await?;
     conn.execute(&format!("DELETE FROM {s}.promotions"), &[])
         .await?;
