@@ -281,8 +281,6 @@ model.
 
 **6.1 With and without.** Both runs use the same four questions, the same harness, the
 same model and the same sandbox. With this memory: 4 of 4. With an empty memory: 0 of 4.
-These counts are for the questions as they were on 12 October; two of them changed with
-the case study since.
 Codex searches, finds nothing, and says so or gives a wrong answer. With memory, it
 finished in 71 seconds against 126. It wrote less than half as much: about 1,600 tokens
 against 3,600. It read more fresh input, about 19,000 tokens against 11,000. It read
@@ -290,7 +288,8 @@ less cached input, the `c` figures: about 147,000 against 256,000. Cached tokens
 input that the provider has seen before in the session, and the provider charges less
 for them. These are amounts, not cost. The provider's prices decide whether the memory
 run was cheaper. The demo also measures the host's side: 7.4 seconds of CPU against
-10.3. In both runs, the same harness had a peak of about 166 MiB.
+10.3. In both runs, the same harness had a peak of about 166 MiB. These counts are for the
+questions as they were on 12 October; two of them changed with the case study since.
 
 ## Act 7 · The platform
 

@@ -118,7 +118,7 @@ pub(crate) fn via_for(l: &Launch, windows: bool) -> Result<Via, String> {
     } else if l.interactive {
         Some("the C API gives a process no terminal, so an interactive launch goes through the command line")
     } else if wants_gateway(l) {
-        Some("the gateway inside the VM needs a network of its own, which the C API cannot make, so a gateway route goes through the command line")
+        Some("the gateway inside the VM needs a network of its own, which the C API cannot make, so --auth gateway or --server-auth gateway goes through the command line")
     } else {
         None
     };
