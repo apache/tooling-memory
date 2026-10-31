@@ -1082,36 +1082,21 @@ impl Memory {
     }
 
     /// Approve a proposal to promote to verified: the person approving did not propose
-    /// it, and the policy says so. The entry is promoted and the proposal task completed
-    /// by the approver, the entry its record. Only a live entry is approved: an erased
-    /// one has nothing left to check, a replaced one is reviewed as its successor, and
-    /// a demoted one was found wanting.
+    /// it, and the policy says so. The approver takes the proposal task first, so one
+    /// another person holds stays theirs and the tier does not move; then the entry is
+    /// promoted and the task completed, the entry its record. Only a live entry is
+    /// approved: an erased one has nothing left to check, a replaced one is reviewed as
+    /// its successor, and a demoted one was found wanting.
     ///
     /// # Errors
     ///
     /// [`Error::Denied`] for a task that is not a live promotion proposal, an entry
-    /// that is not live, or an approval the policy refuses; a ledger or store error.
+    /// that is not live, or an approval the policy refuses; a ledger error for a task
+    /// another holds, or a store error.
     pub async fn approve(&self, task_id: &str) -> Result<Promotion, Error> {
         let task = self.ledger.lock().await.get(task_id).await?;
         self.task_in_grants(&task)?;
-        let Some(id) = task
-            .spec
-            .origin
-            .as_deref()
-            .and_then(|o| o.strip_prefix("promote:"))
-        else {
-            return Err(Error::Denied(format!(
-                "{task_id} is not a promotion proposal"
-            )));
-        };
-        // the entry first: an erasure closes its proposal too, and the entry is the reason
-        let (_, entry) = self.find(id).await?;
-        if let Some(status) = entry.front.status {
-            return Err(not_live(id, status));
-        }
-        if task.status.is_terminal() {
-            return Err(Error::Denied(format!("{task_id} is {:?}", task.status)));
-        }
+        let (id, entry) = self.proposal_entry(&task).await?;
         let d = self.decide_promotion(
             &entry,
             TrustTier::Verified,
@@ -1121,21 +1106,57 @@ impl Memory {
         if !d.allow {
             return Err(Error::Denied(d.reason));
         }
-        let id = id.to_string();
-        let promoted = self.set_tier(entry, TrustTier::Verified).await?;
-        let mut l = self.ledger.lock().await;
-        if task.status == dm_ledger::Status::Proposed {
-            l.admit(task_id).await?;
+        {
+            let mut l = self.ledger.lock().await;
+            if task.status == dm_ledger::Status::Proposed {
+                l.admit(task_id).await?;
+            }
+            l.claim(
+                task_id,
+                &self.author,
+                Duration::minutes(5),
+                &task.spec.requirements,
+            )
+            .await?;
         }
-        l.claim(
-            task_id,
-            &self.author,
-            Duration::minutes(5),
-            &task.spec.requirements,
-        )
-        .await?;
-        l.complete(task_id, &self.author, &id).await?;
+        let promoted = self.set_tier(entry, TrustTier::Verified).await?;
+        self.ledger
+            .lock()
+            .await
+            .complete(task_id, &self.author, &id)
+            .await?;
         Ok(promoted)
+    }
+
+    /// The entry a proposal task asks to verify, while the task still asks it. A task
+    /// approved already says so, whatever became of the entry since; a closed one with
+    /// an entry no longer live says why the entry is not promoted.
+    async fn proposal_entry(&self, task: &Task) -> Result<(String, Entry), Error> {
+        let Some(id) = task
+            .spec
+            .origin
+            .as_deref()
+            .and_then(|o| o.strip_prefix("promote:"))
+        else {
+            return Err(Error::Denied(format!(
+                "{} is not a promotion proposal",
+                task.id
+            )));
+        };
+        if task.status == dm_ledger::Status::Completed {
+            return Err(Error::Denied(format!(
+                "{} is Completed: the proposal was approved",
+                task.id
+            )));
+        }
+        let (_, entry) = self.find(id).await?;
+        if let Some(status) = entry.front.status {
+            return Err(not_live(id, status));
+        }
+        if task.status.is_terminal() {
+            return Err(Error::Denied(format!("{} is {:?}", task.id, task.status)));
+        }
+        Ok((id.to_string(), entry))
     }
 
     fn decide_promotion(
@@ -3031,6 +3052,45 @@ mod tests {
         assert!(again.is_finished(), "{again:?}");
         let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
         assert_eq!(closed.status, Status::Invalidated);
+    }
+
+    #[tokio::test]
+    async fn an_approval_does_not_take_a_proposal_another_person_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact under review.\n").await;
+        owner
+            .ledger
+            .lock()
+            .await
+            .claim(
+                &task.id,
+                "human:test:alice",
+                Duration::minutes(5),
+                &task.spec.requirements,
+            )
+            .await
+            .unwrap();
+        assert!(owner.approve(&task.id).await.is_err());
+        assert_eq!(
+            owner.find(&id).await.unwrap().1.front.trust_tier,
+            TrustTier::Raw,
+            "the tier moved, and then the claim failed"
+        );
+        let held = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(held.status, Status::Claimed);
+        assert_eq!(held.holder.as_deref(), Some("human:test:alice"));
+    }
+
+    #[tokio::test]
+    async fn an_approved_proposal_says_so_whatever_became_of_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact approved, then erased.\n").await;
+        owner.approve(&task.id).await.unwrap();
+        owner.erase(&id, Reason::Mistaken).await.unwrap();
+        let err = owner.approve(&task.id).await.unwrap_err();
+        assert!(err.to_string().contains("Completed"), "{err}");
     }
 
     #[tokio::test]
