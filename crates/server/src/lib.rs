@@ -2150,8 +2150,8 @@ impl Memory {
         self.finish_erasure(&domain, id, receipt).await
     }
 
-    /// The steps of an erasure after the record's: the citing entries, the open
-    /// proposal to verify it, the index, the served bundles and every render; then the
+    /// The steps of an erasure after the record's: the citing entries, the index, the
+    /// served bundles, every render and the open proposal to verify it; then the
     /// receipt, closed.
     async fn finish_erasure(
         &self,
@@ -2165,7 +2165,6 @@ impl Memory {
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         receipt.flagged = self.flag_citers(id).await?;
-        self.close_proposal(domain, id).await?;
         {
             let mut ix = self.index.lock().await;
             ix.remove(id)?;
@@ -2177,6 +2176,9 @@ impl Memory {
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
         let missed = self.erase_from_projections(domain, id);
+        // the ledger last: one another connection holds stops the erasure here, with the
+        // text already out of the index and the renders, and a rerun finishes it
+        self.close_proposal(domain, id).await?;
         close_receipt(&mut receipt, missed);
         self.store.put_receipt(&receipt).await?;
         self.refresh_projection_after_erasure().await;
@@ -2197,7 +2199,6 @@ impl Memory {
         Ok(None)
     }
 
-    /// An entry by id across the granted domains, from the record, whatever its status.
     /// Invalidate the open proposal to verify an entry that is gone, so the board stops
     /// offering it. A proposal already closed is left as it is.
     async fn close_proposal(&self, domain: &str, id: &str) -> Result<(), Error> {
@@ -2216,6 +2217,7 @@ impl Memory {
         Ok(())
     }
 
+    /// An entry by id across the granted domains, from the record, whatever its status.
     async fn find(&self, id: &str) -> Result<(String, Entry), Error> {
         for domain in self.domains() {
             if let Some(e) = self.store.get(&domain, id).await? {
@@ -2938,8 +2940,14 @@ mod tests {
         let err = owner.approve(&replaced.id).await.unwrap_err();
         assert!(err.to_string().contains("replaced"), "{err}");
         let (demoted, task) = proposed(dir.path(), &owner, "Found wanting.\n").await;
+        // the record's own demotion: the index still lists the entry as live
         owner.store.demote("dom-me", &demoted).await.unwrap();
         let err = owner.approve(&task.id).await.unwrap_err();
+        assert!(err.to_string().contains("demoted"), "{err}");
+        let err = owner
+            .promote(&demoted, TrustTier::Verified, "again")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("demoted"), "{err}");
         for id in [&old, &demoted] {
             let (_, e) = owner.find(id).await.unwrap();
@@ -2999,6 +3007,30 @@ mod tests {
             owner.find(&id).await.unwrap().1.front.trust_tier,
             TrustTier::Verified
         );
+    }
+
+    #[tokio::test]
+    async fn an_erasure_the_ledger_stops_has_already_taken_the_text_out_of_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "The vault opens with a brass key.\n").await;
+        let found = |hits: Vec<Hit>| hits.iter().any(|h| h.id == id);
+        assert!(found(owner.search("brass key", None, 10).await.unwrap()));
+        // another connection holds the ledger's write lock
+        let holder = rusqlite::Connection::open(dir.path().join(LEDGER_FILE)).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let first = owner.erase(&id, Reason::Sensitive).await;
+        assert!(matches!(first, Err(Error::Ledger(_))), "{first:?}");
+        assert!(
+            !found(owner.search("brass key", None, 10).await.unwrap()),
+            "the erased text is still searchable"
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
+        drop(holder);
+        let again = owner.erase(&id, Reason::Sensitive).await.unwrap();
+        assert!(again.is_finished(), "{again:?}");
+        let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
     }
 
     #[tokio::test]
