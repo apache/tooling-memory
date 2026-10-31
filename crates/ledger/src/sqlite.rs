@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS promotions (
     label_rank INTEGER NOT NULL,
     digest     TEXT NOT NULL,
     new_digest TEXT NOT NULL,
-    at         TEXT NOT NULL
+    at         TEXT NOT NULL,
+    why_erased INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS promotions_version
     ON promotions (domain, entry, tier, digest, promoter);
@@ -188,9 +189,65 @@ impl Db {
             return Ok(false);
         }
         let key = crate::promotion_key(&spec.entry);
-        apply(&tx, &key, at, &Event::Promoted(spec.clone()))?;
+        apply(
+            &tx,
+            &key,
+            at,
+            &Event::Promoted {
+                spec: spec.clone(),
+                why_erased: false,
+            },
+        )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Remove the why from an entry's promotion events and rows in one transaction, then
+    /// rebuild the file and fold the log into it, so the old text is in neither. Returns
+    /// how many records of the entry hold no why now.
+    pub(crate) fn scrub_promotions(&mut self, domain: &str, entry: &str) -> Result<usize, Error> {
+        let key = crate::promotion_key(entry);
+        let n: i64 = {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let events: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT seq, payload FROM events WHERE task_id = ?1 AND kind = 'promoted'",
+                )?;
+                let rows = stmt.query_map(params![key], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            for (seq, payload) in events {
+                if let Some(scrubbed) = crate::scrub_payload(&key, domain, &payload)? {
+                    tx.execute(
+                        "UPDATE events SET payload = ?2 WHERE seq = ?1",
+                        params![seq, scrubbed],
+                    )?;
+                }
+            }
+            tx.execute(
+                "UPDATE promotions SET why = '', why_erased = 1 WHERE domain = ?1 AND entry = ?2",
+                params![domain, entry],
+            )?;
+            let n = tx.query_row(
+                "SELECT COUNT(*) FROM promotions
+                 WHERE domain = ?1 AND entry = ?2 AND why_erased = 1",
+                params![domain, entry],
+                |r| r.get(0),
+            )?;
+            tx.commit()?;
+            n
+        };
+        self.compact()?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// Rebuild the file without the free space old text sat in, and fold the log into it.
+    fn compact(&self) -> Result<(), Error> {
+        let conn = self.conn();
+        checkpoint(&conn)?;
+        conn.execute_batch("VACUUM;")?;
+        checkpoint(&conn)
     }
 
     pub(crate) fn promotions(
@@ -215,6 +272,7 @@ impl Db {
                 digest: r.get(7)?,
                 new_digest: r.get(8)?,
                 at: r.get(9)?,
+                why_erased: r.get(10)?,
             })
         })?;
         rows.map(|r| r?.into_record()).collect()
@@ -380,6 +438,27 @@ impl Db {
     }
 }
 
+/// Fold the write-ahead log into the file and truncate it, waiting a little for a reader
+/// mid-query; [`Error::Held`] when it still could not, since the log then still holds
+/// what the tables no longer do.
+fn checkpoint(conn: &Connection) -> Result<(), Error> {
+    conn.busy_timeout(std::time::Duration::from_millis(200))?;
+    let mut held = true;
+    for _ in 0..5 {
+        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        if busy == 0 {
+            held = false;
+            break;
+        }
+    }
+    // rusqlite's own default, for every other statement on this connection
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    if held {
+        return Err(Error::Held("the write-ahead log".into()));
+    }
+    Ok(())
+}
+
 fn get_in(conn: &Connection, id: &str) -> Result<Task, Error> {
     conn.query_row(
         &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
@@ -459,11 +538,16 @@ fn insert_task(
 }
 
 /// The row a `Promoted` event projects to.
-fn insert_promotion(conn: &Connection, at: OffsetDateTime, p: &PromotionSpec) -> Result<(), Error> {
+fn insert_promotion(
+    conn: &Connection,
+    at: OffsetDateTime,
+    p: &PromotionSpec,
+    why_erased: bool,
+) -> Result<(), Error> {
     conn.execute(
         "INSERT INTO promotions (domain, entry, tier, promoter, author, why, label_rank,
-            digest, new_digest, at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            digest, new_digest, at, why_erased)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             p.domain,
             p.entry,
@@ -475,6 +559,7 @@ fn insert_promotion(conn: &Connection, at: OffsetDateTime, p: &PromotionSpec) ->
             p.digest,
             p.new_digest,
             crate::fmt_time(at),
+            i64::from(why_erased),
         ],
     )?;
     Ok(())
@@ -483,7 +568,7 @@ fn insert_promotion(conn: &Connection, at: OffsetDateTime, p: &PromotionSpec) ->
 /// Update the projection for one event. Replay calls this and nothing else.
 fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Result<(), Error> {
     match event {
-        Event::Promoted(p) => insert_promotion(conn, at, p)?,
+        Event::Promoted { spec, why_erased } => insert_promotion(conn, at, spec, *why_erased)?,
         Event::Created { id: new_id, spec } => insert_task(conn, new_id, at, spec)?,
         Event::Admitted => {
             conn.execute(

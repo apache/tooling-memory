@@ -939,6 +939,7 @@ mod tests {
             removed,
             flagged: vec![],
             unresolved: vec![],
+            promotion_whys_removed: 0,
         };
         s.put_receipt(&receipt).await.unwrap();
         assert!(receipt.to_yaml().contains("body_digest:"));

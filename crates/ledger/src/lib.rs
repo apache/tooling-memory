@@ -73,6 +73,10 @@ pub enum Error {
         /// Who asked.
         holder: String,
     },
+    /// Another connection holds the write-ahead log, so text just removed may still be
+    /// in it. Run the operation again.
+    #[error("ledger: another connection holds the log: {0}")]
+    Held(String),
     /// A row holds something the ledger did not write. Rebuild it.
     #[error("ledger row for {id}: {what}")]
     BadRow {
@@ -197,6 +201,15 @@ pub struct Task {
     pub posted_to: Option<String>,
 }
 
+/// What an erasure did to an entry's promotion records.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Scrubbed {
+    /// How many records of the entry hold no why now.
+    pub records: usize,
+    /// Copies of the why the ledger could not remove, named so nobody believes it did.
+    pub beyond_reach: Vec<String>,
+}
+
 /// The result of filing a task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Created {
@@ -248,6 +261,10 @@ pub struct PromotionRecord {
     /// What was recorded.
     #[serde(flatten)]
     pub spec: PromotionSpec,
+    /// The why was removed by an erasure of the entry: `why` is then empty, and the rest
+    /// is kept as the least an audit needs.
+    #[serde(default)]
+    pub why_erased: bool,
     /// When.
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
@@ -297,7 +314,13 @@ enum Event {
         why: String,
     },
     /// An entry was promoted, and why. Appended under [`promotion_key`], never a task id.
-    Promoted(PromotionSpec),
+    /// An erasure of the entry rewrites it with the why removed and `why_erased` set.
+    Promoted {
+        #[serde(flatten)]
+        spec: PromotionSpec,
+        #[serde(default, skip_serializing_if = "is_false")]
+        why_erased: bool,
+    },
 }
 
 impl Event {
@@ -314,7 +337,7 @@ impl Event {
             Event::Invalidated { .. } => "invalidated",
             Event::Posted { .. } => "posted",
             Event::Rescored { .. } => "rescored",
-            Event::Promoted(_) => "promoted",
+            Event::Promoted { .. } => "promoted",
         }
     }
 
@@ -332,6 +355,33 @@ impl Event {
             what: format!("event payload: {e}"),
         })
     }
+}
+
+/// What a PostgreSQL ledger keeps of a why after the rows are rewritten: the server, not
+/// the ledger, decides when old row versions and its log are gone.
+const POSTGRES_RESIDUE: &str = "the ledger's PostgreSQL server: old row versions and its write-ahead log keep a removed why until the server vacuums and recycles them";
+
+/// A `promoted` event's payload with its why removed, when the event is that domain's
+/// and holds a why; `None` when there is nothing to rewrite.
+fn scrub_payload(key: &str, domain: &str, payload: &str) -> Result<Option<String>, Error> {
+    match Event::parse(key, payload)? {
+        Event::Promoted {
+            mut spec,
+            why_erased,
+        } if spec.domain == domain && !(why_erased && spec.why.is_empty()) => {
+            spec.why.clear();
+            let scrubbed = Event::Promoted {
+                spec,
+                why_erased: true,
+            };
+            Ok(Some(scrubbed.payload(key)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn fmt_time(t: OffsetDateTime) -> String {
@@ -366,7 +416,7 @@ fn promotion_key(entry: &str) -> String {
 
 /// The columns of a promotion row, in the order both backends read them.
 const PROMOTION_COLUMNS: &str =
-    "domain, entry, tier, promoter, author, why, label_rank, digest, new_digest, at";
+    "domain, entry, tier, promoter, author, why, label_rank, digest, new_digest, at, why_erased";
 
 /// A promotion row as the database returns it, before the ledger has checked it.
 struct RawPromotion {
@@ -380,6 +430,7 @@ struct RawPromotion {
     digest: String,
     new_digest: String,
     at: String,
+    why_erased: i64,
 }
 
 impl RawPromotion {
@@ -402,6 +453,7 @@ impl RawPromotion {
                 new_digest: self.new_digest,
             },
             at: parse_time(&key, &self.at)?,
+            why_erased: self.why_erased != 0,
         })
     }
 }
@@ -1027,6 +1079,27 @@ impl Ledger {
         on_backend!(&self.backend, db => db.promotions(domain, entry))
     }
 
+    /// Remove the why from every promotion record of an entry, for its erasure: the
+    /// events that hold it are rewritten and the projection with them, so no replay
+    /// brings it back. Who promoted which version to which tier, and when, is kept.
+    /// Running it again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`Error::Held`] when another connection holds the log the
+    /// old text is in.
+    pub async fn scrub_promotions(&mut self, domain: &str, entry: &str) -> Result<Scrubbed, Error> {
+        let records = on_backend!(&mut self.backend, db => db.scrub_promotions(domain, entry))?;
+        let beyond_reach = match self.backend {
+            Backend::Sqlite(_) => Vec::new(),
+            Backend::Postgres(_) => vec![POSTGRES_RESIDUE.to_string()],
+        };
+        Ok(Scrubbed {
+            records,
+            beyond_reach,
+        })
+    }
+
     /// How many events the ledger holds.
     ///
     /// # Errors
@@ -1120,6 +1193,37 @@ mod tests {
             }
         }
 
+        /// Every event's payload, as the log holds it.
+        async fn payloads(&self) -> Vec<String> {
+            match self {
+                Site::Sqlite(dir) => {
+                    let conn = rusqlite::Connection::open(dir.path().join("ledger.db")).unwrap();
+                    let mut stmt = conn.prepare("SELECT payload FROM events").unwrap();
+                    let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+                    rows.map(Result::unwrap).collect()
+                }
+                Site::Postgres(server) => {
+                    let c = pg_client(server).await;
+                    let mut out = Vec::new();
+                    for row in c
+                        .query("SELECT schema FROM public.ledger_domains", &[])
+                        .await
+                        .unwrap()
+                    {
+                        let s: String = row.get(0);
+                        for p in c
+                            .query(&format!("SELECT payload FROM {s}.events"), &[])
+                            .await
+                            .unwrap()
+                        {
+                            out.push(p.get(0));
+                        }
+                    }
+                    out
+                }
+            }
+        }
+
         /// A ledger on a clock the test moves.
         async fn ledger(&self) -> (Ledger, Arc<Mutex<OffsetDateTime>>) {
             let now = Arc::new(Mutex::new(T0));
@@ -1179,6 +1283,7 @@ mod tests {
         a_promotion_record_is_no_task,
         replay_keeps_the_promotions,
         a_second_promoter_of_the_same_version_is_recorded,
+        an_erasure_takes_the_why_and_a_replay_keeps_it_out,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1495,10 +1600,12 @@ mod tests {
             vec![
                 PromotionRecord {
                     spec: first,
+                    why_erased: false,
                     at: T0
                 },
                 PromotionRecord {
                     spec: again,
+                    why_erased: false,
                     at: T0 + mins(1)
                 },
             ],
@@ -1532,6 +1639,106 @@ mod tests {
             .collect();
         assert_eq!(got, vec![first, second.clone()]);
         assert!(!l.record_promotion(&second).await.unwrap(), "once each");
+    }
+
+    const SECRET: &str = "passphrase-Qz7xx";
+
+    /// Two promotions of `mem-a-1` whose whys quote its secret, and one of `mem-a-2`.
+    async fn promotions_that_quote_a_secret(l: &mut Ledger) -> Vec<PromotionSpec> {
+        let first = PromotionSpec {
+            why: format!("the vault opens with {SECRET}, as it says"),
+            ..promotion("mem-a-1", "d1")
+        };
+        let second = PromotionSpec {
+            by: "agent:checker".into(),
+            why: format!("tried {SECRET} on the vault"),
+            ..first.clone()
+        };
+        let other = promotion("mem-a-2", "d9");
+        for p in [&first, &second, &other] {
+            assert!(l.record_promotion(p).await.unwrap());
+        }
+        vec![first, second, other]
+    }
+
+    async fn an_erasure_takes_the_why_and_a_replay_keeps_it_out(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let specs = promotions_that_quote_a_secret(&mut l).await;
+        let scrubbed = l.scrub_promotions("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(scrubbed.records, 2);
+        let kept: Vec<PromotionRecord> = specs[..2]
+            .iter()
+            .map(|s| PromotionRecord {
+                spec: PromotionSpec {
+                    why: String::new(),
+                    ..s.clone()
+                },
+                why_erased: true,
+                at: T0,
+            })
+            .collect();
+        assert_eq!(
+            l.promotions("dom-a", "mem-a-1").await.unwrap(),
+            kept,
+            "the why goes; who, which version, which tier and when stay"
+        );
+        another_entry_and_the_log_and_a_replay(b, &mut l, &specs, &kept).await;
+    }
+
+    async fn another_entry_and_the_log_and_a_replay(
+        b: &Site,
+        l: &mut Ledger,
+        specs: &[PromotionSpec],
+        kept: &[PromotionRecord],
+    ) {
+        let untouched = l.promotions("dom-a", "mem-a-2").await.unwrap();
+        assert_eq!(
+            untouched[0].spec, specs[2],
+            "another entry's record is kept"
+        );
+        assert!(!untouched[0].why_erased);
+        assert!(
+            !b.payloads().await.iter().any(|p| p.contains(SECRET)),
+            "the log no longer holds the why"
+        );
+        l.rebuild().await.unwrap();
+        assert_eq!(
+            l.promotions("dom-a", "mem-a-1").await.unwrap(),
+            kept,
+            "replay keeps it out"
+        );
+        let again = l.scrub_promotions("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(again.records, 2, "running it again counts what is scrubbed");
+    }
+
+    /// The first ledger file under `dir` whose bytes hold `needle`.
+    fn file_holding(dir: &Path, needle: &str) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|f| f.path())
+            .find(|p| {
+                std::fs::read(p)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes())
+            })
+    }
+
+    #[tokio::test]
+    async fn on_sqlite_an_erased_why_leaves_no_bytes_in_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = Ledger::open(&dir.path().join("ledger.db")).unwrap();
+        promotions_that_quote_a_secret(&mut l).await;
+        assert!(
+            file_holding(dir.path(), SECRET).is_some(),
+            "the files held it"
+        );
+        let scrubbed = l.scrub_promotions("dom-a", "mem-a-1").await.unwrap();
+        assert!(scrubbed.beyond_reach.is_empty());
+        if let Some(f) = file_holding(dir.path(), SECRET) {
+            panic!("{} still holds the erased why", f.display());
+        }
     }
 
     async fn a_promotion_record_is_no_task(b: &Site) {

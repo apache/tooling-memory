@@ -317,6 +317,13 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
             .collect()
     };
     assert!(ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
+    // a why that quotes the secret is the entry's too, and leaves with it
+    let why = format!("tried {marker} on the vault");
+    ok(
+        &d.root,
+        &["promote", &secret, "--to", "curated", "--why", &why],
+        None,
+    );
     let err = fails(&d.root, &["erase", &secret, "--reason", "because"]);
     assert!(err.contains("invalid value"), "{err}");
     let receipt = json(&ok(
@@ -328,6 +335,7 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
     assert_eq!(receipt["reason"], "sensitive");
     assert_eq!(receipt["removed"][0]["version"], "current");
     assert_eq!(receipt["flagged"], serde_json::json!([citing]));
+    assert_eq!(receipt["promotion_whys_removed"], 1);
     assert!(!ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
     let err = fails(&d.root, &["get", &secret]);
     assert!(err.contains("gone") && err.contains("erased"), "{err}");

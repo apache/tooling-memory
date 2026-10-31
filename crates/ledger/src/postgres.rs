@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS {s}.promotions (
     label_rank BIGINT NOT NULL,
     digest     TEXT NOT NULL,
     new_digest TEXT NOT NULL,
-    at         TEXT NOT NULL
+    at         TEXT NOT NULL,
+    why_erased BIGINT NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS promotions_version
     ON {s}.promotions (entry, tier, digest, promoter);
@@ -322,10 +323,75 @@ impl Db {
             return Ok(false);
         }
         let key = crate::promotion_key(&spec.entry);
-        apply(&tx, &s, &key, at, &Event::Promoted(spec.clone())).await?;
+        apply(
+            &tx,
+            &s,
+            &key,
+            at,
+            &Event::Promoted {
+                spec: spec.clone(),
+                why_erased: false,
+            },
+        )
+        .await?;
         tx.commit().await?;
         self.remember(&spec.domain, &s);
         Ok(true)
+    }
+
+    /// Remove the why from an entry's promotion events and rows, in one transaction under
+    /// the domain's lock. Returns how many records of the entry hold no why now.
+    pub(crate) async fn scrub_promotions(
+        &mut self,
+        domain: &str,
+        entry: &str,
+    ) -> Result<usize, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(0);
+        };
+        let key = crate::promotion_key(entry);
+        let tx = self.client.transaction().await?;
+        ensure_promotions(&tx, domain).await?;
+        let rows = tx
+            .query(
+                &format!(
+                    "SELECT seq, payload FROM {s}.events
+                     WHERE task_id = $1 AND kind = 'promoted' FOR UPDATE"
+                ),
+                &[&key],
+            )
+            .await?;
+        for row in &rows {
+            let seq: i64 = row.try_get(0)?;
+            let payload: String = row.try_get(1)?;
+            if let Some(scrubbed) = crate::scrub_payload(&key, domain, &payload)? {
+                tx.execute(
+                    &format!("UPDATE {s}.events SET payload = $2 WHERE seq = $1"),
+                    &[&seq, &scrubbed],
+                )
+                .await?;
+            }
+        }
+        tx.execute(
+            &format!(
+                "UPDATE {s}.promotions SET why = '', why_erased = 1
+                 WHERE domain = $1 AND entry = $2"
+            ),
+            &[&domain, &entry],
+        )
+        .await?;
+        let row = tx
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM {s}.promotions
+                     WHERE domain = $1 AND entry = $2 AND why_erased = 1"
+                ),
+                &[&domain, &entry],
+            )
+            .await?;
+        let n: i64 = row.try_get(0)?;
+        tx.commit().await?;
+        Ok(usize::try_from(n).unwrap_or(0))
     }
 
     pub(crate) async fn promotions(
@@ -365,6 +431,7 @@ impl Db {
                     digest: r.try_get(7)?,
                     new_digest: r.try_get(8)?,
                     at: r.try_get(9)?,
+                    why_erased: r.try_get(10)?,
                 }
                 .into_record()
             })
@@ -839,12 +906,13 @@ async fn insert_promotion<C: GenericClient>(
     s: &str,
     at: OffsetDateTime,
     p: &PromotionSpec,
+    why_erased: bool,
 ) -> Result<(), Error> {
     conn.execute(
         &format!(
             "INSERT INTO {s}.promotions (domain, entry, tier, promoter, author, why,
-                label_rank, digest, new_digest, at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+                label_rank, digest, new_digest, at, why_erased)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
         ),
         &[
             &p.domain,
@@ -857,6 +925,7 @@ async fn insert_promotion<C: GenericClient>(
             &p.digest,
             &p.new_digest,
             &crate::fmt_time(at),
+            &i64::from(why_erased),
         ],
     )
     .await?;
@@ -878,7 +947,9 @@ async fn project<C: GenericClient>(
     };
     let (sql, args): (&str, Vec<&(dyn ToSql + Sync)>) = match event {
         Event::Created { id: new_id, spec } => return insert_task(conn, s, new_id, at, spec).await,
-        Event::Promoted(p) => return insert_promotion(conn, s, at, p).await,
+        Event::Promoted { spec, why_erased } => {
+            return insert_promotion(conn, s, at, spec, *why_erased).await
+        }
         Event::Admitted => ("SET status = 'admitted' WHERE id = $1", vec![&id]),
         Event::Claimed { holder, .. } => (
             "SET status = 'claimed', holder = $2, lease_until = $3,

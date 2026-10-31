@@ -475,7 +475,9 @@ tool show who promoted which version of the entry to curated, and why. They also
 that version reached the record (`landed`). An auditor reads the why after judging the
 change, not before. A session reads the why only if it can read the entry. The why stays
 readable after the entry is replaced. A proposal to verified is not in this list: it keeps
-its why in the body of its approval task.
+its why in the body of its approval task. When the owner erases the entry, the ledger removes each
+why. It keeps who promoted which version, to which tier, and when. The erasure receipt
+gives the number of whys it removed (`promotion_whys_removed`).
 
 When an entry holds, the librarian's verify task now ends in such a proposal. The rules
 are Rego, in the built-in policy. Each step is a logged decision. A promotion is a new

@@ -2166,7 +2166,10 @@ impl Memory {
     /// the index, the served bundles; then the receipt again without that line. A run
     /// that stops short leaves that receipt, and the next run picks up where it stopped,
     /// keeping the first run's reason. Entries that cite the erased one are flagged for
-    /// review today rather than re-derived here. Exports already handed out, the
+    /// review today rather than re-derived here. The why of each promotion of the entry
+    /// leaves the ledger, its log and its projection alike, and the receipt counts them;
+    /// who promoted which version to which tier, and when, stays. Exports already handed
+    /// out, the
     /// transcripts of sessions that read the entry, and the queries in the read log are
     /// beyond reach and the receipt says so.
     ///
@@ -2219,6 +2222,7 @@ impl Memory {
                     removed,
                     flagged: Vec::new(),
                     unresolved: vec![erasure::UNFINISHED.into()],
+                    promotion_whys_removed: 0,
                 };
                 self.store.put_receipt(&pending).await?;
                 pending
@@ -2234,12 +2238,31 @@ impl Memory {
                     .await?,
             );
         }
+        self.finish_erasure(&domain, id, receipt).await
+    }
+
+    /// The steps of an erasure after the record's: the citing entries, the ledger's
+    /// whys, the index, the served bundles and every render; then the receipt, closed.
+    async fn finish_erasure(
+        &self,
+        domain: &str,
+        id: &str,
+        mut receipt: Receipt,
+    ) -> Result<Receipt, Error> {
         let stub = self
             .store
-            .get(&domain, id)
+            .get(domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         receipt.flagged = self.flag_citers(id).await?;
+        // the whys of its promotions are the entry's text too; who promoted what stays
+        let scrubbed = self
+            .ledger
+            .lock()
+            .await
+            .scrub_promotions(domain, id)
+            .await?;
+        receipt.promotion_whys_removed = scrubbed.records;
         {
             let mut ix = self.index.lock().await;
             ix.remove(id)?;
@@ -2247,11 +2270,12 @@ impl Memory {
             ix.vacuum()?;
         }
         self.forget_pushed(id);
-        self.drop_bundles(&domain)?;
+        self.drop_bundles(domain)?;
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
-        let missed = self.erase_from_projections(&domain, id);
+        let missed = self.erase_from_projections(domain, id);
         close_receipt(&mut receipt, missed);
+        receipt.unresolved.extend(scrubbed.beyond_reach);
         self.store.put_receipt(&receipt).await?;
         self.refresh_projection_after_erasure().await;
         Ok(receipt)
@@ -3202,6 +3226,59 @@ mod tests {
             Label::Restricted,
             "the label rises as a get's does"
         );
+    }
+
+    /// The ledger under `root` keeps the record of `id`'s promotion, and no why: not in
+    /// the record, not in the log.
+    async fn the_ledger_keeps_no_why(root: &Path, id: &str, marker: &str) {
+        let l = Ledger::open(&root.join(LEDGER_FILE)).unwrap();
+        let kept = l.promotions("dom-me", id).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(
+            kept[0].spec.why.is_empty() && kept[0].why_erased,
+            "{kept:?}"
+        );
+        assert_eq!(kept[0].spec.by, "agent:librarian", "who stays");
+        let conn = rusqlite::Connection::open(root.join(LEDGER_FILE)).unwrap();
+        let mut stmt = conn.prepare("SELECT payload FROM events").unwrap();
+        let payloads: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            !payloads.iter().any(|p| p.contains(marker)),
+            "the log keeps no why"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_erasure_takes_the_why_from_the_ledger_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(
+                &secret,
+                TrustTier::Curated,
+                &format!("tried {marker} on the vault"),
+            )
+            .await
+            .unwrap();
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert_eq!(receipt.promotion_whys_removed, 1, "the receipt says so");
+        assert!(matches!(
+            owner.promotions(&secret).await,
+            Err(Error::NotFound(_))
+        ));
+        the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
+        owner.reindex().await.unwrap();
+        the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
     }
 
     #[tokio::test]
