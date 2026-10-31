@@ -19,7 +19,9 @@ trap 'rm -rf "$work"' EXIT
 command -v python3 >/dev/null 2>&1 || { echo "python3 is needed for the conformance test" >&2; exit 1; }
 
 # run <name> <flaw> <args...>: one run of the script against the fake with that flaw, its
-# output and exit status kept under its name
+# output and exit status kept under its name. The lease is 4 seconds, so each check of
+# step 5 has 2 seconds of margin: a machine busy with a build can hold a process back
+# that long, and at 2 seconds a stall of 2 failed a fake with no defect
 run() {
     name=$1
     flaw=$2
@@ -27,7 +29,7 @@ run() {
     (
         status=0
         FLAW="$flaw" FAKE_STATE="$work/$name.json" \
-            python3 "$script" --stdio "python3 $fake" --lease 2 --timeout 5 "$@" \
+            python3 "$script" --stdio "python3 $fake" --lease 4 --timeout 5 "$@" \
             >"$work/$name.out" 2>&1 || status=$?
         echo "$status" >"$work/$name.status"
     ) &
@@ -85,7 +87,7 @@ expect t0-forgets 1 '5 of 7 steps passed; FAILED: 3, 7' 'T0 does not name the ha
 expect search-everything 1 '5 of 7 steps passed; FAILED: 4, 7' 'search for a word only the handoff carries found'
 expect search-bodies 1 '6 of 7 steps passed; FAILED: 4' 'search at summary depth returned a body'
 expect second-claim 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'a second claim_next while the lease holds returned a task'
-expect lease-forever 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat {"id": "task-fake-0004", "lease_seconds": 2} was answered, not refused'
+expect lease-forever 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat {"id": "task-fake-0004", "lease_seconds": 4} was answered, not refused'
 expect heartbeat-noop 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat did not renew it: lease_until went from'
 expect heartbeat-short 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat did not renew it: lease_until went from'
 expect heartbeat-lies 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'a renewed lease lapsed where the first one would have'
