@@ -1435,4 +1435,71 @@ mod tests {
         assert_ne!(invalid.code, internal.code);
         assert_eq!(t0_uri("dom-a"), "memory://t0/dom-a");
     }
+
+    /// A root with one restricted task and one public task, both admitted, and a server
+    /// over a session capped at public: the restricted task's id, and the server.
+    async fn restricted_and_capped() -> (tempfile::TempDir, String, McpServer) {
+        let (dir, _owner) = server().await;
+        let owner = Memory::open(dir.path()).unwrap();
+        let mut ids = Vec::new();
+        for (title, classification) in [
+            ("Rotate the signing key", dm_core::Label::Restricted),
+            ("Tidy the docs", dm_core::Label::Public),
+        ] {
+            let t = owner
+                .file_own(dm_ledger::TaskSpec {
+                    domain: "dom-me".into(),
+                    title: title.into(),
+                    body: "Do it.".into(),
+                    requirements: vec![],
+                    depends_on: vec![],
+                    origin: None,
+                    upstream_event: None,
+                    created_by: String::new(),
+                    classification,
+                    priority: 0,
+                })
+                .await
+                .unwrap()
+                .task;
+            if t.status == dm_ledger::Status::Proposed {
+                owner.admit(&t.id).await.unwrap();
+            }
+            ids.push(t.id);
+        }
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(dm_core::Label::Public);
+        (dir, ids.swap_remove(0), McpServer::new(Arc::new(capped)))
+    }
+
+    #[tokio::test]
+    async fn a_capped_session_neither_lists_nor_gets_a_task_above_its_handling() {
+        let (_dir, hidden, s) = restricted_and_capped().await;
+        let listed = payload(
+            &s.list_tasks(Parameters(ListTasksParams::default()))
+                .await
+                .unwrap(),
+        );
+        let text = listed.to_string();
+        assert!(text.contains("Tidy the docs"), "{text}");
+        assert!(!text.contains("signing key"), "{text}");
+        let refused = s
+            .get_task(Parameters(TaskIdParams { id: hidden.clone() }))
+            .await
+            .map(|r| payload(&r))
+            .unwrap_err();
+        let absent = s
+            .get_task(Parameters(TaskIdParams {
+                id: "task-me-none".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, absent.code, "the answer a missing task gets");
+        assert_eq!(
+            refused.message.replace(&hidden, "<id>"),
+            absent.message.replace("task-me-none", "<id>")
+        );
+        assert_eq!(s.memory.label(), dm_core::Label::Public);
+    }
 }

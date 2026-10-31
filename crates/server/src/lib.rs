@@ -1055,7 +1055,7 @@ impl Memory {
     /// approval the policy refuses; a ledger or store error.
     pub async fn approve(&self, task_id: &str) -> Result<Promotion, Error> {
         let task = self.ledger.lock().await.get(task_id).await?;
-        self.task_in_grants(&task)?;
+        self.read_task(&task)?;
         let Some(id) = task
             .spec
             .origin
@@ -1382,13 +1382,18 @@ impl Memory {
                     .len(),
             )
         };
+        // a count, so nothing is read and the label stays; what it counts is only what
+        // the session may see
+        let handling = self.handling()?;
         let waiting = self
             .ledger
             .lock()
             .await
             .list(&domain, dm_ledger::Status::Admitted)
             .await?
-            .len();
+            .iter()
+            .filter(|t| self.sees(t, handling))
+            .count();
         self.observe(&handoffs);
         self.observe(&decisions);
         self.observe(&conventions);
@@ -1445,11 +1450,64 @@ impl Memory {
 
     // ---- tasks ----
 
-    fn task_in_grants(&self, task: &Task) -> Result<(), Error> {
-        if self.grants.may_write(&task.spec.domain) {
-            Ok(())
-        } else {
-            Err(Error::NotFound(task.id.clone()))
+    /// The most this session may read: the grants, the launcher's cap on them, and the
+    /// policy's read scope, whichever is lowest.
+    fn handling(&self) -> Result<Label, Error> {
+        self.session_filter()?;
+        Ok(lock(&self.session).handling)
+    }
+
+    /// Whether this session may see a task: one in a granted domain, classified within
+    /// `handling`. A task it may not see is left out of every result and every count, as
+    /// an entry above its handling is.
+    fn sees(&self, task: &Task, handling: Label) -> bool {
+        self.grants.may_write(&task.spec.domain) && task.spec.classification <= handling
+    }
+
+    /// Read one named task: the session's label rises to its classification. A task this
+    /// session may not see gets the answer a missing task gets, so the answer says
+    /// nothing that a listing would not.
+    fn read_task(&self, task: &Task) -> Result<(), Error> {
+        if !self.sees(task, self.handling()?) {
+            return Err(dm_ledger::Error::NotFound(task.id.clone()).into());
+        }
+        lock(&self.session).observe(task.spec.classification);
+        Ok(())
+    }
+
+    /// The tasks of `tasks` this session may see, read: the label rises to the
+    /// classification of each, so to the highest handed out.
+    fn read_tasks(&self, tasks: Vec<Task>) -> Result<Vec<Task>, Error> {
+        let handling = self.handling()?;
+        let seen: Vec<Task> = tasks
+            .into_iter()
+            .filter(|t| self.sees(t, handling))
+            .collect();
+        let mut s = lock(&self.session);
+        for t in &seen {
+            s.observe(t.spec.classification);
+        }
+        Ok(seen)
+    }
+
+    /// `tree` without the branches this session may not see, read. What is filed from a
+    /// task is classified at least as high as the task, so a branch above handling goes
+    /// whole. The root is the caller's to have read.
+    fn read_tree(&self, tree: TaskTree) -> Result<TaskTree, Error> {
+        let handling = self.handling()?;
+        Ok(self.prune(tree, handling))
+    }
+
+    fn prune(&self, tree: TaskTree, handling: Label) -> TaskTree {
+        lock(&self.session).observe(tree.task.spec.classification);
+        TaskTree {
+            children: tree
+                .children
+                .into_iter()
+                .filter(|c| self.sees(&c.task, handling))
+                .map(|c| self.prune(c, handling))
+                .collect(),
+            task: tree.task,
         }
     }
 
@@ -1459,7 +1517,9 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// An ungranted domain, or a ledger or policy error.
+    /// An ungranted domain, or a ledger or policy error; [`Error::Denied`] when the
+    /// origin and upstream event name a task already filed that this session may not
+    /// read.
     pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
         let mut l = self.ledger.lock().await;
         let held = match self.held.get() {
@@ -1508,6 +1568,17 @@ impl Memory {
             spec.priority = spec.priority.min(p.spec.priority);
         }
         let created = l.create(spec).await?;
+        // a filing that names a task already there is handed that task, and admits it on
+        // its say, only when this session may see it; the answer names nothing of it.
+        // The label does not rise for it: the filer named the task by the upstream event
+        // it is filing itself, and a tap, which files at its domain's classification
+        // above its own ceiling, would otherwise stop on every replay
+        if created.deduplicated && !self.sees(&created.task, self.handling()?) {
+            return Err(Error::Denied(
+                "this origin and upstream event are filed already, in a task this session may not read"
+                    .into(),
+            ));
+        }
         let task = self
             .admit_per_policy(l, created.task, filing, parent)
             .await?;
@@ -1524,7 +1595,7 @@ impl Memory {
     /// A ledger error, or a task outside the grants.
     pub async fn admit(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
+        self.read_task(&l.get(id).await?)?;
         let admitted = l.admit(id).await?;
         self.rank_edges(&mut l, &admitted).await?;
         Ok(admitted)
@@ -1614,7 +1685,7 @@ impl Memory {
     pub async fn fan_out(&self, parent: &str, items: &[(String, String)]) -> Result<FanOut, Error> {
         let mut l = self.ledger.lock().await;
         let parent = l.get(parent).await?;
-        self.task_in_grants(&parent)?;
+        self.read_task(&parent)?;
         // the chain this parent belongs to: a continuation or a retry resumes a root,
         // and what an earlier run of the chain already asked for is not asked again
         let root = Memory::root_of(&l, &parent).await;
@@ -1653,6 +1724,9 @@ impl Memory {
                     .await?,
             );
         }
+        // what was asked before is not filed again; it is handed back only where this
+        // session may see it
+        let existing = self.read_tasks(existing)?;
         if children.is_empty() {
             return Ok(FanOut {
                 children,
@@ -1774,8 +1848,9 @@ impl Memory {
     pub async fn task_tree(&self, id: &str) -> Result<TaskTree, Error> {
         let l = self.ledger.lock().await;
         let task = l.get(id).await?;
-        self.task_in_grants(&task)?;
-        Ok(Memory::tree_in(&l, task).await?)
+        self.read_task(&task)?;
+        let tree = Memory::tree_in(&l, task).await?;
+        self.read_tree(tree)
     }
 
     /// Boxed, since the tree is as deep as the work and an async fn cannot recurse
@@ -1804,8 +1879,10 @@ impl Memory {
     pub async fn retry_task(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
         let root = l.get(id).await?;
-        self.task_in_grants(&root)?;
-        let tree = Memory::tree_in(&l, root.clone()).await?;
+        self.read_task(&root)?;
+        // the lessons are what this session may read of the chain, and the retry is
+        // classified at the label that reading leaves
+        let tree = self.read_tree(Memory::tree_in(&l, root.clone()).await?)?;
         let mut lessons = Vec::new();
         tree.handoffs(&mut lessons);
         let mut body = root.spec.body.trim_end().to_string();
@@ -1873,7 +1950,7 @@ impl Memory {
     /// A ledger error, or a task outside the grants.
     pub async fn claim(&self, id: &str, lease: Duration) -> Result<Claim, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
+        self.read_task(&l.get(id).await?)?;
         let c = l.claim(id, &self.author, lease, &self.manifest).await?;
         lock(&self.session).observe(c.task.spec.classification);
         Ok(c)
@@ -1886,7 +1963,7 @@ impl Memory {
     /// A ledger error, including a lease already lost, or a task outside the grants.
     pub async fn heartbeat(&self, id: &str, lease: Duration) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
+        self.read_task(&l.get(id).await?)?;
         Ok(l.heartbeat(id, &self.author, lease).await?)
     }
 
@@ -1899,7 +1976,7 @@ impl Memory {
     /// grants.
     pub async fn complete(&self, id: &str, handoff: &str) -> Result<Task, Error> {
         let task = self.ledger.lock().await.get(id).await?;
-        self.task_in_grants(&task)?;
+        self.read_task(&task)?;
         if self.store.get(&task.spec.domain, handoff).await?.is_none() {
             return Err(Error::NotFound(format!("handoff {handoff}")));
         }
@@ -1932,7 +2009,7 @@ impl Memory {
             self.get(h).await?; // the handoff must exist and be readable here
         }
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
+        self.read_task(&l.get(id).await?)?;
         Ok(l.release(id, &self.author, handoff).await?)
     }
 
@@ -1950,7 +2027,7 @@ impl Memory {
         superseded_by: Option<&str>,
     ) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
+        self.read_task(&l.get(id).await?)?;
         let task = l.invalidate(id, reason, superseded_by).await?;
         let mut pending = l.filed_from(id).await?;
         while let Some(t) = pending.pop() {
@@ -1967,18 +2044,20 @@ impl Memory {
         Ok(task)
     }
 
-    /// One task.
+    /// One task, read: the session's label rises to its classification.
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`], including for a task outside the grants.
+    /// The ledger's not-found, including for a task outside the grants or above the
+    /// session's handling.
     pub async fn get_task(&self, id: &str) -> Result<Task, Error> {
         let t = self.ledger.lock().await.get(id).await?;
-        self.task_in_grants(&t)?;
+        self.read_task(&t)?;
         Ok(t)
     }
 
-    /// Tasks in a domain with a status, ranked.
+    /// Tasks in a domain with a status, ranked: those within the session's handling,
+    /// each read, so the label rises to the highest classification handed out.
     ///
     /// # Errors
     ///
@@ -1989,7 +2068,8 @@ impl Memory {
         status: dm_ledger::Status,
     ) -> Result<Vec<Task>, Error> {
         let domain = self.resolve_domain(domain)?;
-        Ok(self.ledger.lock().await.list(&domain, status).await?)
+        let listed = self.ledger.lock().await.list(&domain, status).await?;
+        self.read_tasks(listed)
     }
 
     // ---- leaving, arriving, rebuilding ----
@@ -4181,6 +4261,221 @@ mod tests {
         );
         assert_eq!(full.search("note", None, 10).await.unwrap().len(), 2);
         assert!(full.session_id().starts_with("sess-"));
+    }
+
+    const EVERY_STATUS: [Status; 5] = [
+        Status::Proposed,
+        Status::Admitted,
+        Status::Claimed,
+        Status::Completed,
+        Status::Invalidated,
+    ];
+
+    fn restricted(title: &str) -> TaskSpec {
+        TaskSpec {
+            classification: Label::Restricted,
+            ..tspec(title, 0, None, &[], &[])
+        }
+    }
+
+    /// Move a proposed task on the ledger to `st`.
+    async fn move_to(l: &mut Ledger, id: &str, st: Status) {
+        if st != Status::Proposed {
+            l.admit(id).await.unwrap();
+        }
+        if matches!(st, Status::Claimed | Status::Completed) {
+            l.claim(id, "w", Duration::minutes(5), &[]).await.unwrap();
+        }
+        if st == Status::Completed {
+            l.complete(id, "w", "mem-me-x").await.unwrap();
+        }
+        if st == Status::Invalidated {
+            l.invalidate(id, "obsolete", None).await.unwrap();
+        }
+        assert_eq!(l.get(id).await.unwrap().status, st);
+    }
+
+    /// One restricted task in every status, filed straight on the ledger, and one public
+    /// task, admitted: the restricted ids, and the public one.
+    async fn restricted_in_every_status(m: &Memory) -> (Vec<String>, String) {
+        let mut l = m.ledger.lock().await;
+        let mut hidden = Vec::new();
+        for (i, st) in EVERY_STATUS.iter().enumerate() {
+            let t = l
+                .create(restricted(&format!("Rotate signing key {i}")))
+                .await
+                .unwrap()
+                .task;
+            move_to(&mut l, &t.id, *st).await;
+            hidden.push(t.id);
+        }
+        let shown = l
+            .create(tspec("Tidy the docs", 0, None, &[], &[]))
+            .await
+            .unwrap()
+            .task;
+        l.admit(&shown.id).await.unwrap();
+        (hidden, shown.id)
+    }
+
+    fn family_total(stats: &serde_json::Value) -> u64 {
+        stats["by_family"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|by_status| by_status.as_object().unwrap().values())
+            .map(|n| n.as_u64().unwrap())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_task_above_the_session_s_handling_is_not_listed_counted_or_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, shown) = restricted_in_every_status(&mem(dir.path())).await;
+
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let mut listed = Vec::new();
+        for st in EVERY_STATUS {
+            listed.extend(capped.tasks(None, st).await.unwrap());
+        }
+        assert!(listed.iter().any(|t| t.id == shown), "{listed:?}");
+        assert!(
+            listed.iter().all(|t| !hidden.contains(&t.id)),
+            "a restricted task is listed to a public session: {listed:?}"
+        );
+        for id in &hidden {
+            // the answer a missing task gets, so it says nothing of what is there
+            assert!(
+                matches!(
+                    capped.get_task(id).await,
+                    Err(Error::Ledger(dm_ledger::Error::NotFound(_)))
+                ),
+                "{id} is found by a public session"
+            );
+        }
+        let t0 = capped.t0(None).await.unwrap();
+        assert!(t0.contains("- 1 tasks waiting"), "{t0}");
+        assert_eq!(
+            family_total(&capped.task_stats(None).await.unwrap()),
+            1,
+            "only the public task is counted"
+        );
+        assert_eq!(capped.label(), Label::Public);
+
+        let full = Memory::open(dir.path()).unwrap();
+        assert_eq!(full.label(), Label::Public);
+        let admitted = full.tasks(None, Status::Admitted).await.unwrap();
+        assert!(admitted.iter().any(|t| t.id == hidden[1]), "{admitted:?}");
+        assert_eq!(
+            full.label(),
+            Label::Restricted,
+            "a listing raises the label to what it handed out"
+        );
+        let one = Memory::open(dir.path()).unwrap();
+        assert_eq!(one.get_task(&hidden[0]).await.unwrap().id, hidden[0]);
+        assert_eq!(one.label(), Label::Restricted, "a get_task is a read");
+    }
+
+    #[tokio::test]
+    async fn a_tree_a_retry_and_a_fan_out_leave_out_a_task_above_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, hidden) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let hidden = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(dm_core::digest("Rotate it.")[..16].to_string()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            l.admit(&hidden.id).await.unwrap();
+            l.claim(&hidden.id, "w", Duration::minutes(5), &[])
+                .await
+                .unwrap();
+            l.complete(&hidden.id, "w", "mem-me-x").await.unwrap();
+            (root, hidden)
+        };
+
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let tree = serde_json::to_string(&capped.task_tree(&root.id).await.unwrap()).unwrap();
+        assert!(!tree.contains("signing key"), "{tree}");
+        let again = capped
+            .fan_out(&root.id, &[("Again".into(), "Rotate it.".into())])
+            .await
+            .unwrap();
+        assert!(
+            again.existing.is_empty(),
+            "a fan-out hands back a task above handling: {:?}",
+            again.existing
+        );
+        let retry = capped.retry_task(&root.id).await.unwrap();
+        assert!(
+            !retry.spec.body.contains("signing key"),
+            "{}",
+            retry.spec.body
+        );
+        assert_eq!(retry.spec.classification, Label::Public);
+        assert_eq!(capped.label(), Label::Public);
+
+        let full = Memory::open(dir.path()).unwrap();
+        let tree = full.task_tree(&root.id).await.unwrap();
+        assert!(tree.children.iter().any(|c| c.task.id == hidden.id));
+        assert_eq!(full.label(), Label::Restricted, "a tree is a read");
+        let retry = full.retry_task(&root.id).await.unwrap();
+        assert!(
+            retry.spec.body.contains("signing key"),
+            "{}",
+            retry.spec.body
+        );
+        assert_eq!(
+            retry.spec.classification,
+            Label::Restricted,
+            "a retry that carries a restricted lesson is restricted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_filing_that_dedups_against_a_task_above_handling_does_not_return_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = {
+            let m = mem(dir.path());
+            let mut l = m.ledger.lock().await;
+            l.create(TaskSpec {
+                origin: Some("github:acme/x#7".into()),
+                upstream_event: Some("opened".into()),
+                ..restricted("Rotate the signing key")
+            })
+            .await
+            .unwrap()
+            .task
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let filed = capped
+            .create_task(TaskSpec {
+                origin: Some("github:acme/x#7".into()),
+                upstream_event: Some("opened".into()),
+                ..tspec("Same event", 0, None, &[], &[])
+            })
+            .await;
+        match filed {
+            Err(Error::Denied(why)) => assert!(!why.contains("signing key"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            capped.get_task(&hidden.id).await.map(|t| t.status).ok(),
+            None
+        );
+        assert_eq!(capped.label(), Label::Public);
     }
 
     #[tokio::test]

@@ -9,9 +9,10 @@ use dm_ledger::Task;
 
 impl Memory {
     /// Completed tasks in a granted domain that came from upstream and whose handoff has
-    /// not been posted back, oldest first, each with its handoff. A task above `ceiling`,
-    /// or one whose handoff is, is left out rather than read; so is a task whose handoff
-    /// is gone. Each handoff handed out is a read, logged and counted like any other.
+    /// not been posted back, oldest first, each with its handoff. A task above `ceiling`
+    /// or the session's handling, or one whose handoff is, is left out rather than read;
+    /// so is a task whose handoff is gone. Each task and handoff handed out is a read,
+    /// and raises the label; each handoff is logged and counted like any other.
     ///
     /// # Errors
     ///
@@ -24,10 +25,10 @@ impl Memory {
         let domain = self.resolve_domain(Some(domain))?;
         let tasks = self.ledger.lock().await.unposted(&domain).await?;
         let mut filter = self.session_filter()?;
-        filter.handling = filter.handling.min(ceiling);
+        filter.handling = self.handling()?.min(ceiling);
         let mut out = Vec::new();
         for task in tasks {
-            if task.spec.classification > ceiling {
+            if task.spec.classification > filter.handling {
                 continue;
             }
             let Some(handoff) = task.handoff.as_deref() else {
@@ -48,6 +49,7 @@ impl Memory {
             if entry.front.classification > ceiling {
                 continue;
             }
+            self.read_task(&task)?;
             out.push((task, entry));
         }
         Ok(out)
@@ -61,7 +63,8 @@ impl Memory {
     ///
     /// [`Error::Denied`] for a task of another domain, above the ceiling, or a `to`
     /// that is not one line of at most 2048 characters; a ledger error, including a
-    /// task that is not completed or was posted already; or a task outside the grants.
+    /// task that is not completed or was posted already, and a task outside the grants
+    /// or above the session's handling, which is not found.
     pub async fn post(
         &self,
         id: &str,
@@ -76,7 +79,7 @@ impl Memory {
         }
         let mut l = self.ledger.lock().await;
         let task = l.get(id).await?;
-        self.task_in_grants(&task)?;
+        self.read_task(&task)?;
         if task.spec.domain != domain {
             return Err(Error::Denied(format!("{id} is not a task of {domain}")));
         }
@@ -293,5 +296,61 @@ mod tests {
             .post(&other, "https://x/1", "dom-other", Label::Internal)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_tap_s_handling_bounds_the_tasks_it_is_handed_and_may_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        // a restricted task whose handoff is internal: only the task is above the tap
+        let h = m
+            .write(WriteRequest {
+                entry_type: EntryType::Handoff,
+                body: "Done.\n".into(),
+                classification: Some(Label::Internal),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let id = {
+            let mut l = m.ledger.lock().await;
+            let t = l
+                .create(TaskSpec {
+                    domain: "dom-me".into(),
+                    title: "Rotate the signing key".into(),
+                    body: "Do it.\n".into(),
+                    requirements: vec![],
+                    depends_on: vec![],
+                    origin: Some("github:acme/x#9".into()),
+                    upstream_event: Some("open:2026-10-01T09:00:00Z".into()),
+                    created_by: String::new(),
+                    classification: Label::Restricted,
+                    priority: 0,
+                })
+                .await
+                .unwrap()
+                .task;
+            l.admit(&t.id).await.unwrap();
+            l.claim(&t.id, "w", time::Duration::minutes(5), &[])
+                .await
+                .unwrap();
+            l.complete(&t.id, "w", &h.id).await.unwrap();
+            t.id
+        };
+        let tap = Memory::open(dir.path())
+            .unwrap()
+            .with_author("tap:comments")
+            .with_handling_cap(Label::Internal)
+            .without_read_log();
+        let due = tap.unposted("dom-me", Label::Restricted).await.unwrap();
+        assert!(
+            due.iter().all(|(t, _)| t.id != id),
+            "a task above the tap's handling is handed out: {due:?}"
+        );
+        assert!(tap
+            .post(&id, "https://x/9", "dom-me", Label::Restricted)
+            .await
+            .is_err());
+        assert_eq!(m.get_task(&id).await.unwrap().posted_to, None);
     }
 }

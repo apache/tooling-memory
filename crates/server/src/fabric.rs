@@ -194,7 +194,8 @@ impl Memory {
             .unwrap_or_else(|| (Rubric::default(), "default".into()))
     }
 
-    /// Rank a domain's open tasks by the rubric, once: the paper's cycle.
+    /// Rank a domain's open tasks by the rubric, once: the paper's cycle. Every open task
+    /// is ranked; the changes reported are those within the session's handling, read.
     ///
     /// # Errors
     ///
@@ -240,6 +241,15 @@ impl Memory {
                 });
             }
         }
+        // the queue is ranked whole, since rank lent by a task this session may not see
+        // is rank all the same; what the session is told of is what it may see, read
+        let handling = self.handling()?;
+        let seen: Vec<Task> = open
+            .into_iter()
+            .filter(|t| self.sees(t, handling) && changed.iter().any(|c| c.id == t.id))
+            .collect();
+        changed.retain(|c| seen.iter().any(|t| t.id == c.id));
+        self.read_tasks(seen)?;
         Ok(Rescore {
             domain,
             rubric: from,
@@ -251,7 +261,8 @@ impl Memory {
 
     /// How tasks flow in a domain, the paper's fabric telemetry: by family, how many
     /// are in each status; why tasks were invalidated; and the requirements of waiting
-    /// tasks that no completed task ever carried, a fleet capability gap.
+    /// tasks that no completed task ever carried, a fleet capability gap. Only tasks
+    /// within the session's handling are counted, and each counted is read.
     ///
     /// # Errors
     ///
@@ -270,7 +281,7 @@ impl Memory {
             Status::Completed,
             Status::Invalidated,
         ] {
-            for t in l.list(&domain, status).await? {
+            for t in self.read_tasks(l.list(&domain, status).await?)? {
                 *by_family
                     .entry(family(&t))
                     .or_default()

@@ -169,8 +169,12 @@ async fn run(
     .await
 }
 
+/// The proposed tasks, listed by a session of the owner's own: a listing is a read and
+/// raises the label of the session that lists, so the tap's session does not list.
 async fn proposed(memory: &Memory) -> Vec<dm_ledger::Task> {
-    memory
+    Memory::open(memory.root())
+        .unwrap()
+        .without_read_log()
         .tasks(Some("dom-widgets"), dm_ledger::Status::Proposed)
         .await
         .unwrap()

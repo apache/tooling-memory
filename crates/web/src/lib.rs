@@ -1930,6 +1930,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_board_leaves_out_a_task_above_the_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("memory");
+        let owner = Memory::init(&root, "human:test:me", "dom-me").unwrap();
+        let mut hidden = String::new();
+        for (title, classification) in [
+            ("Rotate the signing key", dm_core::Label::Restricted),
+            ("Tidy the docs", dm_core::Label::Public),
+        ] {
+            let t = owner
+                .file_own(dm_ledger::TaskSpec {
+                    domain: "dom-me".into(),
+                    title: title.into(),
+                    body: "Do it.".into(),
+                    requirements: vec!["human".into()],
+                    depends_on: vec![],
+                    origin: None,
+                    upstream_event: None,
+                    created_by: String::new(),
+                    classification,
+                    priority: 0,
+                })
+                .await
+                .unwrap()
+                .task;
+            if t.status == dm_ledger::Status::Proposed {
+                owner.admit(&t.id).await.unwrap();
+            }
+            if classification == dm_core::Label::Restricted {
+                hidden = t.id;
+            }
+        }
+        drop(owner);
+        // the board's handling drops to internal, under the restricted task
+        let grants = root.join("grants.toml");
+        let lowered = std::fs::read_to_string(&grants)
+            .unwrap()
+            .replace("handling = \"restricted\"", "handling = \"internal\"");
+        assert!(lowered.contains("handling = \"internal\""));
+        std::fs::write(&grants, lowered).unwrap();
+        let app = router(config(dir.path(), &["true"])).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (_, all) = get_json(addr, "/api/tasks").await;
+        let all = all.to_string();
+        assert!(all.contains("Tidy the docs"), "{all}");
+        assert!(!all.contains("signing key"), "{all}");
+        for path in ["tree", "claim"] {
+            let method = if path == "tree" { "GET" } else { "POST" };
+            let (status, body) =
+                http(addr, method, &format!("/api/tasks/{hidden}/{path}"), None).await;
+            let (missing, _) = http(
+                addr,
+                method,
+                &format!("/api/tasks/task-me-none/{path}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, missing, "{path}: {body}");
+            assert!(!body.contains("signing key"), "{path}: {body}");
+        }
+    }
+
+    #[tokio::test]
     async fn the_board_files_admits_claims_and_completes_a_person_s_task() {
         let dir = tempfile::tempdir().unwrap();
         let (addr, _h) = start(dir.path(), &["true"]).await;
