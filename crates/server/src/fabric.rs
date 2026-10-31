@@ -227,7 +227,10 @@ impl Memory {
     }
 
     /// Rank a domain's open tasks by the rubric, once: the paper's cycle. Every open task
-    /// is ranked; the changes reported are those within the session's handling, read.
+    /// is ranked, whatever the session's handling; the changes reported are those within
+    /// it, read, and only those whose rank came from nothing above it. The report hides
+    /// the reason, not the effect: the rank a hidden task lends is stored, and a listing
+    /// shows the priority it set, from which a hidden task's rank can be read.
     ///
     /// # Errors
     ///
@@ -277,7 +280,9 @@ impl Memory {
         // the queue is ranked whole, since rank lent by a task this session may not see
         // is rank all the same; the session is told only of a change to a task it may
         // see whose rank came from nothing it may not see, however far back, since the
-        // reason names the lender and the new rank gives its rank away
+        // reason names the lender and the new rank gives its rank away. This hides the
+        // reason, not the effect: the stored priority is the same rank, and tasks() shows
+        // it, so a hidden task's rank is still readable from what it lifted
         let handling = self.handling()?;
         let visible: HashMap<&str, &Task> = open
             .iter()

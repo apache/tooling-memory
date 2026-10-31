@@ -4955,6 +4955,184 @@ mod tests {
         assert_eq!(closed.status, Status::Invalidated);
     }
 
+    /// An internal task on the ledger, in `st`, held by `holder` when claimed.
+    async fn internal_in(m: &Memory, st: Status, holder: &str) -> String {
+        let mut l = m.ledger.lock().await;
+        let t = l
+            .create(TaskSpec {
+                classification: Label::Internal,
+                ..tspec("Tidy the internal docs", 0, None, &[], &[])
+            })
+            .await
+            .unwrap()
+            .task;
+        if st != Status::Proposed {
+            l.admit(&t.id).await.unwrap();
+        }
+        if matches!(st, Status::Claimed | Status::Completed) {
+            l.claim(&t.id, holder, Duration::minutes(5), &[], Label::Restricted)
+                .await
+                .unwrap();
+        }
+        if st == Status::Completed {
+            l.complete(&t.id, holder, "mem-me-x").await.unwrap();
+        }
+        t.id
+    }
+
+    #[tokio::test]
+    async fn a_refused_fan_out_does_not_raise_the_label_to_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = {
+            let m = mem(dir.path());
+            let mut l = m.ledger.lock().await;
+            let root = l
+                .create(TaskSpec {
+                    classification: Label::Internal,
+                    ..tspec("Root", 0, None, &[], &[])
+                })
+                .await
+                .unwrap()
+                .task;
+            let child = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some("one".into()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            l.create(TaskSpec {
+                origin: Some(dm_ledger::continues(&root.id)),
+                upstream_event: Some("two".into()),
+                depends_on: vec![child.id],
+                ..restricted("Resume: Root")
+            })
+            .await
+            .unwrap();
+            root.id
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Internal);
+        assert!(matches!(
+            capped
+                .fan_out(&root, &[("More".into(), "Do more.".into())])
+                .await,
+            Err(Error::Denied(_))
+        ));
+        assert_eq!(
+            capped.label(),
+            Label::Public,
+            "a refused fan-out read its parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_completion_does_not_raise_the_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = internal_in(&mem(dir.path()), Status::Claimed, "human:test:me").await;
+        let full = Memory::open(dir.path()).unwrap();
+        assert!(matches!(
+            full.complete(&held, "mem-me-none").await,
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(
+            full.label(),
+            Label::Public,
+            "a completion refused for its handoff read the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_invalidation_does_not_raise_the_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let done = internal_in(&mem(dir.path()), Status::Completed, "w").await;
+        let full = Memory::open(dir.path()).unwrap();
+        assert!(matches!(
+            full.invalidate(&done, "late", None).await,
+            Err(Error::Ledger(dm_ledger::Error::WrongState { .. }))
+        ));
+        assert_eq!(
+            full.label(),
+            Label::Public,
+            "an invalidation refused by the ledger read the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_release_does_not_raise_the_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = internal_in(&mem(dir.path()), Status::Claimed, "w").await;
+        let full = Memory::open(dir.path()).unwrap();
+        assert!(matches!(
+            full.release(&theirs, None).await,
+            Err(Error::Ledger(dm_ledger::Error::NotHolder { .. }))
+        ));
+        assert_eq!(
+            full.label(),
+            Label::Public,
+            "a release refused by the ledger read the task"
+        );
+    }
+
+    /// The floor lifts the best curation task over the top delivery task. When that
+    /// delivery task is hidden, the lift is not reported: its new rank is the hidden
+    /// task's rank plus one.
+    #[tokio::test]
+    async fn the_floor_s_report_leaves_out_a_lift_over_a_hidden_delivery_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, curation) = {
+            let m = mem(dir.path());
+            done(&m, tspec("Shipped", 0, None, &[], &[])).await;
+            let mut l = m.ledger.lock().await;
+            let hidden = l
+                .create(TaskSpec {
+                    classification: Label::Restricted,
+                    ..tspec("Rotate the signing key", 50, None, &[], &[])
+                })
+                .await
+                .unwrap()
+                .task;
+            let curation = l
+                .create(tspec(
+                    "Resummarise",
+                    -1,
+                    Some("librarian:resummarise"),
+                    &[],
+                    &[],
+                ))
+                .await
+                .unwrap()
+                .task;
+            for t in [&hidden, &curation] {
+                l.admit(&t.id).await.unwrap();
+            }
+            (hidden.id, curation.id)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let r = capped.rescore(None).await.unwrap();
+        assert!(r.maintenance_share < r.floor);
+        let text = serde_json::to_string(&r.changed).unwrap();
+        assert!(!text.contains(&hidden), "{text}");
+        assert!(
+            r.changed.iter().all(|c| c.id != curation),
+            "the floor's lift over a hidden task is reported: {text}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        let full = Memory::open(dir.path()).unwrap();
+        let lifted = full.get_task(&curation).await.unwrap();
+        let top = full.get_task(&hidden).await.unwrap();
+        assert_eq!(
+            lifted.spec.priority,
+            top.spec.priority + 1,
+            "the lift stands"
+        );
+    }
+
     #[tokio::test]
     async fn a_retry_is_classified_by_what_it_carries_not_by_what_it_passed() {
         let dir = tempfile::tempdir().unwrap();
