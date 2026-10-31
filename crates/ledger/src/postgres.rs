@@ -15,6 +15,7 @@
 //! connections cannot both win the same task.
 
 use crate::{claimable, parse_time, Error, Event, RawTask, Status, Task, TaskSpec, TASK_COLUMNS};
+use dm_core::Label;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use time::OffsetDateTime;
@@ -255,6 +256,7 @@ impl Db {
         holder: &str,
         until: OffsetDateTime,
         manifest: &[String],
+        handling: Label,
     ) -> Result<Option<String>, Error> {
         let Some(s) = self.schema(domain).await? else {
             return Ok(None);
@@ -273,7 +275,7 @@ impl Db {
             .await?;
         for row in &rows {
             let seen = task_from_row(row)?;
-            if !claimable(&seen, now, manifest) {
+            if !claimable(&seen, now, manifest, handling) {
                 continue;
             }
             let Some(locked) = tx
@@ -289,7 +291,7 @@ impl Db {
                 continue;
             };
             let task = task_from_row(&locked)?;
-            if !claimable(&task, now, manifest)
+            if !claimable(&task, now, manifest, handling)
                 || !deps_complete(&tx, &task.spec.depends_on).await?
                 || awaits_continuation(&tx, &s, &task.id).await?
             {
@@ -313,6 +315,7 @@ impl Db {
         holder: &str,
         until: OffsetDateTime,
         manifest: &[String],
+        handling: Label,
     ) -> Result<(), Error> {
         let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
@@ -324,7 +327,7 @@ impl Db {
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         let task = task_from_row(&row)?;
-        if !claimable(&task, now, manifest)
+        if !claimable(&task, now, manifest, handling)
             || !deps_complete(&tx, &task.spec.depends_on).await?
             || awaits_continuation(&tx, &s, &task.id).await?
         {

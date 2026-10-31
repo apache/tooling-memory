@@ -1502,4 +1502,22 @@ mod tests {
         );
         assert_eq!(s.memory.label(), dm_core::Label::Public);
     }
+
+    #[tokio::test]
+    async fn claim_next_over_mcp_skips_a_task_above_the_session_s_handling() {
+        let (_dir, _hidden, s) = restricted_and_capped().await;
+        let claimed = payload(
+            &s.claim_next(Parameters(ClaimNextParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(claimed["task"]["title"], "Tidy the docs", "{claimed}");
+        let none = payload(
+            &s.claim_next(Parameters(ClaimNextParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(none["task"].is_null(), "{none}");
+        assert_eq!(s.memory.label(), dm_core::Label::Public);
+    }
 }

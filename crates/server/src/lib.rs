@@ -1090,6 +1090,7 @@ impl Memory {
             &self.author,
             Duration::minutes(5),
             &task.spec.requirements,
+            self.handling()?,
         )
         .await?;
         l.complete(task_id, &self.author, &id).await?;
@@ -1920,7 +1921,9 @@ impl Memory {
     }
 
     /// Claim the highest-ranked claimable task in a domain that this session's manifest
-    /// can take.
+    /// can take and its handling covers. The ledger passes over a task above the
+    /// handling inside the claim's own transaction, so such a task is never claimed,
+    /// and never offered, to this session.
     ///
     /// # Errors
     ///
@@ -1931,11 +1934,12 @@ impl Memory {
         lease: Duration,
     ) -> Result<Option<Claim>, Error> {
         let domain = self.resolve_domain(domain)?;
+        let handling = self.handling()?;
         let claim = self
             .ledger
             .lock()
             .await
-            .claim_next(&domain, &self.author, lease, &self.manifest)
+            .claim_next(&domain, &self.author, lease, &self.manifest, handling)
             .await?;
         if let Some(c) = &claim {
             lock(&self.session).observe(c.task.spec.classification);
@@ -1943,15 +1947,19 @@ impl Memory {
         Ok(claim)
     }
 
-    /// Claim one named task.
+    /// Claim one named task. A task above the session's handling is not found, as it is
+    /// to every other read, and the ledger refuses it too.
     ///
     /// # Errors
     ///
-    /// A ledger error, or a task outside the grants.
+    /// A ledger error, including a task outside the grants or above the handling.
     pub async fn claim(&self, id: &str, lease: Duration) -> Result<Claim, Error> {
         let mut l = self.ledger.lock().await;
         self.read_task(&l.get(id).await?)?;
-        let c = l.claim(id, &self.author, lease, &self.manifest).await?;
+        let handling = self.handling()?;
+        let c = l
+            .claim(id, &self.author, lease, &self.manifest, handling)
+            .await?;
         lock(&self.session).observe(c.task.spec.classification);
         Ok(c)
     }
@@ -3171,9 +3179,15 @@ mod tests {
     async fn done(m: &Memory, s: TaskSpec) {
         let t = filed(m, s).await;
         let mut l = m.ledger.lock().await;
-        l.claim(&t.id, "w", Duration::minutes(5), &t.spec.requirements)
-            .await
-            .unwrap();
+        l.claim(
+            &t.id,
+            "w",
+            Duration::minutes(5),
+            &t.spec.requirements,
+            Label::Restricted,
+        )
+        .await
+        .unwrap();
         l.complete(&t.id, "w", "mem-x").await.unwrap();
     }
 
@@ -3238,7 +3252,7 @@ mod tests {
             .ledger
             .lock()
             .await
-            .claim_next("dom-me", "w2", Duration::minutes(5), &[])
+            .claim_next("dom-me", "w2", Duration::minutes(5), &[], Label::Restricted)
             .await
             .unwrap()
             .unwrap();
@@ -4284,7 +4298,9 @@ mod tests {
             l.admit(id).await.unwrap();
         }
         if matches!(st, Status::Claimed | Status::Completed) {
-            l.claim(id, "w", Duration::minutes(5), &[]).await.unwrap();
+            l.claim(id, "w", Duration::minutes(5), &[], Label::Restricted)
+                .await
+                .unwrap();
         }
         if st == Status::Completed {
             l.complete(id, "w", "mem-me-x").await.unwrap();
@@ -4395,9 +4411,15 @@ mod tests {
                 .unwrap()
                 .task;
             l.admit(&hidden.id).await.unwrap();
-            l.claim(&hidden.id, "w", Duration::minutes(5), &[])
-                .await
-                .unwrap();
+            l.claim(
+                &hidden.id,
+                "w",
+                Duration::minutes(5),
+                &[],
+                Label::Restricted,
+            )
+            .await
+            .unwrap();
             l.complete(&hidden.id, "w", "mem-me-x").await.unwrap();
             (root, hidden)
         };
@@ -4476,6 +4498,73 @@ mod tests {
             None
         );
         assert_eq!(capped.label(), Label::Public);
+    }
+
+    /// A restricted task at priority 10 and a public one at 1, both admitted.
+    async fn restricted_over_public(m: &Memory) -> (String, String) {
+        let mut l = m.ledger.lock().await;
+        let mut ids = Vec::new();
+        for s in [
+            TaskSpec {
+                priority: 10,
+                ..restricted("Rotate the signing key")
+            },
+            tspec("Tidy the docs", 1, None, &[], &[]),
+        ] {
+            let t = l.create(s).await.unwrap().task;
+            l.admit(&t.id).await.unwrap();
+            ids.push(t.id);
+        }
+        (ids.remove(0), ids.remove(0))
+    }
+
+    #[tokio::test]
+    async fn claim_next_offers_a_task_only_to_a_session_whose_handling_covers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, shown) = restricted_over_public(&mem(dir.path())).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let c = capped
+            .claim_next(None, Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.task.id, shown, "the top task it can handle");
+        assert!(capped
+            .claim_next(None, Duration::minutes(5))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(capped.label(), Label::Public);
+        let full = Memory::open(dir.path()).unwrap();
+        let c = full
+            .claim_next(None, Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.task.id, hidden);
+        assert_eq!(full.label(), Label::Restricted);
+    }
+
+    #[tokio::test]
+    async fn a_named_claim_above_the_session_s_handling_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, _) = restricted_over_public(&mem(dir.path())).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        assert!(
+            matches!(
+                capped.claim(&hidden, Duration::minutes(5)).await,
+                Err(Error::Ledger(dm_ledger::Error::NotFound(_)))
+            ),
+            "a public session claims a restricted task"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        let full = Memory::open(dir.path()).unwrap();
+        full.claim(&hidden, Duration::minutes(5)).await.unwrap();
+        assert_eq!(full.label(), Label::Restricted);
     }
 
     #[tokio::test]

@@ -331,9 +331,15 @@ mod tests {
                 .unwrap()
                 .task;
             l.admit(&t.id).await.unwrap();
-            l.claim(&t.id, "w", time::Duration::minutes(5), &[])
-                .await
-                .unwrap();
+            l.claim(
+                &t.id,
+                "w",
+                time::Duration::minutes(5),
+                &[],
+                Label::Restricted,
+            )
+            .await
+            .unwrap();
             l.complete(&t.id, "w", &h.id).await.unwrap();
             t.id
         };
