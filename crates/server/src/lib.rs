@@ -5134,6 +5134,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_request_view_reads_within_the_policy_s_scope_not_the_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let internal = {
+            let mut l = owner.ledger.lock().await;
+            l.create(TaskSpec {
+                classification: Label::Internal,
+                ..tspec("Tidy the internal docs", 0, None, &[], &[])
+            })
+            .await
+            .unwrap()
+            .task
+            .id
+        };
+        // the root's own policy: the built-in one with agents narrowed to public
+        let text = dm_policy::decide::BUILTIN.replace(
+            "read_filter := base_filter\n",
+            "read_filter := object.union(base_filter, {\"handling\": \"public\"}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n",
+        );
+        std::fs::create_dir_all(dir.path().join("policy")).unwrap();
+        std::fs::write(dir.path().join("policy/local.rego"), text).unwrap();
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:narrowed");
+        assert!(agent.get_task(&internal).await.is_err());
+        let view = agent.for_request().unwrap();
+        assert!(
+            view.get_task(&internal).await.is_err(),
+            "a view read above the policy's scope, at the grants' handling"
+        );
+        assert_eq!(view.label(), Label::Public);
+    }
+
+    #[tokio::test]
+    async fn an_invalidation_is_refused_for_hidden_work_however_far_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, child, grandchild) = {
+            let m = mem(dir.path());
+            let mut l = m.ledger.lock().await;
+            let root = l
+                .create(tspec("Root", 0, None, &[], &[]))
+                .await
+                .unwrap()
+                .task;
+            let child = l
+                .create(tspec(
+                    "Child",
+                    0,
+                    Some(&format!("task:{}", root.id)),
+                    &[],
+                    &[],
+                ))
+                .await
+                .unwrap()
+                .task;
+            let grandchild = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", child.id)),
+                    upstream_event: Some("deep".into()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            (root, child, grandchild)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        match capped.invalidate(&root.id, "closed", None).await {
+            Err(Error::Denied(why)) => {
+                assert!(
+                    !why.contains(&grandchild.id) && !why.contains("signing key"),
+                    "{why}"
+                );
+            }
+            other => panic!("an invalidation closed a hidden grandchild: {other:?}"),
+        }
+        let l = capped.ledger.lock().await;
+        for t in [&root, &child, &grandchild] {
+            assert_eq!(l.get(&t.id).await.unwrap().status, t.status, "{}", t.id);
+        }
+    }
+
+    /// Root R has a hidden dropped child A with hash h; the retry Rt of R has a hidden
+    /// open child B with the same hash. A is elsewhere and dropped, so h is new work
+    /// under Rt by the chain's reading; the ledger then hands B back, and B is withheld.
+    #[tokio::test]
+    async fn a_spawn_the_ledger_dedups_to_a_hidden_task_is_withheld_not_handed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = dm_core::digest("Rotate it.")[..16].to_string();
+        let (retry, b) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let a = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(hash.clone()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            move_to(&mut l, &a.id, Status::Invalidated).await;
+            let retry = l
+                .create(TaskSpec {
+                    domain: "dom-me".into(),
+                    origin: Some(format!("retries:{}", root.id)),
+                    ..spec("Root")
+                })
+                .await
+                .unwrap()
+                .task;
+            let b = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", retry.id)),
+                    upstream_event: Some(hash.clone()),
+                    ..restricted("Rotate the signing key again")
+                })
+                .await
+                .unwrap()
+                .task;
+            (retry, b)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let f = capped
+            .fan_out(&retry.id, &[("Again".into(), "Rotate it.".into())])
+            .await
+            .unwrap();
+        assert_eq!(
+            (f.children.len(), f.existing.len(), f.withheld),
+            (0, 0, 1),
+            "{f:?}"
+        );
+        let answer = serde_json::to_string(&f).unwrap();
+        assert!(
+            !answer.contains(&b.id) && !answer.contains("signing key"),
+            "{answer}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+    }
+
+    #[tokio::test]
     async fn a_retry_is_classified_by_what_it_carries_not_by_what_it_passed() {
         let dir = tempfile::tempdir().unwrap();
         let m = mem(dir.path());
