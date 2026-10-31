@@ -2182,11 +2182,14 @@ impl Memory {
 
     /// Close a task without doing it, and everything still open that was filed from it:
     /// its subagent tasks, their continuations, and theirs, since a promise withdrawn
-    /// withdraws the promises made to keep it.
+    /// withdraws the promises made to keep it. Open work this session may not read is
+    /// not its to close: the call is refused before anything moves, and the refusal
+    /// names nothing of that work.
     ///
     /// # Errors
     ///
-    /// A ledger error, or a task outside the grants.
+    /// A ledger error, or a task outside the grants; [`Error::Denied`] when an open task
+    /// filed from it, however far down, is above the session's handling.
     pub async fn invalidate(
         &self,
         id: &str,
@@ -2195,18 +2198,30 @@ impl Memory {
     ) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
         self.check_task(&l.get(id).await?)?;
-        let task = l.invalidate(id, reason, superseded_by).await?;
+        let handling = self.handling()?;
+        let mut open = Vec::new();
         let mut pending = l.filed_from(id).await?;
         while let Some(t) = pending.pop() {
             pending.extend(l.filed_from(&t.id).await?);
-            if !t.status.is_terminal() {
-                l.invalidate(
-                    &t.id,
-                    &format!("filed from {id}, which was invalidated: {reason}"),
-                    superseded_by,
-                )
-                .await?;
+            if t.status.is_terminal() {
+                continue;
             }
+            if !self.sees(&t, handling) {
+                return Err(Error::Denied(
+                    "this task has open work this session may not read; it is not invalidated here"
+                        .into(),
+                ));
+            }
+            open.push(t.id);
+        }
+        let task = l.invalidate(id, reason, superseded_by).await?;
+        for t in open {
+            l.invalidate(
+                &t,
+                &format!("filed from {id}, which was invalidated: {reason}"),
+                superseded_by,
+            )
+            .await?;
         }
         self.observe_task(&task);
         Ok(task)
@@ -4901,6 +4916,43 @@ mod tests {
             2,
             "nothing is filed"
         );
+    }
+
+    #[tokio::test]
+    async fn an_invalidation_that_would_close_hidden_work_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, cont, child) = hidden_continuation(&mem(dir.path())).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        match capped.invalidate(&root.id, "closed", None).await {
+            Err(Error::Denied(why)) => {
+                assert!(!why.contains(&cont.id) && !why.contains(&child.id), "{why}");
+                assert!(!why.contains("signing key"), "{why}");
+            }
+            other => panic!("an invalidation closed hidden work: {other:?}"),
+        }
+        {
+            let l = capped.ledger.lock().await;
+            for t in [&root, &cont, &child] {
+                assert_eq!(
+                    l.get(&t.id).await.unwrap().status,
+                    t.status,
+                    "{} is left as it was",
+                    t.id
+                );
+            }
+        }
+        assert_eq!(capped.label(), Label::Public);
+        // hidden work already closed is not closed again, so it does not stand in the way
+        {
+            let mut l = capped.ledger.lock().await;
+            for t in [&cont, &child] {
+                l.invalidate(&t.id, "dropped", None).await.unwrap();
+            }
+        }
+        let closed = capped.invalidate(&root.id, "closed", None).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
     }
 
     #[tokio::test]
