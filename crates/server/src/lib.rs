@@ -288,6 +288,11 @@ pub struct FanOut {
     /// with a handoff, or still open. A resumed run asks for what it asked for before;
     /// the answer is the earlier task, not another.
     pub existing: Vec<Task>,
+    /// How many items were not filed because the chain holds each of them in a task
+    /// this session may not read: open work, or work of this parent that is done or
+    /// dropped and that the ledger would hand back as the same task. Nothing of those
+    /// tasks is named. The count is all the answer says of them.
+    pub withheld: usize,
     /// Resumes the parent when the new children are done; none when nothing was new.
     pub continuation: Option<Task>,
 }
@@ -1735,30 +1740,36 @@ impl Memory {
     /// hold every child's handoff and the parent's own, which is what resuming is. Where
     /// the domain admits a session's own filings, everything filed here is admitted.
     ///
+    /// An item that matches a task this session may not read is withheld, not filed and
+    /// not named: the answer counts it and says nothing else of it. An item whose match
+    /// is elsewhere in the chain and done or dropped is new work here.
+    ///
     /// # Errors
     ///
     /// A parent outside the grants or above the handling, or a ledger error;
-    /// [`Error::Denied`] when an item matches a spawn this session may not read, or the
-    /// parent has an open continuation it may not read.
+    /// [`Error::Denied`] when the parent has an open continuation this session may not
+    /// read. That check runs before the items are matched, so the refusal is the same
+    /// whatever the items are.
     pub async fn fan_out(&self, parent: &str, items: &[(String, String)]) -> Result<FanOut, Error> {
         let mut l = self.ledger.lock().await;
         let parent = l.get(parent).await?;
         self.check_task(&parent)?;
         let handling = self.handling()?;
-        let (asked, existing) = self.spawns(&l, &parent, items, handling).await?;
+        // a harness that delegates twice from one run, as Claude Code does with one
+        // Agent call per subagent, gets one continuation waiting on all of them: an open
+        // continuation of this parent is folded into the new one and closed as superseded
+        let (mut ids, folded) = self.open_continuations(&l, &parent, handling).await?;
+        let (asked, mut existing, mut withheld) = self.spawns(&l, &parent, items, handling).await?;
         if asked.is_empty() {
             self.observe_task(&parent);
             existing.iter().for_each(|t| self.observe_task(t));
             return Ok(FanOut {
                 children: Vec::new(),
                 existing,
+                withheld,
                 continuation: None,
             });
         }
-        // a harness that delegates twice from one run, as Claude Code does with one
-        // Agent call per subagent, gets one continuation waiting on all of them: an open
-        // continuation of this parent is folded into the new one and closed as superseded
-        let (mut ids, folded) = self.open_continuations(&l, &parent, handling).await?;
         let mut children = Vec::new();
         for (title, body, hash) in asked {
             let created = l
@@ -1775,6 +1786,17 @@ impl Memory {
                     priority: parent.spec.priority,
                 })
                 .await?;
+            // the ledger dedups on the parent and the hash whatever the task's status: a
+            // task it hands back is not this call's, and one this session may not read
+            // is withheld, never handed out
+            if created.deduplicated {
+                if self.sees(&created.task, handling) {
+                    existing.push(created.task);
+                } else {
+                    withheld += 1;
+                }
+                continue;
+            }
             let child = self
                 .admit_per_policy(&mut l, created.task, Filing::Held, Some(&parent))
                 .await?;
@@ -1782,6 +1804,16 @@ impl Memory {
                 ids.push(child.id.clone());
             }
             children.push(child);
+        }
+        if children.is_empty() {
+            self.observe_task(&parent);
+            existing.iter().for_each(|t| self.observe_task(t));
+            return Ok(FanOut {
+                children,
+                existing,
+                withheld,
+                continuation: None,
+            });
         }
         let continuation = self.file_continuation(&mut l, &parent, ids).await?;
         for old in folded {
@@ -1800,28 +1832,34 @@ impl Memory {
         Ok(FanOut {
             children,
             existing,
+            withheld,
             continuation: Some(continuation),
         })
     }
 
-    /// The items of a fan-out to file, each with the hash that names it, and the tasks
-    /// the chain already holds for the others: what an earlier run of the chain asked
-    /// for is not asked again. An item that matches a task this session may not see is
-    /// refused, as a filing that dedups against one is: filing it again would break
-    /// "the same spawn asked twice is one task", and the refusal names nothing of it.
+    /// The items of a fan-out to file, each with the hash that names it; the tasks the
+    /// chain already holds for the others, since what an earlier run of the chain asked
+    /// for is not asked again; and how many items are withheld. An item that matches a
+    /// task this session may not see is withheld when that task is open, or when it is
+    /// this parent's, since the ledger would hand that task back; filing it again would
+    /// break "the same spawn asked twice is one task", and the count names nothing of
+    /// it. A hidden match elsewhere in the chain that is done or dropped is new work
+    /// here: a retry asks again for what an earlier attempt gave up on.
     async fn spawns(
         &self,
         l: &Ledger,
         parent: &Task,
         items: &[(String, String)],
         handling: Label,
-    ) -> Result<(Vec<(String, String, String)>, Vec<Task>), Error> {
+    ) -> Result<(Vec<(String, String, String)>, Vec<Task>, usize), Error> {
         // the chain this parent belongs to: a continuation or a retry resumes a root
         let root = Memory::root_of(l, parent).await;
         let mut done = Vec::new();
         Memory::tree_in(l, root).await?.flatten(&mut done);
+        let of_parent = format!("task:{}", parent.id);
         let mut asked = Vec::new();
         let mut existing = Vec::new();
+        let mut withheld = 0;
         for (title, body) in items {
             let hash = dm_core::digest(body)[..16].to_string();
             let earlier = done.iter().find(|t| {
@@ -1833,16 +1871,15 @@ impl Memory {
             });
             match earlier {
                 Some(t) if self.sees(t, handling) => existing.push(t.clone()),
-                Some(_) => {
-                    return Err(Error::Denied(
-                        "this spawn was asked for before in this chain, in a task this session may not read"
-                            .into(),
-                    ))
+                Some(t)
+                    if !t.status.is_terminal() || t.spec.origin.as_deref() == Some(&of_parent) =>
+                {
+                    withheld += 1;
                 }
-                None => asked.push((title.clone(), body.clone(), hash)),
+                _ => asked.push((title.clone(), body.clone(), hash)),
             }
         }
-        Ok((asked, existing))
+        Ok((asked, existing, withheld))
     }
 
     /// File the continuation that resumes `parent` once `ids` are done.
@@ -1882,7 +1919,8 @@ impl Memory {
     /// for, which the new one waits for too. A continuation this session may not see, or
     /// one waiting on a task it may not see, is not its to fold: the fan-out is refused,
     /// so no hidden work is closed, or waited on unseen, by a session that cannot read
-    /// it. The refusal names nothing of it.
+    /// it. The refusal names nothing of it, and it comes before the items are looked at,
+    /// so it is the same refusal whatever they are.
     async fn open_continuations(
         &self,
         l: &Ledger,
@@ -4551,15 +4589,22 @@ mod tests {
             .with_handling_cap(Label::Public);
         let tree = serde_json::to_string(&capped.task_tree(&root.id).await.unwrap()).unwrap();
         assert!(!tree.contains("signing key"), "{tree}");
-        // the same spawn as a hidden child is refused, as a filing that dedups against a
-        // hidden task is, and the refusal names nothing of it
-        match capped
+        // the same spawn as a hidden child of this parent is withheld: the ledger holds
+        // it as that child, which is not handed out, and the answer names nothing of it
+        let f = capped
             .fan_out(&root.id, &[("Again".into(), "Rotate it.".into())])
             .await
-        {
-            Err(Error::Denied(why)) => assert!(!why.contains(&hidden.id), "{why}"),
-            other => panic!("a spawn matching a hidden child: {other:?}"),
-        }
+            .unwrap();
+        assert_eq!((f.children.len(), f.existing.len(), f.withheld), (0, 0, 1));
+        assert!(
+            f.continuation.is_none(),
+            "nothing new, nothing to resume for"
+        );
+        let answer = serde_json::to_string(&f).unwrap();
+        assert!(
+            !answer.contains(&hidden.id) && !answer.contains("signing key"),
+            "{answer}"
+        );
         assert_eq!(capped.label(), Label::Public);
         let retry = capped.retry_task(&root.id).await.unwrap();
         assert!(
@@ -4647,6 +4692,185 @@ mod tests {
         assert!(
             first.get_task(&t.id).await.is_ok(),
             "one ledger behind every view"
+        );
+    }
+
+    /// With a hidden open continuation on the root, a spawn that matches its hidden
+    /// child and one that matches nothing get one and the same refusal: the answer
+    /// does not say which guess was right.
+    #[tokio::test]
+    async fn a_fan_out_refused_for_hidden_work_says_the_same_whatever_the_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, cont, child) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let child = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(dm_core::digest("Rotate it.")[..16].to_string()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            let cont = l
+                .create(TaskSpec {
+                    origin: Some(dm_ledger::continues(&root.id)),
+                    upstream_event: Some("two".into()),
+                    depends_on: vec![child.id.clone()],
+                    ..restricted("Resume: Root")
+                })
+                .await
+                .unwrap()
+                .task;
+            (root, cont, child)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let mut answers = Vec::new();
+        for body in ["Rotate it.", "Something else."] {
+            match capped
+                .fan_out(&root.id, &[("Guess".into(), body.into())])
+                .await
+            {
+                Err(Error::Denied(why)) => answers.push(why),
+                other => panic!("a fan-out over hidden open work: {other:?}"),
+            }
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "the refusal tells a right guess from a wrong one"
+        );
+        for why in &answers {
+            assert!(!why.contains(&cont.id) && !why.contains(&child.id), "{why}");
+            assert!(!why.contains("signing key"), "{why}");
+        }
+        assert_eq!(capped.label(), Label::Public);
+        assert_eq!(
+            capped
+                .ledger
+                .lock()
+                .await
+                .filed_from(&root.id)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "nothing is filed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_fans_out_again_what_a_hidden_attempt_gave_up_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, hidden) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let hidden = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(dm_core::digest("Rotate it.")[..16].to_string()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            move_to(&mut l, &hidden.id, Status::Invalidated).await;
+            (root, hidden)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let retry = capped.retry_task(&root.id).await.unwrap();
+        let f = capped
+            .fan_out(
+                &retry.id,
+                &[
+                    ("Again".into(), "Rotate it.".into()),
+                    ("New".into(), "Something new.".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (f.children.len(), f.existing.len(), f.withheld),
+            (2, 0, 0),
+            "a dropped hidden spawn is new work for the retry: {f:?}"
+        );
+        let continuation = f.continuation.as_ref().expect("the retry is resumed");
+        assert_eq!(continuation.spec.depends_on.len(), 2);
+        let answer = serde_json::to_string(&f).unwrap();
+        assert!(!answer.contains(&hidden.id), "{answer}");
+        assert_eq!(capped.label(), Label::Public);
+    }
+
+    #[tokio::test]
+    async fn a_spawn_that_matches_hidden_open_work_is_withheld_and_the_rest_filed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, hidden) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let hidden = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(dm_core::digest("Rotate it.")[..16].to_string()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            l.admit(&hidden.id).await.unwrap();
+            (root, hidden)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let f = capped
+            .fan_out(
+                &root.id,
+                &[
+                    ("Again".into(), "Rotate it.".into()),
+                    ("New".into(), "Something new.".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (f.children.len(), f.existing.len(), f.withheld),
+            (1, 0, 1),
+            "{f:?}"
+        );
+        assert_eq!(f.children[0].spec.title, "New");
+        let continuation = f
+            .continuation
+            .as_ref()
+            .expect("the new child is waited for");
+        assert_eq!(
+            continuation.spec.depends_on,
+            vec![f.children[0].id.clone()],
+            "the hidden task is not this session's to wait on"
+        );
+        let answer = serde_json::to_string(&f).unwrap();
+        assert!(
+            !answer.contains(&hidden.id) && !answer.contains("signing key"),
+            "{answer}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        assert_eq!(
+            capped
+                .ledger
+                .lock()
+                .await
+                .get(&hidden.id)
+                .await
+                .unwrap()
+                .status,
+            Status::Admitted,
+            "the hidden task is left as it was"
         );
     }
 
