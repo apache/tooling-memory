@@ -49,9 +49,9 @@ impl Memory {
             if entry.front.classification > ceiling {
                 continue;
             }
-            self.read_task(&task)?;
             out.push((task, entry));
         }
+        out.iter().for_each(|(task, _)| self.observe_task(task));
         Ok(out)
     }
 
@@ -79,7 +79,7 @@ impl Memory {
         }
         let mut l = self.ledger.lock().await;
         let task = l.get(id).await?;
-        self.read_task(&task)?;
+        self.check_task(&task)?;
         if task.spec.domain != domain {
             return Err(Error::Denied(format!("{id} is not a task of {domain}")));
         }
@@ -89,7 +89,9 @@ impl Memory {
                 task.spec.classification
             )));
         }
-        Ok(l.post(id, to).await?)
+        let posted = l.post(id, to).await?;
+        self.observe_task(&posted);
+        Ok(posted)
     }
 }
 
@@ -358,5 +360,64 @@ mod tests {
             .await
             .is_err());
         assert_eq!(m.get_task(&id).await.unwrap().posted_to, None);
+    }
+
+    #[tokio::test]
+    async fn a_task_handed_to_a_tap_raises_its_label_as_its_handoff_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        // an internal task whose handoff is public: only the task raises the label
+        let h = m
+            .write(WriteRequest {
+                entry_type: EntryType::Handoff,
+                body: "Done.\n".into(),
+                classification: Some(Label::Public),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let id = {
+            let mut l = m.ledger.lock().await;
+            let t = l
+                .create(TaskSpec {
+                    domain: "dom-me".into(),
+                    title: "Internal work".into(),
+                    body: "Do it.\n".into(),
+                    requirements: vec![],
+                    depends_on: vec![],
+                    origin: Some("github:acme/x#4".into()),
+                    upstream_event: Some("open:2026-10-01T09:00:00Z".into()),
+                    created_by: String::new(),
+                    classification: Label::Internal,
+                    priority: 0,
+                })
+                .await
+                .unwrap()
+                .task;
+            l.admit(&t.id).await.unwrap();
+            l.claim(
+                &t.id,
+                "w",
+                time::Duration::minutes(5),
+                &[],
+                Label::Restricted,
+            )
+            .await
+            .unwrap();
+            l.complete(&t.id, "w", &h.id).await.unwrap();
+            t.id
+        };
+        let tap = Memory::open(dir.path())
+            .unwrap()
+            .with_author("tap:comments")
+            .without_read_log();
+        let due = tap.unposted("dom-me", Label::Internal).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0.id, id);
+        assert_eq!(
+            tap.label(),
+            Label::Internal,
+            "the task handed out is read, not only its handoff"
+        );
     }
 }

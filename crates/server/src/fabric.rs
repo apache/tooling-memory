@@ -63,49 +63,75 @@ fn family(t: &Task) -> String {
         .to_string()
 }
 
-type Ranks = HashMap<String, (i64, String)>;
+/// A rank the rubric gave a task: the rank, why, and every task it came from, however
+/// far back, so a report can leave out a rank lent by a task its reader may not see.
+#[derive(Clone, Debug)]
+struct Rank {
+    rank: i64,
+    why: String,
+    from: Vec<String>,
+}
+
+type Ranks = HashMap<String, Rank>;
+
+/// A task's current rank and the tasks it came from: its rank this cycle if it has one,
+/// else, for a claimed task, the priority it holds.
+fn current(ranks: &Ranks, claimed: &[Task], id: &str) -> Option<(i64, Vec<String>)> {
+    ranks.get(id).map(|r| (r.rank, r.from.clone())).or_else(|| {
+        claimed
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| (c.spec.priority, Vec::new()))
+    })
+}
+
+/// The best rank `t` may take from what it blocks and from its parent, if better than
+/// what it has: the rank, why, and where it came from.
+fn lent(t: &Task, open: &[Task], claimed: &[Task], rubric: &Rubric, ranks: &Ranks) -> Option<Rank> {
+    let mut best = ranks.get(&t.id).map_or(0, |r| r.rank);
+    let mut lent = None;
+    for d in open
+        .iter()
+        .chain(claimed)
+        .filter(|d| d.spec.depends_on.contains(&t.id))
+    {
+        if let Some((dr, from)) = current(ranks, claimed, &d.id) {
+            if dr + rubric.unblock_weight > best {
+                best = dr + rubric.unblock_weight;
+                lent = Some((format!("unblocks {}", d.id), d.id.clone(), from));
+            }
+        }
+    }
+    let parent = t
+        .spec
+        .origin
+        .as_deref()
+        .and_then(|o| o.strip_prefix("task:"));
+    if let Some((pr, from)) = parent.and_then(|p| current(ranks, claimed, p)) {
+        if pr > best {
+            best = pr;
+            let p = parent.unwrap_or_default().to_string();
+            lent = Some((format!("a child of {p}"), p, from));
+        }
+    }
+    lent.map(|(why, by, mut from)| {
+        from.insert(0, by);
+        Rank {
+            rank: best,
+            why,
+            from,
+        }
+    })
+}
 
 /// Raise blockers above what they block and children to their parents, until nothing
 /// moves; bounded by the number of tasks, since each pass settles at least one edge.
 fn propagate(open: &[Task], claimed: &[Task], rubric: &Rubric, ranks: &mut Ranks) {
-    let current = |ranks: &Ranks, id: &str| -> Option<i64> {
-        ranks
-            .get(id)
-            .map(|(r, _)| *r)
-            .or_else(|| claimed.iter().find(|c| c.id == id).map(|c| c.spec.priority))
-    };
     for _ in 0..=open.len() {
         let mut moved = false;
         for t in open {
-            let mut best = ranks.get(&t.id).map_or(0, |(r, _)| *r);
-            let mut why = None;
-            for d in open
-                .iter()
-                .chain(claimed)
-                .filter(|d| d.spec.depends_on.contains(&t.id))
-            {
-                if let Some(dr) = current(ranks, &d.id) {
-                    if dr + rubric.unblock_weight > best {
-                        best = dr + rubric.unblock_weight;
-                        why = Some(format!("unblocks {}", d.id));
-                    }
-                }
-            }
-            if let Some(parent) = t
-                .spec
-                .origin
-                .as_deref()
-                .and_then(|o| o.strip_prefix("task:"))
-            {
-                if let Some(pr) = current(ranks, parent) {
-                    if pr > best {
-                        best = pr;
-                        why = Some(format!("a child of {parent}"));
-                    }
-                }
-            }
-            if let Some(why) = why {
-                ranks.insert(t.id.clone(), (best, why));
+            if let Some(r) = lent(t, open, claimed, rubric, ranks) {
+                ranks.insert(t.id.clone(), r);
                 moved = true;
             }
         }
@@ -126,29 +152,35 @@ fn apply_floor(open: &[Task], completed: &[Task], rubric: &Rubric, ranks: &mut R
     if share >= rubric.maintenance_floor {
         return share;
     }
-    let rank_of = |t: &Task, ranks: &Ranks| ranks.get(&t.id).map_or(t.spec.priority, |(r, _)| *r);
+    let rank_of = |t: &Task, ranks: &Ranks| ranks.get(&t.id).map_or(t.spec.priority, |r| r.rank);
     let top_delivery = open
         .iter()
         .filter(|t| !maintenance(t))
-        .map(|t| rank_of(t, ranks))
-        .max();
+        .max_by_key(|t| rank_of(t, ranks));
     // the floor is for curation an agent can do; an alarm for the owner waits for a person
     let best_curation = open
         .iter()
         .filter(|t| maintenance(t) && !t.spec.requirements.iter().any(|r| r == "human"))
         .max_by_key(|t| rank_of(t, ranks));
     if let (Some(top), Some(c)) = (top_delivery, best_curation) {
-        if rank_of(c, ranks) <= top {
+        let top_rank = rank_of(top, ranks);
+        if rank_of(c, ranks) <= top_rank {
+            let mut from = ranks
+                .get(&top.id)
+                .map(|r| r.from.clone())
+                .unwrap_or_default();
+            from.insert(0, top.id.clone());
             ranks.insert(
                 c.id.clone(),
-                (
-                    top + 1,
-                    format!(
+                Rank {
+                    rank: top_rank + 1,
+                    why: format!(
                         "curation's floor: {:.0}% of the completed work, under {:.0}%",
                         share * 100.0,
                         rubric.maintenance_floor * 100.0
                     ),
-                ),
+                    from,
+                },
             );
         }
     }
@@ -216,40 +248,56 @@ impl Memory {
             let age = (now - t.created).whole_days() * rubric.age_weight_per_day;
             ranks.insert(
                 t.id.clone(),
-                (
-                    filed + weight + age,
-                    format!("filed at {filed}, origin {weight:+}, age {age:+}"),
-                ),
+                Rank {
+                    rank: filed + weight + age,
+                    why: format!("filed at {filed}, origin {weight:+}, age {age:+}"),
+                    from: Vec::new(),
+                },
             );
         }
         propagate(&open, &claimed, &rubric, &mut ranks);
         let share = apply_floor(&open, &completed, &rubric, &mut ranks);
         let mut changed = Vec::new();
         for t in &open {
-            let (to, why) = ranks
-                .get(&t.id)
-                .cloned()
-                .unwrap_or((t.spec.priority, String::new()));
-            if to != t.spec.priority {
-                l.rescore(&t.id, to, &why).await?;
-                changed.push(Change {
+            let Some(r) = ranks.get(&t.id).filter(|r| r.rank != t.spec.priority) else {
+                continue;
+            };
+            l.rescore(&t.id, r.rank, &r.why).await?;
+            changed.push((
+                Change {
                     id: t.id.clone(),
                     title: t.spec.title.clone(),
                     from: t.spec.priority,
-                    to,
-                    why,
-                });
-            }
+                    to: r.rank,
+                    why: r.why.clone(),
+                },
+                r.from.clone(),
+            ));
         }
         // the queue is ranked whole, since rank lent by a task this session may not see
-        // is rank all the same; what the session is told of is what it may see, read
+        // is rank all the same; the session is told only of a change to a task it may
+        // see whose rank came from nothing it may not see, however far back, since the
+        // reason names the lender and the new rank gives its rank away
         let handling = self.handling()?;
-        let seen: Vec<Task> = open
-            .into_iter()
-            .filter(|t| self.sees(t, handling) && changed.iter().any(|c| c.id == t.id))
+        let visible: HashMap<&str, &Task> = open
+            .iter()
+            .chain(&claimed)
+            .filter(|t| self.sees(t, handling))
+            .map(|t| (t.id.as_str(), t))
             .collect();
-        changed.retain(|c| seen.iter().any(|t| t.id == c.id));
-        self.read_tasks(seen)?;
+        let changed: Vec<Change> = changed
+            .into_iter()
+            .filter(|(c, from)| {
+                visible.contains_key(c.id.as_str())
+                    && from.iter().all(|f| visible.contains_key(f.as_str()))
+            })
+            .map(|(c, _)| c)
+            .collect();
+        for c in &changed {
+            if let Some(t) = visible.get(c.id.as_str()) {
+                self.observe_task(t);
+            }
+        }
         Ok(Rescore {
             domain,
             rubric: from,
