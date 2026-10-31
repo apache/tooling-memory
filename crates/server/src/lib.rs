@@ -1079,8 +1079,9 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for a task that is not a live promotion proposal or an
-    /// approval the policy refuses; a ledger or store error.
+    /// [`Error::Denied`] for a task that is not a live promotion proposal, an entry
+    /// that changed since it was proposed, or an approval the policy refuses; a ledger
+    /// or store error.
     pub async fn approve(&self, task_id: &str) -> Result<Promotion, Error> {
         let task = self.ledger.lock().await.get(task_id).await?;
         self.task_in_grants(&task)?;
@@ -1098,6 +1099,8 @@ impl Memory {
             return Err(Error::Denied(format!("{task_id} is {:?}", task.status)));
         }
         let (_, entry) = self.find(id).await?;
+        self.proposal_still_stands(&entry, &task.spec.created_by)
+            .await?;
         let d = self.decide_promotion(
             &entry,
             TrustTier::Verified,
@@ -1122,6 +1125,35 @@ impl Memory {
         .await?;
         l.complete(task_id, &self.author, &id).await?;
         Ok(promoted)
+    }
+
+    /// Whether the proposal `proposer` made is about the entry as it stands: the latest
+    /// record of their proposal to verified names the entry's current version. An entry
+    /// rewritten since, by the flag an erasure of an entry it cites puts on it or by any
+    /// other version, must be proposed again, or the approver would approve a version
+    /// the proposal did not name. A proposal from before records were kept has no record
+    /// and is approved as it was.
+    async fn proposal_still_stands(&self, entry: &Entry, proposer: &str) -> Result<(), Error> {
+        let records = self
+            .ledger
+            .lock()
+            .await
+            .promotions(&entry.front.domain, &entry.front.id)
+            .await?;
+        let Some(proposed) = records
+            .iter()
+            .rev()
+            .find(|r| r.spec.tier == TrustTier::Verified && r.spec.by == proposer)
+        else {
+            return Ok(());
+        };
+        if proposed.spec.digest != dm_core::digest(&entry.render()) {
+            return Err(Error::Denied(format!(
+                "{} changed since {proposer} proposed it: judge the entry as it stands and propose it again",
+                entry.front.id
+            )));
+        }
+        Ok(())
     }
 
     /// Why each promotion of an entry was made, oldest first: who moved which version to
@@ -3386,6 +3418,62 @@ mod tests {
                 "a task holds {text:?}: {t:?}"
             );
         }
+    }
+
+    /// An entry rewritten after it was proposed is not the entry the proposal named; the
+    /// approver is refused until it is proposed again, and then the new proposal lands.
+    #[tokio::test]
+    async fn an_approval_refuses_an_entry_that_changed_since_the_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let cited = owner.write(req("The cited fact.\n")).await.unwrap().id;
+        let x = owner
+            .write(req(&format!("A fact that rests on {cited}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        let Promotion::Proposed { task } = lib.promote(&x, TrustTier::Verified, WHY).await.unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        let proposed = owner.get(&x).await.unwrap();
+        // the erasure of what it cites flags it for review: a new version of it
+        owner.erase(&cited, Reason::Requested).await.unwrap();
+        let now = owner.get(&x).await.unwrap();
+        assert_ne!(now.render(), proposed.render(), "the entry changed");
+        let refused = owner.approve(&task.id).await;
+        assert!(
+            matches!(&refused, Err(Error::Denied(why)) if why.contains("changed since")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            owner.get(&x).await.unwrap().front.trust_tier,
+            TrustTier::Raw,
+            "nothing moved"
+        );
+        assert!(!owner.promotions(&x).await.unwrap()[0].landed);
+        // proposed again as it stands, then approved
+        let Promotion::Proposed { task: again } = lib
+            .promote(&x, TrustTier::Verified, "read it again after the flag")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        owner.approve(&again.id).await.unwrap();
+        assert_eq!(
+            owner.get(&x).await.unwrap().front.trust_tier,
+            TrustTier::Verified
+        );
+        let landed: Vec<bool> = owner
+            .promotions(&x)
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.landed)
+            .collect();
+        assert_eq!(landed, vec![false, true], "the first proposal never landed");
     }
 
     #[tokio::test]
