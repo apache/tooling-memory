@@ -7,6 +7,11 @@
   builds the browser reader for the first target. Thus each build of `amem` needs it. The
   second target builds the taps. `make check` lints the taps, and the tests of the tap
   host build them. Thus the gate needs the second target.
+- The build script of `dm-web` runs a second cargo for the reader. That cargo reads the
+  cargo config files and the environment. It does not get the command line of the first
+  cargo: `--config`, `--offline` and `--frozen` do not reach it. Put such a setting, for
+  example a vendored source replacement, in a cargo config file. For a build without the
+  network, set `CARGO_NET_OFFLINE=true`, or `net.offline = true` in a config file.
 - A C toolchain for the bundled SQLite: `build-essential` on Debian and Ubuntu, or the
   Visual Studio Build Tools on Windows.
 - `make`. On Windows, run the targets from Git Bash or WSL.

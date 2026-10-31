@@ -4,6 +4,7 @@
 //! embeds the two files; a test in `src/pages.rs` runs it again and compares, so an embed
 //! that does not follow its sources fails a test.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,10 +16,12 @@ pub const GLUE: &str = "dm_reader.js";
 /// The WebAssembly the glue loads.
 pub const WASM: &str = "dm_reader_bg.wasm";
 
-/// Rust flags and wrappers the outer build hands down, which are for its own target and
-/// not for the wasm: coverage instrumentation, which wasm32 cannot link, and `cargo
-/// clippy`, which would lint the reader a second time.
-const NOT_INHERITED: [&str; 8] = [
+/// What the outer build hands down that is not for the nested one: Rust flags and
+/// wrappers for its own target (coverage instrumentation, which wasm32 cannot link, and
+/// `cargo clippy`, which would lint the reader a second time), its target and build
+/// directories, and what cargo sets for this build script alone, which would otherwise
+/// reach the nested build's rustc and build scripts. `CARGO_CFG_*` goes too, below.
+const NOT_INHERITED: [&str; 15] = [
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_BUILD_RUSTFLAGS",
@@ -27,6 +30,13 @@ const NOT_INHERITED: [&str; 8] = [
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET",
     "CARGO_BUILD_TARGET_DIR",
+    "CARGO_BUILD_BUILD_DIR",
+    "OUT_DIR",
+    "TARGET",
+    "HOST",
+    "PROFILE",
+    "OPT_LEVEL",
+    "DEBUG",
 ];
 
 /// Where one build reads and writes.
@@ -113,37 +123,67 @@ fn target_installed(rustc: &Path) -> Result<(), String> {
     }
 }
 
+/// The environment the nested cargo runs in, from the outer one.
+///
+/// Its build directory is its target directory. A `build-dir` the user configured, in a
+/// cargo config file or `CARGO_BUILD_BUILD_DIR`, is the outer build's, and an outer
+/// release build holds its lock: a nested release build there waits for ever. The
+/// variable wins over a config file.
+///
 /// `cargo llvm-cov` makes itself the rustc wrapper, which instruments every workspace
 /// crate by name, `dm_core` among them, whatever the target. It keeps the wrapper it
 /// replaced, if any, in a variable of its own; the nested build gets that one back.
-fn without_coverage_wrapper(cmd: &mut Command) {
-    if std::env::var_os("__CARGO_LLVM_COV_RUSTC_WRAPPER").is_none() {
-        return;
-    }
-    match std::env::var_os("__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING") {
-        Some(wrapper) => cmd.env("RUSTC_WRAPPER", wrapper),
-        None => cmd.env_remove("RUSTC_WRAPPER"),
-    };
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("__CARGO_LLVM_COV") {
-            cmd.env_remove(name);
+fn nested_env(outer: &[(OsString, OsString)], target_dir: &Path) -> Vec<(OsString, OsString)> {
+    let coverage = outer
+        .iter()
+        .any(|(k, _)| k == "__CARGO_LLVM_COV_RUSTC_WRAPPER");
+    let mut env: Vec<(OsString, OsString)> = outer
+        .iter()
+        .filter(|(k, _)| {
+            let k = k.to_string_lossy();
+            let wrapper = coverage && (k == "RUSTC_WRAPPER" || k.starts_with("__CARGO_LLVM_COV"));
+            !(NOT_INHERITED.contains(&&*k) || k.starts_with("CARGO_CFG_") || wrapper)
+        })
+        .cloned()
+        .collect();
+    if coverage {
+        if let Some((_, w)) = outer
+            .iter()
+            .find(|(k, _)| k == "__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING")
+        {
+            env.push(("RUSTC_WRAPPER".into(), w.clone()));
         }
     }
+    env.push(("CARGO_BUILD_BUILD_DIR".into(), target_dir.into()));
+    env
 }
 
-/// `dm-reader` for the browser, in release, as `make wasm-check` checks it.
-fn compile(b: &Build<'_>) -> Result<PathBuf, String> {
+/// The nested cargo, with an environment of its own built from `outer`. A build script
+/// does not see the outer cargo's `--offline`, `--frozen` or `--config`; it does see
+/// `CARGO_NET_OFFLINE`, and an offline outer build is offline here too.
+fn nested_cargo(b: &Build<'_>, outer: &[(OsString, OsString)]) -> Command {
     let mut cmd = Command::new(b.cargo);
+    let offline = outer
+        .iter()
+        .any(|(k, v)| k == "CARGO_NET_OFFLINE" && v.eq_ignore_ascii_case("true"));
+    if offline {
+        cmd.arg("--offline");
+    }
     cmd.args(["build", "--release", "--locked", "--color", "never"])
         .args(["-p", "dm-reader", "--target", TARGET])
         .arg("--manifest-path")
         .arg(b.workspace.join("Cargo.toml"))
         .arg("--target-dir")
-        .arg(b.target_dir);
-    for name in NOT_INHERITED {
-        cmd.env_remove(name);
-    }
-    without_coverage_wrapper(&mut cmd);
+        .arg(b.target_dir)
+        .env_clear()
+        .envs(nested_env(outer, b.target_dir));
+    cmd
+}
+
+/// `dm-reader` for the browser, in release, as `make wasm-check` checks it.
+fn compile(b: &Build<'_>) -> Result<PathBuf, String> {
+    let outer: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let mut cmd = nested_cargo(b, &outer);
     let out = cmd
         .output()
         .map_err(|e| format!("cannot run {}: {e}", b.cargo.display()))?;
@@ -223,6 +263,117 @@ version = "0.2.130"
         assert!(err.contains("crates/reader/Cargo.toml"), "{err}");
         let unbound = LOCK.replace("wasm-bindgen-cli-support", "something-else");
         assert!(same_bindgen(&unbound).is_err());
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
+    }
+
+    /// The nested cargo's whole environment and its arguments, for `outer`.
+    fn nested(outer: &[(&str, &str)]) -> (Vec<(String, String)>, Vec<String>) {
+        let b = Build {
+            workspace: Path::new("/ws"),
+            cargo: Path::new("cargo"),
+            rustc: Path::new("rustc"),
+            target_dir: Path::new("/ws/target/reader-wasm"),
+            out: Path::new("/out"),
+        };
+        let cmd = nested_cargo(&b, &env(outer));
+        let lossy = |s: &std::ffi::OsStr| s.to_string_lossy().into_owned();
+        let vars = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((lossy(k), lossy(v?))))
+            .collect();
+        (vars, cmd.get_args().map(lossy).collect())
+    }
+
+    #[test]
+    fn the_outer_build_scripts_variables_do_not_reach_the_nested_build() {
+        let (vars, _) = nested(&[
+            ("PATH", "/bin"),
+            ("CARGO_CFG_UNIX", ""),
+            ("CARGO_CFG_TARGET_OS", "linux"),
+            ("OUT_DIR", "/t/debug/build/dm-web-1/out"),
+            ("TARGET", "x86_64-unknown-linux-gnu"),
+            ("HOST", "x86_64-unknown-linux-gnu"),
+            ("PROFILE", "debug"),
+            ("CARGO_ENCODED_RUSTFLAGS", "-Cinstrument-coverage"),
+            ("RUSTC_WORKSPACE_WRAPPER", "clippy-driver"),
+        ]);
+        for (k, _) in &vars {
+            assert!(
+                !k.starts_with("CARGO_CFG_")
+                    && ![
+                        "OUT_DIR",
+                        "TARGET",
+                        "HOST",
+                        "PROFILE",
+                        "RUSTC_WORKSPACE_WRAPPER"
+                    ]
+                    .contains(&k.as_str()),
+                "{k} reaches the nested build"
+            );
+        }
+        assert!(vars.contains(&("PATH".into(), "/bin".into())), "{vars:?}");
+    }
+
+    #[test]
+    fn the_nested_build_has_a_build_dir_of_its_own() {
+        // a build-dir from the user's cargo config or environment is the outer build's,
+        // whose lock it holds: a nested release build there waits for ever
+        let (vars, _) = nested(&[("CARGO_BUILD_BUILD_DIR", "/cache/build/1234")]);
+        let dirs: Vec<_> = vars
+            .iter()
+            .filter(|(k, _)| k == "CARGO_BUILD_BUILD_DIR")
+            .collect();
+        assert_eq!(
+            dirs,
+            [&(
+                "CARGO_BUILD_BUILD_DIR".to_string(),
+                "/ws/target/reader-wasm".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_offline_outer_build_is_offline_inside_too() {
+        let (_, args) = nested(&[("CARGO_NET_OFFLINE", "true")]);
+        assert!(args.iter().any(|a| a == "--offline"), "{args:?}");
+        let (_, args) = nested(&[("CARGO_NET_OFFLINE", "false")]);
+        assert!(!args.iter().any(|a| a == "--offline"), "{args:?}");
+    }
+
+    #[test]
+    fn under_llvm_cov_the_nested_build_gets_the_wrapper_it_replaced() {
+        let (vars, _) = nested(&[
+            ("RUSTC_WRAPPER", "/bin/cargo-llvm-cov"),
+            ("__CARGO_LLVM_COV_RUSTC_WRAPPER", "1"),
+            (
+                "__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS",
+                "-Cinstrument-coverage",
+            ),
+            (
+                "__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING",
+                "/bin/sccache",
+            ),
+        ]);
+        let wrappers = |vars: Vec<(String, String)>| -> Vec<(String, String)> {
+            vars.into_iter()
+                .filter(|(k, _)| k != "CARGO_BUILD_BUILD_DIR")
+                .collect()
+        };
+        assert_eq!(
+            wrappers(vars),
+            [("RUSTC_WRAPPER".into(), "/bin/sccache".into())]
+        );
+        let (vars, _) = nested(&[
+            ("RUSTC_WRAPPER", "/bin/cargo-llvm-cov"),
+            ("__CARGO_LLVM_COV_RUSTC_WRAPPER", "1"),
+        ]);
+        assert!(wrappers(vars.clone()).is_empty(), "{vars:?}");
     }
 
     #[test]
