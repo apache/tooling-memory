@@ -71,7 +71,7 @@ export const test = base.extend<Fixtures>({
 
 export { expect };
 
-/** The hosted copy of the pages: crates/web/static as plain files on another origin. */
+/** The hosted copy of the pages: target/hosted as plain files on another origin. */
 export const hostedURL = `http://localhost:${process.env.HOSTED_PORT ?? 4311}`;
 
 /** The server, as a hosted page is told it in the pairing link. */

@@ -34,9 +34,10 @@ the terminal of each session, in place of the launcher. `session.sh` shows a ban
 names an entry. Then it echoes the text that it receives. Thus the pages, the API, the
 key and the websocket are the real ones. The tests need no harness, no sandbox and no
 credential. `session.sh` also writes the same status file that the launcher writes. Thus
-the strip has data to show. `tests/support/static.mjs` serves `crates/web/static` as
-plain files on a second origin, `http://localhost:4311`. With `--hosted`, the web
-launcher allows this origin. Tests in Rust test the confinement of the launcher
+the strip has data to show. `tests/support/static.mjs` serves `target/hosted` as plain
+files on a second origin, `http://localhost:4311`. `scripts/e2e.sh` makes that copy first,
+with `scripts/hosted.sh`. The copy includes the wasm of the reader, which the build makes.
+With `--hosted`, the web launcher allows this origin. Tests in Rust test the confinement of the launcher
 (`crates/memory/tests/launch.rs`, `crates/sandbox`).
 
 ## Writing a spec
