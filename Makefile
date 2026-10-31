@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: demo-ready podman-ready e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test no-image-push-test conformance-test conformance deny machete coverage wasm-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
+.PHONY: demo-ready podman-ready e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test no-image-push-test conformance-test conformance deny machete coverage wasm-check msrv-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
 	local-up local-down local-logs local-key local-memory launch usage golden drift taps-check taps-build wasip2-target reader
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
@@ -273,6 +273,20 @@ wasm-check:
 	cargo check -p dm-core --target wasm32-unknown-unknown
 	cargo check -p dm-policy --target wasm32-unknown-unknown
 	cargo check -p dm-reader --target wasm32-unknown-unknown
+
+# The rust-version in Cargo.toml is the oldest Rust the workspace builds with: the highest
+# rust-version among the locked dependencies (`cargo metadata` lists them), unless the
+# workspace's own code needs a newer one. This builds with that release, so the declared
+# value cannot fall behind the lock. It needs that toolchain, which `check` and `verify`
+# do not, so CI runs it as a job of its own:
+#   rustup toolchain install <rust-version> --profile minimal --target wasm32-unknown-unknown
+MSRV = $(shell sed -n 's/^rust-version = "\(.*\)"$$/\1/p' Cargo.toml)
+msrv-check:
+	@test -n "$(MSRV)" || { echo "no rust-version in Cargo.toml" >&2; exit 1; }
+	cargo +$(MSRV) check --locked --workspace --all-targets
+	cargo +$(MSRV) check --locked -p dm-core --target wasm32-unknown-unknown
+	cargo +$(MSRV) check --locked -p dm-policy --target wasm32-unknown-unknown
+	cargo +$(MSRV) check --locked -p dm-reader --target wasm32-unknown-unknown
 
 # The taps are a workspace of their own, built as wasm32-wasip2 components. The host's
 # tests build them; the gate also formats and lints them.
