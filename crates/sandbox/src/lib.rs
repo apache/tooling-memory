@@ -1188,7 +1188,7 @@ url = "{relay}/mcp"
         if let Ok(bin) = find_on_path("codex") {
             if !bin.with_file_name("codex-code-mode-host").is_file() {
                 eprintln!(
-                    "memory: warning: {} has no codex-code-mode-host beside it; Codex's tools, memory among them, will fail. Install it from the same Codex release",
+                    "amem: warning: {} has no codex-code-mode-host beside it; Codex's tools, memory among them, will fail. Install it from the same Codex release",
                     bin.display()
                 );
             }
@@ -1839,7 +1839,7 @@ function note(event, sessionID, extra) {
   try {
     hook({ hook_event_name: event, session_id: sessionID, transcript_path: transcript(sessionID), ...extra });
   } catch (err) {
-    console.warn(`memory: ${event} note not left: ${err.message}`);
+    console.warn(`amem: ${event} note not left: ${err.message}`);
   }
 }
 

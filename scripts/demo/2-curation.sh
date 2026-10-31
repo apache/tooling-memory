@@ -18,7 +18,7 @@ a task list --domain dom-demo --status admitted \
 say "A librarian run" "$WORKER_HARNESS on the gateway's $WORKER_MODEL claims the top curation task and does it. An entry rewritten while holding a librarian's task lands one tier up, curated, and never further on an agent's word."
 top=$(a task list --domain dom-demo --status admitted | j "next((t['id'] for t in d if (t.get('origin') or '').startswith(('librarian:','checker:'))), '')")
 if [ -n "$top" ]; then
-  ( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --lease-seconds 900 --task "$top" 2>&1 | grep -E '^memory: (claimed|task|prefetched)' ) || true
+  ( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --lease-seconds 900 --task "$top" 2>&1 | grep -E '^amem: (claimed|task|prefetched)' ) || true
 else
   echo "  no curation task is admitted: the cycle filed none, or the domain does not admit its own filings (a record from an older demo; make demo-ready RESET=1)"
 fi

@@ -1748,7 +1748,7 @@ fn route_for(
                 )?;
                 if var == "GH_TOKEN" {
                     eprintln!(
-                        "memory: copilot holds your GitHub login's token, which reaches every \
+                        "amem: copilot holds your GitHub login's token, which reaches every \
                          repository the login can; a token with only the Copilot Requests \
                          permission, as COPILOT_GITHUB_TOKEN, keeps that out of the sandbox"
                     );
@@ -2021,12 +2021,12 @@ fn record_reported_usage(p: &Prepared) {
                 .telemetry()
                 .record_reported(p.memory.session_id(), &p.provider, usage)
         {
-            eprintln!("memory: could not record reported usage: {e}");
+            eprintln!("amem: could not record reported usage: {e}");
         }
     }
     if let Some((pct, window)) = reported.plan_used_percent {
         eprintln!(
-            "memory: the harness reports {pct:.1}% of its plan's {}-hour window used",
+            "amem: the harness reports {pct:.1}% of its plan's {}-hour window used",
             window / 60
         );
     }
@@ -2079,7 +2079,7 @@ fn report_usage(egress: &Egress) {
     if rows.is_empty() {
         return;
     }
-    eprintln!("memory: usage this root, by destination and model:");
+    eprintln!("amem: usage this root, by destination and model:");
     for r in rows {
         eprintln!(
             "  {:<10} {:<26} {:<8} calls {:>4}  in {:>8}  out {:>8}  cache {:>8}",
@@ -2186,14 +2186,14 @@ fn live_mount(p: &Prepared, harness: Harness) -> Option<dm_mount::Mounted> {
     match dm_mount::mount(p.memory.clone(), &p.projection, &at) {
         Ok(m) => {
             eprintln!(
-                "memory: the projection at {} is a live mount: every open of an entry is a get",
+                "amem: the projection at {} is a live mount: every open of an entry is a get",
                 dm_sandbox::INSIDE_PROJECTION
             );
             Some(m)
         }
         Err(e) => {
             eprintln!(
-                "memory: the projection at {} is a render: {e}",
+                "amem: the projection at {} is a render: {e}",
                 dm_sandbox::INSIDE_PROJECTION
             );
             None
@@ -2405,7 +2405,7 @@ async fn golden_suite(
                 .ok_or_else(|| {
                     format!("the platform holds no verified eval artifact named {name}")
                 })?;
-            eprintln!("memory: the suite is the platform's {}", a.entry);
+            eprintln!("amem: the suite is the platform's {}", a.entry);
             golden::Suite::parse(&a.text)
         }
         (None, None) => Err("name a suite, or --platform".into()),
@@ -3228,7 +3228,7 @@ fn empty_record(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     ));
     std::fs::create_dir_all(&dir)?;
     Memory::init(&dir, &grants.owner, &domain)?;
-    eprintln!("memory: empty memory at {}", dir.display());
+    eprintln!("amem: empty memory at {}", dir.display());
     Ok(dir)
 }
 
@@ -3406,7 +3406,7 @@ fn announce(runner: &Runner, p: &Prepared, harness: Harness, workdir: &Path) {
         _ => workdir.to_path_buf(),
     };
     eprintln!(
-        "memory: {} {how} {} · model calls via {} at ceiling {} · session {}",
+        "amem: {} {how} {} · model calls via {} at ceiling {} · session {}",
         harness.binary(),
         shown.display(),
         p.ceiling_of,
@@ -3449,7 +3449,7 @@ async fn platform_model(memory: &Memory, harness: Harness) -> Option<String> {
         .flatten()?;
     let v: serde_json::Value = serde_json::from_str(&a.text).ok()?;
     let model = v.get("model")?.as_str()?.to_string();
-    eprintln!("memory: model {model} from the platform's {}", a.entry);
+    eprintln!("amem: model {model} from the platform's {}", a.entry);
     Some(model)
 }
 
@@ -3666,7 +3666,7 @@ impl Session {
         via: MineVia,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let Some(t) = mine::newest_transcript(&self.p.home) else {
-            eprintln!("memory: nothing to mine; no transcript under the private home");
+            eprintln!("amem: nothing to mine; no transcript under the private home");
             return Ok(Vec::new());
         };
         let model = model::resolve(&self.p.egress, &self.p.server.provider, model).await;
@@ -3688,7 +3688,7 @@ impl Session {
             )
             .await?
         };
-        eprintln!("memory: mined {} entries from {}", ids.len(), t.display());
+        eprintln!("amem: mined {} entries from {}", ids.len(), t.display());
         client.close().await.ok();
         Ok(ids)
     }
@@ -3810,7 +3810,7 @@ impl Session {
             at: String::new(),
         };
         if let Err(e) = self.p.egress.telemetry().record_run(&run) {
-            eprintln!("memory: the run's resources were not kept: {e}");
+            eprintln!("amem: the run's resources were not kept: {e}");
         }
         Ok((code, out))
     }

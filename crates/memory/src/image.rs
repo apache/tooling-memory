@@ -70,7 +70,7 @@ pub fn unpack(root: &Path, image: &str) -> Fallible<PathBuf> {
         std::fs::remove_dir_all(&fresh)?;
     }
     std::fs::create_dir_all(&fresh)?;
-    eprintln!("memory: exporting {image} from {rt}");
+    eprintln!("amem: exporting {image} from {rt}");
     let id = run(rt, &["create", image, "true"])?;
     let id = id.lines().last().unwrap_or_default().trim().to_string();
     let result = (|| -> Fallible<()> {
@@ -99,7 +99,7 @@ pub fn unpack(root: &Path, image: &str) -> Fallible<PathBuf> {
     }
     std::fs::rename(&fresh, &rootfs)?;
     std::fs::write(rootfs.with_extension("source"), format!("{image}\n"))?;
-    eprintln!("memory: unpacked into {}", rootfs.display());
+    eprintln!("amem: unpacked into {}", rootfs.display());
     Ok(rootfs)
 }
 

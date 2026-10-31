@@ -46,7 +46,7 @@ pub enum Error {
     #[error("listen: {0}")]
     Io(#[from] std::io::Error),
     /// The record.
-    #[error("memory: {0}")]
+    #[error("amem: {0}")]
     Memory(#[from] dm_server::Error),
 }
 

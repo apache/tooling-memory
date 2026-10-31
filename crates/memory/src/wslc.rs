@@ -469,7 +469,7 @@ fn run_api(l: &Launch) -> Fallible<i32> {
     match ready {
         Ok((api, storage)) => crate::wslc_api::run(l, &api, &storage),
         Err(why) if l.via == Via::Auto => {
-            eprintln!("memory: not over the C API ({why}); driving the wslc command line");
+            eprintln!("amem: not over the C API ({why}); driving the wslc command line");
             run_cli(l)
         }
         Err(why) => Err(why.into()),
@@ -637,7 +637,7 @@ fn gateway_up(root: &Path) -> Fallible<String> {
     let probe = "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)";
     for _ in 0..60 {
         if run_ok(&s(&["exec", GATEWAY_LITELLM, "python3", "-c", probe])).is_ok() {
-            eprintln!("memory: gateway up inside the VM at http://{GATEWAY_LITELLM}:4000");
+            eprintln!("amem: gateway up inside the VM at http://{GATEWAY_LITELLM}:4000");
             return Ok(master);
         }
         std::thread::sleep(Duration::from_secs(2));
