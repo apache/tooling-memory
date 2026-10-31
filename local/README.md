@@ -244,7 +244,8 @@ This implementation has three of the paper's containments:
   superseded, demoted or erased. With `--file`, it files a task for the owner that
   requires `human` and names what changed.
 - The source-change trigger. An entry's `source` can name a file, as `file:<path>` under
-  `--workdir` or as an absolute path. If that file changed after the entry was written,
+  `--workdir`, relative or absolute. A path outside `--workdir`, or a link that
+  leads out of it, names nothing. If that file changed after the entry was written,
   the survey proposes a verify of the entry.
 
 The survey also uses the paper's retrieval signals, from the read log. The read log now

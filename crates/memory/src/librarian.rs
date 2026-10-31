@@ -107,18 +107,41 @@ fn source_file(source: &str, root: &Path) -> Option<std::path::PathBuf> {
     {
         return None;
     }
-    // a source names a file in the working tree: a path that is absolute, climbs out of
-    // the tree, or is a link that leads out of it names nothing the librarian may look at
-    let p = Path::new(rel);
-    if !p
-        .components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
-    {
-        return None;
-    }
-    let full = root.join(p).canonicalize().ok()?;
+    // a source names a file in the working tree, and only the real path, links followed,
+    // says whether it is still there
+    let full = root
+        .join(under_root(Path::new(rel), root)?)
+        .canonicalize()
+        .ok()?;
     let root = root.canonicalize().ok()?;
     (full.starts_with(&root) && full.is_file()).then_some(full)
+}
+
+/// A source's path relative to the root: a relative one that never climbs above it, or
+/// an absolute one inside it. Decided on the text, so a path that leaves the root is
+/// never looked up.
+fn under_root(p: &Path, root: &Path) -> Option<std::path::PathBuf> {
+    let rel = if p.is_absolute() {
+        match p.strip_prefix(root) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => p
+                .strip_prefix(root.canonicalize().ok()?)
+                .ok()?
+                .to_path_buf(),
+        }
+    } else {
+        p.to_path_buf()
+    };
+    let mut depth = 0usize;
+    for c in rel.components() {
+        match c {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => depth = depth.checked_sub(1)?,
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(rel)
 }
 
 /// Whether a source file changed after the entry was written: the source-change trigger.
@@ -453,28 +476,50 @@ pub(crate) mod tests {
     fn a_source_names_a_file_in_the_tree_and_nothing_outside_it() {
         let dir = tempfile::tempdir().unwrap();
         let tree = dir.path().join("tree");
-        std::fs::create_dir(&tree).unwrap();
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
         std::fs::write(tree.join("in.md"), "x").unwrap();
         let outside = dir.path().join("outside.txt");
         std::fs::write(&outside, "x").unwrap();
-        assert!(source_file("file:in.md", &tree).is_some());
-        assert!(source_file("in.md", &tree).is_some());
+        for s in [
+            "file:in.md".to_string(),
+            "in.md".to_string(),
+            "file:./in.md".to_string(),
+            "file:sub/../in.md".to_string(),
+            format!("file:{}", tree.join("in.md").display()),
+        ] {
+            assert!(source_file(&s, &tree).is_some(), "{s}");
+        }
         for s in [
             outside.display().to_string(),
             format!("file:{}", outside.display()),
             "file:../outside.txt".to_string(),
             "../outside.txt".to_string(),
-            "file:./x/../../outside.txt".to_string(),
+            "file:sub/../../outside.txt".to_string(),
+            format!("file:{}/../outside.txt", tree.display()),
         ] {
             assert_eq!(source_file(&s, &tree), None, "{s}");
         }
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(&outside, tree.join("link.txt")).unwrap();
-            assert_eq!(
-                source_file("file:link.txt", &tree),
-                None,
-                "a link out of the tree"
+            use std::os::unix::fs::symlink;
+            // a link out of the tree, as the file, as a directory on the way, and to a
+            // sibling whose name the tree's is a prefix of
+            symlink(&outside, tree.join("link.txt")).unwrap();
+            std::fs::create_dir(dir.path().join("outdir")).unwrap();
+            std::fs::write(dir.path().join("outdir/o.txt"), "x").unwrap();
+            symlink(dir.path().join("outdir"), tree.join("ld")).unwrap();
+            std::fs::create_dir(dir.path().join("tree-evil")).unwrap();
+            std::fs::write(dir.path().join("tree-evil/x.txt"), "x").unwrap();
+            symlink(dir.path().join("tree-evil"), tree.join("le")).unwrap();
+            for s in ["file:link.txt", "file:ld/o.txt", "file:le/x.txt"] {
+                assert_eq!(source_file(s, &tree), None, "{s}");
+            }
+            // a tree reached through a link is still the tree
+            let alias = dir.path().join("alias");
+            symlink(&tree, &alias).unwrap();
+            assert!(
+                source_file("file:in.md", &alias).is_some(),
+                "through a link"
             );
         }
     }
