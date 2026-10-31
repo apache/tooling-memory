@@ -27,6 +27,7 @@ mod hosted;
 mod image;
 mod librarian;
 mod mcp_http;
+mod mcp_meta;
 mod mine;
 mod model;
 mod open;

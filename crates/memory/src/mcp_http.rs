@@ -1,8 +1,10 @@
 //! A small client for the memory server over MCP's streamable HTTP transport, for the
-//! hook that runs inside the sandbox: one tool call, three requests, no session kept.
-//! Plain HTTP/1.1 over a socket, since inside the sandbox the only server is the relay
-//! on loopback and the only thing to say is one `tools/call`.
+//! hook that runs inside the sandbox: one tool call, one stateless request of MCP
+//! 2026-07-28, no handshake and no session. Plain HTTP/1.1 over a socket, since inside
+//! the sandbox the only server is the relay on loopback, which passes bytes through to
+//! this project's own memory server, and the only thing to say is one `tools/call`.
 
+use crate::mcp_meta;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -57,17 +59,18 @@ fn dechunk(raw: &str) -> String {
 
 /// POST `body` as JSON to `url` and read the whole answer; the connection is closed
 /// after it, so the end of the stream is the end of the answer.
-async fn post(url: &str, session: Option<&str>, body: &str) -> Result<Answer, String> {
+async fn post(url: &str, headers: &[(&str, String)], body: &str) -> Result<Answer, String> {
     let (authority, path) = split(url)?;
     let mut s = TcpStream::connect(&authority)
         .await
         .map_err(|e| format!("{authority}: {e}"))?;
-    let session = session
-        .map(|id| format!("mcp-session-id: {id}\r\n"))
-        .unwrap_or_default();
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
-         Accept: application/json, text/event-stream\r\n{session}Content-Length: {}\r\n\
+         Accept: application/json, text/event-stream\r\n{extra}Content-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
     );
@@ -123,46 +126,35 @@ fn messages(answer: &Answer) -> Vec<Value> {
     }
 }
 
-/// Call one tool on the memory server at `url`, the MCP endpoint, as a session of its
-/// own. The tool's result on success; on a refusal, the server's words.
+/// Call one tool on the memory server at `url`, the MCP endpoint, in one stateless
+/// request. The tool's result on success; on a refusal, the server's words.
 ///
 /// # Errors
 ///
 /// The server unreachable, a protocol answer that is not one, or the tool's error.
 pub async fn call_tool(url: &str, tool: &str, arguments: Value) -> Result<Value, String> {
-    let init = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18", "capabilities": {},
-            "clientInfo": { "name": "memory-hook", "version": env!("CARGO_PKG_VERSION") }
-        }
-    });
-    let opened = post(url, None, &init.to_string()).await?;
-    if !(200..300).contains(&opened.status) {
-        return Err(format!("initialize answered {}", opened.status));
-    }
-    let session = opened.header("mcp-session-id").map(str::to_string);
-    let ready = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-    post(url, session.as_deref(), &ready.to_string()).await?;
-    let call = json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": { "name": tool, "arguments": arguments }
-    });
-    let answered = post(url, session.as_deref(), &call.to_string()).await?;
+    let call = mcp_meta::request(
+        1,
+        "tools/call",
+        json!({ "name": tool, "arguments": arguments }),
+        "memory-hook",
+    );
+    let answered = post(url, &mcp_meta::headers(&call), &call.to_string()).await?;
+    let reply = messages(&answered).into_iter().find(|m| m["id"] == 1);
     if !(200..300).contains(&answered.status) {
-        return Err(format!(
-            "{tool} answered {}: {}",
-            answered.status, answered.body
-        ));
+        // a request refused as such comes back with its JSON-RPC error in the body
+        let why = reply
+            .as_ref()
+            .and_then(|m| m["error"]["message"].as_str())
+            .map_or_else(|| answered.body.clone(), str::to_string);
+        return Err(format!("{tool} answered {}: {why}", answered.status));
     }
-    let reply = messages(&answered)
-        .into_iter()
-        .find(|m| m["id"] == 2)
-        .ok_or_else(|| format!("{tool}: no reply in {:?}", answered.body))?;
+    let reply = reply.ok_or_else(|| format!("{tool}: no reply in {:?}", answered.body))?;
     if let Some(err) = reply.get("error") {
         return Err(err["message"].as_str().unwrap_or("error").to_string());
     }
     let result = reply["result"].clone();
+    mcp_meta::complete(&result).map_err(|e| format!("{tool}: {e}"))?;
     if result["isError"] == true {
         let text = result["content"][0]["text"].as_str().unwrap_or("refused");
         return Err(text.to_string());
@@ -219,6 +211,25 @@ mod tests {
         let got = call_tool(&url, "get", json!({ "id": w.id })).await.unwrap();
         let text = got.to_string();
         assert!(text.contains("backoff"), "{text}");
+        // the call was one stateless 2026-07-28 request: the server says its result is
+        // complete, which it says only to a request of that revision
+        assert_eq!(got["resultType"], "complete", "{text}");
+        // and it answers discovery without a session, naming that revision
+        let discover = mcp_meta::request(1, "server/discover", Value::Null, "test");
+        let answered = post(&url, &mcp_meta::headers(&discover), &discover.to_string())
+            .await
+            .unwrap();
+        assert_eq!(answered.status, 200, "{}", answered.body);
+        let found = messages(&answered).into_iter().find(|m| m["id"] == 1);
+        let versions = found.map(|m| m["result"]["supportedVersions"].clone());
+        assert!(
+            versions
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|v| v.contains(&json!("2026-07-28"))),
+            "{versions:?}: {}",
+            answered.body
+        );
         let err = call_tool(&url, "get", json!({ "id": "mem-me-nothere" }))
             .await
             .unwrap_err();

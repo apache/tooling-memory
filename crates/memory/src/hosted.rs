@@ -8,19 +8,24 @@
 //! names one the policy refuses, is not kept; what is kept says where it was fetched
 //! from.
 //!
+//! The server is asked once what MCP it speaks (`server/discover`): one of 2026-07-28
+//! is called with one stateless request, one before it, which has no such method,
+//! after the `initialize` handshake, as every server was before that revision.
+//!
 //! The call leaves through the egress ([`Egress::post`]), as a model call does: the
 //! session's label is held to the tool's ceiling before anything is sent, the server's
 //! bearer goes on there, and every request is metered and traced with its status and
 //! latency. The harness itself cannot reach the server that way; a tool server is a
 //! destination of the launcher's, not of the sandbox's.
 
+use crate::mcp_meta::{self, supported, LEGACY, MODERN, MODERN_ERRORS, UNSUPPORTED_VERSION};
 use dm_egress::{Auth, Destination, Egress};
 use dm_policy::Grants;
 use dm_server::sources::Answered;
 use dm_server::Memory;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// What a tool server says back for one call: the tool's JSON, and where it went.
 #[derive(Debug, PartialEq, Eq)]
@@ -110,6 +115,7 @@ pub fn reply(message: &Value) -> Result<Reply, String> {
         return Err(format!("the tool server refused the call: {e}"));
     }
     let result = &message["result"];
+    crate::mcp_meta::complete(result).map_err(|e| format!("the tool server: {e}"))?;
     let text = result["content"]
         .as_array()
         .and_then(|c| c.iter().find_map(|b| b["text"].as_str()))
@@ -159,7 +165,207 @@ pub fn checked(memory: &Memory, tool: &str, r: Reply) -> Result<Answered, String
     })
 }
 
-/// Call `tool` on its tool server for the session `memory` is, through `egress`.
+/// Which revision a tool server speaks: 2026-07-28, called statelessly, or one before
+/// it, called after the `initialize` handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Era {
+    Stateless,
+    Handshake,
+}
+
+/// What each tool server was found to speak, by URL, for the life of this process: a
+/// client keeps that per server rather than asking before every call. A call that
+/// fails on the way forgets it, so the next one asks again.
+fn eras() -> &'static Mutex<HashMap<String, Era>> {
+    static ERAS: OnceLock<Mutex<HashMap<String, Era>>> = OnceLock::new();
+    ERAS.get_or_init(Mutex::default)
+}
+
+fn known(url: &str) -> Option<Era> {
+    eras()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(url)
+        .copied()
+}
+
+fn learn(url: &str, era: Option<Era>) {
+    let mut eras = eras()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match era {
+        Some(e) => eras.insert(url.to_string(), e),
+        None => eras.remove(url),
+    };
+}
+
+/// What a tool server's answer to `server/discover` says it speaks. A result listing
+/// 2026-07-28 is that revision; one listing only revisions with a handshake, or that
+/// revision's refusal of the version naming only those, is one of them. Anything else
+/// no server of 2026-07-28 answers, so it comes from one before it that has no such
+/// method: an error status without one of that revision's errors, a method unknown,
+/// nothing at all.
+///
+/// # Errors
+///
+/// That revision's refusal of the request itself, or a list of versions none of
+/// which this launcher speaks.
+fn era(content_type: &str, body: &str) -> Result<Era, String> {
+    let Ok(m) = message(content_type, body) else {
+        return Ok(Era::Handshake);
+    };
+    let listed = if let Some(e) = m.get("error") {
+        let code = e["code"].as_i64().unwrap_or_default();
+        if !MODERN_ERRORS.contains(&code) {
+            return Ok(Era::Handshake);
+        }
+        if code != UNSUPPORTED_VERSION {
+            return Err(format!("the tool server refused server/discover: {e}"));
+        }
+        &e["data"]["supported"]
+    } else {
+        &m["result"]["supportedVersions"]
+    };
+    let Some(listed) = listed.as_array() else {
+        return Ok(Era::Handshake);
+    };
+    let listed: Vec<&str> = listed.iter().filter_map(Value::as_str).collect();
+    if listed.contains(&MODERN) && m.get("error").is_none() {
+        Ok(Era::Stateless)
+    } else if listed.iter().any(|v| LEGACY.contains(v)) {
+        Ok(Era::Handshake)
+    } else {
+        Err(format!(
+            "the tool server speaks MCP {}, and this launcher {}",
+            listed.join(", "),
+            supported().join(", ")
+        ))
+    }
+}
+
+/// One POST to a tool server, as it answered.
+struct Sent {
+    status: u16,
+    content_type: String,
+    session: Option<String>,
+    body: String,
+}
+
+impl Sent {
+    /// The answer, when its status is a success.
+    fn ok(self) -> Result<Sent, String> {
+        if (200..300).contains(&self.status) {
+            Ok(self)
+        } else {
+            Err(format!(
+                "the tool server answered {}: {}",
+                self.status,
+                self.body.trim()
+            ))
+        }
+    }
+}
+
+/// The way to one tool server: through the egress, under the tool's name, to the path
+/// of its MCP endpoint.
+struct Server<'a> {
+    egress: &'a Egress,
+    tool: &'a str,
+    path: String,
+}
+
+impl Server<'_> {
+    async fn post(&self, body: &Value, extra: &[(&'static str, String)]) -> Result<Sent, String> {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        for (name, value) in extra {
+            let value = axum::http::HeaderValue::from_str(value)
+                .map_err(|_| format!("{name}: {value:?} is not a header value"))?;
+            headers.insert(axum::http::HeaderName::from_static(name), value);
+        }
+        let r = self
+            .egress
+            .post(self.tool, &self.path, headers, body.to_string().into())
+            .await
+            .map_err(|e| e.to_string())?;
+        let text = |name: &str| {
+            r.headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        Ok(Sent {
+            status: r.status,
+            content_type: text("content-type").unwrap_or_default(),
+            session: text("mcp-session-id"),
+            body: r.body,
+        })
+    }
+
+    /// Ask the server what it speaks.
+    async fn discover(&self) -> Result<Era, String> {
+        let request = mcp_meta::request(1, "server/discover", Value::Null, "amem");
+        let sent = self.post(&request, &mcp_meta::headers(&request)).await?;
+        era(&sent.content_type, &sent.body)
+    }
+
+    /// One `tools/call` of 2026-07-28: one request, no session.
+    async fn stateless(&self, params: Value) -> Result<Sent, String> {
+        let request = mcp_meta::request(1, "tools/call", params, "amem");
+        self.post(&request, &mcp_meta::headers(&request))
+            .await?
+            .ok()
+    }
+
+    /// One `tools/call` after the handshake of the revisions before 2026-07-28, in the
+    /// session the server opens, if it opens one, at the version it answers with.
+    async fn handshake(&self, params: Value) -> Result<Sent, String> {
+        let opened = self
+            .post(
+                &json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                               "clientInfo": {"name": "amem", "version": env!("CARGO_PKG_VERSION")}}
+                }),
+                &[],
+            )
+            .await?
+            .ok()?;
+        let mut headers = Vec::new();
+        if let Some(s) = opened.session.clone() {
+            headers.push(("mcp-session-id", s));
+        }
+        let version = message(&opened.content_type, &opened.body)
+            .ok()
+            .and_then(|m| m["result"]["protocolVersion"].as_str().map(str::to_string));
+        if let Some(v) = version {
+            headers.push((mcp_meta::VERSION_HEADER, v));
+        }
+        self.post(
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            &headers,
+        )
+        .await?
+        .ok()?;
+        self.post(
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": params}),
+            &headers,
+        )
+        .await?
+        .ok()
+    }
+}
+
+/// Call `tool` on its tool server for the session `memory` is, through `egress`. A
+/// server is asked once what it speaks (`server/discover`): one of 2026-07-28 is
+/// called statelessly, one before it after the `initialize` handshake.
 ///
 /// # Errors
 ///
@@ -180,76 +386,27 @@ pub async fn call(
         .and_then(|g| g.hosted.clone())
         .ok_or_else(|| format!("[taps.{tool}] names no tool server"))?;
     let (_, path) = split_url(&url)?;
-    let post = |body: Value, session: Option<String>| {
-        let path = path.clone();
-        async move {
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(
-                "content-type",
-                "application/json".parse().map_err(|_| "header")?,
-            );
-            headers.insert(
-                "accept",
-                "application/json, text/event-stream"
-                    .parse()
-                    .map_err(|_| "header")?,
-            );
-            if let Some(s) = session {
-                headers.insert(
-                    "mcp-session-id",
-                    s.parse()
-                        .map_err(|_| "the tool server's session id is not a header")?,
-                );
-            }
-            let r = egress
-                .post(tool, &path, headers, body.to_string().into())
-                .await
-                .map_err(|e| e.to_string())?;
-            if !(200..300).contains(&r.status) {
-                return Err(format!(
-                    "the tool server answered {}: {}",
-                    r.status,
-                    r.body.trim()
-                ));
-            }
-            let content_type = r
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            let id = r
-                .headers
-                .get("mcp-session-id")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            Ok::<_, String>((content_type, id, r.body))
+    let server = Server { egress, tool, path };
+    let era = match known(&url) {
+        Some(e) => e,
+        None => {
+            let e = server.discover().await?;
+            learn(&url, Some(e));
+            e
         }
     };
-    let (_, session, _) = post(
-        json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                       "clientInfo": {"name": "amem", "version": env!("CARGO_PKG_VERSION")}}
-        }),
-        None,
-    )
-    .await?;
-    post(
-        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-        session.clone(),
-    )
-    .await?;
     let hosts = memory.fetch_hosts(tool);
-    let (content_type, _, body) = post(
-        json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments(args, config, &hosts)}
-        }),
-        session,
+    let params = json!({"name": tool, "arguments": arguments(args, config, &hosts)});
+    let sent = match era {
+        Era::Stateless => server.stateless(params).await,
+        Era::Handshake => server.handshake(params).await,
+    }
+    .inspect_err(|_| learn(&url, None))?;
+    checked(
+        &memory,
+        tool,
+        reply(&message(&sent.content_type, &sent.body)?)?,
     )
-    .await?;
-    checked(&memory, tool, reply(&message(&content_type, &body)?)?)
 }
 
 #[cfg(test)]
@@ -275,12 +432,57 @@ mod tests {
         assert_eq!(reply(&failed).unwrap_err(), "refused: x");
         assert!(reply(&json!({"error": {"code": -32601}})).is_err());
         assert!(reply(&json!({"result": {"content": [{"type": "text", "text": "{}"}]}})).is_err());
+        // a result that says it is complete is one; any other kind is not taken
+        let mut done = ok.clone();
+        done["result"]["resultType"] = json!("complete");
+        assert_eq!(reply(&done).unwrap(), r);
+        let mut more = ok.clone();
+        more["result"]["resultType"] = json!("input_required");
+        let e = reply(&more).unwrap_err();
+        assert!(e.contains("input_required"), "{e}");
         assert!(message("application/json", "not json").is_err());
         assert!(message("text/event-stream", "data: nothing\n").is_err());
         let a = arguments("{\"url\": \"u\"}", "not json", &["h".into()]);
         assert_eq!(a["args"]["url"], "u");
         assert_eq!(a["config"], "not json");
         assert_eq!(a["hosts"][0], "h");
+    }
+
+    #[test]
+    fn what_a_server_speaks_is_read_from_its_answer_to_discovery() {
+        let result = |v: Value| {
+            json!({"jsonrpc": "2.0", "id": 1,
+                   "result": {"resultType": "complete", "supportedVersions": v}})
+            .to_string()
+        };
+        let error = |code: i64, data: Value| {
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": "m", "data": data}})
+                .to_string()
+        };
+        let j = "application/json";
+        assert_eq!(era(j, &result(json!(["2026-07-28"]))), Ok(Era::Stateless));
+        let sse = format!("data: {}\n\n", result(json!(["2027-01-01", "2026-07-28"])));
+        assert_eq!(era("text/event-stream", &sse), Ok(Era::Stateless));
+        assert_eq!(era(j, &result(json!(["2025-11-25"]))), Ok(Era::Handshake));
+        // refused for its version, naming only revisions with a handshake
+        let older = json!({"supported": ["2025-06-18"], "requested": "2026-07-28"});
+        assert_eq!(era(j, &error(-32022, older)), Ok(Era::Handshake));
+        // a server from before: a method unknown, nothing, a refusal in words, no list
+        assert_eq!(era(j, &error(-32601, Value::Null)), Ok(Era::Handshake));
+        assert_eq!(era(j, ""), Ok(Era::Handshake));
+        assert_eq!(
+            era("text/plain", "Bad Request: Session not found"),
+            Ok(Era::Handshake)
+        );
+        let bare = json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string();
+        assert_eq!(era(j, &bare), Ok(Era::Handshake));
+        // 2026-07-28 refusing the request itself, or versions none of which are spoken
+        let e = era(j, &error(-32020, Value::Null)).unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        let e = era(j, &result(json!(["2027-01-01"]))).unwrap_err();
+        assert!(e.contains("2027-01-01") && e.contains("2026-07-28"), "{e}");
+        let e = era(j, &error(-32022, json!({"supported": ["2027-01-01"]}))).unwrap_err();
+        assert!(e.contains("2027-01-01"), "{e}");
     }
 
     #[test]
