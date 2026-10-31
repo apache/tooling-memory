@@ -16,8 +16,8 @@ pub const GLUE: &str = "dm_reader.js";
 pub const WASM: &str = "dm_reader_bg.wasm";
 
 /// Rust flags and wrappers the outer build hands down, which are for its own target and
-/// not for the wasm: `cargo llvm-cov` instruments for coverage, which wasm32 cannot link,
-/// and `cargo clippy` would lint the reader a second time.
+/// not for the wasm: coverage instrumentation, which wasm32 cannot link, and `cargo
+/// clippy`, which would lint the reader a second time.
 const NOT_INHERITED: [&str; 8] = [
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
@@ -113,6 +113,24 @@ fn target_installed(rustc: &Path) -> Result<(), String> {
     }
 }
 
+/// `cargo llvm-cov` makes itself the rustc wrapper, which instruments every workspace
+/// crate by name, `dm_core` among them, whatever the target. It keeps the wrapper it
+/// replaced, if any, in a variable of its own; the nested build gets that one back.
+fn without_coverage_wrapper(cmd: &mut Command) {
+    if std::env::var_os("__CARGO_LLVM_COV_RUSTC_WRAPPER").is_none() {
+        return;
+    }
+    match std::env::var_os("__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING") {
+        Some(wrapper) => cmd.env("RUSTC_WRAPPER", wrapper),
+        None => cmd.env_remove("RUSTC_WRAPPER"),
+    };
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("__CARGO_LLVM_COV") {
+            cmd.env_remove(name);
+        }
+    }
+}
+
 /// `dm-reader` for the browser, in release, as `make wasm-check` checks it.
 fn compile(b: &Build<'_>) -> Result<PathBuf, String> {
     let mut cmd = Command::new(b.cargo);
@@ -125,6 +143,7 @@ fn compile(b: &Build<'_>) -> Result<PathBuf, String> {
     for name in NOT_INHERITED {
         cmd.env_remove(name);
     }
+    without_coverage_wrapper(&mut cmd);
     let out = cmd
         .output()
         .map_err(|e| format!("cannot run {}: {e}", b.cargo.display()))?;
