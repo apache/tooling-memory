@@ -444,6 +444,7 @@ pub async fn file(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn a_summary_the_index_should_not_serve_is_named() {
@@ -525,6 +526,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn under_the_root_is_decided_on_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let t = tree.display();
+        for s in [
+            "../x".to_string(),
+            "sub/../../x".to_string(),
+            "/etc/passwd".to_string(),
+            format!("{t}/../x"),
+            format!("{t}-evil/x"),
+        ] {
+            assert_eq!(under_root(Path::new(&s), &tree), None, "{s}");
+        }
+        assert_eq!(
+            under_root(Path::new("sub/../in.md"), &tree),
+            Some(PathBuf::from("sub/../in.md"))
+        );
+        assert_eq!(
+            under_root(&tree.join("in.md"), &tree),
+            Some(PathBuf::from("in.md"))
+        );
+        #[cfg(unix)]
+        {
+            // an absolute source given by the real path, the root by a link to it
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&tree, &alias).unwrap();
+            assert_eq!(
+                under_root(&tree.canonicalize().unwrap().join("in.md"), &alias),
+                Some(PathBuf::from("in.md"))
+            );
+        }
+    }
+
+    #[test]
     fn a_source_file_that_changed_after_the_entry_is_the_trigger() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("notes.md");
@@ -571,24 +607,53 @@ pub(crate) mod tests {
     #[test]
     fn the_reasoning_check_refuses_reasons_put_in_the_entry() {
         let good = verify_body("mem-t-1");
-        for (from, to) in [
+        let held = "the entry is told to hold reasons";
+        for (from, to, rule) in [
             (
                 "its body says what holds now",
                 "its body says what holds now and why you believe it",
+                held,
             ),
             (
                 "its body says what holds now",
                 "its body says what holds now and what was wrong with the old one",
+                held,
+            ),
+            (
+                "its body says what holds now",
+                "the body says what holds now, what you found and how you checked it",
+                held,
+            ),
+            (
+                "its body says what holds now",
+                "the entry's body explains why the old one was wrong",
+                held,
+            ),
+            (
+                "its body says what holds now",
+                "its body says what holds now. In the body, say how you know, drawing it out of the tree",
+                "not sent to the handoff",
+            ),
+            (
+                "keep that out of the entry",
+                "keep that out of the entry; put the same account in the entry's `summary`",
+                held,
             ),
             (
                 "keep that out of the entry",
                 "put the same account in the entry's `summary`",
+                held,
             ),
         ] {
             let bad = good.replacen(from, to, 1);
-            assert_ne!(bad, good, "{from}");
-            let caught = std::panic::catch_unwind(|| reasoning_goes_to_the_handoff(&bad));
-            assert!(caught.is_err(), "not caught: {bad}");
+            assert_ne!(bad, good, "{to}");
+            let caught = std::panic::catch_unwind(|| reasoning_goes_to_the_handoff(&bad))
+                .expect_err(&format!("not caught: {to}"));
+            let said = caught
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default();
+            assert!(said.contains(rule), "{to}: caught for another reason: {said}");
         }
         // forbidding the reasons in the body is not asking for them there
         let fine = good.replacen(
@@ -606,7 +671,14 @@ pub(crate) mod tests {
     /// entry written, so the reasoning can be found from it. A check on wording, so it
     /// catches the wordings it knows, and its own test lists them.
     pub(crate) fn reasoning_goes_to_the_handoff(body: &str) {
-        const REASONS: [&str; 5] = ["how you know", "why", "wrong", "changed", "what you found"];
+        const REASONS: [&str; 6] = [
+            "how you know",
+            "why",
+            "wrong",
+            "changed",
+            "what you found",
+            "account",
+        ];
         let sentences: Vec<&str> = body.split_inclusive(['.', ';']).collect();
         let asks: Vec<&&str> = sentences
             .iter()
@@ -615,18 +687,26 @@ pub(crate) mod tests {
         assert!(!asks.is_empty(), "nothing asks for the reasoning: {body}");
         for s in asks {
             assert!(
-                s.contains("handoff") || s.contains(" out of "),
+                s.contains("handoff")
+                    || s.contains(" out of the entry")
+                    || s.contains(" out of the body"),
                 "the reasoning is not sent to the handoff: {s}"
             );
         }
-        for s in &sentences {
-            for held in ["its body", "`summary`"] {
-                if let Some(i) = s.find(held) {
-                    assert!(
-                        !REASONS.iter().any(|r| s[i..].contains(r)),
-                        "the entry is told to hold reasons: {s}"
-                    );
-                }
+        // what the entry is told to hold: the rest of the sentence from where it names the
+        // body or the summary, and the clause that names it; a sentence that keeps the
+        // reasons out of the entry is not telling it to hold them
+        let keeps_out = |s: &str| s.contains(" out of the entry") || s.contains(" out of the body");
+        for s in sentences.iter().filter(|s| !keeps_out(s)) {
+            for held in ["body", "`summary`"] {
+                let Some(i) = s.find(held) else { continue };
+                let clause = s.split([',', ':']).find(|c| c.contains(held)).unwrap_or("");
+                assert!(
+                    !REASONS
+                        .iter()
+                        .any(|r| s[i..].contains(r) || clause.contains(r)),
+                    "the entry is told to hold reasons: {s}"
+                );
             }
         }
         assert!(
