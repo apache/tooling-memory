@@ -81,11 +81,11 @@ mod tests {
 
     /// The reader the binary serves is what `crates/reader` and `crates/core` build to now:
     /// the build script's work done again, against the sources as they are when the test
-    /// runs, and compared byte for byte. The nested build reuses the build script's
+    /// runs, and compared byte for byte. The nested build uses the build script's
     /// target directory, so when nothing changed it compiles nothing.
     #[test]
     fn the_embedded_reader_is_what_its_sources_build_to() {
-        use crate::reader_build::{build, Build, GLUE, WASM};
+        use crate::reader_build::{build, nested_target_dir, Build, GLUE, WASM};
         use std::path::Path;
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace = manifest.parent().and_then(Path::parent).unwrap();
@@ -95,7 +95,7 @@ mod tests {
             workspace,
             cargo: Path::new(env!("CARGO")),
             rustc: Path::new(&rustc),
-            target_dir: &Path::new(env!("OUT_DIR")).join("reader-target"),
+            target_dir: &nested_target_dir(Path::new(env!("OUT_DIR"))),
             out: fresh.path(),
         })
         .unwrap();

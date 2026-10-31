@@ -47,11 +47,30 @@ pub struct Build<'a> {
     pub cargo: &'a Path,
     /// The rustc asked whether the target is installed.
     pub rustc: &'a Path,
-    /// The nested build's own target directory. Not the outer one: cargo holds that one's
-    /// lock for the whole outer build, so a nested build there waits for ever.
+    /// The nested build's own target directory, from [`nested_target_dir`]. Not the outer
+    /// one: cargo holds that one's lock for the whole outer build, so a nested build there
+    /// waits for ever.
     pub target_dir: &'a Path,
     /// Where the glue and the wasm are written.
     pub out: &'a Path,
+}
+
+/// The nested build's target directory for the build script whose `OUT_DIR` is
+/// `out_dir`: `reader-wasm` beside the profiles of the outer target directory, since
+/// `OUT_DIR` is `<dir>/<profile>/build/dm-web-<hash>/out`. Every cargo command on one
+/// target directory gets its own `OUT_DIR` (build, check, clippy, test, each package
+/// selection and profile), and all of them share this one directory and what is
+/// compiled in it; the nested cargo's own lock keeps two of them apart. `cargo llvm-cov`
+/// has a target directory of its own, and so a nested one of its own. An `OUT_DIR` of
+/// another shape keeps the build under itself.
+pub fn nested_target_dir(out_dir: &Path) -> PathBuf {
+    let mut up = out_dir.ancestors();
+    match (up.nth(2), up.nth(1)) {
+        (Some(build), Some(dir)) if build.file_name() == Some(std::ffi::OsStr::new("build")) => {
+            dir.join("reader-wasm")
+        }
+        _ => out_dir.join("reader-target"),
+    }
 }
 
 /// Compile the reader and bind it, writing [`GLUE`] and [`WASM`] into `out`.
@@ -374,6 +393,23 @@ version = "0.2.130"
             ("__CARGO_LLVM_COV_RUSTC_WRAPPER", "1"),
         ]);
         assert!(wrappers(vars.clone()).is_empty(), "{vars:?}");
+    }
+
+    #[test]
+    fn every_build_into_one_target_directory_shares_one_nested_build() {
+        let dir = |out: &str| nested_target_dir(Path::new(out));
+        let shared = Path::new("/t/reader-wasm");
+        assert_eq!(dir("/t/debug/build/dm-web-0123/out"), shared);
+        assert_eq!(dir("/t/debug/build/dm-web-4567/out"), shared);
+        assert_eq!(dir("/t/release/build/dm-web-89ab/out"), shared);
+        assert_eq!(
+            dir("/t/llvm-cov-target/debug/build/dm-web-0123/out"),
+            Path::new("/t/llvm-cov-target/reader-wasm")
+        );
+        assert_eq!(
+            dir("/elsewhere/out"),
+            Path::new("/elsewhere/out/reader-target")
+        );
     }
 
     #[test]

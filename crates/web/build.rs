@@ -50,7 +50,7 @@ fn run() -> Result<(), String> {
         workspace,
         cargo: &var("CARGO")?,
         rustc: &var("RUSTC")?,
-        target_dir: &out.join("reader-target"),
+        target_dir: &reader_build::nested_target_dir(&out),
         out: &out.join("reader"),
     })
 }
