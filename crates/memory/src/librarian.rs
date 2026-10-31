@@ -206,6 +206,15 @@ pub async fn survey(
     domain: Option<&str>,
     options: &Options,
 ) -> Result<Survey, Box<dyn std::error::Error>> {
+    // a working tree that is not there turns off the source-change trigger for every
+    // entry, which a survey would otherwise report as nothing to verify
+    if let Some(r) = options.source_root.as_deref().filter(|r| !r.is_dir()) {
+        return Err(format!(
+            "the working tree {} is not a directory, so no `file:` source can be checked",
+            r.display()
+        )
+        .into());
+    }
     let domain = memory.resolve_domain(domain)?;
     let hits = memory.list(Some(&domain), None, options.limit).await?;
     let mut survey = Survey {

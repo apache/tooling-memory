@@ -245,7 +245,9 @@ This implementation has three of the paper's containments:
   requires `human` and names what changed.
 - The source-change trigger. An entry's `source` can name a file, as `file:<path>` under
   `--workdir`, relative or absolute. A path outside `--workdir`, or a link that
-  leads out of it, names nothing. If that file changed after the entry was written,
+  leads out of it, names nothing. An absolute path is a path on the host that runs
+  the survey, not inside a confined session. A `--workdir` that is not a directory
+  is an error. If that file changed after the entry was written,
   the survey proposes a verify of the entry.
 
 The survey also uses the paper's retrieval signals, from the read log. The read log now
