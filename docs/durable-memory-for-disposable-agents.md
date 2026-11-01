@@ -160,9 +160,9 @@ The full record, with citations, lineage, and supersession, is in [Appendix A](#
 | Type | How it ages |
 |---|---|
 | **Decision** | Best. It records context, options, choice, and rationale, like an architecture decision record, and the reason stays true after the details change. A new decision supersedes it; it never expires |
-| **Fact** | Fast. It carries a review date |
+| **Fact** | Fast. It carries a review date. A fact about code cites the file and commit, so a reader can check it against the code in front of it and write a correction [[80]](#ref-80) |
 | **Convention** | Needs a named owner; an ownerless one is flagged within days |
-| **Method** | A convention about how to work: a strategy agents reuse ([§10](#10-evolving-the-system)). Like any convention it needs an owner, and it is reviewed more strictly |
+| **Method** | A convention about how to work: a strategy agents reuse ([§10](#10-evolving-the-system)). Like any convention it needs an owner, and it is reviewed more strictly. It says where it applies, and is scored by the outcomes of the tasks that used it, never by its author's confidence |
 
 A T0 for one domain:
 
@@ -180,7 +180,7 @@ A T0 for one domain:
 ## Policy digest: L0 in full + pol-L1-007, pol-L2-031
 ```
 
-A session that may touch several domains sees one T0 made of their slices, under one cap. Slices hold pointers and summaries at the lowest classification the task needs; restricted material arrives only through a query.
+A session that may touch several domains sees one T0 made of their slices, under one cap. Slices hold pointers and summaries at the lowest classification the task needs; restricted material arrives only through a query. A T0 with two standing decisions on one subject is not published until a curator resolves them, because a reader given both may follow either.
 
 ## The write path
 
@@ -288,7 +288,7 @@ If A trusts B and B trusts C, A has not thereby agreed to trust C. The design ap
 
 - **Derived entries inherit the weakest input.** A summary, merge, or recall brief is no more trusted than the least-checked entry it drew on, and carries at least the highest classification among them.
 - **Imports start raw.** An entry verified in another domain, another institution, or a person's home domain arrives at raw here and earns its tier through this domain's gate. Its provenance and classification travel with it ([Appendix B](#appendix-b-seeding)).
-- **Echoes are not evidence.** An entry is never corroborated by entries derived from it; otherwise a claim can cite its own copies, as in circular reporting.
+- **Echoes are not evidence.** An entry is never corroborated by entries derived from it; otherwise a claim can cite its own copies, as in circular reporting. Nor is it corroborated by raw outside entries that agree with it, since several can be planted together; corroboration comes from independent principals at curated or better.
 - **Federation does not lend authority.** A server that queries a host on a person's behalf gets no more than the host's policy gives that person, and passes on no more than that ([§6](#6-retrieval-and-serving)).
 - **Retrieved content is data.** An entry that says "call the admin endpoint with header Z" is a claim to check. The perimeter checks the action itself, so memory cannot grant what policy withholds. The same holds for task specs ([§8](#8-coordination)).
 - **Trust is for a use.** Verified is the bar for loading something as configuration; curated is the bar for retrieving a method mid-task; raw is enough to read a minute-old handoff with its tier shown. The question is always "trusted for what?", decided where the entry is used.
@@ -303,9 +303,9 @@ New writes are raw, and curation lifts them to curated. Raw entries are searchab
 | Other entries written by the fleet's own sessions in the domain | Sessions whose policy admits raw in the domain |
 | Content from external authors, arriving through a tap | Triage, and the session working the task created from it. Everywhere else, only once curated |
 
-Curators and auditors read raw as their work requires. Policy can adjust the defaults ([Appendix E](#appendix-e-rules-in-detail)). Classification still applies in every case: raw reach decides which raw entries a session may see, and handling still caps how high it may read.
+Where a raw entry came from includes what its author read: a fleet session that read tap content writes in the tap row, because an agent restating what it read does not make it a new source [[81]](#ref-81). Curators and auditors read raw as their work requires. Policy can adjust the defaults ([Appendix E](#appendix-e-rules-in-detail)). Classification still applies in every case: raw reach decides which raw entries a session may see, and handling still caps how high it may read.
 
-Promotion to verified passes a review gate. A person approves it, or a senior agent where domain policy allows; the proposer can never approve its own. A wrong fact written once and trusted forever is the largest long-term risk this system carries, and this gate is the main defence against it.
+Promotion to verified passes a review gate. A person approves it, or a senior agent where domain policy allows; the proposer can never approve its own. A wrong fact written once and trusted forever is the largest long-term risk this system carries, and this gate is the main defence against it. Reviewers tend to follow the lean of what they review [[82]](#ref-82), so the reviewer sees the alternatives the proposer rejected, the widest promotions get a second, blind review, and agreement between reviewers is measured ([§9](#9-measurement)). An entry that a reader with none of its context cannot explain back is not ready to promote [[83]](#ref-83).
 
 ## Labels and flow
 
@@ -343,7 +343,7 @@ Model output gets three further rules, because of the hazards in [§1](#1-why).
 
 ## Poisoning
 
-Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it ([§13](#13-related-work)). Everything above is the defence, together with the independent auditors of [§5](#5-the-curator).
+Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it ([§13](#13-related-work)). Everything above is the defence, together with the independent auditors of [§5](#5-the-curator). Each session also records the lowest trust tier it has read. The mark grants and blocks nothing, since most useful work reads something raw; auditors use it to sample first the writes and sends of sessions that did.
 
 ---
 
@@ -358,11 +358,11 @@ Curators are a standing fleet of cheap-model agents. They:
 - merge duplicates and mark what supersedes what;
 - split oversized files and demote dead material.
 
-Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Curation is budgeted like any other work, with a protected floor, so curation and delivery cannot starve each other.
+Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Entries derived from one just superseded, and facts whose cited code has changed, go to the front, because a stale claim misleads more than a missing one [[84]](#ref-84). Curation is budgeted like any other work, with a protected floor, so curation and delivery cannot starve each other.
 
 **Curator, historian, steward.** The historian ([§3](#3-memory)) records what happened; the curator looks after what is kept. "Curator" is the cross-industry name for that work: digital curation is "the management and preservation of digital data/information over the long-term" [[9]](#ref-9), and the work's output here is the curated tier. In data governance the accountable person is the data steward [[10]](#ref-10), which here is the domain owner; curators work under the owner's policy.
 
-A summary keeps the provenance, tier, and classification of what it summarises. A consolidation that drops where a claim came from would let a raw or restricted claim pass as a curated, public one, so the curator's outputs follow the derivation rules of [§4](#4-trust-and-handling).
+A summary keeps the provenance, tier, and classification of what it summarises. A consolidation that drops where a claim came from would let a raw or restricted claim pass as a curated, public one, so the curator's outputs follow the derivation rules of [§4](#4-trust-and-handling). A summary is rebuilt from the entries it summarises each time it is written, never from an earlier summary, and a pass changes only what telemetry flagged. Rewriting a rewrite loses detail with each pass, until memory can do worse than none [[85]](#ref-85), [[86]](#ref-86).
 
 ## Containing the Curator
 
@@ -373,7 +373,7 @@ The curator is the most privileged agent in the system. It writes the summaries 
 - **Telemetry and the historian are out of reach.** The retrieval service and ledger write both, and curators have no write access, so a curator cannot hide the signals that would expose it. The service alerts, per curator instance, on demotion rates, summary drift, and skew in which entries searches surface.
 - **The gate scales with impact.** Routine curation is sampled for review. For promotions, boundary changes, tombstone redirects, and `dom-platform` distillation, a second party must approve.
 - **Lineage re-check.** Provenance names the instance and model behind every action, so if an instance, a source, or a model generation turns out bad, everything it wrote can be listed and re-checked. Curators are rotated like other agents.
-- **Canary entries.** Each domain holds a few entries with known content; a curation pass that alters one improperly raises an alarm.
+- **Canary entries.** Each domain holds a few entries with known content; a curation pass that alters one improperly raises an alarm. Canaries catch bad edits, not a dormant payload, which can wait through a hundred sessions before it acts [[87]](#ref-87).
 
 ## Auditors
 
@@ -383,9 +383,12 @@ Auditors are agents whose only job is checking curators. They:
 
 - run on a different base model and prompt lineage, to reduce shared blind spots;
 - sample summaries against the entries they summarise;
+- test entries in the combinations searches return them, since a payload can be split across several;
+- trace a bad outcome back through the read sets in the historian [[88]](#ref-88);
+- sample handoffs for instructions aimed at the next agent;
 - hunt contradictions between entries;
 - watch the canary entries;
-- share no writable state with curators.
+- share no writable state with curators, and see an entry and its sources, never the curator's reasoning.
 
 Immutable history, deterministic tests, and sampled human review check the auditors in turn, with no further layer of agents.
 
@@ -428,7 +431,7 @@ OPA covers what can be checked mechanically: access, labels, spend and throughpu
 
 **An example.** A developer runs a memory server on their laptop. Their agents connect to it and to nothing else. When an agent needs the institution's memory, the laptop server fetches it from the institution's server under a grant the server holds on the developer's behalf, and applies the same filter and labels to what comes back.
 
-That is the rule: a session sees one memory server, the one run by whoever runs its harness, because enforcement split across servers leaves gaps. Any other memory system is a host behind that server. Agents never connect to a second server themselves.
+That is the rule: a session sees one memory server, the one run by whoever runs its harness, because enforcement split across servers leaves gaps. Any other memory system is a host behind that server. Agents never connect to a second server themselves. A harness's own memory files are a second memory too: the harness turns them off, or they arrive through a tap.
 
 Identity is the serving layer's concern; the record carries only provenance. A server for one person authenticates nobody, since the owner is the only principal, but still applies labels and ceilings. An institution's server uses its identity provider. The credential for each host is held by the server, never by an agent.
 
@@ -436,13 +439,13 @@ The operations in [Appendix A](#appendix-a-interface) are the durable contract; 
 
 ## Turns cost more than transport
 
-Every pull costs the agent a model turn. So the predictable part (T0 and the policy digest) arrives as a cached prefix. Pulls are dense: summaries first, prefetch attached, several queries per call. Where a harness works best with files, the service renders a scoped, read-only file view instead of mounting anything.
+Every pull costs the agent a model turn. So the predictable part (T0 and the policy digest) arrives as a cached prefix. T0 arrives as data with its tiers shown, and only the policy digest is read as instruction: memory loaded as instructions has been rewritten by a malicious package and obeyed [[89]](#ref-89). Pulls are dense: summaries first, prefetch attached, several queries per call. Where a harness works best with files, the service renders a scoped, read-only file view instead of mounting anything.
 
 ## The recall deputy
 
 **Why.** A question that needs several searches and reads would cost the expensive model one turn for each.
 
-So multi-step lookups go to `recall(question, domain)`. A cheap model inside the service runs the search, read, and summarise loop and returns a cited brief, so the expensive caller spends one turn.
+So multi-step lookups go to `recall(question, domain)`. A model cheaper than the caller's, chosen against the domain's suite, runs the search, read, and summarise loop inside the service and returns a cited brief, so the expensive caller spends one turn. It is served conflicts already resolved by curation, not metadata to weigh, because a stale note that looks current misleads larger models most [[90]](#ref-90).
 
 - The deputy runs under the caller's own filter, so a low-privilege caller cannot launder reads through it.
 - The caller's label rises to the highest classification the deputy read, and the deputy's reads join the caller's read set ([§3](#3-memory)).
@@ -614,7 +617,7 @@ sequenceDiagram
     H->>L: complete C after reviewing both handoffs
 ```
 
-No agent messages another. Every hand-over goes through the ledger and a handoff note.
+No agent messages another. Every hand-over goes through the ledger and a handoff note. A handoff says what was done, found, and left; it cannot change the task's spec or requirements.
 
 Where workers' outputs meet, the orchestrator checks for overlapping artifacts, runs the policy gate, and promotes the decisions made along the way from raw to curated. Every finished task is kept in the record with its edges, handoff, and outcome. That history is the ground truth for evaluation ([§11](#11-evaluating-change)).
 
@@ -705,13 +708,15 @@ Every read and every ledger operation passes through the service, so telemetry a
 | Unmatched or invalidated tasks | Capability gaps, noisy taps, stale backlogs |
 | Approval backlog and decision latency | Human review capacity is falling behind; add reviewers or admit less work |
 | Decision-relevant omissions in summaries | Compression is hiding exceptions, uncertainty, or evidence needed to act |
+| Served, then misapplied (paired replays with and without memory) | Memory was found but misled: fix the entry, not the ranking |
+| Reviewer agreement, with each other and with the proposer | Low: the bar is unclear. Near total with the proposer: the gate is not independent |
 | Dependency cycles, priority reversals, missed commitments | Coordination is unstable across domains |
 
 Retrieval is a published contract, because agents depend on it. Starting targets: median search latency 100 ms and 99th-percentile latency 500 ms; 99% of handoffs and mid-task decisions searchable within 60 seconds, screening included, with a looser bound for bulk curation; known-item lookups by ID, title, or error string in the top three; `claim_next` 99th-percentile latency one second.
 
 In an outage, agents keep working from the T0 they loaded and queue their handoffs, within their last confirmed lease. New reads need current authorisation and changes need a valid claim; when either cannot be checked, the action waits. No irreversible action proceeds in an outage. [Appendix C](#appendix-c-ledger-semantics) gives the ledger's outage rules.
 
-Each domain keeps a golden query suite that runs on every change to the indexer, ranker, or summary prompt. A curator's rewrite of summaries counts as such a change. Ranking changes ship through canary or shadow serving. Alerts are per domain, because rot shows locally long before it moves an average. And telemetry is the curator's work queue, which is what keeps the corpus healthy in year ten.
+Each domain keeps a golden query suite that runs on every change to the indexer, ranker, or summary prompt. A curator's rewrite of summaries counts as such a change. The suite checks that a demoted or superseded entry is never served: stores that leave this to the prompt keep serving revoked records [[91]](#ref-91). Ranking changes ship through canary or shadow serving. Alerts are per domain, because rot shows locally long before it moves an average. And telemetry is the curator's work queue, which is what keeps the corpus healthy in year ten.
 
 Decisions need deadlines as much as searches do. Each unit sets response bounds for review and escalation, and a missed bound goes to a named backup or a higher authority, outside the task queue; approval is still required. Tests include a critical exception buried in a summary, an absent approver, and a burst of competing cross-domain requests. Passing means the warning survives, reaches someone who can act, and the response is recorded.
 
@@ -811,14 +816,15 @@ The first change to evaluate is the system itself. Hold model, harness, tasks, a
 |---|---|---|
 | **No memory** | The task spec and the repositories and trackers it would have anyway | The floor |
 | **Transcript replay** | No memory, plus earlier sessions' transcripts | Today's practice |
-| **T0 only** | Cached index and policy digest, no retrieval | What the cheap layer buys |
+| **T0 only** | Cached index and policy digest, no retrieval | What the cheap layer buys; context files alone often do not pay [[92]](#ref-92) |
+| **Raw only** | T0, and retrieval over raw entries and handoffs with no curation | What curation buys |
 | **Full** | T0, retrieval, and handoffs | The system as built |
 
-Arms are scored on task success and on cost per task, paired by task across seeds. Memory earns its place in a domain when success is no worse than without memory, within a margin fixed before the run, and cost is lower; or when success is higher at a cost the domain accepts. Cheaper and worse is a failure.
+Arms are scored on task success and on cost per task, paired by task across seeds. Every arm uses the same retrieval configuration, and the cost of writing and curating counts against the arms that have them. Memory earns its place in a domain when success is no worse than without memory, within a margin fixed before the run, and cost is lower; or when success is higher at a cost the domain accepts. Cheaper and worse is a failure.
 
 The no-memory baseline must be honest: it keeps everything an agent would have without this system, including tracker history. Entries written after the task's snapshot are excluded from the full arm.
 
-The answer is per domain, and it moves. Memory may pay where decisions are long-lived and not where tasks are throwaway, and larger context windows or cheaper reads can erode its margin. So the comparison runs first on a fixed pilot set, and later as a standing holdout: a small sample of completed tasks re-run without memory on a published cadence.
+The answer is per domain, and it moves. Memory may pay where decisions are long-lived and not where tasks are throwaway, and larger context windows or cheaper reads can erode its margin. So the comparison runs first on a fixed pilot set, and later as a standing holdout: a small sample of completed tasks re-run without memory, and without curation, on a published cadence.
 
 ## Vendor changes nobody announced
 
@@ -933,9 +939,9 @@ The design combines recent agent-memory research with decades of systems practic
 
 | Area | Builds on |
 |---|---|
-| **Memory** | Operating-system tiers (MemGPT [[18]](#ref-18)); reflection (Generative Agents [[19]](#ref-19)); experience distillation (ExpeL [[20]](#ref-20), A-Mem [[21]](#ref-21)); agent-written skills (Voyager [[22]](#ref-22)); memory as a write, manage, read loop on shared substrates [[23]](#ref-23), [[24]](#ref-24); event sourcing [[25]](#ref-25), [[26]](#ref-26); decision records [[27]](#ref-27); organisational memory [[28]](#ref-28) |
-| **Trust** | Not transitive [[6]](#ref-6); typed by purpose [[7]](#ref-7); lossy propagation, separate distrust [[29]](#ref-29); provenance and lineage in W3C PROV [[30]](#ref-30); authority collapse [[8]](#ref-8); separation of privilege [[31]](#ref-31) |
-| **Safety** | Indirect prompt injection [[32]](#ref-32); memory poisoning through queries (MINJA [[33]](#ref-33)) and stores (AgentPoison [[34]](#ref-34)), largely missed by injection defences [[35]](#ref-35); OWASP's agentic top risks [[36]](#ref-36); failure modes of governed shared memory [[37]](#ref-37); retrieved content as data, never control flow (CaMeL [[38]](#ref-38)) |
+| **Memory** | Operating-system tiers (MemGPT [[18]](#ref-18)); reflection (Generative Agents [[19]](#ref-19)); experience distillation (ExpeL [[20]](#ref-20), A-Mem [[21]](#ref-21)); agent-written skills (Voyager [[22]](#ref-22)); memory as a write, manage, read loop on shared substrates [[23]](#ref-23), [[24]](#ref-24); event sourcing [[25]](#ref-25), [[26]](#ref-26); decision records [[27]](#ref-27); organisational memory [[28]](#ref-28); surveys finding the governance of persistent state the least studied part [[93]](#ref-93), [[94]](#ref-94); versioned Markdown with frontmatter as the format practice is converging on (Letta [[95]](#ref-95), OKF [[96]](#ref-96)) |
+| **Trust** | Not transitive [[6]](#ref-6); typed by purpose [[7]](#ref-7); lossy propagation, separate distrust [[29]](#ref-29); provenance and lineage in W3C PROV [[30]](#ref-30); authority collapse [[8]](#ref-8), and consolidation that leaves memory worse than none [[85]](#ref-85); separation of privilege [[31]](#ref-31) |
+| **Safety** | Indirect prompt injection [[32]](#ref-32); memory poisoning through queries (MINJA [[33]](#ref-33)) and stores (AgentPoison [[34]](#ref-34)), largely missed by injection defences [[35]](#ref-35); OWASP's agentic top risks [[36]](#ref-36); failure modes of governed shared memory [[37]](#ref-37); retrieved content as data, never control flow (CaMeL [[38]](#ref-38)); dormant payloads [[87]](#ref-87) and laundering through an agent's own summary [[81]](#ref-81); memory poisoning and hardening in MITRE ATLAS [[97]](#ref-97) and OWASP's Agent Memory Guard [[98]](#ref-98) |
 | **Retrieval and access** | Authorisation compiled into the query (OPA [[39]](#ref-39), Zanzibar [[40]](#ref-40)); the Model Context Protocol as today's binding [[41]](#ref-41), and A2A between domains [[79]](#ref-79) |
 | **Policy** | Written, layered values (Constitutional AI [[42]](#ref-42)); specification gaming, which the safety gate exists for [[43]](#ref-43), [[44]](#ref-44) |
 | **Coordination** | Blackboards (Hearsay-II [[45]](#ref-45)) and tuple spaces (Linda [[46]](#ref-46)); stigmergy [[47]](#ref-47), [[48]](#ref-48); leases [[49]](#ref-49); bounded contexts [[50]](#ref-50) and data mesh [[51]](#ref-51); hierarchical task networks [[52]](#ref-52); critical-path priority [[53]](#ref-53); the contract net, without the bidding [[54]](#ref-54) |
@@ -963,7 +969,7 @@ Beer's test is viability, and that depends on how well these functions exchange 
 
 # References
 
-Numbered in order of first citation. Recent works link to their arXiv records; older works give the venue, with a link where a stable copy exists.
+Numbered in order of first citation, with later additions appended. Recent works link to their arXiv records; older works give the venue, with a link where a stable copy exists.
 
 <a id="ref-1"></a>[1] Hugging Face Security Team (2026). Security Incident Disclosure, July 2026. 16 July 2026. https://huggingface.co/blog/security-incident-july-2026
 
@@ -1123,6 +1129,46 @@ Numbered in order of first citation. Recent works link to their arXiv records; o
 
 <a id="ref-79"></a>[79] A2A Project (2026). Agent2Agent (A2A) Protocol Specification, version 1.0. 12 March 2026. https://a2a-protocol.org/latest/specification/
 
+<a id="ref-80"></a>[80] Gazit, T. (2026). Building an Agentic Memory System for GitHub Copilot. The GitHub Blog, 15 January 2026. https://github.blog/ai-and-ml/github-copilot/building-an-agentic-memory-system-for-github-copilot/
+
+<a id="ref-81"></a>[81] Louck, Y. (2026). Securing LLM-Agent Long-Term Memory Against Poisoning: Non-Malleable, Origin-Bound Authority with Machine-Checked Guarantees. arXiv:2606.24322. https://arxiv.org/abs/2606.24322
+
+<a id="ref-82"></a>[82] Herdağdelen, A., Joren, H., & Tamkin, A. (2026). How AI Agents Shape Experts' Judgment Calls. Anthropic, 27 October 2026. https://www.anthropic.com/research/agents-judgment-calls
+
+<a id="ref-83"></a>[83] Suchy, B., Quinn, J., Ewing, E., Newth, O., & Rensin, D. (2026). Introducing the Elephant-Goldfish Model Plugin: Scaling Design-Driven AI Software Development. Google Open Source Blog, 22 October 2026. https://opensource.googleblog.com/2026/10/introducing-elephant-goldfish-model-plugin.html
+
+<a id="ref-84"></a>[84] Poikarayil, O. B., Babu, T. B., Nahhas, A., Mehta, H. D., Baktash, J. A., De Luca, E. W., & Turowski, K. (2026). When Retrieval Is Not Enough: Obsolete Facts in Agent Memory. NeurIPS 2026 Workshop on Personalized, Aligned, Long-Term Memory. arXiv:2610.36308. https://arxiv.org/abs/2610.36308
+
+<a id="ref-85"></a>[85] Zhang, D., Lin, Y., Wu, Z., Sun, Y., Li, B., Li, D., & Peng, H. (2026). Useful Memories Become Faulty When Continuously Updated by LLMs. arXiv:2605.12978. https://arxiv.org/abs/2605.12978
+
+<a id="ref-86"></a>[86] Zerhoudi, S., Mitrovic, J., & Granitzer, M. (2026). The Compaction Cliff in Long-Running AI Agent Memory. arXiv:2608.22752. https://arxiv.org/abs/2608.22752
+
+<a id="ref-87"></a>[87] Das, D., Piet, J., Kaviani, D., Beurer-Kellner, L., Tramèr, F., & Wagner, D. (2026). Trojan Hippo Bench: A Dynamic Benchmark for Persistent Memory Attacks and Defenses in LLM Agents. arXiv:2605.01970. https://arxiv.org/abs/2605.01970
+
+<a id="ref-88"></a>[88] Tan, Z., et al. (2026). MemAudit: Post-hoc Auditing of Poisoned Agent Memory via Causal Attribution and Structural Anomaly Detection. arXiv:2605.23723. https://arxiv.org/abs/2605.23723
+
+<a id="ref-89"></a>[89] Habler, I., & Chang, A. (2026). Identifying and Remediating a Persistent Memory Compromise in Claude Code. Cisco Blogs, 1 April 2026. https://blogs.cisco.com/ai/identifying-and-remediating-a-persistent-memory-compromise-in-claude-code
+
+<a id="ref-90"></a>[90] Hu, J., & Ramachandran, S. (2026). The Memory Trust Gap: Capability-Dependent Failures in Persistent-Memory Agents. arXiv:2609.01852. https://arxiv.org/abs/2609.01852
+
+<a id="ref-91"></a>[91] Shen, Y. T., Toyoda, K., & Leung, A. (2026). Revoked but Still Authoritative: An Empirical Study of Revocation Enforcement in Agent-Memory Systems. arXiv:2609.08258. https://arxiv.org/abs/2609.08258
+
+<a id="ref-92"></a>[92] Gloaguen, T., Mündler-Sasahara, N., Müller, M. N., Raychev, V., & Vechev, M. (2026). Evaluating AGENTS.md: Are Repository-Level Context Files Helpful for Coding Agents? arXiv:2602.11988. https://arxiv.org/abs/2602.11988
+
+<a id="ref-93"></a>[93] Ding, T., Nannapaneni, A., Liu, B., & Zhang, L. (2026). Always-On Agents: A Survey of Persistent Memory, State, and Governance in LLM Agents. arXiv:2606.30306. https://arxiv.org/abs/2606.30306
+
+<a id="ref-94"></a>[94] Huang, W.-C., et al. (2026). A Survey of Agent Memory in the Second Half: Towards Self-Evolving and Long-Horizon Agents. *Transactions on Machine Learning Research*. arXiv:2602.06052. https://arxiv.org/abs/2602.06052
+
+<a id="ref-95"></a>[95] Letta (2026). Introducing Context Repositories: Git-based Memory for Coding Agents. 12 February 2026. https://www.letta.com/blog/context-repositories
+
+<a id="ref-96"></a>[96] Google Cloud. Open Knowledge Format, specification v0.2. https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md
+
+<a id="ref-97"></a>[97] MITRE. ATLAS: AI Agent Context Poisoning: Memory (AML.T0080.000), and Memory Hardening (AML.M0031). ATLAS data v5.6.0. https://atlas.mitre.org
+
+<a id="ref-98"></a>[98] OWASP Foundation. OWASP Agent Memory Guard (incubator project). https://owasp.org/www-project-agent-memory-guard/
+
+<a id="ref-99"></a>[99] Gao, X., Chen, W., Meng, X., Wang, L., Zang, C., Wang, J., Li, Z., & Guo, S. (2026). Isolated but Exposed: Persistence-Based Memory Extraction Attack on LLM Agents. arXiv:2607.23444. https://arxiv.org/abs/2607.23444
+
 ---
 
 # Appendix A: Interface
@@ -1137,7 +1183,7 @@ type: decision | fact | convention | method | handoff
 domain: dom-a                 # a permanent ID, never a team name
 author: agent:worker-3 (model: <model-id>) | human:<authority>,<date>:<user-id>   # §12
 created: <timestamp>
-cites: [entry IDs or links]   # what the author says it drew on; the service records the rest (§3)
+cites: [entry IDs, links, or repo@commit:path]   # what the author says it drew on; the service records the rest (§3)
 session: <session-id>@<historian position>   # recovers the read set
 confidence: high | medium | low
 trust_tier: raw | curated | verified
@@ -1153,7 +1199,7 @@ policy_context: [pol-L1-007]  # policy in force when written
 ```
 search(query, domain?, filters?)   → [{id, title, summary, meta, snippet}]
 get(id | id#anchor)                → {body, related: [{id, summary, p}]}
-recall(question, domain?)          → {brief, citations: [id]}   # cheap model, caller's filter
+recall(question, domain?)          → {brief, citations: [id]}   # cheaper model, caller's filter
 write(entry)                       → {id}    # historian append, screened before indexing; fast lane for handoffs
 ```
 
@@ -1223,9 +1269,11 @@ An excerpt carries its turn's classification and is demoted, exported, or erased
 
 For contributors or tools that cannot call the service, a curator may generate a small instruction stub containing pointers from the domain's T0 slice. It is marked as generated, with a content digest in a published list. Fleet harnesses use the service directly. A hand-edited stub is rejected in review or proposed back as a raw entry.
 
-A foreign harness that loads instruction files needs a load-time hook to check the published list and reject altered or stale stubs. Without that hook, the fleet's enforcement guarantees do not extend to it. Skills served through the tool protocol load only as verified bundles; changing their digest revokes approval. Repository copies of those skills are generated pointers to the approved bundles.
+A foreign harness that loads instruction files needs a load-time hook to check the published list and reject altered or stale stubs. Without that hook, the fleet's enforcement guarantees do not extend to it. Skills served through the tool protocol load only as verified bundles; changing their digest revokes approval. Repository copies of those skills are generated pointers to the approved bundles. An instruction file in the workspace that the service did not generate is read as raw.
 
 **Leaving the system.** `export(domain, max_label)` is a read under the caller's filter: entries at or below the label, with provenance, classification, and supersession. The bundle carries the highest label inside it and goes only to a destination whose ceiling allows that label. Import is the mirror: entries land raw, keep their classification or take the receiving domain's higher default, and are keyed on origin so a second import creates nothing. A personal domain moving between its owner's homes keeps its tiers; everything else earns them again.
+
+An export can be rendered in Google's Open Knowledge Format [[96]](#ref-96), which shares this shape: `review_by` becomes `stale_after`, a tombstone `deprecated`, raw unverified, curated machine-confirmed, and verified human-reviewed only where a person approved. That format has no classification and calls its tiers advisory, so the bundle's label rule above still decides where it may go.
 
 **People are handled by policy.** Norms can be distilled from observable process: how decisions are phrased, how disagreement resolves. Roles and public records are facts. Behavioural profiles of individuals compiled from years of archives are a policy decision, not a distillation default. Set the boundary in L0 or L2 before the first run, and enforce it at the gate.
 
@@ -1389,13 +1437,14 @@ The main text gives each rule at the level needed to follow the design. This app
 - **Attesting handling.** A session's handling is set by policy for its principal and attested by its harness. A harness may attest handling above public only if every outbound path it has goes through the perimeter. Otherwise the send check could be bypassed.
 - **Tool servers are sources too.** Each is registered with its ceiling and with the highest classification of what it reads. A call raises the session's label like any read.
 - **Grants.** Grants are per principal and per server. A server that reads restricted sources is never the same grant as one whose ceiling is public; a deployment that needs that crossing builds it as a `declassify`.
-- **Probing.** Repeated ceiling denials from one principal alert as probing.
+- **Tool calls are sends.** A call's arguments carry what the session read, so each call is checked against the server's ceiling like any send [[99]](#ref-99). Name resolution and redirect services are destinations too.
+- **Probing.** Repeated ceiling denials, or queries that walk the index like an enumeration, from one principal alert as probing.
 - **Declassification.** A `declassify` proposes a new, lower-labelled entry that cites the original. The proposal keeps the higher label until the guard approves. The guard is the domain's owner by default, and a person for the widest crossings. The result names the guard in its provenance, so every crossing can be listed.
 - **Delegation and recall.** A helper's label starts at its parent's and flows back up. A `recall` raises the caller's label to the highest classification its deputy read.
 
 ### Raw reach (§4)
 
-- The write's session tells which row of the raw-reach table applies: a task chain, a fleet session, or a tap.
+- The write's session and what it read tell which row of the raw-reach table applies: a task chain, a fleet session, or a tap. The narrowest row among the raw entries in its read set applies.
 - Domain policy may widen or narrow the defaults.
 - A principal's policy may require curated or better for what it reads in a domain.
 
