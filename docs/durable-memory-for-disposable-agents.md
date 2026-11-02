@@ -14,7 +14,7 @@ Written with Claude Fable 5, Claude Opus 5 (Anthropic), and GPT-6 Astra (OpenAI)
 
 Agents doing real, sustained work fail in four ways.
 
-1. **They forget.** Every session starts cold. Context is rebuilt by replaying transcripts, the most expensive way to recover it.
+1. **They forget.** Every session starts cold. Context is rebuilt by replaying transcripts, the most expensive way to recover it [[100]](#ref-100).
 2. **They collide.** Without shared state, agents duplicate or contradict each other's work, or coordinate by messaging each other over channels that grow with the square of the fleet.
 3. **They lack judgment.** An agent can do a task but cannot tell whether the institution thinks it worth doing or over a line, unless that judgment is written where it can read it.
 4. **They don't survive change.** Models turn over every 6 to 18 months, frameworks faster, organisations every few years. Whatever lives in an agent, a prompt, or a vendor's store dies with it.
@@ -38,7 +38,7 @@ Three constraints follow and shape the rest of the design.
 
 **Model output is untrusted until checked.** Every write records where it came from, how far it has been checked, and who may see it. Nothing an agent writes is executed or loaded as configuration until it has passed a gate, and nothing leaves except within the destination's limits ([§4](#4-trust-and-handling)).
 
-**Reading costs.** Agents pay for every token they read; storage is nearly free. So the design optimises the read path: load the least that answers the question. The discipline holds even if reading becomes free, because overloaded contexts produce worse output. [§12](#12-surviving-long-timescales) explains why the design measures tokens but does not build their price into its structure.
+**Reading costs.** Agents pay for every token they read; storage is nearly free. So the design optimises the read path: load the least that answers the question. The discipline holds even if reading becomes free: accuracy can fall as input grows even when the needed evidence is present [[101]](#ref-101), [[102]](#ref-102), current frontier models included [[103]](#ref-103), though how much varies by model and task. [§12](#12-surviving-long-timescales) explains why the design measures tokens but does not build their price into its structure.
 
 **The system must outlive its parts.** Over decades every model, tool, and vendor is replaced, and the organisation is redrawn many times. So everything of lasting value lives in plain-text data with provenance. Services and agents around it can be rebuilt or replaced without loss.
 
@@ -381,7 +381,7 @@ The curator is the most privileged agent in the system. It writes the summaries 
 
 Auditors are agents whose only job is checking curators. They:
 
-- run on a different base model and prompt lineage, to reduce shared blind spots;
+- run on a different base model and prompt lineage, because a model favours output it recognises as its own [[104]](#ref-104) and does not reliably correct its own reasoning [[105]](#ref-105);
 - sample summaries against the entries they summarise;
 - test entries in the combinations searches return them, since a payload can be split across several;
 - trace a bad outcome back through the read sets in the historian [[88]](#ref-88);
@@ -390,13 +390,13 @@ Auditors are agents whose only job is checking curators. They:
 - watch the canary entries;
 - share no writable state with curators, and see an entry and its sources, never the curator's reasoning.
 
-Immutable history, deterministic tests, and sampled human review check the auditors in turn, with no further layer of agents.
+A different model narrows shared blind spots but does not remove them: errors correlate across models and providers, more so as models improve [[106]](#ref-106), much as independently written programs fail together more often than chance predicts [[107]](#ref-107), [[108]](#ref-108). Immutable history, deterministic tests, and sampled human review check the auditors in turn, with no further layer of agents.
 
 ---
 
 # 6. Retrieval and Serving
 
-**Why.** An agent that loads the whole corpus pays for it on every turn and does worse work, and an agent that reaches the store directly bypasses every check. The service gives agents the least they need, through one checkpoint.
+**Why.** An agent that loads the whole corpus pays for it on every turn and risks worse work, and an agent that reaches the store directly bypasses every check. The service gives agents the least they need, through one checkpoint.
 
 ## Search
 
@@ -617,7 +617,7 @@ sequenceDiagram
     H->>L: complete C after reviewing both handoffs
 ```
 
-No agent messages another. Every hand-over goes through the ledger and a handoff note. A handoff says what was done, found, and left; it cannot change the task's spec or requirements.
+No agent messages another. Every hand-over goes through the ledger and a handoff note. A handoff says what was done, found, and left; it cannot change the task's spec or requirements. Harnesses for long-running agents carry state the same way, in progress notes and version history rather than compacted transcripts [[109]](#ref-109), and a consolidated restatement can beat an accumulated history that carries early wrong attempts forward [[110]](#ref-110). Structured handoffs reduced errors in hospitals [[111]](#ref-111). But a model-written summary can also hide failure signals [[100]](#ref-100), so the next agent checks a handoff against the ledger and the work itself.
 
 Where workers' outputs meet, the orchestrator checks for overlapping artifacts, runs the policy gate, and promotes the decisions made along the way from raw to curated. Every finished task is kept in the record with its edges, handoff, and outcome. That history is the ground truth for evaluation ([§11](#11-evaluating-change)).
 
@@ -1168,6 +1168,30 @@ Numbered in order of first citation, with later additions appended. Recent works
 <a id="ref-98"></a>[98] OWASP Foundation. OWASP Agent Memory Guard (lab project). https://owasp.org/www-project-agent-memory-guard/
 
 <a id="ref-99"></a>[99] Gao, X., Chen, W., Meng, X., Wang, L., Zang, C., Wang, J., Li, Z., & Guo, S. (2026). Isolated but Exposed: Persistence-Based Memory Extraction Attack on LLM Agents. arXiv:2607.23444. https://arxiv.org/abs/2607.23444
+
+<a id="ref-100"></a>[100] Lindenbauer, T., Slinko, I., Felder, L., Bogomolov, E., & Zharov, Y. (2025). The Complexity Trap: Simple Observation Masking Is as Efficient as LLM Summarization for Agent Context Management. arXiv:2508.21433. https://arxiv.org/abs/2508.21433
+
+<a id="ref-101"></a>[101] Du, Y., Tian, M., Ronanki, S., Rongali, S., Bodapati, S., Galstyan, A., Wells, A., Schwartz, R., Huerta, E. A., & Peng, H. (2025). Context Length Alone Hurts LLM Performance Despite Perfect Retrieval. *Findings of EMNLP 2025*. arXiv:2510.05381. https://aclanthology.org/2025.findings-emnlp.1264/
+
+<a id="ref-102"></a>[102] Hong, K., Troynikov, A., & Huber, J. (2025). Context Rot: How Increasing Input Tokens Impacts LLM Performance. Chroma, 14 July 2025. https://research.trychroma.com/context-rot
+
+<a id="ref-103"></a>[103] Martin, S., & Roger, F. (2026). Classifier Context Rot: Monitor Performance Degrades with Context Length. arXiv:2605.12366. https://arxiv.org/abs/2605.12366
+
+<a id="ref-104"></a>[104] Panickssery, A., Bowman, S. R., & Feng, S. (2024). LLM Evaluators Recognize and Favor Their Own Generations. *NeurIPS 2024*. arXiv:2404.13076. https://arxiv.org/abs/2404.13076
+
+<a id="ref-105"></a>[105] Huang, J., Chen, X., Mishra, S., Zheng, H. S., Yu, A. W., Song, X., & Zhou, D. (2024). Large Language Models Cannot Self-Correct Reasoning Yet. *ICLR 2024*. arXiv:2310.01798. https://arxiv.org/abs/2310.01798
+
+<a id="ref-106"></a>[106] Kim, E., Garg, A., Peng, K., & Garg, N. (2025). Correlated Errors in Large Language Models. *ICML 2025*, PMLR 267. https://proceedings.mlr.press/v267/kim25e.html
+
+<a id="ref-107"></a>[107] Knight, J. C., & Leveson, N. G. (1986). An Experimental Evaluation of the Assumption of Independence in Multiversion Programming. *IEEE Transactions on Software Engineering*, SE-12(1), 96–109. https://doi.org/10.1109/TSE.1986.6312924
+
+<a id="ref-108"></a>[108] Ron, J., Baudry, B., & Monperrus, M. (2026). N-Version Programming with Coding Agents. arXiv:2606.20158. https://arxiv.org/abs/2606.20158
+
+<a id="ref-109"></a>[109] Young, J. (2025). Effective Harnesses for Long-Running Agents. Anthropic Engineering, 26 November 2025. https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents
+
+<a id="ref-110"></a>[110] Laban, P., Hayashi, H., Zhou, Y., & Neville, J. (2025). LLMs Get Lost in Multi-Turn Conversation. arXiv:2505.06120. https://arxiv.org/abs/2505.06120
+
+<a id="ref-111"></a>[111] Starmer, A. J., Spector, N. D., Srivastava, R., et al. (2014). Changes in Medical Errors after Implementation of a Handoff Program. *New England Journal of Medicine*, 371(19), 1803–1812. https://doi.org/10.1056/NEJMsa1405556
 
 ---
 
