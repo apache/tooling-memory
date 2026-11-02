@@ -1316,7 +1316,7 @@ scores: {value: 8, urgency: 5, effort: 3, unblocks: [task-a-1210]}
 requires: [<tools, model tier, data scope, human sign-off>]
 reversibility: reversible | irreversible
 classification: internal
-status: proposed | open | claimed | blocked | review | done | invalidated
+status: proposed | open | claimed | blocked | done | invalidated
 claim: {agent: worker-7, generation: 42, lease_expires: <timestamp>}
 depends_on: [...]
 artifacts_touched: [<owned path glob>]
