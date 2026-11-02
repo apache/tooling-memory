@@ -15,6 +15,9 @@ could have, so the test can show which step of conformance.py catches it:
     second-claim        claim_next hands out a task somebody holds
     lease-forever       a lapsed lease is still renewed, and the task not returned
     heartbeat-noop      heartbeat answers but does not extend the lease
+    heartbeat-lies      heartbeat reports a renewed lease_until but does not extend the lease
+    heartbeat-short     heartbeat renews for half of what was asked
+    heartbeat-lies-short heartbeat reports what was asked but renews for 0.7 of it
     release-lies        release answers admitted and leaves the task claimed
     complete-anyone     complete works on a task nobody holds
     no-holder           a claim records no holder
@@ -108,7 +111,7 @@ def lease_for(t, seconds, now):
     """Hold `t` for `seconds` from `now` on the monotonic clock; `lease_until` is the
     same moment on the wall clock, for the caller to read."""
     t["_deadline"] = now + seconds
-    t["lease_until"] = time.time() + seconds
+    t["lease_until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
 
 
 class Fake:
@@ -208,7 +211,7 @@ class Fake:
         t["holder"] = None if FLAW == "no-holder" else "human:fake:owner"
         lease_for(t, lease, now)
         t["attempts"] += 1
-        return {"task": t, "lease_until": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t["lease_until"]))}
+        return {"task": t, "lease_until": t["lease_until"]}
 
     def tool(self, name, a):
         # leases are timed on the monotonic clock: a wall clock that steps back (WSL2's
@@ -269,7 +272,16 @@ class Fake:
             t = self.task(a["id"])
             if t["status"] != "claimed" or (t["_deadline"] < now and FLAW != "lease-forever"):
                 raise Refused("the lease is not held: it expired or was never yours")
-            if FLAW != "heartbeat-noop":
+            if FLAW == "heartbeat-lies":
+                seconds = a.get("lease_seconds") or 1800
+                t["lease_until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+            elif FLAW == "heartbeat-lies-short":
+                seconds = a.get("lease_seconds") or 1800
+                lease_for(t, seconds * 0.7, now)
+                t["lease_until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+            elif FLAW == "heartbeat-short":
+                lease_for(t, (a.get("lease_seconds") or 1800) * 0.55, now)
+            elif FLAW != "heartbeat-noop":
                 lease_for(t, a.get("lease_seconds") or 1800, now)
             return {"task": t}
         if name == "complete":

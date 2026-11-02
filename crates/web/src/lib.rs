@@ -1,11 +1,11 @@
 //! A web terminal on the launcher.
 //!
-//! Each session is a pseudo-terminal running `memory launch`, kept alive by this server
-//! whether or not a browser is attached. Its output goes into a ring buffer and to every
-//! attached websocket; a browser that connects, or reconnects, gets the ring first, so a
-//! refresh or a dropped connection lands in the same place. Beside the terminal a reading
-//! pane renders entries from the record as they land. Loopback only, and behind a token:
-//! see [`access`].
+//! Each session is a pseudo-terminal running `amem launch` or `amem work`, kept alive by
+//! this server whether or not a browser is attached. Its output goes into a ring buffer and
+//! to every attached websocket; a browser that connects, or reconnects, gets the ring
+//! first, so a refresh or a dropped connection lands in the same place. Beside the terminal
+//! a reading pane renders entries from the record as they land. Loopback only, and behind a
+//! token: see [`access`].
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -58,7 +58,7 @@ const RING_BYTES: usize = 2 * 1024 * 1024;
 pub struct Config {
     /// The record.
     pub root: PathBuf,
-    /// The `memory` binary; sessions run `<binary> --root <root> launch ...`.
+    /// The `amem` binary; sessions run `<binary> --root <root> launch ...` or `work ...`.
     pub memory_binary: PathBuf,
     /// The working tree sessions start in.
     pub workdir: PathBuf,
@@ -374,7 +374,7 @@ fn options(config: &Config) -> Value {
     })
 }
 
-/// The models a destination lists, asked of the launcher itself: `memory models` opens
+/// The models a destination lists, asked of the launcher itself: `amem models` opens
 /// the record, routes as a launch would, and prints what the destination's own model
 /// list says. A login mode has no list, since the login is the harness's.
 async fn models_via_launcher(

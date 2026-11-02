@@ -1,0 +1,16 @@
+domain = "dom-demo"
+
+[[question]]
+ask = "What did DR-19 decide about the wiki staying on MoinMoin?"
+answers = ["DR-19"]
+keywords = "DR-19 MoinMoin wiki"
+
+[[question]]
+ask = "Why is the domain the partition key everywhere?"
+answers = ["the domain is the partition key"]
+keywords = "domain partition key"
+
+[[question]]
+ask = "Who is the promotion gate at a foundation?"
+answers = ["Trust and review"]
+keywords = "committers promotion gate"

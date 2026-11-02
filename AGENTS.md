@@ -36,9 +36,32 @@ before you override the instruction.
   installs `make check` as the pre-commit hook. Some changes touch only Markdown files
   outside `crates/` and `taps/`. For this rule, an `AGENTS.md` in `crates/` or `taps/`
   counts as Markdown. The hook and CI do not run `make check` for such a change, because
-  nothing builds from those files or reads them. `scripts/docs-only.sh` decides which
-  changes are of this type. Its test holds the premise that nothing builds from those
-  files or reads them.
+  nothing builds from those files. `scripts/docs-only.sh` decides which changes are of
+  this type. Its test holds the premise that no crate or tap embeds those files or reads
+  them. Some scripts read them:
+
+  - `scripts/seed-corpus.py` seeds the demo record from `docs/` and
+    `examples/decisions/` (`make demo`). `golden/docs.toml` and `evals/demo.toml` score
+    answers against that text.
+  - Act 11 of the demo (`scripts/demo/11-limits.sh`) prints the two lists at the top of
+    `README.md`.
+
+  `make corpus-check` (`scripts/corpus-check.sh`) seeds a scratch record from those
+  files. It fails when a golden question (`golden/docs.toml`, `golden/platform.toml`,
+  `golden/acts.toml`) or an eval task names an entry that the record does not hold, when
+  the keywords of a golden question do not find its answer, when the text of an eval
+  task's entry no longer matches its `expect`, or when act 11 does not print every item
+  of its two lists. CI runs it on every change, a docs-only change included. It does not
+  run a harness, so it does not show what a model answers.
+
+  The demo seeds its record only once. So, after you change a file in `docs/` or
+  `examples/decisions/`, seed a new record with `make demo-ready RESET=1`. Then run
+  `make golden` and act 6 (`make demo-all HARNESS=codex ACTS=6`). Act 6 needs a key
+  for llm.apache.org, in `local/.virtual-key` or `LLMAO_KEY`. Without a key, the act
+  says "skipped" and checks nothing. Neither command fails on a miss. Read what they
+  print: golden's "Answers naming no entry in this record" and "Missed" lists, and the
+  `passed` column of act 6's `memory` row. After you change those two lists, run act 11
+  (`make demo-all HARNESS=codex ACTS=11`).
 - **Show that a new assertion fails before you trust it.** Run it against the code as it
   was before your change. Put what it reported in the pull request. If a test only ever
   passed, nobody has shown that it tests anything. Assert the rule, not a bound on the
@@ -113,9 +136,10 @@ of the Claude Code harness that belongs to the repository is committed under `.c
 | `.claude/commands/reader-test.md` | the prompts for a docs-only branch, instead of that pass: a reader that has only the changed files and their diff, and a fact check against the code |
 
 If the guard refuses something that this repository asks for, the guard has a bug. Add
-the case to the test and fix the guard. Do not work around the bug. All other files in
-`.claude/` stay ignored. An agent that is not Claude Code gets none of this. The same
-rules apply to that agent, and it learns them when it reads them.
+the case to the test and fix the guard. Do not work around the bug. `.gitignore` ignores
+`.claude/settings.local.json` and `.claude/worktrees/`. Do not commit other files in
+`.claude/` unless they belong to the repository. An agent that is not Claude Code gets
+none of this. The same rules apply to that agent, and it learns them when it reads them.
 
 ## Project shape
 
@@ -212,9 +236,9 @@ This applies to:
 - the AGENTS files, and the commands in `.claude/commands/`.
 
 These keep their own style: the paper (`docs/durable-memory-for-disposable-agents.md`),
-the case study (`docs/seeding-a-foundation.md`), `PLAN.md`, the records in `spikes/`, the
-example records in `examples/`, code comments, and the text of the web pages and the
-design book.
+the paper's appendix (`docs/durable-memory-for-disposable-agents-appendix.md`), the case
+study (`docs/seeding-a-foundation.md`), `PLAN.md`, the records in `spikes/`, the example
+records in `examples/`, code comments, and the text of the web pages and the design book.
 
 ## Writing on an issue or a pull request
 
