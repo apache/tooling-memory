@@ -490,11 +490,12 @@ mod tests {
             active: true,
         };
         append(dir.path(), "dom-me", "human:test:me", put).unwrap();
+        let reads = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
         let hook = WriteOnLaterReads {
             file,
             name: format!("/{id}.md"),
             text: next,
-            reads: std::sync::Arc::default(),
+            reads: reads.clone(),
         };
         let root = dir.path().to_string_lossy();
         let op = opendal::Operator::new(opendal::services::Fs::default().root(&root))
@@ -507,6 +508,9 @@ mod tests {
             indexed_next || done.behind.contains(&id),
             "the index holds a version the log does not name, and nothing says so: {done:?}"
         );
+        // One read of the entry: two would let a write land between them, and none would
+        // mean the hook never saw the read, so this test could not fail.
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Rewrite `id`'s stored text with `review_by` as the year and the day of the year, as
