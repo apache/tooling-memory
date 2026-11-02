@@ -161,6 +161,9 @@ fn every_spelling_of_the_old_name_is_found_and_only_those() {
         format!("let q = '\\''; let s = \"//\"; eprintln!(\"{name}: x\");"),
         format!("fn f<'a>(s: &'a str) {{ eprintln!(\"{name}: x\"); }}"),
         format!("/* a note */ eprintln!(\"{name}: x\");"),
+        // a comment ends at its line, and an escaped quote in a char opens no string
+        format!("// a note\neprintln!(\"{name}: x\");"),
+        format!("let c = '\\\"'; let s = \"//\"; eprintln!(\"{name}: x\");"),
     ];
     for line in &caught {
         assert_eq!(under_the_old_name(line).len(), 1, "missed: {line}");
@@ -212,12 +215,16 @@ fn no_message_starts_with_the_old_name() {
         crates.display()
     );
     let mut found = Vec::new();
+    let mut read = 0;
     for file in &files {
         let text = std::fs::read_to_string(file).expect("a source reads");
+        read += without_comments(&text).matches("\"amem: ").count();
         for (n, line) in under_the_old_name(&text) {
             found.push(format!("{}:{n}: {line}", file.display()));
         }
     }
+    // The binary has about 80 messages; far fewer seen means comments hid code.
+    assert!(read > 70, "only {read} messages seen outside comments");
     assert!(
         found.is_empty(),
         "messages under the old name:\n{}",
