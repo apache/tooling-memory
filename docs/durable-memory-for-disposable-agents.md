@@ -939,7 +939,7 @@ The design combines recent agent-memory research with decades of systems practic
 
 | Area | Builds on |
 |---|---|
-| **Memory** | Operating-system tiers (MemGPT [[18]](#ref-18)); reflection (Generative Agents [[19]](#ref-19)); experience distillation (ExpeL [[20]](#ref-20), A-Mem [[21]](#ref-21)); agent-written skills (Voyager [[22]](#ref-22)); memory as a write, manage, read loop on shared substrates [[23]](#ref-23), [[24]](#ref-24); event sourcing [[25]](#ref-25), [[26]](#ref-26); decision records [[27]](#ref-27); organisational memory [[28]](#ref-28); surveys finding the governance of persistent state the least studied part [[93]](#ref-93), [[94]](#ref-94); versioned Markdown with frontmatter as the format practice is converging on (Letta [[95]](#ref-95), OKF [[96]](#ref-96)) |
+| **Memory** | Operating-system tiers (MemGPT [[18]](#ref-18)); reflection (Generative Agents [[19]](#ref-19)); experience distillation (ExpeL [[20]](#ref-20), A-Mem [[21]](#ref-21)); agent-written skills (Voyager [[22]](#ref-22)); memory as a write, manage, read loop on shared substrates [[23]](#ref-23), [[24]](#ref-24); event sourcing [[25]](#ref-25), [[26]](#ref-26); decision records [[27]](#ref-27); organisational memory [[28]](#ref-28); a survey finding the governance of persistent state the least studied part [[93]](#ref-93), and a broader one [[94]](#ref-94); versioned Markdown with frontmatter as the format practice is converging on (Letta [[95]](#ref-95), OKF [[96]](#ref-96)) |
 | **Trust** | Not transitive [[6]](#ref-6); typed by purpose [[7]](#ref-7); lossy propagation, separate distrust [[29]](#ref-29); provenance and lineage in W3C PROV [[30]](#ref-30); authority collapse [[8]](#ref-8), and consolidation that leaves memory worse than none [[85]](#ref-85); separation of privilege [[31]](#ref-31) |
 | **Safety** | Indirect prompt injection [[32]](#ref-32); memory poisoning through queries (MINJA [[33]](#ref-33)) and stores (AgentPoison [[34]](#ref-34)), largely missed by injection defences [[35]](#ref-35); OWASP's agentic top risks [[36]](#ref-36); failure modes of governed shared memory [[37]](#ref-37); retrieved content as data, never control flow (CaMeL [[38]](#ref-38)); dormant payloads [[87]](#ref-87) and laundering through an agent's own summary [[81]](#ref-81); memory poisoning and hardening in MITRE ATLAS [[97]](#ref-97) and OWASP's Agent Memory Guard [[98]](#ref-98) |
 | **Retrieval and access** | Authorisation compiled into the query (OPA [[39]](#ref-39), Zanzibar [[40]](#ref-40)); the Model Context Protocol as today's binding [[41]](#ref-41), and A2A between domains [[79]](#ref-79) |
@@ -1165,7 +1165,7 @@ Numbered in order of first citation, with later additions appended. Recent works
 
 <a id="ref-97"></a>[97] MITRE. ATLAS: AI Agent Context Poisoning: Memory (AML.T0080.000), and Memory Hardening (AML.M0031). ATLAS data v5.6.0. https://atlas.mitre.org
 
-<a id="ref-98"></a>[98] OWASP Foundation. OWASP Agent Memory Guard (incubator project). https://owasp.org/www-project-agent-memory-guard/
+<a id="ref-98"></a>[98] OWASP Foundation. OWASP Agent Memory Guard (lab project). https://owasp.org/www-project-agent-memory-guard/
 
 <a id="ref-99"></a>[99] Gao, X., Chen, W., Meng, X., Wang, L., Zang, C., Wang, J., Li, Z., & Guo, S. (2026). Isolated but Exposed: Persistence-Based Memory Extraction Attack on LLM Agents. arXiv:2607.23444. https://arxiv.org/abs/2607.23444
 
