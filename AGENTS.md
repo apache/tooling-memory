@@ -43,6 +43,12 @@ before you override the instruction.
   was before your change. Put what it reported in the pull request. If a test only ever
   passed, nobody has shown that it tests anything. Assert the rule, not a bound on the
   rule.
+- **A flaky test is a defect. Fix it.** A flaky test passes and fails on the same code.
+  It hides real failures, and people learn to run it again instead of reading it. Find
+  the cause, for example time, order, load or shared state, and remove it. Do not add a
+  retry, a skip or a longer timeout only to make the test pass. Make CI find a flaky test
+  without help: if it fails only under load or on one platform, make the test or the CI
+  job reproduce that condition.
 - **Stage only the files that you changed** (`git add <path>`). Never use `git add -A`,
   `git add .` or `git commit -a`.
 - **Work in your own worktree, and expect other work in the repository.** Several sessions
