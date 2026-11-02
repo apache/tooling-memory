@@ -226,7 +226,10 @@ fn checked(method: &str, params: &Value, headers: &HeaderMap) -> Result<(), Refu
 /// Whether the method and name headers, where sent, say what the body says. Whoever
 /// sends them, a request whose headers name another method or tool than its body is
 /// refused: whatever routed on the headers acted on a different request than this one.
-/// A client of the handshake may leave them out.
+/// A client of the handshake may leave them out. The name is decoded before it is
+/// compared; the method is not, since 2026-07-28 allows the base64 sentinel in
+/// `Mcp-Name` and `Mcp-Param-*` only, and whatever routed on `Mcp-Method` read it as
+/// sent.
 fn mirrored(method: &str, params: &Value, headers: &HeaderMap) -> Result<(), Refusal> {
     if let Some(m) = header(headers, METHOD_HEADER)? {
         if m != method {
@@ -687,6 +690,22 @@ mod tests {
         let (status, got) = post_to(&app, &h, &r).await;
         assert_eq!(status, 404, "{got}");
         assert_eq!(got["error"]["code"], -32601, "{got}");
+    }
+
+    /// 2026-07-28 lets the sentinel stand for a value in `Mcp-Name` and `Mcp-Param-*`
+    /// only, so a method header in it names another method than the body's.
+    #[tokio::test]
+    async fn a_method_header_is_compared_as_sent_and_never_decoded() {
+        let app = app();
+        let (r, mut h) = modern("tools/list", Value::Null);
+        h.retain(|(k, _)| *k != mcp_meta::METHOD_HEADER);
+        h.push((
+            mcp_meta::METHOD_HEADER,
+            "=?base64?dG9vbHMvbGlzdA==?=".into(),
+        ));
+        let (status, got) = post_to(&app, &h, &r).await;
+        assert_eq!(status, 400, "{got}");
+        assert_eq!(got["error"]["code"], mcp_meta::HEADER_MISMATCH, "{got}");
     }
 
     #[tokio::test]

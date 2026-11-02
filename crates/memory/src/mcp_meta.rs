@@ -73,13 +73,15 @@ pub fn request(id: u64, method: &str, mut params: Value, client: &str) -> Value 
 }
 
 /// The headers a streamable HTTP POST of `request` carries: its version, its method,
-/// and, for a method that names something, that name.
+/// and, for a method that names something, that name. Only the name may go encoded
+/// ([`encode`]); 2026-07-28 allows that for `Mcp-Name` and `Mcp-Param-*` alone, and a
+/// server compares `Mcp-Method` with the body as sent.
 #[must_use]
 pub fn headers(request: &Value) -> Vec<(&'static str, String)> {
     let method = request["method"].as_str().unwrap_or_default();
     let mut out = vec![
         (VERSION_HEADER, MODERN.to_string()),
-        (METHOD_HEADER, encode(method)),
+        (METHOD_HEADER, method.to_string()),
     ];
     if let Some(key) = named_by(method) {
         if let Some(name) = request["params"][key].as_str() {
@@ -168,6 +170,15 @@ mod tests {
         let d = request(1, "server/discover", Value::Null, "t");
         assert_eq!(d["params"]["_meta"][PROTOCOL_VERSION], MODERN);
         assert_eq!(headers(&d).len(), 2);
+    }
+
+    /// 2026-07-28 lets the sentinel stand for a value in `Mcp-Name` and `Mcp-Param-*`
+    /// only; `Mcp-Method` carries the method as it is, even one that looks like it.
+    #[test]
+    fn the_method_header_carries_the_method_as_it_is() {
+        let looks_encoded = "=?base64?dG9vbHMvbGlzdA==?=";
+        let r = request(1, looks_encoded, Value::Null, "t");
+        assert_eq!(headers(&r)[1], (METHOD_HEADER, looks_encoded.to_string()));
     }
 
     #[test]

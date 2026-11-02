@@ -175,7 +175,8 @@ enum Era {
 
 /// What each tool server was found to speak, by URL, for the life of this process: a
 /// client keeps that per server rather than asking before every call. A call that
-/// fails on the way forgets it, so the next one asks again.
+/// fails on the way, or is answered with a reply not of that revision ([`unspoken`]),
+/// forgets it, so the next one asks again.
 fn eras() -> &'static Mutex<HashMap<String, Era>> {
     static ERAS: OnceLock<Mutex<HashMap<String, Era>>> = OnceLock::new();
     ERAS.get_or_init(Mutex::default)
@@ -199,18 +200,20 @@ fn learn(url: &str, era: Option<Era>) {
     };
 }
 
-/// What a tool server's answer to `server/discover` says it speaks. A result listing
-/// 2026-07-28 is that revision; one listing only revisions with a handshake, or that
-/// revision's refusal of the version naming only those, is one of them. A server from
-/// before it has no such method: it answers with a status of a request it cannot take
-/// ([`before`]) and none of that revision's errors, or with a success carrying
-/// "method not found", as `amem tool-server` did. Anything else says nothing of the
-/// revision, an error page, a limit, a refusal of the caller, and is not taken as one.
+/// What a tool server's answer to `server/discover` says it speaks. A complete result
+/// listing 2026-07-28 is that revision, and one of another kind is no list at all; one
+/// listing only revisions with a handshake, or that revision's refusal of the version
+/// naming only those, is one of them. A server from before it has no such method: it
+/// answers with a status of a request it cannot take ([`before`]) and none of that
+/// revision's errors, or with a success carrying "method not found", as `amem
+/// tool-server` did. Anything else says nothing of the revision, an error page, a limit,
+/// a refusal of the caller, and is not taken as one.
 ///
 /// # Errors
 ///
-/// That revision's refusal of the request itself, versions none of which this
-/// launcher speaks, or an answer that names no revision, with its status.
+/// That revision's refusal of the request itself, a result of a kind not taken,
+/// versions none of which this launcher speaks, or an answer that names no revision,
+/// with its status.
 fn era(status: u16, content_type: &str, body: &str) -> Result<Era, String> {
     let m = message(content_type, body).ok();
     let error = m.as_ref().and_then(|m| m.get("error"));
@@ -223,9 +226,16 @@ fn era(status: u16, content_type: &str, body: &str) -> Result<Era, String> {
             return Err(format!("the tool server refused server/discover: {e}"));
         }
     }
-    let listed = m.as_ref().map(|m| &m["result"]["supportedVersions"]);
+    let listed = m
+        .as_ref()
+        .map(|m| &m["result"])
+        .filter(|r| r["supportedVersions"].is_array());
     match listed {
-        Some(v) if (200..300).contains(&status) && v.is_array() => return named(v, true),
+        Some(r) if (200..300).contains(&status) => {
+            mcp_meta::complete(r)
+                .map_err(|e| format!("the tool server's answer to server/discover: {e}"))?;
+            return named(&r["supportedVersions"], true);
+        }
         _ if (200..300).contains(&status) && code == Some(-32601) => return Ok(Era::Handshake),
         _ if before(status) => return Ok(Era::Handshake),
         _ => {}
@@ -262,6 +272,21 @@ fn named(listed: &Value, stateless: bool) -> Result<Era, String> {
             listed.join(", "),
             supported().join(", ")
         ))
+    }
+}
+
+/// Whether a reply to a call says the revision kept for its server is not the one it
+/// speaks: no JSON-RPC result or error, a result of a kind not taken, or an error with
+/// the request's form or protocol (a parse error, an invalid request, a method not
+/// found, or one of 2026-07-28's own) rather than with the call. A tool's refusal, an
+/// unknown tool, or a failure in the server says nothing of the revision.
+fn unspoken(message: &Value) -> bool {
+    match (message.get("error"), message.get("result")) {
+        (Some(e), _) => e["code"]
+            .as_i64()
+            .is_none_or(|c| [-32700, -32600, -32601].contains(&c) || MODERN_ERRORS.contains(&c)),
+        (None, Some(r)) => !r.is_object() || mcp_meta::complete(r).is_err(),
+        (None, None) => true,
     }
 }
 
@@ -424,11 +449,11 @@ pub async fn call(
         Era::Handshake => server.handshake(params).await,
     }
     .inspect_err(|_| learn(&url, None))?;
-    checked(
-        &memory,
-        tool,
-        reply(&message(&sent.content_type, &sent.body)?)?,
-    )
+    let answered = message(&sent.content_type, &sent.body).inspect_err(|_| learn(&url, None))?;
+    if unspoken(&answered) {
+        learn(&url, None);
+    }
+    checked(&memory, tool, reply(&answered)?)
 }
 
 #[cfg(test)]
@@ -442,11 +467,12 @@ mod tests {
 
     /// A tool server of 2026-07-28 on loopback, counting what it is asked. Discovery is
     /// answered with `discover` when set, a status, a content type and a body, and with
-    /// the version list otherwise; a call fails with a 502 while `failing` is set; the
-    /// handshake is refused.
+    /// the version list otherwise; a call fails with a 502 while `failing` is set, and
+    /// is answered with `answer` when set; the handshake is refused.
     #[derive(Default)]
     struct Fake {
         discover: Mutex<Option<(u16, &'static str, &'static str)>>,
+        answer: Mutex<Option<(u16, &'static str, &'static str)>>,
         failing: AtomicBool,
         port: AtomicU16,
         discovers: AtomicUsize,
@@ -474,6 +500,11 @@ mod tests {
                 f.calls.fetch_add(1, SeqCst);
                 if f.failing.load(SeqCst) {
                     return (StatusCode::BAD_GATEWAY, "upstream down").into_response();
+                }
+                let set = *f.answer.lock().unwrap();
+                if let Some((status, kind, text)) = set {
+                    let status = StatusCode::from_u16(status).unwrap();
+                    return (status, [("content-type", kind)], text).into_response();
                 }
                 let page = format!("http://127.0.0.1:{}/page", f.port.load(SeqCst));
                 let text = json!({"answer": {"text": "ok"}, "reached": [page]}).to_string();
@@ -570,6 +601,77 @@ mod tests {
         *f.discover.lock().unwrap() = None;
         fetch(&egress, &memory).await.unwrap();
         assert_eq!(f.discovers.load(SeqCst), 4);
+        assert_eq!(f.handshakes.load(SeqCst), 0);
+    }
+
+    /// A result of a kind this client does not take is no list of versions, whatever it
+    /// carries, and is not kept as what the server speaks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_discovery_result_of_a_kind_not_taken_is_refused_and_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (egress, memory, f) = hosted_fetch(dir.path()).await;
+        let more = r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"input_required","supportedVersions":["2026-07-28"],"inputRequests":{}}}"#;
+        *f.discover.lock().unwrap() = Some((200, "application/json", more));
+        let e = fetch(&egress, &memory).await.unwrap_err();
+        assert!(e.contains("input_required"), "{e}");
+        assert_eq!(f.calls.load(SeqCst), 0);
+        *f.discover.lock().unwrap() = None;
+        fetch(&egress, &memory).await.unwrap();
+        assert_eq!(f.discovers.load(SeqCst), 2);
+    }
+
+    /// A reply that is not one of the revision kept for the server forgets it, so the
+    /// next call asks again; a refusal of the call itself, with a success, does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reply_not_of_the_revision_kept_asks_again_and_a_refused_call_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (egress, memory, f) = hosted_fetch(dir.path()).await;
+        fetch(&egress, &memory).await.unwrap();
+        let j = "application/json";
+        let unspoken = [
+            (j, "<html>not JSON</html>"),
+            ("text/event-stream", "data: nothing\n\n"),
+            (j, r#"{"jsonrpc":"2.0","id":1}"#),
+            (j, r#"{"jsonrpc":"2.0","id":1,"result":"done"}"#),
+            (
+                j,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"input_required","inputRequests":{}}}"#,
+            ),
+            (
+                j,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"m","data":{"supported":["2027-01-01"]}}}"#,
+            ),
+            (
+                j,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no such method"}}"#,
+            ),
+            (
+                j,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"message":"no code"}}"#,
+            ),
+        ];
+        for (n, (kind, body)) in unspoken.into_iter().enumerate() {
+            *f.answer.lock().unwrap() = Some((200, kind, body));
+            assert!(fetch(&egress, &memory).await.is_err(), "{body}");
+            *f.answer.lock().unwrap() = None;
+            fetch(&egress, &memory).await.unwrap();
+            assert_eq!(f.discovers.load(SeqCst), n + 2, "{body}");
+        }
+        let asked = f.discovers.load(SeqCst);
+        let refused = [
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"refused: x"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","content":[{"type":"text","text":"not the tool's JSON"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Unknown tool: fetch"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"unauthorized"}}"#,
+        ];
+        for body in refused {
+            *f.answer.lock().unwrap() = Some((200, j, body));
+            assert!(fetch(&egress, &memory).await.is_err(), "{body}");
+            *f.answer.lock().unwrap() = None;
+            fetch(&egress, &memory).await.unwrap();
+            assert_eq!(f.discovers.load(SeqCst), asked, "{body}");
+        }
         assert_eq!(f.handshakes.load(SeqCst), 0);
     }
 
