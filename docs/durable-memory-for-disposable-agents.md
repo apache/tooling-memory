@@ -358,7 +358,7 @@ Curators are a standing fleet of cheap-model agents. They:
 - merge duplicates and mark what supersedes what;
 - split oversized files and demote dead material.
 
-Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Entries derived from one just superseded, and facts whose cited code has changed, go to the front, because a stale claim misleads more than a missing one [[84]](#ref-84). Curation is budgeted like any other work, with a protected floor, so curation and delivery cannot starve each other.
+Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Entries derived from one just superseded, and facts whose cited code has changed, go to the front, because a stale claim misleads even when the current one is retrieved beside it [[84]](#ref-84). Curation is budgeted like any other work, with a protected floor, so curation and delivery cannot starve each other.
 
 **Curator, historian, steward.** The historian ([§3](#3-memory)) records what happened; the curator looks after what is kept. "Curator" is the cross-industry name for that work: digital curation is "the management and preservation of digital data/information over the long-term" [[9]](#ref-9), and the work's output here is the curated tier. In data governance the accountable person is the data steward [[10]](#ref-10), which here is the domain owner; curators work under the owner's policy.
 
@@ -816,7 +816,7 @@ The first change to evaluate is the system itself. Hold model, harness, tasks, a
 |---|---|---|
 | **No memory** | The task spec and the repositories and trackers it would have anyway | The floor |
 | **Transcript replay** | No memory, plus earlier sessions' transcripts | Today's practice |
-| **T0 only** | Cached index and policy digest, no retrieval | What the cheap layer buys; context files alone often do not pay [[92]](#ref-92) |
+| **T0 only** | Cached index and policy digest, no retrieval | What the cheap layer buys; on coding benchmarks, context files added cost with no significant gain [[92]](#ref-92) |
 | **Raw only** | T0, and retrieval over raw entries and handoffs with no curation | What curation buys |
 | **Full** | T0, retrieval, and handoffs | The system as built |
 
