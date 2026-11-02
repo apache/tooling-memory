@@ -44,13 +44,17 @@ before you override the instruction.
   passed, nobody has shown that it tests anything. Assert the rule, not a bound on the
   rule.
 - **A flaky test is a defect. Fix it.** A flaky test passes and fails on the same code.
-  It hides real failures. Find the cause and remove the cause. Possible causes are time,
-  test order, load and shared state. Do not add a retry or a skip to make the test pass.
-  Make a timeout longer only if the old margin was shorter than a delay that the test must
-  tolerate, and say why the new value is sufficient. If the flaky test is not in your
-  change, fix it on its own branch. CI must find a flaky test without a person. If a test
-  fails only under load or on one platform, make the test control that condition, or make
-  a CI job create it.
+  It hides real failures. Find the cause and remove the cause. Possible causes are clock
+  time, test order, load, shared state and outside services. Do not add an automatic retry
+  or a skip, in the test or in the runner, to make the test pass. Make a timeout longer
+  only if it was shorter than a delay that the test must tolerate. Give that reason in the
+  commit message. If your change did not cause the flaky test, fix the test on a separate
+  branch. Until that fix merges, you may run `make check` again on your branch. Each fix
+  must let CI find the next failure of that kind without a person. If a test fails only
+  under load, make the test create the load, or add a CI job that does. If a test fails
+  only on one platform, make sure that CI runs it on that platform. The browser tests run
+  once more after a failure on CI, and a test that then passes fails the run
+  (`e2e/playwright.config.ts`).
 - **Stage only the files that you changed** (`git add <path>`). Never use `git add -A`,
   `git add .` or `git commit -a`.
 - **Work in your own worktree, and expect other work in the repository.** Several sessions

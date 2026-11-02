@@ -12,7 +12,10 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   forbidOnly: !!process.env.CI,
+  // On CI a failure runs once more, for its trace; a test that then passes is flaky,
+  // and failOnFlakyTests fails the run, so CI reports it without a person.
   retries: process.env.CI ? 1 : 0,
+  failOnFlakyTests: !!process.env.CI,
   reporter: process.env.CI ? [['github'], ['html', { open: 'never' }]] : [['list']],
   use: {
     baseURL: `http://127.0.0.1:${port}`,
