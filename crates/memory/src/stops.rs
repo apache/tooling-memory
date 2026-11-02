@@ -194,7 +194,7 @@ fn say(signal: i32) -> bool {
         2 => "SIGINT",
         _ => "SIGTERM",
     };
-    let line = format!("memory: {name}: ending the run and cleaning up\n");
+    let line = format!("amem: {name}: ending the run and cleaning up\n");
     std::io::stderr().write_all(line.as_bytes()).is_ok()
 }
 

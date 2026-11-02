@@ -138,7 +138,7 @@ impl Memory {
             if domain == RECALLS {
                 // a domain by that name would sit where the recall pages do
                 eprintln!(
-                    "memory: the domain {RECALLS} is not projected: the name is the recall pages'"
+                    "amem: the domain {RECALLS} is not projected: the name is the recall pages'"
                 );
                 continue;
             }
@@ -230,7 +230,7 @@ impl Memory {
         });
         match landed {
             Ok(name) => r.projected = Some(format!("{RECALLS}/{}/{name}", self.session_id)),
-            Err(e) => eprintln!("memory: projection at {}: {e}", dir.display()),
+            Err(e) => eprintln!("amem: projection at {}: {e}", dir.display()),
         }
     }
 
@@ -274,7 +274,7 @@ impl Memory {
     pub(crate) async fn refresh_projection(&self) {
         if let Some(dir) = &self.projection {
             if let Err(e) = self.render(dir).await {
-                eprintln!("memory: projection at {}: {e}", dir.display());
+                eprintln!("amem: projection at {}: {e}", dir.display());
             }
         }
     }
@@ -370,7 +370,7 @@ impl Memory {
     pub(crate) async fn refresh_projection_after_erasure(&self) {
         if let Some(dir) = &self.projection {
             if let Err(e) = self.sweep_recalls(dir, false) {
-                eprintln!("memory: projection at {}: {e}", dir.display());
+                eprintln!("amem: projection at {}: {e}", dir.display());
             }
         }
         self.refresh_projection().await;

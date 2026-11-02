@@ -102,7 +102,7 @@ pub async fn cmd(root: &Path, op: GofannonOp) -> Fallible {
                 poll: Duration::from_secs(poll_seconds.max(1)),
             };
             let done = work(&m, &plan).await?;
-            eprintln!("memory: gofannon worked {done} tasks");
+            eprintln!("amem: gofannon worked {done} tasks");
             Ok(())
         }
     }
@@ -129,7 +129,7 @@ pub async fn work(m: &Arc<Memory>, plan: &Plan) -> Result<usize, Box<dyn std::er
             return Ok(n);
         };
         eprintln!(
-            "memory: claimed {}: {} for gofannon {}",
+            "amem: claimed {}: {} for gofannon {}",
             task.id, task.title, plan.agent
         );
         m.set_held_task(&task.id);
@@ -152,7 +152,7 @@ fn keep_lease(client: Arc<MemoryClient>, id: String, lease: i64) -> tokio::task:
         loop {
             tick.tick().await;
             if let Err(e) = client.heartbeat(&id, lease).await {
-                eprintln!("memory: heartbeat on {id}: {e}");
+                eprintln!("amem: heartbeat on {id}: {e}");
                 return;
             }
         }
@@ -235,10 +235,10 @@ async fn settle(
         .await?;
     if done {
         client.complete(&task.id, &handoff).await?;
-        eprintln!("memory: {} completed, handoff {handoff}", task.id);
+        eprintln!("amem: {} completed, handoff {handoff}", task.id);
     } else {
         client.release(&task.id, Some(&handoff)).await?;
-        eprintln!("memory: {} released, handoff {handoff}", task.id);
+        eprintln!("amem: {} released, handoff {handoff}", task.id);
     }
     Ok(())
 }

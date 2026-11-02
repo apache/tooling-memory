@@ -1,4 +1,4 @@
-//! `memory tap`: a connector installed under the root and run under its grant. The
+//! `amem tap`: a connector installed under the root and run under its grant. The
 //! component lives at `<root>/taps/<name>.wasm`, the grant in the grants file, and the
 //! credential in the launcher's environment under the variable the grant names; the
 //! tap gets the host's outbound hook and nothing else.
@@ -64,7 +64,7 @@ pub async fn run(
         })?;
     if !path.is_file() {
         return Err(format!(
-            "no component installed as {name}; run: memory tap install {name} <file.wasm>"
+            "no component installed as {name}; run: amem tap install {name} <file.wasm>"
         )
         .into());
     }
@@ -74,7 +74,7 @@ pub async fn run(
         .and_then(|var| crate::present(std::env::var(var).ok()));
     if grant.credential.is_some() && credential.is_none() {
         eprintln!(
-            "memory: {} is not set; the tap runs without a credential",
+            "amem: {} is not set; the tap runs without a credential",
             grant.credential.as_deref().unwrap_or_default()
         );
     }
@@ -94,12 +94,12 @@ pub async fn run(
             (Ok(outcome), _) => println!("{}", serde_json::to_string_pretty(&outcome)?),
             (Err(e), None) => return Err(e.into()),
             // on a schedule, one failed pull is reported and the next one still comes
-            (Err(e), Some(_)) => eprintln!("memory: tap {name}: {e}"),
+            (Err(e), Some(_)) => eprintln!("amem: tap {name}: {e}"),
         }
         let Some(secs) = every else {
             return Ok(());
         };
-        eprintln!("memory: tap {name} runs again in {secs}s");
+        eprintln!("amem: tap {name} runs again in {secs}s");
         tokio::time::sleep(std::time::Duration::from_secs(secs.max(1))).await;
     }
 }

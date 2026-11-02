@@ -1,7 +1,7 @@
 //! The `wslc` backend: the harness in the harness image, under WSL containers.
 //!
 //! Two containers in the session VM. The egress container runs this same binary as
-//! `memory inside`, with the record mounted in and the only route outside: it opens the
+//! `amem inside`, with the record mounted in and the only route outside: it opens the
 //! memory, serves the egress on a socket in a shared volume, and does everything the
 //! launcher does on Linux, including task mode. The harness container has no network at
 //! all, the working tree and its private home mounted in, and reaches the egress through
@@ -81,7 +81,7 @@ pub struct Launch {
     pub workdir: PathBuf,
     /// The harness image.
     pub image: String,
-    /// The flags for `memory inside` that say what to run: `--prompt`, `--work`, and so
+    /// The flags for `amem inside` that say what to run: `--prompt`, `--work`, and so
     /// on, followed by `--` and the harness's own arguments.
     pub inside_args: Vec<String>,
     /// Attached to the terminal: no prompt and no task.
@@ -118,7 +118,7 @@ pub(crate) fn via_for(l: &Launch, windows: bool) -> Result<Via, String> {
     } else if l.interactive {
         Some("the C API gives a process no terminal, so an interactive launch goes through the command line")
     } else if wants_gateway(l) {
-        Some("the gateway inside the VM needs a network of its own, which the C API cannot make, so --auth gateway goes through the command line")
+        Some("the gateway inside the VM needs a network of its own, which the C API cannot make, so --auth gateway or --server-auth gateway goes through the command line")
     } else {
         None
     };
@@ -276,7 +276,7 @@ pub(crate) fn egress_env(taps: &[String], extra: &[(String, String)]) -> Vec<(St
     env
 }
 
-/// The egress container's command: this binary as `memory inside`, told what to run.
+/// The egress container's command: this binary as `amem inside`, told what to run.
 pub(crate) fn inside_command(l: &Launch) -> Vec<String> {
     let mut a = s(&[
         "/opt/memory/memory",
@@ -469,7 +469,7 @@ fn run_api(l: &Launch) -> Fallible<i32> {
     match ready {
         Ok((api, storage)) => crate::wslc_api::run(l, &api, &storage),
         Err(why) if l.via == Via::Auto => {
-            eprintln!("memory: not over the C API ({why}); driving the wslc command line");
+            eprintln!("amem: not over the C API ({why}); driving the wslc command line");
             run_cli(l)
         }
         Err(why) => Err(why.into()),
@@ -565,7 +565,7 @@ fn gateway_up(root: &Path) -> Fallible<String> {
     let master = std::env::var("LITELLM_MASTER_KEY")
         .ok()
         .filter(|k| !k.is_empty())
-        .ok_or("--auth gateway inside the VM needs LITELLM_MASTER_KEY (from local/.env)")?;
+        .ok_or("the gateway inside the VM (--auth or --server-auth gateway) needs LITELLM_MASTER_KEY, in the environment or the root's credentials.env (make reads local/.env)")?;
     let pg_password = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "litellm".into());
     if run_ok(&s(&["network", "inspect", GATEWAY_NETWORK])).is_err() {
         run_ok(&s(&["network", "create", GATEWAY_NETWORK]))?;
@@ -637,7 +637,7 @@ fn gateway_up(root: &Path) -> Fallible<String> {
     let probe = "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)";
     for _ in 0..60 {
         if run_ok(&s(&["exec", GATEWAY_LITELLM, "python3", "-c", probe])).is_ok() {
-            eprintln!("memory: gateway up inside the VM at http://{GATEWAY_LITELLM}:4000");
+            eprintln!("amem: gateway up inside the VM at http://{GATEWAY_LITELLM}:4000");
             return Ok(master);
         }
         std::thread::sleep(Duration::from_secs(2));

@@ -110,7 +110,7 @@ impl Api {
         let lib = unsafe { Library::new("wslcsdk.dll") }.map_err(|e| {
             Error::other(
                 "wslcsdk.dll",
-                format!("{e} (it ships in the Microsoft.WSL.Containers NuGet package, not with WSL; put it beside memory.exe)"),
+                format!("{e} (it ships in the Microsoft.WSL.Containers NuGet package, not with WSL; put it beside amem.exe)"),
             )
         })?;
         // SAFETY: ole32 is a system DLL; CoTaskMemFree has this signature.
