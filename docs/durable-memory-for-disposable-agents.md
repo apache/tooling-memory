@@ -42,7 +42,7 @@ Three constraints follow and shape the rest of the design.
 
 **The system must outlive its parts.** Over decades every model, tool, and vendor is replaced, and the organisation is redrawn many times. So everything of lasting value lives in plain-text data with provenance. Services and agents around it can be rebuilt or replaced without loss.
 
-**How to read this paper.** [§2](#2-the-design-at-a-glance) describes the whole design in two pages. [§3](#3-memory) to [§12](#12-surviving-long-timescales) take one part each and add detail, always starting from why it exists. [§13](#13-related-work) places the design in related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full, and a glossary. A companion case study, [*Seeding a Foundation*](seeding-a-foundation.md), applies the design to the Apache Software Foundation.
+**How to read this paper.** [§2](#2-the-design-at-a-glance) describes the whole design in two pages. [§3](#3-memory) to [§12](#12-surviving-long-timescales) take one part each and add detail, always starting from why it exists. [§13](#13-related-work) places the design in related work. The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full, and a glossary. [Appendix G](durable-memory-for-disposable-agents-appendix.md), in its own file, gives the evidence behind each property of the design and how strong it is. A companion case study, [*Seeding a Foundation*](seeding-a-foundation.md), applies the design to the Apache Software Foundation.
 
 ---
 
