@@ -301,7 +301,7 @@ New writes are raw, and curation lifts them to curated. Raw entries are searchab
 |---|---|
 | Handoffs and decisions in the same task chain: the task, its parent, children, and dependents | The sessions working that chain, at once. This is what the fast lane is for |
 | Other entries written by the fleet's own sessions in the domain | Sessions whose policy admits raw in the domain |
-| Content from authors outside the fleet, arriving through a tap | Triage, and the session working the task created from it. Everywhere else, only once curated |
+| Content from authors outside the fleet, arriving through a tap | Triage, and the task chain created from it. Everywhere else, only once curated |
 
 The row also depends on what the author read. A session that read content from authors outside the fleet, as a raw entry or through a tool server, writes with the tap row's reach: triage and its own task chain see the entry, and everyone else only once it is curated. Restating someone else's words does not make them a new source [[81]](#ref-81). Curators and auditors read raw as their work requires. Policy can adjust the defaults ([Appendix E](#appendix-e-rules-in-detail)). Classification still applies in every case: raw reach decides which raw entries a session may see, and handling still caps how high it may read.
 
@@ -389,7 +389,7 @@ Auditors are agents whose only job is checking curators and the record they keep
 - sample handoffs for instructions aimed at the next agent;
 - hunt contradictions between entries;
 - watch the canary entries;
-- share no writable state with curators, and see only an entry and its sources, without the curator's reasoning about them.
+- share no writable state with curators, and never see the curator's reasoning about an entry.
 
 A second model is not fully independent. Different models tend to get the same questions wrong, more so as they improve [[106]](#ref-106), just as programs written independently fail together more often than chance would predict [[107]](#ref-107), [[108]](#ref-108). Immutable history, deterministic tests, and sampled human review check the auditors in turn, with no further layer of agents.
 
@@ -448,9 +448,9 @@ Pulls are dense: summaries first, prefetch attached, several queries per call. W
 
 ## The recall deputy
 
-**Why.** A question that needs several searches and reads would cost the expensive model a turn for each. Every result and page it read would also stay in its context for the rest of the session, paid for again on each later turn and crowding out what matters ([§2](#2-the-design-at-a-glance)).
+**Why.** A question that needs several searches and reads would cost the expensive model a turn for each. Every result and page it read would also stay in its context for the rest of the session, paid for again on each later turn and crowding out what matters ([§1](#1-why)).
 
-So multi-step lookups go to `recall(question, domain)`. A model inside the service runs the search, read, and summarise loop and returns a cited brief with the summaries it drew on, so the caller spends one turn and reads summaries, not pages.
+So multi-step lookups go to `recall` ([Appendix A](#appendix-a-interface)). A model inside the service runs the search, read, and summarise loop and returns a cited brief with the summaries it drew on, so the caller spends one turn and reads summaries, not pages.
 
 The deputy reads the same entries as its caller, so its model needs a ceiling at or above the caller's handling ([§4](#4-trust-and-handling)). Among such models, each domain picks with its recall suite, a set of questions with known answers kept like the golden query suite of [§9](#9-measurement): first for briefs that cite their sources correctly, then for speed within its latency target, then for cost. Curation resolves conflicting entries before the deputy reads them, because a stale note that looks current misleads models of every size tested, the larger ones most [[90]](#ref-90).
 
@@ -1237,7 +1237,7 @@ policy_context: [pol-L1-007]  # policy in force when written
 search(query, domain?, filters?)   → [{id, title, summary, meta, snippet}]
 get(id | id#anchor)                → {body, related: [{id, summary, p}]}
 recall(question, domain?, context_tokens?, answer_kind?)   # fact | list | overview
-                                   → {brief, citations: [id]}   # deputy model, caller's filter
+                                   → {brief, citations: [id], summaries}   # deputy model, caller's filter
 write(entry)                       → {id}    # historian append, screened before indexing; fast lane for handoffs
 ```
 
@@ -1482,7 +1482,7 @@ The main text gives each rule at the level needed to follow the design. This app
 
 ### Raw reach (§4)
 
-- What the writing session read decides the row of the raw-reach table: task chain, fleet session, or tap. A write takes the tap row if its session read content from authors outside the fleet, as a raw entry or through a tool server; triage and the session's own task chain still see it.
+- The writing session, and what it read, decide the row of the raw-reach table: task chain, fleet session, or tap. A write takes the tap row if its session read content from authors outside the fleet, as a raw entry or through a tool server; triage and the session's own task chain still see it.
 - Domain policy may widen or narrow the defaults.
 - A principal's policy may require curated or better for what it reads in a domain.
 
