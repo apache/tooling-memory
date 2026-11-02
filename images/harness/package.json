@@ -3,11 +3,11 @@
   "private": true,
   "description": "The npm harnesses in the harness image, at the versions the image carries.",
   "dependencies": {
-    "@anthropic-ai/claude-code": "2.1.314",
+    "@anthropic-ai/claude-code": "2.1.316",
     "@github/copilot": "1.0.105",
     "@google/gemini-cli": "0.66.0",
     "@openai/codex": "0.166.0",
-    "@qwen-code/qwen-code": "0.26.4",
+    "@qwen-code/qwen-code": "0.26.5",
     "@xai-official/grok": "1.0.70",
     "opencode-ai": "1.19.5"
   },
