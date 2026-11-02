@@ -134,7 +134,7 @@ Examples use `dom-a` for the domain under discussion and `dom-b` for a neighbour
 
 | Tier | Contents | Size | Read by |
 |---|---|---|---|
-| **T0, index** | Current goals, active tasks, standing decisions, pointers, policy digest | Under 2k tokens, enforced | Every agent at start, from cache |
+| **T0, index** | Current goals, active tasks, standing decisions, pointers, policy digest | Capped per domain; the cap starts near 2k tokens and is tuned by measuring what it buys ([§11](#11-evaluating-change)) | Every agent at start, from cache |
 | **T1, entries** | Curated entries, grouped by project, decision, or subsystem, with stable section anchors | Small | On demand, through retrieval |
 | **T2, historian** | Every event: writes, reads, ledger operations, curation | Unbounded | The index, the ledger, curators, auditors; rarely agents |
 | **T3, archive** | Demoted and superseded material | Unbounded | Audit only |
