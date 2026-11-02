@@ -446,7 +446,7 @@ Every pull costs the agent a model turn. So the predictable part (T0 and the pol
 
 **Why.** A question that needs several searches and reads would cost the expensive model a turn for each, and every hit and page it read would stay in its context for the rest of the session. Its earlier context is already cached and cheap to re-read; what costs is the new material, paid for again on every later turn and crowding the context ([§2](#2-the-design-at-a-glance)).
 
-So multi-step lookups go to `recall(question, domain)`. A model inside the service runs the search, read, and summarise loop and returns a cited brief, so the caller spends one turn and keeps only the brief. Each domain chooses the deputy's model against its recall suite: briefs that cite faithfully first, then latency within the SLO, then cost. Its model class needs a ceiling at least as high as the caller's handling, because the deputy reads what the caller may read. The brief's length is a session setting the same suite chooses per caller model class, because how much a long context costs in accuracy varies by model [[101]](#ref-101)–[[103]](#ref-103); a caller may ask for a shorter brief. It is served conflicts already resolved by curation, not metadata to weigh, because a stale note that looks current misleads larger models most [[90]](#ref-90).
+So multi-step lookups go to `recall(question, domain)`. A model inside the service runs the search, read, and summarise loop and returns a cited brief, so the caller spends one turn and keeps only the brief. Each domain chooses the deputy's model against its recall suite: briefs that cite faithfully first, then latency within the SLO, then cost. Its model class needs a ceiling at least as high as the caller's handling, because the deputy reads what the caller may read. The caller reports how many tokens its context holds and what kind of answer it needs: a fact, a list, or an overview. The service sets the brief's length from those, the caller's model class, and the recall suite, because how much a long context costs in accuracy varies by model and grows with what the context already holds [[101]](#ref-101)–[[103]](#ref-103). The caller states facts, not a length, and the decision is logged for replay. It is served conflicts already resolved by curation, not metadata to weigh, because a stale note that looks current misleads larger models most [[90]](#ref-90).
 
 - The deputy runs under the caller's own filter, so a low-privilege caller cannot launder reads through it.
 - The caller's label rises to the highest classification the deputy read, and the deputy's reads join the caller's read set ([§3](#3-memory)).
@@ -1228,7 +1228,8 @@ policy_context: [pol-L1-007]  # policy in force when written
 ```
 search(query, domain?, filters?)   → [{id, title, summary, meta, snippet}]
 get(id | id#anchor)                → {body, related: [{id, summary, p}]}
-recall(question, domain?, length?) → {brief, citations: [id]}   # deputy model, caller's filter
+recall(question, domain?, context_tokens?, answer_kind?)   # fact | list | overview
+                                   → {brief, citations: [id]}   # deputy model, caller's filter
 write(entry)                       → {id}    # historian append, screened before indexing; fast lane for handoffs
 ```
 
