@@ -343,7 +343,7 @@ Model output gets three further rules, because of the hazards in [§1](#1-why).
 
 ## Poisoning
 
-Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it ([§13](#13-related-work)). Everything above is the defence, together with the independent auditors of [§5](#5-the-curator). Each session also records the lowest trust tier it has read. The mark grants and blocks nothing: blocking every session that read raw stops poisoning, but broke some of the agent's work in every configuration tested [[87]](#ref-87). Auditors use it to sample first the writes and sends of sessions that read raw.
+Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it ([§13](#13-related-work)). Everything above is the defence, together with the independent auditors of [§5](#5-the-curator). Each session also records the lowest trust tier it has read. The mark grants and blocks nothing. In one study, blocking every session that read untrusted content stopped poisoning but broke some of the agent's work in every configuration tested [[87]](#ref-87). Auditors use it to sample first the writes and sends of sessions that read raw.
 
 ---
 
@@ -373,7 +373,7 @@ The curator is the most privileged agent in the system. It writes the summaries 
 - **Telemetry and the historian are out of reach.** The retrieval service and ledger write both, and curators have no write access, so a curator cannot hide the signals that would expose it. The service alerts, per curator instance, on demotion rates, summary drift, and skew in which entries searches surface.
 - **The gate scales with impact.** Routine curation is sampled for review. For promotions, boundary changes, tombstone redirects, and `dom-platform` distillation, a second party must approve.
 - **Lineage re-check.** Provenance names the instance and model behind every action, so if an instance, a source, or a model generation turns out bad, everything it wrote can be listed and re-checked. Curators are rotated like other agents.
-- **Canary entries.** Each domain holds a few entries with known content; a curation pass that alters one improperly raises an alarm. Canaries catch bad edits, not a dormant payload, which can wait through a hundred sessions before it acts [[87]](#ref-87).
+- **Canary entries.** Each domain holds a few entries with known content; a curation pass that alters one improperly raises an alarm. A dormant payload alters no canary, and it can wait through a hundred sessions before it acts [[87]](#ref-87).
 
 ## Auditors
 
@@ -382,7 +382,7 @@ The curator is the most privileged agent in the system. It writes the summaries 
 Auditors are agents whose only job is checking curators. They:
 
 - run on a different base model where one at least as capable at auditing is available, measured on seeded faults, because a model favours output it recognises as its own [[104]](#ref-104) and does not reliably correct its own reasoning [[105]](#ref-105), and a weaker reviewer can make work worse [[112]](#ref-112);
-- otherwise run the same model in a fresh context, never the curator's session; a fresh same-model review and a cross-model review find different errors [[113]](#ref-113);
+- otherwise run the same model in a fresh context; a fresh same-model review and a cross-model review find different errors [[113]](#ref-113);
 - sample summaries against the entries they summarise;
 - test entries in the combinations searches return them, since a payload can be split across several;
 - trace a bad outcome back through the read sets in the historian [[88]](#ref-88);
@@ -391,7 +391,7 @@ Auditors are agents whose only job is checking curators. They:
 - watch the canary entries;
 - share no writable state with curators, and see an entry and its sources, never the curator's reasoning.
 
-A different model narrows shared blind spots but does not remove them: errors correlate across models and providers, more so as models improve [[106]](#ref-106), much as independently written programs fail together more often than chance predicts [[107]](#ref-107), [[108]](#ref-108). Immutable history, deterministic tests, and sampled human review check the auditors in turn, with no further layer of agents.
+A different model still shares many blind spots: errors correlate across models and providers, more so as models improve [[106]](#ref-106), much as independently written programs fail together more often than chance predicts [[107]](#ref-107), [[108]](#ref-108). Immutable history, deterministic tests, and sampled human review check the auditors in turn, with no further layer of agents.
 
 ---
 
@@ -444,9 +444,9 @@ Every pull costs the agent a model turn. So the predictable part (T0 and the pol
 
 ## The recall deputy
 
-**Why.** A question that needs several searches and reads would cost the expensive model a turn for each, and every hit and page it read would stay in its context for the rest of the session. Its earlier context is already cached and cheap to re-read; what costs is the new material, paid for again on every later turn and crowding the context ([§2](#2-the-design-at-a-glance)).
+**Why.** A question that needs several searches and reads would cost the expensive model a turn for each, and every hit and page it read would stay in its context, re-read on each later turn and crowding it ([§2](#2-the-design-at-a-glance)).
 
-So multi-step lookups go to `recall(question, domain)`. A model inside the service runs the search, read, and summarise loop and returns a cited brief, so the caller spends one turn and keeps only the brief. Each domain chooses the deputy's model against its recall suite: briefs that cite faithfully first, then latency within the SLO, then cost. Its model class needs a ceiling at least as high as the caller's handling, because the deputy reads what the caller may read. The caller reports how many tokens its context holds and what kind of answer it needs: a fact, a list, or an overview. The service sets the brief's length from those, the caller's model class, and the recall suite, because how much a long context costs in accuracy varies by model and grows with what the context already holds [[101]](#ref-101)–[[103]](#ref-103). The caller states facts, not a length, and the decision is logged for replay. It is served conflicts already resolved by curation, not metadata to weigh, because a stale note that looks current misleads larger models most [[90]](#ref-90).
+So multi-step lookups go to `recall(question, domain)`. A model inside the service runs the search, read, and summarise loop and returns a cited brief, so the caller spends one turn and keeps only the brief. Each domain chooses the deputy's model against its recall suite: briefs that cite faithfully first, then latency within the SLO, then cost. Its model class needs a ceiling at least as high as the caller's handling, because the deputy reads what the caller may read. The caller reports how many tokens its context holds and what kind of answer it needs: a fact, a list, or an overview. The service sets the brief's length from those, the caller's model class, and the recall suite, because how much a long context costs in accuracy varies by model and grows with what the context already holds [[101]](#ref-101)–[[103]](#ref-103). The decision is logged for replay. Curation resolves conflicts before the deputy reads them, because a stale note that looks current misleads larger models most [[90]](#ref-90).
 
 - The deputy runs under the caller's own filter, so a low-privilege caller cannot launder reads through it.
 - The caller's label rises to the highest classification the deputy read, and the deputy's reads join the caller's read set ([§3](#3-memory)).
@@ -709,7 +709,7 @@ Every read and every ledger operation passes through the service, so telemetry a
 | Unmatched or invalidated tasks | Capability gaps, noisy taps, stale backlogs |
 | Approval backlog and decision latency | Human review capacity is falling behind; add reviewers or admit less work |
 | Decision-relevant omissions in summaries | Compression is hiding exceptions, uncertainty, or evidence needed to act |
-| Served, then misapplied (paired replays with and without memory) | Memory was found but misled: fix the entry, not the ranking |
+| Served, then misapplied (paired replays with and without memory) | Retrieval worked and the entry misled: the entry needs rewriting or its conflict resolving |
 | Reviewer agreement, with each other and with the proposer | Low: the bar is unclear. Near total with the proposer: the gate is not independent |
 | Dependency cycles, priority reversals, missed commitments | Coordination is unstable across domains |
 
