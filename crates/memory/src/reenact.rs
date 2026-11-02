@@ -323,7 +323,7 @@ fn checkout(repo: &Path, commit: &str, run: &str) -> Fallibly<PathBuf> {
 
 fn remove_checkout(into: &Path) {
     if std::fs::remove_dir_all(into).is_err() {
-        eprintln!("memory: the checkout at {} was left", into.display());
+        eprintln!("amem: the checkout at {} was left", into.display());
     }
 }
 
@@ -498,7 +498,7 @@ async fn run_once(
     session.memory().set_playback(play.clone());
     session.memory().disable_read_log();
     eprintln!(
-        "memory: re-enacting {} ({} calls on its tape) as {}",
+        "amem: re-enacting {} ({} calls on its tape) as {}",
         args.session,
         play.played().tape_calls,
         session.memory().session_id()
@@ -540,7 +540,7 @@ fn tree_for(
     if let Some(c) = commit {
         return Ok((checkout(repo, c, &format!("{session}-{run}"))?, None));
     }
-    eprintln!("memory: {session} recorded no commit; the re-run works in an empty directory");
+    eprintln!("amem: {session} recorded no commit; the re-run works in an empty directory");
     // as an empty record is made for an evaluation's baseline
     let d = std::env::temp_dir().join(format!("amem-reenact-{}-{run}", std::process::id()));
     std::fs::create_dir_all(&d)?;

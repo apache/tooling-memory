@@ -14,7 +14,7 @@ env:
 
 jobs:
   # Whether this push or pull request changes only Markdown outside the code, which cannot
-  # change what builds (scripts/docs-only.sh says which files those are). The jobs below skip on a yes; a job skipped by its
+  # change what builds (scripts/docs-only.sh says which files those are). The jobs below, all but `corpus`, skip on a yes; a job skipped by its
   # condition reports success, so a required check does not sit waiting for it. Anything
   # the diff cannot answer, a first push or a rewritten base, runs everything.
   changes:
@@ -136,6 +136,44 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: make wasm-check
+
+  # The Markdown the demo reads, checked as the demo reads it (scripts/corpus-check.sh).
+  # It runs on every change, a docs-only one included: docs/ and examples/decisions/ are
+  # the demo's record, and a heading renamed there breaks a golden question or an eval.
+  corpus:
+    name: corpus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: make corpus-check
+
+  # The rust-version in Cargo.toml, built with that release of Rust (`make msrv-check`), so
+  # the declared minimum cannot fall behind what the locked dependencies need.
+  # RUSTUP_TOOLCHAIN outranks rust-toolchain.toml, which would otherwise fetch stable and
+  # its targets the first time anything runs cargo or rustc.
+  msrv:
+    name: build (msrv)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+      - run: make msrv-check
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
 
   # Advisories, licences, duplicate versions, sources. Configured in deny.toml. The
   # cargo-deny action is not on the ASF allow-list, so the tool is installed instead.

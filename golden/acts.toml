@@ -1,0 +1,13 @@
+# What the acts ask of the seeded record, apart from the golden suites they score: act 7
+# files the DR-22 question as a task, act 4 asks a session to summarise DR-19 and DR-22,
+# and act 10 searches for DR-19. scripts/corpus-check.sh checks that each names an entry
+# the record holds.
+domain = "dom-demo"
+
+[[question]]
+ask = "What did DR-22 decide about the format memory entries travel in?"
+answers = ["DR-22"]
+
+[[question]]
+ask = "DR-19 MoinMoin"
+answers = ["DR-19"]

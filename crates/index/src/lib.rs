@@ -14,7 +14,7 @@
 //! (Solr, Tantivy) would implement the same methods; the surface is what matters.
 
 use dm_core::{Entry, EntryType, Label, ReadFilter, Status, TrustTier};
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
 use std::path::Path;
 use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime};
 
@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS entries (
     entry_type     TEXT NOT NULL,
     author         TEXT NOT NULL,
     created        TEXT NOT NULL,
+    created_unix   INTEGER,
+    created_nanos  INTEGER,
     review_by      TEXT,
     tier_rank      INTEGER NOT NULL,
     label_rank     INTEGER NOT NULL,
@@ -116,6 +118,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5 (
 );
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
 ";
+
+/// The order of `created`: whole seconds since the Unix epoch, then the nanoseconds within
+/// that second. `created` itself is the frontmatter's RFC 3339 text, which does not sort
+/// as text: `10:00:00Z` sorts after `10:00:00.5Z`, `.15Z` before `.1Z`, and an offset other
+/// than UTC by its local hour. Both are integers, so a year at either end of what the
+/// frontmatter accepts still has a place. An older binary writes rows without them: the
+/// trigger [`SORT_KEY_TRIGGER`] fills those in from `created` as the row lands, to the
+/// millisecond, and [`Index::sort_keys`] fills in any left on the next open.
+const NEWEST_FIRST: &str = "e.created_unix DESC, e.created_nanos DESC";
+
+/// Lives in the file, so it fires for whichever binary inserts the row.
+const SORT_KEY_TRIGGER: &str = "
+CREATE TRIGGER IF NOT EXISTS entries_sort_key AFTER INSERT ON entries
+WHEN NEW.created_unix IS NULL
+BEGIN
+    UPDATE entries SET
+        created_unix = unixepoch(NEW.created),
+        created_nanos = min(999, CAST(
+            (unixepoch(NEW.created, 'subsec') - unixepoch(NEW.created)) * 1000 + 0.5
+            AS INTEGER)) * 1000000
+    WHERE id = NEW.id;
+END;";
+
+fn sort_key(at: OffsetDateTime) -> (i64, i64) {
+    (at.unix_timestamp(), i64::from(at.nanosecond()))
+}
 
 const HIT_COLUMNS: &str =
     "e.id, e.domain, e.entry_type, e.tier_rank, e.label_rank, e.title, e.summary, e.review_by";
@@ -265,7 +293,84 @@ impl Index {
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;",
         )?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Index { conn })
+        let mut ix = Index { conn };
+        ix.sort_keys()?;
+        Ok(ix)
+    }
+
+    /// Give every row its sort key: add the columns to an index made before they existed,
+    /// and fill in the rows written without them. Looks first without a lock, so an open
+    /// with nothing to do writes nothing; the work itself holds the write lock from its
+    /// first read, so two processes opening at once do it once.
+    fn sort_keys(&mut self) -> Result<(), Error> {
+        if self.sort_keys_done()? {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'created_unix'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has == 0 {
+            tx.execute_batch(
+                "ALTER TABLE entries ADD COLUMN created_unix INTEGER;
+                 ALTER TABLE entries ADD COLUMN created_nanos INTEGER;",
+            )?;
+        }
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS entries_created ON entries (created_unix, created_nanos);",
+        )?;
+        tx.execute_batch(SORT_KEY_TRIGGER)?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT id, created FROM entries WHERE created_unix IS NULL")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        {
+            let mut update = tx.prepare(
+                "UPDATE entries SET created_unix = ?1, created_nanos = ?2 WHERE id = ?3",
+            )?;
+            for (id, created) in rows {
+                // a value that does not parse is left for the read to report as a bad row
+                if let Ok(at) = OffsetDateTime::parse(&created, &Rfc3339) {
+                    let (unix, nanos) = sort_key(at);
+                    update.execute(params![unix, nanos, id])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn sort_keys_done(&self) -> Result<bool, Error> {
+        let has: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'created_unix'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has == 0 {
+            return Ok(false);
+        }
+        let indexed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE (type = 'index' AND name = 'entries_created')
+                OR (type = 'trigger' AND name = 'entries_sort_key')",
+            [],
+            |r| r.get(0),
+        )?;
+        let missing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM entries WHERE created_unix IS NULL LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(indexed == 2 && missing.is_none())
     }
 
     /// Index an entry, replacing whatever the index held for its id.
@@ -287,11 +392,12 @@ impl Index {
             .format(&Rfc3339)
             .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"));
         let review_by = f.review_by.map(|d| d.to_string());
+        let (created_unix, created_nanos) = sort_key(f.created);
         tx.execute(
             "INSERT OR REPLACE INTO entries
              (id, domain, entry_type, author, created, review_by, tier_rank, label_rank,
-              status, supersedes, origin, title, summary, digest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              status, supersedes, origin, title, summary, digest, created_unix, created_nanos)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 f.id,
                 f.domain,
@@ -307,6 +413,8 @@ impl Index {
                 entry.title(),
                 entry.summary(),
                 dm_core::digest(&entry.render()),
+                created_unix,
+                created_nanos,
             ],
         )?;
         tx.execute("DELETE FROM entries_fts WHERE id = ?1", params![f.id])?;
@@ -451,7 +559,7 @@ impl Index {
             "SELECT {HIT_COLUMNS}, bm25(entries_fts, 0.0, 10.0, 5.0, 1.0) AS score
              FROM entries_fts f JOIN entries e ON e.id = f.id
              WHERE entries_fts MATCH ?1{where_sql}
-             ORDER BY score, e.created DESC
+             ORDER BY score, {NEWEST_FIRST}
              LIMIT {}",
             limit.max(1)
         );
@@ -500,7 +608,7 @@ impl Index {
         values.insert(0, kind.map_or_else(String::new, |k| k.to_string()).into());
         let sql = format!(
             "SELECT {HIT_COLUMNS} FROM entries e WHERE 1 = 1{kind_sql}{where_sql}
-             ORDER BY e.created DESC LIMIT {}",
+             ORDER BY {NEWEST_FIRST} LIMIT {}",
             limit.max(1)
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -524,7 +632,7 @@ impl Index {
         let sql = format!(
             "SELECT {HIT_COLUMNS} FROM entries e
              WHERE e.review_by IS NOT NULL AND e.review_by <= ?1{where_sql}
-             ORDER BY e.review_by, e.created LIMIT {}",
+             ORDER BY e.review_by, e.created_unix, e.created_nanos LIMIT {}",
             limit.max(1)
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -552,7 +660,7 @@ impl Index {
              )
              SELECT e.id FROM chain c JOIN entries e ON e.id = c.id
              WHERE e.status IS NULL{where_sql}
-             ORDER BY c.depth DESC, e.created DESC LIMIT 1"
+             ORDER BY c.depth DESC, {NEWEST_FIRST} LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params_from_iter(values))?;
@@ -921,6 +1029,142 @@ mod tests {
                 .due_for_review(&any(), date!(2026 - 12 - 01), 10)
                 .unwrap()),
             vec!["mem-a-old", "mem-a-fact"]
+        );
+    }
+
+    // as RFC 3339 text, each of these sorts out of time order against another: a shorter
+    // fraction, no fraction, and an offset other than UTC
+    const WITHIN_A_SECOND: [(&str, OffsetDateTime); 4] = [
+        ("mem-a-whole", datetime!(2026-10-01 10:00:00 UTC)),
+        ("mem-a-tenth", datetime!(2026-10-01 10:00:00.1 UTC)),
+        ("mem-a-tenth-and", datetime!(2026-10-01 10:00:00.15 UTC)),
+        ("mem-a-paris", datetime!(2026-10-01 10:59:59 +01:00)),
+    ];
+    const IN_TIME_ORDER: [&str; 4] = [
+        "mem-a-tenth-and",
+        "mem-a-tenth",
+        "mem-a-whole",
+        "mem-a-paris",
+    ];
+
+    fn holding(at: &[(&str, OffsetDateTime)]) -> Index {
+        let mut ix = Index::in_memory().unwrap();
+        for (id, created) in at {
+            let mut e = entry("dom-a", id, id, "Body.\n");
+            e.front.created = *created;
+            ix.upsert(&e).unwrap();
+        }
+        ix
+    }
+
+    #[test]
+    fn list_is_newest_first_within_a_second_and_across_offsets() {
+        let ix = holding(&WITHIN_A_SECOND);
+        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), IN_TIME_ORDER);
+    }
+
+    #[test]
+    fn a_created_at_either_end_of_the_years_is_indexed_ordered_and_read_back() {
+        // each is a year the frontmatter accepts whose UTC instant is a year outside it
+        // and the second sorts after the first as text, though it is earlier
+        let ends = [
+            ("mem-a-late", datetime!(9999-12-31 23:30:00 -01:00)),
+            ("mem-a-late-paris", datetime!(9999-12-31 23:45:00 +01:00)),
+            ("mem-a-early", datetime!(0000-01-01 00:30:00 +01:00)),
+            ("mem-a-now", datetime!(2026-10-01 10:00:00 UTC)),
+        ];
+        let ix = holding(&ends);
+        assert_eq!(
+            ids(&ix.list(&any(), None, 10).unwrap()),
+            ["mem-a-late", "mem-a-late-paris", "mem-a-now", "mem-a-early"]
+        );
+        for (id, created) in ends {
+            let m = ix.meta(id, &any()).unwrap().unwrap();
+            assert_eq!(m.created, created, "{id}");
+        }
+    }
+
+    #[test]
+    fn due_for_review_and_replaced_by_order_by_the_instant() {
+        let mut ix = Index::in_memory().unwrap();
+        for (id, created) in WITHIN_A_SECOND {
+            let mut e = entry("dom-a", id, id, "Body.\n");
+            e.front.created = created;
+            e.front.review_by = Some(date!(2026 - 10 - 01));
+            e.front.supersedes = Some("mem-a-first".into());
+            ix.upsert(&e).unwrap();
+        }
+        let mut oldest_first = IN_TIME_ORDER;
+        oldest_first.reverse();
+        assert_eq!(
+            ids(&ix
+                .due_for_review(&any(), date!(2026 - 10 - 01), 10)
+                .unwrap()),
+            oldest_first
+        );
+        assert_eq!(
+            ix.replaced_by("mem-a-first", &any()).unwrap().as_deref(),
+            Some(IN_TIME_ORDER[0])
+        );
+    }
+
+    /// A row as a binary from before the sort key writes it: the columns it names.
+    fn insert_as_before(conn: &Connection, id: &str, created: OffsetDateTime) {
+        conn.execute(
+            "INSERT OR REPLACE INTO entries
+             (id, domain, entry_type, author, created, review_by, tier_rank, label_rank,
+              status, supersedes, origin, title, summary, digest)
+             VALUES (?1, 'dom-a', 'fact', 'human:test:me', ?2, NULL, 0, 0,
+              NULL, NULL, NULL, ?1, '', '')",
+            params![id, created.format(&Rfc3339).unwrap()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_index_file_from_before_the_sort_key_is_ordered_on_open_and_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            let before = SCHEMA.replace(
+                "    created_unix   INTEGER,\n    created_nanos  INTEGER,\n",
+                "",
+            );
+            assert_ne!(before, SCHEMA);
+            conn.execute_batch(&before).unwrap();
+            for (id, created) in WITHIN_A_SECOND {
+                insert_as_before(&conn, id, created);
+            }
+        }
+        let ix = Index::open(&path).unwrap();
+        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), IN_TIME_ORDER);
+        assert!(ix.sort_keys_done().unwrap());
+        // an older binary goes on writing to the file after a newer one opened it
+        insert_as_before(
+            &ix.conn,
+            "mem-a-later",
+            datetime!(2026-10-01 10:00:00.2 UTC),
+        );
+        assert_eq!(
+            ids(&ix.list(&any(), None, 10).unwrap())[0],
+            "mem-a-later",
+            "an older binary's row lands without the order"
+        );
+        // past the trigger's reach: SQLite reads no instant after the year 9999, and this
+        // one is in 10000 in UTC, so only the next open can key it
+        insert_as_before(
+            &ix.conn,
+            "mem-a-last",
+            datetime!(9999-12-31 23:30:00 -01:00),
+        );
+        assert!(!ix.sort_keys_done().unwrap());
+        drop(ix);
+        let ix = Index::open(&path).unwrap();
+        assert_eq!(
+            ids(&ix.list(&any(), None, 10).unwrap())[..2],
+            ["mem-a-last", "mem-a-later"],
+            "a row the trigger could not key stays unkeyed after the next open"
         );
     }
 

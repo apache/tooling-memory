@@ -4,7 +4,7 @@
 //! through this, over the same tool surface a harness uses. The rules of the ledger live
 //! on the server; this crate knows the tool names and the shape of their answers, and
 //! nothing else. It is transport-agnostic: in process over a byte pipe, over standard
-//! input and output to a `memory serve`, or over HTTP to a remote server, the calls are
+//! input and output to an `amem serve`, or over HTTP to a remote server, the calls are
 //! the same.
 
 use rmcp::model::CallToolRequestParams;

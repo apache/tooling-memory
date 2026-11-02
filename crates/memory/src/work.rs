@@ -58,7 +58,7 @@ pub async fn client(memory: Arc<Memory>) -> Fallible<MemoryClient> {
     let (sr, sw) = tokio::io::split(server_io);
     tokio::spawn(async move {
         if let Err(e) = mcp::serve_launcher_pipe(memory, sr, sw).await {
-            eprintln!("memory: in-process server: {e}");
+            eprintln!("amem: in-process server: {e}");
         }
     });
     let (cr, cw) = tokio::io::split(client_io);
@@ -119,7 +119,7 @@ pub async fn file_outbox(
             })
             .await?;
         eprintln!(
-            "memory: handoff {id} from the harness's hook ({})",
+            "amem: handoff {id} from the harness's hook ({})",
             note.event.suffix()
         );
         std::fs::remove_file(&note.path).ok();
@@ -193,13 +193,13 @@ pub async fn prompted(
     let new: Vec<&String> = after.difference(&before).collect();
     if new.is_empty() && !no_handoff {
         eprintln!(
-            "memory: the run left no handoff; the next session starts from nothing (pass --no-handoff if that is intended)"
+            "amem: the run left no handoff; the next session starts from nothing (pass --no-handoff if that is intended)"
         );
         client.close().await.ok();
         return Ok(if code == 0 { STOPPED } else { code });
     }
     for id in new {
-        eprintln!("memory: handoff {id}");
+        eprintln!("amem: handoff {id}");
     }
     client.close().await.ok();
     Ok(code)
@@ -275,7 +275,7 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
         let Some(task) = claimed else {
             drop(in_flight);
             if !options.keep_going {
-                eprintln!("memory: nothing claimable");
+                eprintln!("amem: nothing claimable");
                 return Ok(if last == NOTHING_TO_DO {
                     NOTHING_TO_DO
                 } else {
@@ -306,7 +306,7 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
                 crate::MineVia::Api
             };
             if let Err(e) = session.mine(plan.model.as_deref(), via).await {
-                eprintln!("memory: mining failed: {e}");
+                eprintln!("amem: mining failed: {e}");
             }
         }
         if !options.keep_going {
@@ -322,7 +322,7 @@ async fn one(
     options: &Options,
 ) -> Fallible<i32> {
     let lease_seconds = options.lease_seconds;
-    eprintln!("memory: claimed {}: {}", task.id, task.title);
+    eprintln!("amem: claimed {}: {}", task.id, task.title);
     let holding = Holding::of(&task.id);
     let memory = session.memory();
     let platform = Platform::for_harness(&memory, session.harness()).await;
@@ -346,7 +346,7 @@ async fn one(
             loop {
                 tick.tick().await;
                 if let Err(e) = client.heartbeat(&id, lease_seconds).await {
-                    eprintln!("memory: heartbeat on {id}: {e}");
+                    eprintln!("amem: heartbeat on {id}: {e}");
                     return;
                 }
             }
@@ -430,7 +430,7 @@ async fn settle(
     match now.status.as_str() {
         "completed" => {
             eprintln!(
-                "memory: {} completed, handoff {}",
+                "amem: {} completed, handoff {}",
                 task.id,
                 now.handoff.as_deref().unwrap_or("-")
             );
@@ -452,7 +452,7 @@ async fn settle(
                 .await?;
             client.complete(&task.id, &handoff).await?;
             eprintln!(
-                "memory: {} completed with its report as handoff {handoff}",
+                "amem: {} completed with its report as handoff {handoff}",
                 task.id
             );
             Ok(0)
@@ -476,13 +476,13 @@ async fn settle(
                 .await?;
             client.release(&task.id, Some(&handoff)).await?;
             eprintln!(
-                "memory: {} released; its output is filed as handoff {handoff}",
+                "amem: {} released; its output is filed as handoff {handoff}",
                 task.id
             );
             Ok(STOPPED)
         }
         other => {
-            eprintln!("memory: {} is now {other}", task.id);
+            eprintln!("amem: {} is now {other}", task.id);
             Ok(if code == 0 { STOPPED } else { code })
         }
     }
@@ -643,7 +643,7 @@ async fn prefetched(memory: &Memory, task: &Task) -> String {
     match memory.prefetch(&query, &prefetch::Plan::default()).await {
         Ok(found) => {
             eprintln!(
-                "memory: prefetched {} summaries ({} tokens): {}",
+                "amem: prefetched {} summaries ({} tokens): {}",
                 found.hits.len(),
                 found.tokens,
                 found.ids().join(", ")
@@ -651,7 +651,7 @@ async fn prefetched(memory: &Memory, task: &Task) -> String {
             prefetch_section(&found)
         }
         Err(e) => {
-            eprintln!("memory: no prefetch for {}: {e}", task.id);
+            eprintln!("amem: no prefetch for {}: {e}", task.id);
             String::new()
         }
     }

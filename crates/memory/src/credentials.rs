@@ -38,7 +38,7 @@ pub const KNOWN: &[(&str, &str)] = &[
     ),
     (
         "LITELLM_MASTER_KEY",
-        "--auth gateway on the wslc backend, which runs its own gateway",
+        "--auth or --server-auth gateway on the wslc backend, which runs its own gateway",
     ),
     ("POSTGRES_PASSWORD", "that gateway's database"),
 ];

@@ -117,7 +117,7 @@ pub async fn write_proposals(
                 domain: None,
             })
             .await?;
-        eprintln!("memory: mined {} {id}: {}", p.kind, p.title);
+        eprintln!("amem: mined {} {id}: {}", p.kind, p.title);
         ids.push(id);
     }
     Ok(ids)
