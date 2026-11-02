@@ -212,9 +212,9 @@ This applies to:
 - the AGENTS files, and the commands in `.claude/commands/`.
 
 These keep their own style: the paper (`docs/durable-memory-for-disposable-agents.md`),
-the case study (`docs/seeding-a-foundation.md`), `PLAN.md`, the records in `spikes/`, the
-example records in `examples/`, code comments, and the text of the web pages and the
-design book.
+the paper's appendix (`docs/durable-memory-for-disposable-agents-appendix.md`), the case
+study (`docs/seeding-a-foundation.md`), `PLAN.md`, the records in `spikes/`, the example
+records in `examples/`, code comments, and the text of the web pages and the design book.
 
 ## Writing on an issue or a pull request
 
