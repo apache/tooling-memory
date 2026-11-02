@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Seed a memory record from Markdown, one entry per section, for a realistic demo corpus.
 
-Usage: seed-corpus.py --root ROOT [--kind KIND] [--min-words N] [--memory AMEM] PATH...
+Usage: seed-corpus.py --root ROOT [--kind KIND] [--min-words N] [--memory AMEM] [--strict] PATH...
 
 Each .md file under PATH is split on second-level headings; each section becomes an entry
 titled "<file title>: <section heading>". Files under a directory named decisions become
@@ -35,6 +35,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True); ap.add_argument("--kind", default="fact")
     ap.add_argument("--min-words", type=int, default=40); ap.add_argument("--memory", default="amem")
+    # a write that fails is reported and skipped; under --strict it also fails the run,
+    # for a check that must not pass on a partial record
+    ap.add_argument("--strict", action="store_true")
     ap.add_argument("paths", nargs="+")
     a = ap.parse_args()
     files = []
@@ -43,7 +46,7 @@ def main():
             for d, _, fs in os.walk(p):
                 files += [os.path.join(d, f) for f in sorted(fs) if f.endswith(".md") and f.upper() not in SKIP]
         elif p.endswith(".md"): files.append(p)
-    written = 0
+    written = failed = 0
     for f in files:
         kind = "decision" if "/decisions/" in f or f.startswith("decisions/") else a.kind
         title, secs = sections(open(f, encoding="utf-8").read())
@@ -60,9 +63,12 @@ def main():
             r = subprocess.run([a.memory, "--root", a.root, "write", f"--kind={kind}", f"--title={t[:140]}",
                                 f"--body={body[:12000]}"], capture_output=True, text=True)
             if r.returncode != 0:
-                print(f"skip {f} [{head}]: {r.stderr.strip()[:120]}", file=sys.stderr); continue
+                print(f"skip {f} [{head}]: {r.stderr.strip()[:120]}", file=sys.stderr)
+                failed += 1; continue
             written += 1
     print(f"wrote {written} entries from {len(files)} files")
+    if failed and a.strict:
+        sys.exit(f"{failed} writes failed")
 
 if __name__ == "__main__":
     main()
