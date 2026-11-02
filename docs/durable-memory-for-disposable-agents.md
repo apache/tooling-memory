@@ -91,7 +91,7 @@ In the background, curators keep the memory tidy, auditors check the curators, a
 | **[Orchestrators](#decomposition)** | Someone has to decide what is worth doing, and split work too big for one agent | Rank tasks against written strategy, and split them ([§8](#8-coordination)) |
 | **[Curators](#5-the-curator)** | Left alone, memory rots | Summarise, merge, verify, and retire entries ([§5](#5-the-curator)) |
 | **[Auditors](#auditors)** | A curator that checks its own work shares its own blind spots | Check the curators, on a different model ([§5](#5-the-curator)) |
-| **[Recall deputy](#the-recall-deputy)** | A multi-step lookup costs an expensive model many turns | Does the lookup on a cheap model, with the caller's permissions ([§6](#6-retrieval-and-serving)) |
+| **[Recall deputy](#the-recall-deputy)** | A multi-step lookup costs an expensive model many turns | Does the lookup on a model chosen for the job, with the caller's permissions ([§6](#6-retrieval-and-serving)) |
 
 **Where the system meets the world**
 
@@ -118,7 +118,7 @@ When a question is not answered below, reason from these.
 10. **Everything stays human-legible.** People are the only continuity at decade scale.
 11. **Evaluation is built in.** Everything a later replay needs is recorded while the task runs, and every layer, memory included, can be switched off to compare against running without it.
 
-The components are deliberately common: Markdown in a versioned store, BM25 search (Lucene-family or Postgres), Open Policy Agent, OpenTelemetry. Over decades, unusual dependencies become liabilities. Vector search is allowed only as a derived layer.
+The components are deliberately common: Markdown in a versioned store, BM25 search, Open Policy Agent, OpenTelemetry. Over decades, unusual dependencies become liabilities. Vector search is allowed only as a derived layer.
 
 Terms are explained where first used; [Appendix F](#appendix-f-glossary) collects them.
 
@@ -362,7 +362,7 @@ Their work queue is the system's own telemetry. Clusters of failed queries becom
 
 **Curator, historian, steward.** The historian ([§3](#3-memory)) records what happened; the curator looks after what is kept. "Curator" is the cross-industry name for that work: digital curation is "the management and preservation of digital data/information over the long-term" [[9]](#ref-9), and the work's output here is the curated tier. In data governance the accountable person is the data steward [[10]](#ref-10), which here is the domain owner; curators work under the owner's policy.
 
-A summary keeps the provenance, tier, and classification of what it summarises. A consolidation that drops where a claim came from would let a raw or restricted claim pass as a curated, public one, so the curator's outputs follow the derivation rules of [§4](#4-trust-and-handling). A summary is rebuilt from the entries it summarises each time it is written, never from an earlier summary, and a pass changes only what telemetry flagged. Rewriting a rewrite loses detail with each pass, until memory can do worse than none [[85]](#ref-85), [[86]](#ref-86).
+A summary keeps the provenance, tier, and classification of what it summarises. A consolidation that drops where a claim came from would let a raw or restricted claim pass as a curated, public one, so the curator's outputs follow the derivation rules of [§4](#4-trust-and-handling). A summary is rebuilt from the entries it summarises each time it is written, never from an earlier summary, and a pass changes only what telemetry flagged. Repeated incremental rewriting loses detail, until memory can do worse than none [[85]](#ref-85), [[86]](#ref-86).
 
 ## Containing the Curator
 
@@ -439,13 +439,13 @@ The operations in [Appendix A](#appendix-a-interface) are the durable contract; 
 
 ## Turns cost more than transport
 
-Every pull costs the agent a model turn. So the predictable part (T0 and the policy digest) arrives as a cached prefix. T0 arrives as data with its tiers shown, and only the policy digest is read as instruction: memory loaded as instructions has been rewritten by a malicious package and obeyed [[89]](#ref-89). Pulls are dense: summaries first, prefetch attached, several queries per call. Where a harness works best with files, the service renders a scoped, read-only file view instead of mounting anything.
+Every pull costs the agent a model turn. So the predictable part (T0 and the policy digest) arrives as a cached prefix. A provider's cache matches an exact prefix for one model and lasts minutes, so T0 is byte-stable: its slices come in a fixed order, the parts most sessions share come first, and it changes only when its contents do. T0 arrives as data with its tiers shown, and only the policy digest is read as instruction: memory loaded as instructions has been rewritten by a malicious package and obeyed [[89]](#ref-89). Pulls are dense: summaries first, prefetch attached, several queries per call. Where a harness works best with files, the service renders a scoped, read-only file view instead of mounting anything.
 
 ## The recall deputy
 
-**Why.** A question that needs several searches and reads would cost the expensive model one turn for each.
+**Why.** A question that needs several searches and reads would cost the expensive model a turn for each, and every hit and page it read would stay in its context for the rest of the session. Its earlier context is already cached and cheap to re-read; what costs is the new material, paid for again on every later turn and crowding the context ([§2](#2-the-design-at-a-glance)).
 
-So multi-step lookups go to `recall(question, domain)`. A model cheaper than the caller's, chosen against the domain's suite, runs the search, read, and summarise loop inside the service and returns a cited brief, so the expensive caller spends one turn. It is served conflicts already resolved by curation, not metadata to weigh, because a stale note that looks current misleads larger models most [[90]](#ref-90).
+So multi-step lookups go to `recall(question, domain)`. A model inside the service runs the search, read, and summarise loop and returns a cited brief, so the caller spends one turn and keeps only the brief. Each domain chooses the deputy's model against its recall suite: briefs that cite faithfully first, then latency within the SLO, then cost. Its model class needs a ceiling at least as high as the caller's handling, because the deputy reads what the caller may read. It is served conflicts already resolved by curation, not metadata to weigh, because a stale note that looks current misleads larger models most [[90]](#ref-90).
 
 - The deputy runs under the caller's own filter, so a low-privilege caller cannot launder reads through it.
 - The caller's label rises to the highest classification the deputy read, and the deputy's reads join the caller's read set ([§3](#3-memory)).
@@ -728,7 +728,7 @@ Decisions need deadlines as much as searches do. Each unit sets response bounds 
 
 ## The platform is a domain
 
-The harness, meaning system prompts, tool definitions, agent definitions, retrieval settings, the triage rubric, and the methods agents retrieve mid-task, is memory in a domain called `dom-platform`, along with evaluation suites, scorecards, and known model quirks. Curators curate it like any domain, so the system improves without training anything: a better method for a recurring task helps every agent that draws it. Recent work on self-evolving agents finds the same, that most gains come from improving the harness, without retraining ([§13](#13-related-work)).
+The harness, meaning system prompts, tool definitions, agent definitions, retrieval settings, the triage rubric, and the methods agents retrieve mid-task, is memory in a domain called `dom-platform`, along with evaluation suites, scorecards, and known model quirks. Curators curate it like any domain, so the system improves without training anything: a better method for a recurring task helps every agent that draws it. Recent work on self-evolving agents starts from the same premise, that agents improve mainly by changing their harness, without retraining ([§13](#13-related-work)).
 
 The harness has two zones with a hard line between them. The **mutable zone** (prompts, tools, settings, methods) is inside the improvement loop. The **perimeter** (OPA policy, permissions, spend limits, data boundaries, the L0 core) is owned by people, sits outside `dom-platform`'s writable scope, and is enforced on every action whatever the harness says.
 
@@ -854,7 +854,7 @@ One interlock matters most. If the model drifts while the [§10](#10-evolving-th
 
 This is a known problem with a known answer.
 
-- RFC 4151 [[11]](#ref-11), the `tag` URI scheme, names a thing by an authority plus the date on which that authority held its name, because "ownership of domains and email addresses is subject to change".
+- RFC 4151 [[11]](#ref-11), the `tag` URI scheme, names a thing by an authority plus the date on which that authority held its name, because "domain names change hands".
 - OpenID Connect [[12]](#ref-12) makes the same point for people: only the issuer and subject together are stable, while emails and usernames get reused.
 - "Cool URIs don't change" because they leave out the names of people and organisations, who move [[13]](#ref-13).
 
@@ -913,9 +913,9 @@ When the price vector changes, the settings that depend on cost are recomputed a
 
 **Why not budget in number of tokens and turns?** They look like physics, and partly they are: compute scales with what a model reads, and each turn re-reads the context unless it is cached. Three things argue against building the design on them.
 
-- **Price has already left the physics.** Providers charge cached input at a tenth of fresh input or less, and output at several times input, so the same token costs different amounts depending on how it is read and produced. A design tuned to input tokens optimises the wrong quantity as soon as caching changes.
+- **Price has already left the physics.** Providers charge cached input at a tenth of fresh input or less, and output at several times input, so the same token costs different amounts depending on how it is read and produced. Some also charge more for every token once a request passes a length threshold, and bill a model's thinking as output. A design tuned to input tokens optimises the wrong quantity as soon as caching changes.
 - **The price moves fast.** The price of a fixed level of capability has fallen roughly tenfold a year, faster for some tasks [[14]](#ref-14), [[15]](#ref-15). Settings tuned to today's price are wrong within a year; settings recomputed from a price vector are not.
-- **A budget is a target.** Budget agents by tokens or turns and they learn to read less, whether or not the task gets done. When a measure becomes a target it stops being a good measure (Goodhart's law, in Strathern's phrasing [[16]](#ref-16)). Vendors of agents are moving the same way, pricing per resolved outcome [[17]](#ref-17).
+- **A budget is a target.** Budget agents by tokens or turns and they learn to read less, whether or not the task gets done. When a measure becomes a target, it ceases to be a good measure (Goodhart's law, in Strathern's phrasing [[16]](#ref-16)). One vendor of agents reports that its buyers prefer pricing per resolved outcome [[17]](#ref-17).
 
 The physics that is real is throughput. Every resource class is limited by capacity per unit of time; what differs is who holds the queue.
 
@@ -943,9 +943,9 @@ The design combines recent agent-memory research with decades of systems practic
 | **Trust** | Not transitive [[6]](#ref-6); typed by purpose [[7]](#ref-7); lossy propagation, separate distrust [[29]](#ref-29); provenance and lineage in W3C PROV [[30]](#ref-30); authority collapse [[8]](#ref-8), and consolidation that leaves memory worse than none [[85]](#ref-85); separation of privilege [[31]](#ref-31) |
 | **Safety** | Indirect prompt injection [[32]](#ref-32); memory poisoning through queries (MINJA [[33]](#ref-33)) and stores (AgentPoison [[34]](#ref-34)), largely missed by injection defences [[35]](#ref-35); OWASP's agentic top risks [[36]](#ref-36); failure modes of governed shared memory [[37]](#ref-37); retrieved content as data, never control flow (CaMeL [[38]](#ref-38)); dormant payloads [[87]](#ref-87) and laundering through an agent's own summary [[81]](#ref-81); memory poisoning and hardening in MITRE ATLAS [[97]](#ref-97) and OWASP's Agent Memory Guard [[98]](#ref-98) |
 | **Retrieval and access** | Authorisation compiled into the query (OPA [[39]](#ref-39), Zanzibar [[40]](#ref-40)); the Model Context Protocol as today's binding [[41]](#ref-41), and A2A between domains [[79]](#ref-79) |
-| **Policy** | Written, layered values (Constitutional AI [[42]](#ref-42)); specification gaming, which the safety gate exists for [[43]](#ref-43), [[44]](#ref-44) |
+| **Policy** | Written values (Constitutional AI [[42]](#ref-42)); specification gaming, which the safety gate exists for [[43]](#ref-43), [[44]](#ref-44) |
 | **Coordination** | Blackboards (Hearsay-II [[45]](#ref-45)) and tuple spaces (Linda [[46]](#ref-46)); stigmergy [[47]](#ref-47), [[48]](#ref-48); leases [[49]](#ref-49); bounded contexts [[50]](#ref-50) and data mesh [[51]](#ref-51); hierarchical task networks [[52]](#ref-52); critical-path priority [[53]](#ref-53); the contract net, without the bidding [[54]](#ref-54) |
-| **Measurement and evaluation** | SRE [[55]](#ref-55); token cost as an axis (Mem0 [[56]](#ref-56), LoCoMo [[57]](#ref-57)); long-horizon benchmarks (LongMemEval [[58]](#ref-58)); silent vendor drift [[59]](#ref-59); NIST AI RMF [[60]](#ref-60) and ISO/IEC 42001 [[61]](#ref-61); OpenTelemetry [[62]](#ref-62) and Inspect [[63]](#ref-63) as carriers; the paired noise-floor protocol [[64]](#ref-64) |
+| **Measurement and evaluation** | SRE [[55]](#ref-55); token cost as an axis (Mem0 [[56]](#ref-56)); long-horizon benchmarks (LoCoMo [[57]](#ref-57), LongMemEval [[58]](#ref-58)); silent vendor drift [[59]](#ref-59); NIST AI RMF [[60]](#ref-60) and ISO/IEC 42001 [[61]](#ref-61); OpenTelemetry [[62]](#ref-62) and Inspect [[63]](#ref-63) as carriers; the paired noise-floor protocol [[64]](#ref-64) |
 | **Seeding** | Co-change coupling [[65]](#ref-65); fixes linked to their causes [[66]](#ref-66) |
 | **Self-improvement** | Self-evolving harnesses (SEAGym [[67]](#ref-67)); offline distillation, online retrieval (EvolveR [[68]](#ref-68)); gated archives (Darwin Gödel Machine [[69]](#ref-69)); co-evolving evaluators [[70]](#ref-70); agents designed as code [[71]](#ref-71). This design adds human review, a manifest check, and a perimeter outside the loop |
 | **Long timescales** | Dated authorities (RFC 4151 [[11]](#ref-11)); names never reassigned (RFC 8141 [[72]](#ref-72)); stable internal IDs (SCIM [[73]](#ref-73)); issuer and subject (OpenID Connect [[12]](#ref-12)); identifiers free of organisational names [[13]](#ref-13) |
@@ -1043,7 +1043,7 @@ Numbered in order of first citation, with later additions appended. Recent works
 
 <a id="ref-36"></a>[36] OWASP GenAI Security Project (2025). OWASP Top 10 for Agentic Applications. https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/
 
-<a id="ref-37"></a>[37] *Governed Shared Memory for Multi-Agent LLM Systems* (2026). arXiv:2606.24535. https://arxiv.org/abs/2606.24535
+<a id="ref-37"></a>[37] Margalit, Y., Cohen-Inger, N., Avram, E., Taig, R., & Margalit, O. (2026). Governed Shared Memory for Multi-Agent LLM Systems. arXiv:2606.24535. https://arxiv.org/abs/2606.24535
 
 <a id="ref-38"></a>[38] Debenedetti, E., et al. (2025). Defeating Prompt Injections by Design (CaMeL). arXiv:2503.18813. https://arxiv.org/abs/2503.18813
 
@@ -1093,11 +1093,11 @@ Numbered in order of first citation, with later additions appended. Recent works
 
 <a id="ref-61"></a>[61] ISO/IEC (2023). *ISO/IEC 42001:2023 Information technology — Artificial intelligence — Management system*. https://www.iso.org/standard/81230.html
 
-<a id="ref-62"></a>[62] OpenTelemetry. *Generative AI semantic conventions*. https://opentelemetry.io/docs/specs/semconv/gen-ai/ (accessed 13 October 2026).
+<a id="ref-62"></a>[62] OpenTelemetry. *GenAI semantic conventions*. https://github.com/open-telemetry/semantic-conventions-genai (accessed 2 November 2026).
 
 <a id="ref-63"></a>[63] UK AI Security Institute (2024). Inspect AI: Framework for Large Language Model Evaluations. Released May 2024. https://inspect.aisi.org.uk
 
-<a id="ref-64"></a>[64] *How Much Coordination Gain Is Real? A Paired Noise-Floor Protocol for Multi-Agent Benchmarks* (2026). arXiv:2606.20695. https://arxiv.org/abs/2606.20695
+<a id="ref-64"></a>[64] Kaliyev, A. T., & Maryanskyy, A. (2026). How Much Coordination Gain Is Real? A Paired Noise-Floor Protocol for Multi-Agent LLM Benchmarks. arXiv:2606.20695. https://arxiv.org/abs/2606.20695
 
 <a id="ref-65"></a>[65] Zimmermann, T., Weissgerber, P., Diehl, S., & Zeller, A. (2004). Mining Version Histories to Guide Software Changes. *ICSE 2004*. https://doi.org/10.1109/ICSE.2004.1317478
 
@@ -1223,7 +1223,7 @@ policy_context: [pol-L1-007]  # policy in force when written
 ```
 search(query, domain?, filters?)   → [{id, title, summary, meta, snippet}]
 get(id | id#anchor)                → {body, related: [{id, summary, p}]}
-recall(question, domain?)          → {brief, citations: [id]}   # cheaper model, caller's filter
+recall(question, domain?)          → {brief, citations: [id]}   # deputy model, caller's filter
 write(entry)                       → {id}    # historian append, screened before indexing; fast lane for handoffs
 ```
 
