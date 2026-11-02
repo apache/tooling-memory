@@ -61,6 +61,14 @@ fn dechunk(raw: &str) -> String {
 /// after it, so the end of the stream is the end of the answer.
 async fn post(url: &str, headers: &[(&str, String)], body: &str) -> Result<Answer, String> {
     let (authority, path) = split(url)?;
+    // A header value is written into the request as it is, so a line break in one
+    // would start a header of its own.
+    if let Some((name, _)) = headers
+        .iter()
+        .find(|(_, value)| !value.bytes().all(|b| (0x20..0x7f).contains(&b)))
+    {
+        return Err(format!("{name}: the value has a byte a header cannot carry"));
+    }
     let mut s = TcpStream::connect(&authority)
         .await
         .map_err(|e| format!("{authority}: {e}"))?;
@@ -180,6 +188,15 @@ mod tests {
         );
         assert!(split("https://x/mcp").is_err());
         assert!(split("http:///mcp").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_header_value_with_a_line_break_is_refused_before_anything_is_sent() {
+        let headers = [("mcp-method", "tools/call\r\nx-injected: 1".to_string())];
+        let Err(refused) = post("http://127.0.0.1:1/mcp", &headers, "{}").await else {
+            panic!("a request with a broken header was sent");
+        };
+        assert!(refused.contains("cannot carry"), "{refused}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -649,6 +649,14 @@ mod tests {
                 j,
                 r#"{"jsonrpc":"2.0","id":1,"error":{"message":"no code"}}"#,
             ),
+            (
+                j,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32700,"message":"parse error"}}"#,
+            ),
+            (
+                j,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"invalid request"}}"#,
+            ),
         ];
         for (n, (kind, body)) in unspoken.into_iter().enumerate() {
             *f.answer.lock().unwrap() = Some((200, kind, body));
