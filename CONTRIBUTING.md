@@ -37,6 +37,7 @@ make check       # format, clippy, tests, guard, docs-only and conformance tests
 | `make fmt` | `cargo fmt`, which changes the files in place |
 | `make run ARGS='...'` | the `amem` binary, for example `ARGS='init --root /tmp/m --domain dom-me'` |
 | `make verify` | `check`, and also `cargo deny`, `cargo machete`, coverage against `COVERAGE_MIN`, and the browser builds of `dm-core`, `dm-policy` and `dm-reader`. CI runs this target |
+| `make msrv-check` | `cargo check` of the workspace and of the browser builds, with the Rust release that `rust-version` in `Cargo.toml` names. It needs that toolchain: `rustup toolchain install <rust-version> --profile minimal --target wasm32-unknown-unknown`. It is not part of `check` or `verify`. CI runs it as a separate job |
 | `make e2e` | the browser tests in `e2e/`. Chromium in the Playwright image drives the pages. The tests put screenshots in `e2e/screenshots/`. It needs Podman or Docker, not Node. It is not part of `check` or `verify`. Run it for a change to the pages. See [e2e/README.md](e2e/README.md) |
 | `make reader` | builds again the glue and the wasm of the browser reader into `crates/web/static/reader/`. It needs `wasm-bindgen-cli` 0.2.129 (`cargo install wasm-bindgen-cli --version 0.2.129`). Commit the result |
 | `make coverage` | `cargo llvm-cov` over the workspace. It writes an lcov report to `target/lcov.info` |
