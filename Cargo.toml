@@ -7,7 +7,7 @@ exclude = ["taps"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/apache/tooling-memory"
 
