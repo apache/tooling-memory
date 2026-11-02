@@ -502,7 +502,7 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
             go().map_err(|e| {
                 // std carries only the raw errno back to the parent, so say what
                 // failed here, where stderr is still the terminal
-                eprintln!("memory: sandbox: {e}");
+                eprintln!("amem: sandbox: {e}");
                 std::io::Error::other(e.to_string())
             })?;
             cloexec_from_three(open_files)
@@ -516,7 +516,7 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
 
 /// Say what failed between fork and exec, on stderr, without allocating.
 fn say(what: &[u8]) {
-    for part in [b"memory: sandbox: ".as_slice(), what, b"\n"] {
+    for part in [b"amem: sandbox: ".as_slice(), what, b"\n"] {
         // SAFETY: a write of a buffer with its own length to stderr.
         unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
     }
@@ -647,7 +647,7 @@ fn say_the_relay_died(signal: i32, core_dumped: bool) {
     }
     let number = &digits[first..];
     let mut buf = [0u8; 96];
-    let mut n = put(&mut buf, 0, b"memory: the relay was killed by ");
+    let mut n = put(&mut buf, 0, b"amem: the relay was killed by ");
     if let Some(name) = crate::measure::signal_name(signal) {
         n = put(&mut buf, n, name.as_bytes());
         n = put(&mut buf, n, b" (signal ");

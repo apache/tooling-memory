@@ -39,7 +39,7 @@ pub async fn cmd(m: &Memory, op: LogOp) -> Fallible {
         LogOp::Materialize { domain } => {
             let done = m.materialize(domain.as_deref()).await?;
             for id in &done.behind {
-                eprintln!("memory: {id} is not at the version the log names");
+                eprintln!("amem: {id} is not at the version the log names");
             }
             crate::json(&done)
         }
