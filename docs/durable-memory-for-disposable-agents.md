@@ -343,7 +343,7 @@ Model output gets three further rules, because of the hazards in [§1](#1-why).
 
 ## Poisoning
 
-Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it ([§13](#13-related-work)). Everything above is the defence, together with the independent auditors of [§5](#5-the-curator). Each session also records the lowest trust tier it has read. The mark grants and blocks nothing, since most useful work reads something raw; auditors use it to sample first the writes and sends of sessions that did.
+Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it ([§13](#13-related-work)). Everything above is the defence, together with the independent auditors of [§5](#5-the-curator). Each session also records the lowest trust tier it has read. The mark grants and blocks nothing: blocking every session that read raw stops poisoning, but broke some of the agent's work in every configuration tested [[87]](#ref-87). Auditors use it to sample first the writes and sends of sessions that read raw.
 
 ---
 
