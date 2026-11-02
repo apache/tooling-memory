@@ -978,7 +978,7 @@ Beer's test is viability, and that depends on how well these functions exchange 
 
 # References
 
-References [1]–[78] are numbered in order of first citation; [79] and later are appended in the order they were added. Recent works link to their arXiv records; older works give the venue, with a link where a stable copy exists.
+References are numbered in the order they were added. Recent works link to their arXiv records; older works give the venue, with a link where a stable copy exists.
 
 <a id="ref-1"></a>[1] Hugging Face Security Team (2026). Security Incident Disclosure, July 2026. 16 July 2026. https://huggingface.co/blog/security-incident-july-2026
 
