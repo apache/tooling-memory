@@ -67,7 +67,9 @@ async fn post(url: &str, headers: &[(&str, String)], body: &str) -> Result<Answe
         .iter()
         .find(|(_, value)| !value.bytes().all(|b| (0x20..0x7f).contains(&b)))
     {
-        return Err(format!("{name}: the value has a byte a header cannot carry"));
+        return Err(format!(
+            "{name}: the value has a byte a header cannot carry"
+        ));
     }
     let mut s = TcpStream::connect(&authority)
         .await
