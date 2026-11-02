@@ -14,7 +14,7 @@ Written with Claude Fable 5, Claude Opus 5 (Anthropic), and GPT-6 Astra (OpenAI)
 
 Agents doing real, sustained work fail in four ways.
 
-1. **They forget.** Every session starts cold. Context is rebuilt by replaying transcripts. Within one task, keeping the full history costs about twice as much as masking old tool output, for about the same success [[100]](#ref-100).
+1. **They forget.** Every session starts cold. Context is rebuilt by replaying transcripts. Within one task, keeping the full history costs about twice as much as hiding old tool output from the model, for about the same success [[100]](#ref-100).
 2. **They collide.** Without shared state, agents duplicate or contradict each other's work, or coordinate by messaging each other over channels that grow with the square of the fleet.
 3. **They lack judgment.** An agent can do a task but cannot tell whether the institution thinks it worth doing or over a line, unless that judgment is written where it can read it.
 4. **They don't survive change.** Models turn over every 6 to 18 months, frameworks faster, organisations every few years. Whatever lives in an agent, a prompt, or a vendor's store dies with it.
@@ -180,7 +180,7 @@ A T0 for one domain:
 ## Policy digest: L0 in full + pol-L1-007, pol-L2-031
 ```
 
-A session that may touch several domains sees one T0 made of their slices, under the smallest of their caps. Slices hold pointers and summaries at the lowest classification the task needs; restricted material arrives only through a query. If two standing decisions in a T0 cover the same subject, a curator resolves the conflict before the T0 is published, because an agent shown both could follow either one.
+A session that may touch several domains sees one T0 made of their slices, under the smallest of their caps. Slices hold pointers and summaries at the lowest classification the task needs; restricted material arrives only through a query. If two standing decisions in a T0 cover the same subject, the curators of their domains resolve the conflict before the T0 is published, because an agent shown both could follow either one.
 
 ## The write path
 
@@ -301,11 +301,11 @@ New writes are raw, and curation lifts them to curated. Raw entries are searchab
 |---|---|
 | Handoffs and decisions in the same task chain: the task, its parent, children, and dependents | The sessions working that chain, at once. This is what the fast lane is for |
 | Other entries written by the fleet's own sessions in the domain | Sessions whose policy admits raw in the domain |
-| Content from external authors, arriving through a tap | Triage, and the session working the task created from it. Everywhere else, only once curated |
+| Content from authors outside the fleet, arriving through a tap | Triage, and the task chain created from it. Everywhere else, only once curated |
 
-The row also depends on what the author read. A session that read content from external authors, as a raw entry or through a tool server, writes in the tap row, because restating someone else's words does not make them a new source [[81]](#ref-81). Handoffs stay visible to their own task chain. Curators and auditors read raw as their work requires. Policy can adjust the defaults ([Appendix E](#appendix-e-rules-in-detail)). Classification still applies in every case: raw reach decides which raw entries a session may see, and handling still caps how high it may read.
+The row also depends on what the author read. A session that read content from authors outside the fleet, as a raw entry or through a tool server, writes with the tap row's reach: triage and its own task chain see the entry, and everyone else only once it is curated. Restating someone else's words does not make them a new source [[81]](#ref-81). Curators and auditors read raw as their work requires. Policy can adjust the defaults ([Appendix E](#appendix-e-rules-in-detail)). Classification still applies in every case: raw reach decides which raw entries a session may see, and handling still caps how high it may read.
 
-Promotion to verified passes a review gate. A person approves it, or a senior agent where domain policy allows; the proposer can never approve its own. A wrong fact written once and trusted forever is the largest long-term risk this system carries, and this gate is the main defence against it. People who work with an agent tend to follow the option it leans toward: in one study, experts did so 86% of the time [[82]](#ref-82). So the reviewer also sees the options the proposer rejected. The widest promotions get a second review by a reviewer who has not seen the first verdict. How often reviewers agree is measured ([§9](#9-measurement)). Before promotion, a reader with none of the entry's context must be able to explain it back; an entry that fails this is not clear enough to promote [[83]](#ref-83).
+Promotion to verified passes a review gate. A person approves it, or a senior agent where domain policy allows; the proposer can never approve its own. A wrong fact written once and trusted forever is the largest long-term risk this system carries, and this gate is the main defence against it. People who work with an agent tend to follow the option it leans toward: in one study, experts did so 86% of the time [[82]](#ref-82). So the reviewer also sees the options the proposer rejected. Promotions that reach the most readers get a second review by a reviewer who has not seen the first verdict. How often reviewers agree is measured ([§9](#9-measurement)). Before promotion, a fresh agent with none of the entry's context must be able to explain it back; an entry that fails this is not clear enough to promote [[83]](#ref-83).
 
 ## Labels and flow
 
@@ -343,7 +343,7 @@ Model output gets three further rules, because of the hazards in [§1](#1-why).
 
 ## Poisoning
 
-Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it ([§13](#13-related-work)). Everything above is the defence, together with the independent auditors of [§5](#5-the-curator). Each session also records whether it has read content from external authors. Raw reach already limits who sees such a session's writes; the record blocks nothing more. It tells auditors which sends to check first, because a send is where a planted instruction acts outside the record. In one study, blocking every send from a session that had read untrusted content stopped the attack but broke some of the agent's work in every setup tested [[87]](#ref-87).
+Memory poisoning, a wrong or malicious entry planted so that later agents act on it, is the main threat. It has been demonstrated through ordinary queries, and prompt-injection defences tend to miss it ([§13](#13-related-work)). Everything above is the defence, together with the independent auditors of [§5](#5-the-curator). The historian also records, for each session, whether it has read content from authors outside the fleet. Raw reach uses that record to limit who sees the session's writes; the record blocks no other action. It tells auditors which sends to check first, because a send is where a planted instruction acts outside the record. In one study, blocking every send from a session that had read untrusted content stopped the attack but broke some of the agent's work in every setup tested [[87]](#ref-87).
 
 ---
 
@@ -379,17 +379,17 @@ The curator is the most privileged agent in the system. It writes the summaries 
 
 **Why.** A curator that checks its own work shares its own blind spots, and a curator that is wrong or compromised could steer every search without anyone noticing. Someone independent has to check.
 
-Auditors are agents whose only job is checking curators. They:
+Auditors are agents whose only job is checking curators and the record they keep. They:
 
-- run on a different base model when one that audits at least as well is available, as measured on planted faults. A model favours output it recognises as its own [[104]](#ref-104) and does not reliably correct its own reasoning [[105]](#ref-105), but a weaker reviewer can make good work worse [[112]](#ref-112);
-- otherwise run the same model in a fresh session. In one study, a fresh session found about as many planted errors as the best cross-model reviewer, and partly different ones [[113]](#ref-113);
+- run on a different base model when one that audits at least as well as the curators' model is available, as measured on faults planted for the test. A model favours output it recognises as its own [[104]](#ref-104) and does not reliably correct its own reasoning [[105]](#ref-105), but a weaker reviewer can make good work worse [[112]](#ref-112);
+- otherwise run the curators' model in a fresh session. In one study, a fresh session found about as many planted errors as the best cross-model reviewer, and partly different ones [[113]](#ref-113). Sampled human review then checks more of the auditors' work, because a model may favour output of its own kind;
 - sample summaries against the entries they summarise;
 - test entries together, as searches return them, since a planted payload can be split across several entries;
 - trace a bad outcome back to the entries that fed it, using the read sets in the historian [[88]](#ref-88);
 - sample handoffs for instructions aimed at the next agent;
 - hunt contradictions between entries;
 - watch the canary entries;
-- share no writable state with curators, and see only an entry and its sources, without the curator's reasoning about them.
+- share no writable state with curators, and never see the curator's reasoning about an entry.
 
 A second model is not fully independent. Different models tend to get the same questions wrong, more so as they improve [[106]](#ref-106), just as programs written independently fail together more often than chance would predict [[107]](#ref-107), [[108]](#ref-108). Immutable history, deterministic tests, and sampled human review check the auditors in turn, with no further layer of agents.
 
@@ -432,7 +432,7 @@ OPA covers what can be checked mechanically: access, labels, spend and throughpu
 
 **An example.** A developer runs a memory server on their laptop. Their agents connect to it and to nothing else. When an agent needs the institution's memory, the laptop server fetches it from the institution's server under a grant the server holds on the developer's behalf, and applies the same filter and labels to what comes back.
 
-That is the rule: a session sees one memory server, the one run by whoever runs its harness, because enforcement split across servers leaves gaps. Any other memory system is a host behind that server. Agents never connect to a second server themselves. A harness's own memory files count as a second memory server: the harness turns them off, or their content comes in through a tap like any outside source.
+That is the rule: a session sees one memory server, the one run by whoever runs its harness, because enforcement split across servers leaves gaps. Any other memory system is a host behind that server. Agents never connect to a second server themselves. A harness's own memory files count as a second memory server: the harness turns them off, or the service reads their content as raw content from outside the fleet.
 
 Identity is the serving layer's concern; the record carries only provenance. A server for one person authenticates nobody, since the owner is the only principal, but still applies labels and ceilings. An institution's server uses its identity provider. The credential for each host is held by the server, never by an agent.
 
@@ -448,11 +448,11 @@ Pulls are dense: summaries first, prefetch attached, several queries per call. W
 
 ## The recall deputy
 
-**Why.** A question that needs several searches and reads would cost the expensive model a turn for each. Every result and page it read would also stay in its context for the rest of the session, paid for again on each later turn and crowding out what matters ([§2](#2-the-design-at-a-glance)).
+**Why.** A question that needs several searches and reads would cost the expensive model a turn for each. Every result and page it read would also stay in its context for the rest of the session, paid for again on each later turn and crowding out what matters ([§1](#1-why)).
 
-So multi-step lookups go to `recall(question, domain)`. A model inside the service runs the search, read, and summarise loop and returns a cited brief, so the caller spends one turn and keeps only the brief.
+So multi-step lookups go to `recall` ([Appendix A](#appendix-a-interface)). A model inside the service runs the search, read, and summarise loop and returns a cited brief with the summaries it drew on, so the caller spends one turn and reads summaries, not pages.
 
-The deputy reads the same entries as its caller, so its model needs a ceiling at or above the caller's handling ([§4](#4-trust-and-handling)). Among such models, each domain picks with its recall suite: first for briefs that cite their sources correctly, then for speed within the SLO, then for cost. Curation resolves conflicting entries before the deputy reads them, because a stale note that looks current misleads models of every size tested, the larger ones most [[90]](#ref-90).
+The deputy reads the same entries as its caller, so its model needs a ceiling at or above the caller's handling ([§4](#4-trust-and-handling)). Among such models, each domain picks with its recall suite, a set of questions with known answers kept like the golden query suite of [§9](#9-measurement): first for briefs that cite their sources correctly, then for speed within its latency target, then for cost. Curation resolves conflicting entries before the deputy reads them, because a stale note that looks current misleads models of every size tested, the larger ones most [[90]](#ref-90).
 
 The caller says how much its context already holds and what kind of answer it wants: a fact, a list, or an overview. The service sets the brief's length from these, the caller's model and the suite's results. The cost of a long context in accuracy differs by model and by how full the context already is [[101]](#ref-101)–[[103]](#ref-103). The service logs the choice so that a replay can check it.
 
@@ -725,7 +725,7 @@ Retrieval is a published contract, because agents depend on it. Starting targets
 
 In an outage, agents keep working from the T0 they loaded and queue their handoffs, within their last confirmed lease. New reads need current authorisation and changes need a valid claim; when either cannot be checked, the action waits. No irreversible action proceeds in an outage. [Appendix C](#appendix-c-ledger-semantics) gives the ledger's outage rules.
 
-Each domain keeps a golden query suite that runs on every change to the indexer, ranker, or summary prompt. A curator's rewrite of summaries counts as such a change. It also checks that demoted and superseded entries are never served. Stores that leave this to the model's instructions keep serving revoked records [[91]](#ref-91). Ranking changes ship through canary or shadow serving. Alerts are per domain, because rot shows locally long before it moves an average. And telemetry is the curator's work queue, which is what keeps the corpus healthy in year ten.
+Each domain keeps a golden query suite that runs on every change to the indexer, ranker, or summary prompt. A curator's rewrite of summaries counts as such a change. The suite also checks that demoted and superseded entries are never served. Stores that leave this to the model's instructions keep serving revoked records [[91]](#ref-91). Ranking changes ship through canary or shadow serving. Alerts are per domain, because rot shows locally long before it moves an average. And telemetry is the curator's work queue, which is what keeps the corpus healthy in year ten.
 
 Decisions need deadlines as much as searches do. Each unit sets response bounds for review and escalation, and a missed bound goes to a named backup or a higher authority, outside the task queue; approval is still required. Tests include a critical exception buried in a summary, an absent approver, and a burst of competing cross-domain requests. Passing means the warning survives, reaches someone who can act, and the response is recorded.
 
@@ -826,7 +826,7 @@ The first change to evaluate is the system itself. Hold model, harness, tasks, a
 | **No memory** | The task spec and the repositories and trackers it would have anyway | The floor |
 | **Transcript replay** | No memory, plus earlier sessions' transcripts | Today's practice |
 | **T0 only** | Cached index and policy digest, no retrieval | What the cheap layer buys. On coding benchmarks, context files raised cost without a significant gain [[92]](#ref-92) |
-| **Raw only** | Live ledger state and the policy digest, and retrieval over raw entries and handoffs, with no curation | What curation buys |
+| **Raw only** | The ledger's current tasks and the policy digest, and retrieval over raw entries and handoffs; no curator runs, so there are no summaries, merges, or promotions | What curation buys |
 | **Full** | T0, retrieval, and handoffs | The system as built |
 
 Arms are scored on task success and on cost per task, paired by task across seeds. Arms with retrieval use the same retrieval settings, and the cost of writing and curating is charged to the arms that do them. Memory earns its place in a domain when success is no worse than without memory, within a margin fixed before the run, and cost is lower; or when success is higher at a cost the domain accepts. Cheaper and worse is a failure.
@@ -978,7 +978,7 @@ Beer's test is viability, and that depends on how well these functions exchange 
 
 # References
 
-References [1]–[78] are numbered in order of first citation; later additions are appended in the order they were added. Recent works link to their arXiv records; older works give the venue, with a link where a stable copy exists.
+References are numbered in the order they were added. Recent works link to their arXiv records; older works give the venue, with a link where a stable copy exists.
 
 <a id="ref-1"></a>[1] Hugging Face Security Team (2026). Security Incident Disclosure, July 2026. 16 July 2026. https://huggingface.co/blog/security-incident-july-2026
 
@@ -1237,7 +1237,7 @@ policy_context: [pol-L1-007]  # policy in force when written
 search(query, domain?, filters?)   → [{id, title, summary, meta, snippet}]
 get(id | id#anchor)                → {body, related: [{id, summary, p}]}
 recall(question, domain?, context_tokens?, answer_kind?)   # fact | list | overview
-                                   → {brief, citations: [id]}   # deputy model, caller's filter
+                                   → {brief, citations: [id], summaries}   # deputy model, caller's filter
 write(entry)                       → {id}    # historian append, screened before indexing; fast lane for handoffs
 ```
 
@@ -1429,7 +1429,7 @@ When the ledger is down, the historian still accepts appends: handoffs and heart
 | Lost lineage | Every write, read, send, ledger operation, and curation action is an event; informed-by edges are computed by the service, not declared by agents ([§3](#3-memory)) |
 | Memory poisoning | Provenance; tiers that rise only through gates; imports start raw; content is data; independent auditors ([§4](#4-trust-and-handling), [§5](#5-the-curator)) |
 | Leaked secret or unsafe output in memory | Screening before anything downstream reads it; failures quarantined, rotated, and erased; nothing raw is executed or loaded; outbound only within ceilings ([§3](#3-memory), [§4](#4-trust-and-handling)) |
-| Planted external content read before review | Raw from a tap reaches only the task it started until curated ([§4](#4-trust-and-handling)) |
+| Planted external content read before review | Raw from a tap, and what a session that read it writes, reaches only triage and the task chain until curated ([§4](#4-trust-and-handling)) |
 | Trust carried along a chain | Derived entries take the weakest input; imports start raw; federation lends no authority ([§4](#4-trust-and-handling)) |
 | Wrong or compromised curator | Reversible diffs; auditors on another model where a capable one is available; telemetry out of its reach; approver never the proposer; lineage re-check; canaries ([§5](#5-the-curator)) |
 | Content leaves its boundary | Labels on entries, tasks, and sessions; ceilings on destinations; writes inherit; down only through a guard ([§4](#4-trust-and-handling)) |
@@ -1475,14 +1475,14 @@ The main text gives each rule at the level needed to follow the design. This app
 - **Attesting handling.** A session's handling is set by policy for its principal and attested by its harness. A harness may attest handling above public only if every outbound path it has goes through the perimeter. Otherwise the send check could be bypassed.
 - **Tool servers are sources too.** Each is registered with its ceiling and with the highest classification of what it reads. A call raises the session's label like any read.
 - **Grants.** Grants are per principal and per server. A server that reads restricted sources is never the same grant as one whose ceiling is public; a deployment that needs that crossing builds it as a `declassify`.
-- **Tool calls are sends.** An agent puts what it has read into the arguments of its tool calls, so each call is checked against the server's ceiling like any other send [[99]](#ref-99). DNS resolvers and redirect services count as destinations too.
+- **Tool calls are sends.** An agent puts what it has read into the arguments of its tool calls, so each call is checked against the server's ceiling like any other send [[99]](#ref-99). DNS resolvers and redirect services count as destinations too, each with its own ceiling.
 - **Probing.** Repeated ceiling denials, or queries that look like an attempt to list the whole index, from one principal alert as probing.
 - **Declassification.** A `declassify` proposes a new, lower-labelled entry that cites the original. The proposal keeps the higher label until the guard approves. The guard is the domain's owner by default, and a person for the widest crossings. The result names the guard in its provenance, so every crossing can be listed.
 - **Delegation and recall.** A helper's label starts at its parent's and flows back up. A `recall` raises the caller's label to the highest classification its deputy read.
 
 ### Raw reach (§4)
 
-- The writing session decides the row of the raw-reach table: task chain, fleet session, or tap. A write takes the tap row if its session read content from external authors, as a raw entry or through a tool server. Handoffs in the same task chain stay visible to that chain.
+- The writing session, and what it read, decide the row of the raw-reach table: task chain, fleet session, or tap. A write takes the tap row if its session read content from authors outside the fleet, as a raw entry or through a tool server; triage and the session's own task chain still see it.
 - Domain policy may widen or narrow the defaults.
 - A principal's policy may require curated or better for what it reads in a domain.
 
