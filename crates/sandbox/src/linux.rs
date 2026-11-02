@@ -2,7 +2,7 @@
 //!
 //! The child unshares user, mount, network, uts and ipc namespaces, maps itself to the
 //! caller's uid, builds a new root on a tmpfs from the plan's bind mounts, pivots into it,
-//! and execs the relay. The relay (`memory relay`) then unshares a pid namespace and
+//! and execs the relay. The relay (`amem relay`) then unshares a pid namespace and
 //! spawns the harness, mounting `/proc` from inside it, so the harness is pid 1 of its
 //! own world and sees no other process.
 //!
@@ -731,7 +731,7 @@ fn die_with_intermediate(pidfd: libc::c_int) -> Result<(), Error> {
     }
 }
 
-/// What `memory relay` does inside: spawn the harness and wait for it. The relay is
+/// What `amem relay` does inside: spawn the harness and wait for it. The relay is
 /// already pid 1 of the harness's namespace, courtesy of [`run`].
 ///
 /// # Errors

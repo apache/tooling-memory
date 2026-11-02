@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Seed a memory record from Markdown, one entry per section, for a realistic demo corpus.
 
-Usage: seed-corpus.py --root ROOT [--kind KIND] [--min-words N] PATH...
+Usage: seed-corpus.py --root ROOT [--kind KIND] [--min-words N] [--memory AMEM] PATH...
 
 Each .md file under PATH is split on second-level headings; each section becomes an entry
 titled "<file title>: <section heading>". Files under a directory named decisions become
 decisions; everything else the kind given (default fact). Sections shorter than --min-words
-are folded into the previous one. Writes go through the memory CLI, so they land at raw
-trust under the owner, like any other write.
+are folded into the previous one. Writes go through the amem CLI (--memory, `amem` on PATH
+by default), so they land at raw trust under the owner, like any other write.
 """
 import argparse, os, re, subprocess, sys
 
@@ -34,7 +34,7 @@ def sections(text):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True); ap.add_argument("--kind", default="fact")
-    ap.add_argument("--min-words", type=int, default=40); ap.add_argument("--memory", default="memory")
+    ap.add_argument("--min-words", type=int, default=40); ap.add_argument("--memory", default="amem")
     ap.add_argument("paths", nargs="+")
     a = ap.parse_args()
     files = []

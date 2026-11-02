@@ -230,7 +230,7 @@ windows-target:
 	@rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-gnu$$' || \
 		{ echo "the C API binding is linted for Windows; run: rustup target add x86_64-pc-windows-gnu" >&2; exit 1; }
 
-# wslcsdk.dll, the WSL containers C API, beside the Windows memory.exe: pinned and checked.
+# wslcsdk.dll, the WSL containers C API, beside the Windows amem.exe: pinned and checked.
 wslcsdk:
 	sh scripts/fetch-wslcsdk.sh "$(or $(DEST),target/release)"
 

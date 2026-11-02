@@ -28,7 +28,7 @@ This rule also gives two results with no added work. First, the paper requires o
 | Ledger and lease cache | PostgreSQL, one schema for each domain | A claim is one statement with row locking and `SKIP LOCKED`. It is atomic and takes a few ms. Domains are independent, so partitions and replicas scale by domain. A rebuild from the log is possible | One container |
 | Policy engine | OPA as a sidecar, registry and grants as data | Partial evaluation compiles the session filter one time. Each later check is local. The filter goes into the Solr query, so Solr never scores a denied entry | One sidecar for each memory-server replica |
 | Memory server | A stateless service. It has the MCP and HTTP surface, the compiled filter and T0 in a cache for each session, and the read and write checks. In a launch, it limits reads to the ceiling of the model | Replicas behind a load balancer. T0 is a prefix that the harness caches. Thus orientation needs zero tool calls | One container. Scale by count |
-| Launcher and sandbox | Ours. Linux namespaces, WSL containers, or Seatbelt on macOS (not yet run on a Mac) confine each harness. The harness has no network other than the egress. `--unconfined` removes the sandbox and keeps the egress, for a platform without a sandbox backend. So far, it runs Claude Code and Codex | It runs where the harness runs, one for each session. Thus it scales with the people and agents that work, not with the stack | The `amem` binary |
+| Launcher and sandbox | Ours. Linux namespaces, WSL containers, or Seatbelt on macOS (not yet run on a Mac) confine each harness. The harness has no network other than the egress. `--unconfined` removes the sandbox and keeps the egress, for a platform without a sandbox backend | It runs where the harness runs, one for each session. Thus it scales with the people and agents that work, not with the stack | The `amem` binary |
 | Egress | Ours. It is the only network of the confined harness. It serves the MCP of the memory server and forwards model calls. It checks the ceiling for each call. It also injects credentials, applies spend limits, meters, and records decision contexts. It checks a tunnelled call (Copilot, and some subscription logins) when the tunnel opens, and does not meter it. It also carries the calls of the launcher to hosted tool servers | One egress beside each confined session. It forwards to LiteLLM for models, and to tool servers for hosted taps. A loopback relay and a unix socket connect it to the harness | Part of `amem`. Under WSL, it has its own container, which also runs the memory server |
 | Recall deputy, librarians, auditors | Agents on Gofannon, with the cheap tier through llmao | The platform already runs this way. Librarians are a consumer group on the log, as any other consumer group is | The existing Gofannon and LiteLLM containers |
 | Taps | MCP servers, one for each tracker or list, each one with a ceiling at registration; as WASI components that the memory server hosts (section 4) | Contributed taps run in a sandbox, with exactly the network and filesystem that the grant allows | Containers, or components that the memory server loads |
@@ -91,7 +91,7 @@ Thus the browser gives a person a view of their own memory and of the public sli
 
 ## 6. Two deployments from one codebase
 
-**The Foundation's reference deployment** is the compose file above. It has these parts:
+**The Foundation's reference deployment** is planned, and it has no compose file yet. It has these parts:
 
 - MinIO;
 - Kafka;
@@ -119,22 +119,31 @@ It has the same surface and the same bundle format. It is the conformance check 
 
 ## 7. Shape of the codebase
 
-One Rust workspace.
+One Rust workspace. The table gives the planned shape. The last column says what is in
+`crates/` today.
 
-| Crate | Holds | Compiles to |
-|---|---|---|
-| `core` | Entries, frontmatter, bundles, digest manifests, the filter model, labels and ceilings. No I/O | native, wasm, WASI |
-| `store` | The record over OpenDAL: versions, tombstones, erasure | native |
-| `index` | Two backends: Tantivy embedded and Solr remote. The results give summaries first | native; Tantivy also wasm for the reader |
-| `ledger` | Two backends: SQLite and Postgres. Claims, leases, origin dedup | native |
-| `log` | Kafka producer and consumer groups. A file-backed log for the laptop | native |
-| `policy` | OPA sidecar client. Regorus for the local grants file | native, wasm |
-| `server` | MCP and HTTP surface, session cache, the read filter and write checks, T0 assembly | native |
-| `sandbox` | Confinement: the plan, namespaces on Linux, Seatbelt on macOS. The WSL container backend is in `amem` (`crates/memory`) | native |
-| `egress` | The one network path out of the confined harness: the MCP of the memory server over HTTP, and model calls with ceilings, credentials, spend and metering | native |
-| `plugins` | WASI host for taps and skill bundles | native |
-| `ui` | The browser reader and curation page | wasm |
-| `memoryd`, `memory-local` | The two binaries | native, Windows and Linux |
+| Crate | Holds | Compiles to | Today |
+|---|---|---|---|
+| `core` | Entries, frontmatter, bundles, digest manifests, the filter model, labels and ceilings. No I/O | native, wasm, WASI | `crates/core` |
+| `store` | The record over OpenDAL: versions, tombstones, erasure | native | `crates/store`, with the file system and in-memory services |
+| `index` | Two backends: Tantivy embedded and Solr remote. The results give summaries first | native; Tantivy also wasm for the reader | `crates/index`, with one backend: SQLite with FTS5 |
+| `ledger` | Two backends: SQLite and Postgres. Claims, leases, origin dedup | native | `crates/ledger`, with both backends |
+| `log` | Kafka producer and consumer groups. A file-backed log for the laptop | native | No crate. The event log is in `crates/server`, with no Kafka |
+| `policy` | OPA sidecar client. Regorus for the local grants file | native, wasm | `crates/policy`, with regorus in the process and no OPA client |
+| `server` | MCP and HTTP surface, session cache, the read filter and write checks, T0 assembly | native | `crates/server` |
+| `sandbox` | Confinement: the plan, namespaces on Linux, Seatbelt on macOS. The WSL container backend is in `amem` (`crates/memory`) | native | `crates/sandbox` |
+| `egress` | The one network path out of the confined harness: the MCP of the memory server over HTTP, and model calls with ceilings, credentials, spend and metering | native | `crates/egress` |
+| `plugins` | WASI host for taps and skill bundles | native | `crates/taps`, a WASI host for taps |
+| `ui` | The browser reader and curation page | wasm | `crates/reader`, the core crate for a browser, and `crates/web`, the pages of the web launcher |
+| `memoryd`, `memory-local` | The two binaries | native, Windows and Linux | One binary, `amem` (`crates/memory`) |
+
+These crates are in `crates/` too, and the table above does not name them:
+
+- `client`: a typed MCP client for the memory server;
+- `fetch`: what the fetch tool does with a page;
+- `mount`: the projection as a live mount;
+- `otel`: OpenTelemetry traces;
+- `wslc-api`: a binding to the WSL containers C API.
 
 ## 8. Portability notes
 
