@@ -90,7 +90,7 @@ In the background, curators keep the memory tidy, auditors check the curators, a
 | **[Workers](#the-agents-life)** | Work needs doing by something cheap to start and safe to lose | Claim a task, do it, write a handoff |
 | **[Orchestrators](#decomposition)** | Someone has to decide what is worth doing, and split work too big for one agent | Rank tasks against written strategy, and split them ([§8](#8-coordination)) |
 | **[Curators](#5-the-curator)** | Left alone, memory rots | Summarise, merge, verify, and retire entries ([§5](#5-the-curator)) |
-| **[Auditors](#auditors)** | A curator that checks its own work shares its own blind spots | Check the curators, on a different model ([§5](#5-the-curator)) |
+| **[Auditors](#auditors)** | A curator that checks its own work shares its own blind spots | Check the curators, on a different model where a capable one is available ([§5](#5-the-curator)) |
 | **[Recall deputy](#the-recall-deputy)** | A multi-step lookup costs an expensive model many turns | Does the lookup on a model chosen for the job, with the caller's permissions ([§6](#6-retrieval-and-serving)) |
 
 **Where the system meets the world**
@@ -134,7 +134,7 @@ Examples use `dom-a` for the domain under discussion and `dom-b` for a neighbour
 
 | Tier | Contents | Size | Read by |
 |---|---|---|---|
-| **T0, index** | Current goals, active tasks, standing decisions, pointers, policy digest | Capped per domain; the cap starts near 2k tokens and is tuned by measuring what it buys ([§11](#11-evaluating-change)) | Every agent at start, from cache |
+| **T0, index** | Current goals, active tasks, standing decisions, pointers, policy digest | Capped per domain and caller model class; the cap starts near 2k tokens and is tuned by measuring what it buys ([§11](#11-evaluating-change)) | Every agent at start, from cache |
 | **T1, entries** | Curated entries, grouped by project, decision, or subsystem, with stable section anchors | Small | On demand, through retrieval |
 | **T2, historian** | Every event: writes, reads, ledger operations, curation | Unbounded | The index, the ledger, curators, auditors; rarely agents |
 | **T3, archive** | Demoted and superseded material | Unbounded | Audit only |
@@ -381,7 +381,8 @@ The curator is the most privileged agent in the system. It writes the summaries 
 
 Auditors are agents whose only job is checking curators. They:
 
-- run on a different base model and prompt lineage, because a model favours output it recognises as its own [[104]](#ref-104) and does not reliably correct its own reasoning [[105]](#ref-105);
+- run on a different base model where one at least as capable at auditing is available, measured on seeded faults, because a model favours output it recognises as its own [[104]](#ref-104) and does not reliably correct its own reasoning [[105]](#ref-105), and a weaker reviewer can make work worse [[112]](#ref-112);
+- otherwise run the same model in a fresh context, never the curator's session; a fresh same-model review and a cross-model review find different errors [[113]](#ref-113);
 - sample summaries against the entries they summarise;
 - test entries in the combinations searches return them, since a payload can be split across several;
 - trace a bad outcome back through the read sets in the historian [[88]](#ref-88);
@@ -445,7 +446,7 @@ Every pull costs the agent a model turn. So the predictable part (T0 and the pol
 
 **Why.** A question that needs several searches and reads would cost the expensive model a turn for each, and every hit and page it read would stay in its context for the rest of the session. Its earlier context is already cached and cheap to re-read; what costs is the new material, paid for again on every later turn and crowding the context ([§2](#2-the-design-at-a-glance)).
 
-So multi-step lookups go to `recall(question, domain)`. A model inside the service runs the search, read, and summarise loop and returns a cited brief, so the caller spends one turn and keeps only the brief. Each domain chooses the deputy's model against its recall suite: briefs that cite faithfully first, then latency within the SLO, then cost. Its model class needs a ceiling at least as high as the caller's handling, because the deputy reads what the caller may read. It is served conflicts already resolved by curation, not metadata to weigh, because a stale note that looks current misleads larger models most [[90]](#ref-90).
+So multi-step lookups go to `recall(question, domain)`. A model inside the service runs the search, read, and summarise loop and returns a cited brief, so the caller spends one turn and keeps only the brief. Each domain chooses the deputy's model against its recall suite: briefs that cite faithfully first, then latency within the SLO, then cost. Its model class needs a ceiling at least as high as the caller's handling, because the deputy reads what the caller may read. The brief's length is a session setting the same suite chooses per caller model class, because how much a long context costs in accuracy varies by model [[101]](#ref-101)–[[103]](#ref-103); a caller may ask for a shorter brief. It is served conflicts already resolved by curation, not metadata to weigh, because a stale note that looks current misleads larger models most [[90]](#ref-90).
 
 - The deputy runs under the caller's own filter, so a low-privilege caller cannot launder reads through it.
 - The caller's label rises to the highest classification the deputy read, and the deputy's reads join the caller's read set ([§3](#3-memory)).
@@ -1193,6 +1194,10 @@ Numbered in order of first citation, with later additions appended. Recent works
 
 <a id="ref-111"></a>[111] Starmer, A. J., Spector, N. D., Srivastava, R., et al. (2014). Changes in Medical Errors after Implementation of a Handoff Program. *New England Journal of Medicine*, 371(19), 1803–1812. https://doi.org/10.1056/NEJMsa1405556
 
+<a id="ref-112"></a>[112] Xiang, Z., Zhang, Y., Zhang, Y., & Xu, H. (2026). Cross-Model LLM Code Review: Should You Use Claude to Review Codex or Vice Versa? Agentic Software Engineering (SE 3.0) workshop. arXiv:2607.21656. https://arxiv.org/abs/2607.21656
+
+<a id="ref-113"></a>[113] Song, T.-E. (2026). When Does a Second Model Help? Cross-Model Review in LLM Verification. arXiv:2610.01471. https://arxiv.org/abs/2610.01471
+
 ---
 
 # Appendix A: Interface
@@ -1223,7 +1228,7 @@ policy_context: [pol-L1-007]  # policy in force when written
 ```
 search(query, domain?, filters?)   → [{id, title, summary, meta, snippet}]
 get(id | id#anchor)                → {body, related: [{id, summary, p}]}
-recall(question, domain?)          → {brief, citations: [id]}   # deputy model, caller's filter
+recall(question, domain?, length?) → {brief, citations: [id]}   # deputy model, caller's filter
 write(entry)                       → {id}    # historian append, screened before indexing; fast lane for handoffs
 ```
 
