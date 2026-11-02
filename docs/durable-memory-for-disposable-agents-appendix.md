@@ -1,6 +1,6 @@
 # Appendix G: Evidence
 
-Draft, 2 November 2026. A companion to [*Durable Memory for Disposable Agents*](durable-memory-for-disposable-agents.md). It may be moved into the paper as Appendix G or stay beside it.
+2 November 2026. Appendix G of [*Durable Memory for Disposable Agents*](durable-memory-for-disposable-agents.md), kept in its own file because it changes with the research more often than the design does.
 
 ## Purpose, and how to read it
 
