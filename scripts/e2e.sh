@@ -8,6 +8,10 @@
 set -eu
 here=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 image=mcr.microsoft.com/playwright:v1.61.1-noble
+# target/hosted is this script's own output, in the build directory. A CI cache can
+# bring back a copy from before hosted.sh marked what it makes, which hosted.sh would
+# refuse to replace, so the run starts from an empty one.
+rm -rf "$here/target/hosted"
 sh "$here/scripts/hosted.sh" "$here/target/hosted"
 if command -v podman >/dev/null 2>&1; then
     runtime=podman
