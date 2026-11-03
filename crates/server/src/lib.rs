@@ -1184,6 +1184,13 @@ impl Memory {
 
     /// [`Memory::scrub_if_erased`] that says whether the entry was erased, for a caller
     /// that goes on after it. Returns true when it was, and its whys are out.
+    ///
+    /// # Errors
+    ///
+    /// A store or ledger error. When another connection holds the ledger's log, the
+    /// rows are rewritten and the log still holds the why: the erasure's receipt goes
+    /// back to unfinished, since running this operation again finds the entry erased and
+    /// does not scrub, and the [`dm_ledger::Error::Held`] says to run the erasure again.
     async fn scrub_erased(
         &self,
         l: &mut Ledger,
@@ -1195,11 +1202,35 @@ impl Memory {
             .get(domain, id)
             .await?
             .is_some_and(|e| e.front.status == Some(Status::Erased));
-        if erased {
-            l.scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
-                .await?;
+        if !erased {
+            return Ok(false);
         }
-        Ok(erased)
+        match l
+            .scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(dm_ledger::Error::Held(what)) => {
+                self.reopen_erasure(domain, id).await?;
+                Err(dm_ledger::Error::Held(format!(
+                    "{what}, after {id} was erased; run `erase {id}` again to finish its erasure"
+                ))
+                .into())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Put a finished erasure's receipt back to unfinished, so the next
+    /// [`Memory::erase`] runs its steps again rather than refusing.
+    async fn reopen_erasure(&self, domain: &str, id: &str) -> Result<(), Error> {
+        if let Some(mut receipt) = self.store.receipt(domain, id).await? {
+            if receipt.is_finished() {
+                receipt.unresolved.push(erasure::UNFINISHED.into());
+                self.store.put_receipt(&receipt).await?;
+            }
+        }
+        Ok(())
     }
 
     /// File a proposal to verify the entry as it now stands. The proposal names the
@@ -4805,13 +4836,19 @@ mod tests {
         })
     }
 
-    /// An erasure of an entry an import just landed, between the landing and the restore
-    /// of its promotion records: the erasure's scrub ran before the records were there.
-    /// The restore reads the stub after it restores and takes the why out itself.
-    #[tokio::test]
-    async fn an_erasure_between_the_landing_and_the_restore_leaves_no_why() {
-        let marker = "passphrase-Qz7xx";
-        let (_dir, _owner, id, bundle) =
+    /// The landing half of an import, by hand: a bundle of one entry promoted with a why
+    /// holding `marker`, landed in a new root, its promotion records not restored yet.
+    /// Returns the temporary directories to keep, the importing session, the landed id,
+    /// and what the import has left to restore.
+    async fn landed_by_hand(
+        marker: &str,
+    ) -> (
+        [tempfile::TempDir; 3],
+        Memory,
+        String,
+        Vec<dm_ledger::PromotionRecord>,
+    ) {
+        let (dir, _owner, id, bundle) =
             promoted_then_exported(&format!("tried {marker}"), Label::Restricted).await;
         let home = tempfile::tempdir().unwrap();
         let there = mem(home.path());
@@ -4821,7 +4858,6 @@ mod tests {
             .get("dom-me")
             .map(|d| d.default_classification)
             .unwrap_or_default();
-        // the steps of import, by hand, with the erasure between them
         let imported = {
             let mut ix = there.index.lock().await;
             bundle::import(
@@ -4842,11 +4878,18 @@ mod tests {
         };
         let landed = imported.landed[&id].clone();
         assert_eq!(imported.promotions.len(), 1, "the why travels");
+        ([dir, bundle, home], there, landed, imported.promotions)
+    }
+
+    /// An erasure of an entry an import just landed, between the landing and the restore
+    /// of its promotion records: the erasure's scrub ran before the records were there.
+    /// The restore reads the stub after it restores and takes the why out itself.
+    #[tokio::test]
+    async fn an_erasure_between_the_landing_and_the_restore_leaves_no_why() {
+        let marker = "passphrase-Qz7xx";
+        let ([_dir, _bundle, home], there, landed, promotions) = landed_by_hand(marker).await;
         there.erase(&landed, Reason::Requested).await.unwrap();
-        there
-            .restore_promotions(&imported.promotions)
-            .await
-            .unwrap();
+        there.restore_promotions(&promotions).await.unwrap();
         let kept = there
             .ledger
             .lock()
@@ -4858,6 +4901,34 @@ mod tests {
             kept.iter().all(|r| r.spec.why.is_empty() && r.why_erased),
             "{kept:?}"
         );
+        assert_eq!(bundle_holds(home.path(), marker), None);
+    }
+
+    /// The same, with a reader holding the ledger when the restore scrubs: the scrub's
+    /// rows are written, and the log that still holds the why is not folded. The erasure's
+    /// receipt goes back to unfinished, so the owner knows to run it again, and that run
+    /// folds the log.
+    #[tokio::test]
+    async fn a_restore_the_ledger_holds_up_leaves_the_erasure_unfinished() {
+        let marker = "passphrase-Qz7xx";
+        let ([_dir, _bundle, home], there, landed, promotions) = landed_by_hand(marker).await;
+        there.erase(&landed, Reason::Requested).await.unwrap();
+        let reader = rusqlite::Connection::open(home.path().join(LEDGER_FILE)).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM events;")
+            .unwrap();
+        let held = there.restore_promotions(&promotions).await;
+        assert!(
+            matches!(&held, Err(Error::Ledger(dm_ledger::Error::Held(why))) if why.contains("erase")),
+            "{held:?}"
+        );
+        reader.execute_batch("COMMIT;").unwrap();
+        assert!(
+            !there.receipt(&landed).await.unwrap().unwrap().is_finished(),
+            "the receipt says the erasure is owed"
+        );
+        let receipt = there.erase(&landed, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
         assert_eq!(bundle_holds(home.path(), marker), None);
     }
 
