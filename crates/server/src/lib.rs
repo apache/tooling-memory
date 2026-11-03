@@ -5147,6 +5147,44 @@ mod tests {
         assert_eq!(of(&kept)["why"], WHY);
     }
 
+    /// An export while an erasure is unfinished: the record holds the stub, and the index
+    /// and the ledger are not scrubbed yet. The bundle carries the stub, and its promotion
+    /// records without the why, as the scrub will leave them.
+    #[tokio::test]
+    async fn an_export_during_an_erasure_carries_no_why_of_the_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req("The vault opens at nine.\n"))
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(&secret, TrustTier::Curated, &format!("tried {marker}"))
+            .await
+            .unwrap();
+        // the first step of an erasure, and none after it
+        let (domain, entry) = owner.find(&secret).await.unwrap();
+        let mut stub = erasure::stub(&entry, Reason::Requested);
+        stub.front.domain.clone_from(&domain);
+        stub.front.id.clone_from(&secret);
+        owner.store.erase(&domain, &secret, &stub).await.unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, bundle.path())
+            .await
+            .unwrap();
+        assert_eq!(bundle_holds(bundle.path(), marker), None);
+        let carried: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle.path().join("promotions.json")).unwrap(),
+        )
+        .unwrap();
+        let record = &carried.as_array().unwrap()[0];
+        assert_eq!(record["entry"], secret.as_str());
+        assert_eq!(record["why_erased"], true);
+    }
+
     #[tokio::test]
     async fn a_promotion_says_why() {
         let dir = tempfile::tempdir().unwrap();

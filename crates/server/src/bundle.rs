@@ -15,7 +15,7 @@
 
 use dm_core::erasure::body_digest;
 use dm_core::manifest::{Manifest, ManifestEntry, ManifestPromotion, ManifestPromotions};
-use dm_core::{digest, Entry, Label, ReadFilter, TrustTier};
+use dm_core::{digest, Entry, Label, ReadFilter, Status, TrustTier};
 use dm_index::{Hit, Index};
 use dm_ledger::PromotionRecord;
 use dm_store::Store;
@@ -273,8 +273,8 @@ pub fn export_scope(
 }
 
 /// Export `hits`, the entries [`export_scope`] listed for `domain`, into `dest`, with
-/// the `promotions` of those exported at or below the bound. The
-/// index is consulted before this is called and never held across the record reads,
+/// the `promotions` of those exported at or below the bound; those of an entry exported
+/// as its erased stub go without the why. The index is consulted before this is called and never held across the record reads,
 /// so the export can run on any executor thread. The manifest's word on each entry's
 /// label is the record's, read from the text written, not the index's, which can lag
 /// it: every receiver checks the manifest against the text, so an exporter must say
@@ -294,11 +294,16 @@ pub async fn export(
 ) -> Result<Exported, Error> {
     tokio::fs::create_dir_all(dest).await.map_err(io(dest))?;
     let mut manifest = Manifest::new(domain, exported_by, max_label);
+    let mut stubs = HashSet::new();
     for hit in hits {
         let Some(text) = store.get_text(domain, &hit.id).await? else {
             continue;
         };
-        let classification = Entry::parse(&text)?.front.classification;
+        let front = Entry::parse(&text)?.front;
+        if front.status == Some(Status::Erased) {
+            stubs.insert(hit.id.clone());
+        }
+        let classification = front.classification;
         let file = format!("{}.md", hit.id);
         let path = dest.join(&file);
         tokio::fs::write(&path, &text).await.map_err(io(&path))?;
@@ -309,6 +314,18 @@ pub async fn export(
             classification,
         })?;
     }
+    // an erasure writes the stub before it scrubs the ledger: the records of an entry
+    // exported as its stub go without the why, as the scrub leaves them
+    let promotions = promotions
+        .into_iter()
+        .map(|mut r| {
+            if stubs.contains(&r.spec.entry) {
+                r.spec.why.clear();
+                r.why_erased = true;
+            }
+            r
+        })
+        .collect();
     carry_promotions(&mut manifest, promotions, dest).await?;
     let mpath = dest.join("manifest.yaml");
     tokio::fs::write(&mpath, manifest.to_yaml())
