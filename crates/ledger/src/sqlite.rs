@@ -210,9 +210,7 @@ impl Db {
     /// fold the log into it, so the old text is in neither. Returns how many records of
     /// the entry hold no why now.
     pub(crate) fn scrub_promotions(&mut self, domain: &str, entry: &str) -> Result<usize, Error> {
-        let (n, changed) = self.scrubbing(|tx| scrub_promotions_in(tx, domain, entry))?;
-        self.compact_if(changed)?;
-        Ok(n)
+        self.scrubbing(|tx| scrub_promotions_in(tx, domain, entry))
     }
 
     /// Rewrite the tasks filed from `origin` to the redaction, in their events and their
@@ -226,15 +224,11 @@ impl Db {
         origin: &str,
         redaction: &Redaction,
     ) -> Result<usize, Error> {
-        let (n, changed) =
-            self.scrubbing(|tx| scrub_tasks_in(tx, at, domain, origin, redaction))?;
-        self.compact_if(changed)?;
-        Ok(n)
+        self.scrubbing(|tx| scrub_tasks_in(tx, at, domain, origin, redaction))
     }
 
     /// Both scrubs of an erasure in one transaction, and one rebuild of the file after
-    /// them when either rewrote anything. Returns the records that hold no why now and
-    /// the tasks from the origin.
+    /// them. Returns the records that hold no why now and the tasks from the origin.
     pub(crate) fn scrub_entry(
         &mut self,
         at: OffsetDateTime,
@@ -243,38 +237,32 @@ impl Db {
         origin: &str,
         redaction: &Redaction,
     ) -> Result<(usize, usize), Error> {
-        let ((records, tasks), changed) = self.scrubbing(|tx| {
+        self.scrubbing(|tx| {
             let (records, changed_records) = scrub_promotions_in(tx, domain, entry)?;
             let (tasks, changed_tasks) = scrub_tasks_in(tx, at, domain, origin, redaction)?;
             Ok(((records, tasks), changed_records + changed_tasks))
-        })?;
-        self.compact_if(changed)?;
-        Ok((records, tasks))
+        })
     }
 
     /// Run `scrub` in one transaction taken for writing, with what an update frees
     /// overwritten with zeros, here and nowhere else: the rest of the ledger's writes need
-    /// not pay for it. Returns what `scrub` returned and how many rows it rewrote.
+    /// not pay for it. Then rebuild the file and fold the log into it, whether or not
+    /// `scrub` rewrote anything: a scrub that rewrote rows and then found the log held
+    /// committed the rows and left the old text in the log, and the run after it finds
+    /// nothing to rewrite and still has to fold that log. Returns what `scrub` returned,
+    /// without the count of rows it rewrote.
     fn scrubbing<T>(
         &mut self,
         scrub: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(T, usize), Error>,
-    ) -> Result<(T, usize), Error> {
+    ) -> Result<T, Error> {
         let mut conn = self.conn();
         conn.pragma_update(None, "secure_delete", true)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let out = scrub(&tx)?;
+        let (out, _rewritten) = scrub(&tx)?;
         tx.commit()?;
         conn.pragma_update(None, "secure_delete", false)?;
+        compact(&conn)?;
         Ok(out)
-    }
-
-    /// Rebuild the file and fold the log into it when a scrub rewrote anything; a scrub
-    /// that found everything rewritten already leaves the file as it is.
-    fn compact_if(&self, changed: usize) -> Result<(), Error> {
-        if changed == 0 {
-            return Ok(());
-        }
-        compact(&self.conn())
     }
 
     pub(crate) fn promotions(

@@ -4040,6 +4040,11 @@ mod tests {
         let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
         assert!(receipt.is_finished());
         assert_eq!(receipt.promotion_whys_removed, 1);
+        // the rows were rewritten on the first run; the rerun folds the log into the
+        // file, so no byte under the root holds the why or the text
+        for text in ["tried it on the vault", "passphrase-Qz7xx"] {
+            assert_eq!(bundle_holds(dir.path(), text), None, "{text}");
+        }
     }
 
     /// No task, whatever its status, holds `text` in its title or its body.

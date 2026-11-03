@@ -1219,7 +1219,8 @@ impl Ledger {
 
     /// Both scrubs of an erasure, [`Ledger::scrub_promotions`] of `entry` and
     /// [`Ledger::scrub_tasks`] of `origin`, in one transaction, and on SQLite one rebuild
-    /// of the file after them, and none when nothing was left to rewrite.
+    /// of the file after them, also when nothing was left to rewrite: an earlier run that
+    /// a reader held up left the old text in the write-ahead log.
     ///
     /// # Errors
     ///
