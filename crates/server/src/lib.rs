@@ -4897,6 +4897,7 @@ mod tests {
             .promotions("dom-me", &landed)
             .await
             .unwrap();
+        assert_eq!(kept.len(), promotions.len(), "the records are restored");
         assert!(
             kept.iter().all(|r| r.spec.why.is_empty() && r.why_erased),
             "{kept:?}"
