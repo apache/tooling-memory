@@ -99,14 +99,18 @@ impl Default for Options {
 
 /// A source that names a file: `file:<path>`, or a path that exists under the root.
 fn source_file(source: &str, root: &Path) -> Option<std::path::PathBuf> {
-    let rel = source.strip_prefix("file:").unwrap_or(source);
-    if rel.contains("://")
-        || rel.starts_with("transcript:")
-        || rel.starts_with("task-")
-        || rel.starts_with("mem-")
-    {
-        return None;
-    }
+    // `file:` names a file whatever its name; without it, ids and links are not paths
+    let rel = match source.strip_prefix("file:") {
+        Some(rel) => rel,
+        None if source.contains("://")
+            || source.starts_with("transcript:")
+            || source.starts_with("task-")
+            || source.starts_with("mem-") =>
+        {
+            return None
+        }
+        None => source,
+    };
     // a source names a file in the working tree, and only the real path, links followed,
     // says whether it is still there
     let full = root
@@ -488,6 +492,9 @@ pub(crate) mod tests {
         let tree = dir.path().join("tree");
         std::fs::create_dir_all(tree.join("sub")).unwrap();
         std::fs::write(tree.join("in.md"), "x").unwrap();
+        std::fs::write(tree.join("mem-notes.md"), "x").unwrap();
+        std::fs::create_dir(tree.join("task-runner")).unwrap();
+        std::fs::write(tree.join("task-runner/x.md"), "x").unwrap();
         let outside = dir.path().join("outside.txt");
         std::fs::write(&outside, "x").unwrap();
         for s in [
@@ -496,6 +503,8 @@ pub(crate) mod tests {
             "file:./in.md".to_string(),
             "file:sub/../in.md".to_string(),
             format!("file:{}", tree.join("in.md").display()),
+            "file:mem-notes.md".to_string(),
+            "file:task-runner/x.md".to_string(),
         ] {
             assert!(source_file(&s, &tree).is_some(), "{s}");
         }
@@ -653,6 +662,11 @@ pub(crate) mod tests {
                 "put the same account in the entry's `summary`",
                 held,
             ),
+            (
+                "keep that out of the entry",
+                "keep that out of the entry, and repeat what you found in the body as well",
+                held,
+            ),
         ] {
             let bad = good.replacen(from, to, 1);
             assert_ne!(bad, good, "{to}");
@@ -706,7 +720,11 @@ pub(crate) mod tests {
         // body or the summary, and the clause that names it; a sentence that keeps the
         // reasons out of the entry is not telling it to hold them
         let keeps_out = |s: &str| s.contains(" out of the entry") || s.contains(" out of the body");
-        for s in sentences.iter().filter(|s| !keeps_out(s)) {
+        let told: Vec<String> = sentences
+            .iter()
+            .map(|s| s.split_inclusive(',').filter(|c| !keeps_out(c)).collect())
+            .collect();
+        for s in &told {
             for held in ["body", "`summary`"] {
                 let Some(i) = s.find(held) else { continue };
                 let clause = s.split([',', ':']).find(|c| c.contains(held)).unwrap_or("");
