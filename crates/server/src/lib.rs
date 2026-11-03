@@ -1116,6 +1116,17 @@ impl Memory {
             return Err(self.not_served(id, None).await);
         }
         let (_, entry) = self.find(id).await?;
+        self.promote_entry(entry, to, why).await
+    }
+
+    /// [`Memory::promote`] from the entry as the record held it when it was read.
+    async fn promote_entry(
+        &self,
+        entry: Entry,
+        to: TrustTier,
+        why: &str,
+    ) -> Result<Promotion, Error> {
+        let id = entry.front.id.as_str();
         // the index can lag the record: the record says whether it is live
         if let Some(status) = entry.front.status {
             return Err(not_live(id, status));
@@ -1141,8 +1152,42 @@ impl Memory {
         // the record first: a promotion the ledger cannot keep is not made, and one whose
         // new version fails is made again with the record it already has
         let record = self.promotion_spec(&entry, to, why);
-        self.ledger.lock().await.record_promotion(&record).await?;
+        {
+            let mut l = self.ledger.lock().await;
+            l.record_promotion(&record).await?;
+            self.scrub_if_erased(&mut l, &record).await?;
+        }
         self.set_tier(entry, to).await
+    }
+
+    /// The entry of `record`, read from the record again once `record` is on the ledger.
+    /// An erasure that ran whole since the entry was read scrubbed the ledger before the
+    /// record was there, and does not run again: the stub, which an erasure writes before
+    /// it scrubs, says so, and the scrub runs here instead, under the lock `l` the record
+    /// was written under. An erasure that writes its stub after this read scrubs the record
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for an erased entry, once its whys are out; a store or ledger
+    /// error.
+    async fn scrub_if_erased(
+        &self,
+        l: &mut Ledger,
+        record: &dm_ledger::PromotionSpec,
+    ) -> Result<(), Error> {
+        let (domain, id) = (record.domain.as_str(), record.entry.as_str());
+        let erased = self
+            .store
+            .get(domain, id)
+            .await?
+            .is_some_and(|e| e.front.status == Some(Status::Erased));
+        if !erased {
+            return Ok(());
+        }
+        l.scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
+            .await?;
+        Err(not_live(id, Status::Erased))
     }
 
     /// File a proposal to verify the entry as it now stands. The proposal names the
@@ -1188,6 +1233,7 @@ impl Memory {
             return self.slot_taken(task);
         }
         l.record_promotion(&record).await?;
+        self.scrub_if_erased(&mut l, &record).await?;
         let created = match l.create(spec).await {
             Ok(c) => c,
             // another process filed the same slot between the look and the insert; its
@@ -4124,6 +4170,50 @@ mod tests {
             None,
             "nothing of the text came back"
         );
+    }
+
+    /// A whole erasure between a promotion's read of the entry and its record: the
+    /// erasure's scrub ran before the record was written, and the erasure is finished, so
+    /// it does not run again by itself. The promotion reads the stub after it records,
+    /// takes the why out itself and fails: no record and no byte on disk holds the why,
+    /// and a proposal files no task for the erased entry.
+    #[tokio::test]
+    async fn an_erasure_between_the_read_and_the_record_leaves_no_why() {
+        let marker = "passphrase-Qz7xx";
+        for to in [TrustTier::Curated, TrustTier::Verified] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = mem(dir.path());
+            let x = owner
+                .write(req("The vault opens at nine.\n"))
+                .await
+                .unwrap()
+                .id;
+            let lib = librarian(dir.path());
+            // the steps of promote, by hand, with the erasure between them
+            let (_, entry) = lib.find(&x).await.unwrap();
+            owner.erase(&x, Reason::Requested).await.unwrap();
+            let refused = lib
+                .promote_entry(entry, to, &format!("tried {marker} on the vault"))
+                .await;
+            assert!(refused.is_err(), "{to}: {refused:?}");
+            let kept = Ledger::open(&dir.path().join(LEDGER_FILE))
+                .unwrap()
+                .promotions("dom-me", &x)
+                .await
+                .unwrap();
+            assert!(
+                kept.iter().all(|r| r.spec.why.is_empty() && r.why_erased),
+                "{to}: {kept:?}"
+            );
+            assert_eq!(bundle_holds(dir.path(), marker), None, "{to}");
+            let origin = proposal_origin(&x);
+            let filed: Vec<Task> = all_tasks(&owner)
+                .await
+                .into_iter()
+                .filter(|t| t.spec.origin.as_deref() == Some(origin.as_str()))
+                .collect();
+            assert!(filed.is_empty(), "{to}: {filed:?}");
+        }
     }
 
     /// An entry rewritten after it was proposed is not the entry the proposal named; the
