@@ -12,6 +12,8 @@
   cargo: `--config`, `--offline` and `--frozen` do not reach it. Put such a setting, for
   example a vendored source replacement, in a cargo config file. For a build without the
   network, set `CARGO_NET_OFFLINE=true`, or `net.offline = true` in a config file.
+  The build script sets its own rustflags (`--remap-path-prefix`) for this cargo. So the
+  rustflags in a cargo config file do not reach the reader build.
 - A C toolchain for the bundled SQLite: `build-essential` on Debian and Ubuntu, or the
   Visual Studio Build Tools on Windows.
 - `make`. On Windows, run the targets from Git Bash or WSL.
