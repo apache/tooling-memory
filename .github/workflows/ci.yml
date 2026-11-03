@@ -54,7 +54,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-          targets: wasm32-wasip2, x86_64-pc-windows-gnu
+          # wasm32-unknown-unknown: dm-web's build script builds the browser reader
+          targets: wasm32-unknown-unknown, wasm32-wasip2, x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Ubuntu's AppArmor lets an unprivileged process create a user namespace but not map
       # its uid in it, so no confined test could run. A laptop installs the amem profile in
@@ -83,7 +84,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
         with:
           toolchain: stable
-          targets: wasm32-wasip2
+          targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The companion test loads an unpacked extension, which Google Chrome's own builds
       # refuse; the Windows image has no Chromium or Chrome for Testing, so this fetches
@@ -114,7 +115,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
         with:
           toolchain: stable
-          targets: wasm32-wasip2
+          targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace
         # the embedded PostgreSQL for the ledger tests lists its releases through GitHub's
@@ -202,7 +203,7 @@ jobs:
         with:
           toolchain: stable
           components: llvm-tools-preview
-          targets: wasm32-wasip2
+          targets: wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
@@ -231,6 +232,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
         with:
           toolchain: stable
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: make e2e
         env:

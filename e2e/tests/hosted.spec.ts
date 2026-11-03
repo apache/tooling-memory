@@ -1,6 +1,7 @@
-// A hosted copy of the pages: crates/web/static served as plain files from another
-// origin, told its server in the pairing link's fragment. It pairs, lists the sessions,
-// and starts one, every call going across origins to amem on this machine.
+// A hosted copy of the pages: target/hosted, as scripts/hosted.sh makes it, served as
+// plain files from another origin, told its server in the pairing link's fragment. It
+// pairs, lists the sessions, and starts one, every call going across origins to amem on
+// this machine.
 import { test, expect, hostedURL, pairingCode, serverURL, startSession } from './support/fixtures';
 
 test('a hosted copy pairs from its link, lists the sessions and starts one', async ({ page, request }) => {

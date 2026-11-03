@@ -29,6 +29,10 @@ use tokio::sync::broadcast;
 pub mod access;
 pub mod companion;
 mod pages;
+// what build.rs runs, run again by a test of pages.rs against what was embedded
+#[cfg(test)]
+#[path = "../reader_build.rs"]
+mod reader_build;
 pub mod state;
 
 pub use access::Access;
@@ -205,9 +209,25 @@ impl Session {
     }
 }
 
+/// A request's own session ([`App::session`]), or the response that says why there is
+/// none, returned from the handler.
+macro_rules! session {
+    ($app:expr) => {
+        match $app.session() {
+            Ok(m) => m,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+    };
+}
+
 #[derive(Clone)]
 struct App {
     config: Config,
+    /// The board's session for its life: the handles, the session id for the read and
+    /// write logs, and the read scope. Each request gets a view of it with a label of
+    /// its own ([`App::session`]).
     memory: Arc<Memory>,
     sessions: Arc<Mutex<BTreeMap<String, Arc<Session>>>>,
     /// Bundle exports run one at a time: each replaces a directory by renaming.
@@ -476,6 +496,15 @@ async fn session_status(State(app): State<App>, Path(id): Path<String>) -> Respo
 }
 
 impl App {
+    /// The board's session for one request: the same handles and session id as every
+    /// other request, so what the board reads and then writes is joined in the logs,
+    /// with a label of its own. What one request reads raises the label of that request
+    /// only: a listing does not classify what a later request files or writes, as one
+    /// long-lived label would.
+    fn session(&self) -> Result<Memory, dm_server::Error> {
+        self.memory.for_request()
+    }
+
     fn start(&self, req: &NewSession) -> Result<Arc<Session>, Error> {
         let argv = launch_argv(&self.config, req).map_err(Error::Request)?;
         let id = new_id()?;
@@ -846,7 +875,8 @@ async fn kill_session(State(app): State<App>, Path(id): Path<String>) -> Respons
 
 /// Recent entries, newest first: what the pane watches.
 async fn entries(State(app): State<App>) -> Response {
-    match app.memory.list(None, None, 30).await {
+    let m = session!(app);
+    match m.list(None, None, 30).await {
         Ok(hits) => Json(
             hits.iter()
                 .map(|h| {
@@ -864,7 +894,8 @@ async fn entries(State(app): State<App>) -> Response {
 
 /// One entry in full, for the pane.
 async fn entry(State(app): State<App>, Path(id): Path<String>) -> Response {
-    match app.memory.get(&id).await {
+    let m = session!(app);
+    match m.get(&id).await {
         Ok(e) => Json(json!({
             "id": e.front.id, "title": e.title(), "type": e.front.entry_type.to_string(),
             "author": e.front.author, "classification": e.front.classification.to_string(),
@@ -898,8 +929,9 @@ fn task_error(e: &dm_server::Error) -> Response {
 /// Every task of the domain, whatever its status, newest first within a status, with
 /// the domain named: what the board lists and nests by origin.
 async fn tasks(State(app): State<App>) -> Response {
+    let m = session!(app);
     use dm_ledger::Status;
-    let domain = match app.memory.resolve_domain(None) {
+    let domain = match m.resolve_domain(None) {
         Ok(d) => d,
         Err(e) => return task_error(&e),
     };
@@ -911,7 +943,7 @@ async fn tasks(State(app): State<App>) -> Response {
         Status::Completed,
         Status::Invalidated,
     ] {
-        match app.memory.tasks(Some(&domain), status).await {
+        match m.tasks(Some(&domain), status).await {
             Ok(mut t) => all.append(&mut t),
             Err(e) => return task_error(&e),
         }
@@ -932,6 +964,7 @@ struct FileTask {
 }
 
 async fn file_task(State(app): State<App>, Json(req): Json<FileTask>) -> Response {
+    let m = session!(app);
     if req.title.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "a task needs a title").into_response();
     }
@@ -947,21 +980,23 @@ async fn file_task(State(app): State<App>, Json(req): Json<FileTask>) -> Respons
         classification: dm_core::Label::Public,
         priority: req.priority.unwrap_or(0),
     };
-    match app.memory.create_task(spec).await {
+    match m.create_task(spec).await {
         Ok(c) => Json(json!({ "task": c.task, "deduplicated": c.deduplicated })).into_response(),
         Err(e) => task_error(&e),
     }
 }
 
 async fn task_tree(State(app): State<App>, Path(id): Path<String>) -> Response {
-    match app.memory.task_tree(&id).await {
+    let m = session!(app);
+    match m.task_tree(&id).await {
         Ok(t) => Json(json!(t)).into_response(),
         Err(e) => task_error(&e),
     }
 }
 
 async fn admit_task(State(app): State<App>, Path(id): Path<String>) -> Response {
-    match app.memory.admit(&id).await {
+    let m = session!(app);
+    match m.admit(&id).await {
         Ok(t) => Json(json!({ "task": t })).into_response(),
         Err(e) => task_error(&e),
     }
@@ -970,7 +1005,8 @@ async fn admit_task(State(app): State<App>, Path(id): Path<String>) -> Response 
 /// The person claims a task, for half an hour at a time; the board's own heartbeat is
 /// the person coming back to complete it.
 async fn claim_task(State(app): State<App>, Path(id): Path<String>) -> Response {
-    match app.memory.claim(&id, time::Duration::minutes(30)).await {
+    let m = session!(app);
+    match m.claim(&id, time::Duration::minutes(30)).await {
         Ok(c) => Json(json!({ "task": c.task })).into_response(),
         Err(e) => task_error(&e),
     }
@@ -989,10 +1025,11 @@ async fn complete_task(
     Path(id): Path<String>,
     Json(h): Json<Handoff>,
 ) -> Response {
+    let m = session!(app);
     if h.handoff.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "a handoff needs a body").into_response();
     }
-    let task = match app.memory.get_task(&id).await {
+    let task = match m.get_task(&id).await {
         Ok(t) => t,
         Err(e) => return task_error(&e),
     };
@@ -1008,8 +1045,7 @@ async fn complete_task(
         )
             .into_response();
     }
-    let written = app
-        .memory
+    let written = m
         .write(dm_server::WriteRequest {
             domain: Some(task.spec.domain.clone()),
             entry_type: dm_core::EntryType::Handoff,
@@ -1022,7 +1058,7 @@ async fn complete_task(
         Ok(w) => w,
         Err(e) => return task_error(&e),
     };
-    match app.memory.complete(&id, &written.id).await {
+    match m.complete(&id, &written.id).await {
         Ok(t) => Json(json!({ "task": t, "handoff": written.id })).into_response(),
         Err(e) => task_error(&e),
     }
@@ -1039,15 +1075,17 @@ async fn invalidate_task(
     Path(id): Path<String>,
     Json(r): Json<Reason>,
 ) -> Response {
+    let m = session!(app);
     let reason = r.reason.unwrap_or_else(|| "closed from the board".into());
-    match app.memory.invalidate(&id, &reason, None).await {
+    match m.invalidate(&id, &reason, None).await {
         Ok(t) => Json(json!({ "task": t })).into_response(),
         Err(e) => task_error(&e),
     }
 }
 
 async fn retry_task(State(app): State<App>, Path(id): Path<String>) -> Response {
-    match app.memory.retry_task(&id).await {
+    let m = session!(app);
+    match m.retry_task(&id).await {
         Ok(t) => Json(json!({ "task": t })).into_response(),
         Err(e) => task_error(&e),
     }
@@ -1111,13 +1149,11 @@ fn admit_bundle_request(
             format!("domain {domain} is not granted"),
         ));
     }
-    if label > app.memory.grants().handling {
+    let handling = app.memory.grants().handling;
+    if label > handling {
         return Err((
             StatusCode::FORBIDDEN,
-            format!(
-                "{label} is above the handling {}",
-                app.memory.grants().handling
-            ),
+            format!("{label} is above the handling {handling}"),
         ));
     }
     Ok(label)
@@ -1152,7 +1188,8 @@ async fn refresh_bundle(
     let (fresh, old) = (sibling(".new"), sibling(".old"));
     let _ = tokio::fs::remove_dir_all(&fresh).await;
     let _ = tokio::fs::remove_dir_all(&old).await;
-    app.memory
+    app.session()
+        .map_err(export_refusal)?
         .export(Some(domain), label, &fresh)
         .await
         .map_err(export_refusal)?;
@@ -1927,6 +1964,233 @@ mod tests {
         // the socket wants a key too
         let (status, _) = as_browser(addr, "not-a-key", "GET", companion::WS_PATH, "").await;
         assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn the_board_leaves_out_a_task_above_the_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("memory");
+        let owner = Memory::init(&root, "human:test:me", "dom-me").unwrap();
+        let mut hidden = String::new();
+        for (title, classification) in [
+            ("Rotate the signing key", dm_core::Label::Restricted),
+            ("Tidy the docs", dm_core::Label::Public),
+        ] {
+            let t = owner
+                .file_own(dm_ledger::TaskSpec {
+                    domain: "dom-me".into(),
+                    title: title.into(),
+                    body: "Do it.".into(),
+                    requirements: vec!["human".into()],
+                    depends_on: vec![],
+                    origin: None,
+                    upstream_event: None,
+                    created_by: String::new(),
+                    classification,
+                    priority: 0,
+                })
+                .await
+                .unwrap()
+                .task;
+            if t.status == dm_ledger::Status::Proposed {
+                owner.admit(&t.id).await.unwrap();
+            }
+            if classification == dm_core::Label::Restricted {
+                hidden = t.id;
+            }
+        }
+        drop(owner);
+        // the board's handling drops to internal, under the restricted task
+        let grants = root.join("grants.toml");
+        let lowered = std::fs::read_to_string(&grants)
+            .unwrap()
+            .replace("handling = \"restricted\"", "handling = \"internal\"");
+        assert!(lowered.contains("handling = \"internal\""));
+        std::fs::write(&grants, lowered).unwrap();
+        let app = router(config(dir.path(), &["true"])).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (_, all) = get_json(addr, "/api/tasks").await;
+        let all = all.to_string();
+        assert!(all.contains("Tidy the docs"), "{all}");
+        assert!(!all.contains("signing key"), "{all}");
+        for path in ["tree", "claim"] {
+            let method = if path == "tree" { "GET" } else { "POST" };
+            let (status, body) =
+                http(addr, method, &format!("/api/tasks/{hidden}/{path}"), None).await;
+            let (missing, _) = http(
+                addr,
+                method,
+                &format!("/api/tasks/task-me-none/{path}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, missing, "{path}: {body}");
+            assert!(!body.contains("signing key"), "{path}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listing_on_the_board_does_not_classify_what_it_files_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let owner = Memory::open(&dir.path().join("memory")).unwrap();
+        let secret = owner
+            .file_own(dm_ledger::TaskSpec {
+                domain: "dom-me".into(),
+                title: "Rotate the signing key".into(),
+                body: "Do it.".into(),
+                requirements: vec![],
+                depends_on: vec![],
+                origin: None,
+                upstream_event: None,
+                created_by: String::new(),
+                classification: dm_core::Label::Restricted,
+                priority: 0,
+            })
+            .await
+            .unwrap()
+            .task;
+        drop(owner);
+        let file = |title: &'static str| async move {
+            let body = format!(r#"{{"title":"{title}"}}"#);
+            let (status, body) = http(addr, "POST", "/api/tasks", Some(&body)).await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str::<Value>(&body).unwrap()["task"]["classification"].clone()
+        };
+        assert_eq!(file("Before the listing").await, "public");
+        let (_, all) = get_json(addr, "/api/tasks").await;
+        assert!(all.to_string().contains(&secret.id), "{all}");
+        assert_eq!(
+            file("After the listing").await,
+            "public",
+            "a listing in one request classified a filing in a later one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_on_the_board_is_joined_to_what_a_later_board_request_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let owner = Memory::open(&dir.path().join("memory")).unwrap();
+        let poison = owner
+            .write(dm_server::WriteRequest {
+                body: "Something.\n".into(),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        let (status, body) = http(addr, "GET", &format!("/api/entry/{poison}"), None).await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) =
+            http(addr, "POST", "/api/tasks", Some(r#"{"title":"Sign off"}"#)).await;
+        assert_eq!(status, 200, "{body}");
+        let id = serde_json::from_str::<Value>(&body).unwrap()["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for step in ["admit", "claim"] {
+            let (status, body) = http(addr, "POST", &format!("/api/tasks/{id}/{step}"), None).await;
+            assert_eq!(status, 200, "{step}: {body}");
+        }
+        let (status, body) = http(
+            addr,
+            "POST",
+            &format!("/api/tasks/{id}/complete"),
+            Some(r#"{"handoff":"Done, after reading."}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let handoff = serde_json::from_str::<Value>(&body).unwrap()["handoff"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let t = owner.taint(&poison);
+        assert_eq!(
+            t.readers.len(),
+            1,
+            "the board reads as one session: {:?}",
+            t.readers
+        );
+        assert_eq!(
+            t.written,
+            vec![handoff],
+            "the handoff the board wrote after reading the entry follows from the read"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_board_answers_while_a_rebuild_holds_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let root = dir.path().join("memory");
+        let owner = Memory::open(&root).unwrap();
+        let id = owner
+            .write(dm_server::WriteRequest {
+                body: "Kept.\n".into(),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        let entry = owner.get(&id).await.unwrap();
+        drop(owner);
+        // a reindex in another process holds the index for writing until it has been
+        // given every entry; the board polls meanwhile
+        let (give, given) = std::sync::mpsc::channel::<()>();
+        let (held, holding) = std::sync::mpsc::channel::<()>();
+        let path = root.join(dm_server::INDEX_FILE);
+        let rebuild = std::thread::spawn(move || {
+            let mut ix = dm_index::Index::open(&path).unwrap();
+            let mut pending = Some(entry);
+            ix.rebuild(std::iter::from_fn(move || {
+                let _ = held.send(());
+                given.recv().ok()?;
+                pending.take()
+            }))
+            .unwrap()
+        });
+        holding.recv().unwrap();
+        let started = std::time::Instant::now();
+        for path in ["/api/tasks", "/api/entries"] {
+            let (status, body) = http(addr, "GET", path, None).await;
+            assert_eq!(status, 200, "{path} while the index is held: {body}");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "the board waited on the index: {:?}",
+            started.elapsed()
+        );
+        give.send(()).unwrap();
+        drop(give);
+        assert_eq!(rebuild.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_board_s_read_scope_is_decided_once_not_once_per_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let log = dir.path().join("memory/state/decisions.jsonl");
+        let lines = || {
+            std::fs::read_to_string(&log)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        let (status, _) = http(addr, "GET", "/api/tasks", None).await;
+        assert_eq!(status, 200);
+        let after_one = lines();
+        for _ in 0..5 {
+            let (status, _) = get_json(addr, "/api/tasks").await;
+            assert_eq!(status, 200);
+        }
+        assert_eq!(
+            lines(),
+            after_one,
+            "a board poll logged a decision; the read scope is decided once for the board"
+        );
     }
 
     #[tokio::test]

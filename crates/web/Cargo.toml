@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "A web terminal on the launcher: sessions in pseudo-terminals, streamed to a browser, with a reading pane over the record"
+# build.rs reads the workspace's Cargo.lock and builds crates/reader, and a package
+# tarball has neither
+publish = false
 
 [dependencies]
 axum = { version = "0.8", features = ["ws", "json", "http1", "tokio", "query"] }
@@ -22,9 +25,16 @@ thiserror.workspace = true
 time = { version = "0.3.55", features = ["formatting", "parsing", "serde-well-known"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time", "fs"] }
 
+# The reader's wasm is bound by the library of the very release `crates/reader` compiles
+# against; build.rs refuses a Cargo.lock where the two differ. Change both pins together.
+[build-dependencies]
+wasm-bindgen-cli-support = "=0.2.129"
+
 [dev-dependencies]
+dm-index = { version = "0.1.0", path = "../index" }
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30"
+wasm-bindgen-cli-support = "=0.2.129"
 
 [lints]
 workspace = true
