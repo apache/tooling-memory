@@ -246,7 +246,10 @@ This implementation has three of the paper's containments:
   superseded, demoted or erased. With `--file`, it files a task for the owner that
   requires `human` and names what changed.
 - The source-change trigger. An entry's `source` can name a file, as `file:<path>` under
-  `--workdir` or as an absolute path. If that file changed after the entry was written,
+  `--workdir`, relative or absolute. A path outside `--workdir`, or a link that
+  leads out of it, names nothing. An absolute path is a path on the host that runs
+  the survey, not inside a confined session. A `--workdir` that is not a directory
+  is an error. If that file changed after the entry was written,
   the survey proposes a verify of the entry.
 
 The survey also uses the paper's retrieval signals, from the read log. The read log now
@@ -472,9 +475,12 @@ Verified is the review gate. Nobody sets it directly. It has two steps:
 2. A person who did not propose it approves it, with `amem approve <task>`. An agent never
    approves. The approval is of the version the proposal named: if the entry changed
    since, `approve` refuses it, and a proposer, any proposer, proposes the entry as it
-   stands. The ledger keeps one approval task per entry; the proposal is the record on
-   the ledger, and a task with no record behind it approves nothing. Only `promote` files
-   a task with a `promote:` origin.
+   stands. The ledger keeps one approval task per entry and version. The task names the
+   version it proposes, and the promotion record on the ledger names the same version. A
+   new proposal closes the open proposal of an older version. A second proposer is
+   refused while an open proposal of the same version stands, and a declined version is
+   not proposed again until the entry changes. Only `promote` files a task with a
+   `promote:` origin.
 
 Each promotion must say why. A promotion without a why is refused. The ledger keeps the
 why beside the entry, not in the entry. `amem promotions <id>` and the `promotions` memory

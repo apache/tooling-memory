@@ -400,6 +400,13 @@ impl Db {
         )
     }
 
+    pub(crate) fn with_origin(&self, domain: &str, origin: &str) -> Result<Vec<Task>, Error> {
+        self.select(
+            "WHERE domain = ?1 AND origin = ?2 ORDER BY created",
+            &[&domain, &origin],
+        )
+    }
+
     pub(crate) fn list(&self, domain: &str, status: Status) -> Result<Vec<Task>, Error> {
         self.select(
             "WHERE domain = ?1 AND status = ?2 ORDER BY priority DESC, created",

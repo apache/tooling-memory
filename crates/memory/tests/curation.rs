@@ -473,6 +473,29 @@ fn the_checker_alone_reports_and_files_and_the_librarian_surveys() {
 }
 
 #[test]
+fn a_working_tree_that_is_not_there_is_an_error_not_a_quiet_survey() {
+    let f = fixture();
+    let gone = f.work.join("no-such-tree");
+    let out = f.run(
+        &[
+            "librarian",
+            "--domain",
+            "dom-me",
+            "--workdir",
+            gone.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        !out.status.success(),
+        "a survey that can check no file source said nothing:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no-such-tree"), "{err}");
+}
+
+#[test]
 fn drift_probes_stay_quiet_on_one_model_and_fire_on_another() {
     let f = fixture();
     let probe = [

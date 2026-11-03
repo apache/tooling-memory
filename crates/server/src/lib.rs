@@ -932,7 +932,8 @@ impl Memory {
     }
 
     /// Write an entry at raw trust, attributed to this session's author, classified at
-    /// least as high as what the session has read.
+    /// least as high as what the session has read. An entry it replaces has its open
+    /// proposals to verify closed, since its successor is what is reviewed now.
     ///
     /// # Errors
     ///
@@ -979,8 +980,12 @@ impl Memory {
         self.gate(&entry).await?;
         self.put_logged(&entry).await?;
         self.index_put(&entry).await?;
-        if entry.front.supersedes.is_some() {
+        if let Some(old) = &entry.front.supersedes {
             self.superseded.fetch_add(1, Ordering::Relaxed);
+            // approve refuses a replaced entry anyway: a ledger another connection holds
+            // leaves the proposal on the board rather than failing a write already made
+            let why = format!("{old} was replaced by {}; propose that one", entry.front.id);
+            let _ = self.close_proposals(&domain, old, &why).await;
         }
         reads::wrote(
             &self.root,
@@ -1037,9 +1042,11 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] for an entry this session cannot read, [`Error::Denied`]
-    /// for an empty why, or when the policy refuses or the entry is already at or
-    /// above the tier.
+    /// [`Error::NotFound`] for an entry this session cannot read; for one it could read
+    /// that is no longer served, [`Error::Moved`] or [`Error::Gone`] as from
+    /// [`Memory::get`]; [`Error::Denied`] for an empty why, when the policy refuses, the
+    /// entry is not live, the entry is already at or above the tier, or a proposal of
+    /// this version is open by another principal or was closed.
     pub async fn promote(&self, id: &str, to: TrustTier, why: &str) -> Result<Promotion, Error> {
         let why = why.trim();
         if why.is_empty() {
@@ -1049,9 +1056,13 @@ impl Memory {
         }
         let f = self.session_filter()?;
         if self.index.lock().await.meta(id, &f)?.is_none() {
-            return Err(Error::NotFound(id.to_string()));
+            return Err(self.not_served(id, None).await);
         }
         let (_, entry) = self.find(id).await?;
+        // the index can lag the record: the record says whether it is live
+        if let Some(status) = entry.front.status {
+            return Err(not_live(id, status));
+        }
         if entry.front.trust_tier >= to {
             return Err(Error::Denied(format!(
                 "{id} is {} already",
@@ -1067,49 +1078,192 @@ impl Memory {
         if !d.allow {
             return Err(Error::Denied(d.reason));
         }
-        // the record first: a promotion the ledger cannot keep is not made, and one whose
-        // new version fails is made again with the record it already has. A proposal to
-        // verified is recorded the same way, and lands when a person approves it
-        self.record_promotion(&entry, to, why).await?;
-        if to != TrustTier::Verified {
-            return self.set_tier(entry, to).await;
+        if to == TrustTier::Verified {
+            return self.propose(entry, why).await;
         }
-        let created = self
-            .file_own(TaskSpec {
+        // the record first: a promotion the ledger cannot keep is not made, and one whose
+        // new version fails is made again with the record it already has
+        let record = self.promotion_spec(&entry, to, why);
+        self.ledger.lock().await.record_promotion(&record).await?;
+        self.set_tier(entry, to).await
+    }
+
+    /// File a proposal to verify the entry as it now stands. The proposal names the
+    /// version, `verified:<digest>`, and the ledger keeps one task for each entry and
+    /// version: a new version is a new proposal, and a proposal of an older one closes as
+    /// stale. The slot is checked before anything is admitted, under the ledger's lock,
+    /// and the proposal is recorded as a promotion only when the slot is free: one
+    /// refused, or one handed its own open task back, records nothing. The record and
+    /// the task name one version, the record's digest, so what [`Memory::approve`] reads
+    /// from the task and what [`Memory::promotions`] shows are the same proposal. The
+    /// record is written before the task, as a direct promotion's is before its version:
+    /// a proposal the ledger cannot keep is not filed, and one whose task fails is filed
+    /// again with the record it already has.
+    async fn propose(&self, entry: Entry, why: &str) -> Result<Promotion, Error> {
+        let id = entry.front.id.clone();
+        let origin = proposal_origin(&id);
+        let record = self.promotion_spec(&entry, TrustTier::Verified, why);
+        let event = verify_event(&record.digest);
+        let spec = self.stamp(
+            TaskSpec {
                 domain: entry.front.domain.clone(),
                 // by id, not title: an erasure of the entry takes its title with it, and
                 // the task then has nothing of the entry to lose but the id a stub keeps
-                title: proposal_title(id),
+                title: proposal_title(&id),
                 body: format!(
                     "`{}` proposes that `{id}`, written by `{}`, be promoted to verified.\n\nRead it with `amem get {id}` and judge it first. Then read why it was proposed, on the ledger: `amem promotions {id}`. Approve with `amem approve <this task>` if it holds; a person who did not propose it approves, and an agent never does. Invalidate this task to decline.",
                     self.author, entry.front.author
                 ),
                 requirements: vec!["human".into()],
                 depends_on: Vec::new(),
-                origin: Some(proposal_origin(id)),
-                upstream_event: Some("verified".into()),
+                origin: Some(origin.clone()),
+                upstream_event: Some(event.clone()),
                 created_by: String::new(),
                 classification: entry.front.classification,
                 priority: 3,
-            })
+            },
+            Filing::Own,
+            None,
+        )?;
+        let domain = spec.domain.clone();
+        let mut l = self.ledger.lock().await;
+        if let Some(task) = l.by_origin(&domain, &origin, &event).await? {
+            return self.slot_taken(task);
+        }
+        l.record_promotion(&record).await?;
+        let created = match l.create(spec).await {
+            Ok(c) => c,
+            // another process filed the same slot between the look and the insert; its
+            // task is what this proposal gets, and the record just written stands for a
+            // proposal that was made and merged
+            Err(e) => match l.by_origin(&domain, &origin, &event).await? {
+                Some(task) => Created {
+                    task,
+                    deduplicated: true,
+                },
+                None => return Err(e.into()),
+            },
+        };
+        if created.deduplicated {
+            return self.slot_taken(created.task);
+        }
+        let task = self
+            .admit_per_policy(&mut l, created.task, Filing::Own, None)
             .await?;
+        for t in l.with_origin(&domain, &origin).await? {
+            if t.id != task.id && !t.status.is_terminal() {
+                l.invalidate(
+                    &t.id,
+                    &format!(
+                        "{id} changed since this proposal; {} proposes it as it stands",
+                        task.id
+                    ),
+                    Some(&task.id),
+                )
+                .await?;
+            }
+        }
         Ok(Promotion::Proposed {
-            task: Box::new(created.task),
+            task: Box::new(task),
         })
     }
 
+    /// What a proposal of a version gets when that version has a task already: its own
+    /// open task back. Another principal's open task is not joined, since
+    /// [`Memory::approve`] knows only who filed it and a proposer never approves its
+    /// own; a closed task, declined or done, is not proposed again until the entry
+    /// changes, and is never handed back as if it had been filed.
+    fn slot_taken(&self, t: Task) -> Result<Promotion, Error> {
+        if t.status.is_terminal() {
+            return Err(Error::Denied(format!(
+                "task {} closed the proposal to verify this version of the entry ({:?}{}); it is not proposed again until the entry changes",
+                t.id,
+                t.status,
+                t.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default()
+            )));
+        }
+        if t.spec.created_by != self.author {
+            return Err(Error::Denied(format!(
+                "`{}` has proposed this version for verified already, in task {}. A second proposal is not filed: a person who did not propose it approves that task with `amem approve {}`",
+                t.spec.created_by, t.id, t.id
+            )));
+        }
+        Ok(Promotion::Proposed { task: Box::new(t) })
+    }
+
     /// Approve a proposal to promote to verified: the person approving did not propose
-    /// it, and the policy says so. The entry is promoted and the proposal task completed
-    /// by the approver, the entry its record.
+    /// it, and the policy says so. The approver takes the proposal task first, so one
+    /// another person holds stays theirs and the tier does not move; then the entry is
+    /// promoted and the task completed, the entry its record. Only a live entry is
+    /// approved: an erased one has nothing left to check, a replaced one is reviewed as
+    /// its successor, and a demoted one was found wanting.
     ///
     /// # Errors
     ///
     /// [`Error::Denied`] for a task that is not a live promotion proposal, an entry
-    /// that changed since it was proposed, or an approval the policy refuses; a ledger
-    /// or store error.
+    /// that is not live or that changed since it was proposed, or an approval the policy
+    /// refuses; a ledger error for a task another holds, or a store error.
     pub async fn approve(&self, task_id: &str) -> Result<Promotion, Error> {
         let task = self.ledger.lock().await.get(task_id).await?;
         self.task_in_grants(&task)?;
+        let (id, entry) = self.proposal_entry(&task).await?;
+        let d = self.decide_promotion(
+            &entry,
+            TrustTier::Verified,
+            "approve",
+            &task.spec.created_by,
+        )?;
+        if !d.allow {
+            return Err(Error::Denied(d.reason));
+        }
+        self.claim_proposal(&task).await?;
+        let entry = self.still_proposed(task_id).await?;
+        let promoted = self.set_tier(entry, TrustTier::Verified).await?;
+        self.ledger
+            .lock()
+            .await
+            .complete(task_id, &self.author, &id)
+            .await?;
+        Ok(promoted)
+    }
+
+    /// Take the proposal task, so no second approver acts on it at the same time.
+    async fn claim_proposal(&self, task: &Task) -> Result<(), Error> {
+        let mut l = self.ledger.lock().await;
+        if task.status == dm_ledger::Status::Proposed {
+            l.admit(&task.id).await?;
+        }
+        l.claim(
+            &task.id,
+            &self.author,
+            Duration::minutes(5),
+            &task.spec.requirements,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The proposed entry as it is now, read after the claim. An erase or a replace may
+    /// have landed while the claim was taken, and the version read before it must not be
+    /// written back; if the proposal no longer holds, the claim is released.
+    async fn still_proposed(&self, task_id: &str) -> Result<Entry, Error> {
+        let held = self.ledger.lock().await.get(task_id).await?;
+        match self.proposal_entry(&held).await {
+            Ok((_, current)) => Ok(current),
+            Err(e) => {
+                let mut l = self.ledger.lock().await;
+                if l.get(task_id).await?.status == dm_ledger::Status::Claimed {
+                    l.release(task_id, &self.author, None).await?;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The entry a proposal task asks to verify, while the task still asks it. A task
+    /// approved already says so, whatever became of the entry since; a closed one with
+    /// an entry no longer live says why the entry is not promoted.
+    async fn proposal_entry(&self, task: &Task) -> Result<(String, Entry), Error> {
         let Some(id) = task
             .spec
             .origin
@@ -1117,68 +1271,48 @@ impl Memory {
             .and_then(|o| o.strip_prefix("promote:"))
         else {
             return Err(Error::Denied(format!(
-                "{task_id} is not a promotion proposal"
+                "{} is not a promotion proposal",
+                task.id
             )));
         };
-        if task.status.is_terminal() {
-            return Err(Error::Denied(format!("{task_id} is {:?}", task.status)));
-        }
-        let (_, entry) = self.find(id).await?;
-        // the proposal is the ledger's record of it, not the task: the task is one per
-        // entry, whoever filed it first, and names no version
-        let proposer = self.standing_proposal(&entry).await?;
-        let d = self.decide_promotion(&entry, TrustTier::Verified, "approve", &proposer)?;
-        if !d.allow {
-            return Err(Error::Denied(d.reason));
-        }
-        let id = id.to_string();
-        let promoted = self.set_tier(entry, TrustTier::Verified).await?;
-        let mut l = self.ledger.lock().await;
-        if task.status == dm_ledger::Status::Proposed {
-            l.admit(task_id).await?;
-        }
-        l.claim(
-            task_id,
-            &self.author,
-            Duration::minutes(5),
-            &task.spec.requirements,
-        )
-        .await?;
-        l.complete(task_id, &self.author, &id).await?;
-        Ok(promoted)
-    }
-
-    /// Who proposed the entry as it stands: the latest record of a proposal to verified,
-    /// by whoever made it, names the entry's current version. An entry rewritten since,
-    /// by the flag an erasure of an entry it cites puts on it or by any other version,
-    /// must be proposed again, or the approver would approve a version the proposal did
-    /// not name; any proposer may do so, since the task is one per entry. An approval
-    /// task with no record behind it, filed by a build from before records were kept or
-    /// by anything but a proposal, is no proposal: the entry must be proposed first.
-    async fn standing_proposal(&self, entry: &Entry) -> Result<String, Error> {
-        let records = self
-            .ledger
-            .lock()
-            .await
-            .promotions(&entry.front.domain, &entry.front.id)
-            .await?;
-        let Some(proposed) = records
-            .iter()
-            .rev()
-            .find(|r| r.spec.tier == TrustTier::Verified)
+        // only promote files a proposal, and it names the version it proposes
+        let Some(version) = task
+            .spec
+            .upstream_event
+            .as_deref()
+            .and_then(|e| e.strip_prefix(VERIFY_PREFIX))
         else {
             return Err(Error::Denied(format!(
-                "{} has no proposal to verified on the ledger: propose it again",
-                entry.front.id
+                "{} is not a proposal to verify a version of {id}",
+                task.id
             )));
         };
-        if proposed.spec.digest != dm_core::digest(&entry.render()) {
+        if task.status == dm_ledger::Status::Completed {
             return Err(Error::Denied(format!(
-                "{} changed since {} proposed it: judge the entry as it stands and propose it again",
-                entry.front.id, proposed.spec.by
+                "{} is Completed: the proposal was approved",
+                task.id
             )));
         }
-        Ok(proposed.spec.by.clone())
+        let (_, entry) = self.find(id).await?;
+        if entry.front.domain != task.spec.domain {
+            return Err(Error::Denied(format!(
+                "{} was filed in {}, and {id} is in {}",
+                task.id, task.spec.domain, entry.front.domain
+            )));
+        }
+        if let Some(status) = entry.front.status {
+            return Err(not_live(id, status));
+        }
+        if task.status.is_terminal() {
+            return Err(Error::Denied(format!("{} is {:?}", task.id, task.status)));
+        }
+        if version != dm_core::digest(&entry.render()) {
+            return Err(Error::Denied(format!(
+                "{id} has changed since {} proposed it; propose it as it stands",
+                task.id
+            )));
+        }
+        Ok((id.to_string(), entry))
     }
 
     /// Why each promotion of an entry was made, oldest first: who moved which version to
@@ -1257,18 +1391,18 @@ impl Memory {
         readable
     }
 
-    /// The record of a promotion made at once, on the ledger and not in the entry: the
-    /// version promoted, by whom, and why, so an auditor finds the reason beside the
-    /// change. Recorded once per promoter and version, so a retry adds nothing, and a
+    /// The record of a promotion, on the ledger and not in the entry: the version
+    /// promoted, by whom, and why, so an auditor finds the reason beside the change. The
+    /// ledger keeps it once per promoter and version, so a retry adds nothing, and a
     /// failed promotion's record never stands in for another promoter's. It carries the
     /// digest of the version it writes as well as the one it promotes. It is classified as
     /// the entry is, or as this session's label if that is higher, since the why is the
     /// session's own text.
-    async fn record_promotion(&self, entry: &Entry, to: TrustTier, why: &str) -> Result<(), Error> {
+    fn promotion_spec(&self, entry: &Entry, to: TrustTier, why: &str) -> dm_ledger::PromotionSpec {
         // the version set_tier will write, so a reader can tell whether it was
         let mut promoted = entry.clone();
         promoted.front.trust_tier = to;
-        let spec = dm_ledger::PromotionSpec {
+        dm_ledger::PromotionSpec {
             domain: entry.front.domain.clone(),
             entry: entry.front.id.clone(),
             tier: to,
@@ -1278,9 +1412,7 @@ impl Memory {
             classification: entry.front.classification.max(self.label()),
             digest: dm_core::digest(&entry.render()),
             new_digest: dm_core::digest(&promoted.render()),
-        };
-        self.ledger.lock().await.record_promotion(&spec).await?;
-        Ok(())
+        }
     }
 
     fn decide_promotion(
@@ -1644,14 +1776,17 @@ impl Memory {
     /// session holds a task and this one asks for nothing more than that one did, and
     /// the domain admits its own; otherwise born proposed.
     ///
+    /// A task with a proposal's origin, `promote:<id>`, is refused: only
+    /// [`Memory::promote`] files one, since [`Memory::approve`] acts on it.
+    ///
     /// # Errors
     ///
     /// An ungranted domain, [`Error::Denied`] for a `promote:` origin, which only
     /// [`Memory::promote`] files, or a ledger or policy error.
     pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
-        // a task from this origin is an approval task, and the ledger keeps one per
-        // entry: one filed here would take the place of a real proposal's, and have
-        // approve ask the policy about the wrong proposer
+        // a task from this origin is an approval task: approve reads its event as the
+        // version proposed and its filer as the proposer, so one filed here would be a
+        // proposal nobody made
         if spec
             .origin
             .as_deref()
@@ -1691,10 +1826,29 @@ impl Memory {
     async fn file_in(
         &self,
         l: &mut Ledger,
-        mut spec: TaskSpec,
+        spec: TaskSpec,
         filing: Filing,
         parent: Option<&Task>,
     ) -> Result<Created, Error> {
+        let spec = self.stamp(spec, filing, parent)?;
+        let created = l.create(spec).await?;
+        let task = self
+            .admit_per_policy(l, created.task, filing, parent)
+            .await?;
+        Ok(Created {
+            task,
+            deduplicated: created.deduplicated,
+        })
+    }
+
+    /// A spec as this session files it: its domain resolved, its author and label, and
+    /// no higher a rank than the task it is filed from.
+    fn stamp(
+        &self,
+        mut spec: TaskSpec,
+        filing: Filing,
+        parent: Option<&Task>,
+    ) -> Result<TaskSpec, Error> {
         spec.domain = self.resolve_domain(
             Some(&spec.domain)
                 .filter(|d| !d.is_empty())
@@ -1707,14 +1861,7 @@ impl Memory {
         if let (Filing::Held, Some(p)) = (filing, parent) {
             spec.priority = spec.priority.min(p.spec.priority);
         }
-        let created = l.create(spec).await?;
-        let task = self
-            .admit_per_policy(l, created.task, filing, parent)
-            .await?;
-        Ok(Created {
-            task,
-            deduplicated: created.deduplicated,
-        })
+        Ok(spec)
     }
 
     /// Admit a proposed task. On a laptop the owner is the triage.
@@ -2242,8 +2389,9 @@ impl Memory {
     /// keeping the first run's reason. Entries that cite the erased one are flagged for
     /// review today rather than re-derived here. The why of each promotion of the entry
     /// leaves the ledger, its log and its projection alike, and the receipt counts them;
-    /// who promoted which version to which tier, and when, stays. Exports already handed
-    /// out, the
+    /// who promoted which version to which tier, and when, stays. Its approval tasks
+    /// keep nothing of it but its id, and an open one is invalidated: nothing is left to
+    /// approve. Exports already handed out, the
     /// transcripts of sessions that read the entry, and the queries in the read log are
     /// beyond reach and the receipt says so.
     ///
@@ -2317,7 +2465,8 @@ impl Memory {
     }
 
     /// The steps of an erasure after the record's: the citing entries, the index, the
-    /// served bundles, every render and the ledger's whys; then the receipt, closed.
+    /// served bundles, every render, and the ledger's whys and approval tasks; then the
+    /// receipt, closed.
     async fn finish_erasure(
         &self,
         domain: &str,
@@ -2343,8 +2492,10 @@ impl Memory {
         let missed = self.erase_from_projections(domain, id);
         // the whys of its promotions are the entry's text too, and so is what its
         // approval tasks say of it; who promoted what stays, and so does each task's id.
-        // Last of the steps, since a ledger another connection holds stops here: the
-        // index and the renders are clean by then, and the receipt stays unfinished
+        // The scrub closes every open proposal to verify the entry, of any version, as
+        // it rewrites it. Last of the steps, since a ledger another connection holds
+        // stops here: the index and the renders are clean by then, and the receipt stays
+        // unfinished
         let scrubbed = self
             .ledger
             .lock()
@@ -2372,6 +2523,20 @@ impl Memory {
             }
         }
         Ok(None)
+    }
+
+    /// Invalidate every open proposal to verify an entry that was replaced, of any
+    /// version, so the board stops offering them. A proposal already closed is left as it
+    /// is. An erasure closes its proposals through the scrub instead, which rewrites them
+    /// too.
+    async fn close_proposals(&self, domain: &str, id: &str, why: &str) -> Result<(), Error> {
+        let mut l = self.ledger.lock().await;
+        for t in l.with_origin(domain, &format!("promote:{id}")).await? {
+            if !t.status.is_terminal() {
+                l.invalidate(&t.id, why, None).await?;
+            }
+        }
+        Ok(())
     }
 
     /// An entry by id across the granted domains, from the record, whatever its status.
@@ -2409,6 +2574,26 @@ fn proposal_redaction(id: &str) -> dm_ledger::Redaction {
         ),
         reason: format!("{id} was erased"),
     }
+}
+
+/// What the upstream event of a proposal to verify starts with; the digest of the
+/// version proposed follows. Filed with origin `promote:<id>`.
+const VERIFY_PREFIX: &str = "verified:";
+
+/// The upstream event of a proposal to verify the version of an entry with `digest`.
+fn verify_event(digest: &str) -> String {
+    format!("{VERIFY_PREFIX}{digest}")
+}
+
+/// Why an entry that is not live is not promoted.
+fn not_live(id: &str, status: Status) -> Error {
+    Error::Denied(match status {
+        Status::Erased => format!("{id} is erased; nothing is left to verify"),
+        Status::Superseded => {
+            format!("{id} was replaced; review and promote its current version instead")
+        }
+        Status::Demoted => format!("{id} was demoted by curation and is not promoted"),
+    })
 }
 
 /// What an erasure here cannot reach, named on every receipt so nobody believes it did.
@@ -3495,9 +3680,10 @@ mod tests {
         }
     }
 
-    /// A second proposer's proposal of the entry as it stands unblocks the approval that
-    /// the first proposer's, of an older version, left refused: the ledger keeps one
-    /// approval task per entry, and the proposal is the record, not the task.
+    /// A second proposer's proposal of the entry as it stands is a new task, approved in
+    /// place of the first proposer's, which named an older version and is closed as
+    /// stale: the ledger keeps one approval task per entry and version, and each
+    /// proposal is a record of its own.
     #[tokio::test]
     async fn any_proposer_s_standing_proposal_unblocks_the_approval() {
         let dir = tempfile::tempdir().unwrap();
@@ -3530,8 +3716,10 @@ mod tests {
         else {
             panic!("verified is proposed")
         };
-        assert_eq!(again.id, task.id, "one approval task per entry");
-        owner.approve(&task.id).await.unwrap();
+        assert_ne!(again.id, task.id, "a new version is a new proposal");
+        let stale = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(stale.status, Status::Invalidated, "the first is stale");
+        owner.approve(&again.id).await.unwrap();
         assert_eq!(
             owner.get(&x).await.unwrap().front.trust_tier,
             TrustTier::Verified
@@ -3552,9 +3740,10 @@ mod tests {
         );
     }
 
-    /// An approval task with no proposal behind it on the ledger, filed by a build from
-    /// before records were kept or by anything but a proposal, approves nothing: the
-    /// entry is proposed first. And nothing but `promote` files one.
+    /// An approval task with no proposal behind it, filed by a build from before the
+    /// event named the version or by anything but a proposal, approves nothing: the
+    /// entry is proposed first, and the proposal is a task of its own that closes the
+    /// old one. And nothing but `promote` files one.
     #[tokio::test]
     async fn an_approval_task_without_a_proposal_record_approves_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -3581,14 +3770,15 @@ mod tests {
         let filed = librarian(dir.path()).file_own(squat).await.unwrap().task;
         let refused = owner.approve(&filed.id).await;
         assert!(
-            matches!(&refused, Err(Error::Denied(why)) if why.contains("propose it again")),
+            matches!(&refused, Err(Error::Denied(why)) if why.contains("not a proposal to verify a version")),
             "{refused:?}"
         );
         assert_eq!(
             owner.get(&x).await.unwrap().front.trust_tier,
             TrustTier::Raw
         );
-        // a real proposal dedups into that task, and then it approves the proposed version
+        assert!(owner.promotions(&x).await.unwrap().is_empty(), "no record");
+        // a real proposal is a task of its own, closes the old one, and is approved
         let Promotion::Proposed { task } = librarian(dir.path())
             .promote(&x, TrustTier::Verified, WHY)
             .await
@@ -3596,7 +3786,9 @@ mod tests {
         else {
             panic!("verified is proposed")
         };
-        assert_eq!(task.id, filed.id);
+        assert_ne!(task.id, filed.id);
+        let old = owner.ledger.lock().await.get(&filed.id).await.unwrap();
+        assert_eq!(old.status, Status::Invalidated);
         owner.approve(&task.id).await.unwrap();
         assert_eq!(
             owner.get(&x).await.unwrap().front.trust_tier,
@@ -3618,13 +3810,15 @@ mod tests {
             .await
             .unwrap()
             .id;
-        librarian(dir.path())
+        let Promotion::Proposed { task } = librarian(dir.path())
             .promote(&x, TrustTier::Verified, "checked it on the vault")
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
         // the steps of approve, by hand, with the erasure between them
-        let (_, entry) = owner.find(&x).await.unwrap();
-        owner.standing_proposal(&entry).await.unwrap();
+        let (_, entry) = owner.proposal_entry(&task).await.unwrap();
         owner.erase(&x, Reason::Requested).await.unwrap();
         let refused = owner.set_tier(entry, TrustTier::Verified).await;
         assert!(
@@ -3737,6 +3931,164 @@ mod tests {
         assert_eq!(approved.len(), 1);
         assert!(approved[0].landed, "the approval lands it");
         no_task_holds(&owner, why).await;
+    }
+
+    /// A proposal refused, because another's open proposal of the version stands or a
+    /// closed one declined it, and a proposal handed its own open task back, record no
+    /// promotion: the record is written only when a task is filed.
+    #[tokio::test]
+    async fn a_refused_or_merged_proposal_records_no_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let x = owner.write(req("A fact.\n")).await.unwrap().id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&x, TrustTier::Verified, WHY)
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_eq!(recorded(&owner, &x).await, 1);
+        let bob = Memory::open(dir.path())
+            .unwrap()
+            .with_author("human:test:bob");
+        let refused = bob.promote(&x, TrustTier::Verified, "me too").await;
+        assert!(matches!(refused, Err(Error::Denied(_))), "{refused:?}");
+        assert_eq!(
+            recorded(&owner, &x).await,
+            1,
+            "bob's refused proposal was recorded"
+        );
+        // the librarian asking again gets its own task back, and no second record
+        let Promotion::Proposed { task: again } = librarian(dir.path())
+            .promote(&x, TrustTier::Verified, "still holds")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_eq!(again.id, task.id);
+        assert_eq!(recorded(&owner, &x).await, 1);
+        // declined: a third proposer of the same version is refused, and not recorded
+        owner
+            .invalidate(&task.id, "does not hold", None)
+            .await
+            .unwrap();
+        let checker = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:checker");
+        let refused = checker
+            .promote(&x, TrustTier::Verified, "I say it holds")
+            .await;
+        assert!(matches!(refused, Err(Error::Denied(_))), "{refused:?}");
+        assert_eq!(
+            recorded(&owner, &x).await,
+            1,
+            "the checker's refused proposal was recorded"
+        );
+    }
+
+    /// How many promotions of `id` the ledger records.
+    async fn recorded(m: &Memory, id: &str) -> usize {
+        m.promotions(id).await.unwrap().len()
+    }
+
+    /// The task of a proposal and its record name the same version: the event
+    /// `verified:<digest>` that `approve` reads carries the digest the record carries, so
+    /// what `approve` checks and what `amem promotions` shows are one proposal.
+    #[tokio::test]
+    async fn a_proposal_s_task_names_the_version_its_record_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let x = owner.write(req("A fact.\n")).await.unwrap().id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&x, TrustTier::Verified, WHY)
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        let records = owner.promotions(&x).await.unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0].record.spec;
+        assert_eq!(
+            task.spec.upstream_event.as_deref(),
+            Some(format!("verified:{}", record.digest).as_str()),
+            "the task names the version the record names"
+        );
+        assert_eq!(
+            record.digest,
+            dm_core::digest(&owner.get(&x).await.unwrap().render()),
+            "and that is the entry as it stands"
+        );
+        owner.approve(&task.id).await.unwrap();
+        let verified = owner.get(&x).await.unwrap();
+        assert_eq!(verified.front.trust_tier, TrustTier::Verified);
+        let landed = owner.promotions(&x).await.unwrap();
+        assert_eq!(
+            landed[0].record.spec.new_digest,
+            dm_core::digest(&verified.render()),
+            "the record names the version the approval wrote"
+        );
+        assert!(landed[0].landed);
+    }
+
+    /// The ledger's steps of an erasure, closing the proposal and taking its why and the
+    /// task's text, run after the index and before the receipt closes: a ledger another
+    /// connection holds leaves the receipt owed with the proposal still open, and the
+    /// next run closes both.
+    #[tokio::test]
+    async fn an_erasure_closes_the_proposal_and_takes_its_why_before_the_receipt_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(
+                &secret,
+                TrustTier::Verified,
+                &format!("tried {marker} on the vault"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        let holder = rusqlite::Connection::open(dir.path().join(LEDGER_FILE)).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let held = owner.erase(&secret, Reason::Requested).await;
+        assert!(matches!(held, Err(Error::Ledger(_))), "{held:?}");
+        holder.execute_batch("ROLLBACK").unwrap();
+        drop(holder);
+        let open = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert!(
+            !open.status.is_terminal(),
+            "the held ledger took the proposal: {open:?}"
+        );
+        assert!(
+            !owner.receipt(&secret).await.unwrap().unwrap().is_finished(),
+            "the receipt closed with the proposal open"
+        );
+        assert!(
+            owner
+                .search("vault opens", None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the text is still in search"
+        );
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
+        assert_eq!(receipt.promotion_whys_removed, 1);
+        assert_eq!(receipt.promotion_tasks_cleared, 1);
+        let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
+        the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
+        no_task_holds(&owner, marker).await;
     }
 
     #[tokio::test]
@@ -4449,6 +4801,428 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("verified"), "{err}");
+    }
+
+    /// An entry written by the owner and proposed for verified by the librarian: the
+    /// entry's id and the proposal task.
+    async fn proposed(dir: &Path, owner: &Memory, body: &str) -> (String, Task) {
+        let id = owner.write(req(body)).await.unwrap().id;
+        let librarian = Memory::open(dir).unwrap().with_author("agent:librarian");
+        let Promotion::Proposed { task } = librarian
+            .promote(&id, TrustTier::Verified, "checked against the tree")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed, not set")
+        };
+        (id, *task)
+    }
+
+    #[tokio::test]
+    async fn an_erased_entry_is_not_approved_and_its_stub_keeps_its_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact, then erased.\n").await;
+        owner.erase(&id, Reason::Mistaken).await.unwrap();
+        let err = owner.approve(&task.id).await.unwrap_err();
+        assert!(err.to_string().contains("erased"), "{err}");
+        let (_, stub) = owner.find(&id).await.unwrap();
+        assert_eq!(stub.front.status, Some(dm_core::Status::Erased));
+        assert_eq!(stub.front.trust_tier, TrustTier::Raw);
+        let err = owner
+            .promote(&id, TrustTier::Verified, "again")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("erased"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_erasure_closes_the_open_proposal_to_verify_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact, then erased.\n").await;
+        let (kept, _) = proposed(dir.path(), &owner, "A fact that stays.\n").await;
+        owner.erase(&id, Reason::Mistaken).await.unwrap();
+        let open = gate_tasks(&owner, &format!("promote:{id}")).await;
+        assert!(open.is_empty(), "the board offers {open:?}");
+        let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
+        assert_eq!(
+            gate_tasks(&owner, &format!("promote:{kept}")).await.len(),
+            1,
+            "another entry's proposal stays open"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_or_demoted_entry_is_not_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (old, replaced) = proposed(dir.path(), &owner, "Retries three times.\n").await;
+        owner
+            .write(WriteRequest {
+                supersedes: Some(old.clone()),
+                ..req("Retries five times.\n")
+            })
+            .await
+            .unwrap();
+        let err = owner.approve(&replaced.id).await.unwrap_err();
+        assert!(err.to_string().contains("replaced"), "{err}");
+        let (demoted, task) = proposed(dir.path(), &owner, "Found wanting.\n").await;
+        // the record's own demotion: the index still lists the entry as live
+        owner.store.demote("dom-me", &demoted).await.unwrap();
+        let err = owner.approve(&task.id).await.unwrap_err();
+        assert!(err.to_string().contains("demoted"), "{err}");
+        let err = owner
+            .promote(&demoted, TrustTier::Verified, "again")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("demoted"), "{err}");
+        for id in [&old, &demoted] {
+            let (_, e) = owner.find(id).await.unwrap();
+            assert_eq!(e.front.trust_tier, TrustTier::Raw, "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_proposer_approves_a_proposal_its_own_was_merged_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact worth verifying.\n").await;
+        let bob = Memory::open(dir.path())
+            .unwrap()
+            .with_author("human:test:bob");
+        // a proposal bob made, in whatever task it landed, is not bob's to approve; a
+        // proposal refused is not one bob made
+        match bob
+            .promote(&id, TrustTier::Verified, "I checked it too")
+            .await
+        {
+            Ok(Promotion::Proposed { task: landed }) => {
+                assert!(
+                    bob.approve(&landed.id).await.is_err(),
+                    "bob proposed {}, and approved it",
+                    landed.id
+                );
+            }
+            Ok(other) => panic!("verified is proposed, not set: {other:?}"),
+            Err(e) => assert!(e.to_string().contains(&task.id), "{e}"),
+        }
+        // the librarian asking again is the same proposal
+        let librarian = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:librarian");
+        let Promotion::Proposed { task: again } = librarian
+            .promote(&id, TrustTier::Verified, "still holds")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        assert_eq!(again.id, task.id);
+        // and a person who proposed nothing approves it
+        let alice = Memory::open(dir.path())
+            .unwrap()
+            .with_author("human:test:alice");
+        let r = alice.approve(&task.id).await.unwrap();
+        assert!(matches!(
+            r,
+            Promotion::Promoted {
+                tier: TrustTier::Verified,
+                ..
+            }
+        ));
+        assert_eq!(
+            owner.find(&id).await.unwrap().1.front.trust_tier,
+            TrustTier::Verified
+        );
+    }
+
+    #[tokio::test]
+    async fn an_erasure_the_ledger_stops_has_already_taken_the_text_out_of_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "The vault opens with a brass key.\n").await;
+        let found = |hits: Vec<Hit>| hits.iter().any(|h| h.id == id);
+        assert!(found(owner.search("brass key", None, 10).await.unwrap()));
+        // another connection holds the ledger's write lock
+        let holder = rusqlite::Connection::open(dir.path().join(LEDGER_FILE)).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let first = owner.erase(&id, Reason::Sensitive).await;
+        assert!(matches!(first, Err(Error::Ledger(_))), "{first:?}");
+        assert!(
+            !found(owner.search("brass key", None, 10).await.unwrap()),
+            "the erased text is still searchable"
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
+        drop(holder);
+        let again = owner.erase(&id, Reason::Sensitive).await.unwrap();
+        assert!(again.is_finished(), "{again:?}");
+        let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
+    }
+
+    #[tokio::test]
+    async fn an_approval_does_not_take_a_proposal_another_person_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact under review.\n").await;
+        owner
+            .ledger
+            .lock()
+            .await
+            .claim(
+                &task.id,
+                "human:test:alice",
+                Duration::minutes(5),
+                &task.spec.requirements,
+            )
+            .await
+            .unwrap();
+        assert!(owner.approve(&task.id).await.is_err());
+        assert_eq!(
+            owner.find(&id).await.unwrap().1.front.trust_tier,
+            TrustTier::Raw,
+            "the tier moved, and then the claim failed"
+        );
+        let held = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(held.status, Status::Claimed);
+        assert_eq!(held.holder.as_deref(), Some("human:test:alice"));
+    }
+
+    #[tokio::test]
+    async fn an_approved_proposal_says_so_whatever_became_of_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact approved, then erased.\n").await;
+        owner.approve(&task.id).await.unwrap();
+        owner.erase(&id, Reason::Mistaken).await.unwrap();
+        let err = owner.approve(&task.id).await.unwrap_err();
+        assert!(err.to_string().contains("Completed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_declined_proposal_is_not_proposed_again_until_the_entry_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, task) = proposed(dir.path(), &owner, "A fact once declined.\n").await;
+        owner
+            .invalidate(&task.id, "does not hold", None)
+            .await
+            .unwrap();
+        let librarian = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:librarian");
+        for who in [&librarian, &owner] {
+            match who.promote(&id, TrustTier::Verified, "again").await {
+                Ok(Promotion::Proposed { task: t }) => assert!(
+                    !t.status.is_terminal(),
+                    "{} is {:?}: nothing was filed",
+                    t.id,
+                    t.status
+                ),
+                Ok(other) => panic!("verified is proposed, not set: {other:?}"),
+                Err(e) => assert!(e.to_string().contains(&task.id), "{e}"),
+            }
+        }
+        // a new version of the entry is a new proposal
+        owner
+            .promote(&id, TrustTier::Curated, "read it")
+            .await
+            .unwrap();
+        let Promotion::Proposed { task: fresh } = librarian
+            .promote(&id, TrustTier::Verified, "holds")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        assert_ne!(fresh.id, task.id);
+        assert!(!fresh.status.is_terminal(), "{:?}", fresh.status);
+    }
+
+    #[tokio::test]
+    async fn a_stale_proposal_neither_blocks_a_new_one_nor_is_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (id, stale) = proposed(dir.path(), &owner, "A fact that moves on.\n").await;
+        owner
+            .promote(&id, TrustTier::Curated, "read it")
+            .await
+            .unwrap();
+        let alice = Memory::open(dir.path())
+            .unwrap()
+            .with_author("human:test:alice");
+        let err = alice.approve(&stale.id).await.unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert_eq!(
+            owner.find(&id).await.unwrap().1.front.trust_tier,
+            TrustTier::Curated
+        );
+        let bob = Memory::open(dir.path())
+            .unwrap()
+            .with_author("human:test:bob");
+        let Promotion::Proposed { task: current } = bob
+            .promote(&id, TrustTier::Verified, "holds as curated")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        assert_ne!(current.id, stale.id);
+        let closed = owner.ledger.lock().await.get(&stale.id).await.unwrap();
+        assert_eq!(closed.status, dm_ledger::Status::Invalidated);
+        assert_eq!(closed.superseded_by.as_deref(), Some(current.id.as_str()));
+        alice.approve(&current.id).await.unwrap();
+        assert_eq!(
+            owner.find(&id).await.unwrap().1.front.trust_tier,
+            TrustTier::Verified
+        );
+    }
+
+    #[tokio::test]
+    async fn only_promote_files_a_proposal_to_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner
+            .write(req("A fact a tap wants verified.\n"))
+            .await
+            .unwrap()
+            .id;
+        let forged = owner
+            .create_task(TaskSpec {
+                domain: "dom-me".into(),
+                title: "Approve".into(),
+                body: String::new(),
+                requirements: vec!["human".into()],
+                depends_on: Vec::new(),
+                origin: Some(format!("promote:{id}")),
+                upstream_event: Some("verified".into()),
+                created_by: String::new(),
+                classification: Label::Internal,
+                priority: 3,
+            })
+            .await;
+        assert!(forged.is_err(), "{forged:?}");
+    }
+
+    /// A task with a proposal's origin, filed straight into the ledger as a forged or
+    /// an old one would be.
+    fn proposal_spec(id: &str, domain: &str, event: &str) -> TaskSpec {
+        TaskSpec {
+            domain: domain.into(),
+            title: "Approve".into(),
+            body: String::new(),
+            requirements: vec!["human".into()],
+            depends_on: Vec::new(),
+            origin: Some(format!("promote:{id}")),
+            upstream_event: Some(event.into()),
+            created_by: "tap:issues".into(),
+            classification: Label::Internal,
+            priority: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn approve_takes_only_a_proposal_to_verify_a_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner.write(req("A fact.\n")).await.unwrap().id;
+        let t = owner
+            .ledger
+            .lock()
+            .await
+            .create(proposal_spec(&id, "dom-me", "labeled"))
+            .await
+            .unwrap()
+            .task;
+        let err = owner.approve(&t.id).await.unwrap_err();
+        assert!(err.to_string().contains("not a proposal"), "{err}");
+        assert_eq!(
+            owner.find(&id).await.unwrap().1.front.trust_tier,
+            TrustTier::Raw
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_takes_only_a_proposal_filed_in_the_entrys_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        mem(dir.path());
+        grant_domain(dir.path(), "dom-b");
+        let owner = Memory::open(dir.path()).unwrap();
+        let id = owner
+            .write(WriteRequest {
+                domain: Some("dom-me".into()),
+                ..req("A fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let (_, entry) = owner.find(&id).await.unwrap();
+        let event = format!("verified:{}", dm_core::digest(&entry.render()));
+        let t = owner
+            .ledger
+            .lock()
+            .await
+            .create(proposal_spec(&id, "dom-b", &event))
+            .await
+            .unwrap()
+            .task;
+        let err = owner.approve(&t.id).await.unwrap_err();
+        assert!(err.to_string().contains("dom-b"), "{err}");
+        assert_eq!(
+            owner.find(&id).await.unwrap().1.front.trust_tier,
+            TrustTier::Raw
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_proposal_leaves_the_open_one_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        mem(dir.path());
+        let grants = dir.path().join(GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(
+            &grants,
+            text.replace("admit_own = true", "admit_own = false"),
+        )
+        .unwrap();
+        let owner = Memory::open(dir.path()).unwrap();
+        let (id, task) = proposed(dir.path(), &owner, "A fact for the owner to admit.\n").await;
+        assert_eq!(task.status, Status::Proposed);
+        // the domain admits its own filings from now on: bob's would be admitted
+        std::fs::write(&grants, text).unwrap();
+        let bob = Memory::open(dir.path())
+            .unwrap()
+            .with_author("human:test:bob");
+        assert!(bob
+            .promote(&id, TrustTier::Verified, "me too")
+            .await
+            .is_err());
+        let after = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(after.status, Status::Proposed, "bob's refusal admitted it");
+    }
+
+    #[tokio::test]
+    async fn replacing_an_entry_closes_the_proposal_to_verify_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (old, task) = proposed(dir.path(), &owner, "Retries three times.\n").await;
+        let new = owner
+            .write(WriteRequest {
+                supersedes: Some(old.clone()),
+                ..req("Retries five times.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
+        assert!(
+            closed.reason.as_deref().is_some_and(|r| r.contains(&new)),
+            "{:?}",
+            closed.reason
+        );
     }
 
     #[tokio::test]
