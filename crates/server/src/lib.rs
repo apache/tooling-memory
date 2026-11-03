@@ -1188,6 +1188,19 @@ impl Memory {
             )
             .await?;
         }
+        // an erase or a replace may have landed while the claim was taken: write only the
+        // version that is live now, so an erased or replaced text is not written back
+        let held = self.ledger.lock().await.get(task_id).await?;
+        let entry = match self.proposal_entry(&held).await {
+            Ok((_, current)) => current,
+            Err(e) => {
+                let mut l = self.ledger.lock().await;
+                if l.get(task_id).await?.status == dm_ledger::Status::Claimed {
+                    l.release(task_id, &self.author, None).await?;
+                }
+                return Err(e);
+            }
+        };
         let promoted = self.set_tier(entry, TrustTier::Verified).await?;
         self.ledger
             .lock()
@@ -3318,6 +3331,9 @@ mod tests {
             panic!("proposed")
         };
         assert_ne!(current.id, stale.id);
+        let closed = owner.ledger.lock().await.get(&stale.id).await.unwrap();
+        assert_eq!(closed.status, dm_ledger::Status::Invalidated);
+        assert_eq!(closed.superseded_by.as_deref(), Some(current.id.as_str()));
         alice.approve(&current.id).await.unwrap();
         assert_eq!(
             owner.find(&id).await.unwrap().1.front.trust_tier,
