@@ -5004,6 +5004,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_rescore_report_counts_only_completed_work_the_session_may_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let survey = TaskSpec {
+            origin: Some("librarian:stale".into()),
+            upstream_event: Some("ev-1".into()),
+            ..spec("Survey")
+        };
+        for s in [survey, restricted("Rotate the signing key")] {
+            let t = owner.file_own(s).await.unwrap().task;
+            if t.status == Status::Proposed {
+                owner.admit(&t.id).await.unwrap();
+            }
+            owner.claim(&t.id, Duration::minutes(5)).await.unwrap();
+            let h = owner
+                .write(WriteRequest {
+                    entry_type: EntryType::Handoff,
+                    body: "Done.\n".into(),
+                    ..WriteRequest::default()
+                })
+                .await
+                .unwrap();
+            owner.complete(&t.id, &h.id).await.unwrap();
+        }
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let r = capped.rescore(None).await.unwrap();
+        // the one completed task it may see is curation; the restricted one is not counted
+        assert!(
+            (r.maintenance_share - 1.0).abs() < f64::EPSILON,
+            "{}",
+            r.maintenance_share
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidating_a_task_raises_the_label_to_its_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let t = owner
+            .file_own(TaskSpec {
+                classification: Label::Internal,
+                ..spec("Close me")
+            })
+            .await
+            .unwrap()
+            .task;
+        let fresh = Memory::open(dir.path()).unwrap();
+        assert_eq!(fresh.label(), Label::Public);
+        fresh.invalidate(&t.id, "obsolete", None).await.unwrap();
+        assert_eq!(fresh.label(), Label::Internal);
+    }
+
+    #[tokio::test]
     async fn an_invalidation_that_would_close_hidden_work_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (root, cont, child) = hidden_continuation(&mem(dir.path())).await;

@@ -141,16 +141,25 @@ fn propagate(open: &[Task], claimed: &[Task], rubric: &Rubric, ranks: &mut Ranks
     }
 }
 
-/// Curation's floor: when its share of the completed work is under the floor, the best
-/// curation task waiting goes to the head of the queue. Returns the share.
-fn apply_floor(open: &[Task], completed: &[Task], rubric: &Rubric, ranks: &mut Ranks) -> f64 {
-    if completed.is_empty() {
-        return 1.0;
-    }
+/// The share of completed work that is curation; with nothing completed, all of it is.
+fn maintenance_share<'a>(completed: impl Iterator<Item = &'a Task>) -> f64 {
+    let (curation, all) = completed.fold((0_usize, 0_usize), |(c, n), t| {
+        (c + usize::from(maintenance(t)), n + 1)
+    });
     #[allow(clippy::cast_precision_loss)] // counts of tasks
-    let share = completed.iter().filter(|t| maintenance(t)).count() as f64 / completed.len() as f64;
+    if all == 0 {
+        1.0
+    } else {
+        curation as f64 / all as f64
+    }
+}
+
+/// Curation's floor: when its share of the completed work is under the floor, the best
+/// curation task waiting goes to the head of the queue.
+fn apply_floor(open: &[Task], completed: &[Task], rubric: &Rubric, ranks: &mut Ranks) {
+    let share = maintenance_share(completed.iter());
     if share >= rubric.maintenance_floor {
-        return share;
+        return;
     }
     let rank_of = |t: &Task, ranks: &Ranks| ranks.get(&t.id).map_or(t.spec.priority, |r| r.rank);
     let top_delivery = open
@@ -184,7 +193,6 @@ fn apply_floor(open: &[Task], completed: &[Task], rubric: &Rubric, ranks: &mut R
             );
         }
     }
-    share
 }
 
 /// Filings held back for requirements their filer does not hold, per creator, from the
@@ -259,7 +267,7 @@ impl Memory {
             );
         }
         propagate(&open, &claimed, &rubric, &mut ranks);
-        let share = apply_floor(&open, &completed, &rubric, &mut ranks);
+        apply_floor(&open, &completed, &rubric, &mut ranks);
         let mut changed = Vec::new();
         for t in &open {
             let Some(r) = ranks.get(&t.id).filter(|r| r.rank != t.spec.priority) else {
@@ -307,7 +315,10 @@ impl Memory {
             domain,
             rubric: from,
             changed,
-            maintenance_share: share,
+            // the floor weighs all completed work; the report counts only what it may see
+            maintenance_share: maintenance_share(
+                completed.iter().filter(|t| self.sees(t, handling)),
+            ),
             floor: rubric.maintenance_floor,
         })
     }
