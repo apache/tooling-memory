@@ -23,6 +23,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io
 workspace = true
 
 [dev-dependencies]
+# the record's operator with a hook on each read, to change an entry between two reads
+opendal = { version = "0.59.3", default-features = false, features = ["services-fs", "layers-logging"] }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 # a paused clock, for asserting a timeout exactly rather than by a margin

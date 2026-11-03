@@ -1583,12 +1583,11 @@ mod tests {
         );
         clock_zero(dir.path());
         let m = Memory::open(dir.path()).unwrap();
-        // a minute on, not now: a host clock that steps back (WSL2 does when it resyncs)
-        // would otherwise leave the transcript unexpired and nothing swept
-        let swept = m
-            .sweep_transcripts(OffsetDateTime::now_utc() + Duration::minutes(1))
-            .await
-            .unwrap();
+        // at the instant it was kept, not the host's clock, which steps back (WSL2 does
+        // when it resyncs); it sweeps only because the domain's 0 days overrides the 30
+        // the transcript was kept for
+        let kept_at = m.transcripts().await.unwrap()[0].kept_at;
+        let swept = m.sweep_transcripts(kept_at).await.unwrap();
         (dir, m, k.session, a, b, swept)
     }
 
@@ -1782,9 +1781,9 @@ mod tests {
         let k = m.keep_transcript(keep("a.jsonl")).await.unwrap();
         let a = citing(&m, &k.session, &[2], "Handoff A.\n").await;
         let b = citing(&m, &k.session, &[2], "Handoff B.\n").await;
-        m.sweep_transcripts(OffsetDateTime::now_utc())
-            .await
-            .unwrap();
+        // at the instant it expires, not the host's clock, which steps back (WSL2 does
+        // when it resyncs) and would leave it unexpired
+        m.sweep_transcripts(k.retain_until).await.unwrap();
         let receipt = m.erase(&a, Reason::Mistaken).await.unwrap();
         assert!(
             receipt

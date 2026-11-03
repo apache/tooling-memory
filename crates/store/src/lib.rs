@@ -302,12 +302,31 @@ impl Store {
     ///
     /// A bad name, a backend error, or text in the record that is not an entry.
     pub async fn get(&self, domain: &str, id: &str) -> Result<Option<Entry>, Error> {
+        Ok(self
+            .get_with_text(domain, id)
+            .await?
+            .map(|(entry, _)| entry))
+    }
+
+    /// The current version of an entry, parsed, with the text it was parsed from: one
+    /// read, so the two are the same version even while a write lands. `None` when there
+    /// is none.
+    ///
+    /// # Errors
+    ///
+    /// A bad name, a backend error, or text in the record that is not an entry.
+    pub async fn get_with_text(
+        &self,
+        domain: &str,
+        id: &str,
+    ) -> Result<Option<(Entry, String)>, Error> {
         let path = current_path(domain, id)?;
         match self.read_text(&path).await? {
             None => Ok(None),
-            Some(text) => Entry::parse(&text)
-                .map(Some)
-                .map_err(|source| Error::Entry { path, source }),
+            Some(text) => match Entry::parse(&text) {
+                Ok(entry) => Ok(Some((entry, text))),
+                Err(source) => Err(Error::Entry { path, source }),
+            },
         }
     }
 

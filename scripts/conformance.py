@@ -666,17 +666,35 @@ class Run:
             t2 = task_of(s.call("create_task", title=f"Left behind {self.only}", body="Claimed, then abandoned.", domain=d), "create_task")
             tid2 = t2["id"]
             s.call("admit_task", id=tid2)
-            t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease)
+            got = s.call("claim_next", domain=d, lease_seconds=lease)
+            t = self.claimed(got, "claim_next", lease)
+            first = when(str(got.get("lease_until", "")))
             self.check(t.get("id") == tid2, "the second task was not claimed")
-            print(f"   holding the lease across {lease}s with one heartbeat, then letting it lapse")
+            print(f"   holding the lease past {lease}s with one heartbeat, then letting it lapse")
+            # the heartbeat renews for three leases, so each check stands clear of the ends
+            # it sits between, by half a lease or more: a full renewal moves lease_until on
+            # by two and a half leases, and the check asks for two; the claim check falls two
+            # leases after the first lease lapsed and half a lease before the renewed one
+            # does, so a server that reports the renewal but holds the task for less than
+            # two and a half leases of the three fails there; and the lapse check comes a
+            # lease after the renewed one ends. A stalled call, or a server clock that steps
+            # by less than those margins, moves no end past a check
             time.sleep(lease * 0.5)
-            s.call("heartbeat", id=tid2, lease_seconds=lease)
-            time.sleep(lease * 0.7)
+            got = s.call("heartbeat", id=tid2, lease_seconds=3 * lease)
+            beat = task_of(got, "heartbeat")
+            until = got.get("lease_until") or beat.get("lease_until")
+            renewed = when(str(until or ""))
+            self.check(renewed is not None, f"heartbeat names no lease_until: {short(got)}")
+            self.check(
+                first is not None and renewed - first >= 2 * lease,
+                f"heartbeat did not renew it: lease_until went from {first} to {renewed}",
+            )
+            time.sleep(lease * 2.5)
             self.check(
                 task_of(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next") is None,
                 "a renewed lease lapsed where the first one would have: heartbeat did not renew it",
             )
-            time.sleep(lease + 2)
+            time.sleep(lease * 1.5)
             s.refused("heartbeat", id=tid2, lease_seconds=lease)
             s.refused("complete", id=tid2, handoff=h)
             t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease, "the task whose lease lapsed")
@@ -897,6 +915,9 @@ def main(argv):
     opts = p.parse_args(argv)
     if opts.lease < 1:
         p.error("--lease must be at least 1")
+    # step 5's heartbeat asks for three leases, and the surface grants at most a day
+    if opts.lease > 28800:
+        p.error("--lease must be at most 28800, a third of the surface's ceiling of a day")
 
     run = Run(opts)
     passed, failed, not_run, blocked = 0, [], [], []

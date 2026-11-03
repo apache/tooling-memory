@@ -13,7 +13,7 @@ a log show --domain dom-demo | j "f\"  {len(d)} events: \" + ', '.join(f'{n} {k}
 say "The index, rebuilt" "The materializer reads the log and the record and builds the index from them, and replays the ledger's own events; it says what the record holds at another version than the log names."
 a log materialize --domain dom-demo | j "f\"  {d['events']} events read, {d['live']} entries live in the index, {d['ledger_events']} ledger events replayed, {len(d['behind'])} behind the log\""
 
-say "Exported at a label" "A bundle is the entries at or below a label, Markdown and a manifest. You mark one note public; a public export carries that note alone, an internal one the whole domain."
+say "Exported at a label" "A bundle is the entries at or below a label, Markdown and a manifest. You write one new note, marked public; a public export carries that note alone, an internal one the whole domain."
 a write --domain dom-demo --kind fact --title "The demo record is open to read" --classification public --body "This note is public: it may leave in a bundle at the public label." | j "f\"  wrote {d['id']}, {d['classification']}\""
 a export "$work/public" --domain dom-demo --max-label public 2>&1 | sed 's/ to .*, highest/, highest/; s/^/  /'
 a export "$work/internal" --domain dom-demo --max-label internal 2>&1 | sed 's/ to .*, highest/, highest/; s/^/  /'

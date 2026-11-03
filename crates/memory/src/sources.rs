@@ -77,7 +77,7 @@ pub async fn cmd(m: &Memory, op: SourceOp) -> Fallible {
             let id = id.strip_prefix(dm_server::sources::CITATION).unwrap_or(&id);
             let s = m.release_source(id).await?;
             eprintln!(
-                "memory: {} released; it carries {}",
+                "amem: {} released; it carries {}",
                 s.id,
                 if s.findings.is_empty() {
                     "nothing the scan found".to_string()

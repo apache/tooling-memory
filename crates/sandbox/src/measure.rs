@@ -197,7 +197,7 @@ fn exit_code_as(status: ExitStatus, program: &OsStr, stopped: bool) -> i32 {
                     |name| format!("{name} (signal {signal})"),
                 );
                 let line = format!(
-                    "memory: {} was killed by {name}{core}\n",
+                    "amem: {} was killed by {name}{core}\n",
                     program.to_string_lossy()
                 );
                 // one write, so what other threads print does not land inside the line

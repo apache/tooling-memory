@@ -1,7 +1,7 @@
 #!/bin/sh
 # What fetch-wslcsdk.sh refuses: a package that is not the pinned one, a package that
 # cannot be read, an architecture the SDK has no DLL for, and no destination. In each case
-# nothing may be written, since a DLL beside memory.exe is code it loads.
+# nothing may be written, since a DLL beside amem.exe is code it loads.
 #
 # Then the real package, downloaded once into target/ and checked by its sum like any
 # other: both architectures are accepted, and with the two DLL pins swapped each is

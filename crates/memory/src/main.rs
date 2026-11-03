@@ -27,6 +27,7 @@ mod hosted;
 mod image;
 mod librarian;
 mod mcp_http;
+mod mcp_meta;
 mod mine;
 mod model;
 mod open;
@@ -254,7 +255,7 @@ enum BackendArg {
     Auto,
     /// Native Linux namespaces, from this host's binaries.
     Namespaces,
-    /// Native Linux namespaces, pivoted into the unpacked harness image (`memory image
+    /// Native Linux namespaces, pivoted into the unpacked harness image (`amem image
     /// unpack` first). What `auto` picks on Linux once the image is unpacked.
     Image,
     /// WSL containers: the harness image in a session VM, through `wslc`.
@@ -1286,10 +1287,10 @@ fn main() {
         match outbox {
             Some(outbox) => {
                 if let Err(e) = hooks::run(&outbox, harness) {
-                    eprintln!("memory hook: {e}");
+                    eprintln!("amem: hook: {e}");
                 }
             }
-            None => eprintln!("memory hook: no MEMORY_OUTBOX and no HOME"),
+            None => eprintln!("amem: hook: no MEMORY_OUTBOX and no HOME"),
         }
         std::process::exit(0);
     }
@@ -1469,7 +1470,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
                     println!("{}", p.display());
                     Ok(())
                 }
-                None => Err("no unpacked image; run `memory image unpack`".into()),
+                None => Err("no unpacked image; run `amem image unpack`".into()),
             },
         },
         Command::Relay { .. } => unreachable!("handled in main"),
@@ -1752,7 +1753,7 @@ fn route_for(
                 )?;
                 if var == "GH_TOKEN" {
                     eprintln!(
-                        "memory: copilot holds your GitHub login's token, which reaches every \
+                        "amem: copilot holds your GitHub login's token, which reaches every \
                          repository the login can; a token with only the Copilot Requests \
                          permission, as COPILOT_GITHUB_TOKEN, keeps that out of the sandbox"
                     );
@@ -2025,18 +2026,18 @@ fn record_reported_usage(p: &Prepared) {
                 .telemetry()
                 .record_reported(p.memory.session_id(), &p.provider, usage)
         {
-            eprintln!("memory: could not record reported usage: {e}");
+            eprintln!("amem: could not record reported usage: {e}");
         }
     }
     if let Some((pct, window)) = reported.plan_used_percent {
         eprintln!(
-            "memory: the harness reports {pct:.1}% of its plan's {}-hour window used",
+            "amem: the harness reports {pct:.1}% of its plan's {}-hour window used",
             window / 60
         );
     }
 }
 
-/// `memory usage`: the telemetry by destination, model and who counted.
+/// `amem usage`: the telemetry by destination, model and who counted.
 fn print_usage(rows: &[dm_egress::telemetry::Totals]) {
     if rows.is_empty() {
         println!("no model calls recorded");
@@ -2083,7 +2084,7 @@ fn report_usage(egress: &Egress) {
     if rows.is_empty() {
         return;
     }
-    eprintln!("memory: usage this root, by destination and model:");
+    eprintln!("amem: usage this root, by destination and model:");
     for r in rows {
         eprintln!(
             "  {:<10} {:<26} {:<8} calls {:>4}  in {:>8}  out {:>8}  cache {:>8}",
@@ -2190,14 +2191,14 @@ fn live_mount(p: &Prepared, harness: Harness) -> Option<dm_mount::Mounted> {
     match dm_mount::mount(p.memory.clone(), &p.projection, &at) {
         Ok(m) => {
             eprintln!(
-                "memory: the projection at {} is a live mount: every open of an entry is a get",
+                "amem: the projection at {} is a live mount: every open of an entry is a get",
                 dm_sandbox::INSIDE_PROJECTION
             );
             Some(m)
         }
         Err(e) => {
             eprintln!(
-                "memory: the projection at {} is a render: {e}",
+                "amem: the projection at {} is a render: {e}",
                 dm_sandbox::INSIDE_PROJECTION
             );
             None
@@ -2409,7 +2410,7 @@ async fn golden_suite(
                 .ok_or_else(|| {
                     format!("the platform holds no verified eval artifact named {name}")
                 })?;
-            eprintln!("memory: the suite is the platform's {}", a.entry);
+            eprintln!("amem: the suite is the platform's {}", a.entry);
             golden::Suite::parse(&a.text)
         }
         (None, None) => Err("name a suite, or --platform".into()),
@@ -2469,7 +2470,7 @@ async fn tap_cmd(root: &Path, op: TapOp) -> Fallible {
 }
 
 /// `mine` and the C API check.
-/// `memory mine`: a transcript read by a small model through the session's destination.
+/// `amem mine`: a transcript read by a small model through the session's destination.
 async fn mine_cmd(
     root: &Path,
     transcript: &Path,
@@ -2502,7 +2503,7 @@ async fn mine_cmd(
     Ok(())
 }
 
-/// `memory models`: the destination's own model list, as the web form's picker reads it.
+/// `amem models`: the destination's own model list, as the web form's picker reads it.
 async fn models_cmd(root: &Path, auth: AuthArg, provider: Option<String>) -> Fallible {
     let auth = AuthMode::from(auth);
     if auth == AuthMode::Subscription {
@@ -2996,7 +2997,7 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     std::process::exit(code);
 }
 
-/// The `memory inside` flags for a task run, after the run options.
+/// The `amem inside` flags for a task run, after the run options.
 fn work_inside_args(
     mut args: Vec<String>,
     domain: Option<&str>,
@@ -3232,7 +3233,7 @@ fn empty_record(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     ));
     std::fs::create_dir_all(&dir)?;
     Memory::init(&dir, &grants.owner, &domain)?;
-    eprintln!("memory: empty memory at {}", dir.display());
+    eprintln!("amem: empty memory at {}", dir.display());
     Ok(dir)
 }
 
@@ -3281,7 +3282,7 @@ fn split_program(harness: Harness, args: Vec<String>) -> (Vec<String>, Vec<Strin
     }
 }
 
-/// The flags `memory inside` gets for a launch handed to the wslc backend.
+/// The flags `amem inside` gets for a launch handed to the wslc backend.
 fn inside_args_for_launch(
     prompt: Option<&str>,
     prompt_file: Option<&Path>,
@@ -3389,7 +3390,7 @@ fn runner_for(backend: Backend, root: &Path) -> Result<Runner, Box<dyn std::erro
         Backend::Namespaces => Runner::Namespaces,
         Backend::Seatbelt => Runner::Seatbelt,
         Backend::Image => Runner::Image(
-            image::present(root).ok_or("no unpacked image; run `memory image unpack` first")?,
+            image::present(root).ok_or("no unpacked image; run `amem image unpack` first")?,
         ),
         Backend::None | Backend::Wslc => Runner::Unconfined(None),
     })
@@ -3410,7 +3411,7 @@ fn announce(runner: &Runner, p: &Prepared, harness: Harness, workdir: &Path) {
         _ => workdir.to_path_buf(),
     };
     eprintln!(
-        "memory: {} {how} {} · model calls via {} at ceiling {} · session {}",
+        "amem: {} {how} {} · model calls via {} at ceiling {} · session {}",
         harness.binary(),
         shown.display(),
         p.ceiling_of,
@@ -3453,7 +3454,7 @@ async fn platform_model(memory: &Memory, harness: Harness) -> Option<String> {
         .flatten()?;
     let v: serde_json::Value = serde_json::from_str(&a.text).ok()?;
     let model = v.get("model")?.as_str()?.to_string();
-    eprintln!("memory: model {model} from the platform's {}", a.entry);
+    eprintln!("amem: model {model} from the platform's {}", a.entry);
     Some(model)
 }
 
@@ -3670,7 +3671,7 @@ impl Session {
         via: MineVia,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let Some(t) = mine::newest_transcript(&self.p.home) else {
-            eprintln!("memory: nothing to mine; no transcript under the private home");
+            eprintln!("amem: nothing to mine; no transcript under the private home");
             return Ok(Vec::new());
         };
         let model = model::resolve(&self.p.egress, &self.p.server.provider, model).await;
@@ -3692,7 +3693,7 @@ impl Session {
             )
             .await?
         };
-        eprintln!("memory: mined {} entries from {}", ids.len(), t.display());
+        eprintln!("amem: mined {} entries from {}", ids.len(), t.display());
         client.close().await.ok();
         Ok(ids)
     }
@@ -3814,7 +3815,7 @@ impl Session {
             at: String::new(),
         };
         if let Err(e) = self.p.egress.telemetry().record_run(&run) {
-            eprintln!("memory: the run's resources were not kept: {e}");
+            eprintln!("amem: the run's resources were not kept: {e}");
         }
         Ok((code, out))
     }

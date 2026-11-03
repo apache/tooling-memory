@@ -19,7 +19,10 @@ trap 'rm -rf "$work"' EXIT
 command -v python3 >/dev/null 2>&1 || { echo "python3 is needed for the conformance test" >&2; exit 1; }
 
 # run <name> <flaw> <args...>: one run of the script against the fake with that flaw, its
-# output and exit status kept under its name
+# output and exit status kept under its name. The lease is 4 seconds, so each check of
+# step 5 has 2 seconds of margin or more: a machine busy with a build can hold a process
+# back that long. The runs start together, so a fake can take seconds to answer its first
+# request; a reply has 30 seconds, and only the run that must time out waits less
 run() {
     name=$1
     flaw=$2
@@ -27,7 +30,7 @@ run() {
     (
         status=0
         FLAW="$flaw" FAKE_STATE="$work/$name.json" \
-            python3 "$script" --stdio "python3 $fake" --lease 2 --timeout 5 "$@" \
+            python3 "$script" --stdio "python3 $fake" --lease 4 --timeout 30 "$@" \
             >"$work/$name.out" 2>&1 || status=$?
         echo "$status" >"$work/$name.status"
     ) &
@@ -43,6 +46,9 @@ run search-bodies search-bodies --operator "python3 $fake operator"
 run second-claim second-claim
 run lease-forever lease-forever
 run heartbeat-noop heartbeat-noop
+run heartbeat-lies heartbeat-lies
+run heartbeat-short heartbeat-short
+run heartbeat-lies-short heartbeat-lies-short
 run release-lies release-lies
 run complete-anyone complete-anyone
 run no-holder no-holder
@@ -50,7 +56,7 @@ run import-trusts import-trusts --operator "python3 $fake operator"
 run highest-wrong highest-wrong --operator "python3 $fake operator"
 run records-uncounted records-uncounted --operator "python3 $fake operator"
 run reindex-forgets reindex-forgets --operator "python3 $fake operator" --drop-index "python3 $fake operator drop-index"
-run silent silent
+run silent silent --timeout 5
 wait
 
 failures=0
@@ -83,8 +89,11 @@ expect t0-forgets 1 '5 of 7 steps passed; FAILED: 3, 7' 'T0 does not name the ha
 expect search-everything 1 '5 of 7 steps passed; FAILED: 4, 7' 'search for a word only the handoff carries found'
 expect search-bodies 1 '6 of 7 steps passed; FAILED: 4' 'search at summary depth returned a body'
 expect second-claim 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'a second claim_next while the lease holds returned a task'
-expect lease-forever 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat {"id": "task-fake-0004", "lease_seconds": 2} was answered, not refused'
-expect heartbeat-noop 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat did not renew it'
+expect lease-forever 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat {"id": "task-fake-0004", "lease_seconds": 4} was answered, not refused'
+expect heartbeat-noop 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat did not renew it: lease_until went from'
+expect heartbeat-short 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'heartbeat did not renew it: lease_until went from'
+expect heartbeat-lies 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'a renewed lease lapsed where the first one would have'
+expect heartbeat-lies-short 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'a renewed lease lapsed where the first one would have'
 expect release-lies 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'expecting the released task back from the pool'
 expect complete-anyone 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'complete {"id": "task-fake-0004", "handoff": "mem-fake-0002"} was answered, not refused'
 expect no-holder 1 '4 of 7 steps passed; not run: 6, 7; FAILED: 5' 'the claimed task names no holder'
@@ -107,6 +116,10 @@ esac
 status=0
 python3 "$script" >/dev/null 2>&1 || status=$?
 [ "$status" = 2 ] || { printf 'no transport given: exit %s, wanted 2\n' "$status" >&2; failures=$((failures + 1)); }
+# and so is a lease whose heartbeat of three would ask past the surface's ceiling of a day
+status=0
+python3 "$script" --stdio "/nonexistent/server" --lease 28801 >/dev/null 2>&1 || status=$?
+[ "$status" = 2 ] || { printf 'a lease above 28800: exit %s, wanted 2\n' "$status" >&2; failures=$((failures + 1)); }
 
 if [ "$failures" -ne 0 ]; then
     printf '%s conformance test(s) failed\n' "$failures" >&2
