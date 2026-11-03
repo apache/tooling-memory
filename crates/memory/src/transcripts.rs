@@ -75,21 +75,21 @@ pub async fn sweep(m: &Memory) -> Result<Vec<Swept>, Box<dyn std::error::Error>>
     let swept = m.sweep_transcripts(now).await?;
     // decision contexts run on the same clock, and go whole: no entry cites them
     for session in m.sweep_contexts(now).await? {
-        eprintln!("memory: decision contexts of {session} expired and were dropped");
+        eprintln!("amem: decision contexts of {session} expired and were dropped");
     }
     // and the tapes a re-run is answered from, unless pinned for a benchmark
     for session in m.sweep_tapes(now).await? {
         // and the reports of its re-runs, which quote what the runs wrote and said
         crate::reenact::forget_runs(m.root(), &session);
-        eprintln!("memory: the tape of {session} expired and was dropped, with its re-runs");
+        eprintln!("amem: the tape of {session} expired and was dropped, with its re-runs");
     }
     // and so do the sources tools brought in, except what a live entry cites
     for id in m.sweep_sources(now).await? {
-        eprintln!("memory: source {id} expired, uncited, and was dropped");
+        eprintln!("amem: source {id} expired, uncited, and was dropped");
     }
     for s in &swept {
         eprintln!(
-            "memory: transcript {} expired: {} turns kept as {} excerpts, {} dropped",
+            "amem: transcript {} expired: {} turns kept as {} excerpts, {} dropped",
             s.session,
             s.kept.len(),
             s.excerpts,
@@ -147,7 +147,7 @@ pub async fn keep_newest(
     match keep_file(memory, harness, domain, Some(home), &path).await {
         Ok(k) => {
             eprintln!(
-                "memory: transcript kept as source {} in {}: {} turns, {}, until {}",
+                "amem: transcript kept as source {} in {}: {} turns, {}, until {}",
                 k.session,
                 k.domain,
                 k.turns,
@@ -158,7 +158,7 @@ pub async fn keep_newest(
         }
         Err(e) => {
             eprintln!(
-                "memory: the transcript at {} was not kept: {e}",
+                "amem: the transcript at {} was not kept: {e}",
                 path.display()
             );
             None
@@ -175,7 +175,7 @@ pub async fn remove_kept(memory: &Memory, home: &Path) -> Vec<std::path::PathBuf
     let origins = match memory.kept_origins().await {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("memory: the harness's transcripts were left in its home: {e}");
+            eprintln!("amem: the harness's transcripts were left in its home: {e}");
             return Vec::new();
         }
     };
@@ -188,7 +188,7 @@ pub async fn remove_kept(memory: &Memory, home: &Path) -> Vec<std::path::PathBuf
             continue;
         };
         if std::fs::remove_file(&path).is_ok() {
-            eprintln!("memory: the harness's copy of {origin} removed; the record keeps it");
+            eprintln!("amem: the harness's copy of {origin} removed; the record keeps it");
             removed.push(path);
         }
     }

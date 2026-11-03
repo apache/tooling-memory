@@ -6,7 +6,7 @@
 # image to a registry, and `packages: none` below says so in this file (with other
 # permissions named, GitHub gives none for packages anyway). Pins are bumped by a daily
 # check that opens a pull request, and a pull request that touches them has its lockfile
-# checked against package.json. Never on a run: `memory launch` uses the tag it is given.
+# checked against package.json. Never on a run: `amem launch` uses the tag it is given.
 name: image
 
 on:
@@ -83,7 +83,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Build the memory binary
+      - name: Build the amem binary
+        # staged as `memory`: the Dockerfile copies that file to /opt/memory/memory
         run: cargo build --release --locked -p amem && cp target/release/amem images/harness/memory
       - name: Build the image
         run: docker build --pull -t harness:${{ github.sha }} images/harness

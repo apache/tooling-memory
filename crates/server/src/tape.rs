@@ -505,7 +505,7 @@ impl Memory {
     ) -> Result<Option<TapeHeader>, Error> {
         match self.header_in(domain, session).await {
             Err(Error::Transcript(e)) => {
-                eprintln!("memory: the tape of {session} has a header that does not parse, left as it is: {e}");
+                eprintln!("amem: the tape of {session} has a header that does not parse, left as it is: {e}");
                 Ok(None)
             }
             other => other,

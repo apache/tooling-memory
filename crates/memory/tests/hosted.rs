@@ -54,7 +54,8 @@ fn fetch_component() -> PathBuf {
     repo.join("taps/target/wasm32-wasip2/release/tap_fetch.wasm")
 }
 
-/// Answer each connection with what `respond` makes of its request line, until dropped.
+/// Answer each connection with what `respond` makes of its request: the request line,
+/// then its headers lower-cased one to a line, then its body; until dropped.
 fn serve(respond: fn(&str, u16) -> String) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -66,18 +67,26 @@ fn serve(respond: fn(&str, u16) -> String) -> u16 {
                 let mut first = String::new();
                 reader.read_line(&mut first).unwrap_or(0);
                 let mut length = 0;
+                let mut headers = String::new();
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
-                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    let line = line.to_ascii_lowercase();
+                    if let Some(v) = line.strip_prefix("content-length:") {
                         length = v.trim().parse().unwrap_or(0);
                     }
+                    headers.push_str(line.trim_end());
+                    headers.push('\n');
                 }
                 let mut body = vec![0u8; length];
                 reader.read_exact(&mut body).ok();
-                let line = format!("{}{}", first.trim(), String::from_utf8_lossy(&body));
+                let line = format!(
+                    "{}\n{headers}{}",
+                    first.trim(),
+                    String::from_utf8_lossy(&body)
+                );
                 let _ = s.write_all(respond(&line, port).as_bytes());
             });
         }
@@ -293,6 +302,11 @@ fn a_tool_server_without_the_component_fetches_natively_behind_the_same_gate() {
 /// An MCP endpoint that answers every call with a reply naming `reached`.
 fn liar(reached: &'static str) -> String {
     fn respond(line: &str, reached: &str) -> String {
+        // a server from before 2026-07-28 knows no discovery, as amem tool-server did not
+        if line.contains("\"server/discover\"") {
+            let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no method server/discover"}}"#;
+            return http("200 OK", "application/json", "", body);
+        }
         let body = if line.contains("\"initialize\"") {
             r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"liar"}}}"#.to_string()
         } else if line.contains("tools/call") {
@@ -326,6 +340,102 @@ fn a_server_that_names_nowhere_or_somewhere_unreachable_is_not_believed() {
     // and neither answer was kept
     let sources = ok(&amem(&nowhere).args(["source", "list"]).output().unwrap());
     assert!(!sources.contains("trust me"), "{sources}");
+}
+
+/// An MCP endpoint of 2026-07-28 only: it answers `server/discover` and a stateless
+/// `tools/call` whose headers mirror its body, and refuses the handshake as a server
+/// without one does.
+fn modern_only(request: &str, port: u16) -> String {
+    let refuse = |code: i64, message: &str| {
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1,
+            "error": {"code": code, "message": message}});
+        http("400 Bad Request", "application/json", "", &body.to_string())
+    };
+    let has = |h: &str| request.lines().any(|l| l == h);
+    if request.contains("\"initialize\"") {
+        return refuse(-32601, "no initialize here; this server speaks 2026-07-28");
+    }
+    if !has("mcp-protocol-version: 2026-07-28")
+        || !request.contains("\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"")
+        || !request.contains("\"io.modelcontextprotocol/clientCapabilities\":{}")
+    {
+        return refuse(-32602, "no 2026-07-28 _meta and header");
+    }
+    let body = if request.contains("\"server/discover\"") && has("mcp-method: server/discover") {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete",
+            "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}})
+    } else if request.contains("\"tools/call\"")
+        && has("mcp-method: tools/call")
+        && has("mcp-name: fetch")
+    {
+        let text = serde_json::json!({"answer": {"text": "modern and stateless"},
+            "reached": [format!("http://127.0.0.1:{port}/page")]})
+        .to_string();
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete",
+            "content": [{"type": "text", "text": text}]}})
+    } else {
+        return refuse(-32020, "the headers do not mirror the body");
+    };
+    // answered as an event stream, as a server may
+    http(
+        "200 OK",
+        "text/event-stream",
+        "",
+        &format!("event: message\ndata: {body}\n\n"),
+    )
+}
+
+#[test]
+fn a_server_of_the_stateless_revision_is_called_without_a_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://127.0.0.1:{}/mcp", serve(modern_only));
+    let root = launcher(dir.path(), "near", &url, "[\"127.0.0.1\"]");
+    let answer = ok(&fetch(&root, "http://127.0.0.1:1/page", ""));
+    assert!(answer.contains("modern and stateless"), "{answer}");
+}
+
+/// An MCP endpoint of a revision before 2026-07-28: no `server/discover`, and a call
+/// only in the session `initialize` opens, at the version it answered with.
+fn handshake_only(request: &str, port: u16) -> String {
+    let has = |h: &str| request.lines().any(|l| l == h);
+    if request.contains("\"initialize\"") {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"old"}}}"#;
+        return http(
+            "200 OK",
+            "application/json",
+            "Mcp-Session-Id: s-1\r\n",
+            body,
+        );
+    }
+    if !has("mcp-session-id: s-1") {
+        return http(
+            "400 Bad Request",
+            "text/plain",
+            "",
+            "Bad Request: no session",
+        );
+    }
+    if request.contains("notifications/initialized") {
+        return http("202 Accepted", "text/plain", "", "");
+    }
+    if !request.contains("\"tools/call\"") || !has("mcp-protocol-version: 2025-06-18") {
+        return http("400 Bad Request", "text/plain", "", "Bad Request");
+    }
+    let text = serde_json::json!({"answer": {"text": "from before the change"},
+        "reached": [format!("http://127.0.0.1:{port}/page")]})
+    .to_string();
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 2,
+        "result": {"content": [{"type": "text", "text": text}]}});
+    http("200 OK", "application/json", "", &body.to_string())
+}
+
+#[test]
+fn a_server_from_before_the_stateless_revision_is_called_after_the_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://127.0.0.1:{}/mcp", serve(handshake_only));
+    let root = launcher(dir.path(), "near", &url, "[\"127.0.0.1\"]");
+    let answer = ok(&fetch(&root, "http://127.0.0.1:1/page", ""));
+    assert!(answer.contains("from before the change"), "{answer}");
 }
 
 #[test]

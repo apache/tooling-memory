@@ -372,7 +372,7 @@ impl Grants {
         Grants::parse(&text)
     }
 
-    /// Render as TOML, for `memory init` to write.
+    /// Render as TOML, for `amem init` to write.
     ///
     /// # Errors
     ///
