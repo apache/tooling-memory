@@ -808,6 +808,36 @@ impl Ledger {
         on_backend!(&self.backend, db => db.get(id))
     }
 
+    /// The domain's task for an `origin` and `upstream_event` pair, in any status: the
+    /// one [`Ledger::create`] returns in place of filing the same pair again.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the ledger did not write.
+    pub async fn by_origin(
+        &self,
+        domain: &str,
+        origin: &str,
+        upstream_event: &str,
+    ) -> Result<Option<Task>, Error> {
+        let found =
+            on_backend!(&self.backend, db => db.find_origin(domain, origin, upstream_event))?;
+        match found {
+            Some(id) => Ok(Some(self.get(&id).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The domain's tasks with an `origin`, of every upstream event and status, oldest
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the ledger did not write.
+    pub async fn with_origin(&self, domain: &str, origin: &str) -> Result<Vec<Task>, Error> {
+        on_backend!(&self.backend, db => db.with_origin(domain, origin))
+    }
+
     /// The tasks filed from `parent`: the subagent tasks a run of it asked for
     /// (`origin` `task:<parent>`), its continuations (`continues:<parent>`) and its
     /// retries (`retries:<parent>`), oldest first.
@@ -1399,6 +1429,7 @@ mod tests {
         let again = l.create(s.clone()).await.unwrap();
         assert!(again.deduplicated);
         assert_eq!(again.task.id, first.task.id);
+        the_pair_finds_the_task(&l, &first.task).await;
         s.upstream_event = Some("labeled:2026-10-02T09:00:00Z".into());
         let other = l.create(s).await.unwrap();
         assert!(!other.deduplicated, "a new upstream event is a new task");
@@ -1409,6 +1440,31 @@ mod tests {
             "the duplicate appended nothing"
         );
         dedup_is_scoped_to_the_domain(&mut l, &first.task).await;
+    }
+
+    /// The pair names the task create would return, and a pair never filed names none.
+    async fn the_pair_finds_the_task(l: &Ledger, first: &Task) {
+        let dom = first.spec.domain.as_str();
+        let found = l
+            .by_origin(dom, "github:apache/x#12", "labeled:2026-10-01T09:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(found.map(|t| t.id), Some(first.id.clone()));
+        let none = l
+            .by_origin(dom, "github:apache/x#12", "labeled:2026-10-02T09:00:00Z")
+            .await
+            .unwrap();
+        assert!(none.is_none(), "{none:?}");
+        let all = l.with_origin(dom, "github:apache/x#12").await.unwrap();
+        assert_eq!(
+            all.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec![first.id.as_str()]
+        );
+        assert!(l
+            .with_origin(dom, "github:apache/x#13")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// The same issue filed into another domain is that domain's task: dedup is scoped
