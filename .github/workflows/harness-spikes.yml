@@ -47,6 +47,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
         with:
           toolchain: stable
+          # dm-web's build script builds the browser reader for this target
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p amem
       # crash reports are collected from here on, the tests' own sandbox-exec runs among

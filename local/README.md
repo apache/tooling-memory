@@ -1341,7 +1341,8 @@ measures is on the screen while the harness runs.
 ### A hosted page
 
 The pages are plain files, so a static host can serve them. `make hosted` puts them in
-`target/hosted`. This repository does not publish them. A copy built from unreleased
+`target/hosted`. It builds `amem` first, because the build makes the wasm of the reader.
+This repository does not publish them. A copy built from unreleased
 source is unreleased material. The Apache release policy says that the project does not
 publish that material outside its development community.
 

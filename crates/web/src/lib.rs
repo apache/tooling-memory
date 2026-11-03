@@ -29,6 +29,10 @@ use tokio::sync::broadcast;
 pub mod access;
 pub mod companion;
 mod pages;
+// what build.rs runs, run again by a test of pages.rs against what was embedded
+#[cfg(test)]
+#[path = "../reader_build.rs"]
+mod reader_build;
 pub mod state;
 
 pub use access::Access;

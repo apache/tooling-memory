@@ -1,13 +1,14 @@
-// A hosted copy of the pages for the browser tests: crates/web/static served as plain
-// files from another origin, the way a static host would serve them, with nothing of
-// amem's behind it. Playwright starts it (playwright.config.ts); the page is opened as
-// http://localhost:<port>/, an origin other than the server's.
+// A hosted copy of the pages for the browser tests: target/hosted, as scripts/hosted.sh
+// makes it (scripts/e2e.sh runs that first), served as plain files from another origin,
+// the way a static host would serve them, with nothing of amem's behind it. Playwright
+// starts it (playwright.config.ts); the page is opened as http://localhost:<port>/, an
+// origin other than the server's.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = fileURLToPath(new URL('../../../crates/web/static/', import.meta.url));
+const root = fileURLToPath(new URL('../../../target/hosted/', import.meta.url));
 const port = Number(process.env.HOSTED_PORT ?? 4311);
 const types = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript',
