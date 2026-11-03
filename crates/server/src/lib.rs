@@ -1175,32 +1175,8 @@ impl Memory {
         if !d.allow {
             return Err(Error::Denied(d.reason));
         }
-        {
-            let mut l = self.ledger.lock().await;
-            if task.status == dm_ledger::Status::Proposed {
-                l.admit(task_id).await?;
-            }
-            l.claim(
-                task_id,
-                &self.author,
-                Duration::minutes(5),
-                &task.spec.requirements,
-            )
-            .await?;
-        }
-        // an erase or a replace may have landed while the claim was taken: write only the
-        // version that is live now, so an erased or replaced text is not written back
-        let held = self.ledger.lock().await.get(task_id).await?;
-        let entry = match self.proposal_entry(&held).await {
-            Ok((_, current)) => current,
-            Err(e) => {
-                let mut l = self.ledger.lock().await;
-                if l.get(task_id).await?.status == dm_ledger::Status::Claimed {
-                    l.release(task_id, &self.author, None).await?;
-                }
-                return Err(e);
-            }
-        };
+        self.claim_proposal(&task).await?;
+        let entry = self.still_proposed(task_id).await?;
         let promoted = self.set_tier(entry, TrustTier::Verified).await?;
         self.ledger
             .lock()
@@ -1208,6 +1184,39 @@ impl Memory {
             .complete(task_id, &self.author, &id)
             .await?;
         Ok(promoted)
+    }
+
+    /// Take the proposal task, so no second approver acts on it at the same time.
+    async fn claim_proposal(&self, task: &Task) -> Result<(), Error> {
+        let mut l = self.ledger.lock().await;
+        if task.status == dm_ledger::Status::Proposed {
+            l.admit(&task.id).await?;
+        }
+        l.claim(
+            &task.id,
+            &self.author,
+            Duration::minutes(5),
+            &task.spec.requirements,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The proposed entry as it is now, read after the claim. An erase or a replace may
+    /// have landed while the claim was taken, and the version read before it must not be
+    /// written back; if the proposal no longer holds, the claim is released.
+    async fn still_proposed(&self, task_id: &str) -> Result<Entry, Error> {
+        let held = self.ledger.lock().await.get(task_id).await?;
+        match self.proposal_entry(&held).await {
+            Ok((_, current)) => Ok(current),
+            Err(e) => {
+                let mut l = self.ledger.lock().await;
+                if l.get(task_id).await?.status == dm_ledger::Status::Claimed {
+                    l.release(task_id, &self.author, None).await?;
+                }
+                Err(e)
+            }
+        }
     }
 
     /// The entry a proposal task asks to verify, while the task still asks it. A task
