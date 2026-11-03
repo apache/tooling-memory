@@ -56,7 +56,7 @@ jobs:
           components: rustfmt, clippy
           # wasm32-unknown-unknown: dm-web's build script builds the browser reader
           targets: wasm32-unknown-unknown, wasm32-wasip2, x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Ubuntu's AppArmor lets an unprivileged process create a user namespace but not map
       # its uid in it, so no confined test could run. A laptop installs the amem profile in
       # packaging/apparmor; the tests' own probe is unshare, not amem, so this throwaway VM
@@ -67,7 +67,7 @@ jobs:
         # API; unauthenticated, a runner's address is soon refused
         env:
           GITHUB_TOKEN: ${{ github.token }}
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-machete
       - run: make machete
@@ -85,7 +85,7 @@ jobs:
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown, wasm32-wasip2
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The companion test loads an unpacked extension, which Google Chrome's own builds
       # refuse; the Windows image has no Chromium or Chrome for Testing, so this fetches
       # the stable Chrome for Testing and names it in CHROME
@@ -116,7 +116,7 @@ jobs:
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown, wasm32-wasip2
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --workspace
         # the embedded PostgreSQL for the ledger tests lists its releases through GitHub's
         # API; unauthenticated, a runner's address is soon refused
@@ -135,7 +135,7 @@ jobs:
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: make wasm-check
 
   # The Markdown the demo reads, checked as the demo reads it (scripts/corpus-check.sh).
@@ -149,7 +149,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 2026-07-16, the commit the ASF allow-list pins
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: make corpus-check
 
   # The rust-version in Cargo.toml, built with that release of Rust (`make msrv-check`), so
@@ -169,7 +169,7 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         env:
           RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
       - run: make msrv-check
@@ -185,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-deny
       - run: make deny
@@ -204,8 +204,8 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
           targets: wasm32-unknown-unknown, wasm32-wasip2
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-llvm-cov
       # the confined tests run here too, as in the check job
@@ -233,7 +233,7 @@ jobs:
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: make e2e
         env:
           CI: 'true'
