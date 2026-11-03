@@ -245,6 +245,16 @@ pub async fn hunt(
     Ok(found)
 }
 
+/// The task that has a curator settle a contradiction the checker found.
+fn reconcile_body(model: &str, c: &Contradiction) -> String {
+    format!(
+        "The checker, on {model}, found `{}` and `{}` at odds: {}\n\nRead both with `get`. Find out which is right, from the record and the working tree. `write` the corrected entry with `supersedes` naming the wrong one: its body says what is right, and its `source` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If both are right about different things, give each a title that says which. Change no facts you cannot verify. Leave a handoff that names the entry you wrote and the one it supersedes, and says what was wrong and how you know; keep that out of the entry, so whoever checks it judges it on its sources first.",
+        c.a,
+        c.b,
+        if c.why.is_empty() { "no claim named" } else { &c.why }
+    )
+}
+
 /// File a task to reconcile each contradiction, once per pair.
 ///
 /// # Errors
@@ -262,16 +272,13 @@ pub async fn file_contradictions(
             .file_own(dm_ledger::TaskSpec {
                 domain: domain.to_string(),
                 title: format!("Librarian: reconcile {} and {}", c.a, c.b),
-                body: format!(
-                    "The checker, on {model}, found `{}` and `{}` at odds: {}\n\nRead both with `get`. Find out which is right, from the record and the working tree. `write` the corrected entry with `supersedes` naming the wrong one and say in its body what was wrong and how you know; if both are right about different things, give each a title that says which. Change no facts you cannot verify. Leave a handoff.",
-                    c.a,
-                    c.b,
-                    if c.why.is_empty() { "no claim named" } else { &c.why }
-                ),
+                body: reconcile_body(model, c),
                 requirements: Vec::new(),
                 depends_on: Vec::new(),
                 origin: Some("checker:contradiction".into()),
-                upstream_event: Some(dm_core::digest(&format!("{}\n{}", c.a, c.b))[..16].to_string()),
+                upstream_event: Some(
+                    dm_core::digest(&format!("{}\n{}", c.a, c.b))[..16].to_string(),
+                ),
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
                 priority: 1,
@@ -351,5 +358,15 @@ mod tests {
         assert!(q.contains("## Summary\n\nS") && q.contains("## Body\n\nB"));
         let q = contradiction_question("A", "a", "B", "b");
         assert!(q.contains("## Entry A: A") && q.contains("## Entry B: B"));
+    }
+
+    #[test]
+    fn a_reconciled_entry_leaves_the_reasoning_to_the_handoff() {
+        let c = Contradiction {
+            a: "mem-t-1".into(),
+            b: "mem-t-2".into(),
+            why: "one says MoinMoin stays, the other that it went".into(),
+        };
+        crate::librarian::tests::reasoning_goes_to_the_handoff(&reconcile_body("m", &c));
     }
 }
