@@ -162,7 +162,8 @@ The full record, with citations, lineage, and supersession, is in [Appendix A](#
 | **Decision** | Best. It records context, options, choice, and rationale, like an architecture decision record, and the reason stays true after the details change. A new decision supersedes it; it never expires |
 | **Fact** | Fast. It carries a review date. A fact about code cites where in the code it comes from, at a commit, so a reader can check it against the current code and correct it [[80]](#ref-80) |
 | **Convention** | Needs a named owner; an ownerless one is flagged within days |
-| **Method** | A convention about how to work: a strategy agents reuse ([§10](#10-evolving-the-system)). Like any convention it needs an owner, and it is reviewed more strictly. It states where it applies, and its score comes from how the tasks that used it turned out |
+| **Method** | A convention about how to work: a strategy agents reuse ([§10](#10-evolving-the-system)). Like any convention it needs an owner, and it is reviewed more strictly. It states where it applies, and its score comes from how the tasks that used it turned out It cites the facts and decisions it relies on and does not restate them. Each cited fact keeps its own review date and each cited entry its own trust tier, and a failure can be traced to the method or to what it cites |
+| **Handoff** | Fastest. It serves the work it hands over. When nothing live still reaches it, the curator lifts what lasts into other entries and the handoff leaves search and the views built on the search index, T0 included. It is not demoted, and `get` still serves it ([Appendix C](#endings)) |
 
 A T0 for one domain:
 
@@ -360,6 +361,8 @@ Curators are a standing fleet of cheap-model agents. They:
 
 Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Two kinds go to the front: entries built from one that has just been superseded, and facts whose cited code has changed. A stale claim misleads even when the current one is retrieved beside it [[84]](#ref-84). Curation is budgeted like any other work, with a protected floor, so curation and delivery cannot starve each other.
 
+People's corrections join the queue too. A correction of an agent's output and a rejected or reverted result are outcome events on the task ([Appendix C](#appendix-c-ledger-semantics)); a person's answer to an escalation is an event on the escalated task, or on a sign-off task whose match is a person ([§8](#decomposition)). The curator sorts each by one question: could the agent have reached the right answer from what its permission filter admitted ([§6](#access-control)), whether or not it read it? If it could, the method is at fault, and the fix is a candidate change in `dom-platform` ([§10](#10-evolving-the-system)). If it could not, knowledge is missing, and the fix is an entry in the domain. If the people correcting it disagree, it is neither, and the question goes to the people who own the policy the disputed question falls under ([§7](#7-the-policy-stack)). Sorting by the form of a correction, information against redirection, is a poor guide, because a correction of either form can be any of the three; one expert-knowledge deployment reports trying it and moving to the question above [[114]](#ref-114).
+
 **Curator, historian, steward.** The historian ([§3](#3-memory)) records what happened; the curator looks after what is kept. "Curator" is the cross-industry name for that work: digital curation is "the management and preservation of digital data/information over the long-term" [[9]](#ref-9), and the work's output here is the curated tier. In data governance the accountable person is the data steward [[10]](#ref-10), which here is the domain owner; curators work under the owner's policy.
 
 A summary keeps the provenance, tier, and classification of what it summarises. A consolidation that drops where a claim came from would let a raw or restricted claim pass as a curated, public one, so the curator's outputs follow the derivation rules of [§4](#4-trust-and-handling). A curation pass rewrites only the summaries telemetry flagged, and rebuilds each from its entries, never from the old summary. Updating a summary again and again, one batch at a time, loses detail, and after enough rounds memory can do worse than none [[85]](#ref-85), [[86]](#ref-86).
@@ -384,10 +387,12 @@ Auditors are agents whose only job is checking curators and the record they keep
 - run on a different base model when one that audits at least as well as the curators' model is available, as measured on faults planted for the test. A model favours output it recognises as its own [[104]](#ref-104) and does not reliably correct its own reasoning [[105]](#ref-105), but a weaker reviewer can make good work worse [[112]](#ref-112);
 - otherwise run the curators' model in a fresh session. In one study, a fresh session found about as many planted errors as the best cross-model reviewer, and partly different ones [[113]](#ref-113). Sampled human review then checks more of the auditors' work, because a model may favour output of its own kind;
 - sample summaries against the entries they summarise;
+- judge each change against the entries it draws on before they see the curator's reasoning, so they do not start from the curator's argument. A changed entry states its claim and cites its sources, and the reasoning stays out of its body: in the curator's handoff and transcript, and in the why that a promotion carries;
 - test entries together, as searches return them, since a planted payload can be split across several entries;
 - trace a bad outcome back to the entries that fed it, using the read sets in the historian [[88]](#ref-88);
 - sample handoffs for instructions aimed at the next agent;
 - hunt contradictions between entries;
+- sample handoffs that left search for what the curator did not lift;
 - watch the canary entries;
 - share no writable state with curators, and never see the curator's reasoning about an entry.
 
@@ -639,6 +644,8 @@ Most work already arrives in issue trackers, ticket queues, and incident tools. 
 - **Ownership** does not move. The tracker stays canonical for the item, the ledger for the task, and the tracker's owner closes the item; the fleet only proposes.
 - **Replays are safe.** Taps are idempotent on origin, so replaying a tracker's history creates nothing twice.
 
+Some items belong to more than one domain: a meeting that covers three projects, a mailing list that spans components. The item stays with the domain the registry names, and that domain's triage finds the parts another domain owns. For each such part the orchestrator files a request task on the owner's ledger, as for any work [across domains](#across-domains), and the owner triages it against its own rubric. Triage may score the content (names, people, explicit mentions, as one personal-workspace deployment does [[115]](#ref-115)) to propose the owner, but the score never decides alone, because content can be written to steer its own routing; a close call between candidate owners goes to the owner of the item's domain. The request is filed by a session that read the item, so it carries at least the item's label, and only a guard can lower that ([§4](#4-trust-and-handling)). [Appendix C](#appendix-c-ledger-semantics) gives the rules.
+
 ## Across domains
 
 Domains work together the way services do. When `dom-a` needs something `dom-b` owns, its orchestrator:
@@ -733,7 +740,7 @@ Decisions need deadlines as much as searches do. Each unit sets response bounds 
 
 # 10. Evolving the System
 
-**Why.** The quickest way to make every agent better is to improve the instructions, tools, and methods they all load. That same shared path is also the quickest way to spread a mistake or an exploit to all of them.
+**Why.** The quickest way to make every agent better is to improve the instructions, tools, and methods they all load. That same shared path is also the quickest way to spread a mistake or an exploit to all of them, and plain-text methods travel fast: one personal-workspace deployment, where anyone and the agents themselves may write them, reports thousands written by its users [[115]](#ref-115).
 
 ## The platform is a domain
 
@@ -898,6 +905,8 @@ Other systems that write to a personal domain (a harness, an assistant, an emplo
 
 One catch: an entry about the person, written in a session that read restricted material, carries that label. It can then leave only through the institution's guard. So anything meant for the person's domain should be written in a session that read nothing above the person's level.
 
+Personal memory is wanted at scale. One personal-workspace deployment of this kind, a root file of identity and active work with project detail loaded on demand, reports 63,000 installs and about 10,000 daily users within three months [[115]](#ref-115). Its next step is a team layer fed from the personal workspaces. In this design that step crosses from a person's domain into a team's: the person chooses, entry by entry, what to offer, and the team domain's owner admits it, raw, as any import ([§4](#4-trust-and-handling)).
+
 When a grant ends, the institution's views are dropped with receipts. What the person wrote into the institution's domains stays there under their identifier.
 
 ## Models and tools
@@ -956,7 +965,8 @@ The design combines recent agent-memory research with decades of systems practic
 | **Coordination** | Blackboards (Hearsay-II [[45]](#ref-45)) and tuple spaces (Linda [[46]](#ref-46)); stigmergy [[47]](#ref-47), [[48]](#ref-48); leases [[49]](#ref-49); bounded contexts [[50]](#ref-50) and data mesh [[51]](#ref-51); hierarchical task networks [[52]](#ref-52); critical-path priority [[53]](#ref-53); the contract net, without the bidding [[54]](#ref-54) |
 | **Measurement and evaluation** | SRE [[55]](#ref-55); token cost as an axis (Mem0 [[56]](#ref-56)); long-horizon benchmarks (LoCoMo [[57]](#ref-57), LongMemEval [[58]](#ref-58)); silent vendor drift [[59]](#ref-59); NIST AI RMF [[60]](#ref-60) and ISO/IEC 42001 [[61]](#ref-61); OpenTelemetry [[62]](#ref-62) and Inspect [[63]](#ref-63) as carriers; the paired noise-floor protocol [[64]](#ref-64) |
 | **Seeding** | Co-change coupling [[65]](#ref-65); fixes linked to their causes [[66]](#ref-66) |
-| **Self-improvement** | Self-evolving harnesses (SEAGym [[67]](#ref-67)); offline distillation, online retrieval (EvolveR [[68]](#ref-68)); gated archives (Darwin Gödel Machine [[69]](#ref-69)); co-evolving evaluators [[70]](#ref-70); agents designed as code [[71]](#ref-71). This design adds human review, a manifest check, and a perimeter outside the loop |
+| **Self-improvement** | Self-evolving harnesses (SEAGym [[67]](#ref-67)); offline distillation, online retrieval (EvolveR [[68]](#ref-68)); gated archives (Darwin Gödel Machine [[69]](#ref-69)); co-evolving evaluators [[70]](#ref-70); agents designed as code [[71]](#ref-71). This design adds a manifest check and a perimeter outside the loop, and keeps a person's review in the loop for every change that reaches every task and every change to the evaluation suites ([§10](#the-loop-and-its-gates)) |
+| **Industry practice** | Deployments cited as evidence from practice: they inform this design but do not settle it, and each rule here keeps its own reason. Each is cited for what it reports, and its details can differ from this design's. An expert-knowledge deployment improves its agent by reviewed edits to text files, sorts corrections by whether the agent could have reached the answer, gives a fresh-context reviewer only the diff, and replays the case that prompted a change without the agent knowing it is a test [[114]](#ref-114). A personal-workspace deployment serves a small root file and loads project detail on demand, and its users share procedures as plain-text files, which this design calls methods [[115]](#ref-115) |
 | **Long timescales** | Dated authorities (RFC 4151 [[11]](#ref-11)); names never reassigned (RFC 8141 [[72]](#ref-72)); stable internal IDs (SCIM [[73]](#ref-73)); issuer and subject (OpenID Connect [[12]](#ref-12)); identifiers free of organisational names [[13]](#ref-13) |
 
 **Organisational cybernetics.** Beer's Viable System Model [[74]](#ref-74), [[75]](#ref-75) names the functions an organisation needs to stay viable, and stresses the exchange between them and adaptation to a changing environment [[76]](#ref-76). It is a useful check on the design, and it shows where the design stops. The design supplies mechanisms; most of what makes an organisation viable comes from people the deployment appoints:
@@ -1206,6 +1216,10 @@ References are numbered in the order they were added. Recent works link to their
 
 <a id="ref-113"></a>[113] Song, T.-E. (2026). When Does a Second Model Help? Cross-Model Review in LLM Verification. arXiv:2610.01471. https://arxiv.org/abs/2610.01471
 
+<a id="ref-114"></a>[114] Sengar, S., Nawrocki, J., Shah, J., & Kommireddi, P. (2026). An Organizational Second Brain: Building an AI That Learns From Experts. Engineering at Meta, 2 September 2026. https://engineering.fb.com/2026/09/02/ml-applications/organizational-second-brain-ai-learns-from-experts/
+
+<a id="ref-115"></a>[115] Analytics at Meta (2026). How We Built an AI Second Brain for 60K Knowledge Workers. Medium, 29 April 2026. https://medium.com/@AnalyticsAtMeta/how-we-built-an-ai-second-brain-for-60k-knowledge-workers-78c507dd795b
+
 ---
 
 # Appendix A: Interface
@@ -1282,7 +1296,7 @@ A new deployment starts on top of existing knowledge: repositories, tickets, rev
 
 **Seeding is ordinary import, at scale.** Nothing enters a trusted tier because it is old or looks authoritative. Sources land raw with provenance and earn promotion through the normal gates ([§4](#4-trust-and-handling)). A wrong seed is the hardest corruption to find later.
 
-**Two speeds.** Indexing is cheap and distillation costs model time. So index everything at once as a raw searchable layer that cites the originals, and distil selectively. Known-item lookup works from day one; understanding builds where it is needed. Zero-result queries mark where to distil next; history nobody asks about is indexed and never distilled, which is the right outcome.
+**Two speeds.** Indexing is cheap and distillation costs model time. So index everything at once as a raw searchable layer that cites the originals, and distil selectively. Known-item lookup works from day one; understanding builds where it is needed. Zero-result queries mark where to distil next; history nobody asks about is indexed and never distilled, which is the right outcome. Value in the first session matters: one personal-workspace deployment builds a first workspace from the user's recent activity in a single session, and reports that this removed the largest barrier to adoption [[115]](#ref-115). What such a bootstrap writes is model output and lands raw.
 
 **Backfill is replay.** Build the live taps first, then run history through the same pipeline, oldest first. The pipeline itself is a `dom-platform` artifact.
 
@@ -1379,15 +1393,21 @@ The historian is the ledger's authoritative store. The current task table is a p
 - An invalidated parent invalidates its live children. An invalidated dependency re-triages its dependents.
 - A holder learns of either from its next heartbeat, stops, and writes a handoff.
 - Tasks blocked past a bound alert. Tasks the world has moved past are invalidated as obsolete.
+- A task is live until it is done or invalidated. A handoff leaves search and the views built on the search index, T0 included, only when nothing live still reaches it: no task in its chain ([§4](#4-trust-and-handling)) is live; no request filed from the chain's tap item is live in any domain; and, for a chain that came from a tap, the tap has posted the chain's result upstream, or will not because the result is above the tap's ceiling. Ending its own task is not enough. The handoff is not demoted, and `get` still serves it, so a task filed for a reopened item reaches it through the predecessor that task cites.
+- Before a handoff leaves search, the curator lifts what lasts. A lifted entry is the curator's, cites the handoff, carries at least the handoff's label, and lands raw; it is promoted through the normal gates ([§4](#4-trust-and-handling)), a lifted method goes to `dom-platform` as a candidate ([§10](#10-evolving-the-system)). Auditors sample handoffs that left search for what the curator did not lift ([§5](#auditors)).
 
 ### Taps
 
-- Admission deduplicates on `origin` among a domain's live tasks, so one item is one live task. An issue and the change that fixes it are related tasks, not one.
+- Admission deduplicates on `origin` among a domain's live tasks, so one item is one live task. An issue and the change that fixes it are related tasks, not one. A request for a part of an item that belongs to more than one domain ([§8](#taps)) is the exception: dedup is on `origin` plus a hash of the part, so each part is one request.
 - An upstream close invalidates a live task and confirms a finished one. A reopen creates a new task citing its predecessor.
 - Taps are idempotent on origin and upstream event, and the origin index keeps every origin it has seen.
 - Taps reconcile by pull on a schedule. A webhook may hasten a pull but is never relied on.
 - When the registry moves a repository to another domain, its live tasks move with it.
 - Outbound writes carry the fleet's identity, which is how a tap ignores its own echoes.
+- A request for another domain's part of an item cites the item as its `origin` and says which part it is. For raw reach ([§4](#4-trust-and-handling)) it counts as a task created from the item. Its label is at least the item's, so only sessions whose handling covers that label can claim it. For other sessions, the filing session proposes a `declassify` that carries only the part ([§4](#4-trust-and-handling)). Once a guard approves it, a session that has read only the declassified entry files a new request with the same `origin` that cites it, its part hash taken over the declassified text. The item's domain flags the original request, and the receiving domain invalidates it as obsolete; a holder stops at its next heartbeat. A receiving session follows the citation only where its own grants allow.
+- When the item closes upstream, its own domain's task is invalidated or confirmed as above. A request filed from it in another domain is only flagged, and that domain decides whether to invalidate it.
+- The item's domain policy caps the requests filed from one item, so one item cannot fan out across every domain's ledger. Parts over the cap go to the owner of the item's domain.
+- A request the receiver invalidates as invalid, because the part is not its own, counts as a misroute. When one source keeps sending parts to the same other domain, the curator proposes a registry change, and a person decides it.
 
 ### Delegation
 
