@@ -374,6 +374,14 @@ impl Db {
         .await
     }
 
+    pub(crate) async fn with_origin(&self, domain: &str, origin: &str) -> Result<Vec<Task>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        self.select(&s, "WHERE origin = $1 ORDER BY created", &[&origin])
+            .await
+    }
+
     pub(crate) async fn list(&self, domain: &str, status: Status) -> Result<Vec<Task>, Error> {
         let Some(s) = self.schema(domain).await? else {
             return Ok(Vec::new());

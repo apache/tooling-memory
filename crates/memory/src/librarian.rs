@@ -359,7 +359,7 @@ fn survey_entry(
 /// The task that has a curator check a stale entry and correct or re-date it.
 fn verify_body(id: &str) -> String {
     format!(
-        "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}`: its body says what holds now, and its `source` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If it holds, also call `promote` with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff that names the entry you wrote and the one it supersedes, and says what you found and how you know; keep that out of the entry, so whoever checks it judges it on its sources first."
+        "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}`: its body says what holds now, and its `source` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If it holds, also call `promote` on the entry that write made, the id your `write` returned and not `{id}`, which it replaced, with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff that names the entry you wrote and the one it supersedes, and says what you found and how you know; keep that out of the entry, so whoever checks it judges it on its sources first."
     )
 }
 
@@ -613,6 +613,52 @@ pub(crate) mod tests {
         assert_eq!(source, "file:notes.md");
         assert!(source_file("https://x/y", dir.path()).is_none());
         assert!(source_file("mem-t-2", dir.path()).is_none());
+    }
+
+    #[test]
+    fn a_verify_task_promotes_the_entry_it_wrote_not_the_one_it_read() {
+        let e = dm_core::Entry {
+            front: dm_core::Frontmatter {
+                id: "mem-t-1".into(),
+                entry_type: EntryType::Fact,
+                domain: "dom-t".into(),
+                author: "a".into(),
+                created: time::OffsetDateTime::now_utc(),
+                source: Vec::new(),
+                confidence: None,
+                trust_tier: TrustTier::Raw,
+                review_by: Some(time::OffsetDateTime::now_utc().date() - time::Duration::days(1)),
+                supersedes: None,
+                policy_context: Vec::new(),
+                classification: dm_core::Label::Public,
+                status: None,
+                origin: None,
+                summary: Some(
+                    "The wiki stays on MoinMoin until the S2 spike says otherwise.".into(),
+                ),
+                title: Some("Wiki".into()),
+            },
+            body: "b".into(),
+        };
+        let mut out = Vec::new();
+        let today = time::OffsetDateTime::now_utc().date();
+        survey_entry(
+            &e,
+            e.front.summary.as_deref().unwrap_or(""),
+            &Options::default(),
+            today,
+            &mut out,
+        );
+        let verify = out
+            .iter()
+            .find(|p| p.kind == Kind::Verify)
+            .expect("a verify task");
+        // the write that confirms it replaces it, so `mem-t-1` is superseded by then
+        assert!(
+            verify.body.contains("the id your `write` returned"),
+            "{}",
+            verify.body
+        );
     }
 
     #[test]
