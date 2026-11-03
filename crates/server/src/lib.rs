@@ -1176,18 +1176,30 @@ impl Memory {
         l: &mut Ledger,
         record: &dm_ledger::PromotionSpec,
     ) -> Result<(), Error> {
+        if self.scrub_erased(l, record).await? {
+            return Err(not_live(&record.entry, Status::Erased));
+        }
+        Ok(())
+    }
+
+    /// [`Memory::scrub_if_erased`] that says whether the entry was erased, for a caller
+    /// that goes on after it. Returns true when it was, and its whys are out.
+    async fn scrub_erased(
+        &self,
+        l: &mut Ledger,
+        record: &dm_ledger::PromotionSpec,
+    ) -> Result<bool, Error> {
         let (domain, id) = (record.domain.as_str(), record.entry.as_str());
         let erased = self
             .store
             .get(domain, id)
             .await?
             .is_some_and(|e| e.front.status == Some(Status::Erased));
-        if !erased {
-            return Ok(());
+        if erased {
+            l.scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
+                .await?;
         }
-        l.scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
-            .await?;
-        Err(not_live(id, Status::Erased))
+        Ok(erased)
     }
 
     /// File a proposal to verify the entry as it now stands. The proposal names the
@@ -3109,14 +3121,24 @@ impl Memory {
         imported.excerpts = self
             .restore_excerpts(&domain, carried, &imported, default, &erased)
             .await?;
-        {
-            let mut l = self.ledger.lock().await;
-            for r in &imported.promotions {
-                l.restore_promotion(r).await?;
-            }
-        }
+        self.restore_promotions(&imported.promotions).await?;
         self.refresh_projection().await;
         Ok(imported)
+    }
+
+    /// Restore the promotion records an import carried, about the entries as they landed.
+    /// An entry erased since it landed keeps its records without the why: each entry is
+    /// read again once its record is restored, as a promotion's is.
+    async fn restore_promotions(
+        &self,
+        records: &[dm_ledger::PromotionRecord],
+    ) -> Result<(), Error> {
+        let mut l = self.ledger.lock().await;
+        for r in records {
+            l.restore_promotion(r).await?;
+            self.scrub_erased(&mut l, &r.spec).await?;
+        }
+        Ok(())
     }
 
     /// Rebuild the index from the record and the ledger's projection from its events.
@@ -4781,6 +4803,62 @@ mod tests {
                 .windows(needle.len())
                 .any(|w| w == needle.as_bytes())
         })
+    }
+
+    /// An erasure of an entry an import just landed, between the landing and the restore
+    /// of its promotion records: the erasure's scrub ran before the records were there.
+    /// The restore reads the stub after it restores and takes the why out itself.
+    #[tokio::test]
+    async fn an_erasure_between_the_landing_and_the_restore_leaves_no_why() {
+        let marker = "passphrase-Qz7xx";
+        let (_dir, _owner, id, bundle) =
+            promoted_then_exported(&format!("tried {marker}"), Label::Restricted).await;
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        let default = there
+            .grants
+            .domains
+            .get("dom-me")
+            .map(|d| d.default_classification)
+            .unwrap_or_default();
+        // the steps of import, by hand, with the erasure between them
+        let imported = {
+            let mut ix = there.index.lock().await;
+            bundle::import(
+                &there.store,
+                &mut ix,
+                bundle::LogTo {
+                    root: home.path(),
+                    by: &there.author,
+                },
+                &there.grants.owner,
+                bundle.path(),
+                "dom-me",
+                default,
+                &HashSet::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let landed = imported.landed[&id].clone();
+        assert_eq!(imported.promotions.len(), 1, "the why travels");
+        there.erase(&landed, Reason::Requested).await.unwrap();
+        there
+            .restore_promotions(&imported.promotions)
+            .await
+            .unwrap();
+        let kept = there
+            .ledger
+            .lock()
+            .await
+            .promotions("dom-me", &landed)
+            .await
+            .unwrap();
+        assert!(
+            kept.iter().all(|r| r.spec.why.is_empty() && r.why_erased),
+            "{kept:?}"
+        );
+        assert_eq!(bundle_holds(home.path(), marker), None);
     }
 
     #[tokio::test]
