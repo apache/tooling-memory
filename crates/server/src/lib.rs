@@ -2704,14 +2704,15 @@ impl Memory {
     /// leaves the ledger, its log and its projection alike, and the receipt counts them;
     /// who promoted which version to which tier, and when, stays. Its approval tasks
     /// keep nothing of it but its id, and an open one is invalidated: nothing is left to
-    /// approve. Exports already handed out, the
-    /// transcripts of sessions that read the entry, and the queries in the read log are
-    /// beyond reach and the receipt says so.
+    /// approve. Run again once finished, it scrubs the ledger again, for a why recorded
+    /// after the first run's scrub, and is refused when nothing was left there. Exports
+    /// already handed out, the transcripts of sessions that read the entry, and the
+    /// queries in the read log are beyond reach and the receipt says so.
     ///
     /// # Errors
     ///
     /// [`Error::Denied`] for a session that is not the owner or an entry already
-    /// erased, [`Error::NotFound`] for an entry in no granted domain, or a store, index
+    /// erased with nothing left on the ledger to scrub, [`Error::NotFound`] for an entry in no granted domain, or a store, index
     /// or I/O error; an index another connection holds is [`dm_index::Error::Held`],
     /// and the erasure is finished by running it again.
     pub async fn erase(&self, id: &str, reason: Reason) -> Result<Receipt, Error> {
@@ -2737,9 +2738,7 @@ impl Memory {
         let (domain, entry) = self.find(id).await?;
         let stubbed = entry.front.status == Some(Status::Erased);
         let mut receipt = match self.store.receipt(&domain, id).await? {
-            Some(r) if r.is_finished() => {
-                return Err(Error::Denied(format!("{id} is already erased")));
-            }
+            Some(r) if r.is_finished() => return self.erase_again(&domain, id, r).await,
             Some(unfinished) => unfinished,
             None => {
                 let removed = if stubbed {
@@ -2775,6 +2774,34 @@ impl Memory {
             );
         }
         self.finish_erasure(&domain, id, receipt).await
+    }
+
+    /// An erasure run again once it finished: the ledger's scrub alone. A promotion can
+    /// record a why after the first run's scrub, and take it out itself only when the
+    /// ledger lets it; this takes out what it left. The scrub counts every record without
+    /// a why and every task it holds redacted, so counts that grew mean it found more, and
+    /// the receipt takes them; counts that did not mean the entry was erased already.
+    async fn erase_again(
+        &self,
+        domain: &str,
+        id: &str,
+        mut receipt: Receipt,
+    ) -> Result<Receipt, Error> {
+        let scrubbed = self
+            .ledger
+            .lock()
+            .await
+            .scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
+            .await?;
+        if scrubbed.records == receipt.promotion_whys_removed
+            && scrubbed.tasks == receipt.promotion_tasks_cleared
+        {
+            return Err(Error::Denied(format!("{id} is already erased")));
+        }
+        receipt.promotion_whys_removed = scrubbed.records;
+        receipt.promotion_tasks_cleared = scrubbed.tasks;
+        self.store.put_receipt(&receipt).await?;
+        Ok(receipt)
     }
 
     /// The steps of an erasure after the record's: the citing entries, the index, the
@@ -4214,6 +4241,49 @@ mod tests {
                 .collect();
             assert!(filed.is_empty(), "{to}: {filed:?}");
         }
+    }
+
+    /// A why on the ledger after a finished erasure, as a promotion whose own scrub could
+    /// not run leaves it: the owner runs the erasure again, which takes the why out and
+    /// counts it on the receipt. A run that finds nothing more is refused as before.
+    #[tokio::test]
+    async fn an_erasure_run_again_takes_out_a_why_recorded_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let x = owner
+            .write(req("The vault opens at nine.\n"))
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        let (_, entry) = lib.find(&x).await.unwrap();
+        let first = owner.erase(&x, Reason::Requested).await.unwrap();
+        assert_eq!(first.promotion_whys_removed, 0);
+        let late = lib.promotion_spec(&entry, TrustTier::Curated, &format!("tried {marker}"));
+        owner
+            .ledger
+            .lock()
+            .await
+            .record_promotion(&late)
+            .await
+            .unwrap();
+        let again = owner.erase(&x, Reason::Requested).await.unwrap();
+        assert_eq!(again.promotion_whys_removed, 1, "{again:?}");
+        assert!(again.is_finished());
+        assert_eq!(
+            owner
+                .receipt(&x)
+                .await
+                .unwrap()
+                .unwrap()
+                .promotion_whys_removed,
+            1,
+            "the stored receipt counts it"
+        );
+        assert_eq!(bundle_holds(dir.path(), marker), None);
+        let third = owner.erase(&x, Reason::Requested).await.unwrap_err();
+        assert!(third.to_string().contains("already erased"), "{third}");
     }
 
     /// An entry rewritten after it was proposed is not the entry the proposal named; the
