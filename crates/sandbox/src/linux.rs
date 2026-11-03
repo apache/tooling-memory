@@ -2,7 +2,7 @@
 //!
 //! The child unshares user, mount, network, uts and ipc namespaces, maps itself to the
 //! caller's uid, builds a new root on a tmpfs from the plan's bind mounts, pivots into it,
-//! and execs the relay. The relay (`memory relay`) then unshares a pid namespace and
+//! and execs the relay. The relay (`amem relay`) then unshares a pid namespace and
 //! spawns the harness, mounting `/proc` from inside it, so the harness is pid 1 of its
 //! own world and sees no other process.
 //!
@@ -502,7 +502,7 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
             go().map_err(|e| {
                 // std carries only the raw errno back to the parent, so say what
                 // failed here, where stderr is still the terminal
-                eprintln!("memory: sandbox: {e}");
+                eprintln!("amem: sandbox: {e}");
                 std::io::Error::other(e.to_string())
             })?;
             cloexec_from_three(open_files)
@@ -516,7 +516,7 @@ fn command(plan: &Plan) -> Result<(Command, PathBuf), Error> {
 
 /// Say what failed between fork and exec, on stderr, without allocating.
 fn say(what: &[u8]) {
-    for part in [b"memory: sandbox: ".as_slice(), what, b"\n"] {
+    for part in [b"amem: sandbox: ".as_slice(), what, b"\n"] {
         // SAFETY: a write of a buffer with its own length to stderr.
         unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
     }
@@ -647,7 +647,7 @@ fn say_the_relay_died(signal: i32, core_dumped: bool) {
     }
     let number = &digits[first..];
     let mut buf = [0u8; 96];
-    let mut n = put(&mut buf, 0, b"memory: the relay was killed by ");
+    let mut n = put(&mut buf, 0, b"amem: the relay was killed by ");
     if let Some(name) = crate::measure::signal_name(signal) {
         n = put(&mut buf, n, name.as_bytes());
         n = put(&mut buf, n, b" (signal ");
@@ -731,7 +731,7 @@ fn die_with_intermediate(pidfd: libc::c_int) -> Result<(), Error> {
     }
 }
 
-/// What `memory relay` does inside: spawn the harness and wait for it. The relay is
+/// What `amem relay` does inside: spawn the harness and wait for it. The relay is
 /// already pid 1 of the harness's namespace, courtesy of [`run`].
 ///
 /// # Errors

@@ -935,7 +935,7 @@ impl ServerHandler for McpServer {
             .tape_call(&tool, &arguments, &value, is_error)
             .await
         {
-            eprintln!("memory: {tool} was not kept on the tape: {e}");
+            eprintln!("amem: {tool} was not kept on the tape: {e}");
         }
         result
     }

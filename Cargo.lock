@@ -43,6 +43,7 @@ name = "amem"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "clap",
  "dm-client",
  "dm-core",
@@ -1034,6 +1035,7 @@ dependencies = [
  "dm-otel",
  "dm-policy",
  "dm-store",
+ "opendal",
  "opentelemetry",
  "opentelemetry_sdk",
  "rmcp",
@@ -2397,6 +2399,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef16fe6b19b73b49ce39e3e0f4cec27e54789eee5d5f752cb2d26bd3e9449686"
 dependencies = [
  "opendal-core",
+ "opendal-layer-logging",
  "opendal-service-fs",
 ]
 
@@ -2423,6 +2426,16 @@ dependencies = [
  "url",
  "uuid",
  "web-time",
+]
+
+[[package]]
+name = "opendal-layer-logging"
+version = "0.59.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6fd30cc4be601d5adf4936f3bcc186be5e09046c85b4e0f4e6c47ac10966335"
+dependencies = [
+ "log",
+ "opendal-core",
 ]
 
 [[package]]

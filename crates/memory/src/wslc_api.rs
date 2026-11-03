@@ -49,7 +49,7 @@ pub(crate) struct Mounts {
     pub host_home: Option<(String, Vec<String>)>,
 }
 
-/// The egress container: this binary as `memory inside`, the record, the shared volume,
+/// The egress container: this binary as `amem inside`, the record, the shared volume,
 /// the logins read-only, and the session's bridge as its only way out.
 pub(crate) fn egress_spec(
     l: &Launch,
@@ -357,8 +357,8 @@ mod on_windows {
         }
         for v in stale {
             match session.delete_volume(&v) {
-                Ok(()) => eprintln!("memory: removed {v}, left by a launch that was killed"),
-                Err(e) => eprintln!("memory: {v}, left by a launch that was killed, stays: {e}"),
+                Ok(()) => eprintln!("amem: removed {v}, left by a launch that was killed"),
+                Err(e) => eprintln!("amem: {v}, left by a launch that was killed, stays: {e}"),
             }
         }
     }
@@ -374,7 +374,7 @@ mod on_windows {
         if process_alive(pid) {
             return false;
         }
-        eprintln!("memory: ending {name}, left by process {pid}, which is gone");
+        eprintln!("amem: ending {name}, left by process {pid}, which is gone");
         let args = ["--session", name, "system", "session", "terminate"].map(String::from);
         wslc::run_ok(&args).is_ok()
     }
@@ -403,7 +403,7 @@ mod on_windows {
         let s = session.clone();
         Some(rt.spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("memory: interrupted; ending the session");
+                eprintln!("amem: interrupted; ending the session");
                 s.terminate().ok();
                 std::fs::remove_dir_all(&projection).ok();
                 std::process::exit(130);
@@ -429,14 +429,14 @@ mod on_windows {
         match provision(image, &store, refresh, || cli_image_id(image)) {
             Provision::Present { id } => {
                 eprintln!(
-                    "memory: {image} {} from this session's store; after a rebuild, \
-                     `memory wslc-api-check --refresh`",
+                    "amem: {image} {} from this session's store; after a rebuild, \
+                     `amem wslc-api-check --refresh`",
                     id.get(..12).unwrap_or(&id)
                 );
                 Ok(())
             }
             Provision::Pull => {
-                eprintln!("memory: pulling {image} into this session's store");
+                eprintln!("amem: pulling {image} into this session's store");
                 session.pull_image(image, None).map_err(Into::into)
             }
             Provision::Load { stale } => {
@@ -451,7 +451,7 @@ mod on_windows {
     /// `wslc save` the image to a file beside the session's disk, load it, and remove the
     /// file.
     fn load_from_cli(session: &Session, image: &str, scratch: &Path) -> Fallible<()> {
-        eprintln!("memory: loading {image} into this session's store; once per image");
+        eprintln!("amem: loading {image} into this session's store; once per image");
         let archive = scratch.join("image.tar");
         let started = std::time::Instant::now();
         let status = Command::new(wslc::wslc())
@@ -471,7 +471,7 @@ mod on_windows {
                 format!("{image} was loaded but the session's store does not list it").into(),
             );
         }
-        eprintln!("memory: loaded in {:.0?}", started.elapsed());
+        eprintln!("amem: loaded in {:.0?}", started.elapsed());
         Ok(())
     }
 

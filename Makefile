@@ -8,7 +8,7 @@ NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
 .PHONY: demo-ready podman-ready e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test no-image-push-test conformance-test conformance deny machete coverage wasm-check msrv-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
-	local-up local-down local-logs local-key local-memory launch usage golden drift taps-check taps-build wasip2-target
+	local-up local-down local-logs local-key local-memory launch usage golden corpus-check drift taps-check taps-build wasip2-target
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
 # Reads local/.env. See local/README.md.
@@ -175,6 +175,11 @@ local-memory:
 # `make check` is the pre-commit gate: fast, and what every commit must pass.
 check: wasip2-target fmt-check clippy test guard-test docs-only-test no-image-push-test wslcsdk-test conformance-test unsafe-check taps-check
 
+# The demo's Markdown, checked as the golden suites, the evals and the acts read it.
+corpus-check:
+	cargo build -p amem
+	sh scripts/corpus-check.sh target/debug/amem $(DEMO_FROM)
+
 # `make verify` is what CI runs: the gate plus dependencies, coverage, and the wasm build.
 verify: check deny machete coverage wasm-check
 
@@ -230,7 +235,7 @@ windows-target:
 	@rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-gnu$$' || \
 		{ echo "the C API binding is linted for Windows; run: rustup target add x86_64-pc-windows-gnu" >&2; exit 1; }
 
-# wslcsdk.dll, the WSL containers C API, beside the Windows memory.exe: pinned and checked.
+# wslcsdk.dll, the WSL containers C API, beside the Windows amem.exe: pinned and checked.
 wslcsdk:
 	sh scripts/fetch-wslcsdk.sh "$(or $(DEST),target/release)"
 

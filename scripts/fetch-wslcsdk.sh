@@ -1,10 +1,10 @@
 #!/bin/sh
 # Fetch wslcsdk.dll, the WSL containers C API, which does not ship with WSL: it comes in
-# the Microsoft.WSL.Containers NuGet package, and the Windows `memory.exe` loads it from
+# the Microsoft.WSL.Containers NuGet package, and the Windows `amem.exe` loads it from
 # beside itself. The package and the DLL are pinned by version and sha256, and nothing is
 # written unless both match.
 #
-#   scripts/fetch-wslcsdk.sh <directory beside memory.exe> [x64|arm64]
+#   scripts/fetch-wslcsdk.sh <directory beside amem.exe> [x64|arm64]
 #
 # WSLCSDK_NUPKG names a package already on disk instead of downloading it. To move to a
 # new SDK, change the version and all three sums together, from a package you checked.
@@ -17,7 +17,7 @@ dll_sha256_x64=f3528a5b69b777d2bf606edc1629d13ca549f1b87c9f57380dd2f2c611b30b4f
 dll_sha256_arm64=7afecfc4fc5d3133172e8c0fba763ff8266473d4f78b4cfb20386eb2865b1ab4
 
 if [ $# -lt 1 ] || [ -z "$1" ]; then
-    echo "usage: $0 <directory beside memory.exe> [x64|arm64]" >&2
+    echo "usage: $0 <directory beside amem.exe> [x64|arm64]" >&2
     exit 2
 fi
 dest=$1
