@@ -1,24 +1,30 @@
-//! The PostgreSQL backend: the same two tables and the same events, on a server several
+//! The PostgreSQL backend: the same tables and the same events, on a server several
 //! processes can share. One connection, driven by a task of its own.
 //!
 //! One schema per domain, as the reference stack partitions everything by domain: a
-//! domain's `events` and `tasks` live in a schema of their own, created when the domain
-//! files its first task, so a domain's queue is a table no other domain's claims touch
-//! and a domain can be moved, backed up or dropped as a unit. Two tables in `public`
-//! route the rest: `ledger_domains`, each domain and its schema, and `ledger_tasks`,
-//! each task id and its domain, written in the transaction that files the task, so an
-//! operation by id finds its schema in one lookup.
+//! domain's `events`, `tasks` and `promotions` live in a schema of their own, created
+//! when the domain files its first task or records its first promotion, so a domain's
+//! queue is a table no other domain's claims touch and a domain can be moved, backed up
+//! or dropped as a unit. Two tables in `public` route the rest: `ledger_domains`, each
+//! domain and its schema, and `ledger_tasks`, each task id and its domain, written in
+//! the transaction that files the task, so an operation by id finds its schema in one
+//! lookup. A promotion is no task and has no route there: it names its domain, and is
+//! read by domain.
 //!
 //! Times are stored as the RFC 3339 text the SQLite backend stores, so a row reads back
 //! exactly as it was written and a replay produces the same projection on either side.
 //! A claim takes its candidates `FOR UPDATE SKIP LOCKED`, so two claimers on two
 //! connections cannot both win the same task.
 
-use crate::{claimable, parse_time, Error, Event, RawTask, Status, Task, TaskSpec, TASK_COLUMNS};
+use crate::{
+    claimable, parse_time, Error, Event, PromotionRecord, PromotionSpec, RawPromotion, RawTask,
+    Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+};
 use dm_core::Label;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use time::OffsetDateTime;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, GenericClient, NoTls, Row};
 
@@ -69,6 +75,65 @@ CREATE TABLE IF NOT EXISTS {s}.tasks (
 CREATE INDEX IF NOT EXISTS tasks_queue ON {s}.tasks (status, priority DESC, created);
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_origin ON {s}.tasks (origin, upstream_event)
     WHERE origin IS NOT NULL AND upstream_event IS NOT NULL;
+";
+
+/// One domain's promotions, created in its schema with the rest, and added at connect to
+/// a schema made before promotions were recorded. A table an earlier shape made gets
+/// each column it lacks, so the statements hold for every shape; the index is
+/// [`PROMOTION_INDEX`], made again when the one there lacks the promoter. `{s}` is the
+/// quoted schema name.
+const PROMOTION_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS {s}.promotions (
+    seq        BIGSERIAL PRIMARY KEY,
+    domain     TEXT NOT NULL,
+    entry      TEXT NOT NULL,
+    tier       TEXT NOT NULL,
+    promoter   TEXT NOT NULL,
+    author     TEXT NOT NULL,
+    why        TEXT NOT NULL,
+    label_rank BIGINT NOT NULL,
+    digest     TEXT NOT NULL,
+    new_digest TEXT NOT NULL DEFAULT '',
+    at         TEXT NOT NULL,
+    why_erased BIGINT NOT NULL DEFAULT 0
+);
+ALTER TABLE {s}.promotions ADD COLUMN IF NOT EXISTS new_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE {s}.promotions ADD COLUMN IF NOT EXISTS why_erased BIGINT NOT NULL DEFAULT 0;
+";
+
+/// The key a promotion is kept once under. `{s}` is the quoted schema name.
+const PROMOTION_INDEX: &str = "
+CREATE UNIQUE INDEX IF NOT EXISTS promotions_version
+    ON {s}.promotions (entry, tier, digest, promoter);
+";
+
+/// Whether the promotions table `$1` names (`<schema>.promotions`, quoted) has an index
+/// `promotions_version` that the promoter is part of.
+const INDEX_HAS_PROMOTER: &str = "
+SELECT EXISTS (
+    SELECT 1 FROM pg_index i
+    JOIN pg_class ic ON ic.oid = i.indexrelid
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+    WHERE i.indrelid = to_regclass($1) AND ic.relname = 'promotions_version'
+      AND a.attname = 'promoter')
+";
+
+/// The domains whose promotions table is missing, lacks a column, or is keyed without
+/// the promoter: what a connect migrates, and nothing else.
+const DOMAINS_TO_MIGRATE: &str = "
+SELECT d.domain FROM public.ledger_domains d
+LEFT JOIN pg_class c ON c.oid = to_regclass(d.schema || '.promotions')
+WHERE c.oid IS NULL
+   OR NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid
+                  AND a.attname = 'new_digest' AND NOT a.attisdropped)
+   OR NOT EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid
+                  AND a.attname = 'why_erased' AND NOT a.attisdropped)
+   OR NOT EXISTS (SELECT 1 FROM pg_index i
+                  JOIN pg_class ic ON ic.oid = i.indexrelid
+                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+                  WHERE i.indrelid = c.oid AND ic.relname = 'promotions_version'
+                    AND a.attname = 'promoter')
+ORDER BY d.domain
 ";
 
 /// The schema a domain's tables live in: `ledger_` and the domain with anything that is
@@ -138,7 +203,26 @@ impl Db {
             known: Mutex::new(HashMap::new()),
         };
         db.migrate_shared_tables().await?;
+        db.add_promotion_tables().await?;
         Ok(db)
+    }
+
+    /// Give a promotions table to each domain schema made before promotions were
+    /// recorded, and its missing columns and key to one an earlier shape made: one
+    /// catalog query finds them, and only those are locked and migrated, so a connect
+    /// costs nothing per domain whose table is as it should be.
+    async fn add_promotion_tables(&mut self) -> Result<(), Error> {
+        let rows = self.client.query(DOMAINS_TO_MIGRATE, &[]).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.client.transaction().await?;
+        for row in &rows {
+            let domain: String = row.try_get(0)?;
+            ensure_promotions(&tx, &domain).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     fn cached(&self, domain: &str) -> Option<String> {
@@ -243,6 +327,151 @@ impl Db {
             self.remember(&spec.domain, &s);
         }
         Ok(())
+    }
+
+    /// Record a promotion unless that promoter promoted that version of the entry to that
+    /// tier already. The domain's lock is held from the check to the commit, so two
+    /// processes recording the same promotion record it once.
+    pub(crate) async fn record_promotion(
+        &mut self,
+        at: OffsetDateTime,
+        spec: &PromotionSpec,
+        why_erased: bool,
+    ) -> Result<bool, Error> {
+        let tx = self.client.transaction().await?;
+        let s = ensure_domain(&tx, &spec.domain).await?;
+        // a schema an older binary made has no table, or one of an earlier shape
+        ensure_promotion_table(&tx, &s).await?;
+        let seen = tx
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {s}.promotions
+                     WHERE entry = $1 AND tier = $2 AND digest = $3 AND promoter = $4"
+                ),
+                &[&spec.entry, &spec.tier.to_string(), &spec.digest, &spec.by],
+            )
+            .await?
+            .is_some();
+        if seen {
+            return Ok(false);
+        }
+        let key = crate::promotion_key(&spec.entry);
+        apply(
+            &tx,
+            &s,
+            &key,
+            at,
+            &Event::Promoted {
+                spec: spec.clone(),
+                why_erased,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        self.remember(&spec.domain, &s);
+        Ok(true)
+    }
+
+    /// Remove the why from an entry's promotion events and rows, in one transaction under
+    /// the domain's lock. Returns how many records of the entry hold no why now.
+    pub(crate) async fn scrub_promotions(
+        &mut self,
+        domain: &str,
+        entry: &str,
+    ) -> Result<usize, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(0);
+        };
+        let tx = self.client.transaction().await?;
+        ensure_promotions(&tx, domain).await?;
+        let n = scrub_promotions_in(&tx, &s, domain, entry).await?;
+        tx.commit().await?;
+        Ok(n)
+    }
+
+    /// Rewrite the tasks filed from `origin` to the redaction, in their events and their
+    /// rows, and invalidate the open ones, in one transaction under the domain's lock.
+    /// Returns how many tasks from that origin there are.
+    pub(crate) async fn scrub_tasks(
+        &mut self,
+        at: OffsetDateTime,
+        domain: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<usize, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(0);
+        };
+        let tx = self.client.transaction().await?;
+        lock_domain(&tx, domain).await?;
+        let n = scrub_tasks_in(&tx, &s, at, origin, redaction).await?;
+        tx.commit().await?;
+        Ok(n)
+    }
+
+    /// Both scrubs of an erasure in one transaction under the domain's lock. Returns the
+    /// records that hold no why now and the tasks from the origin.
+    pub(crate) async fn scrub_entry(
+        &mut self,
+        at: OffsetDateTime,
+        domain: &str,
+        entry: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<(usize, usize), Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok((0, 0));
+        };
+        let tx = self.client.transaction().await?;
+        ensure_promotions(&tx, domain).await?;
+        let records = scrub_promotions_in(&tx, &s, domain, entry).await?;
+        let tasks = scrub_tasks_in(&tx, &s, at, origin, redaction).await?;
+        tx.commit().await?;
+        Ok((records, tasks))
+    }
+
+    pub(crate) async fn promotions(
+        &self,
+        domain: &str,
+        entry: &str,
+    ) -> Result<Vec<PromotionRecord>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = match self
+            .client
+            .query(
+                &format!(
+                    "SELECT {PROMOTION_COLUMNS} FROM {s}.promotions
+                     WHERE domain = $1 AND entry = $2 ORDER BY seq"
+                ),
+                &[&domain, &entry],
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            // a schema an older binary made has no table, and so no promotions
+            Err(e) if e.code() == Some(&SqlState::UNDEFINED_TABLE) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        rows.iter()
+            .map(|r| {
+                RawPromotion {
+                    domain: r.try_get(0)?,
+                    entry: r.try_get(1)?,
+                    tier: r.try_get(2)?,
+                    promoter: r.try_get(3)?,
+                    author: r.try_get(4)?,
+                    why: r.try_get(5)?,
+                    label_rank: r.try_get(6)?,
+                    digest: r.try_get(7)?,
+                    new_digest: r.try_get(8)?,
+                    at: r.try_get(9)?,
+                    why_erased: r.try_get(10)?,
+                }
+                .into_record()
+            })
+            .collect()
     }
 
     /// The id of the task claimed, if any candidate qualified. The candidates are read
@@ -512,14 +741,56 @@ impl Db {
     }
 }
 
-/// Make a domain's schema and tables if they are not there, under a lock on the domain
-/// so two processes filing a domain's first task do not race to create it.
-async fn ensure_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<String, Error> {
+/// Take a domain's lock until the transaction ends.
+async fn lock_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<(), Error> {
     conn.execute(
         "SELECT pg_advisory_xact_lock(hashtext('ledger_domain:' || $1))",
         &[&domain],
     )
     .await?;
+    Ok(())
+}
+
+/// Give a domain's schema its promotions table if it has none, under the domain's lock,
+/// held until the caller's transaction ends. The schema's name comes from the routing
+/// table, read under the lock.
+async fn ensure_promotions<C: GenericClient>(conn: &C, domain: &str) -> Result<(), Error> {
+    lock_domain(conn, domain).await?;
+    let row = conn
+        .query_one(
+            "SELECT schema FROM public.ledger_domains WHERE domain = $1",
+            &[&domain],
+        )
+        .await?;
+    let s: String = row.try_get(0)?;
+    ensure_promotion_table(conn, &s).await
+}
+
+/// Make schema `s`'s promotions table if it is not there, give it each column it lacks,
+/// and make its key again when the one there lacks the promoter. The caller holds the
+/// domain's lock.
+async fn ensure_promotion_table<C: GenericClient>(conn: &C, s: &str) -> Result<(), Error> {
+    conn.batch_execute(&PROMOTION_TABLE.replace("{s}", s))
+        .await?;
+    let row = conn
+        .query_one(INDEX_HAS_PROMOTER, &[&format!("{s}.promotions")])
+        .await?;
+    let keyed_by_promoter: bool = row.try_get(0)?;
+    if !keyed_by_promoter {
+        conn.batch_execute(&format!(
+            "DROP INDEX IF EXISTS {s}.promotions_version;{}",
+            PROMOTION_INDEX.replace("{s}", s)
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// Make a domain's schema and tables if they are not there, under a lock on the domain
+/// so two processes filing a domain's first task do not race to create it. The lock is
+/// held until the caller's transaction ends.
+async fn ensure_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<String, Error> {
+    lock_domain(conn, domain).await?;
     let known = conn
         .query_opt(
             "SELECT schema FROM public.ledger_domains WHERE domain = $1",
@@ -531,8 +802,10 @@ async fn ensure_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<Strin
     }
     let s = schema_for(domain);
     conn.batch_execute(&format!(
-        "CREATE SCHEMA IF NOT EXISTS {s};{}",
-        DOMAIN_TABLES.replace("{s}", &s)
+        "CREATE SCHEMA IF NOT EXISTS {s};{}{}{}",
+        DOMAIN_TABLES.replace("{s}", &s),
+        PROMOTION_TABLE.replace("{s}", &s),
+        PROMOTION_INDEX.replace("{s}", &s)
     ))
     .await?;
     conn.execute(
@@ -602,7 +875,11 @@ async fn awaits_continuation<C: GenericClient>(conn: &C, s: &str, id: &str) -> R
 
 /// Drop one domain's projection and replay its events into it.
 async fn rebuild_domain<C: GenericClient>(conn: &C, domain: &str, s: &str) -> Result<u64, Error> {
+    // a schema an older binary made after this process connected has no promotions table
+    ensure_promotions(conn, domain).await?;
     conn.execute(&format!("DELETE FROM {s}.tasks"), &[]).await?;
+    conn.execute(&format!("DELETE FROM {s}.promotions"), &[])
+        .await?;
     conn.execute(
         "DELETE FROM public.ledger_tasks WHERE domain = $1",
         &[&domain],
@@ -625,6 +902,129 @@ async fn rebuild_domain<C: GenericClient>(conn: &C, domain: &str, s: &str) -> Re
         n += 1;
     }
     Ok(n)
+}
+
+/// The scrub of an entry's promotions in schema `s`, in the caller's transaction: the why
+/// leaves its events and its rows. Returns how many records of the entry hold no why now.
+async fn scrub_promotions_in<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    domain: &str,
+    entry: &str,
+) -> Result<usize, Error> {
+    let key = crate::promotion_key(entry);
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT seq, payload FROM {s}.events
+                 WHERE task_id = $1 AND kind = 'promoted' FOR UPDATE"
+            ),
+            &[&key],
+        )
+        .await?;
+    for row in &rows {
+        let seq: i64 = row.try_get(0)?;
+        let payload: String = row.try_get(1)?;
+        if let Some(scrubbed) = crate::scrub_payload(&key, domain, &payload)? {
+            conn.execute(
+                &format!("UPDATE {s}.events SET payload = $2 WHERE seq = $1"),
+                &[&seq, &scrubbed],
+            )
+            .await?;
+        }
+    }
+    conn.execute(
+        &format!(
+            "UPDATE {s}.promotions SET why = '', why_erased = 1
+             WHERE domain = $1 AND entry = $2 AND (why_erased = 0 OR why != '')"
+        ),
+        &[&domain, &entry],
+    )
+    .await?;
+    let row = conn
+        .query_one(
+            &format!(
+                "SELECT COUNT(*) FROM {s}.promotions
+                 WHERE domain = $1 AND entry = $2 AND why_erased = 1"
+            ),
+            &[&domain, &entry],
+        )
+        .await?;
+    let n: i64 = row.try_get(0)?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
+/// The scrub of the tasks filed from `origin` in schema `s`, in the caller's transaction:
+/// each is rewritten to the redaction and the open ones are invalidated. Returns how many
+/// tasks there are from that origin.
+async fn scrub_tasks_in<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    at: OffsetDateTime,
+    origin: &str,
+    redaction: &Redaction,
+) -> Result<usize, Error> {
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT id, status IN ('completed', 'invalidated') FROM {s}.tasks
+                 WHERE origin = $1 ORDER BY created FOR UPDATE"
+            ),
+            &[&origin],
+        )
+        .await?;
+    for row in &rows {
+        let id: String = row.try_get(0)?;
+        let terminal: bool = row.try_get(1)?;
+        if !terminal {
+            let closed = Event::Invalidated {
+                reason: redaction.reason.clone(),
+                superseded_by: None,
+            };
+            apply(conn, s, &id, at, &closed).await?;
+        }
+        redact_task(conn, s, &id, redaction).await?;
+    }
+    Ok(rows.len())
+}
+
+/// One task's events and row, rewritten to the redaction: the title and body it was
+/// filed with, the reason it was invalidated for, and the handoffs left on it or that
+/// closed it, each free text an approver may have put the entry's text in.
+async fn redact_task<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    id: &str,
+    redaction: &Redaction,
+) -> Result<(), Error> {
+    let rows = conn
+        .query(
+            &format!("SELECT seq, payload FROM {s}.events WHERE task_id = $1 FOR UPDATE"),
+            &[&id],
+        )
+        .await?;
+    for row in &rows {
+        let seq: i64 = row.try_get(0)?;
+        let payload: String = row.try_get(1)?;
+        if let Some(redacted) = crate::redact_event(id, &payload, redaction)? {
+            conn.execute(
+                &format!("UPDATE {s}.events SET payload = $2 WHERE seq = $1"),
+                &[&seq, &redacted],
+            )
+            .await?;
+        }
+    }
+    conn.execute(
+        &format!(
+            "UPDATE {s}.tasks SET title = $2, body = $3,
+                reason = CASE WHEN reason IS NULL THEN NULL ELSE $4 END,
+                handoff = CASE WHEN handoff IS NULL THEN NULL ELSE $4 END
+             WHERE id = $1"
+        ),
+        &[&id, &redaction.title, &redaction.body, &redaction.reason],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Append the event and project it, in the caller's transaction.
@@ -688,6 +1088,38 @@ async fn insert_task<C: GenericClient>(
     Ok(())
 }
 
+/// The row a `Promoted` event projects to. No route: a promotion is read by its domain.
+async fn insert_promotion<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    at: OffsetDateTime,
+    p: &PromotionSpec,
+    why_erased: bool,
+) -> Result<(), Error> {
+    conn.execute(
+        &format!(
+            "INSERT INTO {s}.promotions (domain, entry, tier, promoter, author, why,
+                label_rank, digest, new_digest, at, why_erased)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
+        ),
+        &[
+            &p.domain,
+            &p.entry,
+            &p.tier.to_string(),
+            &p.by,
+            &p.author,
+            &p.why,
+            &(p.classification as i64),
+            &p.digest,
+            &p.new_digest,
+            &crate::fmt_time(at),
+            &i64::from(why_erased),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Update the projection for one event. Replay calls this and nothing else.
 async fn project<C: GenericClient>(
     conn: &C,
@@ -703,6 +1135,9 @@ async fn project<C: GenericClient>(
     };
     let (sql, args): (&str, Vec<&(dyn ToSql + Sync)>) = match event {
         Event::Created { id: new_id, spec } => return insert_task(conn, s, new_id, at, spec).await,
+        Event::Promoted { spec, why_erased } => {
+            return insert_promotion(conn, s, at, spec, *why_erased).await
+        }
         Event::Admitted => ("SET status = 'admitted' WHERE id = $1", vec![&id]),
         Event::Claimed { holder, .. } => (
             "SET status = 'claimed', holder = $2, lease_until = $3,

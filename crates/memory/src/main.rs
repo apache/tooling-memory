@@ -602,13 +602,17 @@ enum Command {
         /// curated or verified.
         #[arg(long)]
         to: String,
-        /// What was checked, and against what.
-        #[arg(long, default_value = "")]
+        /// What was checked, and against what. Required: the ledger keeps it.
+        #[arg(long)]
         why: String,
     },
     /// Approve a proposal to promote an entry to verified. The approver did not
     /// propose it, and is a person.
     Approve { task: String },
+    /// Why each promotion of an entry was made, as JSON, oldest first. A proposal to
+    /// verified is listed, not landed until a person approves it. An auditor reads it
+    /// after judging the change, not before.
+    Promotions { id: String },
     /// The models a destination lists, as JSON: what the web form offers to pick from.
     /// Routed as a launch would be, with the destination's credential; a login mode has
     /// no list, since the login is the harness's own.
@@ -4588,6 +4592,7 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         Command::Taint { id } => json(&m.taint(&id)),
         Command::Promote { id, to, why } => json(&m.promote(&id, to.parse()?, &why).await?),
         Command::Approve { task } => json(&m.approve(&task).await?),
+        Command::Promotions { id } => json(&m.promotions(&id).await?),
         Command::Canary { op } => canary_cmd(m, op).await,
         Command::Erase { id, reason } => json(&m.erase(&id, reason.into()).await?),
         Command::Reindex => {
@@ -4748,11 +4753,12 @@ async fn bundle_cmd(m: &Memory, command: Command) -> Fallible {
             let im = m.import(&src, domain.as_deref()).await?;
             println!(
                 "imported {} entries with {} transcript excerpts, skipped {} already present, \
-                 refused {} erased here",
+                 refused {} erased here, restored {} promotion records",
                 im.written.len(),
                 im.excerpts,
                 im.skipped.len(),
-                im.erased.len()
+                im.erased.len(),
+                im.promotions.len()
             );
             Ok(())
         }
@@ -4783,6 +4789,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Erase { .. }
         | Command::Promote { .. }
         | Command::Approve { .. }
+        | Command::Promotions { .. }
         | Command::Reindex
         | Command::Policy { .. }
         | Command::Quarantine { .. }

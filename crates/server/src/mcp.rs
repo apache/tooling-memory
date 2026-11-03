@@ -194,9 +194,9 @@ pub struct PromoteParams {
     pub id: String,
     /// `curated` or `verified`.
     pub to: String,
-    /// One sentence of why: what was checked, and against what.
-    #[serde(default)]
-    pub why: Option<String>,
+    /// One sentence of why: what was checked, and against what. Required: the ledger
+    /// keeps it beside the entry.
+    pub why: String,
 }
 
 /// Parameters of `write`.
@@ -426,6 +426,7 @@ const READS: &[&str] = &[
     "t0",
     "recall",
     "transcript_turn",
+    "promotions",
     "task_tree",
     "get_task",
     "list_tasks",
@@ -665,10 +666,18 @@ impl McpServer {
             .ok_or_else(|| McpError::invalid_params("to: curated or verified", None))?;
         let r = self
             .memory
-            .promote(&p.id, to, p.why.as_deref().unwrap_or(""))
+            .promote(&p.id, to, &p.why)
             .await
             .map_err(mcp_err)?;
         ok(serde_json::to_value(r).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Why each promotion of an entry was made, oldest first: who promoted which version to which tier, the reason they gave, and whether that version reached the record (`landed`). A proposal to verified is listed from when it is made, with `landed` false until a person approves it. As an auditor, read it after you have judged the change yourself, not before, so the reasons do not lead your judgement. Only for an entry you may read, replaced ones included; reading it raises your label as a get does."
+    )]
+    async fn promotions(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+        let r = self.memory.promotions(&p.0.id).await.map_err(mcp_err)?;
+        ok(json!({ "promotions": r }))
     }
 
     #[tool(
@@ -1074,6 +1083,7 @@ mod tests {
             "fan_out",
             "task_tree",
             "retry_task",
+            "promotions",
         ] {
             assert!(
                 names.contains(&expected),

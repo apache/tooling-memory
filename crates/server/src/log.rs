@@ -185,7 +185,9 @@ pub fn state(events: &[Event]) -> BTreeMap<String, Option<(String, bool)>> {
 
 impl Memory {
     /// Write a version of an entry through its domain's log: the change is appended
-    /// first, then the record takes it. Every record write of an entry comes here.
+    /// first, then the record takes it. Every record write of an entry comes here. A
+    /// version the record refuses over an erased stub is followed in the log by the
+    /// erasure again.
     pub(crate) async fn put_logged(&self, entry: &Entry) -> Result<(), Error> {
         append(
             &self.root,
@@ -197,7 +199,14 @@ impl Memory {
                 active: entry.is_active(),
             },
         )?;
-        self.store.put(entry).await?;
+        if let Err(e) = self.store.put(entry).await {
+            // the record keeps the stub of an erased entry: the log says so again, after
+            // the version just appended, so it does not name a version the record refused
+            if matches!(e, dm_store::Error::Erased { .. }) {
+                self.log_erased(&entry.front.domain, &entry.front.id)?;
+            }
+            return Err(e.into());
+        }
         // the record marks the entry this one replaces as superseded as it takes it: that
         // version goes in the log too, so the log says what the record holds. The digest is
         // of the stored text: the record leaves an inactive entry as it was written, which
@@ -567,6 +576,30 @@ mod tests {
         .unwrap();
         let path = dir.path().join(format!("record/dom-me/{old}.md"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let done = m.materialize(None).await.unwrap();
+        assert!(done.behind.is_empty(), "{done:?}");
+    }
+
+    /// A writer that read an entry before it was erased writes a version of it: the
+    /// record refuses it, and the log says what the record holds, that the entry is
+    /// erased, not that the version it refused is live.
+    #[tokio::test]
+    async fn a_write_the_record_refuses_over_a_stub_leaves_the_log_saying_erased() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let id = m.write(req("# Key\n\nOn the wiki.\n")).await.unwrap().id;
+        let (_, mut read) = m.find(&id).await.unwrap();
+        m.erase(&id, dm_core::erasure::Reason::Mistaken)
+            .await
+            .unwrap();
+        read.front.trust_tier = dm_core::TrustTier::Curated;
+        let refused = m.put_logged(&read).await;
+        assert!(
+            matches!(&refused, Err(Error::Store(dm_store::Error::Erased { .. }))),
+            "{refused:?}"
+        );
+        let events = m.log(None, 0).unwrap();
+        assert_eq!(state(&events).get(&id), Some(&None), "{events:?}");
         let done = m.materialize(None).await.unwrap();
         assert!(done.behind.is_empty(), "{done:?}");
     }

@@ -116,6 +116,18 @@ pub struct Receipt {
     /// Copies this erasure could not reach, named so nobody believes it did.
     #[serde(default)]
     pub unresolved: Vec<String>,
+    /// How many records of the entry's promotions had their why removed from the
+    /// ledger. Who promoted which version to which tier, and when, is kept.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub promotion_whys_removed: usize,
+    /// How many approval tasks of the entry's promotions now name it by its id alone:
+    /// their title and body were rewritten, and the open ones closed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub promotion_tasks_cleared: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// The line a receipt carries while an erasure has not finished: the record step is done
@@ -166,6 +178,8 @@ mod tests {
             removed: vec![],
             flagged: vec![],
             unresolved: vec![],
+            promotion_whys_removed: 0,
+            promotion_tasks_cleared: 0,
         };
         assert!(r.is_finished());
         r.unresolved.push(UNFINISHED.into());
@@ -188,6 +202,8 @@ mod tests {
             }],
             flagged: vec!["mem-me-00000002".into()],
             unresolved: vec!["exports issued before the erasure".into()],
+            promotion_whys_removed: 0,
+            promotion_tasks_cleared: 0,
         };
         let text = r.to_yaml();
         assert!(text.contains("reason: requested"));

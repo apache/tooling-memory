@@ -186,6 +186,20 @@ pub enum Promotion {
     },
 }
 
+/// A promotion as [`Memory::promotions`] serves it: the ledger's record, and whether the
+/// version it writes is in the record now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PromotionView {
+    /// What the ledger keeps.
+    #[serde(flatten)]
+    pub record: dm_ledger::PromotionRecord,
+    /// Whether the version this promotion writes is the entry's current version or one
+    /// in its history. False for a promotion whose new version was never written. Two
+    /// promoters of one version write the same text, so this says the version landed,
+    /// not whose write it was.
+    pub landed: bool,
+}
+
 /// The record's policy entries, active, in every granted domain, at any tier: read
 /// through the index and the files the record keeps, so the policy can be compiled
 /// where no runtime is at hand. Policy is enforced whatever a session may read, so the
@@ -1077,21 +1091,42 @@ impl Memory {
     /// Promote an entry: to curated at once where the policy allows it, by anyone but
     /// its author; to verified only by proposal, which files a task for a person to
     /// approve with [`Memory::approve`]. The entry is never edited in place: a
-    /// promotion is a new version of it, the old one kept in its history.
+    /// promotion is a new version of it, the old one kept in its history. Every
+    /// promotion says why, and the why is kept on the ledger, never in the entry nor in
+    /// a task: a promotion is recorded there before its new version is written or its
+    /// proposal filed, and [`Memory::promotions`] reads it back. A proposal's task names
+    /// the entry, the proposer and the author, and points there.
     ///
     /// # Errors
     ///
     /// [`Error::NotFound`] for an entry this session cannot read; for one it could read
     /// that is no longer served, [`Error::Moved`] or [`Error::Gone`] as from
-    /// [`Memory::get`]; [`Error::Denied`] when the policy refuses, the entry is not live,
-    /// the entry is already at or above the tier, or a proposal of this version is open
-    /// by another principal or was closed.
+    /// [`Memory::get`]; [`Error::Denied`] for an empty why, when the policy refuses, the
+    /// entry is not live, the entry is already at or above the tier, or a proposal of
+    /// this version is open by another principal or was closed.
     pub async fn promote(&self, id: &str, to: TrustTier, why: &str) -> Result<Promotion, Error> {
+        let why = why.trim();
+        if why.is_empty() {
+            return Err(Error::Denied(
+                "a promotion says why: what was checked, and against what".into(),
+            ));
+        }
         let f = self.session_filter()?;
         if self.index.lock().await.meta(id, &f)?.is_none() {
             return Err(self.not_served(id, None).await);
         }
         let (_, entry) = self.find(id).await?;
+        self.promote_entry(entry, to, why).await
+    }
+
+    /// [`Memory::promote`] from the entry as the record held it when it was read.
+    async fn promote_entry(
+        &self,
+        entry: Entry,
+        to: TrustTier,
+        why: &str,
+    ) -> Result<Promotion, Error> {
+        let id = entry.front.id.as_str();
         // the index can lag the record: the record says whether it is live
         if let Some(status) = entry.front.status {
             return Err(not_live(id, status));
@@ -1111,29 +1146,117 @@ impl Memory {
         if !d.allow {
             return Err(Error::Denied(d.reason));
         }
-        if to != TrustTier::Verified {
-            return self.set_tier(entry, to).await;
+        if to == TrustTier::Verified {
+            return self.propose(entry, why).await;
         }
-        self.propose(entry, why).await
+        // the record first: a promotion the ledger cannot keep is not made, and one whose
+        // new version fails is made again with the record it already has
+        let record = self.promotion_spec(&entry, to, why);
+        {
+            let mut l = self.ledger.lock().await;
+            l.record_promotion(&record).await?;
+            self.scrub_if_erased(&mut l, &record).await?;
+        }
+        self.set_tier(entry, to).await
+    }
+
+    /// The entry of `record`, read from the record again once `record` is on the ledger.
+    /// An erasure that ran whole since the entry was read scrubbed the ledger before the
+    /// record was there, and does not run again: the stub, which an erasure writes before
+    /// it scrubs, says so, and the scrub runs here instead, under the lock `l` the record
+    /// was written under. An erasure that writes its stub after this read scrubs the record
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for an erased entry, once its whys are out; a store or ledger
+    /// error.
+    async fn scrub_if_erased(
+        &self,
+        l: &mut Ledger,
+        record: &dm_ledger::PromotionSpec,
+    ) -> Result<(), Error> {
+        if self.scrub_erased(l, record).await? {
+            return Err(not_live(&record.entry, Status::Erased));
+        }
+        Ok(())
+    }
+
+    /// [`Memory::scrub_if_erased`] that says whether the entry was erased, for a caller
+    /// that goes on after it. Returns true when it was, and its whys are out.
+    ///
+    /// # Errors
+    ///
+    /// A store or ledger error. When another connection holds the ledger's log, the
+    /// rows are rewritten and the log still holds the why: the erasure's receipt goes
+    /// back to unfinished, since running this operation again finds the entry erased and
+    /// does not scrub, and the [`dm_ledger::Error::Held`] says to run the erasure again.
+    async fn scrub_erased(
+        &self,
+        l: &mut Ledger,
+        record: &dm_ledger::PromotionSpec,
+    ) -> Result<bool, Error> {
+        let (domain, id) = (record.domain.as_str(), record.entry.as_str());
+        let erased = self
+            .store
+            .get(domain, id)
+            .await?
+            .is_some_and(|e| e.front.status == Some(Status::Erased));
+        if !erased {
+            return Ok(false);
+        }
+        match l
+            .scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(dm_ledger::Error::Held(what)) => {
+                self.reopen_erasure(domain, id).await?;
+                Err(dm_ledger::Error::Held(format!(
+                    "{what}, after {id} was erased; run `erase {id}` again to finish its erasure"
+                ))
+                .into())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Put a finished erasure's receipt back to unfinished, so the next
+    /// [`Memory::erase`] runs its steps again rather than refusing.
+    async fn reopen_erasure(&self, domain: &str, id: &str) -> Result<(), Error> {
+        if let Some(mut receipt) = self.store.receipt(domain, id).await? {
+            if receipt.is_finished() {
+                receipt.unresolved.push(erasure::UNFINISHED.into());
+                self.store.put_receipt(&receipt).await?;
+            }
+        }
+        Ok(())
     }
 
     /// File a proposal to verify the entry as it now stands. The proposal names the
     /// version, `verified:<digest>`, and the ledger keeps one task for each entry and
     /// version: a new version is a new proposal, and a proposal of an older one closes as
-    /// stale. The slot is checked before anything is admitted, under the ledger's lock.
+    /// stale. The slot is checked before anything is admitted, under the ledger's lock,
+    /// and the proposal is recorded as a promotion only when the slot is free: one
+    /// refused, or one handed its own open task back, records nothing. The record and
+    /// the task name one version, the record's digest, so what [`Memory::approve`] reads
+    /// from the task and what [`Memory::promotions`] shows are the same proposal. The
+    /// record is written before the task, as a direct promotion's is before its version:
+    /// a proposal the ledger cannot keep is not filed, and one whose task fails is filed
+    /// again with the record it already has.
     async fn propose(&self, entry: Entry, why: &str) -> Result<Promotion, Error> {
         let id = entry.front.id.clone();
-        let origin = format!("promote:{id}");
-        let event = verify_event(&entry);
+        let origin = proposal_origin(&id);
+        let record = self.promotion_spec(&entry, TrustTier::Verified, why);
+        let event = verify_event(&record.digest);
         let spec = self.stamp(
             TaskSpec {
                 domain: entry.front.domain.clone(),
-                title: format!(
-                    "Approve: verified for {}",
-                    entry.front.title.as_deref().unwrap_or(&id)
-                ),
+                // by id, not title: an erasure of the entry takes its title with it, and
+                // the task then has nothing of the entry to lose but the id a stub keeps
+                title: proposal_title(&id),
                 body: format!(
-                    "`{}` proposes that `{id}`, written by `{}`, be promoted to verified.\n\n{why}\n\nRead it with `amem get {id}`. Approve with `amem approve <this task>` if it holds; a person who did not propose it approves, and an agent never does. Invalidate this task to decline.",
+                    "`{}` proposes that `{id}`, written by `{}`, be promoted to verified.\n\nRead it with `amem get {id}` and judge it first. Then read why it was proposed, on the ledger: `amem promotions {id}`. Approve with `amem approve <this task>` if it holds; a person who did not propose it approves, and an agent never does. Invalidate this task to decline.",
                     self.author, entry.front.author
                 ),
                 requirements: vec!["human".into()],
@@ -1149,9 +1272,16 @@ impl Memory {
         )?;
         let domain = spec.domain.clone();
         let mut l = self.ledger.lock().await;
+        if let Some(task) = l.by_origin(&domain, &origin, &event).await? {
+            return self.slot_taken(task);
+        }
+        l.record_promotion(&record).await?;
+        self.scrub_if_erased(&mut l, &record).await?;
         let created = match l.create(spec).await {
             Ok(c) => c,
-            // another process filed the same slot between the look and the insert
+            // another process filed the same slot between the look and the insert; its
+            // task is what this proposal gets, and the record just written stands for a
+            // proposal that was made and merged
             Err(e) => match l.by_origin(&domain, &origin, &event).await? {
                 Some(task) => Created {
                     task,
@@ -1166,8 +1296,11 @@ impl Memory {
         let task = self
             .admit_per_policy(&mut l, created.task, Filing::Own, None)
             .await?;
+        // a proposal this session may not see is left for a session that may: closing it
+        // would act on work it cannot read
+        let handling = self.handling()?;
         for t in l.with_origin(&domain, &origin).await? {
-            if t.id != task.id && !t.status.is_terminal() {
+            if t.id != task.id && !t.status.is_terminal() && self.sees(&t, handling) {
                 l.invalidate(
                     &t.id,
                     &format!(
@@ -1185,11 +1318,20 @@ impl Memory {
     }
 
     /// What a proposal of a version gets when that version has a task already: its own
-    /// open task back. Another principal's open task is not joined, since
+    /// open task back, when this session may see it, and a refusal that names nothing of
+    /// it when not. Another principal's open task is not joined, since
     /// [`Memory::approve`] knows only who filed it and a proposer never approves its
     /// own; a closed task, declined or done, is not proposed again until the entry
     /// changes, and is never handed back as if it had been filed.
     fn slot_taken(&self, t: Task) -> Result<Promotion, Error> {
+        // a task this session may not see is not handed out, and the answer names nothing
+        // of it: not its id, its status, nor who filed it
+        if !self.sees(&t, self.handling()?) {
+            return Err(Error::Denied(
+                "this version of the entry is proposed already, in a task this session may not read"
+                    .into(),
+            ));
+        }
         if t.status.is_terminal() {
             return Err(Error::Denied(format!(
                 "task {} closed the proposal to verify this version of the entry ({:?}{}); it is not proposed again until the entry changes",
@@ -1217,8 +1359,8 @@ impl Memory {
     /// # Errors
     ///
     /// [`Error::Denied`] for a task that is not a live promotion proposal, an entry
-    /// that is not live, or an approval the policy refuses; a ledger error for a task
-    /// another holds, or a store error.
+    /// that is not live or that changed since it was proposed, or an approval the policy
+    /// refuses; a ledger error for a task another holds, or a store error.
     pub async fn approve(&self, task_id: &str) -> Result<Promotion, Error> {
         let task = self.ledger.lock().await.get(task_id).await?;
         self.check_task(&task)?;
@@ -1330,6 +1472,106 @@ impl Memory {
             )));
         }
         Ok((id.to_string(), entry))
+    }
+
+    /// Why each promotion of an entry was made, oldest first: who moved which version to
+    /// which tier, the reason they gave, and whether that version reached the record. A
+    /// proposal to verified is here from when it is made, and lands when a person
+    /// approves it. Reading it is reading the entry: only for an entry this session
+    /// may read, replaced or demoted ones included and erased ones never; the session's
+    /// label rises to the entry's classification as a [`Memory::get`] would raise it, and
+    /// to each record's; the read log says the entry was read. A record above what the
+    /// session may handle is left out.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an entry this session cannot read, or a store, index or
+    /// ledger error.
+    pub async fn promotions(&self, id: &str) -> Result<Vec<PromotionView>, Error> {
+        let mut f = self.session_filter()?;
+        // why an entry was promoted outlives the version: replaced ones are read too
+        f.include_inactive = true;
+        let Some(meta) = self.index.lock().await.meta(id, &f)? else {
+            return Err(Error::NotFound(id.to_string()));
+        };
+        let domain = meta.hit.domain;
+        let entry = self
+            .store
+            .get(&domain, id)
+            .await?
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        if entry.front.status == Some(Status::Erased)
+            || !lock(&self.session).observe(entry.front.classification)
+        {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        let records = self.ledger.lock().await.promotions(&domain, id).await?;
+        let versions: HashSet<String> = self
+            .store
+            .digests(&domain, id)
+            .await?
+            .into_iter()
+            .map(|v| v.digest)
+            .collect();
+        let readable = self.readable_promotions(records, &versions);
+        let tokens = readable
+            .iter()
+            .map(|p| dm_core::approx_tokens(&p.record.spec.why))
+            .sum();
+        self.reads.served_ids(
+            "promotions",
+            None,
+            readable.len(),
+            tokens,
+            false,
+            None,
+            &[id.to_string()],
+        );
+        Ok(readable)
+    }
+
+    /// The records this session may handle, each raising its label, and whether the
+    /// version each writes is among `versions`.
+    fn readable_promotions(
+        &self,
+        records: Vec<dm_ledger::PromotionRecord>,
+        versions: &HashSet<String>,
+    ) -> Vec<PromotionView> {
+        let mut session = lock(&self.session);
+        let handling = session.handling;
+        let mut readable = Vec::new();
+        for r in records {
+            if r.spec.classification <= handling {
+                session.observe(r.spec.classification);
+                let landed = versions.contains(&r.spec.new_digest);
+                readable.push(PromotionView { record: r, landed });
+            }
+        }
+        readable
+    }
+
+    /// The record of a promotion, on the ledger and not in the entry: the version
+    /// promoted, by whom, and why, so an auditor finds the reason beside the change. The
+    /// ledger keeps it once per promoter and version, so a retry adds nothing, and a
+    /// failed promotion's record never stands in for another promoter's. It carries the
+    /// digest of the version it writes as well as the one it promotes. It is classified as
+    /// the entry is, or as this session's label if that is higher, since the why is the
+    /// session's own text.
+    fn promotion_spec(&self, entry: &Entry, to: TrustTier, why: &str) -> dm_ledger::PromotionSpec {
+        // the version set_tier will write, so a reader can tell whether it was
+        let mut promoted = entry.clone();
+        promoted.front.trust_tier = to;
+        dm_ledger::PromotionSpec {
+            domain: entry.front.domain.clone(),
+            entry: entry.front.id.clone(),
+            tier: to,
+            by: self.author.clone(),
+            author: entry.front.author.clone(),
+            why: why.to_string(),
+            classification: entry.front.classification.max(self.label()),
+            digest: dm_core::digest(&entry.render()),
+            new_digest: dm_core::digest(&promoted.render()),
+        }
     }
 
     fn decide_promotion(
@@ -1763,18 +2005,21 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// An ungranted domain, a proposal's origin, or a ledger or policy error;
-    /// [`Error::Denied`] when the origin and upstream event name a task already filed
-    /// that this session may not read.
+    /// An ungranted domain, or a ledger or policy error; [`Error::Denied`] for a
+    /// `promote:` origin, which only [`Memory::promote`] files, or when the origin and
+    /// upstream event name a task already filed that this session may not read.
     pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
+        // a task from this origin is an approval task: approve reads its event as the
+        // version proposed and its filer as the proposer, so one filed here would be a
+        // proposal nobody made
         if spec
             .origin
             .as_deref()
-            .is_some_and(|o| o.starts_with("promote:"))
+            .is_some_and(|o| o.starts_with(PROPOSAL_ORIGIN))
         {
-            return Err(Error::Denied(
-                "a proposal to verify is filed by promote, not as a task".into(),
-            ));
+            return Err(Error::Denied(format!(
+                "a task with origin {PROPOSAL_ORIGIN}<id> is an approval task: only promote files one"
+            )));
         }
         let mut l = self.ledger.lock().await;
         let held = match self.held.get() {
@@ -2485,6 +2730,9 @@ impl Memory {
         let scope = bundle::export_scope(&self.session_filter()?, &domain, max_label)?;
         // the index is read and released before the record is, so the future is Send
         let hits = self.index.lock().await.list(&scope, None, usize::MAX / 2)?;
+        let promotions = self
+            .promotions_to_carry(&domain, &hits, scope.handling)
+            .await?;
         let ex = bundle::export(
             &self.store,
             hits,
@@ -2492,6 +2740,7 @@ impl Memory {
             max_label,
             &self.grants.owner,
             dest,
+            promotions,
         )
         .await?;
         self.export_excerpts(&domain, &ex.manifest.entries, max_label, dest)
@@ -2506,15 +2755,19 @@ impl Memory {
     /// the index, the served bundles; then the receipt again without that line. A run
     /// that stops short leaves that receipt, and the next run picks up where it stopped,
     /// keeping the first run's reason. Entries that cite the erased one are flagged for
-    /// review today rather than re-derived here. An open proposal to verify the entry is
-    /// invalidated: nothing is left to approve. Exports already handed out, the
-    /// transcripts of sessions that read the entry, and the queries in the read log are
-    /// beyond reach and the receipt says so.
+    /// review today rather than re-derived here. The why of each promotion of the entry
+    /// leaves the ledger, its log and its projection alike, and the receipt counts them;
+    /// who promoted which version to which tier, and when, stays. Its approval tasks
+    /// keep nothing of it but its id, and an open one is invalidated: nothing is left to
+    /// approve. Run again once finished, it scrubs the ledger again, for a why recorded
+    /// after the first run's scrub, and is refused when nothing was left there. Exports
+    /// already handed out, the transcripts of sessions that read the entry, and the
+    /// queries in the read log are beyond reach and the receipt says so.
     ///
     /// # Errors
     ///
     /// [`Error::Denied`] for a session that is not the owner or an entry already
-    /// erased, [`Error::NotFound`] for an entry in no granted domain, or a store, index
+    /// erased with nothing left on the ledger to scrub, [`Error::NotFound`] for an entry in no granted domain, or a store, index
     /// or I/O error; an index another connection holds is [`dm_index::Error::Held`],
     /// and the erasure is finished by running it again.
     pub async fn erase(&self, id: &str, reason: Reason) -> Result<Receipt, Error> {
@@ -2540,9 +2793,7 @@ impl Memory {
         let (domain, entry) = self.find(id).await?;
         let stubbed = entry.front.status == Some(Status::Erased);
         let mut receipt = match self.store.receipt(&domain, id).await? {
-            Some(r) if r.is_finished() => {
-                return Err(Error::Denied(format!("{id} is already erased")));
-            }
+            Some(r) if r.is_finished() => return self.erase_again(&domain, id, r).await,
             Some(unfinished) => unfinished,
             None => {
                 let removed = if stubbed {
@@ -2560,6 +2811,8 @@ impl Memory {
                     removed,
                     flagged: Vec::new(),
                     unresolved: vec![erasure::UNFINISHED.into()],
+                    promotion_whys_removed: 0,
+                    promotion_tasks_cleared: 0,
                 };
                 self.store.put_receipt(&pending).await?;
                 pending
@@ -2578,8 +2831,36 @@ impl Memory {
         self.finish_erasure(&domain, id, receipt).await
     }
 
+    /// An erasure run again once it finished: the ledger's scrub alone. A promotion can
+    /// record a why after the first run's scrub, and take it out itself only when the
+    /// ledger lets it; this takes out what it left. The scrub counts every record without
+    /// a why and every task it holds redacted, so counts that grew mean it found more, and
+    /// the receipt takes them; counts that did not mean the entry was erased already.
+    async fn erase_again(
+        &self,
+        domain: &str,
+        id: &str,
+        mut receipt: Receipt,
+    ) -> Result<Receipt, Error> {
+        let scrubbed = self
+            .ledger
+            .lock()
+            .await
+            .scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
+            .await?;
+        if scrubbed.records == receipt.promotion_whys_removed
+            && scrubbed.tasks == receipt.promotion_tasks_cleared
+        {
+            return Err(Error::Denied(format!("{id} is already erased")));
+        }
+        receipt.promotion_whys_removed = scrubbed.records;
+        receipt.promotion_tasks_cleared = scrubbed.tasks;
+        self.store.put_receipt(&receipt).await?;
+        Ok(receipt)
+    }
+
     /// The steps of an erasure after the record's: the citing entries, the index, the
-    /// served bundles, every render and the open proposal to verify it; then the
+    /// served bundles, every render, and the ledger's whys and approval tasks; then the
     /// receipt, closed.
     async fn finish_erasure(
         &self,
@@ -2604,15 +2885,22 @@ impl Memory {
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
         let missed = self.erase_from_projections(domain, id);
-        // the ledger last: one another connection holds stops the erasure here, with the
-        // text already out of the index and the renders, and a rerun finishes it
-        self.close_proposals(
-            domain,
-            id,
-            &format!("{id} was erased; nothing is left to verify"),
-        )
-        .await?;
+        // the whys of its promotions are the entry's text too, and so is what its
+        // approval tasks say of it; who promoted what stays, and so does each task's id.
+        // The scrub closes every open proposal to verify the entry, of any version, as
+        // it rewrites it. Last of the steps, since a ledger another connection holds
+        // stops here: the index and the renders are clean by then, and the receipt stays
+        // unfinished
+        let scrubbed = self
+            .ledger
+            .lock()
+            .await
+            .scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
+            .await?;
+        receipt.promotion_tasks_cleared = scrubbed.tasks;
+        receipt.promotion_whys_removed = scrubbed.records;
         close_receipt(&mut receipt, missed);
+        receipt.unresolved.extend(scrubbed.beyond_reach);
         self.store.put_receipt(&receipt).await?;
         self.refresh_projection_after_erasure().await;
         Ok(receipt)
@@ -2632,8 +2920,10 @@ impl Memory {
         Ok(None)
     }
 
-    /// Invalidate every open proposal to verify an entry that is gone, of any version,
-    /// so the board stops offering them. A proposal already closed is left as it is.
+    /// Invalidate every open proposal to verify an entry that was replaced, of any
+    /// version, so the board stops offering them. A proposal already closed is left as it
+    /// is. An erasure closes its proposals through the scrub instead, which rewrites them
+    /// too.
     async fn close_proposals(&self, domain: &str, id: &str, why: &str) -> Result<(), Error> {
         let mut l = self.ledger.lock().await;
         for t in l.with_origin(domain, &format!("promote:{id}")).await? {
@@ -2655,13 +2945,39 @@ impl Memory {
     }
 }
 
+/// The prefix of the origin of approval tasks: `promote:` and the entry's id.
+const PROPOSAL_ORIGIN: &str = "promote:";
+
+/// The origin of the approval tasks of proposals to promote `id` to verified.
+fn proposal_origin(id: &str) -> String {
+    format!("{PROPOSAL_ORIGIN}{id}")
+}
+
+/// The title of an approval task: the entry by id, and nothing else of it.
+fn proposal_title(id: &str) -> String {
+    format!("Approve: verified for {id}")
+}
+
+/// What an erasure of `id` rewrites its approval tasks to: the id a stub keeps, and
+/// nothing of the entry's title, nor of the why a task filed before the ledger kept the
+/// why held in its body.
+fn proposal_redaction(id: &str) -> dm_ledger::Redaction {
+    dm_ledger::Redaction {
+        title: proposal_title(id),
+        body: format!(
+            "`{id}` was erased, and this proposal is closed with it. Nothing of the entry, nor of why it was proposed, is kept here."
+        ),
+        reason: format!("{id} was erased"),
+    }
+}
+
 /// What the upstream event of a proposal to verify starts with; the digest of the
 /// version proposed follows. Filed with origin `promote:<id>`.
 const VERIFY_PREFIX: &str = "verified:";
 
-/// The upstream event of a proposal to verify the entry as it now stands.
-fn verify_event(entry: &Entry) -> String {
-    format!("{VERIFY_PREFIX}{}", dm_core::digest(&entry.render()))
+/// The upstream event of a proposal to verify the version of an entry with `digest`.
+fn verify_event(digest: &str) -> String {
+    format!("{VERIFY_PREFIX}{digest}")
 }
 
 /// Why an entry that is not live is not promoted.
@@ -2767,8 +3083,28 @@ impl Memory {
         Ok(())
     }
 
+    /// The promotion records of `hits`, at or below `bound`, for an export to carry.
+    async fn promotions_to_carry(
+        &self,
+        domain: &str,
+        hits: &[Hit],
+        bound: Label,
+    ) -> Result<Vec<dm_ledger::PromotionRecord>, Error> {
+        let l = self.ledger.lock().await;
+        let mut out = Vec::new();
+        for h in hits {
+            out.extend(
+                l.promotions(domain, &h.id)
+                    .await?
+                    .into_iter()
+                    .filter(|r| r.spec.classification <= bound),
+            );
+        }
+        Ok(out)
+    }
+
     /// Import a bundle into a granted domain. Entries land raw unless this owner
-    /// exported them.
+    /// exported them; then why they were promoted lands with them, on the ledger.
     ///
     /// # Errors
     ///
@@ -2816,8 +3152,24 @@ impl Memory {
         imported.excerpts = self
             .restore_excerpts(&domain, carried, &imported, default, &erased)
             .await?;
+        self.restore_promotions(&imported.promotions).await?;
         self.refresh_projection().await;
         Ok(imported)
+    }
+
+    /// Restore the promotion records an import carried, about the entries as they landed.
+    /// An entry erased since it landed keeps its records without the why: each entry is
+    /// read again once its record is restored, as a promotion's is.
+    async fn restore_promotions(
+        &self,
+        records: &[dm_ledger::PromotionRecord],
+    ) -> Result<(), Error> {
+        let mut l = self.ledger.lock().await;
+        for r in records {
+            l.restore_promotion(r).await?;
+            self.scrub_erased(&mut l, &r.spec).await?;
+        }
+        Ok(())
     }
 
     /// Rebuild the index from the record and the ledger's projection from its events.
@@ -3274,6 +3626,1803 @@ mod tests {
             .filter(|p| p.to_string_lossy().contains(&theirs))
             .count();
         assert!(versions >= 2, "the raw version is kept: {versions}");
+    }
+
+    const WHY: &str = "checked against the tree";
+
+    /// A session of the librarian, which did not write the owner's entries.
+    fn librarian(dir: &Path) -> Memory {
+        Memory::open(dir).unwrap().with_author("agent:librarian")
+    }
+
+    /// Every task in the session's domain, whatever its status.
+    async fn all_tasks(m: &Memory) -> Vec<Task> {
+        let mut out = Vec::new();
+        for st in [
+            Status::Proposed,
+            Status::Admitted,
+            Status::Claimed,
+            Status::Completed,
+            Status::Invalidated,
+        ] {
+            out.extend(m.tasks(None, st).await.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_promotion_to_curated_is_recorded_on_the_ledger_and_is_no_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let raw = owner.get(&theirs).await.unwrap();
+        let agent = librarian(dir.path());
+        let before = all_tasks(&agent).await;
+        agent
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let after = all_tasks(&agent).await;
+        assert_eq!(after, before, "a promotion files no task");
+        let records = agent.promotions(&theirs).await.unwrap();
+        assert_eq!(records.len(), 1, "one record: {records:?}");
+        assert!(records[0].landed);
+        let r = &records[0].record.spec;
+        assert_eq!(r.entry, theirs);
+        assert_eq!(r.why, WHY);
+        assert_eq!(r.tier, TrustTier::Curated);
+        assert_eq!(r.by, "agent:librarian");
+        assert_eq!(r.author, "human:test:me");
+        assert_eq!(
+            r.digest,
+            dm_core::digest(&raw.render()),
+            "the version promoted"
+        );
+        assert_eq!(
+            r.new_digest,
+            dm_core::digest(&agent.get(&theirs).await.unwrap().render()),
+            "the version written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_promotion_moves_only_the_tier_and_keeps_the_why_out_of_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner
+            .write(WriteRequest {
+                title: Some("The owner's fact".into()),
+                summary: Some("What the owner found.".into()),
+                source: vec!["https://example.org/fact".into()],
+                ..req("The owner's fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let old = owner.get(&theirs).await.unwrap();
+        librarian(dir.path())
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let new = owner.get(&theirs).await.unwrap();
+        assert_eq!(new.front.trust_tier, TrustTier::Curated);
+        let mut front = new.front.clone();
+        front.trust_tier = old.front.trust_tier;
+        assert_eq!(front, old.front, "nothing but the tier moves");
+        assert_eq!(new.body, old.body);
+        assert!(
+            !new.render().contains(WHY),
+            "the why is kept beside the entry"
+        );
+    }
+
+    /// The ledger's files made read-only, so a session opened on them cannot write
+    /// there; the permissions they had, to put back.
+    #[cfg(unix)]
+    fn ledger_read_only(root: &Path) -> Vec<(PathBuf, std::fs::Permissions)> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut kept = Vec::new();
+        for name in ["ledger.db", "ledger.db-wal", "ledger.db-shm"] {
+            let path = root.join("state").join(name);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            kept.push((path.clone(), meta.permissions()));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        assert!(!kept.is_empty(), "no ledger files under {}", root.display());
+        kept
+    }
+
+    #[cfg(unix)]
+    fn put_back(kept: Vec<(PathBuf, std::fs::Permissions)>) {
+        for (path, perms) in kept {
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_ledger_that_fails_stops_the_promotion_before_the_tier_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let kept = ledger_read_only(dir.path());
+        let refused = librarian(dir.path())
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await;
+        put_back(kept);
+        assert!(refused.is_err(), "the record could not be written");
+        assert_eq!(
+            owner.get(&theirs).await.unwrap().front.trust_tier,
+            TrustTier::Raw,
+            "no promotion without its record"
+        );
+        let agent = librarian(dir.path());
+        agent
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        assert_eq!(agent.promotions(&theirs).await.unwrap().len(), 1);
+    }
+
+    /// `record/dom-me` read-only while `f` runs, so no version can be written there.
+    #[cfg(unix)]
+    async fn with_record_read_only<T>(root: &Path, f: impl std::future::Future<Output = T>) -> T {
+        use std::os::unix::fs::PermissionsExt;
+        let record = root.join("record").join("dom-me");
+        let perms = std::fs::metadata(&record).unwrap().permissions();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let out = f.await;
+        std::fs::set_permissions(&record, perms).unwrap();
+        out
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_promotion_whose_new_version_fails_can_be_made_again_with_one_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let agent = librarian(dir.path());
+        let refused =
+            with_record_read_only(dir.path(), agent.promote(&theirs, TrustTier::Curated, WHY))
+                .await;
+        assert!(refused.is_err(), "the new version could not be written");
+        assert_eq!(
+            owner.get(&theirs).await.unwrap().front.trust_tier,
+            TrustTier::Raw
+        );
+        let pending = agent.promotions(&theirs).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].landed, "its version was never written");
+        agent
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        assert_eq!(
+            owner.get(&theirs).await.unwrap().front.trust_tier,
+            TrustTier::Curated
+        );
+        let done = agent.promotions(&theirs).await.unwrap();
+        assert_eq!(done.len(), 1, "the retry records nothing twice");
+        assert!(done[0].landed, "its version is the entry's now");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_promoter_is_recorded_after_a_first_one_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let first = librarian(dir.path());
+        let refused =
+            with_record_read_only(dir.path(), first.promote(&theirs, TrustTier::Curated, WHY))
+                .await;
+        assert!(refused.is_err());
+        let checker = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:checker");
+        checker
+            .promote(
+                &theirs,
+                TrustTier::Curated,
+                "read it against the release notes",
+            )
+            .await
+            .unwrap();
+        let said: Vec<(String, String)> = checker
+            .promotions(&theirs)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.record.spec.by, p.record.spec.why))
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                ("agent:librarian".to_string(), WHY.to_string()),
+                (
+                    "agent:checker".to_string(),
+                    "read it against the release notes".to_string()
+                ),
+            ],
+            "the second promoter's why is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_replays_the_promotions() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let agent = librarian(dir.path());
+        agent
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let before = agent.promotions(&theirs).await.unwrap();
+        assert_eq!(before.len(), 1);
+        // the projection's rows gone, the events kept: only a replay brings them back
+        rusqlite::Connection::open(dir.path().join(LEDGER_FILE))
+            .unwrap()
+            .execute("DELETE FROM promotions", [])
+            .unwrap();
+        assert!(agent.promotions(&theirs).await.unwrap().is_empty());
+        agent.reindex().await.unwrap();
+        assert_eq!(agent.promotions(&theirs).await.unwrap(), before);
+        assert_eq!(
+            librarian(dir.path()).promotions(&theirs).await.unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn why_a_replaced_entry_was_promoted_can_still_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let old = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        librarian(dir.path())
+            .promote(&old, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let new = owner
+            .write(WriteRequest {
+                supersedes: Some(old.clone()),
+                ..req("The owner's fact, corrected.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let reader = librarian(dir.path());
+        let kept = reader.promotions(&old).await.unwrap();
+        assert_eq!(kept.len(), 1, "the why outlives the version it promoted");
+        assert_eq!(kept[0].record.spec.why, WHY);
+        assert!(kept[0].landed, "the promoted version is in the history");
+        assert!(reader.promotions(&new).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reading_why_an_entry_was_promoted_is_logged_as_a_read_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        librarian(dir.path())
+            .promote(&theirs, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let reader = librarian(dir.path());
+        reader.promotions(&theirs).await.unwrap();
+        let after = reader
+            .write(req("Something learned from the why.\n"))
+            .await
+            .unwrap()
+            .id;
+        let t = owner.taint(&theirs);
+        assert!(
+            t.readers.contains(&reader.session_id().to_string()),
+            "{t:?}"
+        );
+        assert!(t.written.contains(&after), "{t:?}");
+    }
+
+    #[tokio::test]
+    async fn a_why_written_above_what_a_reader_may_handle_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let secret = owner
+            .write(WriteRequest {
+                classification: Some(Label::Restricted),
+                ..req("The restricted fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let public = owner
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("The public fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        // a librarian that has read restricted text writes its why at restricted
+        let lib = librarian(dir.path());
+        lib.get(&secret).await.unwrap();
+        assert_eq!(lib.label(), Label::Restricted);
+        lib.promote(&public, TrustTier::Curated, WHY).await.unwrap();
+        let capped = librarian(dir.path()).with_handling_cap(Label::Public);
+        assert!(
+            capped.promotions(&public).await.unwrap().is_empty(),
+            "a public reader does not get a restricted why"
+        );
+        assert_eq!(capped.label(), Label::Public, "and its label stays public");
+        let full = librarian(dir.path());
+        let got = full.promotions(&public).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].record.spec.classification, Label::Restricted);
+        assert_eq!(
+            full.label(),
+            Label::Restricted,
+            "reading the why raises the label to the why's"
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_why_an_entry_was_promoted_is_reading_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let secret = owner
+            .write(WriteRequest {
+                classification: Some(Label::Restricted),
+                ..req("The restricted fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(&secret, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let capped = librarian(dir.path()).with_handling_cap(Label::Public);
+        assert!(
+            matches!(capped.promotions(&secret).await, Err(Error::NotFound(_))),
+            "a session that may not read the entry may not read why it was promoted"
+        );
+        assert_eq!(capped.label(), Label::Public, "and its label does not rise");
+        assert!(matches!(
+            capped.promotions("mem-none").await,
+            Err(Error::NotFound(_))
+        ));
+        let full = librarian(dir.path());
+        assert_eq!(full.label(), Label::Public);
+        assert_eq!(full.promotions(&secret).await.unwrap().len(), 1);
+        assert_eq!(
+            full.label(),
+            Label::Restricted,
+            "the label rises as a get's does"
+        );
+    }
+
+    /// The ledger under `root` keeps the record of `id`'s promotion, and no why: not in
+    /// the record, not in the log.
+    async fn the_ledger_keeps_no_why(root: &Path, id: &str, marker: &str) {
+        let l = Ledger::open(&root.join(LEDGER_FILE)).unwrap();
+        let kept = l.promotions("dom-me", id).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(
+            kept[0].spec.why.is_empty() && kept[0].why_erased,
+            "{kept:?}"
+        );
+        assert_eq!(kept[0].spec.by, "agent:librarian", "who stays");
+        let conn = rusqlite::Connection::open(root.join(LEDGER_FILE)).unwrap();
+        let mut stmt = conn.prepare("SELECT payload FROM events").unwrap();
+        let payloads: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            !payloads.iter().any(|p| p.contains(marker)),
+            "the log keeps no why"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_erasure_takes_the_why_from_the_ledger_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(
+                &secret,
+                TrustTier::Curated,
+                &format!("tried {marker} on the vault"),
+            )
+            .await
+            .unwrap();
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert_eq!(receipt.promotion_whys_removed, 1, "the receipt says so");
+        assert!(matches!(
+            owner.promotions(&secret).await,
+            Err(Error::NotFound(_))
+        ));
+        the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
+        owner.reindex().await.unwrap();
+        the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
+    }
+
+    #[tokio::test]
+    async fn an_erasure_the_ledger_holds_up_still_takes_the_text_out_of_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let secret = owner
+            .write(req("The vault opens with passphrase-Qz7xx.\n"))
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(&secret, TrustTier::Curated, "tried it on the vault")
+            .await
+            .unwrap();
+        // a reader mid-query on the ledger: its log cannot be folded into the file
+        let reader = rusqlite::Connection::open(dir.path().join(LEDGER_FILE)).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM events;")
+            .unwrap();
+        let held = owner.erase(&secret, Reason::Requested).await;
+        assert!(
+            matches!(held, Err(Error::Ledger(dm_ledger::Error::Held(_)))),
+            "{held:?}"
+        );
+        let found = owner.search("vault opens", None, 10).await.unwrap();
+        assert!(
+            found.iter().all(|h| h.id != secret),
+            "the erased text is still searchable: {found:?}"
+        );
+        assert!(
+            !owner.receipt(&secret).await.unwrap().unwrap().is_finished(),
+            "the receipt says the erasure is owed"
+        );
+        reader.execute_batch("COMMIT;").unwrap();
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
+        assert_eq!(receipt.promotion_whys_removed, 1);
+        // the rows were rewritten on the first run; the rerun folds the log into the
+        // file, so no byte under the root holds the why or the text
+        for text in ["tried it on the vault", "passphrase-Qz7xx"] {
+            assert_eq!(bundle_holds(dir.path(), text), None, "{text}");
+        }
+    }
+
+    /// No task, whatever its status, holds `text` in its title or its body.
+    async fn no_task_holds(m: &Memory, text: &str) {
+        for t in all_tasks(m).await {
+            assert!(
+                !t.spec.title.contains(text) && !t.spec.body.contains(text),
+                "a task holds {text:?}: {t:?}"
+            );
+        }
+    }
+
+    /// A second proposer's proposal of the entry as it stands is a new task, approved in
+    /// place of the first proposer's, which named an older version and is closed as
+    /// stale: the ledger keeps one approval task per entry and version, and each
+    /// proposal is a record of its own.
+    #[tokio::test]
+    async fn any_proposer_s_standing_proposal_unblocks_the_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let cited = owner.write(req("The cited fact.\n")).await.unwrap().id;
+        let x = owner
+            .write(req(&format!("A fact that rests on {cited}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&x, TrustTier::Verified, WHY)
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        owner.erase(&cited, Reason::Requested).await.unwrap();
+        assert!(
+            owner.approve(&task.id).await.is_err(),
+            "the first proposal is stale"
+        );
+        let checker = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:checker");
+        let Promotion::Proposed { task: again } = checker
+            .promote(&x, TrustTier::Verified, "read it as it stands")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_ne!(again.id, task.id, "a new version is a new proposal");
+        let stale = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(stale.status, Status::Invalidated, "the first is stale");
+        owner.approve(&again.id).await.unwrap();
+        assert_eq!(
+            owner.get(&x).await.unwrap().front.trust_tier,
+            TrustTier::Verified
+        );
+        let by: Vec<(String, bool)> = owner
+            .promotions(&x)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.record.spec.by, p.landed))
+            .collect();
+        assert_eq!(
+            by,
+            vec![
+                ("agent:librarian".to_string(), false),
+                ("agent:checker".to_string(), true)
+            ]
+        );
+    }
+
+    /// An approval task with no proposal behind it, filed by a build from before the
+    /// event named the version or by anything but a proposal, approves nothing: the
+    /// entry is proposed first, and the proposal is a task of its own that closes the
+    /// old one. And nothing but `promote` files one.
+    #[tokio::test]
+    async fn an_approval_task_without_a_proposal_record_approves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let x = owner.write(req("A fact.\n")).await.unwrap().id;
+        let squat = TaskSpec {
+            domain: "dom-me".into(),
+            title: "Approve: verified".into(),
+            body: "A task that looks like a proposal.".into(),
+            requirements: vec!["human".into()],
+            depends_on: Vec::new(),
+            origin: Some(format!("promote:{x}")),
+            upstream_event: Some("verified".into()),
+            created_by: String::new(),
+            classification: Label::Internal,
+            priority: 3,
+        };
+        let refused = librarian(dir.path()).create_task(squat.clone()).await;
+        assert!(
+            matches!(&refused, Err(Error::Denied(why)) if why.contains("promote")),
+            "a session files no approval task: {refused:?}"
+        );
+        // as a build from before records were kept filed it
+        let filed = librarian(dir.path()).file_own(squat).await.unwrap().task;
+        let refused = owner.approve(&filed.id).await;
+        assert!(
+            matches!(&refused, Err(Error::Denied(why)) if why.contains("not a proposal to verify a version")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            owner.get(&x).await.unwrap().front.trust_tier,
+            TrustTier::Raw
+        );
+        assert!(owner.promotions(&x).await.unwrap().is_empty(), "no record");
+        // a real proposal is a task of its own, closes the old one, and is approved
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&x, TrustTier::Verified, WHY)
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_ne!(task.id, filed.id);
+        let old = owner.ledger.lock().await.get(&filed.id).await.unwrap();
+        assert_eq!(old.status, Status::Invalidated);
+        owner.approve(&task.id).await.unwrap();
+        assert_eq!(
+            owner.get(&x).await.unwrap().front.trust_tier,
+            TrustTier::Verified
+        );
+    }
+
+    /// An erasure between the approver's checks and its write: `approve` read the entry
+    /// and found the proposal standing, the owner erased it, and then the write of the
+    /// verified version runs. The store refuses it, so nothing of the text comes back,
+    /// and the approval fails as any failed write does.
+    #[tokio::test]
+    async fn an_erasure_between_the_check_and_the_write_leaves_the_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let x = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&x, TrustTier::Verified, "checked it on the vault")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        // the steps of approve, by hand, with the erasure between them
+        let (_, entry) = owner.proposal_entry(&task).await.unwrap();
+        owner.erase(&x, Reason::Requested).await.unwrap();
+        let refused = owner.set_tier(entry, TrustTier::Verified).await;
+        assert!(
+            matches!(&refused, Err(Error::Store(dm_store::Error::Erased { .. }))),
+            "{refused:?}"
+        );
+        let stub = owner.find(&x).await.unwrap().1;
+        assert_eq!(
+            stub.front.status,
+            Some(dm_core::Status::Erased),
+            "the stub stays"
+        );
+        assert!(!stub.render().contains(marker));
+        assert_eq!(
+            bundle_holds(dir.path(), marker),
+            None,
+            "nothing of the text came back"
+        );
+    }
+
+    /// A whole erasure between a promotion's read of the entry and its record: the
+    /// erasure's scrub ran before the record was written, and the erasure is finished, so
+    /// it does not run again by itself. The promotion reads the stub after it records,
+    /// takes the why out itself and fails: no record and no byte on disk holds the why,
+    /// and a proposal files no task for the erased entry.
+    #[tokio::test]
+    async fn an_erasure_between_the_read_and_the_record_leaves_no_why() {
+        let marker = "passphrase-Qz7xx";
+        for to in [TrustTier::Curated, TrustTier::Verified] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = mem(dir.path());
+            let x = owner
+                .write(req("The vault opens at nine.\n"))
+                .await
+                .unwrap()
+                .id;
+            let lib = librarian(dir.path());
+            // the steps of promote, by hand, with the erasure between them
+            let (_, entry) = lib.find(&x).await.unwrap();
+            owner.erase(&x, Reason::Requested).await.unwrap();
+            let refused = lib
+                .promote_entry(entry, to, &format!("tried {marker} on the vault"))
+                .await;
+            assert!(refused.is_err(), "{to}: {refused:?}");
+            let kept = Ledger::open(&dir.path().join(LEDGER_FILE))
+                .unwrap()
+                .promotions("dom-me", &x)
+                .await
+                .unwrap();
+            assert!(
+                kept.iter().all(|r| r.spec.why.is_empty() && r.why_erased),
+                "{to}: {kept:?}"
+            );
+            assert_eq!(bundle_holds(dir.path(), marker), None, "{to}");
+            let origin = proposal_origin(&x);
+            let filed: Vec<Task> = all_tasks(&owner)
+                .await
+                .into_iter()
+                .filter(|t| t.spec.origin.as_deref() == Some(origin.as_str()))
+                .collect();
+            assert!(filed.is_empty(), "{to}: {filed:?}");
+        }
+    }
+
+    /// A why on the ledger after a finished erasure, as a promotion whose own scrub could
+    /// not run leaves it: the owner runs the erasure again, which takes the why out and
+    /// counts it on the receipt. A run that finds nothing more is refused as before.
+    #[tokio::test]
+    async fn an_erasure_run_again_takes_out_a_why_recorded_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let x = owner
+            .write(req("The vault opens at nine.\n"))
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        let (_, entry) = lib.find(&x).await.unwrap();
+        let first = owner.erase(&x, Reason::Requested).await.unwrap();
+        assert_eq!(first.promotion_whys_removed, 0);
+        let late = lib.promotion_spec(&entry, TrustTier::Curated, &format!("tried {marker}"));
+        owner
+            .ledger
+            .lock()
+            .await
+            .record_promotion(&late)
+            .await
+            .unwrap();
+        let again = owner.erase(&x, Reason::Requested).await.unwrap();
+        assert_eq!(again.promotion_whys_removed, 1, "{again:?}");
+        assert!(again.is_finished());
+        assert_eq!(
+            owner
+                .receipt(&x)
+                .await
+                .unwrap()
+                .unwrap()
+                .promotion_whys_removed,
+            1,
+            "the stored receipt counts it"
+        );
+        assert_eq!(bundle_holds(dir.path(), marker), None);
+        let third = owner.erase(&x, Reason::Requested).await.unwrap_err();
+        assert!(third.to_string().contains("already erased"), "{third}");
+    }
+
+    /// A proposal filed above what a session may handle: the proposer had read restricted
+    /// text, so its task is restricted though the entry is public. A session capped at
+    /// public that proposes the same version is refused with nothing of that task, and
+    /// one that proposes a newer version leaves that task open for a session that may
+    /// see it.
+    #[tokio::test]
+    async fn a_proposal_a_session_may_not_see_is_neither_handed_out_nor_closed_by_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let public = |body: &str| WriteRequest {
+            classification: Some(Label::Public),
+            ..req(body)
+        };
+        let secret = owner
+            .write(WriteRequest {
+                classification: Some(Label::Restricted),
+                ..req("The restricted fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let cited = owner.write(public("The cited fact.\n")).await.unwrap().id;
+        let x = owner
+            .write(public(&format!("A fact that rests on {cited}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        lib.get(&secret).await.unwrap();
+        let Promotion::Proposed { task: hidden } =
+            lib.promote(&x, TrustTier::Verified, WHY).await.unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_eq!(hidden.spec.classification, Label::Restricted);
+        let capped = librarian(dir.path()).with_handling_cap(Label::Public);
+        let refused = capped.promote(&x, TrustTier::Verified, WHY).await;
+        assert!(
+            matches!(&refused, Err(Error::Denied(why)) if !why.contains(&hidden.id)
+                && !why.contains("agent:librarian")),
+            "{refused:?}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        // the erasure of what it cites flags it for review: a new version of it
+        owner.erase(&cited, Reason::Requested).await.unwrap();
+        let Promotion::Proposed { task: newer } =
+            capped.promote(&x, TrustTier::Verified, WHY).await.unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_ne!(newer.id, hidden.id);
+        let left = owner.ledger.lock().await.get(&hidden.id).await.unwrap();
+        assert!(!left.status.is_terminal(), "{left:?}");
+    }
+
+    /// An entry rewritten after it was proposed is not the entry the proposal named; the
+    /// approver is refused until it is proposed again, and then the new proposal lands.
+    #[tokio::test]
+    async fn an_approval_refuses_an_entry_that_changed_since_the_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let cited = owner.write(req("The cited fact.\n")).await.unwrap().id;
+        let x = owner
+            .write(req(&format!("A fact that rests on {cited}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        let Promotion::Proposed { task } = lib.promote(&x, TrustTier::Verified, WHY).await.unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        let proposed = owner.get(&x).await.unwrap();
+        // the erasure of what it cites flags it for review: a new version of it
+        owner.erase(&cited, Reason::Requested).await.unwrap();
+        let now = owner.get(&x).await.unwrap();
+        assert_ne!(now.render(), proposed.render(), "the entry changed");
+        let refused = owner.approve(&task.id).await;
+        assert!(
+            matches!(&refused, Err(Error::Denied(why)) if why.contains("changed since")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            owner.get(&x).await.unwrap().front.trust_tier,
+            TrustTier::Raw,
+            "nothing moved"
+        );
+        assert!(!owner.promotions(&x).await.unwrap()[0].landed);
+        // proposed again as it stands, then approved
+        let Promotion::Proposed { task: again } = lib
+            .promote(&x, TrustTier::Verified, "read it again after the flag")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        owner.approve(&again.id).await.unwrap();
+        assert_eq!(
+            owner.get(&x).await.unwrap().front.trust_tier,
+            TrustTier::Verified
+        );
+        let landed: Vec<bool> = owner
+            .promotions(&x)
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.landed)
+            .collect();
+        assert_eq!(landed, vec![false, true], "the first proposal never landed");
+    }
+
+    #[tokio::test]
+    async fn a_proposal_to_verified_is_recorded_and_its_approval_lands_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner
+            .write(req("A fact worth verifying.\n"))
+            .await
+            .unwrap()
+            .id;
+        let why = "checked against the tree and the release notes";
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&id, TrustTier::Verified, why)
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed, not set")
+        };
+        let proposed = owner.promotions(&id).await.unwrap();
+        assert_eq!(proposed.len(), 1, "{proposed:?}");
+        let r = &proposed[0].record.spec;
+        assert_eq!(
+            (r.tier, r.why.as_str(), r.by.as_str()),
+            (TrustTier::Verified, why, "agent:librarian")
+        );
+        assert!(!proposed[0].landed, "not until a person approves it");
+        assert!(
+            task.spec.body.contains(&format!("amem promotions {id}")),
+            "{}",
+            task.spec.body
+        );
+        no_task_holds(&owner, why).await;
+        owner.approve(&task.id).await.unwrap();
+        let approved = owner.promotions(&id).await.unwrap();
+        assert_eq!(approved.len(), 1);
+        assert!(approved[0].landed, "the approval lands it");
+        no_task_holds(&owner, why).await;
+    }
+
+    /// A proposal refused, because another's open proposal of the version stands or a
+    /// closed one declined it, and a proposal handed its own open task back, record no
+    /// promotion: the record is written only when a task is filed.
+    #[tokio::test]
+    async fn a_refused_or_merged_proposal_records_no_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let x = owner.write(req("A fact.\n")).await.unwrap().id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&x, TrustTier::Verified, WHY)
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_eq!(recorded(&owner, &x).await, 1);
+        let bob = Memory::open(dir.path())
+            .unwrap()
+            .with_author("human:test:bob");
+        let refused = bob.promote(&x, TrustTier::Verified, "me too").await;
+        assert!(matches!(refused, Err(Error::Denied(_))), "{refused:?}");
+        assert_eq!(
+            recorded(&owner, &x).await,
+            1,
+            "bob's refused proposal was recorded"
+        );
+        // the librarian asking again gets its own task back, and no second record
+        let Promotion::Proposed { task: again } = librarian(dir.path())
+            .promote(&x, TrustTier::Verified, "still holds")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_eq!(again.id, task.id);
+        assert_eq!(recorded(&owner, &x).await, 1);
+        // declined: a third proposer of the same version is refused, and not recorded
+        owner
+            .invalidate(&task.id, "does not hold", None)
+            .await
+            .unwrap();
+        let checker = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:checker");
+        let refused = checker
+            .promote(&x, TrustTier::Verified, "I say it holds")
+            .await;
+        assert!(matches!(refused, Err(Error::Denied(_))), "{refused:?}");
+        assert_eq!(
+            recorded(&owner, &x).await,
+            1,
+            "the checker's refused proposal was recorded"
+        );
+    }
+
+    /// How many promotions of `id` the ledger records.
+    async fn recorded(m: &Memory, id: &str) -> usize {
+        m.promotions(id).await.unwrap().len()
+    }
+
+    /// The task of a proposal and its record name the same version: the event
+    /// `verified:<digest>` that `approve` reads carries the digest the record carries, so
+    /// what `approve` checks and what `amem promotions` shows are one proposal.
+    #[tokio::test]
+    async fn a_proposal_s_task_names_the_version_its_record_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let x = owner.write(req("A fact.\n")).await.unwrap().id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&x, TrustTier::Verified, WHY)
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        let records = owner.promotions(&x).await.unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0].record.spec;
+        assert_eq!(
+            task.spec.upstream_event.as_deref(),
+            Some(format!("verified:{}", record.digest).as_str()),
+            "the task names the version the record names"
+        );
+        assert_eq!(
+            record.digest,
+            dm_core::digest(&owner.get(&x).await.unwrap().render()),
+            "and that is the entry as it stands"
+        );
+        owner.approve(&task.id).await.unwrap();
+        let verified = owner.get(&x).await.unwrap();
+        assert_eq!(verified.front.trust_tier, TrustTier::Verified);
+        let landed = owner.promotions(&x).await.unwrap();
+        assert_eq!(
+            landed[0].record.spec.new_digest,
+            dm_core::digest(&verified.render()),
+            "the record names the version the approval wrote"
+        );
+        assert!(landed[0].landed);
+    }
+
+    /// The ledger's steps of an erasure, closing the proposal and taking its why and the
+    /// task's text, run after the index and before the receipt closes: a ledger another
+    /// connection holds leaves the receipt owed with the proposal still open, and the
+    /// next run closes both.
+    #[tokio::test]
+    async fn an_erasure_closes_the_proposal_and_takes_its_why_before_the_receipt_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(
+                &secret,
+                TrustTier::Verified,
+                &format!("tried {marker} on the vault"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        let holder = rusqlite::Connection::open(dir.path().join(LEDGER_FILE)).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let held = owner.erase(&secret, Reason::Requested).await;
+        assert!(matches!(held, Err(Error::Ledger(_))), "{held:?}");
+        holder.execute_batch("ROLLBACK").unwrap();
+        drop(holder);
+        let open = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert!(
+            !open.status.is_terminal(),
+            "the held ledger took the proposal: {open:?}"
+        );
+        assert!(
+            !owner.receipt(&secret).await.unwrap().unwrap().is_finished(),
+            "the receipt closed with the proposal open"
+        );
+        assert!(
+            owner
+                .search("vault opens", None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the text is still in search"
+        );
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
+        assert_eq!(receipt.promotion_whys_removed, 1);
+        assert_eq!(receipt.promotion_tasks_cleared, 1);
+        let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
+        the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
+        no_task_holds(&owner, marker).await;
+    }
+
+    #[tokio::test]
+    async fn an_erasure_takes_the_why_of_a_proposal_to_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(
+                &secret,
+                TrustTier::Verified,
+                &format!("tried {marker} on the vault"),
+            )
+            .await
+            .unwrap();
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert_eq!(receipt.promotion_whys_removed, 1);
+        the_ledger_keeps_no_why(dir.path(), &secret, marker).await;
+        no_task_holds(&owner, marker).await;
+    }
+
+    /// The `created` payloads of every task in the ledger under `root`.
+    fn created_payloads(root: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(root.join(LEDGER_FILE)).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT payload FROM events WHERE kind = 'created'")
+            .unwrap();
+        let out: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        out
+    }
+
+    /// The approval tasks of `id`, whatever their status.
+    async fn approval_tasks(m: &Memory, id: &str) -> Vec<Task> {
+        all_tasks(m)
+            .await
+            .into_iter()
+            .filter(|t| t.spec.origin.as_deref() == Some(&proposal_origin(id)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_erasure_clears_the_approval_task_of_a_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(WriteRequest {
+                title: Some(format!("The vault opens with {marker}")),
+                ..req(&format!("Try {marker} on the vault.\n"))
+            })
+            .await
+            .unwrap()
+            .id;
+        let Promotion::Proposed { task } = librarian(dir.path())
+            .promote(&secret, TrustTier::Verified, "checked it on the vault")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_eq!(
+            task.spec.title,
+            format!("Approve: verified for {secret}"),
+            "the task names the entry by id, not by title"
+        );
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
+        assert_eq!(receipt.promotion_tasks_cleared, 1);
+        no_task_holds(&owner, marker).await;
+        let kept = approval_tasks(&owner, &secret).await;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].id, task.id, "the task keeps its id");
+        assert_eq!(kept[0].status, Status::Invalidated, "and is closed");
+        assert_eq!(
+            kept[0].spec.created_by, "agent:librarian",
+            "who filed it stays"
+        );
+        assert!(
+            !created_payloads(dir.path())
+                .iter()
+                .any(|p| p.contains(marker)),
+            "its created event holds nothing of the entry"
+        );
+        owner.reindex().await.unwrap();
+        no_task_holds(&owner, marker).await;
+    }
+
+    /// A build from before the ledger kept the why filed the approval task with the
+    /// entry's title and the why in it, and recorded no promotion. An erasure after an
+    /// upgrade still takes both out, and the receipt says so.
+    #[tokio::test]
+    async fn an_erasure_clears_an_approval_task_filed_before_the_why_was_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(WriteRequest {
+                title: Some(format!("The vault opens with {marker}")),
+                ..req(&format!("Try {marker} on the vault.\n"))
+            })
+            .await
+            .unwrap()
+            .id;
+        // as origin/main files it: no record, the why in the body, the title in the title
+        let filed = librarian(dir.path())
+            .file_own(TaskSpec {
+                domain: "dom-me".into(),
+                title: format!("Approve: verified for The vault opens with {marker}"),
+                body: format!(
+                    "`agent:librarian` proposes that `{secret}`, written by `human:test:me`, be promoted to verified.\n\ntried {marker} on the vault\n\nRead it with `amem get {secret}`."
+                ),
+                requirements: vec!["human".into()],
+                depends_on: Vec::new(),
+                origin: Some(format!("promote:{secret}")),
+                upstream_event: Some("verified".into()),
+                created_by: String::new(),
+                classification: Label::Internal,
+                priority: 3,
+            })
+            .await
+            .unwrap()
+            .task;
+        let receipt = owner.erase(&secret, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
+        assert_eq!(receipt.promotion_whys_removed, 0, "no record to scrub");
+        assert_eq!(receipt.promotion_tasks_cleared, 1, "but a task to clear");
+        no_task_holds(&owner, marker).await;
+        let kept = approval_tasks(&owner, &secret).await;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].id, filed.id);
+        assert_eq!(kept[0].status, Status::Invalidated);
+        assert!(
+            !created_payloads(dir.path())
+                .iter()
+                .any(|p| p.contains(marker)),
+            "its created event holds neither the title nor the why"
+        );
+    }
+
+    /// The owner's entry, promoted by the librarian with `why`, exported at `max`.
+    async fn promoted_then_exported(
+        why: &str,
+        max: Label,
+    ) -> (tempfile::TempDir, Memory, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        librarian(dir.path())
+            .promote(&id, TrustTier::Curated, why)
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner.export(None, max, bundle.path()).await.unwrap();
+        (dir, owner, id, bundle)
+    }
+
+    /// The first file in a bundle whose text holds `needle`.
+    fn bundle_holds(bundle: &Path, needle: &str) -> Option<PathBuf> {
+        walk(bundle).into_iter().find(|p| {
+            std::fs::read(p)
+                .unwrap()
+                .windows(needle.len())
+                .any(|w| w == needle.as_bytes())
+        })
+    }
+
+    /// The landing half of an import, by hand: a bundle of one entry promoted with a why
+    /// holding `marker`, landed in a new root, its promotion records not restored yet.
+    /// Returns the temporary directories to keep, the importing session, the landed id,
+    /// and what the import has left to restore.
+    async fn landed_by_hand(
+        marker: &str,
+    ) -> (
+        [tempfile::TempDir; 3],
+        Memory,
+        String,
+        Vec<dm_ledger::PromotionRecord>,
+    ) {
+        let (dir, _owner, id, bundle) =
+            promoted_then_exported(&format!("tried {marker}"), Label::Restricted).await;
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        let default = there
+            .grants
+            .domains
+            .get("dom-me")
+            .map(|d| d.default_classification)
+            .unwrap_or_default();
+        let imported = {
+            let mut ix = there.index.lock().await;
+            bundle::import(
+                &there.store,
+                &mut ix,
+                bundle::LogTo {
+                    root: home.path(),
+                    by: &there.author,
+                },
+                &there.grants.owner,
+                bundle.path(),
+                "dom-me",
+                default,
+                &HashSet::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let landed = imported.landed[&id].clone();
+        assert_eq!(imported.promotions.len(), 1, "the why travels");
+        ([dir, bundle, home], there, landed, imported.promotions)
+    }
+
+    /// An erasure of an entry an import just landed, between the landing and the restore
+    /// of its promotion records: the erasure's scrub ran before the records were there.
+    /// The restore reads the stub after it restores and takes the why out itself.
+    #[tokio::test]
+    async fn an_erasure_between_the_landing_and_the_restore_leaves_no_why() {
+        let marker = "passphrase-Qz7xx";
+        let ([_dir, _bundle, home], there, landed, promotions) = landed_by_hand(marker).await;
+        there.erase(&landed, Reason::Requested).await.unwrap();
+        there.restore_promotions(&promotions).await.unwrap();
+        let kept = there
+            .ledger
+            .lock()
+            .await
+            .promotions("dom-me", &landed)
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), promotions.len(), "the records are restored");
+        assert!(
+            kept.iter().all(|r| r.spec.why.is_empty() && r.why_erased),
+            "{kept:?}"
+        );
+        assert_eq!(bundle_holds(home.path(), marker), None);
+    }
+
+    /// The same, with a reader holding the ledger when the restore scrubs: the scrub's
+    /// rows are written, and the log that still holds the why is not folded. The erasure's
+    /// receipt goes back to unfinished, so the owner knows to run it again, and that run
+    /// folds the log.
+    #[tokio::test]
+    async fn a_restore_the_ledger_holds_up_leaves_the_erasure_unfinished() {
+        let marker = "passphrase-Qz7xx";
+        let ([_dir, _bundle, home], there, landed, promotions) = landed_by_hand(marker).await;
+        there.erase(&landed, Reason::Requested).await.unwrap();
+        let reader = rusqlite::Connection::open(home.path().join(LEDGER_FILE)).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM events;")
+            .unwrap();
+        let held = there.restore_promotions(&promotions).await;
+        assert!(
+            matches!(&held, Err(Error::Ledger(dm_ledger::Error::Held(why))) if why.contains("erase")),
+            "{held:?}"
+        );
+        reader.execute_batch("COMMIT;").unwrap();
+        assert!(
+            !there.receipt(&landed).await.unwrap().unwrap().is_finished(),
+            "the receipt says the erasure is owed"
+        );
+        let receipt = there.erase(&landed, Reason::Requested).await.unwrap();
+        assert!(receipt.is_finished());
+        assert_eq!(bundle_holds(home.path(), marker), None);
+    }
+
+    #[tokio::test]
+    async fn a_same_owner_import_keeps_why_its_entries_were_promoted() {
+        let (_dir, owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        let before = owner.promotions(&id).await.unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        let im = there.import(bundle.path(), None).await.unwrap();
+        let landed = &im.landed[&id];
+        assert_eq!(
+            there.get(landed).await.unwrap().front.trust_tier,
+            TrustTier::Curated,
+            "the same owner keeps the tier"
+        );
+        let after = there.promotions(landed).await.unwrap();
+        assert_eq!(after.len(), 1, "and why it was given: {after:?}");
+        let (b, a) = (&before[0].record, &after[0].record);
+        assert_eq!(
+            (&a.spec.why, &a.spec.by, a.spec.tier, a.at),
+            (&b.spec.why, &b.spec.by, b.spec.tier, b.at)
+        );
+        // landing sets the origin, so the text here is not the bundle's: the record
+        // names the version as it landed, or it reads as a promotion that never landed
+        assert!(
+            after[0].landed,
+            "the restored record names the landed version"
+        );
+        assert_eq!(
+            a.spec.new_digest,
+            dm_core::digest(&there.get(landed).await.unwrap().render())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_record_is_at_least_as_classified_as_its_entry_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = owner
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("The public fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(&id, TrustTier::Curated, WHY)
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, bundle.path())
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        mem(home.path());
+        // a domain whose default is internal raises a public entry to internal on import
+        grant_domain(home.path(), "dom-x");
+        let there = Memory::open(home.path()).unwrap();
+        let im = there.import(bundle.path(), Some("dom-x")).await.unwrap();
+        let landed = &im.landed[&id];
+        assert_eq!(
+            there.get(landed).await.unwrap().front.classification,
+            Label::Internal
+        );
+        let after = there.promotions(landed).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].record.spec.classification,
+            Label::Internal,
+            "the record is raised with its entry"
+        );
+    }
+
+    /// An import whose ledger fails after the entries landed owes their records; the next
+    /// import skips the entries, since they are here, and restores the records.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_import_restores_the_records_the_first_could_not() {
+        let (_dir, _owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        let home = tempfile::tempdir().unwrap();
+        mem(home.path());
+        // a session opened on a ledger it cannot write
+        let kept = ledger_read_only(home.path());
+        let failing = Memory::open(home.path()).unwrap();
+        let failed = failing.import(bundle.path(), None).await;
+        drop(failing);
+        put_back(kept);
+        // the log and the shared memory the failing session made took the file's mode
+        for name in ["ledger.db-wal", "ledger.db-shm"] {
+            use std::os::unix::fs::PermissionsExt;
+            let path = home.path().join("state").join(name);
+            if path.exists() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        assert!(
+            matches!(failed, Err(Error::Ledger(_))),
+            "the ledger could not take the records: {failed:?}"
+        );
+        let there = Memory::open(home.path()).unwrap();
+        assert_eq!(
+            there.get(&id).await.unwrap().front.trust_tier,
+            TrustTier::Curated,
+            "but the entry landed"
+        );
+        assert!(there.promotions(&id).await.unwrap().is_empty());
+        let again = there.import(bundle.path(), None).await.unwrap();
+        assert_eq!(again.skipped, vec![id.clone()], "the entry is here already");
+        assert_eq!(again.promotions.len(), 1, "{again:?}");
+        let after = there.promotions(&id).await.unwrap();
+        assert_eq!(after.len(), 1, "its record is here now: {after:?}");
+        assert_eq!(after[0].record.spec.why, WHY);
+        assert!(after[0].landed);
+        let third = there.import(bundle.path(), None).await.unwrap();
+        assert_eq!(there.promotions(&id).await.unwrap().len(), 1, "{third:?}");
+    }
+
+    /// A record is restored for an entry that is here, and for no other: one refused
+    /// because its text was erased here keeps its erased why.
+    #[tokio::test]
+    async fn no_record_is_restored_for_an_entry_that_is_not_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let kept = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let gone = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        lib.promote(&kept, TrustTier::Curated, WHY).await.unwrap();
+        lib.promote(&gone, TrustTier::Curated, &format!("tried {marker}"))
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, bundle.path())
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        there.import(bundle.path(), None).await.unwrap();
+        there.erase(&gone, Reason::Requested).await.unwrap();
+        let again = there.import(bundle.path(), None).await.unwrap();
+        assert_eq!(again.erased, vec![gone.clone()]);
+        assert!(
+            again.promotions.iter().all(|r| r.spec.entry == kept),
+            "a record about an entry that is not here is left out: {again:?}"
+        );
+        the_ledger_keeps_no_why(home.path(), &gone, marker).await;
+    }
+
+    /// A bundle of a later version of an entry that is here from an earlier bundle: the
+    /// entry is skipped, and its records stay out, since they are of a version that is
+    /// not here; a record of the version here is not shown as landed by mistake.
+    #[tokio::test]
+    async fn records_of_another_version_of_an_entry_here_stay_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let x = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let lib = librarian(dir.path());
+        lib.promote(&x, TrustTier::Curated, WHY).await.unwrap();
+        let b1 = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, b1.path())
+            .await
+            .unwrap();
+        let Promotion::Proposed { task } = lib
+            .promote(&x, TrustTier::Verified, "checked it twice")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        owner.approve(&task.id).await.unwrap();
+        let b2 = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, b2.path())
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        there.import(b1.path(), None).await.unwrap();
+        let second = there.import(b2.path(), None).await.unwrap();
+        assert_eq!(second.skipped, vec![x.clone()]);
+        assert!(second.promotions.is_empty(), "{second:?}");
+        assert_eq!(
+            there.get(&x).await.unwrap().front.trust_tier,
+            TrustTier::Curated,
+            "the version here is the first bundle's"
+        );
+        let tiers: Vec<(TrustTier, bool)> = there
+            .promotions(&x)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.record.spec.tier, p.landed))
+            .collect();
+        assert_eq!(
+            tiers,
+            vec![(TrustTier::Curated, true)],
+            "no record of a version that never landed here"
+        );
+    }
+
+    /// The bundle at `bundle` with `record` added to its promotion records, the manifest
+    /// made to agree: what a bundle written by hand can carry.
+    fn with_added_record(bundle: &Path, record: dm_ledger::PromotionRecord) {
+        let file = bundle.join(bundle::PROMOTIONS_FILE);
+        let mut records: Vec<dm_ledger::PromotionRecord> =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        records.push(record);
+        let text = serde_json::to_string_pretty(&records).unwrap();
+        std::fs::write(&file, &text).unwrap();
+        let mpath = bundle.join("manifest.yaml");
+        let mut m =
+            dm_core::manifest::Manifest::from_yaml(&std::fs::read_to_string(&mpath).unwrap())
+                .unwrap();
+        m.promotions = None;
+        m.set_promotions(dm_core::manifest::ManifestPromotions {
+            path: bundle::PROMOTIONS_FILE.into(),
+            digest: dm_core::digest(&text),
+            records: records
+                .iter()
+                .map(|r| dm_core::manifest::ManifestPromotion {
+                    entry: r.spec.entry.clone(),
+                    classification: r.spec.classification,
+                })
+                .collect(),
+        })
+        .unwrap();
+        std::fs::write(&mpath, m.to_yaml()).unwrap();
+    }
+
+    /// A bundle whose text of an entry is not the text here attaches no record to it: a
+    /// record is of a version, and a bundle written by hand says who it likes.
+    #[tokio::test]
+    async fn a_bundle_whose_text_differs_from_what_is_here_restores_nothing_for_it() {
+        let (_dir, owner, x, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        there.import(bundle.path(), None).await.unwrap();
+        // the entry moves on here: verified, so its text is no longer the bundle's
+        let Promotion::Proposed { task } = librarian(home.path())
+            .promote(&x, TrustTier::Verified, "checked it here")
+            .await
+            .unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        there.approve(&task.id).await.unwrap();
+        let mut forged = owner.promotions(&x).await.unwrap().remove(0).record;
+        forged.spec.by = "agent:forger".into();
+        forged.spec.why = "a why nobody here gave".into();
+        forged.spec.tier = TrustTier::Verified;
+        with_added_record(bundle.path(), forged);
+        let again = there.import(bundle.path(), None).await.unwrap();
+        assert_eq!(again.skipped, vec![x.clone()]);
+        assert!(again.promotions.is_empty(), "{again:?}");
+        assert!(
+            there
+                .promotions(&x)
+                .await
+                .unwrap()
+                .iter()
+                .all(|p| p.record.spec.by != "agent:forger"),
+            "nothing of the bundle's attached to the entry here"
+        );
+    }
+
+    /// An erased stub that a bundle entry names, when the bundle's text is edited so the
+    /// receipt does not know it, gets no record: nothing of the entry comes back.
+    #[tokio::test]
+    async fn no_record_is_offered_for_an_erased_stub() {
+        let (dir, owner, x, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        owner.erase(&x, Reason::Requested).await.unwrap();
+        // the bundle's own entry comes home, with one word changed so its digest is not
+        // the receipt's
+        let file = bundle.path().join(format!("{x}.md"));
+        let text = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("The owner's fact.", "The owner's facts.");
+        std::fs::write(&file, &text).unwrap();
+        let mpath = bundle.path().join("manifest.yaml");
+        let mut m =
+            dm_core::manifest::Manifest::from_yaml(&std::fs::read_to_string(&mpath).unwrap())
+                .unwrap();
+        for e in &mut m.entries {
+            e.digest = dm_core::digest(&text);
+        }
+        std::fs::write(&mpath, m.to_yaml()).unwrap();
+        let back = owner.import(bundle.path(), None).await.unwrap();
+        assert_eq!(back.skipped, vec![x.clone()], "the stub is here: {back:?}");
+        assert!(back.promotions.is_empty(), "{back:?}");
+        the_ledger_keeps_no_why(dir.path(), &x, WHY).await;
+    }
+
+    #[tokio::test]
+    async fn another_owner_s_import_lands_raw_without_the_whys() {
+        let (_dir, _owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        let home = tempfile::tempdir().unwrap();
+        let there = Memory::init(home.path(), "human:test:bob", "dom-me").unwrap();
+        let im = there.import(bundle.path(), None).await.unwrap();
+        let landed = &im.landed[&id];
+        assert_eq!(
+            there.get(landed).await.unwrap().front.trust_tier,
+            TrustTier::Raw
+        );
+        assert!(
+            there.promotions(landed).await.unwrap().is_empty(),
+            "the tier is not kept, and neither are the reasons for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_promotion_record_refuses_the_bundle() {
+        let (_dir, _owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        let file = bundle.path().join("promotions.json");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains(WHY), "{text}");
+        std::fs::write(&file, text.replace(WHY, "a why nobody gave")).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        let refused = there.import(bundle.path(), None).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(there.get(&id).await.is_err(), "nothing landed");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_from_before_records_were_carried_still_imports() {
+        let (_dir, _owner, id, bundle) = promoted_then_exported(WHY, Label::Restricted).await;
+        // as a build from before records were carried wrote it: no file, no field
+        let mpath = bundle.path().join("manifest.yaml");
+        let mut m =
+            dm_core::manifest::Manifest::from_yaml(&std::fs::read_to_string(&mpath).unwrap())
+                .unwrap();
+        m.promotions = None;
+        std::fs::write(&mpath, m.to_yaml()).unwrap();
+        std::fs::remove_file(bundle.path().join(bundle::PROMOTIONS_FILE)).unwrap();
+        assert!(!std::fs::read_to_string(&mpath)
+            .unwrap()
+            .contains("promotions"));
+        let home = tempfile::tempdir().unwrap();
+        let there = mem(home.path());
+        let im = there.import(bundle.path(), None).await.unwrap();
+        let landed = &im.landed[&id];
+        assert_eq!(
+            there.get(landed).await.unwrap().front.trust_tier,
+            TrustTier::Curated
+        );
+        assert!(there.promotions(landed).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_why_above_the_bound_or_for_an_entry_left_home_is_not_exported() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let secret = owner
+            .write(WriteRequest {
+                classification: Some(Label::Restricted),
+                ..req("The restricted fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let public = owner
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("The public fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        lib.promote(&secret, TrustTier::Curated, "the restricted entry's why")
+            .await
+            .unwrap();
+        // read at restricted, so the why it gives next is restricted too
+        lib.get(&secret).await.unwrap();
+        lib.promote(&public, TrustTier::Curated, "a why given at restricted")
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        let ex = owner
+            .export(None, Label::Internal, bundle.path())
+            .await
+            .unwrap();
+        assert!(ex.manifest.entries.iter().any(|e| e.id == public));
+        for why in ["the restricted entry's why", "a why given at restricted"] {
+            assert_eq!(bundle_holds(bundle.path(), why), None, "{why}");
+        }
+        assert_eq!(ex.manifest.highest_label, Label::Public);
+    }
+
+    #[tokio::test]
+    async fn an_erased_why_stays_erased_in_an_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req(&format!("The vault opens with {marker}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let kept = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let lib = librarian(dir.path());
+        lib.promote(&secret, TrustTier::Curated, &format!("tried {marker}"))
+            .await
+            .unwrap();
+        lib.promote(&kept, TrustTier::Curated, WHY).await.unwrap();
+        owner.erase(&secret, Reason::Requested).await.unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, bundle.path())
+            .await
+            .unwrap();
+        assert_eq!(bundle_holds(bundle.path(), marker), None);
+        let carried: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle.path().join("promotions.json")).unwrap(),
+        )
+        .unwrap();
+        let of = |id: &str| {
+            carried
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["entry"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("no record of {id}: {carried}"))
+        };
+        assert_eq!(of(&secret)["why_erased"], true);
+        assert_eq!(of(&secret)["why"], "");
+        assert_eq!(of(&kept)["why"], WHY);
+    }
+
+    /// An export while an erasure is unfinished: the record holds the stub, and the index
+    /// and the ledger are not scrubbed yet. The bundle carries the stub, and its promotion
+    /// records without the why, as the scrub will leave them.
+    #[tokio::test]
+    async fn an_export_during_an_erasure_carries_no_why_of_the_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let marker = "passphrase-Qz7xx";
+        let secret = owner
+            .write(req("The vault opens at nine.\n"))
+            .await
+            .unwrap()
+            .id;
+        librarian(dir.path())
+            .promote(&secret, TrustTier::Curated, &format!("tried {marker}"))
+            .await
+            .unwrap();
+        // the first step of an erasure, and none after it
+        let (domain, entry) = owner.find(&secret).await.unwrap();
+        let mut stub = erasure::stub(&entry, Reason::Requested);
+        stub.front.domain.clone_from(&domain);
+        stub.front.id.clone_from(&secret);
+        owner.store.erase(&domain, &secret, &stub).await.unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Restricted, bundle.path())
+            .await
+            .unwrap();
+        assert_eq!(bundle_holds(bundle.path(), marker), None);
+        let carried: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle.path().join("promotions.json")).unwrap(),
+        )
+        .unwrap();
+        let record = &carried.as_array().unwrap()[0];
+        assert_eq!(record["entry"], secret.as_str());
+        assert_eq!(record["why_erased"], true);
+    }
+
+    #[tokio::test]
+    async fn a_promotion_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:librarian");
+        for to in [TrustTier::Curated, TrustTier::Verified] {
+            let err = agent.promote(&theirs, to, " ").await.unwrap_err();
+            assert!(err.to_string().contains("why"), "{to}: {err}");
+        }
+        assert_eq!(
+            agent.get(&theirs).await.unwrap().front.trust_tier,
+            TrustTier::Raw
+        );
     }
 
     fn walk(dir: &Path) -> Vec<PathBuf> {

@@ -1,4 +1,5 @@
-//! The task ledger: tasks, leases, handoffs, origin dedup.
+//! The task ledger: tasks, leases, handoffs, origin dedup, and the record of why each
+//! entry was promoted.
 //!
 //! The ledger is event-sourced. Every operation appends one event to an append-only
 //! table and updates a projection of current task state in the same transaction. The
@@ -22,6 +23,11 @@
 //!   ledger alike. An expired lease makes the task claimable again; the stale holder's
 //!   heartbeat, release, and complete are refused.
 //!
+//! A promotion is recorded on the same log, as an event of its own under the key
+//! `promotion:<entry>`, and projected into a table of its own. It is no task: nothing
+//! claims it, lists it, or reads it as delivered work. It is kept once per version of the
+//! entry, and a rebuild replays it with the rest.
+//!
 //! Time comes from a clock the ledger owns, so tests can move it.
 
 mod postgres;
@@ -29,7 +35,7 @@ mod sqlite;
 #[cfg(any(test, feature = "pg-test"))]
 pub mod testing;
 
-use dm_core::Label;
+use dm_core::{Label, TrustTier};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
@@ -67,6 +73,10 @@ pub enum Error {
         /// Who asked.
         holder: String,
     },
+    /// Another connection holds the write-ahead log, so text just removed may still be
+    /// in it. Run the operation again.
+    #[error("ledger: another connection holds the log: {0}")]
+    Held(String),
     /// A row holds something the ledger did not write. Rebuild it.
     #[error("ledger row for {id}: {what}")]
     BadRow {
@@ -191,6 +201,29 @@ pub struct Task {
     pub posted_to: Option<String>,
 }
 
+/// What an erasure did to an entry's promotion records and approval tasks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Scrubbed {
+    /// How many records of the entry hold no why now.
+    pub records: usize,
+    /// How many tasks filed from the entry's origin hold the redaction now.
+    pub tasks: usize,
+    /// Copies of the text the ledger could not remove, named so nobody believes it did.
+    pub beyond_reach: Vec<String>,
+}
+
+/// What an erasure rewrites a task to when the task is about the erased entry: a title
+/// and a body that name the entry by its id and nothing else of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Redaction {
+    /// The title every task gets.
+    pub title: String,
+    /// The body every task gets.
+    pub body: String,
+    /// Why an open task is invalidated.
+    pub reason: String,
+}
+
 /// The result of filing a task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Created {
@@ -208,6 +241,49 @@ pub struct Claim {
     pub task: Task,
     /// When to heartbeat by.
     pub lease_until: OffsetDateTime,
+}
+
+/// What a promotion records: which version of an entry was moved to which tier, by
+/// whom, and why. A record of a change already judged, not work: it is no task, and no
+/// query over tasks returns it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionSpec {
+    /// The domain the entry lives in, whose ledger keeps the record.
+    pub domain: String,
+    /// The entry promoted.
+    pub entry: String,
+    /// The tier it was promoted to.
+    pub tier: TrustTier,
+    /// Who promoted it, system-qualified.
+    pub by: String,
+    /// Who wrote the entry.
+    pub author: String,
+    /// Why: what was checked, and against what.
+    pub why: String,
+    /// How sensitive the record is: at least the entry's classification.
+    pub classification: Label,
+    /// The digest of the version of the entry that was promoted.
+    pub digest: String,
+    /// The digest of the version the promotion writes, so a record whose version never
+    /// reached the record can be told from one whose version did. Empty in a record from
+    /// before it was kept.
+    #[serde(default)]
+    pub new_digest: String,
+}
+
+/// A promotion as the ledger holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionRecord {
+    /// What was recorded.
+    #[serde(flatten)]
+    pub spec: PromotionSpec,
+    /// The why was removed by an erasure of the entry: `why` is then empty, and the rest
+    /// is kept as the least an audit needs.
+    #[serde(default)]
+    pub why_erased: bool,
+    /// When.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
 }
 
 type Clock = Box<dyn Fn() -> OffsetDateTime + Send + Sync>;
@@ -253,6 +329,14 @@ enum Event {
         priority: i64,
         why: String,
     },
+    /// An entry was promoted, and why. Appended under [`promotion_key`], never a task id.
+    /// An erasure of the entry rewrites it with the why removed and `why_erased` set.
+    Promoted {
+        #[serde(flatten)]
+        spec: PromotionSpec,
+        #[serde(default, skip_serializing_if = "is_false")]
+        why_erased: bool,
+    },
 }
 
 impl Event {
@@ -269,6 +353,7 @@ impl Event {
             Event::Invalidated { .. } => "invalidated",
             Event::Posted { .. } => "posted",
             Event::Rescored { .. } => "rescored",
+            Event::Promoted { .. } => "promoted",
         }
     }
 
@@ -286,6 +371,65 @@ impl Event {
             what: format!("event payload: {e}"),
         })
     }
+}
+
+/// What a PostgreSQL ledger keeps of a why after the rows are rewritten: the server, not
+/// the ledger, decides when old row versions and its log are gone.
+const POSTGRES_RESIDUE: &str = "the ledger's PostgreSQL server: old row versions and its write-ahead log keep removed text until the server vacuums and recycles them";
+
+/// A task event's payload with the redaction in place of its free text: a `created`
+/// event's title and body, an `invalidated` event's reason, and the handoff of a
+/// `handoff_left` or `completed` event, each text a person may have put the entry's text
+/// in. `None` when it holds the redaction already, or carries no text.
+fn redact_event(id: &str, payload: &str, redaction: &Redaction) -> Result<Option<String>, Error> {
+    let redacted = match Event::parse(id, payload)? {
+        Event::Created {
+            id: new_id,
+            mut spec,
+        } if spec.title != redaction.title || spec.body != redaction.body => {
+            spec.title.clone_from(&redaction.title);
+            spec.body.clone_from(&redaction.body);
+            Event::Created { id: new_id, spec }
+        }
+        Event::Invalidated {
+            reason,
+            superseded_by,
+        } if reason != redaction.reason => Event::Invalidated {
+            reason: redaction.reason.clone(),
+            superseded_by,
+        },
+        Event::HandoffLeft { handoff } if handoff != redaction.reason => Event::HandoffLeft {
+            handoff: redaction.reason.clone(),
+        },
+        Event::Completed { handoff } if handoff != redaction.reason => Event::Completed {
+            handoff: redaction.reason.clone(),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(redacted.payload(id)?))
+}
+
+/// A `promoted` event's payload with its why removed, when the event is that domain's
+/// and holds a why; `None` when there is nothing to rewrite.
+fn scrub_payload(key: &str, domain: &str, payload: &str) -> Result<Option<String>, Error> {
+    match Event::parse(key, payload)? {
+        Event::Promoted {
+            mut spec,
+            why_erased,
+        } if spec.domain == domain && !(why_erased && spec.why.is_empty()) => {
+            spec.why.clear();
+            let scrubbed = Event::Promoted {
+                spec,
+                why_erased: true,
+            };
+            Ok(Some(scrubbed.payload(key)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn fmt_time(t: OffsetDateTime) -> String {
@@ -309,6 +453,56 @@ fn label_from_rank(id: &str, rank: i64) -> Result<Label, Error> {
             id: id.to_string(),
             what: format!("label rank {other}"),
         }),
+    }
+}
+
+/// The key a promotion's events are appended under. A task id starts `task-`, so the two
+/// never meet.
+fn promotion_key(entry: &str) -> String {
+    format!("promotion:{entry}")
+}
+
+/// The columns of a promotion row, in the order both backends read them.
+const PROMOTION_COLUMNS: &str =
+    "domain, entry, tier, promoter, author, why, label_rank, digest, new_digest, at, why_erased";
+
+/// A promotion row as the database returns it, before the ledger has checked it.
+struct RawPromotion {
+    domain: String,
+    entry: String,
+    tier: String,
+    promoter: String,
+    author: String,
+    why: String,
+    label_rank: i64,
+    digest: String,
+    new_digest: String,
+    at: String,
+    why_erased: i64,
+}
+
+impl RawPromotion {
+    fn into_record(self) -> Result<PromotionRecord, Error> {
+        let key = promotion_key(&self.entry);
+        let tier = self.tier.parse::<TrustTier>().map_err(|_| Error::BadRow {
+            id: key.clone(),
+            what: format!("tier {:?}", self.tier),
+        })?;
+        Ok(PromotionRecord {
+            spec: PromotionSpec {
+                domain: self.domain,
+                entry: self.entry,
+                tier,
+                by: self.promoter,
+                author: self.author,
+                why: self.why,
+                classification: label_from_rank(&key, self.label_rank)?,
+                digest: self.digest,
+                new_digest: self.new_digest,
+            },
+            at: parse_time(&key, &self.at)?,
+            why_erased: self.why_erased != 0,
+        })
     }
 }
 
@@ -944,6 +1138,121 @@ impl Ledger {
         on_backend!(&self.backend, db => db.dependents(id))
     }
 
+    /// Record a promotion: one event, projected into the promotions and nowhere else.
+    /// Once per promoter and version: a second record of the same entry, tier, digest
+    /// and promoter appends nothing and returns false. Another version, or another
+    /// promoter of the same version, is a record of its own, so a record whose promotion
+    /// failed never stands in for a later one that did not.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn record_promotion(&mut self, spec: &PromotionSpec) -> Result<bool, Error> {
+        let now = self.now();
+        on_backend!(&mut self.backend, db => db.record_promotion(now, spec, false))
+    }
+
+    /// Record a promotion another ledger kept, as it was there: its time, and whether its
+    /// why was erased. An import of a bundle the same owner exported calls this, after
+    /// moving the record to the entry as it landed here. Once, as
+    /// [`Ledger::record_promotion`] is.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn restore_promotion(&mut self, record: &PromotionRecord) -> Result<bool, Error> {
+        on_backend!(&mut self.backend, db => db.record_promotion(record.at, &record.spec, record.why_erased))
+    }
+
+    /// The promotions of an entry in a domain, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the ledger did not write.
+    pub async fn promotions(
+        &self,
+        domain: &str,
+        entry: &str,
+    ) -> Result<Vec<PromotionRecord>, Error> {
+        on_backend!(&self.backend, db => db.promotions(domain, entry))
+    }
+
+    /// Remove the why from every promotion record of an entry, for its erasure: the
+    /// events that hold it are rewritten and the projection with them, so no replay
+    /// brings it back. Who promoted which version to which tier, and when, is kept.
+    /// Running it again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`Error::Held`] when another connection holds the log the
+    /// old text is in.
+    pub async fn scrub_promotions(&mut self, domain: &str, entry: &str) -> Result<Scrubbed, Error> {
+        let records = on_backend!(&mut self.backend, db => db.scrub_promotions(domain, entry))?;
+        Ok(Scrubbed {
+            records,
+            tasks: 0,
+            beyond_reach: self.beyond_reach(),
+        })
+    }
+
+    /// Rewrite the tasks filed from `origin` in `domain` for an erasure of what they are
+    /// about: each gets `redaction`'s title and body in its `created` event and in the
+    /// projection, its reason for being invalidated and the handoffs left on it or that
+    /// closed it become the redaction's reason, so no replay brings the old text back;
+    /// each still open is invalidated. The task's id, origin, who filed it and its history
+    /// stay. Returns how many tasks from that origin now hold the redaction. Running it
+    /// again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`Error::Held`] when another connection holds the log the
+    /// old text is in.
+    pub async fn scrub_tasks(
+        &mut self,
+        domain: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<usize, Error> {
+        let now = self.now();
+        on_backend!(&mut self.backend, db => db.scrub_tasks(now, domain, origin, redaction))
+    }
+
+    /// Both scrubs of an erasure, [`Ledger::scrub_promotions`] of `entry` and
+    /// [`Ledger::scrub_tasks`] of `origin`, in one transaction, and on SQLite one rebuild
+    /// of the file after them, also when nothing was left to rewrite: an earlier run that
+    /// a reader held up left the old text in the write-ahead log.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`Error::Held`] when another connection holds the log the
+    /// old text is in.
+    pub async fn scrub_entry(
+        &mut self,
+        domain: &str,
+        entry: &str,
+        origin: &str,
+        redaction: &Redaction,
+    ) -> Result<Scrubbed, Error> {
+        let now = self.now();
+        let (records, tasks) = on_backend!(
+            &mut self.backend,
+            db => db.scrub_entry(now, domain, entry, origin, redaction)
+        )?;
+        Ok(Scrubbed {
+            records,
+            tasks,
+            beyond_reach: self.beyond_reach(),
+        })
+    }
+
+    /// What a scrub on this backend cannot remove.
+    fn beyond_reach(&self) -> Vec<String> {
+        match self.backend {
+            Backend::Sqlite(_) => Vec::new(),
+            Backend::Postgres(_) => vec![POSTGRES_RESIDUE.to_string()],
+        }
+    }
+
     /// How many events the ledger holds.
     ///
     /// # Errors
@@ -1037,6 +1346,37 @@ mod tests {
             }
         }
 
+        /// Every event's payload, as the log holds it.
+        async fn payloads(&self) -> Vec<String> {
+            match self {
+                Site::Sqlite(dir) => {
+                    let conn = rusqlite::Connection::open(dir.path().join("ledger.db")).unwrap();
+                    let mut stmt = conn.prepare("SELECT payload FROM events").unwrap();
+                    let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+                    rows.map(Result::unwrap).collect()
+                }
+                Site::Postgres(server) => {
+                    let c = pg_client(server).await;
+                    let mut out = Vec::new();
+                    for row in c
+                        .query("SELECT schema FROM public.ledger_domains", &[])
+                        .await
+                        .unwrap()
+                    {
+                        let s: String = row.get(0);
+                        for p in c
+                            .query(&format!("SELECT payload FROM {s}.events"), &[])
+                            .await
+                            .unwrap()
+                        {
+                            out.push(p.get(0));
+                        }
+                    }
+                    out
+                }
+            }
+        }
+
         /// A ledger on a clock the test moves.
         async fn ledger(&self) -> (Ledger, Arc<Mutex<OffsetDateTime>>) {
             let now = Arc::new(Mutex::new(T0));
@@ -1093,6 +1433,14 @@ mod tests {
         a_task_waits_on_its_continuation,
         a_task_closes_with_its_continuation,
         a_continuation_given_up_on_gives_its_task_back,
+        a_promotion_is_recorded_once_per_version,
+        a_promotion_record_is_no_task,
+        replay_keeps_the_promotions,
+        a_second_promoter_of_the_same_version_is_recorded,
+        an_erasure_takes_the_why_and_a_replay_keeps_it_out,
+        a_restored_record_keeps_its_time_and_its_erased_why,
+        an_erasure_rewrites_the_tasks_filed_from_an_origin,
+        an_erasure_takes_the_reason_and_the_handoff_of_the_tasks_too,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -1401,6 +1749,616 @@ mod tests {
         ));
         l.invalidate(&dead.id, "a dead end", None).await.unwrap();
         claim(&mut l, &parent.id, "s1", mins(5)).await.unwrap();
+    }
+
+    fn promotion(entry: &str, digest: &str) -> PromotionSpec {
+        PromotionSpec {
+            domain: "dom-a".into(),
+            entry: entry.into(),
+            tier: TrustTier::Curated,
+            by: "agent:librarian".into(),
+            author: "human:test:me".into(),
+            why: "checked against the tree".into(),
+            classification: Label::Internal,
+            digest: digest.into(),
+            new_digest: format!("{digest}-curated"),
+        }
+    }
+
+    async fn a_promotion_is_recorded_once_per_version(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let first = promotion("mem-a-1", "d1");
+        assert!(l.record_promotion(&first).await.unwrap(), "a new record");
+        let events = l.event_count().await.unwrap();
+        assert_eq!(events, 1, "one event for one record");
+        assert!(
+            !l.record_promotion(&first).await.unwrap(),
+            "the same version again is not new"
+        );
+        assert_eq!(
+            l.event_count().await.unwrap(),
+            events,
+            "and appends nothing"
+        );
+        *now.lock().unwrap() = T0 + mins(1);
+        a_new_version_is_a_new_record(&mut l, first).await;
+    }
+
+    async fn a_new_version_is_a_new_record(l: &mut Ledger, first: PromotionSpec) {
+        let again = PromotionSpec {
+            digest: "d2".into(),
+            why: "the id came back at raw and was checked again".into(),
+            ..first.clone()
+        };
+        assert!(
+            l.record_promotion(&again).await.unwrap(),
+            "a new version is a new record"
+        );
+        let got = l.promotions("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(
+            got,
+            vec![
+                PromotionRecord {
+                    spec: first,
+                    why_erased: false,
+                    at: T0
+                },
+                PromotionRecord {
+                    spec: again,
+                    why_erased: false,
+                    at: T0 + mins(1)
+                },
+            ],
+            "every field kept, oldest first"
+        );
+        assert!(l.promotions("dom-a", "mem-a-2").await.unwrap().is_empty());
+        assert!(l.promotions("dom-b", "mem-a-1").await.unwrap().is_empty());
+    }
+
+    /// A promotion whose new version never landed leaves its record; a second promoter
+    /// of the same version is not that record, and is kept with its own why.
+    async fn a_second_promoter_of_the_same_version_is_recorded(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let first = promotion("mem-a-1", "d1");
+        assert!(l.record_promotion(&first).await.unwrap());
+        let second = PromotionSpec {
+            by: "agent:checker".into(),
+            why: "read it against the release notes".into(),
+            ..first.clone()
+        };
+        assert!(
+            l.record_promotion(&second).await.unwrap(),
+            "another promoter is another record"
+        );
+        let got: Vec<PromotionSpec> = l
+            .promotions("dom-a", "mem-a-1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.spec)
+            .collect();
+        assert_eq!(got, vec![first, second.clone()]);
+        assert!(!l.record_promotion(&second).await.unwrap(), "once each");
+    }
+
+    const SECRET: &str = "passphrase-Qz7xx";
+
+    /// Two promotions of `mem-a-1` whose whys quote its secret, one of `mem-a-2`, and one
+    /// of an entry with the same id in `dom-b`, which is another entry.
+    async fn promotions_that_quote_a_secret(l: &mut Ledger) -> Vec<PromotionSpec> {
+        let first = PromotionSpec {
+            why: format!("the vault opens with {SECRET}, as it says"),
+            ..promotion("mem-a-1", "d1")
+        };
+        let second = PromotionSpec {
+            by: "agent:checker".into(),
+            why: format!("tried {SECRET} on the vault"),
+            ..first.clone()
+        };
+        let other = promotion("mem-a-2", "d9");
+        let elsewhere = PromotionSpec {
+            domain: "dom-b".into(),
+            why: "dom-b's own reading of its own entry".into(),
+            ..promotion("mem-a-1", "d1")
+        };
+        for p in [&first, &second, &other, &elsewhere] {
+            assert!(l.record_promotion(p).await.unwrap());
+        }
+        vec![first, second, other, elsewhere]
+    }
+
+    /// The records of `entry` in `domain` are exactly `spec`, why and all.
+    async fn kept_whole(l: &Ledger, domain: &str, entry: &str, spec: &PromotionSpec) {
+        let got = l.promotions(domain, entry).await.unwrap();
+        assert_eq!(got.len(), 1, "{domain}/{entry}: {got:?}");
+        assert_eq!(&got[0].spec, spec, "{domain}/{entry} keeps its why");
+        assert!(!got[0].why_erased);
+    }
+
+    async fn an_erasure_takes_the_why_and_a_replay_keeps_it_out(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let specs = promotions_that_quote_a_secret(&mut l).await;
+        let scrubbed = l.scrub_promotions("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(scrubbed.records, 2);
+        let kept: Vec<PromotionRecord> = specs[..2]
+            .iter()
+            .map(|s| PromotionRecord {
+                spec: PromotionSpec {
+                    why: String::new(),
+                    ..s.clone()
+                },
+                why_erased: true,
+                at: T0,
+            })
+            .collect();
+        assert_eq!(
+            l.promotions("dom-a", "mem-a-1").await.unwrap(),
+            kept,
+            "the why goes; who, which version, which tier and when stay"
+        );
+        another_entry_and_the_log_and_a_replay(b, &mut l, &specs, &kept).await;
+    }
+
+    async fn another_entry_and_the_log_and_a_replay(
+        b: &Site,
+        l: &mut Ledger,
+        specs: &[PromotionSpec],
+        kept: &[PromotionRecord],
+    ) {
+        kept_whole(l, "dom-a", "mem-a-2", &specs[2]).await;
+        kept_whole(l, "dom-b", "mem-a-1", &specs[3]).await;
+        assert!(
+            !b.payloads().await.iter().any(|p| p.contains(SECRET)),
+            "the log no longer holds the why"
+        );
+        l.rebuild().await.unwrap();
+        assert_eq!(
+            l.promotions("dom-a", "mem-a-1").await.unwrap(),
+            kept,
+            "replay keeps it out"
+        );
+        // and replay brings back every other why, in this domain and the other
+        kept_whole(l, "dom-a", "mem-a-2", &specs[2]).await;
+        kept_whole(l, "dom-b", "mem-a-1", &specs[3]).await;
+        let again = l.scrub_promotions("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(again.records, 2, "running it again counts what is scrubbed");
+    }
+
+    /// The redaction an erasure of `mem-a-1` gives its tasks.
+    fn redaction() -> Redaction {
+        Redaction {
+            title: "Approve: verified for mem-a-1".into(),
+            body: "`mem-a-1` was erased.".into(),
+            reason: "the entry was erased".into(),
+        }
+    }
+
+    /// A task filed from `origin` on `event` whose title and body quote the secret.
+    fn task_quoting_the_secret(origin: &str, event: &str) -> TaskSpec {
+        TaskSpec {
+            title: format!("Approve: verified for The vault opens with {SECRET}"),
+            body: format!("proposed because {SECRET} opens it"),
+            origin: Some(origin.into()),
+            upstream_event: Some(event.into()),
+            ..spec("")
+        }
+    }
+
+    /// Three tasks: an open one and a completed one filed from `promote:mem-a-1`, and an
+    /// open one filed from `promote:mem-a-2`.
+    async fn tasks_quoting_the_secret(l: &mut Ledger) -> (Task, Task, Task) {
+        let open = admitted(l, task_quoting_the_secret("promote:mem-a-1", "verified")).await;
+        let done = admitted(l, task_quoting_the_secret("promote:mem-a-1", "again")).await;
+        claim(l, &done.id, "s1", mins(5)).await.unwrap();
+        l.complete(&done.id, "s1", "mem-a-1").await.unwrap();
+        let other = admitted(l, task_quoting_the_secret("promote:mem-a-2", "verified")).await;
+        (open, done, other)
+    }
+
+    async fn an_erasure_rewrites_the_tasks_filed_from_an_origin(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let (open, done, other) = tasks_quoting_the_secret(&mut l).await;
+        let scrubbed = l
+            .scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+            .await;
+        assert_eq!(scrubbed.unwrap(), 2);
+        the_tasks_hold_the_redaction(&l, &open, &done, &other).await;
+        let holding = b
+            .payloads()
+            .await
+            .iter()
+            .filter(|p| p.contains(SECRET))
+            .count();
+        assert_eq!(
+            holding, 1,
+            "the log holds the text in the other entry's task alone"
+        );
+        l.rebuild().await.unwrap();
+        the_tasks_hold_the_redaction(&l, &open, &done, &other).await;
+        let again = l
+            .scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+            .await;
+        assert_eq!(
+            again.unwrap(),
+            2,
+            "running it again counts what holds the redaction"
+        );
+    }
+
+    async fn the_tasks_hold_the_redaction(l: &Ledger, open: &Task, done: &Task, other: &Task) {
+        let open_now = l.get(&open.id).await.unwrap();
+        assert_eq!(
+            open_now.status,
+            Status::Invalidated,
+            "an open task is closed"
+        );
+        assert_eq!(open_now.reason.as_deref(), Some("the entry was erased"));
+        redacted(&open_now);
+        let done_now = l.get(&done.id).await.unwrap();
+        assert_eq!(
+            done_now.status,
+            Status::Completed,
+            "a closed task keeps its status"
+        );
+        assert_eq!(
+            done_now.handoff.as_deref(),
+            Some("the entry was erased"),
+            "the handoff is free text, and goes with the rest"
+        );
+        redacted(&done_now);
+        let other_now = l.get(&other.id).await.unwrap();
+        assert_eq!(
+            other_now.spec, other.spec,
+            "another entry's task is untouched"
+        );
+        assert_eq!(other_now.status, Status::Admitted);
+    }
+
+    /// The task holds the redaction and nothing else of the entry, and the rest of it
+    /// is as it was filed.
+    fn redacted(t: &Task) {
+        assert_eq!(t.spec.title, "Approve: verified for mem-a-1");
+        assert_eq!(t.spec.body, "`mem-a-1` was erased.");
+        assert_eq!(
+            t.spec.origin.as_deref(),
+            Some("promote:mem-a-1"),
+            "the origin stays"
+        );
+        assert_eq!(t.spec.created_by, "human:test:me", "who filed it stays");
+        assert_eq!(t.created, T0, "and when");
+    }
+
+    /// The reason a proposal was declined for, and the handoffs left on or closing a
+    /// task, are free text an approver can quote the entry in: the scrub takes them too,
+    /// in the events, in the rows and after a replay.
+    async fn an_erasure_takes_the_reason_and_the_handoff_of_the_tasks_too(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let declined = admitted(
+            &mut l,
+            task_quoting_the_secret("promote:mem-a-1", "verified"),
+        )
+        .await;
+        l.invalidate(
+            &declined.id,
+            &format!("declined: {SECRET} no longer opens it"),
+            None,
+        )
+        .await
+        .unwrap();
+        let left = admitted(&mut l, task_quoting_the_secret("promote:mem-a-1", "again")).await;
+        claim(&mut l, &left.id, "s1", mins(5)).await.unwrap();
+        l.release(&left.id, "s1", Some(&format!("left: {SECRET}")))
+            .await
+            .unwrap();
+        claim(&mut l, &left.id, "s2", mins(5)).await.unwrap();
+        l.complete(&left.id, "s2", &format!("done: {SECRET}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            l.scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+                .await
+                .unwrap(),
+            2
+        );
+        the_reason_and_the_handoff_hold_the_redaction(b, &l, &declined, &left).await;
+        l.rebuild().await.unwrap();
+        the_reason_and_the_handoff_hold_the_redaction(b, &l, &declined, &left).await;
+    }
+
+    async fn the_reason_and_the_handoff_hold_the_redaction(
+        b: &Site,
+        l: &Ledger,
+        declined: &Task,
+        left: &Task,
+    ) {
+        let declined_now = l.get(&declined.id).await.unwrap();
+        assert_eq!(declined_now.status, Status::Invalidated);
+        assert_eq!(
+            declined_now.reason.as_deref(),
+            Some("the entry was erased"),
+            "the reason"
+        );
+        let left_now = l.get(&left.id).await.unwrap();
+        assert_eq!(left_now.status, Status::Completed);
+        assert_eq!(
+            left_now.handoff.as_deref(),
+            Some("the entry was erased"),
+            "the handoff"
+        );
+        assert!(
+            !b.payloads().await.iter().any(|p| p.contains(SECRET)),
+            "no event holds the text"
+        );
+    }
+
+    /// The first ledger file under `dir` whose bytes hold `needle`.
+    fn file_holding(dir: &Path, needle: &str) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|f| f.path())
+            .find(|p| {
+                std::fs::read(p)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes())
+            })
+    }
+
+    #[tokio::test]
+    async fn on_sqlite_an_erased_why_leaves_no_bytes_in_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ledger.db");
+        let mut l = Ledger::open(&file).unwrap();
+        // long enough to spill onto pages of its own, which an update frees and does not
+        // overwrite
+        let why = format!("{SECRET} {}", "and so on ".repeat(900));
+        let long = PromotionSpec {
+            why,
+            ..promotion("mem-a-1", "d1")
+        };
+        assert!(l.record_promotion(&long).await.unwrap());
+        // and buried under later records, so the pages it sat on are deep in the file
+        for n in 0..40 {
+            let later = promotion(&format!("mem-a-{}", n + 2), "d1");
+            assert!(l.record_promotion(&later).await.unwrap());
+        }
+        // in the file itself, not only in the log
+        rusqlite::Connection::open(&file)
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(
+            file_holding(dir.path(), SECRET),
+            Some(file.clone()),
+            "the file held it"
+        );
+        let scrubbed = l.scrub_promotions("dom-a", "mem-a-1").await.unwrap();
+        assert!(scrubbed.beyond_reach.is_empty());
+        if let Some(f) = file_holding(dir.path(), SECRET) {
+            panic!("{} still holds the erased why", f.display());
+        }
+    }
+
+    #[test]
+    fn a_promoted_payload_from_before_the_new_digest_still_parses() {
+        let old = r#"{"kind":"promoted","domain":"dom-a","entry":"mem-a-1","tier":"curated","by":"agent:librarian","author":"human:test:me","why":"checked","classification":"internal","digest":"d1"}"#;
+        let Event::Promoted { spec, why_erased } = Event::parse("promotion:mem-a-1", old).unwrap()
+        else {
+            panic!("not a promotion");
+        };
+        assert_eq!(spec.new_digest, "");
+        assert!(!why_erased);
+    }
+
+    /// The shapes the promotions table had before this one, each a commit of the branch:
+    /// 41e0bc5 had neither `new_digest` nor `why_erased` and an index without the
+    /// promoter; 088f890 and 9db9e03 had `new_digest` and the promoter in the index, and
+    /// no `why_erased`.
+    const OLD_SHAPES: [&str; 2] = ["41e0bc5", "088f890"];
+
+    /// The `promotions` table and its index as `shape` made them, in SQLite's dialect
+    /// (`domain` leads the index) or PostgreSQL's (`{s}` the schema, no `domain`).
+    fn old_promotions_table(shape: &str, s: Option<&str>) -> String {
+        let (table, dot) = s.map_or(("promotions".to_string(), String::new()), |s| {
+            (format!("{s}.promotions"), format!("{s}."))
+        });
+        let (new_digest, key) = match (shape, s) {
+            ("41e0bc5", None) => ("", "domain, entry, tier, digest"),
+            ("41e0bc5", Some(_)) => ("", "entry, tier, digest"),
+            (_, None) => (
+                "new_digest TEXT NOT NULL,",
+                "domain, entry, tier, digest, promoter",
+            ),
+            (_, Some(_)) => ("new_digest TEXT NOT NULL,", "entry, tier, digest, promoter"),
+        };
+        let serial = if s.is_some() {
+            "BIGSERIAL PRIMARY KEY"
+        } else {
+            "INTEGER PRIMARY KEY AUTOINCREMENT"
+        };
+        let new_digest_value = if new_digest.is_empty() { "" } else { "'', " };
+        let new_digest_column = if new_digest.is_empty() {
+            ""
+        } else {
+            "new_digest, "
+        };
+        format!(
+            "CREATE TABLE {table} (seq {serial},
+                 domain TEXT NOT NULL, entry TEXT NOT NULL, tier TEXT NOT NULL,
+                 promoter TEXT NOT NULL, author TEXT NOT NULL, why TEXT NOT NULL,
+                 label_rank BIGINT NOT NULL, digest TEXT NOT NULL, {new_digest} at TEXT NOT NULL);
+             CREATE UNIQUE INDEX promotions_version ON {table} ({key});
+             INSERT INTO {dot}events (task_id, kind, at, payload) VALUES ('promotion:mem-a-1',
+                 'promoted', '2026-10-01T10:00:00Z',
+                 '{{\"kind\":\"promoted\",\"domain\":\"dom-a\",\"entry\":\"mem-a-1\",\"tier\":\"curated\",\"by\":\"agent:librarian\",\"author\":\"human:test:me\",\"why\":\"checked\",\"classification\":\"internal\",\"digest\":\"d1\"}}');
+             INSERT INTO {table} (domain, entry, tier, promoter, author, why, label_rank,
+                 digest, {new_digest_column}at) VALUES ('dom-a', 'mem-a-1', 'curated', 'agent:librarian',
+                 'human:test:me', 'checked', 1, 'd1', {new_digest_value}'2026-10-01T10:00:00Z');"
+        )
+    }
+
+    /// A ledger file whose promotions table is as `shape` made it, holding one record.
+    fn ledger_of_shape(file: &Path, shape: &str) {
+        let c = rusqlite::Connection::open(file).unwrap();
+        c.execute_batch(&format!(
+            "CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                 kind TEXT NOT NULL, at TEXT NOT NULL, payload TEXT NOT NULL);
+             {}",
+            old_promotions_table(shape, None)
+        ))
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn on_sqlite_a_ledger_of_each_old_shape_is_migrated() {
+        for shape in OLD_SHAPES {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("ledger.db");
+            ledger_of_shape(&file, shape);
+            let l = Ledger::open(&file).unwrap();
+            the_migrated_ledger_works(l, shape).await;
+        }
+    }
+
+    /// Reading, a second promoter of the old version, a rebuild and a scrub all work on
+    /// a ledger of an old shape once it is opened.
+    async fn the_migrated_ledger_works(mut l: Ledger, shape: &str) {
+        let old = l
+            .promotions("dom-a", "mem-a-1")
+            .await
+            .unwrap_or_else(|e| panic!("{shape}: {e}"));
+        assert_eq!(old.len(), 1, "{shape}");
+        assert_eq!(old[0].spec.new_digest, "", "{shape}");
+        assert!(!old[0].why_erased, "{shape}");
+        let second = PromotionSpec {
+            by: "agent:checker".into(),
+            ..promotion("mem-a-1", "d1")
+        };
+        assert!(
+            l.record_promotion(&second)
+                .await
+                .unwrap_or_else(|e| panic!("{shape}: {e}")),
+            "{shape}: the index has the promoter now"
+        );
+        assert_eq!(l.rebuild().await.unwrap(), 2, "{shape}");
+        assert_eq!(
+            l.promotions("dom-a", "mem-a-1").await.unwrap().len(),
+            2,
+            "{shape}"
+        );
+        let scrubbed = l.scrub_promotions("dom-a", "mem-a-1").await;
+        assert_eq!(
+            scrubbed.unwrap_or_else(|e| panic!("{shape}: {e}")).records,
+            2,
+            "{shape}"
+        );
+    }
+
+    async fn a_restored_record_keeps_its_time_and_its_erased_why(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let then = T0 - Duration::days(30);
+        let records = [
+            PromotionRecord {
+                spec: promotion("mem-a-1", "d1"),
+                why_erased: false,
+                at: then,
+            },
+            PromotionRecord {
+                spec: PromotionSpec {
+                    why: String::new(),
+                    ..promotion("mem-a-1", "d0")
+                },
+                why_erased: true,
+                at: then - Duration::days(1),
+            },
+        ];
+        for r in &records {
+            assert!(l.restore_promotion(r).await.unwrap());
+            assert!(!l.restore_promotion(r).await.unwrap(), "once");
+        }
+        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap(), records);
+        l.rebuild().await.unwrap();
+        assert_eq!(
+            l.promotions("dom-a", "mem-a-1").await.unwrap(),
+            records,
+            "a replay keeps both"
+        );
+    }
+
+    async fn a_promotion_record_is_no_task(b: &Site) {
+        let mut l = b.open().await;
+        let parent = admitted(&mut l, spec("A task beside it")).await;
+        assert!(l
+            .record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap());
+        only_the_task_is_listed(&l, &parent).await;
+        no_task_query_finds_the_record(&mut l, &parent).await;
+    }
+
+    async fn only_the_task_is_listed(l: &Ledger, parent: &Task) {
+        for st in [
+            Status::Proposed,
+            Status::Admitted,
+            Status::Claimed,
+            Status::Completed,
+            Status::Invalidated,
+        ] {
+            let ids: Vec<String> = l
+                .list("dom-a", st)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            let expected = if st == Status::Admitted {
+                vec![parent.id.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(ids, expected, "{st:?}");
+        }
+    }
+
+    async fn no_task_query_finds_the_record(l: &mut Ledger, parent: &Task) {
+        assert!(l.unposted("dom-a").await.unwrap().is_empty());
+        assert!(l.dependents("promotion:mem-a-1").await.unwrap().is_empty());
+        assert!(l.filed_from("mem-a-1").await.unwrap().is_empty());
+        assert!(matches!(
+            l.get("promotion:mem-a-1").await,
+            Err(Error::NotFound(_))
+        ));
+        let c = next(l, "s1", mins(5)).await.unwrap();
+        assert_eq!(c.task.id, parent.id);
+        assert!(
+            next(l, "s1", mins(5)).await.is_none(),
+            "nothing else to claim"
+        );
+    }
+
+    async fn replay_keeps_the_promotions(b: &Site) {
+        let mut l = b.open().await;
+        admitted(&mut l, spec("A task beside it")).await;
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        l.record_promotion(&promotion("mem-a-1", "d2"))
+            .await
+            .unwrap();
+        let before = l.promotions("dom-a", "mem-a-1").await.unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(l.rebuild().await.unwrap(), 4);
+        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap(), before);
+        assert!(
+            !l.record_promotion(&promotion("mem-a-1", "d1"))
+                .await
+                .unwrap(),
+            "replay keeps what makes a record new"
+        );
+        assert_eq!(l.list("dom-a", Status::Admitted).await.unwrap().len(), 1);
     }
 
     async fn invalidate_is_terminal(l: &mut Ledger, t: &Task) {
@@ -1821,6 +2779,170 @@ mod tests {
         // and a second connect finds nothing left to move
         let again = Ledger::connect(server.url()).await.unwrap();
         assert_eq!(again.event_count().await.unwrap(), 3);
+    }
+
+    /// A domain whose schema was made before promotions were recorded has no table for
+    /// them; connecting adds it, and a promotion there is kept.
+    #[tokio::test]
+    async fn on_postgres_a_domain_from_before_promotions_gets_their_table() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        let t = admitted(&mut l, spec("Old")).await;
+        drop(l);
+        let s = crate::postgres::schema_for("dom-a");
+        let c = pg_client(&server).await;
+        c.batch_execute(&format!("DROP TABLE IF EXISTS {s}.promotions"))
+            .await
+            .unwrap();
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        assert!(l
+            .record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap());
+        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap().len(), 1);
+        assert_eq!(l.get(&t.id).await.unwrap().status, Status::Admitted);
+        let routed = c
+            .query_one(
+                "SELECT COUNT(*) FROM public.ledger_tasks WHERE id LIKE 'promotion:%'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            routed.get::<_, i64>(0),
+            0,
+            "a record is not routed as a task"
+        );
+    }
+
+    /// A connected ledger on a server whose `dom-a` schema has a promotions table of
+    /// `shape`, holding the one old record and no other event, and a client on the server.
+    async fn pg_domain_of_shape(
+        server: &PgServer,
+        shape: &str,
+    ) -> (Ledger, tokio_postgres::Client) {
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        admitted(&mut l, spec("Makes the schema")).await;
+        drop(l);
+        let s = crate::postgres::schema_for("dom-a");
+        let c = pg_client(server).await;
+        c.batch_execute(&format!(
+            "DROP TABLE {s}.promotions; DELETE FROM {s}.events; DELETE FROM {s}.tasks;
+             DELETE FROM public.ledger_tasks; {}",
+            old_promotions_table(shape, Some(&s))
+        ))
+        .await
+        .unwrap();
+        (Ledger::connect(server.url()).await.unwrap(), c)
+    }
+
+    /// A domain schema of each old shape is migrated when the ledger connects.
+    #[tokio::test]
+    async fn on_postgres_a_domain_of_each_old_shape_is_migrated_at_connect() {
+        for shape in OLD_SHAPES {
+            let Some(server) = PgServer::start().await.unwrap() else {
+                return;
+            };
+            let (l, _c) = pg_domain_of_shape(&server, shape).await;
+            the_migrated_ledger_works(l, shape).await;
+        }
+    }
+
+    /// A domain schema of an old shape made after this ledger connected is migrated where
+    /// a record, a rebuild or a scrub reaches it.
+    #[tokio::test]
+    async fn on_postgres_a_domain_of_an_old_shape_made_after_connect_is_migrated() {
+        for shape in OLD_SHAPES {
+            let Some(server) = PgServer::start().await.unwrap() else {
+                return;
+            };
+            let (mut l, c) = pg_domain_of_shape(&server, shape).await;
+            let s = crate::postgres::schema_for("dom-a");
+            let back_to_old = format!(
+                "DROP TABLE {s}.promotions; DELETE FROM {s}.events; {}",
+                old_promotions_table(shape, Some(&s))
+            );
+            c.batch_execute(&back_to_old).await.unwrap();
+            let second = PromotionSpec {
+                by: "agent:checker".into(),
+                ..promotion("mem-a-1", "d1")
+            };
+            assert!(
+                l.record_promotion(&second).await.unwrap(),
+                "{shape}: record"
+            );
+            assert_eq!(
+                l.promotions("dom-a", "mem-a-1").await.unwrap().len(),
+                2,
+                "{shape}"
+            );
+            c.batch_execute(&back_to_old).await.unwrap();
+            assert_eq!(l.rebuild().await.unwrap(), 1, "{shape}: rebuild");
+            assert_eq!(
+                l.promotions("dom-a", "mem-a-1").await.unwrap().len(),
+                1,
+                "{shape}"
+            );
+            c.batch_execute(&back_to_old).await.unwrap();
+            let scrubbed = l.scrub_promotions("dom-a", "mem-a-1").await;
+            assert_eq!(scrubbed.unwrap().records, 1, "{shape}: scrub");
+        }
+    }
+
+    /// Connecting migrates only a schema that lacks the promotions table, so a domain
+    /// another process holds does not hold up the connect.
+    #[tokio::test]
+    async fn on_postgres_connect_waits_on_no_domain_that_has_its_table() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        admitted(&mut l, spec("In a")).await;
+        drop(l);
+        let holder = pg_client(&server).await;
+        holder
+            .execute(
+                "SELECT pg_advisory_lock(hashtext('ledger_domain:' || $1))",
+                &[&"dom-a"],
+            )
+            .await
+            .unwrap();
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Ledger::connect(server.url()),
+        )
+        .await;
+        assert!(
+            connected.is_ok(),
+            "connect waited on a domain that needed nothing"
+        );
+    }
+
+    /// A domain schema an older binary made after this ledger connected has no
+    /// promotions table; reading, recording and rebuilding there still work.
+    #[tokio::test]
+    async fn on_postgres_a_schema_without_the_table_made_after_connect_still_works() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        admitted(&mut l, spec("In a")).await;
+        let c = pg_client(&server).await;
+        let drop_table = format!(
+            "DROP TABLE {}.promotions",
+            crate::postgres::schema_for("dom-a")
+        );
+        c.batch_execute(&drop_table).await.unwrap();
+        assert!(l.promotions("dom-a", "mem-a-1").await.unwrap().is_empty());
+        assert!(l
+            .record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap());
+        c.batch_execute(&drop_table).await.unwrap();
+        assert_eq!(l.rebuild().await.unwrap(), 3);
+        assert_eq!(l.promotions("dom-a", "mem-a-1").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
