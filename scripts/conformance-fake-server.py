@@ -23,6 +23,7 @@ could have, so the test can show which step of conformance.py catches it:
     no-holder           a claim records no holder
     import-trusts       import does not check digests
     highest-wrong       the manifest's highest_label is below its lines
+    records-uncounted   the manifest's highest_label leaves its promotion records out
     reindex-forgets     reindex drops the ledger
     silent              nothing is ever answered
 
@@ -392,6 +393,20 @@ class Fake:
             lines.append((e["id"], path, digest(text), e["classification"]))
             if LABELS.index(e["classification"]) > LABELS.index(highest):
                 highest = e["classification"]
+        # the record of why the first entry was promoted travels with it; its why was
+        # given at internal, so the record is internal and the bound admits it, and the
+        # highest label counts it as the manifest does its entries
+        records = []
+        if lines:
+            records.append({
+                "domain": DOMAIN, "entry": lines[0][0], "tier": "curated", "by": "agent:fake:librarian",
+                "author": "human:fake:owner", "why": "checked against the tree", "classification": "internal",
+                "digest": lines[0][2], "new_digest": lines[0][2], "why_erased": False,
+                "at": "2026-10-08T00:00:00Z",
+            })
+        for r in records:
+            if LABELS.index(r["classification"]) > LABELS.index(highest) and FLAW != "records-uncounted":
+                highest = r["classification"]
         if FLAW == "highest-wrong":
             highest = "public" if highest != "public" else "internal"
         out = [
@@ -399,18 +414,27 @@ class Fake:
             f"domain: {DOMAIN}",
             "exported_at: 2026-10-08T00:00:00Z",
             "exported_by: human:fake:owner",
-            "max_label: public",
+            "max_label: internal",
             f"highest_label: {highest}",
             "entries:",
         ]
         for eid, path, dig, label in lines:
             out += [f"- id: {eid}", f"  path: {path}", f"  digest: {dig}", f"  classification: {label}"]
+        if records:
+            text = json.dumps(records, indent=2)
+            with open(os.path.join(dest, "promotions.json"), "w", encoding="utf-8") as f:
+                f.write(text)
+            out += ["promotions:", "  path: promotions.json", f"  digest: {digest(text)}", "  records:"]
+            for r in records:
+                out += [f"  - entry: {r['entry']}", f"    classification: {r['classification']}"]
         with open(os.path.join(dest, "manifest.yaml"), "w", encoding="utf-8") as f:
             f.write("\n".join(out) + "\n")
 
     def import_(self, src):
         with open(os.path.join(src, "manifest.yaml"), encoding="utf-8") as f:
-            lines = [l for l in f.read().splitlines() if l.startswith("- id:") or l.startswith("  ")]
+            # the entries block alone: the promotions block after it is not read here
+            entries = f.read().split("\npromotions:")[0]
+        lines = [l for l in entries.splitlines() if l.startswith("- id:") or l.startswith("  ")]
         items = []
         for l in lines:
             if l.startswith("- id:"):

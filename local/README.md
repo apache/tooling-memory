@@ -466,14 +466,47 @@ curated in two ways:
 - A write that supersedes an entry lands curated when the session holds a librarian's task
   or the checker's task.
 - Anyone except the entry's author can mark the entry curated, with the `promote` memory
-  tool or with `amem promote <id> --to curated`.
+  tool or with `amem promote <id> --to curated --why "<what you checked>"`.
 
 Verified is the review gate. Nobody sets it directly. It has two steps:
 
 1. One principal proposes it, with `promote` and `to: verified`. This files a task that
    requires a person.
 2. A person who did not propose it approves it, with `amem approve <task>`. An agent never
-   approves.
+   approves. The approval is of the version the proposal named: if the entry changed
+   since, `approve` refuses it, and a proposer, any proposer, proposes the entry as it
+   stands. The ledger keeps one approval task per entry and version. The task names the
+   version it proposes, and the promotion record on the ledger names the same version. A
+   new proposal closes the open proposal of an older version. A second proposer is
+   refused while an open proposal of the same version stands, and a declined version is
+   not proposed again until the entry changes. Only `promote` files a task with a
+   `promote:` origin.
+
+Each promotion must say why. A promotion without a why is refused. The ledger keeps the
+why beside the entry, not in the entry. `amem promotions <id>` and the `promotions` memory
+tool show who promoted which version of the entry to which tier, and why. They also show
+if that version reached the record (`landed`). A proposal to verified is in the list from
+when it is made. It lands when a person approves it. Its approval task names the entry,
+the proposer and the author, and points to `amem promotions <id>`, but does not hold the
+why. An auditor reads the why after judging the change, not before. A session reads the
+why only if it can read the entry. The why stays readable after the entry is replaced. When the owner erases the entry, the ledger removes each
+why. It keeps who promoted which version, to which tier, and when. The erasure also
+rewrites each approval task of the entry so that it names the entry by id alone, and it
+closes the open ones; a task from a build that still put the why in the task body loses
+it the same way. The erasure receipt gives the number of whys it removed
+(`promotion_whys_removed`) and the number of tasks it rewrote
+(`promotion_tasks_cleared`). An export carries the records of the
+entries it exports, at or below its label bound, in `promotions.json`. The manifest holds
+the digest of that file, so an import refuses a changed record. An import of the same
+owner's bundle keeps the tiers and the records. An import of another owner's bundle
+lands the entries raw and leaves the records out.
+
+A ledger made by a build of the `feat/promotion-why` branch before this change needs no
+step. Commits 41e0bc5 and 088f890 made a `promotions` table with fewer columns, and the
+first with a key without the promoter. A SQLite ledger gets each missing column and the
+key the next time it opens. A PostgreSQL ledger gets them the next time a process
+connects, in each domain schema that lacks them. Commit 9944964 kept each why in a
+completed `promoted:` task. Those tasks stay as they are.
 
 When an entry holds, the librarian's verify task now ends in such a proposal. The rules
 are Rego, in the built-in policy. Each step is a logged decision. A promotion is a new

@@ -317,6 +317,13 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
             .collect()
     };
     assert!(ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
+    // a why that quotes the secret is the entry's too, and leaves with it
+    let why = format!("tried {marker} on the vault");
+    ok(
+        &d.root,
+        &["promote", &secret, "--to", "curated", "--why", &why],
+        None,
+    );
     let err = fails(&d.root, &["erase", &secret, "--reason", "because"]);
     assert!(err.contains("invalid value"), "{err}");
     let receipt = json(&ok(
@@ -328,6 +335,7 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
     assert_eq!(receipt["reason"], "sensitive");
     assert_eq!(receipt["removed"][0]["version"], "current");
     assert_eq!(receipt["flagged"], serde_json::json!([citing]));
+    assert_eq!(receipt["promotion_whys_removed"], 1);
     assert!(!ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
     let err = fails(&d.root, &["get", &secret]);
     assert!(err.contains("gone") && err.contains("erased"), "{err}");
@@ -345,6 +353,29 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
     if let Some(file) = holds(&d.root, marker.as_bytes()) {
         panic!("{} still holds the erased body", file.display());
     }
+}
+
+#[test]
+fn promotions_says_why_an_entry_was_promoted() {
+    let mut d = step_init();
+    step_write(&mut d);
+    let why = "read it against the pilot's notes";
+    let promoted = json(&ok(
+        &d.root,
+        &["promote", &d.decision, "--to", "curated", "--why", why],
+        None,
+    ));
+    assert_eq!(promoted["tier"], "curated");
+    let records = json(&ok(&d.root, &["promotions", &d.decision], None));
+    let records = records.as_array().unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["why"], why);
+    assert_eq!(records[0]["tier"], "curated");
+    assert_eq!(records[0]["by"], "human:test:me");
+    assert_eq!(records[0]["landed"], true);
+    let none = json(&ok(&d.root, &["promotions", &d.handoff], None));
+    assert_eq!(none, serde_json::json!([]));
+    assert!(fails(&d.root, &["promotions", "mem-none"]).contains("not found"));
 }
 
 #[test]
