@@ -4,6 +4,7 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{claimable, parse_time, Error, Event, RawTask, Status, Task, TaskSpec, TASK_COLUMNS};
+use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -149,6 +150,7 @@ impl Db {
         holder: &str,
         until: OffsetDateTime,
         manifest: &[String],
+        handling: Label,
     ) -> Result<Option<String>, Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -164,7 +166,7 @@ impl Db {
             rows.map(|r| r?).collect::<Result<_, _>>()?
         };
         for task in candidates {
-            if !claimable(&task, now, manifest)
+            if !claimable(&task, now, manifest, handling)
                 || !deps_complete(&tx, &task.spec.depends_on)?
                 || awaits_continuation(&tx, &task)?
             {
@@ -192,11 +194,12 @@ impl Db {
         holder: &str,
         until: OffsetDateTime,
         manifest: &[String],
+        handling: Label,
     ) -> Result<(), Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let task = get_in(&tx, id)?;
-        if !claimable(&task, now, manifest)
+        if !claimable(&task, now, manifest, handling)
             || !deps_complete(&tx, &task.spec.depends_on)?
             || awaits_continuation(&tx, &task)?
         {

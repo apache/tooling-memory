@@ -647,6 +647,12 @@ async fn fan_out(
         text.push_str(&earlier.join("; "));
         text.push_str(". ");
     }
+    // held back and not named: the chain holds them in work this session may not read
+    if let Some(n) = answer["withheld"].as_u64().filter(|n| *n > 0) {
+        text.push_str(&format!(
+            "The board withheld {n}: asked for before in this chain, in work this session may not read; do not ask again. "
+        ));
+    }
     text.push_str("Finish what you can from what is already known, then leave a handoff.");
     Decision::Deny(text)
 }

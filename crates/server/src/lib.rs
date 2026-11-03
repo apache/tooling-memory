@@ -30,7 +30,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -236,10 +236,12 @@ pub struct Memory {
     manifest: Vec<String>,
     session_id: String,
     store: Store,
-    index: AsyncMutex<Index>,
-    ledger: AsyncMutex<Ledger>,
+    /// The handles a long-lived surface shares between its requests ([`Memory::for_request`]):
+    /// the index, the ledger, the read log and the policy in force.
+    index: Arc<AsyncMutex<Index>>,
+    ledger: Arc<AsyncMutex<Ledger>>,
     session: Mutex<Session>,
-    reads: reads::ReadLog,
+    reads: Arc<reads::ReadLog>,
     /// The recall deputy, held weakly: it lives as long as the launcher that built it.
     deputy: OnceLock<Weak<dyn recall::Deputy>>,
     /// Whether this session has issued two gets inside one turn.
@@ -253,25 +255,27 @@ pub struct Memory {
     /// Entries this session wrote, and how many of them were handoffs.
     written: (AtomicUsize, AtomicUsize),
     /// The checkable perimeter: admission and the gates, as Rego over the grants.
-    policy: std::sync::RwLock<std::sync::Arc<Policy>>,
+    policy: Arc<std::sync::RwLock<std::sync::Arc<Policy>>>,
     /// The task this session holds, when the launcher runs it on one: what it files
-    /// from is judged against that task's requirements.
-    held: OnceLock<String>,
+    /// from is judged against that task's requirements. Shared by the views of a
+    /// session ([`Memory::for_request`]), as every count below that is kept per session.
+    held: Arc<OnceLock<String>>,
     /// How many entries this session has superseded: the blast-radius gate's count.
-    superseded: AtomicUsize,
+    superseded: Arc<AtomicUsize>,
     /// What this session may read, as the policy computed it once and the index applies
     /// inside every query.
     scope: OnceLock<ReadFilter>,
     /// How many decision contexts this session has kept.
-    contexts_kept: AtomicUsize,
+    contexts_kept: Arc<AtomicUsize>,
     /// The tools this session may call, when the launcher hosts them.
     tools: OnceLock<std::sync::Arc<dyn sources::Tools>>,
     /// The tape this session is re-enacting, when it is a re-run.
     playback: OnceLock<std::sync::Arc<tape::Playback>>,
     /// This session's own tape, as it is kept.
-    recording: Mutex<tape::Recording>,
-    /// When this service last stamped a write; see [`next_stamp`].
-    last_stamp: Mutex<OffsetDateTime>,
+    recording: Arc<Mutex<tape::Recording>>,
+    /// When this service last stamped a write; see [`next_stamp`]. Shared with the
+    /// views [`Memory::for_request`] makes, which write for the same service.
+    last_stamp: Arc<Mutex<OffsetDateTime>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -310,6 +314,11 @@ pub struct FanOut {
     /// with a handoff, or still open. A resumed run asks for what it asked for before;
     /// the answer is the earlier task, not another.
     pub existing: Vec<Task>,
+    /// How many items were not filed because the chain holds each of them in a task
+    /// this session may not read: open work, or work of this parent that is done or
+    /// dropped and that the ledger would hand back as the same task. Nothing of those
+    /// tasks is named. The count is all the answer says of them.
+    pub withheld: usize,
     /// Resumes the parent when the new children are done; none when nothing was new.
     pub continuation: Option<Task>,
 }
@@ -399,26 +408,74 @@ impl Memory {
             author: grants.owner.clone(),
             grants,
             manifest: Vec::new(),
-            reads,
+            reads: Arc::new(reads),
             session_id,
             store,
-            index: AsyncMutex::new(index),
-            ledger: AsyncMutex::new(ledger),
+            index: Arc::new(AsyncMutex::new(index)),
+            ledger: Arc::new(AsyncMutex::new(ledger)),
             session: Mutex::new(session),
             deputy: OnceLock::new(),
             fan_out: Mutex::new(recall::FanOut::default()),
             cache: Mutex::new(recall::Cache::default()),
             projection: None,
             written: (AtomicUsize::new(0), AtomicUsize::new(0)),
-            policy: std::sync::RwLock::new(std::sync::Arc::new(policy)),
-            held: OnceLock::new(),
-            superseded: AtomicUsize::new(0),
+            policy: Arc::new(std::sync::RwLock::new(std::sync::Arc::new(policy))),
+            held: Arc::new(OnceLock::new()),
+            superseded: Arc::new(AtomicUsize::new(0)),
             scope: OnceLock::new(),
-            contexts_kept: AtomicUsize::new(0),
+            contexts_kept: Arc::new(AtomicUsize::new(0)),
             tools: OnceLock::new(),
             playback: OnceLock::new(),
-            recording: Mutex::new(tape::Recording::default()),
-            last_stamp: Mutex::new(OffsetDateTime::UNIX_EPOCH),
+            recording: Arc::new(Mutex::new(tape::Recording::default())),
+            last_stamp: Arc::new(Mutex::new(OffsetDateTime::UNIX_EPOCH)),
+        })
+    }
+
+    /// This session, for one request of a surface that lives longer than a request
+    /// does, as the board does. The record, the index, the ledger, the policy in force,
+    /// the read log and the session id are this session's, shared: a read here and a
+    /// write in a later request carry the same session id, which is what joins them
+    /// for lineage. The label is the request's own: it starts at the bottom and rises
+    /// with what this request reads, so what one request lists does not classify what a
+    /// later one files. The read scope is this session's too, asked of the policy and
+    /// logged once, here, rather than once per request. The grants, the author, the
+    /// manifest, the tools and the projection carry over. What is kept per session and
+    /// keyed by the session id is shared too, so a view counts with its session: the
+    /// held task, the supersede count the blast-radius gate reads, the tape and the
+    /// number of kept contexts. What this view wrote starts at zero.
+    ///
+    /// # Errors
+    ///
+    /// When the policy fails to give the read scope.
+    pub fn for_request(&self) -> Result<Memory, Error> {
+        let scope = self.session_filter()?;
+        let mut session = self.grants.session();
+        session.handling = session.handling.min(scope.handling);
+        Ok(Memory {
+            root: self.root.clone(),
+            grants: self.grants.clone(),
+            author: self.author.clone(),
+            manifest: self.manifest.clone(),
+            session_id: self.session_id.clone(),
+            store: self.store.clone(),
+            index: Arc::clone(&self.index),
+            ledger: Arc::clone(&self.ledger),
+            session: Mutex::new(session),
+            reads: Arc::clone(&self.reads),
+            deputy: self.deputy.clone(),
+            fan_out: Mutex::new(recall::FanOut::default()),
+            cache: Mutex::new(recall::Cache::default()),
+            projection: self.projection.clone(),
+            written: (AtomicUsize::new(0), AtomicUsize::new(0)),
+            policy: Arc::clone(&self.policy),
+            held: Arc::clone(&self.held),
+            superseded: Arc::clone(&self.superseded),
+            scope: OnceLock::from(scope),
+            contexts_kept: Arc::clone(&self.contexts_kept),
+            tools: self.tools.clone(),
+            playback: self.playback.clone(),
+            recording: Arc::clone(&self.recording),
+            last_stamp: Arc::clone(&self.last_stamp),
         })
     }
 
@@ -1164,7 +1221,7 @@ impl Memory {
     /// another holds, or a store error.
     pub async fn approve(&self, task_id: &str) -> Result<Promotion, Error> {
         let task = self.ledger.lock().await.get(task_id).await?;
-        self.task_in_grants(&task)?;
+        self.check_task(&task)?;
         let (id, entry) = self.proposal_entry(&task).await?;
         let d = self.decide_promotion(
             &entry,
@@ -1197,6 +1254,7 @@ impl Memory {
             &self.author,
             Duration::minutes(5),
             &task.spec.requirements,
+            self.handling()?,
         )
         .await?;
         Ok(())
@@ -1560,13 +1618,18 @@ impl Memory {
                     .len(),
             )
         };
+        // a count, so nothing is read and the label stays; what it counts is only what
+        // the session may see
+        let handling = self.handling()?;
         let waiting = self
             .ledger
             .lock()
             .await
             .list(&domain, dm_ledger::Status::Admitted)
             .await?
-            .len();
+            .iter()
+            .filter(|t| self.sees(t, handling))
+            .count();
         self.observe(&handoffs);
         self.observe(&decisions);
         self.observe(&conventions);
@@ -1623,11 +1686,71 @@ impl Memory {
 
     // ---- tasks ----
 
-    fn task_in_grants(&self, task: &Task) -> Result<(), Error> {
-        if self.grants.may_write(&task.spec.domain) {
+    /// The most this session may read: the grants, the launcher's cap on them, and the
+    /// policy's read scope, whichever is lowest.
+    fn handling(&self) -> Result<Label, Error> {
+        self.session_filter()?;
+        Ok(lock(&self.session).handling)
+    }
+
+    /// Whether this session may see a task: one in a granted domain, classified within
+    /// `handling`. A task it may not see is left out of every result and every count, as
+    /// an entry above its handling is.
+    fn sees(&self, task: &Task, handling: Label) -> bool {
+        self.grants.may_write(&task.spec.domain) && task.spec.classification <= handling
+    }
+
+    /// Whether this session may act on a named task. A task it may not see gets the
+    /// answer a missing task gets, so the answer says nothing that a listing would not.
+    /// Nothing is read yet: an operation that goes on to fail hands nothing out, and
+    /// [`Memory::observe_task`] is for the task it does hand out.
+    fn check_task(&self, task: &Task) -> Result<(), Error> {
+        if self.sees(task, self.handling()?) {
             Ok(())
         } else {
-            Err(Error::NotFound(task.id.clone()))
+            Err(dm_ledger::Error::NotFound(task.id.clone()).into())
+        }
+    }
+
+    /// A task handed out is read: the session's label rises to its classification.
+    fn observe_task(&self, task: &Task) {
+        lock(&self.session).observe(task.spec.classification);
+    }
+
+    /// Read one named task that is handed out as it is: checked, then observed.
+    fn read_task(&self, task: &Task) -> Result<(), Error> {
+        self.check_task(task)?;
+        self.observe_task(task);
+        Ok(())
+    }
+
+    /// The tasks of `tasks` this session may see, read: the label rises to the
+    /// classification of each, so to the highest handed out.
+    fn read_tasks(&self, tasks: Vec<Task>) -> Result<Vec<Task>, Error> {
+        let handling = self.handling()?;
+        let seen: Vec<Task> = tasks
+            .into_iter()
+            .filter(|t| self.sees(t, handling))
+            .collect();
+        let mut s = lock(&self.session);
+        for t in &seen {
+            s.observe(t.spec.classification);
+        }
+        Ok(seen)
+    }
+
+    /// `tree` without the branches this session may not see, nothing read yet. What is
+    /// filed from a task is classified at least as high as the task, so a branch above
+    /// handling goes whole. The root is the caller's to have checked.
+    fn visible_tree(&self, tree: TaskTree, handling: Label) -> TaskTree {
+        TaskTree {
+            children: tree
+                .children
+                .into_iter()
+                .filter(|c| self.sees(&c.task, handling))
+                .map(|c| self.visible_tree(c, handling))
+                .collect(),
+            task: tree.task,
         }
     }
 
@@ -1640,7 +1763,9 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// An ungranted domain, a proposal's origin, or a ledger or policy error.
+    /// An ungranted domain, a proposal's origin, or a ledger or policy error;
+    /// [`Error::Denied`] when the origin and upstream event name a task already filed
+    /// that this session may not read.
     pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
         if spec
             .origin
@@ -1687,6 +1812,17 @@ impl Memory {
     ) -> Result<Created, Error> {
         let spec = self.stamp(spec, filing, parent)?;
         let created = l.create(spec).await?;
+        // a filing that names a task already there is handed that task, and admits it on
+        // its say, only when this session may see it; the answer names nothing of it.
+        // The label does not rise for it: the filer named the task by the upstream event
+        // it is filing itself, and a tap, which files at its domain's classification
+        // above its own ceiling, would otherwise stop on every replay
+        if created.deduplicated && !self.sees(&created.task, self.handling()?) {
+            return Err(Error::Denied(
+                "this origin and upstream event are filed already, in a task this session may not read"
+                    .into(),
+            ));
+        }
         let task = self
             .admit_per_policy(l, created.task, filing, parent)
             .await?;
@@ -1726,9 +1862,10 @@ impl Memory {
     /// A ledger error, or a task outside the grants.
     pub async fn admit(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
+        self.check_task(&l.get(id).await?)?;
         let admitted = l.admit(id).await?;
         self.rank_edges(&mut l, &admitted).await?;
+        self.observe_task(&admitted);
         Ok(admitted)
     }
 
@@ -1810,32 +1947,38 @@ impl Memory {
     /// hold every child's handoff and the parent's own, which is what resuming is. Where
     /// the domain admits a session's own filings, everything filed here is admitted.
     ///
+    /// An item that matches a task this session may not read is withheld, not filed and
+    /// not named: the answer counts it and says nothing else of it. An item whose match
+    /// is elsewhere in the chain and done or dropped is new work here.
+    ///
     /// # Errors
     ///
-    /// A parent outside the grants, or a ledger error.
+    /// A parent outside the grants or above the handling, or a ledger error;
+    /// [`Error::Denied`] when the parent has an open continuation this session may not
+    /// read. That check runs before the items are matched, so the refusal is the same
+    /// whatever the items are.
     pub async fn fan_out(&self, parent: &str, items: &[(String, String)]) -> Result<FanOut, Error> {
         let mut l = self.ledger.lock().await;
         let parent = l.get(parent).await?;
-        self.task_in_grants(&parent)?;
-        // the chain this parent belongs to: a continuation or a retry resumes a root,
-        // and what an earlier run of the chain already asked for is not asked again
-        let root = Memory::root_of(&l, &parent).await;
-        let mut done = Vec::new();
-        Memory::tree_in(&l, root).await?.flatten(&mut done);
+        self.check_task(&parent)?;
+        let handling = self.handling()?;
+        // a harness that delegates twice from one run, as Claude Code does with one
+        // Agent call per subagent, gets one continuation waiting on all of them: an open
+        // continuation of this parent is folded into the new one and closed as superseded
+        let (mut ids, folded) = self.open_continuations(&l, &parent, handling).await?;
+        let (asked, mut existing, mut withheld) = self.spawns(&l, &parent, items, handling).await?;
+        if asked.is_empty() {
+            self.observe_task(&parent);
+            existing.iter().for_each(|t| self.observe_task(t));
+            return Ok(FanOut {
+                children: Vec::new(),
+                existing,
+                withheld,
+                continuation: None,
+            });
+        }
         let mut children = Vec::new();
-        let mut existing = Vec::new();
-        for (title, body) in items {
-            let hash = dm_core::digest(body)[..16].to_string();
-            if let Some(earlier) = done.iter().find(|t| {
-                t.spec.upstream_event.as_deref() == Some(hash.as_str())
-                    && t.spec
-                        .origin
-                        .as_deref()
-                        .is_some_and(|o| o.starts_with("task:"))
-            }) {
-                existing.push(earlier.clone());
-                continue;
-            }
+        for (title, body, hash) in asked {
             let created = l
                 .create(TaskSpec {
                     domain: parent.spec.domain.clone(),
@@ -1850,22 +1993,35 @@ impl Memory {
                     priority: parent.spec.priority,
                 })
                 .await?;
-            children.push(
-                self.admit_per_policy(&mut l, created.task, Filing::Held, Some(&parent))
-                    .await?,
-            );
+            // the ledger dedups on the parent and the hash whatever the task's status: a
+            // task it hands back is not this call's, and one this session may not read
+            // is withheld, never handed out
+            if created.deduplicated {
+                if self.sees(&created.task, handling) {
+                    existing.push(created.task);
+                } else {
+                    withheld += 1;
+                }
+                continue;
+            }
+            let child = self
+                .admit_per_policy(&mut l, created.task, Filing::Held, Some(&parent))
+                .await?;
+            if !ids.contains(&child.id) {
+                ids.push(child.id.clone());
+            }
+            children.push(child);
         }
         if children.is_empty() {
+            self.observe_task(&parent);
+            existing.iter().for_each(|t| self.observe_task(t));
             return Ok(FanOut {
                 children,
                 existing,
+                withheld,
                 continuation: None,
             });
         }
-        // a harness that delegates twice from one run, as Claude Code does with one
-        // Agent call per subagent, gets one continuation waiting on all of them: an open
-        // continuation of this parent is folded into the new one and closed as superseded
-        let (ids, folded) = Memory::fold_continuations(&l, &parent, &children).await?;
         let continuation = self.file_continuation(&mut l, &parent, ids).await?;
         for old in folded {
             l.invalidate(
@@ -1878,11 +2034,59 @@ impl Memory {
             )
             .await?;
         }
+        self.observe_task(&parent);
+        existing.iter().for_each(|t| self.observe_task(t));
         Ok(FanOut {
             children,
             existing,
+            withheld,
             continuation: Some(continuation),
         })
+    }
+
+    /// The items of a fan-out to file, each with the hash that names it; the tasks the
+    /// chain already holds for the others, since what an earlier run of the chain asked
+    /// for is not asked again; and how many items are withheld. An item that matches a
+    /// task this session may not see is withheld when that task is open, or when it is
+    /// this parent's, since the ledger would hand that task back; filing it again would
+    /// break "the same spawn asked twice is one task", and the count names nothing of
+    /// it. A hidden match elsewhere in the chain that is done or dropped is new work
+    /// here: a retry asks again for what an earlier attempt gave up on.
+    async fn spawns(
+        &self,
+        l: &Ledger,
+        parent: &Task,
+        items: &[(String, String)],
+        handling: Label,
+    ) -> Result<(Vec<(String, String, String)>, Vec<Task>, usize), Error> {
+        // the chain this parent belongs to: a continuation or a retry resumes a root
+        let root = Memory::root_of(l, parent).await;
+        let mut done = Vec::new();
+        Memory::tree_in(l, root).await?.flatten(&mut done);
+        let of_parent = format!("task:{}", parent.id);
+        let mut asked = Vec::new();
+        let mut existing = Vec::new();
+        let mut withheld = 0;
+        for (title, body) in items {
+            let hash = dm_core::digest(body)[..16].to_string();
+            let earlier = done.iter().find(|t| {
+                t.spec.upstream_event.as_deref() == Some(hash.as_str())
+                    && t.spec
+                        .origin
+                        .as_deref()
+                        .is_some_and(|o| o.starts_with("task:"))
+            });
+            match earlier {
+                Some(t) if self.sees(t, handling) => existing.push(t.clone()),
+                Some(t)
+                    if !t.status.is_terminal() || t.spec.origin.as_deref() == Some(&of_parent) =>
+                {
+                    withheld += 1;
+                }
+                _ => asked.push((title.clone(), body.clone(), hash)),
+            }
+        }
+        Ok((asked, existing, withheld))
     }
 
     /// File the continuation that resumes `parent` once `ids` are done.
@@ -1918,26 +2122,41 @@ impl Memory {
         Ok(continuation)
     }
 
-    /// The children a new continuation waits for: this fan-out's, and those of any
-    /// continuation of the same parent still open, which the new one replaces.
-    async fn fold_continuations(
+    /// The open continuations of `parent` a new one replaces, and the tasks they wait
+    /// for, which the new one waits for too. A continuation this session may not see, or
+    /// one waiting on a task it may not see, is not its to fold: the fan-out is refused,
+    /// so no hidden work is closed, or waited on unseen, by a session that cannot read
+    /// it. The refusal names nothing of it, and it comes before the items are looked at,
+    /// so it is the same refusal whatever they are.
+    async fn open_continuations(
+        &self,
         l: &Ledger,
         parent: &Task,
-        children: &[Task],
+        handling: Label,
     ) -> Result<(Vec<String>, Vec<String>), Error> {
         let mut ids: Vec<String> = Vec::new();
         let mut folded = Vec::new();
         let marker = dm_ledger::continues(&parent.id);
         for t in l.filed_from(&parent.id).await? {
-            if t.spec.origin.as_deref() == Some(marker.as_str()) && !t.status.is_terminal() {
-                ids.extend(t.spec.depends_on.iter().cloned());
-                folded.push(t.id);
+            if t.spec.origin.as_deref() != Some(marker.as_str()) || t.status.is_terminal() {
+                continue;
             }
-        }
-        for c in children {
-            if !ids.contains(&c.id) {
-                ids.push(c.id.clone());
+            let mut seen = self.sees(&t, handling);
+            for dep in &t.spec.depends_on {
+                seen &= match l.get(dep).await {
+                    Ok(d) => self.sees(&d, handling),
+                    Err(dm_ledger::Error::NotFound(_)) => true,
+                    Err(e) => return Err(e.into()),
+                };
             }
+            if !seen {
+                return Err(Error::Denied(
+                    "this task has open work this session may not read; it is not fanned out again here"
+                        .into(),
+                ));
+            }
+            ids.extend(t.spec.depends_on.iter().cloned());
+            folded.push(t.id);
         }
         Ok((ids, folded))
     }
@@ -1976,8 +2195,13 @@ impl Memory {
     pub async fn task_tree(&self, id: &str) -> Result<TaskTree, Error> {
         let l = self.ledger.lock().await;
         let task = l.get(id).await?;
-        self.task_in_grants(&task)?;
-        Ok(Memory::tree_in(&l, task).await?)
+        self.check_task(&task)?;
+        let tree = Memory::tree_in(&l, task).await?;
+        let tree = self.visible_tree(tree, self.handling()?);
+        let mut all = Vec::new();
+        tree.flatten(&mut all);
+        all.iter().for_each(|t| self.observe_task(t));
+        Ok(tree)
     }
 
     /// Boxed, since the tree is as deep as the work and an async fn cannot recurse
@@ -2006,10 +2230,20 @@ impl Memory {
     pub async fn retry_task(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
         let root = l.get(id).await?;
-        self.task_in_grants(&root)?;
-        let tree = Memory::tree_in(&l, root.clone()).await?;
+        self.check_task(&root)?;
+        // the lessons are what this session may read of the chain; the retry carries the
+        // root and the tasks with a handoff, and is classified at the highest of those,
+        // not at what the walk passed over
+        let tree = self.visible_tree(Memory::tree_in(&l, root.clone()).await?, self.handling()?);
         let mut lessons = Vec::new();
         tree.handoffs(&mut lessons);
+        let mut carried = Vec::new();
+        tree.flatten(&mut carried);
+        carried.retain(|t| t.id == root.id || t.handoff.is_some());
+        let classification = carried
+            .iter()
+            .map(|t| t.spec.classification)
+            .fold(self.label(), Label::max);
         let mut body = root.spec.body.trim_end().to_string();
         if !lessons.is_empty() {
             body.push_str(
@@ -2036,16 +2270,21 @@ impl Memory {
                 origin: Some(format!("retries:{}", root.id)),
                 upstream_event: None,
                 created_by: self.author.clone(),
-                classification: root.spec.classification.max(self.label()),
+                classification,
                 priority: root.spec.priority,
             })
             .await?;
-        self.admit_per_policy(&mut l, created.task, Filing::Held, Some(&root))
-            .await
+        let retry = self
+            .admit_per_policy(&mut l, created.task, Filing::Held, Some(&root))
+            .await?;
+        carried.iter().for_each(|t| self.observe_task(t));
+        Ok(retry)
     }
 
     /// Claim the highest-ranked claimable task in a domain that this session's manifest
-    /// can take.
+    /// can take and its handling covers. The ledger passes over a task above the
+    /// handling inside the claim's own transaction, so such a task is never claimed,
+    /// and never offered, to this session.
     ///
     /// # Errors
     ///
@@ -2056,11 +2295,12 @@ impl Memory {
         lease: Duration,
     ) -> Result<Option<Claim>, Error> {
         let domain = self.resolve_domain(domain)?;
+        let handling = self.handling()?;
         let claim = self
             .ledger
             .lock()
             .await
-            .claim_next(&domain, &self.author, lease, &self.manifest)
+            .claim_next(&domain, &self.author, lease, &self.manifest, handling)
             .await?;
         if let Some(c) = &claim {
             lock(&self.session).observe(c.task.spec.classification);
@@ -2068,15 +2308,19 @@ impl Memory {
         Ok(claim)
     }
 
-    /// Claim one named task.
+    /// Claim one named task. A task above the session's handling is not found, as it is
+    /// to every other read, and the ledger refuses it too.
     ///
     /// # Errors
     ///
-    /// A ledger error, or a task outside the grants.
+    /// A ledger error, including a task outside the grants or above the handling.
     pub async fn claim(&self, id: &str, lease: Duration) -> Result<Claim, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
-        let c = l.claim(id, &self.author, lease, &self.manifest).await?;
+        self.check_task(&l.get(id).await?)?;
+        let handling = self.handling()?;
+        let c = l
+            .claim(id, &self.author, lease, &self.manifest, handling)
+            .await?;
         lock(&self.session).observe(c.task.spec.classification);
         Ok(c)
     }
@@ -2088,8 +2332,10 @@ impl Memory {
     /// A ledger error, including a lease already lost, or a task outside the grants.
     pub async fn heartbeat(&self, id: &str, lease: Duration) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
-        Ok(l.heartbeat(id, &self.author, lease).await?)
+        self.check_task(&l.get(id).await?)?;
+        let t = l.heartbeat(id, &self.author, lease).await?;
+        self.observe_task(&t);
+        Ok(t)
     }
 
     /// Complete a task with the handoff entry that records what happened. The handoff
@@ -2101,7 +2347,7 @@ impl Memory {
     /// grants.
     pub async fn complete(&self, id: &str, handoff: &str) -> Result<Task, Error> {
         let task = self.ledger.lock().await.get(id).await?;
-        self.task_in_grants(&task)?;
+        self.check_task(&task)?;
         if self.store.get(&task.spec.domain, handoff).await?.is_none() {
             return Err(Error::NotFound(format!("handoff {handoff}")));
         }
@@ -2121,6 +2367,7 @@ impl Memory {
             };
             by = closed;
         }
+        self.observe_task(&done);
         Ok(done)
     }
 
@@ -2134,17 +2381,22 @@ impl Memory {
             self.get(h).await?; // the handoff must exist and be readable here
         }
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
-        Ok(l.release(id, &self.author, handoff).await?)
+        self.check_task(&l.get(id).await?)?;
+        let t = l.release(id, &self.author, handoff).await?;
+        self.observe_task(&t);
+        Ok(t)
     }
 
     /// Close a task without doing it, and everything still open that was filed from it:
     /// its subagent tasks, their continuations, and theirs, since a promise withdrawn
-    /// withdraws the promises made to keep it.
+    /// withdraws the promises made to keep it. Open work this session may not read is
+    /// not its to close: the call is refused before anything moves, and the refusal
+    /// names nothing of that work.
     ///
     /// # Errors
     ///
-    /// A ledger error, or a task outside the grants.
+    /// A ledger error, or a task outside the grants; [`Error::Denied`] when an open task
+    /// filed from it, however far down, is above the session's handling.
     pub async fn invalidate(
         &self,
         id: &str,
@@ -2152,35 +2404,50 @@ impl Memory {
         superseded_by: Option<&str>,
     ) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.task_in_grants(&l.get(id).await?)?;
-        let task = l.invalidate(id, reason, superseded_by).await?;
+        self.check_task(&l.get(id).await?)?;
+        let handling = self.handling()?;
+        let mut open = Vec::new();
         let mut pending = l.filed_from(id).await?;
         while let Some(t) = pending.pop() {
             pending.extend(l.filed_from(&t.id).await?);
-            if !t.status.is_terminal() {
-                l.invalidate(
-                    &t.id,
-                    &format!("filed from {id}, which was invalidated: {reason}"),
-                    superseded_by,
-                )
-                .await?;
+            if t.status.is_terminal() {
+                continue;
             }
+            if !self.sees(&t, handling) {
+                return Err(Error::Denied(
+                    "this task has open work this session may not read; it is not invalidated here"
+                        .into(),
+                ));
+            }
+            open.push(t.id);
         }
+        let task = l.invalidate(id, reason, superseded_by).await?;
+        for t in open {
+            l.invalidate(
+                &t,
+                &format!("filed from {id}, which was invalidated: {reason}"),
+                superseded_by,
+            )
+            .await?;
+        }
+        self.observe_task(&task);
         Ok(task)
     }
 
-    /// One task.
+    /// One task, read: the session's label rises to its classification.
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`], including for a task outside the grants.
+    /// The ledger's not-found, including for a task outside the grants or above the
+    /// session's handling.
     pub async fn get_task(&self, id: &str) -> Result<Task, Error> {
         let t = self.ledger.lock().await.get(id).await?;
-        self.task_in_grants(&t)?;
+        self.read_task(&t)?;
         Ok(t)
     }
 
-    /// Tasks in a domain with a status, ranked.
+    /// Tasks in a domain with a status, ranked: those within the session's handling,
+    /// each read, so the label rises to the highest classification handed out.
     ///
     /// # Errors
     ///
@@ -2191,7 +2458,8 @@ impl Memory {
         status: dm_ledger::Status,
     ) -> Result<Vec<Task>, Error> {
         let domain = self.resolve_domain(domain)?;
-        Ok(self.ledger.lock().await.list(&domain, status).await?)
+        let listed = self.ledger.lock().await.list(&domain, status).await?;
+        self.read_tasks(listed)
     }
 
     // ---- leaving, arriving, rebuilding ----
@@ -2608,6 +2876,26 @@ mod tests {
         let w = m.write(req("Written after the step.\n")).await.unwrap();
         let e = m.store.get("dom-me", &w.id).await.unwrap().unwrap();
         assert_eq!(e.front.created, ahead + Duration::nanoseconds(1));
+    }
+
+    #[tokio::test]
+    async fn a_request_view_dates_its_writes_after_its_session_s_last_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let ahead = OffsetDateTime::now_utc() + Duration::seconds(30);
+        *lock(&m.last_stamp) = ahead;
+        let view = m.for_request().unwrap();
+        let w = view
+            .write(req("Written through the board.\n"))
+            .await
+            .unwrap();
+        let e = m.store.get("dom-me", &w.id).await.unwrap().unwrap();
+        assert_eq!(e.front.created, ahead + Duration::nanoseconds(1));
+        assert_eq!(
+            *lock(&m.last_stamp),
+            e.front.created,
+            "one clock per service"
+        );
     }
 
     fn req(body: &str) -> WriteRequest {
@@ -3246,6 +3534,7 @@ mod tests {
                 "human:test:alice",
                 Duration::minutes(5),
                 &task.spec.requirements,
+                Label::Restricted,
             )
             .await
             .unwrap();
@@ -3803,9 +4092,15 @@ mod tests {
     async fn done(m: &Memory, s: TaskSpec) {
         let t = filed(m, s).await;
         let mut l = m.ledger.lock().await;
-        l.claim(&t.id, "w", Duration::minutes(5), &t.spec.requirements)
-            .await
-            .unwrap();
+        l.claim(
+            &t.id,
+            "w",
+            Duration::minutes(5),
+            &t.spec.requirements,
+            Label::Restricted,
+        )
+        .await
+        .unwrap();
         l.complete(&t.id, "w", "mem-x").await.unwrap();
     }
 
@@ -3870,7 +4165,7 @@ mod tests {
             .ledger
             .lock()
             .await
-            .claim_next("dom-me", "w2", Duration::minutes(5), &[])
+            .claim_next("dom-me", "w2", Duration::minutes(5), &[], Label::Restricted)
             .await
             .unwrap()
             .unwrap();
@@ -4893,6 +5188,1153 @@ mod tests {
         );
         assert_eq!(full.search("note", None, 10).await.unwrap().len(), 2);
         assert!(full.session_id().starts_with("sess-"));
+    }
+
+    const EVERY_STATUS: [Status; 5] = [
+        Status::Proposed,
+        Status::Admitted,
+        Status::Claimed,
+        Status::Completed,
+        Status::Invalidated,
+    ];
+
+    fn restricted(title: &str) -> TaskSpec {
+        TaskSpec {
+            classification: Label::Restricted,
+            ..tspec(title, 0, None, &[], &[])
+        }
+    }
+
+    /// Move a proposed task on the ledger to `st`.
+    async fn move_to(l: &mut Ledger, id: &str, st: Status) {
+        if st != Status::Proposed {
+            l.admit(id).await.unwrap();
+        }
+        if matches!(st, Status::Claimed | Status::Completed) {
+            l.claim(id, "w", Duration::minutes(5), &[], Label::Restricted)
+                .await
+                .unwrap();
+        }
+        if st == Status::Completed {
+            l.complete(id, "w", "mem-me-x").await.unwrap();
+        }
+        if st == Status::Invalidated {
+            l.invalidate(id, "obsolete", None).await.unwrap();
+        }
+        assert_eq!(l.get(id).await.unwrap().status, st);
+    }
+
+    /// One restricted task in every status, filed straight on the ledger, and one public
+    /// task, admitted: the restricted ids, and the public one.
+    async fn restricted_in_every_status(m: &Memory) -> (Vec<String>, String) {
+        let mut l = m.ledger.lock().await;
+        let mut hidden = Vec::new();
+        for (i, st) in EVERY_STATUS.iter().enumerate() {
+            let t = l
+                .create(restricted(&format!("Rotate signing key {i}")))
+                .await
+                .unwrap()
+                .task;
+            move_to(&mut l, &t.id, *st).await;
+            hidden.push(t.id);
+        }
+        let shown = l
+            .create(tspec("Tidy the docs", 0, None, &[], &[]))
+            .await
+            .unwrap()
+            .task;
+        l.admit(&shown.id).await.unwrap();
+        (hidden, shown.id)
+    }
+
+    fn family_total(stats: &serde_json::Value) -> u64 {
+        stats["by_family"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|by_status| by_status.as_object().unwrap().values())
+            .map(|n| n.as_u64().unwrap())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_task_above_the_session_s_handling_is_not_listed_counted_or_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, shown) = restricted_in_every_status(&mem(dir.path())).await;
+
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let mut listed = Vec::new();
+        for st in EVERY_STATUS {
+            listed.extend(capped.tasks(None, st).await.unwrap());
+        }
+        assert!(listed.iter().any(|t| t.id == shown), "{listed:?}");
+        assert!(
+            listed.iter().all(|t| !hidden.contains(&t.id)),
+            "a restricted task is listed to a public session: {listed:?}"
+        );
+        for id in &hidden {
+            // the answer a missing task gets, so it says nothing of what is there
+            assert!(
+                matches!(
+                    capped.get_task(id).await,
+                    Err(Error::Ledger(dm_ledger::Error::NotFound(_)))
+                ),
+                "{id} is found by a public session"
+            );
+        }
+        let t0 = capped.t0(None).await.unwrap();
+        assert!(t0.contains("- 1 tasks waiting"), "{t0}");
+        assert_eq!(
+            family_total(&capped.task_stats(None).await.unwrap()),
+            1,
+            "only the public task is counted"
+        );
+        assert_eq!(capped.label(), Label::Public);
+
+        let full = Memory::open(dir.path()).unwrap();
+        assert_eq!(full.label(), Label::Public);
+        let admitted = full.tasks(None, Status::Admitted).await.unwrap();
+        assert!(admitted.iter().any(|t| t.id == hidden[1]), "{admitted:?}");
+        assert_eq!(
+            full.label(),
+            Label::Restricted,
+            "a listing raises the label to what it handed out"
+        );
+        let one = Memory::open(dir.path()).unwrap();
+        assert_eq!(one.get_task(&hidden[0]).await.unwrap().id, hidden[0]);
+        assert_eq!(one.label(), Label::Restricted, "a get_task is a read");
+    }
+
+    #[tokio::test]
+    async fn a_tree_a_retry_and_a_fan_out_leave_out_a_task_above_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, hidden) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let hidden = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(dm_core::digest("Rotate it.")[..16].to_string()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            l.admit(&hidden.id).await.unwrap();
+            l.claim(
+                &hidden.id,
+                "w",
+                Duration::minutes(5),
+                &[],
+                Label::Restricted,
+            )
+            .await
+            .unwrap();
+            l.complete(&hidden.id, "w", "mem-me-x").await.unwrap();
+            (root, hidden)
+        };
+
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let tree = serde_json::to_string(&capped.task_tree(&root.id).await.unwrap()).unwrap();
+        assert!(!tree.contains("signing key"), "{tree}");
+        // the same spawn as a hidden child of this parent is withheld: the ledger holds
+        // it as that child, which is not handed out, and the answer names nothing of it
+        let f = capped
+            .fan_out(&root.id, &[("Again".into(), "Rotate it.".into())])
+            .await
+            .unwrap();
+        assert_eq!((f.children.len(), f.existing.len(), f.withheld), (0, 0, 1));
+        assert!(
+            f.continuation.is_none(),
+            "nothing new, nothing to resume for"
+        );
+        let answer = serde_json::to_string(&f).unwrap();
+        assert!(
+            !answer.contains(&hidden.id) && !answer.contains("signing key"),
+            "{answer}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        let retry = capped.retry_task(&root.id).await.unwrap();
+        assert!(
+            !retry.spec.body.contains("signing key"),
+            "{}",
+            retry.spec.body
+        );
+        assert_eq!(retry.spec.classification, Label::Public);
+        assert_eq!(capped.label(), Label::Public);
+
+        let full = Memory::open(dir.path()).unwrap();
+        let tree = full.task_tree(&root.id).await.unwrap();
+        assert!(tree.children.iter().any(|c| c.task.id == hidden.id));
+        assert_eq!(full.label(), Label::Restricted, "a tree is a read");
+        let retry = full.retry_task(&root.id).await.unwrap();
+        assert!(
+            retry.spec.body.contains("signing key"),
+            "{}",
+            retry.spec.body
+        );
+        assert_eq!(
+            retry.spec.classification,
+            Label::Restricted,
+            "a retry that carries a restricted lesson is restricted"
+        );
+    }
+
+    /// A public root with an open restricted continuation, waiting on a restricted
+    /// child, all filed straight on the ledger: the root, the continuation, the child.
+    async fn hidden_continuation(m: &Memory) -> (Task, Task, Task) {
+        let root = m.create_task(spec("Root")).await.unwrap().task;
+        let mut l = m.ledger.lock().await;
+        let child = l
+            .create(TaskSpec {
+                origin: Some(format!("task:{}", root.id)),
+                upstream_event: Some("one".into()),
+                ..restricted("Rotate the signing key")
+            })
+            .await
+            .unwrap()
+            .task;
+        let cont = l
+            .create(TaskSpec {
+                origin: Some(dm_ledger::continues(&root.id)),
+                upstream_event: Some("two".into()),
+                depends_on: vec![child.id.clone()],
+                ..restricted("Resume: Root")
+            })
+            .await
+            .unwrap()
+            .task;
+        (root, cont, child)
+    }
+
+    #[tokio::test]
+    async fn a_request_view_shares_the_session_id_and_starts_its_label_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        m.file_own(restricted("Rotate the signing key"))
+            .await
+            .unwrap();
+        for st in [Status::Proposed, Status::Admitted] {
+            m.tasks(None, st).await.unwrap();
+        }
+        assert_eq!(m.label(), Label::Restricted);
+        let first = m.for_request().unwrap();
+        assert_eq!(first.session_id(), m.session_id());
+        assert_eq!(
+            first.label(),
+            Label::Public,
+            "a view's label starts fresh, whatever the shared session read"
+        );
+        for st in [Status::Proposed, Status::Admitted] {
+            first.tasks(None, st).await.unwrap();
+        }
+        assert_eq!(first.label(), Label::Restricted);
+        let second = m.for_request().unwrap();
+        assert_eq!(second.label(), Label::Public, "a view's label is its own");
+        let t = second
+            .create_task(spec("Tidy the docs"))
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(t.spec.classification, Label::Public);
+        assert!(
+            first.get_task(&t.id).await.is_ok(),
+            "one ledger behind every view"
+        );
+    }
+
+    /// With a hidden open continuation on the root, a spawn that matches its hidden
+    /// child and one that matches nothing get one and the same refusal: the answer
+    /// does not say which guess was right.
+    #[tokio::test]
+    async fn a_fan_out_refused_for_hidden_work_says_the_same_whatever_the_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, cont, child) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let child = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(dm_core::digest("Rotate it.")[..16].to_string()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            let cont = l
+                .create(TaskSpec {
+                    origin: Some(dm_ledger::continues(&root.id)),
+                    upstream_event: Some("two".into()),
+                    depends_on: vec![child.id.clone()],
+                    ..restricted("Resume: Root")
+                })
+                .await
+                .unwrap()
+                .task;
+            (root, cont, child)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let mut answers = Vec::new();
+        for body in ["Rotate it.", "Something else."] {
+            match capped
+                .fan_out(&root.id, &[("Guess".into(), body.into())])
+                .await
+            {
+                Err(Error::Denied(why)) => answers.push(why),
+                other => panic!("a fan-out over hidden open work: {other:?}"),
+            }
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "the refusal tells a right guess from a wrong one"
+        );
+        for why in &answers {
+            assert!(!why.contains(&cont.id) && !why.contains(&child.id), "{why}");
+            assert!(!why.contains("signing key"), "{why}");
+        }
+        assert_eq!(capped.label(), Label::Public);
+        assert_eq!(
+            capped
+                .ledger
+                .lock()
+                .await
+                .filed_from(&root.id)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "nothing is filed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_fans_out_again_what_a_hidden_attempt_gave_up_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, hidden) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let hidden = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(dm_core::digest("Rotate it.")[..16].to_string()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            move_to(&mut l, &hidden.id, Status::Invalidated).await;
+            (root, hidden)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let retry = capped.retry_task(&root.id).await.unwrap();
+        let f = capped
+            .fan_out(
+                &retry.id,
+                &[
+                    ("Again".into(), "Rotate it.".into()),
+                    ("New".into(), "Something new.".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (f.children.len(), f.existing.len(), f.withheld),
+            (2, 0, 0),
+            "a dropped hidden spawn is new work for the retry: {f:?}"
+        );
+        let continuation = f.continuation.as_ref().expect("the retry is resumed");
+        assert_eq!(continuation.spec.depends_on.len(), 2);
+        let answer = serde_json::to_string(&f).unwrap();
+        assert!(!answer.contains(&hidden.id), "{answer}");
+        assert_eq!(capped.label(), Label::Public);
+    }
+
+    #[tokio::test]
+    async fn a_spawn_that_matches_hidden_open_work_is_withheld_and_the_rest_filed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, hidden) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let hidden = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(dm_core::digest("Rotate it.")[..16].to_string()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            l.admit(&hidden.id).await.unwrap();
+            (root, hidden)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let f = capped
+            .fan_out(
+                &root.id,
+                &[
+                    ("Again".into(), "Rotate it.".into()),
+                    ("New".into(), "Something new.".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (f.children.len(), f.existing.len(), f.withheld),
+            (1, 0, 1),
+            "{f:?}"
+        );
+        assert_eq!(f.children[0].spec.title, "New");
+        let continuation = f
+            .continuation
+            .as_ref()
+            .expect("the new child is waited for");
+        assert_eq!(
+            continuation.spec.depends_on,
+            vec![f.children[0].id.clone()],
+            "the hidden task is not this session's to wait on"
+        );
+        let answer = serde_json::to_string(&f).unwrap();
+        assert!(
+            !answer.contains(&hidden.id) && !answer.contains("signing key"),
+            "{answer}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        assert_eq!(
+            capped
+                .ledger
+                .lock()
+                .await
+                .get(&hidden.id)
+                .await
+                .unwrap()
+                .status,
+            Status::Admitted,
+            "the hidden task is left as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fan_out_that_would_fold_a_hidden_continuation_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, cont, child) = hidden_continuation(&mem(dir.path())).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        match capped
+            .fan_out(&root.id, &[("More".into(), "Do more.".into())])
+            .await
+        {
+            Err(Error::Denied(why)) => {
+                assert!(!why.contains(&cont.id) && !why.contains(&child.id), "{why}");
+            }
+            other => panic!("a fan-out folded a hidden continuation: {other:?}"),
+        }
+        let l = capped.ledger.lock().await;
+        assert_eq!(
+            l.get(&cont.id).await.unwrap().status,
+            Status::Proposed,
+            "the hidden continuation is left as it was"
+        );
+        assert_eq!(
+            l.filed_from(&root.id).await.unwrap().len(),
+            2,
+            "nothing is filed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rescore_report_counts_only_completed_work_the_session_may_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let survey = TaskSpec {
+            origin: Some("librarian:stale".into()),
+            upstream_event: Some("ev-1".into()),
+            ..spec("Survey")
+        };
+        for s in [survey, restricted("Rotate the signing key")] {
+            let t = owner.file_own(s).await.unwrap().task;
+            if t.status == Status::Proposed {
+                owner.admit(&t.id).await.unwrap();
+            }
+            owner.claim(&t.id, Duration::minutes(5)).await.unwrap();
+            let h = owner
+                .write(WriteRequest {
+                    entry_type: EntryType::Handoff,
+                    body: "Done.\n".into(),
+                    ..WriteRequest::default()
+                })
+                .await
+                .unwrap();
+            owner.complete(&t.id, &h.id).await.unwrap();
+        }
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let r = capped.rescore(None).await.unwrap();
+        // the one completed task it may see is curation; the restricted one is not counted
+        assert!(
+            (r.maintenance_share - 1.0).abs() < f64::EPSILON,
+            "{}",
+            r.maintenance_share
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidating_a_task_raises_the_label_to_its_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let t = owner
+            .file_own(TaskSpec {
+                classification: Label::Internal,
+                ..spec("Close me")
+            })
+            .await
+            .unwrap()
+            .task;
+        let fresh = Memory::open(dir.path()).unwrap();
+        assert_eq!(fresh.label(), Label::Public);
+        fresh.invalidate(&t.id, "obsolete", None).await.unwrap();
+        assert_eq!(fresh.label(), Label::Internal);
+    }
+
+    #[tokio::test]
+    async fn an_invalidation_that_would_close_hidden_work_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, cont, child) = hidden_continuation(&mem(dir.path())).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        match capped.invalidate(&root.id, "closed", None).await {
+            Err(Error::Denied(why)) => {
+                assert!(!why.contains(&cont.id) && !why.contains(&child.id), "{why}");
+                assert!(!why.contains("signing key"), "{why}");
+            }
+            other => panic!("an invalidation closed hidden work: {other:?}"),
+        }
+        {
+            let l = capped.ledger.lock().await;
+            for t in [&root, &cont, &child] {
+                assert_eq!(
+                    l.get(&t.id).await.unwrap().status,
+                    t.status,
+                    "{} is left as it was",
+                    t.id
+                );
+            }
+        }
+        assert_eq!(capped.label(), Label::Public);
+        // hidden work already closed is not closed again, so it does not stand in the way
+        {
+            let mut l = capped.ledger.lock().await;
+            for t in [&cont, &child] {
+                l.invalidate(&t.id, "dropped", None).await.unwrap();
+            }
+        }
+        let closed = capped.invalidate(&root.id, "closed", None).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
+    }
+
+    /// An internal task on the ledger, in `st`, held by `holder` when claimed.
+    async fn internal_in(m: &Memory, st: Status, holder: &str) -> String {
+        let mut l = m.ledger.lock().await;
+        let t = l
+            .create(TaskSpec {
+                classification: Label::Internal,
+                ..tspec("Tidy the internal docs", 0, None, &[], &[])
+            })
+            .await
+            .unwrap()
+            .task;
+        if st != Status::Proposed {
+            l.admit(&t.id).await.unwrap();
+        }
+        if matches!(st, Status::Claimed | Status::Completed) {
+            l.claim(&t.id, holder, Duration::minutes(5), &[], Label::Restricted)
+                .await
+                .unwrap();
+        }
+        if st == Status::Completed {
+            l.complete(&t.id, holder, "mem-me-x").await.unwrap();
+        }
+        t.id
+    }
+
+    #[tokio::test]
+    async fn a_refused_fan_out_does_not_raise_the_label_to_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = {
+            let m = mem(dir.path());
+            let mut l = m.ledger.lock().await;
+            let root = l
+                .create(TaskSpec {
+                    classification: Label::Internal,
+                    ..tspec("Root", 0, None, &[], &[])
+                })
+                .await
+                .unwrap()
+                .task;
+            let child = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some("one".into()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            l.create(TaskSpec {
+                origin: Some(dm_ledger::continues(&root.id)),
+                upstream_event: Some("two".into()),
+                depends_on: vec![child.id],
+                ..restricted("Resume: Root")
+            })
+            .await
+            .unwrap();
+            root.id
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Internal);
+        assert!(matches!(
+            capped
+                .fan_out(&root, &[("More".into(), "Do more.".into())])
+                .await,
+            Err(Error::Denied(_))
+        ));
+        assert_eq!(
+            capped.label(),
+            Label::Public,
+            "a refused fan-out read its parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_completion_does_not_raise_the_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = internal_in(&mem(dir.path()), Status::Claimed, "human:test:me").await;
+        let full = Memory::open(dir.path()).unwrap();
+        assert!(matches!(
+            full.complete(&held, "mem-me-none").await,
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(
+            full.label(),
+            Label::Public,
+            "a completion refused for its handoff read the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_invalidation_does_not_raise_the_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let done = internal_in(&mem(dir.path()), Status::Completed, "w").await;
+        let full = Memory::open(dir.path()).unwrap();
+        assert!(matches!(
+            full.invalidate(&done, "late", None).await,
+            Err(Error::Ledger(dm_ledger::Error::WrongState { .. }))
+        ));
+        assert_eq!(
+            full.label(),
+            Label::Public,
+            "an invalidation refused by the ledger read the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_release_does_not_raise_the_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = internal_in(&mem(dir.path()), Status::Claimed, "w").await;
+        let full = Memory::open(dir.path()).unwrap();
+        assert!(matches!(
+            full.release(&theirs, None).await,
+            Err(Error::Ledger(dm_ledger::Error::NotHolder { .. }))
+        ));
+        assert_eq!(
+            full.label(),
+            Label::Public,
+            "a release refused by the ledger read the task"
+        );
+    }
+
+    /// The floor lifts the best curation task over the top delivery task. When that
+    /// delivery task is hidden, the lift is not reported: its new rank is the hidden
+    /// task's rank plus one.
+    #[tokio::test]
+    async fn the_floor_s_report_leaves_out_a_lift_over_a_hidden_delivery_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, curation) = {
+            let m = mem(dir.path());
+            done(&m, tspec("Shipped", 0, None, &[], &[])).await;
+            let mut l = m.ledger.lock().await;
+            let hidden = l
+                .create(TaskSpec {
+                    classification: Label::Restricted,
+                    ..tspec("Rotate the signing key", 50, None, &[], &[])
+                })
+                .await
+                .unwrap()
+                .task;
+            let curation = l
+                .create(tspec(
+                    "Resummarise",
+                    -1,
+                    Some("librarian:resummarise"),
+                    &[],
+                    &[],
+                ))
+                .await
+                .unwrap()
+                .task;
+            for t in [&hidden, &curation] {
+                l.admit(&t.id).await.unwrap();
+            }
+            (hidden.id, curation.id)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let r = capped.rescore(None).await.unwrap();
+        assert!(r.maintenance_share < r.floor);
+        let text = serde_json::to_string(&r.changed).unwrap();
+        assert!(!text.contains(&hidden), "{text}");
+        assert!(
+            r.changed.iter().all(|c| c.id != curation),
+            "the floor's lift over a hidden task is reported: {text}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        let full = Memory::open(dir.path()).unwrap();
+        let lifted = full.get_task(&curation).await.unwrap();
+        let top = full.get_task(&hidden).await.unwrap();
+        assert_eq!(
+            lifted.spec.priority,
+            top.spec.priority + 1,
+            "the lift stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_view_reads_within_the_policy_s_scope_not_the_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let internal = {
+            let mut l = owner.ledger.lock().await;
+            l.create(TaskSpec {
+                classification: Label::Internal,
+                ..tspec("Tidy the internal docs", 0, None, &[], &[])
+            })
+            .await
+            .unwrap()
+            .task
+            .id
+        };
+        // the root's own policy: the built-in one with agents narrowed to public
+        let text = dm_policy::decide::BUILTIN.replace(
+            "read_filter := base_filter\n",
+            "read_filter := object.union(base_filter, {\"handling\": \"public\"}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n",
+        );
+        std::fs::create_dir_all(dir.path().join("policy")).unwrap();
+        std::fs::write(dir.path().join("policy/local.rego"), text).unwrap();
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:narrowed");
+        assert!(agent.get_task(&internal).await.is_err());
+        let view = agent.for_request().unwrap();
+        assert!(
+            view.get_task(&internal).await.is_err(),
+            "a view read above the policy's scope, at the grants' handling"
+        );
+        assert_eq!(view.label(), Label::Public);
+    }
+
+    #[tokio::test]
+    async fn an_invalidation_is_refused_for_hidden_work_however_far_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, child, grandchild) = {
+            let m = mem(dir.path());
+            let mut l = m.ledger.lock().await;
+            let root = l
+                .create(tspec("Root", 0, None, &[], &[]))
+                .await
+                .unwrap()
+                .task;
+            let child = l
+                .create(tspec(
+                    "Child",
+                    0,
+                    Some(&format!("task:{}", root.id)),
+                    &[],
+                    &[],
+                ))
+                .await
+                .unwrap()
+                .task;
+            let grandchild = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", child.id)),
+                    upstream_event: Some("deep".into()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            (root, child, grandchild)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        match capped.invalidate(&root.id, "closed", None).await {
+            Err(Error::Denied(why)) => {
+                assert!(
+                    !why.contains(&grandchild.id) && !why.contains("signing key"),
+                    "{why}"
+                );
+            }
+            other => panic!("an invalidation closed a hidden grandchild: {other:?}"),
+        }
+        let l = capped.ledger.lock().await;
+        for t in [&root, &child, &grandchild] {
+            assert_eq!(l.get(&t.id).await.unwrap().status, t.status, "{}", t.id);
+        }
+    }
+
+    /// Root R has a hidden dropped child A with hash h; the retry Rt of R has a hidden
+    /// open child B with the same hash. A is elsewhere and dropped, so h is new work
+    /// under Rt by the chain's reading; the ledger then hands B back, and B is withheld.
+    #[tokio::test]
+    async fn a_spawn_the_ledger_dedups_to_a_hidden_task_is_withheld_not_handed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = dm_core::digest("Rotate it.")[..16].to_string();
+        let (retry, b) = {
+            let m = mem(dir.path());
+            let root = m.create_task(spec("Root")).await.unwrap().task;
+            let mut l = m.ledger.lock().await;
+            let a = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", root.id)),
+                    upstream_event: Some(hash.clone()),
+                    ..restricted("Rotate the signing key")
+                })
+                .await
+                .unwrap()
+                .task;
+            move_to(&mut l, &a.id, Status::Invalidated).await;
+            let retry = l
+                .create(TaskSpec {
+                    domain: "dom-me".into(),
+                    origin: Some(format!("retries:{}", root.id)),
+                    ..spec("Root")
+                })
+                .await
+                .unwrap()
+                .task;
+            let b = l
+                .create(TaskSpec {
+                    origin: Some(format!("task:{}", retry.id)),
+                    upstream_event: Some(hash.clone()),
+                    ..restricted("Rotate the signing key again")
+                })
+                .await
+                .unwrap()
+                .task;
+            (retry, b)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let f = capped
+            .fan_out(&retry.id, &[("Again".into(), "Rotate it.".into())])
+            .await
+            .unwrap();
+        assert_eq!(
+            (f.children.len(), f.existing.len(), f.withheld),
+            (0, 0, 1),
+            "{f:?}"
+        );
+        let answer = serde_json::to_string(&f).unwrap();
+        assert!(
+            !answer.contains(&b.id) && !answer.contains("signing key"),
+            "{answer}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+    }
+
+    #[tokio::test]
+    async fn the_views_of_a_session_count_supersedes_together() {
+        let dir = tempfile::tempdir().unwrap();
+        mem(dir.path());
+        let grants = dir.path().join("grants.toml");
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(
+            &grants,
+            text.replace(
+                "max_supersedes_per_session = 20",
+                "max_supersedes_per_session = 2",
+            ),
+        )
+        .unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:test");
+        let (first, second) = (agent.for_request().unwrap(), agent.for_request().unwrap());
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(first.write(req(&format!("Fact {i}.\n"))).await.unwrap().id);
+        }
+        for id in &ids[..2] {
+            first
+                .write(WriteRequest {
+                    supersedes: Some(id.clone()),
+                    ..req("Rewritten.\n")
+                })
+                .await
+                .unwrap();
+        }
+        let err = second
+            .write(WriteRequest {
+                supersedes: Some(ids[2].clone()),
+                ..req("Rewritten.\n")
+            })
+            .await
+            .expect_err("a view of the same session supersedes past the gate");
+        assert!(err.to_string().contains("blast radius"), "{err}");
+        agent.set_held_task("task-me-held");
+        assert_eq!(
+            second.held.get().map(String::as_str),
+            Some("task-me-held"),
+            "the held task is the session's, shared with its views"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_is_classified_by_what_it_carries_not_by_what_it_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let (root, _, _) = hidden_continuation(&m).await;
+        let full = Memory::open(dir.path()).unwrap();
+        let retry = full.retry_task(&root.id).await.unwrap();
+        assert!(!retry.spec.body.contains("Lessons"), "{}", retry.spec.body);
+        assert_eq!(
+            retry.spec.classification,
+            Label::Public,
+            "open restricted tasks with no handoff are not in the retry"
+        );
+        assert_eq!(full.label(), Label::Public);
+    }
+
+    #[tokio::test]
+    async fn a_refused_operation_does_not_raise_the_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = {
+            let m = mem(dir.path());
+            let mut l = m.ledger.lock().await;
+            let t = l.create(restricted("Held elsewhere")).await.unwrap().task;
+            move_to(&mut l, &t.id, Status::Claimed).await;
+            t.id
+        };
+        let full = Memory::open(dir.path()).unwrap();
+        assert!(matches!(
+            full.claim(&held, Duration::minutes(5)).await,
+            Err(Error::Ledger(dm_ledger::Error::WrongState { .. }))
+        ));
+        assert!(full.heartbeat(&held, Duration::minutes(5)).await.is_err());
+        assert!(full.admit(&held).await.is_err());
+        assert_eq!(
+            full.label(),
+            Label::Public,
+            "nothing was handed out, so nothing was read"
+        );
+    }
+
+    /// A visible blocker that a hidden task waits on, and a visible task that waits on a
+    /// visible blocker that the hidden one waits on too: what a public session's
+    /// rescore reports must not come from the hidden task.
+    #[tokio::test]
+    async fn a_rescore_reports_no_rank_lent_by_a_task_above_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, near, far) = {
+            let m = mem(dir.path());
+            let mut l = m.ledger.lock().await;
+            let far = l
+                .create(tspec("Far blocker", 0, None, &[], &[]))
+                .await
+                .unwrap()
+                .task;
+            let near = l
+                .create(tspec("Near blocker", 0, None, &[&far.id], &[]))
+                .await
+                .unwrap()
+                .task;
+            let hidden = l
+                .create(TaskSpec {
+                    classification: Label::Restricted,
+                    ..tspec("Rotate the signing key", 50, None, &[&near.id], &[])
+                })
+                .await
+                .unwrap()
+                .task;
+            for t in [&far, &near, &hidden] {
+                l.admit(&t.id).await.unwrap();
+            }
+            (hidden.id, near.id, far.id)
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let r = capped.rescore(None).await.unwrap();
+        let text = serde_json::to_string(&r.changed).unwrap();
+        assert!(!text.contains(&hidden), "{text}");
+        assert!(
+            r.changed.iter().all(|c| c.id != near && c.id != far),
+            "a rank lent by a hidden task is reported: {text}"
+        );
+        let full = Memory::open(dir.path()).unwrap();
+        // the ranks moved all the same: the queue is ranked whole
+        let near = full.get_task(&near).await.unwrap();
+        assert!(near.spec.priority > 50, "{near:?}");
+    }
+
+    #[tokio::test]
+    async fn a_rescore_reports_no_change_to_a_task_above_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = {
+            let m = mem(dir.path());
+            let mut l = m.ledger.lock().await;
+            let hidden = l
+                .create(restricted("Rotate the signing key"))
+                .await
+                .unwrap()
+                .task;
+            let shown = l
+                .create(tspec("Tidy the docs", 50, None, &[&hidden.id], &[]))
+                .await
+                .unwrap()
+                .task;
+            for t in [&hidden, &shown] {
+                l.admit(&t.id).await.unwrap();
+            }
+            hidden.id
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let r = capped.rescore(None).await.unwrap();
+        assert!(r.changed.iter().all(|c| c.id != hidden), "{:?}", r.changed);
+        assert_eq!(capped.label(), Label::Public);
+    }
+
+    #[tokio::test]
+    async fn a_filing_that_dedups_against_a_task_above_handling_does_not_return_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = {
+            let m = mem(dir.path());
+            let mut l = m.ledger.lock().await;
+            l.create(TaskSpec {
+                origin: Some("github:acme/x#7".into()),
+                upstream_event: Some("opened".into()),
+                ..restricted("Rotate the signing key")
+            })
+            .await
+            .unwrap()
+            .task
+        };
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let filed = capped
+            .create_task(TaskSpec {
+                origin: Some("github:acme/x#7".into()),
+                upstream_event: Some("opened".into()),
+                ..tspec("Same event", 0, None, &[], &[])
+            })
+            .await;
+        match filed {
+            Err(Error::Denied(why)) => assert!(!why.contains("signing key"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            capped.get_task(&hidden.id).await.map(|t| t.status).ok(),
+            None
+        );
+        assert_eq!(capped.label(), Label::Public);
+    }
+
+    /// A restricted task at priority 10 and a public one at 1, both admitted.
+    async fn restricted_over_public(m: &Memory) -> (String, String) {
+        let mut l = m.ledger.lock().await;
+        let mut ids = Vec::new();
+        for s in [
+            TaskSpec {
+                priority: 10,
+                ..restricted("Rotate the signing key")
+            },
+            tspec("Tidy the docs", 1, None, &[], &[]),
+        ] {
+            let t = l.create(s).await.unwrap().task;
+            l.admit(&t.id).await.unwrap();
+            ids.push(t.id);
+        }
+        (ids.remove(0), ids.remove(0))
+    }
+
+    #[tokio::test]
+    async fn claim_next_offers_a_task_only_to_a_session_whose_handling_covers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, shown) = restricted_over_public(&mem(dir.path())).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let c = capped
+            .claim_next(None, Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.task.id, shown, "the top task it can handle");
+        assert!(capped
+            .claim_next(None, Duration::minutes(5))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(capped.label(), Label::Public);
+        let full = Memory::open(dir.path()).unwrap();
+        let c = full
+            .claim_next(None, Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.task.id, hidden);
+        assert_eq!(full.label(), Label::Restricted);
+    }
+
+    #[tokio::test]
+    async fn a_named_claim_above_the_session_s_handling_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, _) = restricted_over_public(&mem(dir.path())).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        assert!(
+            matches!(
+                capped.claim(&hidden, Duration::minutes(5)).await,
+                Err(Error::Ledger(dm_ledger::Error::NotFound(_)))
+            ),
+            "a public session claims a restricted task"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        let full = Memory::open(dir.path()).unwrap();
+        full.claim(&hidden, Duration::minutes(5)).await.unwrap();
+        assert_eq!(full.label(), Label::Restricted);
     }
 
     #[tokio::test]

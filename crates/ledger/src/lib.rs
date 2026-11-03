@@ -387,13 +387,16 @@ pub fn continues(parent: &str) -> String {
     format!("continues:{parent}")
 }
 
-/// Whether a manifest may claim `task` now: it is admitted, or claimed under a lease
-/// that has run out, and the manifest carries every requirement. Whether its
-/// dependencies are complete is the backend's question, asked inside the transaction.
-fn claimable(task: &Task, now: OffsetDateTime, manifest: &[String]) -> bool {
+/// Whether a session may claim `task` now: it is admitted, or claimed under a lease
+/// that has run out; the session's manifest carries every requirement; and the
+/// session's handling covers the task's classification. Whether its dependencies are
+/// complete is the backend's question, asked inside the transaction.
+fn claimable(task: &Task, now: OffsetDateTime, manifest: &[String], handling: Label) -> bool {
     let lease_live = task.lease_until.is_some_and(|t| t >= now);
     let state = task.status == Status::Admitted || (task.status == Status::Claimed && !lease_live);
-    state && task.spec.requirements.iter().all(|r| manifest.contains(r))
+    state
+        && task.spec.classification <= handling
+        && task.spec.requirements.iter().all(|r| manifest.contains(r))
 }
 
 fn check_holder(task: &Task, holder: &str, now: OffsetDateTime) -> Result<(), Error> {
@@ -581,8 +584,10 @@ impl Ledger {
     }
 
     /// Claim the highest-ranked claimable task in a domain whose requirements the
-    /// manifest satisfies and whose dependencies are complete. Claimable means admitted,
-    /// or claimed under a lease that has expired. One transaction, so one holder.
+    /// manifest satisfies, whose classification `handling` covers, and whose
+    /// dependencies are complete. Claimable means admitted, or claimed under a lease
+    /// that has expired. One transaction, so one holder; a task above `handling` is
+    /// passed over inside it, so it is never claimed and then given back.
     ///
     /// # Errors
     ///
@@ -593,10 +598,11 @@ impl Ledger {
         holder: &str,
         lease: Duration,
         manifest: &[String],
+        handling: Label,
     ) -> Result<Option<Claim>, Error> {
         let now = self.now();
         let until = now + lease;
-        let claimed = on_backend!(&mut self.backend, db => db.claim_next(domain, now, holder, until, manifest))?;
+        let claimed = on_backend!(&mut self.backend, db => db.claim_next(domain, now, holder, until, manifest, handling))?;
         if let Some(id) = &claimed {
             self.trace("claimed", id).await;
         }
@@ -614,17 +620,19 @@ impl Ledger {
     /// # Errors
     ///
     /// [`Error::NotFound`]; [`Error::WrongState`] when it is not claimable, including when
-    /// another holder's lease is still live or a dependency is open.
+    /// another holder's lease is still live, a dependency is open, or the task is above
+    /// `handling`.
     pub async fn claim(
         &mut self,
         id: &str,
         holder: &str,
         lease: Duration,
         manifest: &[String],
+        handling: Label,
     ) -> Result<Claim, Error> {
         let now = self.now();
         let until = now + lease;
-        on_backend!(&mut self.backend, db => db.claim(id, now, holder, until, manifest))?;
+        on_backend!(&mut self.backend, db => db.claim(id, now, holder, until, manifest, handling))?;
         self.trace("claimed", id).await;
         Ok(Claim {
             task: self.get(id).await?,
@@ -1071,6 +1079,7 @@ mod tests {
         heartbeat_renews_only_for_the_holder_and_complete_closes,
         an_unrenewed_lease_is_lost_at_expiry_for_both_sides,
         requirements_match_the_manifest_and_priority_orders_the_queue,
+        a_task_goes_only_to_a_session_whose_handling_covers_it,
         dependencies_block_until_complete,
         release_returns_to_pool_and_invalidate_is_terminal,
         origin_and_upstream_event_dedup_a_second_filing,
@@ -1110,19 +1119,21 @@ mod tests {
         Duration::minutes(n)
     }
 
-    /// `claim_next` in `dom-a` with an empty manifest.
+    /// `claim_next` in `dom-a` with an empty manifest and the highest handling.
     async fn next(l: &mut Ledger, holder: &str, lease: Duration) -> Option<Claim> {
-        l.claim_next("dom-a", holder, lease, &[]).await.unwrap()
+        l.claim_next("dom-a", holder, lease, &[], Label::Restricted)
+            .await
+            .unwrap()
     }
 
-    /// `claim` with an empty manifest.
+    /// `claim` with an empty manifest and the highest handling.
     async fn claim(
         l: &mut Ledger,
         id: &str,
         holder: &str,
         lease: Duration,
     ) -> Result<Claim, Error> {
-        l.claim(id, holder, lease, &[]).await
+        l.claim(id, holder, lease, &[], Label::Restricted).await
     }
 
     fn is_wrong_state<T>(r: &Result<T, Error>) -> bool {
@@ -1229,7 +1240,13 @@ mod tests {
         let c = next(l, "s1", mins(5)).await.unwrap();
         assert_eq!(c.task.id, high.id, "highest priority the manifest can take");
         let c = l
-            .claim_next("dom-a", "s1", mins(5), &["tool:github".into()])
+            .claim_next(
+                "dom-a",
+                "s1",
+                mins(5),
+                &["tool:github".into()],
+                Label::Restricted,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1239,6 +1256,41 @@ mod tests {
         assert!(is_wrong_state(
             &claim(l, &needs_tool.id, "s3", mins(5)).await
         ));
+    }
+
+    async fn a_task_goes_only_to_a_session_whose_handling_covers_it(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let mut secret = spec("Rotate the signing key");
+        secret.classification = Label::Restricted;
+        secret.priority = 10;
+        let secret = admitted(&mut l, secret).await;
+        let mut low = spec("Tidy the docs");
+        low.priority = 1;
+        let low = admitted(&mut l, low).await;
+        handling_bounds_the_claim(&mut l, &secret, &low).await;
+    }
+
+    /// `claim_next` in `dom-a` for a session whose handling is public.
+    async fn public(l: &mut Ledger) -> Option<Claim> {
+        l.claim_next("dom-a", "s1", mins(5), &[], Label::Public)
+            .await
+            .unwrap()
+    }
+
+    async fn handling_bounds_the_claim(l: &mut Ledger, secret: &Task, low: &Task) {
+        let c = public(l).await.unwrap();
+        assert_eq!(
+            c.task.id, low.id,
+            "the top task a public session can handle"
+        );
+        assert!(public(l).await.is_none(), "nothing it may handle is left");
+        assert!(is_wrong_state(
+            &l.claim(&secret.id, "s1", mins(5), &[], Label::Internal)
+                .await
+        ));
+        assert_eq!(l.get(&secret.id).await.unwrap().status, Status::Admitted);
+        let c = next(l, "s2", mins(5)).await.unwrap();
+        assert_eq!(c.task.id, secret.id, "a restricted session takes it");
     }
 
     async fn dependencies_block_until_complete(b: &Site) {
@@ -1581,8 +1633,8 @@ mod tests {
         let first = admitted(&mut l1, spec("First")).await;
         let second = admitted(&mut l1, spec("Second")).await;
         let (c1, c2) = tokio::join!(
-            l1.claim_next("dom-a", "s1", mins(5), &[]),
-            l2.claim_next("dom-a", "s2", mins(5), &[]),
+            l1.claim_next("dom-a", "s1", mins(5), &[], Label::Restricted),
+            l2.claim_next("dom-a", "s2", mins(5), &[], Label::Restricted),
         );
         let c1 = c1.unwrap().unwrap();
         let c2 = c2.unwrap().unwrap();
@@ -1614,13 +1666,13 @@ mod tests {
             vec![&other.id]
         );
         let got = l
-            .claim_next("dom-b", "s", mins(5), &[])
+            .claim_next("dom-b", "s", mins(5), &[], Label::Restricted)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(got.task.id, other.id);
         assert!(l
-            .claim_next("dom-b", "s", mins(5), &[])
+            .claim_next("dom-b", "s", mins(5), &[], Label::Restricted)
             .await
             .unwrap()
             .is_none());
@@ -1635,7 +1687,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(l
-            .claim_next("dom-none", "s", mins(5), &[])
+            .claim_next("dom-none", "s", mins(5), &[], Label::Restricted)
             .await
             .unwrap()
             .is_none());
@@ -1783,7 +1835,7 @@ mod tests {
         let mut l = Ledger::in_memory().unwrap();
         let t = admitted(&mut l, spec("Traced")).await;
         let c = l
-            .claim_next("dom-a", "agent:x", mins(5), &[])
+            .claim_next("dom-a", "agent:x", mins(5), &[], Label::Restricted)
             .await
             .unwrap()
             .unwrap();
