@@ -79,8 +79,10 @@ pub enum Error {
         /// The id asked for.
         id: String,
     },
-    /// Asked to write a version with text over an entry that was erased: the stub stays,
-    /// whatever a writer that read the entry before the erasure still holds of it.
+    /// Asked to write a version with text over an entry that was erased, when the put
+    /// reads the stub: a writer that read the entry before the erasure does not write
+    /// what it holds of it. A put whose read comes before the erasure's write is not
+    /// refused: see [`Store::put`].
     #[error("entry {id} in {domain} is erased: no version with text is written over its stub")]
     Erased {
         /// The domain of the stub.
@@ -240,6 +242,10 @@ impl Store {
     /// already current, nothing is written. If the entry supersedes another that is still
     /// active, that one is marked superseded, which is a write of its own.
     ///
+    /// A version with text is refused over an erased stub that this put reads. The read
+    /// and the writes after it are not one step: an [`Store::erase`] between them is not
+    /// seen, and the version read before the erasure goes into the history.
+    ///
     /// # Errors
     ///
     /// [`Error::BadName`] for a domain or id that cannot be a path, [`Error::Erased`] for
@@ -260,8 +266,11 @@ impl Store {
                 changed: false,
             });
         }
-        // an erasure is for good: a writer that read the entry before it, and now writes
-        // a version of what it read, would bring the text back over the stub
+        // a writer that read the entry before the erasure, and now writes a version of
+        // what it read, would bring the text back over the stub. The check holds only when
+        // this read sees the stub: an erasure that writes its stub between this read and
+        // the writes below is not seen, and the text read here goes into the history.
+        // Closing that needs a conditional put or a lock for each entry
         if entry.front.status != Some(Status::Erased) && previous.as_deref().is_some_and(is_erased)
         {
             return Err(Error::Erased {
