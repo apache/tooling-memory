@@ -472,7 +472,7 @@ fn render_recall(r: &RecallRow) -> String {
     let mut s = String::new();
     s.push_str("\nRecall: one turn either way; the brief against the pack it is written from\n");
     if r.briefs + r.packs == 0 {
-        s.push_str("  none yet; `memory recall <question>` on this record\n");
+        s.push_str("  none yet; `amem recall <question>` on this record\n");
         return s;
     }
     let each = |tokens: usize, n: usize| tokens.checked_div(n).unwrap_or(0);

@@ -199,16 +199,18 @@ impl Memory {
         )?;
         self.store.put(entry).await?;
         // the record marks the entry this one replaces as superseded as it takes it: that
-        // version goes in the log too, so the log says what the record holds
+        // version goes in the log too, so the log says what the record holds. The digest is
+        // of the stored text: the record leaves an inactive entry as it was written, which
+        // a render of it can differ from when the format writes a field anew
         if let Some(older) = &entry.front.supersedes {
-            if let Some(old) = self.store.get(&entry.front.domain, older).await? {
+            if let Some((old, text)) = self.store.get_with_text(&entry.front.domain, older).await? {
                 append(
                     &self.root,
                     &entry.front.domain,
                     &self.author,
                     Change::Put {
                         id: old.front.id.clone(),
-                        digest: dm_core::digest(&old.render()),
+                        digest: dm_core::digest(&text),
                         active: old.is_active(),
                     },
                 )?;
@@ -242,6 +244,22 @@ impl Memory {
         read(&self.root, &domain, from)
     }
 
+    /// What the record holds and the log never named, written before the log was kept:
+    /// it is indexed as the record has it, since the log starts where it starts.
+    async fn unnamed(
+        &self,
+        domain: &str,
+        named: impl Fn(&str) -> bool,
+    ) -> Result<Vec<Entry>, Error> {
+        let mut out = Vec::new();
+        for id in self.store.list(domain).await? {
+            if !named(&id) {
+                out.extend(self.store.get(domain, &id).await?);
+            }
+        }
+        Ok(out)
+    }
+
     /// The materializer: build the domain's index from its log and the record, and
     /// replay the ledger's events into its projection. What the log says is live is
     /// indexed at the version the record holds; an entry the record holds at another
@@ -265,10 +283,14 @@ impl Memory {
         let named = state(&events);
         let mut entries = Vec::new();
         for (id, now) in named.clone() {
-            let held = self.store.get(&domain, &id).await?;
+            // the entry and the text the log's digest is compared with come from one read:
+            // a write landing between two reads would index one version and compare another.
+            // The stored text, not a render of the entry, which can differ when the format
+            // writes a field anew
+            let held = self.store.get_with_text(&domain, &id).await?;
             match (now, held) {
-                (Some((digest, _)), Some(e)) => {
-                    if dm_core::digest(&e.render()) != digest {
+                (Some((digest, _)), Some((e, text))) => {
+                    if dm_core::digest(&text) != digest {
                         out.behind.push(id.clone());
                     }
                     if e.is_active() {
@@ -280,18 +302,9 @@ impl Memory {
                 (None, _) => {}
             }
         }
-        // what the record holds and the log never named, written before the log was
-        // kept, is indexed as the record has it: the log starts where it starts
-        for id in self.store.list(&domain).await? {
-            if !named.contains_key(&id) {
-                if let Some(e) = self.store.get(&domain, &id).await? {
-                    if e.is_active() {
-                        out.live += 1;
-                    }
-                    entries.push(e);
-                }
-            }
-        }
+        let unnamed = self.unnamed(&domain, |id| named.contains_key(id)).await?;
+        out.live += unnamed.iter().filter(|e| e.is_active()).count();
+        entries.extend(unnamed);
         self.index.lock().await.rebuild_domain(&domain, entries)?;
         out.ledger_events = self.ledger.lock().await.rebuild().await?;
         Ok(out)
@@ -409,5 +422,152 @@ mod tests {
         assert_eq!(m.materialize(None).await.unwrap().behind, [b]);
         let agent = Memory::open(dir.path()).unwrap().with_author("agent:test");
         assert!(agent.log(None, 0).is_err() && agent.materialize(None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_record_an_older_binary_wrote_is_not_behind_the_log_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let id = m
+            .write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap()
+            .id;
+        as_an_older_binary_wrote(&m, dir.path(), &id).await;
+        let done = m.materialize(None).await.unwrap();
+        assert!(done.behind.is_empty(), "{done:?}");
+    }
+
+    /// Writes `text` over `file` as every read of it after the first starts: a logged
+    /// write that the record takes while the materializer reads the entry.
+    #[derive(Clone, Debug)]
+    struct WriteOnLaterReads {
+        file: PathBuf,
+        name: String,
+        text: String,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl opendal::layers::LoggingInterceptor for WriteOnLaterReads {
+        fn log(
+            &self,
+            _: &opendal::raw::ServiceInfo,
+            op: opendal::raw::Operation,
+            context: &[(&str, &str)],
+            message: &str,
+            _: Option<&opendal::Error>,
+        ) {
+            let this = context
+                .iter()
+                .any(|(k, v)| *k == "path" && v.ends_with(&self.name));
+            if op == opendal::raw::Operation::Read
+                && message == "started"
+                && this
+                && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+            {
+                std::fs::write(&self.file, &self.text).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_materializer_compares_the_log_with_the_text_it_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let id = m
+            .write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap()
+            .id;
+        let file = dir.path().join(format!("record/dom-me/{id}.md"));
+        // the next version is logged, and the record takes it after the first read
+        let next = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("8080", "9090");
+        let put = Change::Put {
+            id: id.clone(),
+            digest: dm_core::digest(&next),
+            active: true,
+        };
+        append(dir.path(), "dom-me", "human:test:me", put).unwrap();
+        let reads = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
+        let hook = WriteOnLaterReads {
+            file,
+            name: format!("/{id}.md"),
+            text: next,
+            reads: reads.clone(),
+        };
+        let root = dir.path().to_string_lossy();
+        let op = opendal::Operator::new(opendal::services::Fs::default().root(&root))
+            .unwrap()
+            .layer(opendal::layers::LoggingLayer::new(hook));
+        m.store = dm_store::Store::from_operator(op);
+        let done = m.materialize(None).await.unwrap();
+        let indexed_next = !m.search("9090", None, 10).await.unwrap().is_empty();
+        assert!(
+            indexed_next || done.behind.contains(&id),
+            "the index holds a version the log does not name, and nothing says so: {done:?}"
+        );
+        // One read of the entry: two would let a write land between them, and none would
+        // mean the hook never saw the read, so this test could not fail.
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Rewrite `id`'s stored text with `review_by` as the year and the day of the year, as
+    /// a binary from before wrote it, and log the digest of that text. Returns the text.
+    async fn as_an_older_binary_wrote(m: &Memory, root: &Path, id: &str) -> String {
+        let date = m
+            .store
+            .get("dom-me", id)
+            .await
+            .unwrap()
+            .unwrap()
+            .front
+            .review_by
+            .unwrap();
+        let path = root.join(format!("record/dom-me/{id}.md"));
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            &format!("review_by: {date}\n"),
+            &format!("review_by:\n- {}\n- {}\n", date.year(), date.ordinal()),
+        );
+        assert!(text.contains("\n- "), "{text}");
+        std::fs::write(&path, &text).unwrap();
+        let put = Change::Put {
+            id: id.to_string(),
+            digest: dm_core::digest(&text),
+            active: Entry::parse(&text).unwrap().is_active(),
+        };
+        append(root, "dom-me", "human:test:me", put).unwrap();
+        text
+    }
+
+    #[tokio::test]
+    async fn superseding_an_inactive_entry_an_older_binary_wrote_logs_the_text_the_record_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let old = m
+            .write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap()
+            .id;
+        m.write(WriteRequest {
+            supersedes: Some(old.clone()),
+            ..req("# Port\n\nIt listens on 8081.\n")
+        })
+        .await
+        .unwrap();
+        let text = as_an_older_binary_wrote(&m, dir.path(), &old).await;
+        assert!(text.contains("status: superseded"), "{text}");
+        // a second entry names the inactive one: the record leaves its text as it is
+        m.write(WriteRequest {
+            supersedes: Some(old.clone()),
+            ..req("# Port\n\nIt listens on 8082.\n")
+        })
+        .await
+        .unwrap();
+        let path = dir.path().join(format!("record/dom-me/{old}.md"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let done = m.materialize(None).await.unwrap();
+        assert!(done.behind.is_empty(), "{done:?}");
     }
 }

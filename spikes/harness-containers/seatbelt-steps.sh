@@ -18,7 +18,7 @@ step() {
         --workdir "$work" -- "$@" </dev/null > "$work/.out" 2>&1
     code=$?
     printf 'STEP  %-22s exit=%s\n' "$name" "$code"
-    grep -v '^memory: ' "$work/.out" | sed 's/^/      /' | head -20
+    grep -v '^amem: ' "$work/.out" | sed 's/^/      /' | head -20
 }
 step true /usr/bin/true
 step echo /bin/echo inside

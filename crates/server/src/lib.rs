@@ -273,10 +273,35 @@ pub struct Memory {
     playback: OnceLock<std::sync::Arc<tape::Playback>>,
     /// This session's own tape, as it is kept.
     recording: Arc<Mutex<tape::Recording>>,
+    /// When this service last stamped a write; see [`next_stamp`]. Shared with the
+    /// views [`Memory::for_request`] makes, which write for the same service.
+    last_stamp: Arc<Mutex<OffsetDateTime>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How far back the clock may step and still have this service's writes dated after the
+/// last one. A VM's clock steps back by seconds when the host resyncs it; a clock that
+/// was wrong by more than this was wrong, and writes go back to it.
+const STAMP_STEP: Duration = Duration::minutes(1);
+
+/// The time to stamp a write with: `now`, or a nanosecond after the last stamp when the
+/// clock reads no later than that and no more than [`STAMP_STEP`] before it. A write
+/// this service makes after another must not be dated before it, or newest-first puts
+/// it second. The last stamp is this service's own, so writes from another process on
+/// the same record are ordered by their own clocks. A stamp can run up to
+/// [`STAMP_STEP`] ahead of the clock, and a source file edited in that window has an
+/// mtime before the entry's `created`, so the librarian's source-change check misses it.
+fn next_stamp(last: &mut OffsetDateTime, now: OffsetDateTime) -> OffsetDateTime {
+    let at = if now > *last || *last - now > STAMP_STEP {
+        now
+    } else {
+        *last + Duration::nanoseconds(1)
+    };
+    *last = at;
+    at
 }
 
 /// What a fan-out filed: the subagent tasks, the ones it did not file because the same
@@ -402,6 +427,7 @@ impl Memory {
             tools: OnceLock::new(),
             playback: OnceLock::new(),
             recording: Arc::new(Mutex::new(tape::Recording::default())),
+            last_stamp: Arc::new(Mutex::new(OffsetDateTime::UNIX_EPOCH)),
         })
     }
 
@@ -449,6 +475,7 @@ impl Memory {
             tools: self.tools.clone(),
             playback: self.playback.clone(),
             recording: Arc::clone(&self.recording),
+            last_stamp: Arc::clone(&self.last_stamp),
         })
     }
 
@@ -965,7 +992,7 @@ impl Memory {
                 .classification_for_write(&domain, req.classification, &s)
                 .ok_or_else(|| Error::Denied(format!("domain {domain} is not granted")))?
         };
-        let now = OffsetDateTime::now_utc();
+        let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
         // facts decay fast and carry mandatory review dates (the paper, §4): one written
         // without a date gets one ninety days out, which the librarian enforces
         let review_by = req.review_by.or_else(|| {
@@ -2584,6 +2611,61 @@ mod tests {
 
     fn mem(dir: &Path) -> Memory {
         Memory::init(dir, "human:test:me", "dom-me").unwrap()
+    }
+
+    #[test]
+    fn a_stamp_never_goes_back_when_the_clock_does() {
+        let ns = Duration::nanoseconds;
+        let t = time::macros::datetime!(2026-10-01 10:00:00 UTC);
+        let mut last = OffsetDateTime::UNIX_EPOCH;
+        assert_eq!(next_stamp(&mut last, t), t);
+        assert_eq!(next_stamp(&mut last, t - Duration::seconds(3)), t + ns(1));
+        assert_eq!(next_stamp(&mut last, t), t + ns(2));
+        let later = t + Duration::seconds(1);
+        assert_eq!(next_stamp(&mut last, later), later);
+        // a clock that reads the last stamp again
+        assert_eq!(next_stamp(&mut last, later), later + ns(1));
+        // a step back of a minute, the bound, then of a nanosecond more
+        let top = later + ns(1);
+        let minute = Duration::minutes(1);
+        assert_eq!(next_stamp(&mut last, top - minute), top + ns(1));
+        let past = top + ns(1) - minute - ns(1);
+        assert_eq!(next_stamp(&mut last, past), past);
+        // a clock that read an hour ahead once and was then put right: back to the clock
+        let corrected = later - Duration::hours(1);
+        assert_eq!(next_stamp(&mut last, corrected), corrected);
+    }
+
+    #[tokio::test]
+    async fn a_write_after_a_clock_step_back_is_dated_after_the_last_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        // as if the clock read 30 seconds later at the last write than it does now
+        let ahead = OffsetDateTime::now_utc() + Duration::seconds(30);
+        *lock(&m.last_stamp) = ahead;
+        let w = m.write(req("Written after the step.\n")).await.unwrap();
+        let e = m.store.get("dom-me", &w.id).await.unwrap().unwrap();
+        assert_eq!(e.front.created, ahead + Duration::nanoseconds(1));
+    }
+
+    #[tokio::test]
+    async fn a_request_view_dates_its_writes_after_its_session_s_last_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let ahead = OffsetDateTime::now_utc() + Duration::seconds(30);
+        *lock(&m.last_stamp) = ahead;
+        let view = m.for_request().unwrap();
+        let w = view
+            .write(req("Written through the board.\n"))
+            .await
+            .unwrap();
+        let e = m.store.get("dom-me", &w.id).await.unwrap().unwrap();
+        assert_eq!(e.front.created, ahead + Duration::nanoseconds(1));
+        assert_eq!(
+            *lock(&m.last_stamp),
+            e.front.created,
+            "one clock per service"
+        );
     }
 
     fn req(body: &str) -> WriteRequest {

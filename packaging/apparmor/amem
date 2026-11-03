@@ -16,7 +16,7 @@
 #
 # Without a profile, `amem launch` fails at the first mapping:
 #
-#   memory: sandbox: confinement: /proc/self/setgroups: Permission denied
+#   amem: sandbox: confinement: /proc/self/setgroups: Permission denied
 #   error: confinement: spawn /opt/memory/memory: Invalid argument (os error 22)
 #
 # WHAT THIS GRANTS
