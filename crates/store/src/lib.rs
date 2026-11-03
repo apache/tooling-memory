@@ -244,7 +244,8 @@ impl Store {
     ///
     /// A version with text is refused over an erased stub that this put reads. The read
     /// and the writes after it are not one step: an [`Store::erase`] between them is not
-    /// seen, and the version read before the erasure goes into the history.
+    /// seen. The version read before the erasure then goes into the history, and this
+    /// version, with its text, is written over the stub, so the entry is live again.
     ///
     /// # Errors
     ///
@@ -269,8 +270,9 @@ impl Store {
         // a writer that read the entry before the erasure, and now writes a version of
         // what it read, would bring the text back over the stub. The check holds only when
         // this read sees the stub: an erasure that writes its stub between this read and
-        // the writes below is not seen, and the text read here goes into the history.
-        // Closing that needs a conditional put or a lock for each entry
+        // the writes below is not seen. The text read here then goes into the history,
+        // and this version is written over the stub, so the entry is live again with its
+        // text. Closing that needs a conditional put or a lock for each entry
         if entry.front.status != Some(Status::Erased) && previous.as_deref().is_some_and(is_erased)
         {
             return Err(Error::Erased {
