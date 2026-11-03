@@ -1253,8 +1253,11 @@ impl Memory {
         let task = self
             .admit_per_policy(&mut l, created.task, Filing::Own, None)
             .await?;
+        // a proposal this session may not see is left for a session that may: closing it
+        // would act on work it cannot read
+        let handling = self.handling()?;
         for t in l.with_origin(&domain, &origin).await? {
-            if t.id != task.id && !t.status.is_terminal() {
+            if t.id != task.id && !t.status.is_terminal() && self.sees(&t, handling) {
                 l.invalidate(
                     &t.id,
                     &format!(
@@ -1272,11 +1275,20 @@ impl Memory {
     }
 
     /// What a proposal of a version gets when that version has a task already: its own
-    /// open task back. Another principal's open task is not joined, since
+    /// open task back, when this session may see it, and a refusal that names nothing of
+    /// it when not. Another principal's open task is not joined, since
     /// [`Memory::approve`] knows only who filed it and a proposer never approves its
     /// own; a closed task, declined or done, is not proposed again until the entry
     /// changes, and is never handed back as if it had been filed.
     fn slot_taken(&self, t: Task) -> Result<Promotion, Error> {
+        // a task this session may not see is not handed out, and the answer names nothing
+        // of it: not its id, its status, nor who filed it
+        if !self.sees(&t, self.handling()?) {
+            return Err(Error::Denied(
+                "this version of the entry is proposed already, in a task this session may not read"
+                    .into(),
+            ));
+        }
         if t.status.is_terminal() {
             return Err(Error::Denied(format!(
                 "task {} closed the proposal to verify this version of the entry ({:?}{}); it is not proposed again until the entry changes",
@@ -4284,6 +4296,61 @@ mod tests {
         assert_eq!(bundle_holds(dir.path(), marker), None);
         let third = owner.erase(&x, Reason::Requested).await.unwrap_err();
         assert!(third.to_string().contains("already erased"), "{third}");
+    }
+
+    /// A proposal filed above what a session may handle: the proposer had read restricted
+    /// text, so its task is restricted though the entry is public. A session capped at
+    /// public that proposes the same version is refused with nothing of that task, and
+    /// one that proposes a newer version leaves that task open for a session that may
+    /// see it.
+    #[tokio::test]
+    async fn a_proposal_a_session_may_not_see_is_neither_handed_out_nor_closed_by_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let public = |body: &str| WriteRequest {
+            classification: Some(Label::Public),
+            ..req(body)
+        };
+        let secret = owner
+            .write(WriteRequest {
+                classification: Some(Label::Restricted),
+                ..req("The restricted fact.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let cited = owner.write(public("The cited fact.\n")).await.unwrap().id;
+        let x = owner
+            .write(public(&format!("A fact that rests on {cited}.\n")))
+            .await
+            .unwrap()
+            .id;
+        let lib = librarian(dir.path());
+        lib.get(&secret).await.unwrap();
+        let Promotion::Proposed { task: hidden } =
+            lib.promote(&x, TrustTier::Verified, WHY).await.unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_eq!(hidden.spec.classification, Label::Restricted);
+        let capped = librarian(dir.path()).with_handling_cap(Label::Public);
+        let refused = capped.promote(&x, TrustTier::Verified, WHY).await;
+        assert!(
+            matches!(&refused, Err(Error::Denied(why)) if !why.contains(&hidden.id)
+                && !why.contains("agent:librarian")),
+            "{refused:?}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        // the erasure of what it cites flags it for review: a new version of it
+        owner.erase(&cited, Reason::Requested).await.unwrap();
+        let Promotion::Proposed { task: newer } =
+            capped.promote(&x, TrustTier::Verified, WHY).await.unwrap()
+        else {
+            panic!("verified is proposed")
+        };
+        assert_ne!(newer.id, hidden.id);
+        let left = owner.ledger.lock().await.get(&hidden.id).await.unwrap();
+        assert!(!left.status.is_terminal(), "{left:?}");
     }
 
     /// An entry rewritten after it was proposed is not the entry the proposal named; the
