@@ -91,7 +91,7 @@ In the background, curators keep the memory tidy, auditors check the curators, a
 | **[Retrieval service](#6-retrieval-and-serving)** | Agents cannot hold the whole corpus, and every read must be checked the same way | Answers searches, summaries first, through one permission filter ([§6](#6-retrieval-and-serving)) |
 | **[Perimeter](#access-control)** | Models can be wrong or manipulated, so some limits must hold regardless | Enforces access, labels, spend, and irreversibility on every call ([§4](#4-trust-and-handling), [§6](#6-retrieval-and-serving)) |
 | **[Task ledger](#a-tasks-life)** | Work needs a shared account of ownership, dependencies, and outcomes | Holds each domain's tasks, with leased claims and handoff notes ([§8](#8-coordination)) |
-| **[Seats](#seats)** | A session that starts from nothing works out on every start who is asking, what is in scope, and what it owes | Hold a standing role's charter, scope, authority, commitments, and history, which a session may boot into ([§8](#8-coordination)) |
+| **[Seats](#seats)** | A session that starts from nothing works out on every start who is asking, what is in scope, and what it owes | Hold a standing role's charter, scope, authority, commitments, history, and handoff cache, which a session may boot into ([§8](#8-coordination)) |
 
 **Who does the work**
 
@@ -316,9 +316,9 @@ If A trusts B and B trusts C, A has not thereby agreed to trust C. The design ap
 | Other entries written by the fleet's own sessions in the domain | Sessions whose policy admits raw in the domain |
 | Content from authors outside the fleet, arriving through a tap | Triage ([§8](#admission)), and the task chain created from it. Everywhere else, only once curated |
 
-The row also depends on what the author read. A session that read content from authors outside the fleet, as a raw entry or through a tool server, writes with the tap row's reach. Triage and its own task chain see the entry, and everyone else only once it is curated. Restating someone else's words does not make them a new source [[81]](#ref-81).
+The row also depends on what the author read. A session that read content from authors outside the fleet, as a raw entry or through a tool server, writes with the tap row's reach. Triage and its own task chain see the entry; every other session whose handling covers it sees it only once it is curated. Restating someone else's words does not make them a new source [[81]](#ref-81).
 
-Curators and auditors read raw as their work requires. Policy can adjust the defaults ([Appendix E](#appendix-e-rules-in-detail)). Classification still applies in every case: raw reach decides which raw entries a session may see, and handling caps how high it may read.
+Curators and auditors read raw as their work requires. Policy can adjust the defaults ([Appendix E](#appendix-e-rules-in-detail)). Classification still applies in every case: raw reach decides which raw entries a session may see, and handling ([Labels and flow](#labels-and-flow)) caps how high it may read.
 
 Promotion to verified passes a review gate. A person approves it, or a senior agent where domain policy allows; the proposer can never approve its own. A wrong fact written once and trusted forever is the largest long-term risk this system carries, and this gate is the main defence against it.
 
@@ -555,7 +555,7 @@ Every rule also has an owner and a review date, as a convention does ([§3](#3-m
 
 Four rules follow.
 
-- **Enforced rules per domain have a ceiling** ([§12](#cost-and-throughput)). Each rule over it is enforced only after a person signs it off, one rule at a time; the ceiling itself does not move.
+- **Enforced rules per domain have a ceiling** ([§12](#cost-and-throughput)). Each rule over it is enforced only after a person signs it off, one rule at a time; a signature admits that rule and does not raise the ceiling.
 - **A reset keeps every rule with a person in its lineage.** A reset is the domain's owner retiring its rules in one step, when the stack has grown past use. It keeps every rule written or promoted by a person and retires the rest.
 - **An unused rule goes back to its owner.** A rule that produced no denial and no citation in a review period goes to its owner for retirement.
 - **A denial teaches.** It names the rule, the reason code, and the remedy, so a refusal tells the agent what would pass [[130]](#ref-130). An agent that finds a rule wrong in the case before it declines with a reason code and may attach a proposed amendment, an ordinary task routed to the rule's owner [[119]](#ref-119).
@@ -804,7 +804,7 @@ A **seat** is a record in a domain's memory for one standing role: the reviewer 
 - open commitments and a history;
 - a **handoff cache**: the latest handoffs of the sessions that filled it, which the next occupant reads first.
 
-The authority fields are verified entries and change only through the review gate ([§4](#promotion)). The sessions that fill the seat write its commitments and history, as raw entries that cite the seat. A seat survives model changes and renames, and it is addressable: a tap that posts for a seat carries the fleet's identity and names the seat, so an outside project sees one author across sessions.
+The authority fields are verified entries and change only through the review gate ([§4](#promotion)). Sessions under the charter's agent definition write its commitments and history, as raw entries that cite the seat. A seat survives model changes and renames, and it is addressable: a tap that posts for a seat carries the fleet's identity and names the seat, so an outside project sees one author across sessions.
 
 A session that boots into a seat takes the seat's T0 slice, presents the manifest its agent definition fixes ([§10](#10-evolving-the-system)) narrowed by the seat's authority envelope, and takes the tasks the seat's charter covers. The seat grants nothing by itself: the perimeter checks every action against the seat's authority envelope, the task definition's declared tools, and the principal chain, and the narrowest applies.
 
@@ -883,7 +883,7 @@ Retrieval is a published contract, because agents depend on it. Starting targets
 - known-item lookups by ID, title, or error string in the top three;
 - `claim_next` within one second at the 99th percentile.
 
-Two parties measure progress: the **evaluator**, the role that holds the withheld scenarios and grades completions, tuned apart from the sessions it grades ([§10](#10-evolving-the-system)), and the landing queue, which the fleet cannot edit, read after a fixed delay. A task an agent filed and completed itself counts as upkeep. A check an agent changed counts only once a person has reviewed the change. A fleet that files and grades its own work can show throughput without delivering anything [[126]](#ref-126).
+Two parties measure progress: the **evaluator**, the role that holds the withheld scenarios and grades completions, tuned apart from the sessions it grades ([§10](#10-evolving-the-system)), and the landing queue, which the fleet cannot edit and whose count is read after a fixed delay. A task an agent filed and completed itself counts as upkeep. A check an agent changed counts only once a person has reviewed the change. A fleet that files and grades its own work can show throughput without delivering anything [[126]](#ref-126).
 
 The spend behind the numbers is a product of five terms:
 
@@ -1575,7 +1575,7 @@ A skill is served the way a tool is ([§6](#turns-cost-more-than-transport)): th
 
 **Leaving the system.** `export(domain, max_label)` is a read under the caller's filter: entries at or below the label, with provenance, classification, and supersession. The bundle carries the highest label inside it and goes only to a destination whose ceiling allows that label. Import is the mirror: entries land raw, keep their classification or take the receiving domain's higher default, and are keyed on origin so a second import creates nothing. A personal domain moving between its owner's homes keeps its tiers; everything else earns them again.
 
-An export can also be written in Google's Open Knowledge Format [[96]](#ref-96), which uses the same shape of Markdown files with frontmatter. `review_by` maps to `stale_after`, and a tombstone to `deprecated`. Raw maps to unverified and curated to machine-confirmed; verified maps to human-reviewed where a person approved it, and to machine-confirmed where an agent did. The format has no classification field and treats its tiers as advice, so the label rule above still decides where the bundle may go.
+An export can also be written in the Open Knowledge Format [[96]](#ref-96), which uses the same shape of Markdown files with frontmatter. `review_by` maps to `stale_after`, and a tombstone to `deprecated`. Raw maps to unverified and curated to machine-confirmed; verified maps to human-reviewed where a person approved it, and to machine-confirmed where an agent did. The format has no classification field and treats its tiers as advice, so the label rule above still decides where the bundle may go.
 
 **People are handled by policy.** Norms can be distilled from observable process: how decisions are phrased, how disagreement resolves. Roles and public records are facts. Whether to compile behavioural profiles of individuals from years of archives is a policy decision, and distillation never does it by default. Set the boundary in L0 or L2 before the first run, and enforce it at the gate.
 
@@ -1754,7 +1754,7 @@ When the ledger is down, the historian still accepts appends: handoffs and heart
 | Verification is the bottleneck, or is gamed | An autonomy level per task definition earned on held-out suites; scenarios withheld from claimants; an evaluator tuned apart from the sessions it grades ([§10](#10-evolving-the-system)) |
 | A relayed or bundled approval | An approval is an event naming principal, action, version, scope, and expiry; relayed and bundled approvals have no force ([§8](#decomposition), [Appendix C](#appendix-c-ledger-semantics)) |
 | A seat becomes a bottleneck or a single point of loss | Pins name seats; a seat with no occupant wakes one; retirement returns commitments to the ledger; pinned tasks and seat queue depth measured ([§8](#seats), [§9](#9-measurement)) |
-| A session re-derives who it is on every start | Seats hold a charter, scope, authority, commitments, and history; a session may boot into one ([§8](#seats)) |
+| A session re-derives who it is on every start | Seats hold a charter, scope, authority, commitments, history, and a handoff cache; a session may boot into one ([§8](#seats)) |
 | Institution keeps a person's memory | Personal domain under the owner's grants; views dropped with receipts ([§12](#12-surviving-long-timescales)) |
 | A contributed component's authors leave | Ownership test: on-path components are institution-operated ([§12](#12-surviving-long-timescales)) |
 
