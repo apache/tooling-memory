@@ -249,3 +249,74 @@ print(f"not={c(r'\bnot\b')} rather_than={c(r'\brather than\b')} instead_of={c(r'
       f"ensur={len(re.findall(r'\bensur', text, re.I))} emdash={text.count('—')} "
       f"parens15={c(r'\([^)]{15,}\)')} dup_sentences={dup}")
 ```
+
+The second script counts the parts of the design: roles, entry types, labels, limits, operations,
+states, metrics, failure modes, rules, glossary terms and evidence rows, and the words and list
+items per section. [Appendix H](docs/durable-memory-for-disposable-agents-complexity.md) prints
+its output at each revision and reads it. It lives here, with the metrics script, because `docs/`
+is seeded into the demo record and a code block there would compete with the paper in search.
+
+```python
+"""Inventory of the system the paper describes. Usage: python3 -I inventory.py <paper.md> <appendix.md>"""
+import re, sys, collections
+paper = open(sys.argv[1], encoding='utf-8').read()
+appendix = open(sys.argv[2], encoding='utf-8').read()
+
+def section(text, heading):
+    """The text from a heading to the next heading of the same or a higher level."""
+    m = re.search(r'^(#{1,2}) ' + re.escape(heading) + r'\s*$', text, flags=re.M)
+    level = len(m.group(1))
+    rest = text[m.end():]
+    # a level-1 section ends at the next numbered section, appendix or the references; the T0 example
+    # inside §3 is a level-1 heading and does not end it
+    stop = r'^# (\d+\. |Appendix|References)' if level == 1 else r'^#{1,2} '
+    n = re.search(stop, rest, flags=re.M)
+    return rest[:n.start()] if n else rest
+
+def table_rows(text):
+    rows = [l for l in text.split('\n') if l.startswith('|')]
+    rows = [r for r in rows if not re.match(r'^\|[\s:-]+\|', r)]
+    return [r for r in rows[1:] if r != rows[0]] if rows else []     # the first row is the header; a table may repeat it
+
+def bullets(text):
+    return re.findall(r'^\s*(?:- |\d+\. )', text, flags=re.M)
+
+def code_lines(text, pattern):
+    return [l for l in text.split('\n') if re.match(pattern, l)]
+
+counts = collections.OrderedDict()
+counts['Roles (§2 table)'] = len(table_rows(section(paper, 'Roles')))
+counts['Principles (§2)'] = len(bullets(section(paper, 'Principles')))
+counts['Entry types'] = len(re.search(r'^type: (.+)$', section(paper, 'Appendix A: Interface'), flags=re.M).group(1).split('|'))
+counts['Labels (§4 four questions)'] = len(table_rows(section(paper, 'Four questions, four labels')))
+counts['Trust tiers'] = len(re.search(r'^trust_tier: (.+)$', section(paper, 'Appendix A: Interface'), flags=re.M).group(1).split('|'))
+counts['Policy layers (§7)'] = len(re.findall(r'^L\d  ', section(paper, '7. The Policy Stack'), flags=re.M))
+counts['Perimeter limits (§12)'] = len(table_rows(section(paper, 'Cost and throughput')))
+counts['Interface operations (Appendix A)'] = len(code_lines(section(paper, 'Appendix A: Interface'), r'^[a-z_]+\('))
+counts['Task states (Appendix C)'] = len(re.search(r'^status: (.+)$', section(paper, 'Appendix C: Ledger Semantics'), flags=re.M).group(1).split('|'))
+counts['Metrics (§9)'] = len(table_rows(section(paper, '9. Measurement')))
+counts['Evaluation arms (§11)'] = len([r for r in table_rows(section(paper, '11. Evaluating Change')) if r.startswith('| **')])
+counts['Failure modes (Appendix D)'] = len(table_rows(section(paper, 'Appendix D: Failure Modes')))
+counts['Rules (Appendix C)'] = len(bullets(section(paper, 'Appendix C: Ledger Semantics')))
+counts['Rules (Appendix E)'] = len(bullets(section(paper, 'Appendix E: Rules in Detail')))
+counts['Glossary terms (Appendix F)'] = len(table_rows(section(paper, 'Appendix F: Glossary')))
+counts['Diagrams'] = paper.count('```mermaid')
+g_rows = [l for l in appendix.split('\n') if l.startswith('| [')]
+counts['Evidence rows (Appendix G)'] = len(g_rows)
+counts['Evidence rows at Argued only'] = len([r for r in g_rows if re.search(r'\| Argued \|', r)])
+
+print('| Kind | Count |\n|---|---|')
+for k, v in counts.items():
+    print(f'| {k} | {v} |')
+
+# per numbered section: words, list items and table rows (the paper states a rule or a part as one of these)
+print('\n| Section | Words | List items | Table rows |\n|---|---|---|---|')
+main = paper.split('\n# 13. Related Work')[0]
+for m in re.finditer(r'^# (\d+\. .+)$', main, flags=re.M):
+    t = section(paper, m.group(1))
+    t = re.sub(r'```.*?```', '', t, flags=re.S)
+    print(f'| {m.group(1)} | {len(re.findall(r"[A-Za-z]+", t))} | {len(bullets(t))} | {len(table_rows(t))} |')
+for name in ['Appendix C: Ledger Semantics', 'Appendix E: Rules in Detail']:
+    t = re.sub(r'```.*?```', '', section(paper, name), flags=re.S)
+    print(f'| {name} | {len(re.findall(r"[A-Za-z]+", t))} | {len(bullets(t))} | {len(table_rows(t))} |')
+```
