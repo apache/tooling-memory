@@ -1696,13 +1696,13 @@ Replay quantifies confirmed drift. Then the model is pinned or failed over, and 
 | **Approval event** | A person's recorded approval of one action at one version, with scope and expiry; the perimeter checks it when the action runs ([§8](#8-coordination)) |
 | **Autonomy level** | What a task definition's completions need before they count: a person's verdict, an independent review, or the acceptance checks alone; earned on held-out suites ([§10](#10-evolving-the-system)) |
 | **BM25** | A method for ranking documents by how well their words match a query ([§6](#6-retrieval-and-serving)) |
+| **Charter** | A seat's standing orders, the kinds of task it covers, and the agent definition that fills it by default ([§8](#seats)) |
 | **Checkpoint** | A recorded position showing how far a log or a view rebuilt from it has progressed ([§12](#12-surviving-long-timescales)) |
 | **Classification, handling, ceiling** | Who may see an entry; the most a session may read; the most a destination may receive ([§4](#4-trust-and-handling)) |
 | **Distil** | Turn raw material (threads, transcripts, trajectories) into curated entries or methods ([§5](#5-the-curator), [§10](#10-evolving-the-system), [Appendix B](#appendix-b-seeding)) |
 | **`dom-platform`** | The domain that holds the system's own configuration ([§10](#10-evolving-the-system)) |
 | **Domain** | An area of work with an owner; memory, tasks, policy, and access are organised by it ([§2](#2-the-design-at-a-glance)) |
 | **Exception** | A scoped, expiring, approved permission to breach a policy ([§7](#7-the-policy-stack)) |
-| **Charter** | A seat's standing orders, the kinds of task it covers, and the agent definition that fills it by default ([§8](#seats)) |
 | **Evaluator** | The role that holds the withheld scenarios and grades completions, tuned apart from the sessions it grades ([§9](#9-measurement), [§10](#10-evolving-the-system)) |
 | **Fence** | A refusal the agent is told about, with its rule, reason, and remedy; the perimeter holds whether or not the agent heeds it ([§4](#4-trust-and-handling)) |
 | **Fencing token** | An increasing claim generation carried with mutations so destinations can reject old claims ([§8](#8-coordination), [Appendix C](#appendix-c-ledger-semantics)) |
