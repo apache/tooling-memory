@@ -4,7 +4,7 @@ How *Durable Memory for Disposable Agents* and its case study are kept readable.
 below were recovered from the commits that shortened the paper in October 2026 and revised
 it in early November. Measured with the script at the end of this file, the body went from
 13,000 words at the commit before the pass (57d67d1, 12 October) to 8,700 at the end of the
-pass (29ff584, 13 October), and from 27 paragraphs over 100 words to none (29bf659, 15
+pass (29ff584, 13 October), and from 38 paragraphs over 100 words to none (29bf659, 15
 October). Most rules give one example from those commits, before and after, so that the
 next pass can tell the rule from a taste. The last section is the procedure a pass runs.
 
@@ -19,8 +19,8 @@ how."** No list of mechanisms.
 > *Agent fleets need shared memory, and shared memory spreads mistakes and leaked secrets as easily as knowledge. It has to be cheap to read, safe to share, and outlast every model and tool it runs on. This paper proposes how.*
 
 **The section that introduces a part or a role opens with why it exists, labelled
-`**Why.**`** A subsection whose reason its parent gave may open with an example or a
-diagram instead. A section whose first paragraph is a mechanism has lost its reason; where
+`**Why.**`** A subsection whose reason its parent gave may open with its mechanism, an
+example or a diagram. A section whose first paragraph is a mechanism has lost its reason; where
 none can be written, the section may not belong.
 
 > − Organisations rename, split, merge, and hand names to new owners. ...
@@ -44,8 +44,7 @@ lives in an appendix, and one sentence in the body points there.
 > + Content moves to a lower label only through `declassify`, and a guard named in policy approves each one. ... Appendix E gives the rules in detail: who may attest handling, tool servers that are also sources, grants, and who guards which crossing.
 
 **Parallel facts go in a table with a Why column.** Three or more items that share the
-same two or three attributes are a table. A rules table has a Why column; a milestone has
-two lists, "Delivers" and "Proven when".
+same two or three attributes are a table. A rules table has a Why column.
 
 > | Rule | What it says | Why |
 > | **Leases** | A claim expires unless renewed | A crashed agent must never hold work hostage |
@@ -53,7 +52,7 @@ two lists, "Delivers" and "Proven when".
 **Cut what only repeats something said elsewhere.** For each section, name one thing a
 reader learns there and nowhere else. If nothing, cut it and redirect its references.
 
-> Build Order added little the evaluation and survival sections do not already say; remove it and point its few references at §11 instead. (commit 29ff584, which removed 1,600 words)
+> Build Order added little the evaluation and survival sections do not already say; remove it and point its few references at §11 instead. (commit 29ff584, which cut 1,200 words of body)
 
 **A term is explained where it first appears, and the glossary holds the definition.** The
 first occurrence carries an appositive ("the harness, the program that runs the model") or
@@ -123,7 +122,7 @@ or none, the same for every bullet in its list.
 ## Tells
 
 These are removed on the lines a change adds. They are the marks of text written by a model
-or of a discussion restated as prose, and each has an instance from the commits.
+or of a discussion restated as prose, and most have an instance from the commits.
 
 **Contrast for effect.** "X, not Y", "rather than", "instead of", "never ... but". Delete
 the negative half; if the sentence still says the rule, the contrast was for effect. Keep a
@@ -143,8 +142,11 @@ length"). Cut the clause; keep the rule and the reason.
 > − The caller states facts, not a length, and the decision is logged for replay.
 > + The decision is logged for replay.
 
-**Lead-ins that only count what follows.** "Three findings shape this section." is cut when
-the list has bold leads that carry it.
+**Lead-ins that only count what follows.** A sentence whose only content is a count and a
+promise is cut when the list has bold leads that carry it.
+
+> − Three findings from security and knowledge-system research shape this section.
+> (the three bullets follow directly from the **Why.**)
 
 **The aphorism and the closing flourish.** A short sentence at the end of a paragraph that
 restates it; a semicolon joining two clauses that mirror each other.
@@ -161,7 +163,7 @@ restates it; a semicolon joining two clauses that mirror each other.
 **A company or product as the authority.** Named deployments appear in §13 and the
 references; the body cites them by kind ("one personal-workspace deployment") and every
 rule keeps its own reason. The body names a party only where the name is the fact: the
-incident in §1, a component the design adopts (OPA, OpenTelemetry), and Gas Town, the one
+incidents in §1, a component the design adopts (OPA, OpenTelemetry), and Gas Town, the one
 operator's fleet the paper cites most, which §4 defines once.
 
 > − At Meta a personal workspace of this kind ... reached 63,000 installs

@@ -553,8 +553,6 @@ Every rule also has an owner and a review date, as a convention does ([§3](#3-m
 
 **An example.** Gas Town ([§4](#model-output-in-particular)) ran 450 rules that grew in three weeks to 650 refusal points, until no work was legal and it stopped. The reset that followed removed the gates people had set along with the ones agents had added [[117]](#ref-117), [[121]](#ref-121).
 
-Four rules follow.
-
 - **Enforced rules per domain have a ceiling** ([§12](#cost-and-throughput)). Each rule over it is enforced only after a person signs it off, one rule at a time; a signature admits that rule and does not raise the ceiling.
 - **A reset keeps every rule with a person in its lineage.** A reset is the domain's owner retiring its rules in one step, when the stack has grown past use. It keeps every rule written or promoted by a person and retires the rest.
 - **An unused rule goes back to its owner.** A rule that produced no denial and no citation in a review period goes to its owner for retirement.
@@ -734,7 +732,7 @@ No agent messages another. Every hand-over goes through the ledger and a handoff
 
 Builders of long-running agents carry state between sessions the same way, in progress notes and version history [[109]](#ref-109). A fresh start from one clear restatement can also do better than a long history, because models rely too heavily on their earlier, wrong attempts [[110]](#ref-110). Hospitals that adopted structured handoffs made fewer errors [[111]](#ref-111). But an LLM summary of a run can hide signs that an attempt is failing [[100]](#ref-100), so the next agent checks a handoff against the ledger and the work itself.
 
-Where workers' outputs meet, the orchestrator checks for overlapping artifacts, runs the policy gate, and queues the decisions made along the way for curation ([§5](#5-the-curator)). Every finished task is kept in the record with its edges, handoff, and outcome. That history is the ground truth for evaluation ([§11](#11-evaluating-change)).
+Where workers' outputs meet, the orchestrator checks for overlapping artifacts, runs the policy gate, and queues the decisions made along the way for curation ([§4](#promotion)). Every finished task is kept in the record with its edges, handoff, and outcome. That history is the ground truth for evaluation ([§11](#11-evaluating-change)).
 
 ## Taps
 
@@ -807,8 +805,6 @@ A **seat** is a record in a domain's memory for one standing role: the reviewer 
 The authority fields are verified entries and change only through the review gate ([§4](#promotion)). Sessions under the charter's agent definition write its commitments and history, as raw entries that cite the seat. A seat survives model changes and renames, and it is addressable: a tap that posts for a seat carries the fleet's identity and names the seat, so an outside project sees one author across sessions.
 
 A session that boots into a seat takes the seat's T0 slice, presents the manifest its agent definition fixes ([§10](#10-evolving-the-system)) narrowed by the seat's authority envelope, and takes the tasks the seat's charter covers. The seat grants nothing by itself: the perimeter checks every action against the seat's authority envelope, the task definition's declared tools, and the principal chain, and the narrowest applies.
-
-Three rules follow.
 
 - **Secondment.** A session under an agent definition other than the one the charter names, a substitute model for instance, may read the seat's memory and write to the task chain. It may not write the seat's history, commitments, or handoff cache, because those are what the next occupant will trust.
 - **Retirement.** A seat's owner retires it through the review gate. Its open commitments return to the ledger for matching, and its history stays in the record under its identifier.
@@ -883,7 +879,7 @@ Retrieval is a published contract, because agents depend on it. Starting targets
 - known-item lookups by ID, title, or error string in the top three;
 - `claim_next` within one second at the 99th percentile.
 
-Two parties measure progress: the **evaluator**, the role that holds the withheld scenarios and grades completions, tuned apart from the sessions it grades ([§10](#10-evolving-the-system)), and the landing queue, which the fleet cannot edit and whose count is read after a fixed delay. A task an agent filed and completed itself counts as upkeep. A check an agent changed counts only once a person has reviewed the change. A fleet that files and grades its own work can show throughput without delivering anything [[126]](#ref-126).
+Two parties measure progress. The **evaluator** is the role that holds the withheld scenarios and grades completions, tuned apart from the sessions it grades ([§10](#10-evolving-the-system)). The landing queue is the other: the fleet cannot edit it, and its count is read after a fixed delay. A task an agent filed and completed itself counts as upkeep. A check an agent changed counts only once a person has reviewed the change. A fleet that files and grades its own work can show throughput without delivering anything [[126]](#ref-126).
 
 The spend behind the numbers is a product of five terms:
 
