@@ -1719,7 +1719,7 @@ Replay quantifies confirmed drift. Then the model is pinned or failed over, and 
 | **Operational unit** | A team of people and agents accountable for a continuing area of work, served by one or more domains ([§8](#8-coordination)) |
 | **Principal chain** | The person, the seat, the session and each hop between, carried inside a call and evaluated by every grant ([§6](#one-server-per-session)) |
 | **Principal** | A person or agent identity that holds grants |
-| **Reason code** | The code a denial or a release carries, naming the rule that applied and the remedy ([§7](#7-the-policy-stack), [§8](#8-coordination)) |
+| **Reason code** | The code a denial or a release carries; a denial names it beside the rule that applied and the remedy ([§7](#7-the-policy-stack), [Appendix A](#appendix-a-interface)) |
 | **Recovery bundle** | Record and historian snapshots, checkpoints, and configuration needed to rebuild the serving layer ([§12](#12-surviving-long-timescales)) |
 | **Registry** | The data mapping organisational units to the domains they own ([§12](#12-surviving-long-timescales)) |
 | **Rubric** | Task-scoring weights compiled from written strategy ([§7](#7-the-policy-stack)) |
