@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Durable Memory for Disposable Agents on one page: the five layers, the three loops that run through them, where a person decides, and what a smaller deployment leaves out.">
+<title>Durable memory on one page</title>
+<!--
+  The poster for docs/durable-memory-for-disposable-agents.md: the design on one page.
+  It takes its colours and type from crates/web/static/tokens.css, as every amem page does,
+  and follows docs/design-book.html: one meaning per hue, so the only colour on the page is
+  where its meaning applies. Await (magenta) marks where a person decides; fail (red) marks
+  a call refused at the ceiling. Everything else is ink on paper. Labels and trust tiers are
+  drawn as the book draws them, as ordered marks in ink. Open the file from a checkout; the
+  stylesheet is linked, not fetched from anywhere else.
+-->
+<link rel="stylesheet" href="../crates/web/static/tokens.css">
+<style>
+  .po-page { background: var(--am-paper); color: var(--am-body); font-family: var(--am-font-sans); font-size: var(--am-text-body); line-height: var(--am-leading-body); margin: 0; padding: var(--am-space-8) var(--am-space-4) var(--am-space-16); }
+  .po-sheet { max-width: 1240px; margin: 0 auto; }
+  .po-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--am-space-2) var(--am-space-8); margin-bottom: var(--am-space-6); }
+  .po-head h1 { font-size: var(--am-text-title); font-weight: var(--am-weight-strong); line-height: var(--am-leading-tight); color: var(--am-ink); margin: 0; }
+  .po-head p { margin: 0; max-width: var(--am-measure); color: var(--am-body); }
+  .po-head a, .po-foot a, .po-col a { color: var(--am-accent); }
+  .po-scroll { overflow-x: auto; background: var(--am-surface); border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); }
+  .po-scroll svg { display: block; min-width: 980px; width: 100%; height: auto; }
+  svg text { font-family: var(--am-font-sans); fill: var(--am-ink); }
+  .po-band { fill: var(--am-plate); }
+  .po-band-name { fill: var(--am-muted); font-size: 0.75rem; }
+  .po-box { fill: var(--am-surface); stroke: var(--am-edge); stroke-width: 1; }
+  .po-name { font-size: 0.9375rem; font-weight: var(--am-weight-strong); }
+  .po-premise { fill: var(--am-muted); font-size: 0.6875rem; }
+  .po-note { fill: var(--am-body); font-size: 0.75rem; }
+  .po-small { fill: var(--am-muted); font-size: 0.6875rem; }
+  .po-line { stroke: var(--am-ink); stroke-width: 1.4; fill: none; }
+  .po-line-soft { stroke: var(--am-edge); stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
+  .po-bar { fill: var(--am-surface); stroke: var(--am-ink); stroke-width: 1.4; }
+  .po-await { fill: var(--am-await-tint); stroke: var(--am-await); stroke-width: 1.6; }
+  .po-await-dot { fill: var(--am-await); }
+  .po-await-text { fill: var(--am-await); font-size: 0.75rem; font-weight: var(--am-weight-strong); }
+  .po-fail { stroke: var(--am-fail); fill: none; stroke-width: 1.5; }
+  .po-fail-text { fill: var(--am-fail); font-size: 0.75rem; font-weight: var(--am-weight-strong); }
+  .po-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--am-space-8); margin-top: var(--am-space-8); }
+  .po-col h2 { font-size: var(--am-text-section); font-weight: var(--am-weight-strong); color: var(--am-ink); margin: 0 0 var(--am-space-3); line-height: var(--am-leading-tight); }
+  .po-col p, .po-col li { font-size: var(--am-text-ui); line-height: var(--am-leading-ui); }
+  .po-col ul { padding-left: 1.1em; margin: 0; }
+  .po-col li { margin-bottom: var(--am-space-2); }
+  .po-col table { border-collapse: collapse; width: 100%; font-size: var(--am-text-ui); }
+  .po-col th, .po-col td { text-align: left; padding: var(--am-space-1) var(--am-space-2) var(--am-space-1) 0; border-bottom: var(--am-line) solid var(--am-rule-soft); vertical-align: top; }
+  .po-col th { font-weight: var(--am-weight-strong); color: var(--am-ink); }
+  .po-col td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .po-key { display: inline-block; width: 12px; height: 12px; border-radius: 50%; vertical-align: -1px; margin-right: 6px; }
+  .po-key.await { background: var(--am-await); }
+  .po-key.fail { border: 2px solid var(--am-fail); box-sizing: border-box; }
+  .po-foot { margin-top: var(--am-space-12); font-size: var(--am-text-ui); color: var(--am-muted); max-width: var(--am-measure); }
+  @media (prefers-reduced-motion: no-preference) { .po-page a { transition: color var(--am-dur-quick) var(--am-ease); } }
+  :focus-visible { outline: var(--am-focus-width) solid var(--am-accent); outline-offset: 2px; }
+</style>
+</head>
+<body class="po-page">
+<main class="po-sheet">
+<header class="po-head">
+  <h1>Durable memory for disposable agents, on one page</h1>
+  <p>Agents start empty and end after one task. What they learn, decide and owe lives in a shared record that people own. Three loops run through five layers: work, trust, and improvement. Read the diagram from the top; the paper is <a href="durable-memory-for-disposable-agents.md">durable-memory-for-disposable-agents.md</a>.</p>
+</header>
+
+<div class="po-scroll">
+<svg viewBox="0 0 1200 840" role="img" aria-labelledby="po-title po-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="po-title">The design in five layers and three loops</title>
+<desc id="po-desc">People own domains and policy. Disposable agents (workers, orchestrators, curators, auditors, an evaluator, a recall deputy) call one serving layer per session: a task ledger with leases, retrieval, a screen on every write, telemetry, taps. A perimeter checks every call. Below sits the durable data: the record of entries at three trust tiers with policy and positions, and the historian of every event. Outside the fleet are model vendors, other institutions' servers, tool servers and trackers, reached only through one way out. Magenta marks where a person decides; red marks a call refused at the ceiling.</desc>
+<defs>
+  <marker id="po-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill: var(--am-ink)"/></marker>
+  <symbol id="i-trust-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/></symbol>
+  <symbol id="i-trust-1" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/><path d="M8 2.4a5.6 5.6 0 0 0 0 11.2Z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-trust-2" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6" fill="currentColor"/></symbol>
+  <symbol id="i-refused" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M3.7 12.3l8.6-8.6"/></symbol>
+</defs>
+
+<!-- bands -->
+<rect class="po-band" x="60" y="40" width="1100" height="100" rx="8"/>
+<text class="po-band-name" x="72" y="58">People: own domains, amend policy, approve what matters</text>
+<rect class="po-band" x="60" y="170" width="1100" height="170" rx="8"/>
+<text class="po-band-name" x="72" y="188">Agents: stateless and disposable, each in a session that ends after one task</text>
+<rect class="po-band" x="60" y="370" width="1100" height="160" rx="8"/>
+<text class="po-band-name" x="72" y="388">Serving layer: one memory server per session, rebuildable from the data below</text>
+<rect class="po-band" x="60" y="560" width="1100" height="140" rx="8"/>
+<text class="po-band-name" x="72" y="578">Durable data: versioned plain text with provenance, the only thing that must survive</text>
+<rect class="po-band" x="60" y="735" width="1100" height="85" rx="8"/>
+<text class="po-band-name" x="72" y="753">Outside the fleet</text>
+
+<!-- people -->
+<g>
+  <rect class="po-box" x="80" y="70" width="170" height="52" rx="4"/><text class="po-name" x="90" y="92">Domain owners</text><text class="po-premise" x="90" y="110">ownership</text>
+  <rect class="po-box" x="440" y="70" width="150" height="52" rx="4"/><text class="po-name" x="450" y="92">Guards</text><text class="po-premise" x="450" y="110">untrusted output</text>
+  <rect class="po-box" x="800" y="70" width="150" height="52" rx="4"/><text class="po-name" x="810" y="92">Policy authors</text><text class="po-premise" x="810" y="110">viability</text>
+  <rect class="po-box" x="960" y="70" width="150" height="52" rx="4"/><text class="po-name" x="970" y="92">Horizon scanner</text><text class="po-premise" x="970" y="110">viability</text>
+</g>
+
+<!-- agents -->
+<g>
+  <rect class="po-box" x="80" y="205" width="150" height="52" rx="4"/><text class="po-name" x="90" y="227">Workers</text><text class="po-premise" x="90" y="245">disposable</text>
+  <rect class="po-box" x="250" y="205" width="150" height="52" rx="4"/><text class="po-name" x="260" y="227">Orchestrators</text><text class="po-premise" x="260" y="245">disposable</text>
+  <rect class="po-box" x="80" y="268" width="150" height="52" rx="4"/><text class="po-name" x="90" y="290">Recall deputy</text><text class="po-premise" x="90" y="308">disposable</text>
+  <rect class="po-box" x="440" y="205" width="150" height="52" rx="4"/><text class="po-name" x="450" y="227">Curators</text><text class="po-premise" x="450" y="245">viability</text>
+  <rect class="po-box" x="610" y="205" width="150" height="52" rx="4"/><text class="po-name" x="620" y="227">Auditors</text><text class="po-premise" x="620" y="245">untrusted output</text>
+  <rect class="po-box" x="800" y="205" width="150" height="52" rx="4"/><text class="po-name" x="810" y="227">Evaluator</text><text class="po-premise" x="810" y="245">evaluation</text>
+</g>
+
+<!-- serving -->
+<g>
+  <rect class="po-box" x="80" y="395" width="160" height="52" rx="4"/><text class="po-name" x="90" y="417">Task ledger</text><text class="po-premise" x="90" y="435">disposable</text>
+  <rect class="po-box" x="260" y="395" width="150" height="52" rx="4"/><text class="po-name" x="270" y="417">Retrieval</text><text class="po-premise" x="270" y="435">disposable</text>
+  <rect class="po-box" x="440" y="395" width="150" height="52" rx="4"/><text class="po-name" x="450" y="417">Screen</text><text class="po-premise" x="450" y="435">untrusted output</text>
+  <rect class="po-box" x="620" y="395" width="150" height="52" rx="4"/><text class="po-name" x="630" y="417">Telemetry</text><text class="po-premise" x="630" y="435">evaluation</text>
+  <rect class="po-box" x="960" y="395" width="180" height="52" rx="4"/><text class="po-name" x="970" y="417">Taps</text><text class="po-premise" x="970" y="435">ownership</text>
+  <rect class="po-bar" x="80" y="470" width="1060" height="40" rx="4"/>
+  <text class="po-name" x="92" y="489" style="font-size: 0.8125rem">Perimeter</text>
+  <text class="po-note" x="170" y="489">every call checked against labels, grants, limits and the principal chain</text>
+  <text class="po-note" x="170" y="503">self-improvement never widens permission; only a person can</text>
+</g>
+
+<!-- durable data -->
+<g>
+  <rect class="po-box" x="80" y="590" width="760" height="46" rx="4"/>
+  <text class="po-name" x="90" y="610">The record</text>
+  <text class="po-note" x="190" y="610">entries at three trust tiers</text>
+  <use href="#i-trust-0" x="356" y="598" width="14" height="14"/><text class="po-note" x="374" y="610">raw</text>
+  <use href="#i-trust-1" x="406" y="598" width="14" height="14"/><text class="po-note" x="424" y="610">curated</text>
+  <use href="#i-trust-2" x="480" y="598" width="14" height="14"/><text class="po-note" x="498" y="610">verified</text>
+  <text class="po-note" x="560" y="610">policy L0 to L3, positions, registry</text>
+  <text class="po-small" x="190" y="628">trust rises only through gates, and is checked at the point of use; labels fall only through a guard</text>
+  <rect class="po-box" x="80" y="646" width="760" height="40" rx="4"/>
+  <text class="po-name" x="90" y="666">The historian</text>
+  <text class="po-note" x="200" y="666">every write, read, send and task operation, in order, with offsets; lineage is a query over it</text>
+  <text class="po-premise" x="90" y="680">outlives its parts</text>
+</g>
+
+<!-- outside -->
+<g>
+  <rect class="po-box" x="80" y="765" width="170" height="44" rx="4"/><text class="po-name" x="90" y="786">Model vendors</text><text class="po-premise" x="90" y="802">pinned, probed for drift</text>
+  <rect class="po-box" x="440" y="765" width="240" height="44" rx="4"/><text class="po-name" x="450" y="786">Other institutions' servers</text><text class="po-premise" x="450" y="802">hosts behind this server, same filter</text>
+  <rect class="po-box" x="800" y="765" width="150" height="44" rx="4"/><text class="po-name" x="810" y="786">Tool servers</text><text class="po-premise" x="810" y="802">declared per task</text>
+  <rect class="po-box" x="960" y="765" width="180" height="44" rx="4"/><text class="po-name" x="970" y="786">Trackers, archives</text><text class="po-premise" x="970" y="802">items in, proposals out</text>
+</g>
+
+<!-- the work loop -->
+<path class="po-line" d="M240 262V390" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
+<text class="po-note" x="248" y="320">claim with a lease, read the least that answers,</text>
+<text class="po-note" x="248" y="334">write a handoff before the session ends</text>
+<path class="po-line" d="M200 320L300 393" marker-end="url(#po-arrow)"/>
+<text class="po-small" x="236" y="372">recall: a lookup on a small model, the caller's permissions</text>
+<path class="po-line" d="M160 447V588" marker-end="url(#po-arrow)"/>
+<text class="po-small" x="168" y="548">tasks and handoffs</text>
+<path class="po-line" d="M335 447V588" marker-end="url(#po-arrow)"/>
+<text class="po-small" x="343" y="548">search, get: summaries first</text>
+
+<!-- the trust loop -->
+<path class="po-line" d="M515 257V393" marker-end="url(#po-arrow)"/>
+<text class="po-small" x="523" y="300">curate: summarise, merge, verify, retire</text>
+<use href="#i-trust-1" x="523" y="306" width="12" height="12"/><text class="po-small" x="539" y="316">curated, through the gate</text>
+<path class="po-line" d="M515 447V588" marker-end="url(#po-arrow)"/>
+<text class="po-small" x="523" y="538">write: screened, quarantined if unsafe,</text>
+<use href="#i-trust-0" x="523" y="542" width="12" height="12"/><text class="po-small" x="539" y="552">lands raw, served with its tier visible</text>
+<path class="po-line" d="M608 231H594" marker-end="url(#po-arrow)"/>
+<text class="po-small" x="596" y="200">check, on another model</text>
+<path class="po-line" d="M515 122V158" marker-end="url(#po-arrow)"/>
+<circle class="po-await" cx="515" cy="160" r="7"/><circle class="po-await-dot" cx="515" cy="160" r="2.5"/>
+<text class="po-await-text" x="528" y="164">declassify: a guard, a person, approves each move down</text>
+
+<!-- the improvement loop -->
+<path class="po-line" d="M660 395L565 259" marker-end="url(#po-arrow)"/>
+<text class="po-small" x="586" y="340">curator work queue</text>
+<path class="po-line" d="M720 395L820 259" marker-end="url(#po-arrow)"/>
+<text class="po-small" x="738" y="340">grades against withheld scenarios</text>
+<path class="po-line" d="M700 588V512" marker-end="url(#po-arrow)"/>
+<text class="po-small" x="708" y="548">rules enforced once verified</text>
+<path class="po-line" d="M875 122V160H1000V538H860V588" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M1000 122V160"/>
+<path class="po-line" d="M950 231H1000"/>
+<text class="po-small" x="868" y="150">policy, proposals, approvals</text>
+<circle class="po-await" cx="1000" cy="350" r="8"/><circle class="po-await-dot" cx="1000" cy="350" r="3"/>
+<text class="po-await-text" x="988" y="346" text-anchor="end">a person decides:</text>
+<text class="po-await-text" x="988" y="361" text-anchor="end">promotion to verified, a new rule, an exception, an irreversible act</text>
+
+<!-- one way out -->
+<path class="po-line" d="M1050 447V722" />
+<use href="#i-refused" x="1058" y="548" width="14" height="14" class="po-fail" style="color: var(--am-fail)"/>
+<text class="po-fail-text" x="1040" y="562" text-anchor="end">refused over the ceiling</text>
+<path class="po-line" d="M80 722H1140"/>
+<text class="po-note" x="80" y="716">one way out: through taps and tool servers, each destination with a ceiling and a budget; the fleet proposes, people merge and close</text>
+<path class="po-line" d="M165 722V763" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M550 722V763" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M875 722V763" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M1050 722V763" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
+</svg>
+</div>
+
+<div class="po-cols">
+  <section class="po-col">
+    <h2>Where colour appears</h2>
+    <p><span class="po-key await"></span>A person decides. Promotion to verified, a new rule above the ceiling, an exception, an irreversible action, each move of content to a lower label. Everything an agent does is inside limits a person set.</p>
+    <p><span class="po-key fail"></span>Refused. A call over its destination's ceiling does not leave. Below the ceiling is the normal case and has no colour.</p>
+    <p>The word under each part names the premise it serves: <em>disposable</em> agents, <em>untrusted output</em> from models, <em>ownership</em> that limits conflict, <em>viability</em> over years, <em>evaluation</em> built in, and data that <em>outlives its parts</em>. <a href="durable-memory-for-disposable-agents-complexity.md">Appendix H</a> sorts every part, rule and failure mode under those six.</p>
+  </section>
+  <section class="po-col">
+    <h2>What a smaller deployment leaves out</h2>
+    <table>
+      <tr><th>Setting</th><th>Keeps</th><th>Accepts</th></tr>
+      <tr><td>One operator, trusted inputs, one machine</td><td>The disposable and evaluation parts: ledger, handoffs, T0, recall, metrics, replays</td><td class="n">30 of 38 failure modes</td></tr>
+      <tr><td>One team on shared infrastructure</td><td>Those, and the untrusted-output parts: labels, screen, gate, lineage, auditors</td><td class="n">19 of 38</td></tr>
+      <tr><td>An organisation over years</td><td>The whole design</td><td class="n">none by choice</td></tr>
+    </table>
+  </section>
+  <section class="po-col">
+    <h2>How much system this is</h2>
+    <table>
+      <tr><td>Roles</td><td class="n">16</td></tr>
+      <tr><td>Entry types</td><td class="n">7</td></tr>
+      <tr><td>Trust tiers</td><td class="n">3</td></tr>
+      <tr><td>Policy layers</td><td class="n">4</td></tr>
+      <tr><td>Perimeter limits</td><td class="n">5</td></tr>
+      <tr><td>Interface operations</td><td class="n">20</td></tr>
+      <tr><td>Metrics</td><td class="n">21</td></tr>
+      <tr><td>Rules in the appendices</td><td class="n">94</td></tr>
+      <tr><td>Failure modes</td><td class="n">38</td></tr>
+    </table>
+    <p>Counted by the script in <a href="../WRITING.md">WRITING.md</a> at commit <code>ab52e91</code>.</p>
+  </section>
+</div>
+
+<footer class="po-foot">
+  <p>A page of <em>Durable Memory for Disposable Agents</em>. The parts are few and the rules are where the system is large; the paper's own remedy for rule growth, a ceiling with a person signing each rule above it, applies to it. Colours and type are the amem tokens; the design book says what each colour means.</p>
+</footer>
+</main>
+</body>
+</html>
