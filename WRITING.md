@@ -252,7 +252,7 @@ print(f"not={c(r'\bnot\b')} rather_than={c(r'\brather than\b')} instead_of={c(r'
 
 The second script counts the parts of the design: roles, entry types, labels, limits, operations,
 states, metrics, failure modes, rules, glossary terms and evidence rows, and the words and list
-items per section. [Appendix H](docs/durable-memory-for-disposable-agents-complexity.md) prints
+items per section. [Appendix H](docs/durable-memory-for-disposable-agents-complexity.md) shows
 its output at each revision and reads it. It lives here, with the metrics script, because `docs/`
 is seeded into the demo record and a code block there would compete with the paper in search.
 
