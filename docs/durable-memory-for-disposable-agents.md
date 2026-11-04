@@ -239,9 +239,9 @@ That record is the event log, called the **historian** after the process histori
 
 | Event | Carries | Answers |
 |---|---|---|
-| Write | Entry version, author, session, historian position, and what it cites or supersedes | Where did this come from? |
+| Write | Entry version, author, session, historian offset, and what it cites or supersedes | Where did this come from? |
 | Read | Session, plus the entry versions a search returned or a fetch or `recall` used | Who has seen this? |
-| Send | Destination, a digest of the content, session, historian position | What left, and what was it made from? |
+| Send | Destination, a digest of the content, session, historian offset | What left, and what was it made from? |
 | Ledger operation | Task, principal (the person or agent acting), attempt key | Who did what work, and when? |
 | Curation | Curator instance, model, the diff | Who changed the collection, and how? |
 
@@ -804,9 +804,9 @@ A **position** is a record in a domain's memory for one standing role: the revie
 
 The authority fields are verified entries and change only through the review gate ([§4](#promotion)). Sessions under the charter's agent definition write its commitments and history, as raw entries that cite the position. A position survives model changes and renames, and it is addressable: a tap that posts for a position carries the fleet's identity and names the position, so an outside project sees one author across sessions.
 
-A session that fills a position takes the position's T0 slice, presents the manifest its agent definition fixes ([§10](#10-evolving-the-system)) narrowed by the position's authority envelope, and takes the tasks the position's charter covers. The position grants nothing by itself: the perimeter checks every action against the position's authority envelope, the task definition's declared tools, and the principal chain, and the narrowest applies.
+A session that fills a position takes the position's T0 slice, presents the manifest the session's agent definition fixes ([§10](#10-evolving-the-system)) narrowed by the position's authority envelope, and takes the tasks the position's charter covers. The position grants nothing by itself: the perimeter checks every action against the position's authority envelope, the task definition's declared tools, and the principal chain, and the narrowest applies.
 
-- **Secondment.** A session under an agent definition other than the one the charter names, a substitute model for instance, may read the position's memory and write to the task chain. It may not write the position's history, commitments, or handoff cache, because those are what the next occupant will trust.
+- **Secondment.** A session under an agent definition other than the one the charter names, a substitute model for instance, may read what the position holds and write to the task chain. It may not write the position's history, commitments, or handoff cache, because those are what the next occupant will trust.
 - **Retirement.** A position's owner retires it through the review gate. Its open commitments return to the ledger for matching, and its history stays in the record under its identifier.
 - **Waking.** When a task pinned to a position with no live session is admitted, the service starts a session in the position, under the agent definition its charter names, so a pin names a role and never a process.
 
@@ -1466,7 +1466,7 @@ domain: dom-a                 # a permanent ID, never a team name
 author: agent:worker-3 (model: <model-id>) | human:<authority>,<date>:<user-id>   # §12
 created: <timestamp>
 cites: [entry IDs or id@version, links, or repo@commit:path]   # what the author says it drew on, at the version it read; the service records the rest (§3)
-session: <session-id>@<historian position>   # recovers the read set
+session: <session-id>@<historian offset>     # recovers the read set
 confidence: high | medium | low
 trust_tier: raw | curated | verified
 classification: internal      # who may see it (§4)
@@ -1834,7 +1834,7 @@ Replay quantifies confirmed drift. Then the model is pinned or failed over, and 
 | **Autonomy level** | What a task definition's completions need before they count: a person's verdict, an independent review, or the acceptance checks alone; earned on held-out suites ([§10](#10-evolving-the-system)) |
 | **BM25** | A method for ranking documents by how well their words match a query ([§6](#6-retrieval-and-serving)) |
 | **Charter** | A position's standing orders, the kinds of task it covers, and the agent definition that fills it by default ([§8](#positions)) |
-| **Checkpoint** | A recorded position showing how far a log or a view rebuilt from it has progressed ([§12](#12-surviving-long-timescales)) |
+| **Checkpoint** | A recorded offset showing how far a log or a view rebuilt from it has progressed ([§12](#12-surviving-long-timescales)) |
 | **Connector** | The tap or tool server that commits an external effect for the ledger and records its outcome ([Appendix C](#appendix-c-ledger-semantics)) |
 | **Classification, handling, ceiling** | Who may see an entry; the most a session may read; the most a destination may receive ([§4](#4-trust-and-handling)) |
 | **Distil** | Turn raw material (threads, transcripts, trajectories) into curated entries or methods ([§5](#5-the-curator), [§10](#10-evolving-the-system), [Appendix B](#appendix-b-seeding)) |
