@@ -251,8 +251,9 @@ This applies to:
 These keep their own style: the paper (`docs/durable-memory-for-disposable-agents.md`),
 the paper's appendix (`docs/durable-memory-for-disposable-agents-appendix.md`), the case
 study (`docs/seeding-a-foundation.md`), `PLAN.md`, the records in `spikes/`, the example
-records in `examples/`, code comments, and the text of the web pages and the design book.
-The paper's style is written down in [WRITING.md](WRITING.md).
+records in `examples/`, `WRITING.md`, code comments, and the text of the web pages and the
+design book. The style of the paper and the case study is written down in
+[WRITING.md](WRITING.md).
 
 ## Writing on an issue or a pull request
 

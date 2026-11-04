@@ -1,10 +1,12 @@
 # Writing the paper
 
 How *Durable Memory for Disposable Agents* and its case study are kept readable. The rules
-below were recovered from the commits that shortened the paper in October 2026, from
-13,000 words of body to 8,700, and from 27 paragraphs over 100 words to none. Each rule
-gives one example from those commits, before and after, so that the next pass can tell
-the rule from a taste. The last section is the procedure a pass runs.
+below were recovered from the commits that shortened the paper in October 2026 and revised
+it in early November. Measured with the script at the end of this file, the body went from
+13,000 words at the commit before the pass (57d67d1, 12 October) to 8,700 at the end of the
+pass (29ff584, 13 October), and from 27 paragraphs over 100 words to none (29bf659, 15
+October). Most rules give one example from those commits, before and after, so that the
+next pass can tell the rule from a taste. The last section is the procedure a pass runs.
 
 The paper keeps this style; the documents written for the repository follow AGENTS.md and
 [docs/terms.md](docs/terms.md) instead.
@@ -16,9 +18,10 @@ how."** No list of mechanisms.
 
 > *Agent fleets need shared memory, and shared memory spreads mistakes and leaked secrets as easily as knowledge. It has to be cheap to read, safe to share, and outlast every model and tool it runs on. This paper proposes how.*
 
-**Every section and every role opens with why it exists, labelled `**Why.**`** A section
-whose first paragraph is a mechanism has lost its reason. Where none can be written, the
-section may not belong.
+**The section that introduces a part or a role opens with why it exists, labelled
+`**Why.**`** A subsection whose reason its parent gave may open with an example or a
+diagram instead. A section whose first paragraph is a mechanism has lost its reason; where
+none can be written, the section may not belong.
 
 > − Organisations rename, split, merge, and hand names to new owners. ...
 > + **Why.** Organisations rename, split, merge, and hand names to new owners. ...
@@ -50,7 +53,7 @@ two lists, "Delivers" and "Proven when".
 **Cut what only repeats something said elsewhere.** For each section, name one thing a
 reader learns there and nowhere else. If nothing, cut it and redirect its references.
 
-> Build Order added little the evaluation and survival sections do not already say; remove it and point its few references at §11 instead. (commit 29ff584, 1,200 words)
+> Build Order added little the evaluation and survival sections do not already say; remove it and point its few references at §11 instead. (commit 29ff584, which removed 1,600 words)
 
 **A term is explained where it first appears, and the glossary holds the definition.** The
 first occurrence carries an appositive ("the harness, the program that runs the model") or
@@ -113,9 +116,9 @@ rhetorical one.
 > − ## Prices, and why not build in the token
 > + ## Cost and throughput
 
-**One bold label per paragraph, at its start, from a fixed set:** `**Why.**`, `**An
-example.**`, `**Read:**` / `**Write:**` / `**Send:**`, `**Delivers:**` / `**Proven when:**`,
-and one bold phrase per principle or bullet.
+**One bold label per paragraph, at its start.** `**Why.**` and `**An example.**` recur;
+any other label names the paragraph's subject in a few words. A bullet has one bold phrase
+or none, the same for every bullet in its list.
 
 ## Tells
 
@@ -157,7 +160,9 @@ restates it; a semicolon joining two clauses that mirror each other.
 
 **A company or product as the authority.** Named deployments appear in §13 and the
 references; the body cites them by kind ("one personal-workspace deployment") and every
-rule keeps its own reason.
+rule keeps its own reason. The body names a party only where the name is the fact: the
+incident in §1, a component the design adopts (OPA, OpenTelemetry), and Gas Town, the one
+operator's fleet the paper cites most, which §4 defines once.
 
 > − At Meta a personal workspace of this kind ... reached 63,000 installs
 > + One industry deployment of a personal workspace of this kind ... reports 63,000 installs
@@ -177,7 +182,7 @@ rather than restating it.
 
 **A rule stated twice says the same thing, and the second place is a pointer.** List every
 place a rule appears (body, appendix, failure-mode table, case study) and diff them by
-hand. The reader test's "two passages that disagree" is the check.
+hand. The reader test's "two passages that do not agree" is the check.
 
 **A cross-reference points to where the claim is made**, not to a mention of it.
 
@@ -198,8 +203,9 @@ count; tells last, because they are cheapest to reintroduce while rewriting.
 1. **Measure.** On the body prose (no code fences, tables, headings, or citation links):
    words; sentences; mean, ninetieth-percentile, and longest sentence; paragraphs over 100
    words; counts of "not", "rather than", "instead of", "ensur", em-dashes, and
-   parentheticals over fifteen characters; exact-duplicate sentences; and shared eight-word
-   runs between sections. The script below prints them.
+   parentheticals over fifteen characters; and exact-duplicate sentences. The script below
+   prints these. Shared eight-word runs between sections, which find a rule stated twice,
+   need a separate shingle search.
 2. **Structure.** Abstract; `**Why.**`; example or diagram before rules; tables for
    parallel rules; detail to the appendix with one pointer; cut duplicates and redirect
    their references; terms defined at first use; every reference a link. Record in the
@@ -217,13 +223,12 @@ count; tells last, because they are cheapest to reintroduce while rewriting.
    reader's result in the pull request.
 
 ```python
-#!/usr/bin/env python3 -I
 """Prose metrics for a Markdown paper. Usage: python3 -I metrics.py <file.md>"""
 import re, sys, statistics, collections
 t = open(sys.argv[1], encoding='utf-8').read()
 body = re.sub(r'```.*?```', '', t, flags=re.S).split('\n# References')[0]
 paras = [x for x in re.split(r'\n\s*\n', body)
-         if x.strip() and not x.lstrip().startswith(('|', '#', '-', '*', '>'))
+         if x.strip() and not x.lstrip().startswith(('|', '#', '- ', '* ', '>'))
          and not re.match(r'\s*\d+\. ', x)]
 prose = [l for l in body.split('\n') if l.strip() and not l.startswith(('|', '#'))]
 text = re.sub(r'\[\[\d+\]\]\(#ref-\d+\)', '', ' '.join(prose))
