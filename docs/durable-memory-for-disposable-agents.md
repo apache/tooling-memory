@@ -67,7 +67,7 @@ flowchart TB
 
 Everything is partitioned into **domains**. A domain is an area of work with an owner, such as a product area, a project, or a person's own notes. Memory, tasks, policy, and access are all organised by domain. Domains can serve **operational units**: the teams, of people and agents, accountable for a continuing area of work ([§8](#local-responsibility)).
 
-An agent is a model run by a **harness**, the program that gives it prompts, tools, and settings. An agent starts empty. It loads a small cached index of its domain (T0), a digest of the policy that applies to it, and the seat it fills ([§8](#seats)). It claims a task from the domain's ledger, reads what it needs through the retrieval service, does the work, and writes a handoff note before it ends. The next agent starts from that note.
+An agent is a model run by a **harness**, the program that gives it prompts, tools, and settings. An agent starts empty. It loads a small cached index of its domain (T0), a digest of the policy that applies to it, and, when it fills one, its seat ([§8](#seats)). It claims a task from the domain's ledger, reads what it needs through the retrieval service, does the work, and writes a handoff note before it ends. The next agent starts from that note.
 
 In the background, curators keep the memory tidy, auditors check the curators, and people (or senior agents, where policy allows) promote what is good enough to rely on. A horizon scanner in each unit watches what changes outside the fleet, and owners decide when its goals must change ([§7](#7-the-policy-stack)).
 
@@ -92,6 +92,7 @@ In the background, curators keep the memory tidy, auditors check the curators, a
 | **[Orchestrators](#decomposition)** | Someone has to decide what is worth doing, and split work too big for one agent | Rank tasks against written strategy, and split them ([§8](#8-coordination)) |
 | **[Curators](#5-the-curator)** | Left alone, memory rots | Summarise, merge, verify, and retire entries ([§5](#5-the-curator)) |
 | **[Auditors](#auditors)** | A curator that checks its own work shares its own blind spots | Check the curators, on a different model where a capable one is available ([§5](#5-the-curator)) |
+| **[Evaluator](#9-measurement)** | A fleet that grades its own work shares its blind spots | Holds the withheld scenarios and grades completions, tuned apart from the sessions it grades ([§9](#9-measurement), [§10](#10-evolving-the-system)) |
 | **[Recall deputy](#the-recall-deputy)** | A multi-step lookup costs an expensive model many turns | Does the lookup on a model the domain picks for it, with the caller's permissions ([§6](#6-retrieval-and-serving)) |
 
 **Where the system meets the world**
@@ -148,7 +149,7 @@ Each entry is a Markdown file. Its frontmatter, the metadata block at the top, s
 
 ```yaml
 id: mem-a-0847                # stable, permanent, meaningless
-type: decision                # or fact, convention, method, handoff
+type: decision                # or fact, convention, method, handoff, seat
 domain: dom-a
 author: agent:worker-3 (model: <model-id>)
 trust_tier: curated           # raw, curated, or verified (§4)
@@ -165,7 +166,7 @@ The full record, with citations, lineage, and supersession, is in [Appendix A](#
 | **Convention** | Needs a named owner; an ownerless one is flagged within days |
 | **Method** | A convention about how to work: a strategy agents reuse ([§10](#10-evolving-the-system)). Like any convention it needs an owner, and it is reviewed more strictly. It states where it applies, and its score comes from how the tasks that used it turned out It cites the facts and decisions it relies on and does not restate them. Each cited fact keeps its own review date and each cited entry its own trust tier, and a failure can be traced to the method or to what it cites |
 | **Handoff** | Fastest. It serves the work it hands over. When nothing live still reaches it, the curator lifts what lasts into other entries and the handoff leaves search and the views built on the search index, T0 included. It is not demoted, and `get` still serves it ([Appendix C](#endings)) |
-| **Seat** | Slowly. It is the record for a standing role ([§8](#seats)): standing orders, scope, an authority envelope, open commitments, history, and the handoff cache the role's sessions leave. Its authority fields are verified and change only through the review gate; its commitments and history are written by the sessions that fill it |
+| **Seat** | Slowly. It is the record for a standing role ([§8](#seats)): a charter, scope, an authority envelope, open commitments, history, and the handoff cache the role's sessions leave. Its authority fields are verified and change only through the review gate; its commitments and history are written by the sessions that fill it |
 
 A T0 for one domain:
 
@@ -363,7 +364,7 @@ Curators are a standing fleet of cheap-model agents. They:
 - merge duplicates and mark what supersedes what;
 - split oversized files and demote dead material;
 - check conventions on a schedule, mechanically: freshness, ownership, and cross-links. A failed check opens a task to the entry's owner. A repository built by agents found that a single large instruction file rotted because nothing in it could be checked this way [[130]](#ref-130);
-- curate policy with the rest ([§7](#7-the-policy-stack)): merge rules that overlap, queue unused rules to their owners for retirement, and propose a task definition where the same work keeps being done by hand ([§10](#10-evolving-the-system)).
+- curate policy with the rest ([§7](#7-the-policy-stack)): merge rules that overlap, queue unused rules to their owners for retirement, and propose a task definition ([§8](#matching)) where the same work keeps being done by hand ([§10](#10-evolving-the-system)).
 
 Their work queue is the system's own telemetry. Clusters of failed queries become entries to write, pairs of entries always read together become merge candidates, and entries fetched but unused become summaries to rewrite. Two kinds go to the front: entries built from one that has just been superseded, and facts whose cited code has changed. A stale claim misleads even when the current one is retrieved beside it [[84]](#ref-84). Curation is budgeted like any other work, with a protected floor, so curation and delivery cannot starve each other.
 
@@ -443,19 +444,19 @@ OPA covers what can be checked mechanically: access, labels, spend and throughpu
 
 **An example.** A developer runs a memory server on their laptop. Their agents connect to it and to nothing else. When an agent needs the institution's memory, the laptop server fetches it from the institution's server under a grant the server holds on the developer's behalf, and applies the same filter and labels to what comes back.
 
-That is the rule: a session sees one memory server, the one run by whoever runs its harness, because enforcement split across servers leaves gaps. Any other memory system is a host behind that server. Agents never connect to a second server themselves. A harness's own memory files count as a second memory server: the harness turns them off, or the service reads their content as raw content from outside the fleet. A harness's own list of tool servers counts the same way: tools reach a session through the service, declared by its task definition or found by search ([§6](#turns-cost-more-than-transport)), and a server the harness registered on its own is unreachable.
+That is the rule: a session sees one memory server, the one run by whoever runs its harness, because enforcement split across servers leaves gaps. Any other memory system is a host behind that server. Agents never connect to a second server themselves. A harness's own memory files count as a second memory server: the harness turns them off, or the service reads their content as raw content from outside the fleet. A harness's own list of tool servers is a second server too: tools reach a session through the service, declared by its task definition ([§8](#matching)) or served by search ([§6](#turns-cost-more-than-transport)), and a server the harness registered on its own is unreachable.
 
 Identity is the serving layer's concern; the record carries only provenance. A server for one person authenticates nobody, since the owner is the only principal, but still applies labels and ceilings. An institution's server uses its identity provider. The credential for each host is held by the server, never by an agent.
 
-A call made by a helper for a worker for a person carries the whole chain: the person, the seat, the session, and each hop between. The token that carries it lives minutes and is bound to one audience, and grants are evaluated against the chain, so authority can be lost at a hop and never gained. The chain travels inside the call, because a proxy sees only the hop in front of it [[129]](#ref-129).
+A call made by a helper for a worker for a person carries the whole **principal chain**: the person, the seat, the session, and each hop between. The token that carries it lives minutes and is bound to one audience, and grants are evaluated against the chain, so authority can be lost at a hop and never gained. The chain travels inside the call, because a proxy sees only the hop in front of it [[129]](#ref-129).
 
 The operations in [Appendix A](#appendix-a-interface) are the durable contract; protocols are adapters (today MCP or its successor for agents, plain HTTP for scripts, and an agent-to-agent protocol between domains, [§8](#8-coordination)), and all of them meet the same filter. A public deployment is the same endpoint with one more principal tier, limited to public entries at curated or better.
 
 ## Turns cost more than transport
 
-Every pull costs the agent a model turn. So the predictable part (T0 and the policy digest) arrives as a cached prefix. T0 is assembled the same way each time, with the parts most sessions share first, so that a provider's prefix cache can match it. A provider keeps that cache for minutes, and a session that falls out of it pays full price to rebuild its context, so the heartbeat and the handoff cadence keep a session inside the window or hand off before it closes [[127]](#ref-127).
+Every pull costs the agent a model turn. So the predictable part (T0 and the policy digest) arrives as a cached prefix. T0 is assembled the same way each time, with the parts most sessions share first, so that a provider's prefix cache can match it. A provider keeps that cache for minutes, and a session that falls out of it pays full price to rebuild its context, so a session's turn cadence keeps it inside the window, or it hands off before the window closes [[127]](#ref-127).
 
-Tool definitions cost to read and widen what a session can reach, in the same measure as entries, and the service serves them the same way. A session receives the tools its task definition declares ([§8](#matching)) and a search over the rest. Serving tools by search is the model vendors' own practice: Anthropic defers tool definitions and loads them on demand through a search tool, and reports a token saving and better tool selection on large libraries [[139]](#ref-139), [[140]](#ref-140). A tool is enabled by its owner before any session can discover it, and a change to a tool's description is a reviewed change, because the description is the contract the model reads [[128]](#ref-128). A response is trimmed to the fields the caller named and redacted before it reaches the model.
+Tool definitions cost to read and widen what a session can reach, in the same measure as entries, and the service serves them the same way. A session receives the tools its task definition declares ([§8](#matching)): the few its work always needs load at boot, and the rest of the declared set arrive by search when the work calls for one. Serving tools by search is the model vendors' own practice: Anthropic defers tool definitions and loads them on demand through a search tool, and reports a token saving and better tool selection on large libraries [[139]](#ref-139), [[140]](#ref-140). A tool is enabled by its owner before any session can discover it, and a change to a tool's description is a reviewed change, because the description is the contract the model reads [[128]](#ref-128). A response is trimmed to the fields the caller named and redacted before it reaches the model.
 
 T0's entries are presented as data, with each entry's tier shown; its policy-digest section is presented as instructions. Researchers have shown memory loaded as instructions being rewritten by an install script and then obeyed [[89]](#ref-89).
 
@@ -594,13 +595,13 @@ Domain ownership identifies who can resolve file conflicts. Touching another dom
 
 Each session presents a **manifest** of what it can do, drawn from its verified harness ([§10](#10-evolving-the-system)). A task is offered only to a session whose manifest meets the task's requirements, whose handling covers the task's classification, and which the perimeter lets hold it. A high-ranked task nobody can match is reported as a capability gap.
 
-Every task names a **task definition**: the record in `dom-platform` for its kind of work ([§10](#the-platform-is-a-domain)). The definition declares the tools and data scope the work needs, the acceptance checks that verify it, the expected outputs, and the autonomy level the kind has earned, which decides what completion needs: the checks alone, a review by a session on another model, or a person's verdict. The grant a claimant receives is derived from the declaration, narrowed by its seat and its principal chain ([§6](#one-server-per-session)), so a task cannot reach a tool its definition did not declare. One deployment runs hundreds of such definitions as versioned files and derives each run's permissions from the file [[131]](#ref-131).
+Every task names a **task definition**: the record in `dom-platform` for its kind of work ([§10](#the-platform-is-a-domain)). The definition declares the tools and data scope the work needs, the acceptance checks that verify it, the expected outputs, and the autonomy level the kind has earned, which decides what completion needs: the checks alone, a review by a session on another model and vendor, or a person's verdict. The grant a claimant receives is derived from the declaration, narrowed by its seat and its principal chain ([§6](#one-server-per-session)), so a task cannot reach a tool its definition did not declare. One deployment runs hundreds of such definitions as versioned files and derives each run's permissions from the file [[131]](#ref-131).
 
 A task may also name a **seat** ([Seats](#seats)), with a reason: continuity, where the seat holds open commitments the task depends on; an external relationship that expects one identity; or separation, where review must go to a seat other than the author's. A pin names a seat and never a session or a model. Most tasks name no seat and go to any session that matches, in a seat whose charter covers them or in none, because a pinned seat is a queue of one.
 
 ### Authority
 
-A task spec is data. The perimeter checks every action the claimant takes, whatever the spec asks for.
+A task spec is data and grants nothing; the claimant's grant comes from the task definition. The perimeter checks every action the claimant takes, whatever the spec asks for.
 
 Requirements need guarding too. A task that requires write access to a production database will be picked up by an agent that has it, so a creator could use requirements to steer a payload toward the most powerful agents. Three guards prevent that:
 
@@ -614,13 +615,13 @@ A blocked task is visible but not claimable, and its priority flows to whatever 
 
 An agent may not route around a dependency. It records why it is stuck and releases the task.
 
-Waiting is a ledger state. A task that waits on an outside event, a check that is running, a reply, a change that has not landed, is blocked on it, the tap's event unblocks it, and the service wakes a claimant. An agent does not wait in a session for an event, because a waiting session spends tokens and context on nothing; Yegge's crew seats worked for a quarter of an hour and then idled for most of an hour on monitors, until a scheduled process took the waiting over, under his rule that crons watch and models act [[116]](#ref-116), [[119]](#ref-119), [[137]](#ref-137), [[138]](#ref-138).
+Waiting is a ledger state. A task that waits on an outside event, a check that is running, a reply, a change that has not landed, is blocked on it, the tap's event unblocks it, and the service offers it for claiming again. An agent does not wait in a session for an event, because a waiting session spends tokens and context on nothing; Yegge's standing agents worked for a quarter of an hour and then idled for most of an hour, watching for events, until a scheduled process took the waiting over, under his rule that crons watch and models act [[116]](#ref-116), [[119]](#ref-119), [[137]](#ref-137), [[138]](#ref-138).
 
 ### Decomposition
 
 The orchestrator splits work too big for one agent into dependent subtasks that each fit someone. A person counts: a sign-off is a task whose match is a human.
 
-The outcome of a sign-off is an **approval event** in the historian: the human principal, the exact action and the version of what it approved, its scope, and an expiry. The perimeter checks the event when the action runs and refuses an action whose version differs. An approval relayed by an agent, or given for a set of actions at once, has no force, because the person approved what they saw. Where a session serves several people, each prompt records which principal gave it, and a change leaves the fleet under that person's identity, so the author and the approver of a change are never one identity [[132]](#ref-132), [[129]](#ref-129).
+The outcome of a sign-off is an **approval event** in the historian: the human principal, the exact action and the version of what it approved, its scope, and an expiry. The perimeter checks the event when the action runs and refuses an action whose version differs. An approval relayed by an agent, or given for a set of actions at once, has no force, because the person approved what they saw. A session may take prompts from more than one person; each prompt records which principal gave it, and a change leaves the fleet under that person's identity, so the author and the approver of a change are never one identity [[132]](#ref-132), [[129]](#ref-129).
 
 An agent that finds part of its task beyond it finishes what it can as a subtask, files the rest with the missing requirements, and hands off.
 
@@ -715,13 +716,13 @@ Shared services may serve several units, but each unit needs all five covered. T
 
 **Why.** A session that starts from nothing has to work out, before it acts, who is asking, what is in scope, what authority covers the act, and what is still owed from earlier work. It pays for that on every start, and in a fleet of short-lived sessions the price repeats without end. Steve Yegge, running Gas Town, a fleet of some fifty agents, reached the same answer from practice and named it the seat: the unit that lasts is a named role with an identity and a history, and sessions are its occupants [[117]](#ref-117), [[120]](#ref-120). The account is one operator's, and the saving is unmeasured; the arms in [§11](#11-evaluating-change) can run a seated session against a seatless one on the same work.
 
-A **seat** is a record in the domain's memory for one standing role: the reviewer for a subsystem, a release coordinator, a domain's curator, the owner of a relationship with an outside project. It holds standing orders, scope, an authority envelope, open commitments, a history, and the handoff cache of the sessions that filled it. The authority fields are verified entries and change only through the review gate ([§4](#promotion)); the commitments and history are written by the sessions that fill the seat, as raw entries in its chain. A seat survives model changes and renames, and it is addressable: a tap that posts under a seat posts under a stable identity.
+A **seat** is a record in the domain's memory for one standing role: the reviewer for a subsystem, a release coordinator, a domain's curator, the owner of a relationship with an outside project. It holds a **charter**, the standing orders, the kinds of task the seat covers, and the agent definition ([§10](#10-evolving-the-system)) that fills it by default; a scope; an authority envelope; open commitments; a history; and a **handoff cache**, the latest handoffs of the sessions that filled it, which the next occupant reads first. The authority fields are verified entries and change only through the review gate ([§4](#promotion)); the commitments and history are written by the sessions that fill the seat, as raw entries that cite the seat. A seat survives model changes and renames, and it is addressable: a tap that posts for a seat carries the fleet's identity and names the seat, so an outside project sees one author across sessions.
 
-A session boots into a seat. Its T0 slice is the seat's, its manifest is the seat's verified definition narrowed by the session's harness ([§10](#10-evolving-the-system)), and its tasks are those the seat's charter covers. The seat grants nothing by itself: the perimeter checks every action against the seat's authority envelope, the task definition's declared tools, and the principal chain, and the narrowest applies.
+A session that boots into a seat takes the seat's T0 slice, presents the manifest its agent definition fixes ([§10](#10-evolving-the-system)) narrowed by the seat's authority envelope, and takes the tasks the seat's charter covers. The seat grants nothing by itself: the perimeter checks every action against the seat's authority envelope, the task definition's declared tools, and the principal chain, and the narrowest applies.
 
-Two rules follow. **Secondment**: a session on a model other than the seat's own may read the seat's memory and write to the task chain, and may not write the seat's history or commitments, because those are what the next occupant will trust. **Retirement**: a seat is retired by its owner through the review gate; its open commitments return to the ledger for matching, and its history stays in the record under its identifier. A seat with no live session wakes one when a task pinned to it is admitted, so a pin names a role and never a process.
+Two rules follow. **Secondment**: a session under an agent definition other than the one the charter names, a substitute model for instance, may read the seat's memory and write to the task chain, and may not write the seat's history or commitments, because those are what the next occupant will trust. **Retirement**: a seat is retired by its owner through the review gate; its open commitments return to the ledger for matching, and its history stays in the record under its identifier. When a task pinned to a seat with no live session is admitted, the service starts a session in the seat, so a pin names a role and never a process.
 
-**Where seats come from.** An empty system has none and needs none: a session with no seat is the default, and work runs on task definitions alone until a seat earns its place. Seats enter by three routes. The platform's standing roles, the curator, the auditors, and the orchestrator ([§2](#roles-and-why-each-exists)), are seats that `dom-platform` creates for a domain when the domain is registered, with charters fixed by policy. At seeding ([Appendix B](#appendix-b-seeding)) a domain's owner writes the seats its people already recognise, a subsystem's reviewer or the holder of an outside relationship, from the ownership map the code reviews yield; a seat's authority fields are verified entries, so each is a reviewed write by a person. After that, a curator proposes a seat when the ledger shows the need: tasks pinned for the same reason, a tap that expects one identity, commitments that outlive the tasks that made them; the domain's owner approves it through the review gate. A seat that holds no commitment and claims no task over a review period goes to its owner for retirement, as an unused rule does ([§7](#7-the-policy-stack)).
+**Where seats come from.** An empty system has none and needs none: a session with no seat is the default, and work runs on task definitions alone until a seat earns its place. Seats enter by three routes. The platform's standing roles, the curator, the auditors, and the orchestrator ([§2](#roles-and-why-each-exists)), are seats that `dom-platform` creates in its own memory when a domain is registered, one set per domain, with charters fixed by policy. At seeding ([Appendix B](#appendix-b-seeding)) a domain's owner writes the seats its people already recognise, a subsystem's reviewer or the holder of an outside relationship, from the ownership map the code reviews yield; a seat's authority fields are verified entries, so each is a reviewed write by a person. After that, a curator proposes a seat when the ledger shows the need: tasks pinned for the same reason, a tap that expects one identity, commitments that outlive the tasks that made them; the domain's owner approves it through the review gate. A seat that holds no commitment and claims no task over a review period goes to its owner for retirement, as an unused rule does ([§7](#7-the-policy-stack)).
 
 The lower bound is a session with no seat: a task definition, a T0 slice, and a policy row. It fits high-volume, low-variety work whose outcome is measured, where an occupant with a history would add cost and no judgment; Yegge's Counting House is this bound, a pool of stateless clerks for whom the house remembers [[119]](#ref-119).
 
@@ -729,7 +730,7 @@ The lower bound is a session with no seat: a task definition, a T0 slice, and a 
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Oriented: load cached T0 and policy digest, boot into a seat, present manifest
+    [*] --> Oriented: load cached T0 and policy digest, boot into a seat or none, present manifest
     Oriented --> Working: claim a task, start lease
     Oriented --> [*]: nothing claimable
     Working --> Working: search, read, act, write, renew lease
@@ -779,7 +780,7 @@ Every read and every ledger operation passes through the service, so telemetry a
 
 Retrieval is a published contract, because agents depend on it. Starting targets: median search latency 100 ms and 99th-percentile latency 500 ms; 99% of handoffs and mid-task decisions searchable within 60 seconds, screening included, with a looser bound for bulk curation; known-item lookups by ID, title, or error string in the top three; `claim_next` 99th-percentile latency one second.
 
-Progress is measured by the evaluator and by the landing queue, which the fleet cannot edit, after a fixed delay. A task an agent filed and completed itself counts as upkeep. A check an agent changed counts only once a person has reviewed the change. A fleet that files and grades its own work can show throughput without delivering anything [[126]](#ref-126). The spend behind the numbers factors into terms that multiply: how many people and agents use the fleet, how many requests a task takes, how many of those the agent makes on its own behalf, how many tokens each request carries, and the price per token. The middle terms are what memory exists to shrink. One operator that held its model fixed to measure them cut cost per request by a third and cost per session by half while requests grew ninefold [[127]](#ref-127); a gain in cost is measured with the model held fixed, because a model change moves cost on its own.
+Progress is measured by the **evaluator**, the role that holds the withheld scenarios and grades completions ([§10](#10-evolving-the-system)), and by the landing queue, which the fleet cannot edit, after a fixed delay. A task an agent filed and completed itself counts as upkeep. A check an agent changed counts only once a person has reviewed the change. A fleet that files and grades its own work can show throughput without delivering anything [[126]](#ref-126). The spend behind the numbers factors into terms that multiply: how many people and agents use the fleet, how many requests a task takes, how many of those the agent makes on its own behalf, how many tokens each request carries, and the price per token. The middle terms are what memory exists to shrink. One operator that held its model fixed to measure them cut cost per request by a third and cost per session by half while requests grew ninefold [[127]](#ref-127); a gain in cost is measured with the model held fixed, because a model change moves cost on its own.
 
 In an outage, agents keep working from the T0 they loaded and queue their handoffs, within their last confirmed lease. New reads need current authorisation and changes need a valid claim; when either cannot be checked, the action waits. No irreversible action proceeds in an outage. [Appendix C](#appendix-c-ledger-semantics) gives the ledger's outage rules.
 
@@ -805,7 +806,7 @@ A definition also fixes the capability manifest the agent presents ([§8](#8-coo
 
 A **task definition** is the same kind of record for a kind of work ([§8](#matching)). It declares the inputs, the context to load, the tools and data scope, the acceptance checks, the expected outputs, and the deterministic steps that bracket the agent's, so a step can move between code and model as the work is understood [[123]](#ref-123), [[131]](#ref-131). Review checks its declared tools against its purpose, as it checks an agent definition's manifest. The methods a definition cites carry the model generation they were tuned on, and a model change re-evaluates them with removal as the default, because a method tuned around one model's habits can be a cost on the next.
 
-Each task definition carries an **autonomy level**: what a completion needs before it counts. The lowest level needs a person's verdict; the next, a review by a session on another model and vendor than the author's, never in the author's session; the highest, the acceptance checks alone. A definition starts at the lowest level and earns the next on a held-out suite, and an outcome event that reverts or rejects its work lowers it [[119]](#ref-119), [[125]](#ref-125). The scenarios that grade a definition are withheld from the sessions that claim its tasks and visible to the evaluator role alone, because a readable test is a target [[122]](#ref-122). The evaluator is tuned on its own, against the generator, because a generator asked to judge its own work shares its blind spots [[134]](#ref-134). Only the acceptance checks can be cheap, run often, and be hard to fake, and the level can rise only as far as they reach [[124]](#ref-124).
+Each task definition carries an **autonomy level**: what a completion needs before it counts. The lowest level needs a person's verdict; the next, a review by a session on another model and vendor than the author's, never in the author's session; the highest, the acceptance checks alone. A definition starts at the lowest level and earns the next on a held-out suite, and an outcome event that reverts or rejects its work lowers it [[119]](#ref-119), [[125]](#ref-125). The scenarios that grade a definition are withheld from the sessions that claim its tasks and visible to the evaluator role alone, because a readable test is a target [[122]](#ref-122). The evaluator is tuned on its own, apart from the sessions whose work it grades, because a model asked to judge its own work shares its blind spots [[134]](#ref-134). Only the acceptance checks can be cheap, run often, and be hard to fake, and the level can rise only as far as they reach [[124]](#ref-124).
 
 ## The loop and its gates
 
@@ -996,7 +997,7 @@ The physics that is real is throughput. Every resource class is limited by capac
 - **A vendor's API** is someone else's accelerator pool. Money buys a higher rate limit or reserved throughput, but not more capacity than the vendor has. At peak the vendor throttles, queues, or quietly serves a cheaper variant ([§11](#11-evaluating-change)). The institution's rate limit is a shared pool of its own: one principal's burst can use up everyone's quota.
 - **A self-hosted pool** puts the queue in the institution's hands, at a fixed capacity it cannot buy more of at short notice.
 
-One currency cannot express a fair share of a pool at peak. So the perimeter sets two limits on each resource class, per domain and per principal:
+One currency cannot express a fair share of a pool at peak. So the perimeter sets five limits, per domain and per principal:
 
 | Limit | Unit | Protects against |
 |---|---|---|
@@ -1360,7 +1361,7 @@ policy_context: [pol-L1-007]  # policy in force when written
 
 ```
 search(query, domain?, filters?)   → [{id, title, summary, meta, snippet}]
-get(id | id#anchor)                → {body, related: [{id, summary, p}]}
+get(id | id#anchor | id@version)   → {body, related: [{id, summary, p}]}
 recall(question, domain?, context_tokens?, answer_kind?)   # fact | list | overview
                                    → {brief, citations: [id], summaries}   # deputy model, caller's filter
 write(entry)                       → {id}    # historian append, screened before indexing; fast lane for handoffs
@@ -1428,13 +1429,13 @@ An excerpt carries its turn's classification and is demoted, exported, or erased
 | Documentation, wikis | Interface summaries |
 | Rosters, versions | Facts with short review dates |
 
-**Order of work.** Domains first, with current owners registered. Then one verified interface summary per domain, so every area can answer "what is this and where do I look". Pilot on two or three deliberately different domains, show that memory pays on each ([§11](#11-evaluating-change)), then fan out. One pilot is high-volume, measurable work with a small blast radius, a ticket queue or code review, where years of human outcomes give the evaluator its baseline [[120]](#ref-120), [[131]](#ref-131). The evaluation suites are the institution's own from the first pilot, because whoever owns the evaluations decides which models may be used [[119]](#ref-119).
+**Order of work.** Domains first, with current owners registered. Then the seats each domain's people already recognise, written by the domain's owner from the ownership map the code reviews yield, each a reviewed write ([§8](#seats)). Then one verified interface summary per domain, so every area can answer "what is this and where do I look". Pilot on two or three deliberately different domains, show that memory pays on each ([§11](#11-evaluating-change)), then fan out. One pilot is high-volume, measurable work with a small blast radius, a ticket queue or code review, where years of human outcomes give the evaluator its baseline [[120]](#ref-120), [[131]](#ref-131). The evaluation suites are the institution's own from the first pilot, because whoever owns the evaluations decides which models may be used [[119]](#ref-119).
 
 **Repository knowledge and shared memory.** Facts that must change with a code commit belong in the repository. Decisions, rationale, and lessons that span commits or repositories belong in shared memory. Repository instruction files have owners and history, but none of this system's trust labels, access checks, or review gates.
 
 For contributors or tools that cannot call the service, a curator may generate a small instruction stub containing pointers from the domain's T0 slice. It is marked as generated, with a content digest in a published list. Fleet harnesses use the service directly. A hand-edited stub is rejected in review or proposed back as a raw entry.
 
-A foreign harness that loads instruction files needs a load-time hook to check the published list and reject altered or stale stubs. Without that hook, the fleet's enforcement guarantees do not extend to it. Skills served through the tool protocol load only as verified bundles; changing their digest revokes approval. A skill is found the way a tool is: the task definition declares the ones its work needs, and a search over the rest serves others on demand, once their owner has enabled them. Repository copies of those skills are generated pointers to the approved bundles. An instruction file in the workspace that the service did not generate is read as raw.
+A foreign harness that loads instruction files needs a load-time hook to check the published list and reject altered or stale stubs. Without that hook, the fleet's enforcement guarantees do not extend to it. A **skill**, a packaged set of instructions and scripts for one kind of work, is served through the tool protocol ([§6](#one-server-per-session)) and loads only as a verified bundle; changing its digest revokes approval. A skill is served the way a tool is: the task definition declares the skills its work may use, the few it always needs load at boot, and the rest arrive by search when the work calls for one, once their owner has enabled them. Repository copies of those skills are generated pointers to the approved bundles. An instruction file in the workspace that the service did not generate is read as raw.
 
 **Leaving the system.** `export(domain, max_label)` is a read under the caller's filter: entries at or below the label, with provenance, classification, and supersession. The bundle carries the highest label inside it and goes only to a destination whose ceiling allows that label. Import is the mirror: entries land raw, keep their classification or take the receiving domain's higher default, and are keyed on origin so a second import creates nothing. A personal domain moving between its owner's homes keeps its tiers; everything else earns them again.
 
@@ -1530,19 +1531,19 @@ The historian is the ledger's authoritative store. The current task table is a p
 ### Approvals
 
 - An approval is an event: the human principal, the action, the version of what was approved, its scope, and an expiry. The perimeter checks it when the action runs and refuses an action whose version differs.
-- An approval given by an agent, relayed by an agent, or given for a set of actions has no force.
+- An approval event given by an agent, relayed by an agent, or given for a set of actions has no force.
 - A change that leaves the fleet is opened under the human principal in the task's chain, so the author and the approver of a change differ by identity.
 - A raise of a spend or throughput share is an approval event.
 
 ### Seats and landing
 
 - A pin names a seat. A seat with no live session wakes one when a pinned task is admitted. A retired seat's pinned tasks return to matching.
-- A session on a model other than the seat's own writes to the task chain and never to the seat's history or commitments.
+- A session under an agent definition other than the one the seat's charter names writes to the task chain and never to the seat's history or commitments.
 - A destination that many tasks end in is a queue with a throughput share. A change is blocked on the queue until it lands; a person's change is ordered ahead of the fleet's; claim-to-landed time is recorded on the task.
 
 ### Delegation
 
-- A helper runs a verified definition the parent selects, never one the parent writes, with a manifest no wider than the parent's. It fills the parent's seat and writes nothing to the seat's history.
+- A helper runs a verified definition the parent selects, never one the parent writes, with a manifest no wider than the parent's. It works under the parent's seat and writes nothing to the seat's history.
 - Its label starts at the parent's and flows back up, and its reads join the parent's read set, so delegation cannot launder a read.
 - Spawning a helper is a `create_task` and a `claim` in one step.
 - A child whose requirements fit inside the parent's manifest inherits the parent's admission. One that needs more is filed through the orchestrator.
@@ -1612,7 +1613,7 @@ When the ledger is down, the historian still accepts appends: handoffs and heart
 | Verification is the bottleneck, or is gamed | An autonomy level per task definition earned on held-out suites; scenarios withheld from claimants; an evaluator tuned apart from the generator, on another model ([§10](#10-evolving-the-system)) |
 | A relayed or bundled approval | An approval is an event naming principal, action, version, scope, and expiry; relayed and bundled approvals have no force ([§8](#decomposition), [Appendix C](#appendix-c-ledger-semantics)) |
 | A seat becomes a bottleneck or a single point of loss | Pins name seats; a seat with no occupant wakes one; retirement returns commitments to the ledger; pinned tasks and seat queue depth measured ([§8](#seats), [§9](#9-measurement)) |
-| A session re-derives who it is on every start | Seats hold standing orders, scope, authority, commitments, and history; a session boots into one ([§8](#seats)) |
+| A session re-derives who it is on every start | Seats hold a charter, scope, authority, commitments, and history; a session may boot into one ([§8](#seats)) |
 | Institution keeps a person's memory | Personal domain under the owner's grants; views dropped with receipts ([§12](#12-surviving-long-timescales)) |
 | A contributed component's authors leave | Ownership test: on-path components are institution-operated ([§12](#12-surviving-long-timescales)) |
 
@@ -1700,6 +1701,7 @@ Replay quantifies confirmed drift. Then the model is pinned or failed over, and 
 | **`dom-platform`** | The domain that holds the system's own configuration ([§10](#10-evolving-the-system)) |
 | **Domain** | An area of work with an owner; memory, tasks, policy, and access are organised by it ([§2](#2-the-design-at-a-glance)) |
 | **Exception** | A scoped, expiring, approved permission to breach a policy ([§7](#7-the-policy-stack)) |
+| **Evaluator** | The role that holds the withheld scenarios and grades completions, tuned apart from the sessions it grades ([§9](#9-measurement), [§10](#10-evolving-the-system)) |
 | **Fence** | A refusal the agent is told about, with its rule, reason, and remedy; the perimeter holds whether or not the agent heeds it ([§4](#4-trust-and-handling)) |
 | **Fencing token** | An increasing claim generation carried with mutations so destinations can reject old claims ([§8](#8-coordination), [Appendix C](#appendix-c-ledger-semantics)) |
 | **Golden suite** | A domain's fixed set of queries with known answers, run on every change ([§9](#9-measurement)) |
@@ -1712,11 +1714,13 @@ Replay quantifies confirmed drift. Then the model is pinned or failed over, and 
 | **L0 to L3** | The layers of written policy: values, strategy, practice, domain conventions ([§7](#7-the-policy-stack)) |
 | **Manifest** | What an agent's verified harness says it can do, presented when it claims work ([§8](#8-coordination)) |
 | **Operational unit** | A team of people and agents accountable for a continuing area of work, served by one or more domains ([§8](#8-coordination)) |
+| **Principal chain** | The person, the seat, the session and each hop between, carried inside a call and evaluated by every grant ([§6](#one-server-per-session)) |
 | **Principal** | A person or agent identity that holds grants |
 | **Recovery bundle** | Record and historian snapshots, checkpoints, and configuration needed to rebuild the serving layer ([§12](#12-surviving-long-timescales)) |
 | **Registry** | The data mapping organisational units to the domains they own ([§12](#12-surviving-long-timescales)) |
 | **Rubric** | Task-scoring weights compiled from written strategy ([§7](#7-the-policy-stack)) |
-| **Seat** | The record for a standing role: standing orders, scope, authority envelope, open commitments, history, and handoff cache; a session boots into one ([§8](#8-coordination)) |
+| **Seat** | The record for a standing role: charter, scope, authority envelope, open commitments, history, and handoff cache; a session may boot into one, and most tasks need none ([§8](#8-coordination)) |
+| **Skill** | A packaged set of instructions and scripts for one kind of work, served through the tool protocol as a verified bundle ([Appendix B](#appendix-b-seeding)) |
 | **Steward** | Whoever answers for a domain: its owner ([§5](#5-the-curator)) |
 | **T0** | The small index every agent loads at start: goals, active tasks, standing decisions, pointers ([§3](#3-memory)) |
 | **Tap** | A two-way connector between an outside system and the ledger ([§8](#8-coordination)) |
