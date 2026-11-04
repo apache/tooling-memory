@@ -82,7 +82,7 @@ In the background, curators keep the memory tidy, auditors check the curators, a
 | **[Retrieval service](#6-retrieval-and-serving)** | Agents cannot hold the whole corpus, and every read must be checked the same way | Answers searches, summaries first, through one permission filter ([§6](#6-retrieval-and-serving)) |
 | **[Perimeter](#access-control)** | Models can be wrong or manipulated, so some limits must hold regardless | Enforces access, labels, spend, and irreversibility on every call ([§4](#4-trust-and-handling), [§6](#6-retrieval-and-serving)) |
 | **[Task ledger](#a-tasks-life)** | Work needs a shared account of ownership, dependencies, and outcomes | Holds each domain's tasks, with leased claims and handoff notes ([§8](#8-coordination)) |
-| **[Seats](#seats)** | A session that starts from nothing works out on every start who is asking, what is in scope, and what it owes | Hold a standing role's orders, scope, authority, commitments, and history, so a session boots into them ([§8](#8-coordination)) |
+| **[Seats](#seats)** | A session that starts from nothing works out on every start who is asking, what is in scope, and what it owes | Hold a standing role's charter, scope, authority, commitments, and history, which a session may boot into ([§8](#8-coordination)) |
 
 **Who does the work**
 
@@ -149,7 +149,7 @@ Each entry is a Markdown file. Its frontmatter, the metadata block at the top, s
 
 ```yaml
 id: mem-a-0847                # stable, permanent, meaningless
-type: decision                # or fact, convention, method, handoff, seat
+type: decision                # or fact, convention, method, handoff, policy, seat
 domain: dom-a
 author: agent:worker-3 (model: <model-id>)
 trust_tier: curated           # raw, curated, or verified (§4)
@@ -722,7 +722,7 @@ A session that boots into a seat takes the seat's T0 slice, presents the manifes
 
 Two rules follow. **Secondment**: a session under an agent definition other than the one the charter names, a substitute model for instance, may read the seat's memory and write to the task chain, and may not write the seat's history or commitments, because those are what the next occupant will trust. **Retirement**: a seat is retired by its owner through the review gate; its open commitments return to the ledger for matching, and its history stays in the record under its identifier. When a task pinned to a seat with no live session is admitted, the service starts a session in the seat, so a pin names a role and never a process.
 
-**Where seats come from.** An empty system has none and needs none: a session with no seat is the default, and work runs on task definitions alone until a seat earns its place. Seats enter by three routes. The platform's standing roles, the curator, the auditors, and the orchestrator ([§2](#roles-and-why-each-exists)), are seats that `dom-platform` creates in its own memory when a domain is registered, one set per domain, with charters fixed by policy. At seeding ([Appendix B](#appendix-b-seeding)) a domain's owner writes the seats its people already recognise, a subsystem's reviewer or the holder of an outside relationship, from the ownership map the code reviews yield; a seat's authority fields are verified entries, so each is a reviewed write by a person. After that, a curator proposes a seat when the ledger shows the need: tasks pinned to one seat for the same reason, a tap that expects one identity, commitments that outlive the tasks that made them; the domain's owner approves it through the review gate. A seat that holds no commitment and claims no task over a review period goes to its owner for retirement, as an unused rule does ([§7](#7-the-policy-stack)).
+**Where seats come from.** An empty system has none and needs none: a session with no seat is the default, and work runs on task definitions alone until a seat earns its place. Seats enter by three routes. The platform's standing roles, the curator, the auditors, the evaluator, and the orchestrator ([§2](#roles-and-why-each-exists)), are seats that `dom-platform` creates in its own memory when a domain is registered, one set per domain, with charters fixed by policy. At seeding ([Appendix B](#appendix-b-seeding)) a domain's owner writes the seats its people already recognise, a subsystem's reviewer or the holder of an outside relationship, from the ownership map the code reviews yield; a seat's authority fields are verified entries, so each is a reviewed write by a person. After that, a curator proposes a seat when the ledger shows the need: tasks pinned to one seat for the same reason, a tap that expects one identity, commitments that outlive the tasks that made them; the domain's owner approves it through the review gate. A seat that holds no commitment and claims no task over a review period goes to its owner for retirement, as an unused rule does ([§7](#7-the-policy-stack)).
 
 The lower bound is a session with no seat: a task definition, a T0 slice, and a policy row. It fits high-volume, low-variety work whose outcome is measured, where an occupant with a history would add cost and no judgment; Yegge's Counting House is this bound, a pool of stateless clerks for whom the house remembers [[119]](#ref-119).
 
@@ -1342,7 +1342,7 @@ Signatures are indicative. Schemas: entries below, policies in [§7](#7-the-poli
 
 ```yaml
 id: mem-a-0847                # stable, permanent, meaningless
-type: decision | fact | convention | method | handoff | seat
+type: decision | fact | convention | method | handoff | policy | seat
 domain: dom-a                 # a permanent ID, never a team name
 author: agent:worker-3 (model: <model-id>) | human:<authority>,<date>:<user-id>   # §12
 created: <timestamp>
@@ -1692,6 +1692,7 @@ Replay quantifies confirmed drift. Then the model is pinned or failed over, and 
 
 | Term | Meaning |
 |---|---|
+| **Agent definition** | The readable record in `dom-platform` for one kind of agent, written by a person or from a person's intent; it fixes the manifest the agent presents ([§10](#10-evolving-the-system)) |
 | **Approval event** | A person's recorded approval of one action at one version, with scope and expiry; the perimeter checks it when the action runs ([§8](#8-coordination)) |
 | **Autonomy level** | What a task definition's completions need before they count: a person's verdict, an independent review, or the acceptance checks alone; earned on held-out suites ([§10](#10-evolving-the-system)) |
 | **BM25** | A method for ranking documents by how well their words match a query ([§6](#6-retrieval-and-serving)) |
@@ -1701,12 +1702,14 @@ Replay quantifies confirmed drift. Then the model is pinned or failed over, and 
 | **`dom-platform`** | The domain that holds the system's own configuration ([§10](#10-evolving-the-system)) |
 | **Domain** | An area of work with an owner; memory, tasks, policy, and access are organised by it ([§2](#2-the-design-at-a-glance)) |
 | **Exception** | A scoped, expiring, approved permission to breach a policy ([§7](#7-the-policy-stack)) |
+| **Charter** | A seat's standing orders, the kinds of task it covers, and the agent definition that fills it by default ([§8](#seats)) |
 | **Evaluator** | The role that holds the withheld scenarios and grades completions, tuned apart from the sessions it grades ([§9](#9-measurement), [§10](#10-evolving-the-system)) |
 | **Fence** | A refusal the agent is told about, with its rule, reason, and remedy; the perimeter holds whether or not the agent heeds it ([§4](#4-trust-and-handling)) |
 | **Fencing token** | An increasing claim generation carried with mutations so destinations can reject old claims ([§8](#8-coordination), [Appendix C](#appendix-c-ledger-semantics)) |
 | **Golden suite** | A domain's fixed set of queries with known answers, run on every change ([§9](#9-measurement)) |
 | **Guard** | Whoever policy names to approve moving content to a lower label ([§4](#4-trust-and-handling)) |
 | **Handoff** | The note an agent writes when it stops, so the next one can carry on ([§8](#8-coordination)) |
+| **Handoff cache** | The latest handoffs of the sessions that filled a seat, read first by the next occupant ([§8](#seats)) |
 | **Harness** | The program that runs a model as an agent: its prompts, tools, and settings ([§10](#10-evolving-the-system)) |
 | **Historian** | The ordered log of every event; lineage is a query over it ([§3](#3-memory)) |
 | **Horizon scanner** | The person in an operational unit who watches outside the fleet and proposes changes of direction ([§7](#7-the-policy-stack)) |
