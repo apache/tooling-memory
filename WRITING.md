@@ -60,9 +60,10 @@ a link to the section that defines it.
 running text. Every `§n` and every "Appendix X" is inside a link that resolves.
 
 **A diagram stays when an example in prose walks through it.** The paper went from
-fourteen diagrams to seven, and each one left tells one story: the system at a glance, a
-handoff through the write path, a label crossing, a task's life, one task with three
-claimants, the agent's life, the improvement loop.
+fourteen diagrams to seven in October 2026, and has nine now. Each one tells one story: the
+system at a glance, a handoff through the write path, a label crossing, the curation loop,
+one server per session, a task's life, one task with three claimants, the agent's life, the
+improvement loop.
 
 ## Sentences
 
