@@ -1702,8 +1702,8 @@ Replay quantifies confirmed drift. Then the model is pinned or failed over, and 
 | **Distil** | Turn raw material (threads, transcripts, trajectories) into curated entries or methods ([§5](#5-the-curator), [§10](#10-evolving-the-system), [Appendix B](#appendix-b-seeding)) |
 | **`dom-platform`** | The domain that holds the system's own configuration ([§10](#10-evolving-the-system)) |
 | **Domain** | An area of work with an owner; memory, tasks, policy, and access are organised by it ([§2](#2-the-design-at-a-glance)) |
-| **Exception** | A scoped, expiring, approved permission to breach a policy ([§7](#7-the-policy-stack)) |
 | **Evaluator** | The role that holds the withheld scenarios and grades completions, tuned apart from the sessions it grades ([§9](#9-measurement), [§10](#10-evolving-the-system)) |
+| **Exception** | A scoped, expiring, approved permission to breach a policy ([§7](#7-the-policy-stack)) |
 | **Fence** | A refusal the agent is told about, with its rule, reason, and remedy; the perimeter holds whether or not the agent heeds it ([§4](#4-trust-and-handling)) |
 | **Fencing token** | An increasing claim generation carried with mutations so destinations can reject old claims ([§8](#8-coordination), [Appendix C](#appendix-c-ledger-semantics)) |
 | **Golden suite** | A domain's fixed set of queries with known answers, run on every change ([§9](#9-measurement)) |
