@@ -11,7 +11,8 @@ pub const READER: &str = include_str!("../static/reader.html");
 pub const AMEM_JS: &str = include_str!("../static/amem.js");
 /// The board: tasks by status, each under the task it was filed from.
 pub const BOARD: &str = include_str!("../static/board.html");
-/// The design tokens every page links: docs/design-book.html holds the same values.
+/// The design tokens every page links: docs/design-book.html and docs/poster.html carry
+/// the same file whole.
 pub const TOKENS: &str = include_str!("../static/tokens.css");
 
 /// The reader's core, built from `crates/reader` by this crate's build script: the
@@ -122,12 +123,45 @@ mod tests {
     #[test]
     fn the_poster_inlines_the_tokens_and_components_whole() {
         // docs/poster.html draws the paper's design in the tokens' colours and type, and
-        // is opened from anywhere: a copy with nothing beside it must still render
+        // is opened from anywhere: a copy with nothing beside it must still render in them
         let poster = include_str!("../../../docs/poster.html");
-        assert!(
-            poster.contains(TOKENS),
-            "docs/poster.html must carry crates/web/static/tokens.css whole, as it is"
+        assert_eq!(
+            poster.matches(TOKENS).count(),
+            1,
+            "docs/poster.html must carry crates/web/static/tokens.css whole, once, as it is"
         );
+        let style = poster.find("<style>").expect("a style block");
+        let copy = poster.find(TOKENS).unwrap();
+        assert!(
+            style < copy && copy < poster.find("</style>").unwrap(),
+            "the tokens must be inside the poster's style block, not quoted elsewhere"
+        );
+        // beyond that copy, the page names no colour of its own, defines no token of its
+        // own, and fetches nothing
+        let rest = poster.replacen(TOKENS, "", 1);
+        assert!(!hex_colour(&rest), "the poster has a colour of its own");
+        let styles = rest
+            .split("<style>")
+            .skip(1)
+            .filter_map(|s| s.split("</style>").next());
+        let attributes = rest
+            .split("style=\"")
+            .skip(1)
+            .filter_map(|s| s.split('"').next());
+        for css in styles.chain(attributes) {
+            if let Some(f) = named_colour(css) {
+                panic!("the poster names a colour: {f}");
+            }
+        }
+        assert!(
+            !rest.contains("--am-") || !rest.split("--am-").skip(1).any(|s| {
+                s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).next().map_or(false, |_| s.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '-').starts_with(':'))
+            }),
+            "the poster defines a token of its own"
+        );
+        for fetch in ["<link", "src=\"", "src='", "@import"] {
+            assert!(!rest.contains(fetch), "the poster fetches something: {fetch}");
+        }
     }
 
     #[test]
