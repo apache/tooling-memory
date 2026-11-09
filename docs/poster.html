@@ -7,39 +7,690 @@
 <title>Durable memory on one page</title>
 <!--
   The poster for docs/durable-memory-for-disposable-agents.md: the design on one page.
-  It takes its colours and type from crates/web/static/tokens.css, as every amem page does,
-  and follows docs/design-book.html: one meaning per hue, so the only colour on the page is
+  Built by a script that is not part of the repository; the page is the artefact. It
+  follows docs/design-book.html: one meaning per hue, so the only colour on the page is
   where its meaning applies. Await (magenta) marks where a person decides; fail (red) marks
-  a call refused at the ceiling. Everything else is ink on paper. Trust tiers are drawn as
-  the book draws them, as ordered marks in ink. Open the file from a checkout; the
-  stylesheet is linked, not fetched from anywhere else.
+  a call refused over its destination's ceiling. Everything else is ink on paper. Trust
+  tiers are drawn as the book draws them, as ordered marks in ink. The style block below
+  opens with crates/web/static/tokens.css, whole, as the book does, so the page needs
+  nothing it does not carry; a test in crates/web holds the page to the file. Text inside
+  the drawing is set in the drawing's own units and scales with it; at the drawing's
+  minimum width the smallest text is the micro role's 12px.
 -->
-<link rel="stylesheet" href="../crates/web/static/tokens.css">
 <style>
+/* amem design tokens, and the components the pages are composed of.
+
+   docs/design-book.html inlines this whole file, because the book is one self-contained
+   page with nothing to fetch. The two change together, in the same commit: a token or a
+   component added, renamed or re-valued here and not there (or there and not here) is a
+   bug in both, and a test in crates/web says so.
+
+   Named for meaning, never appearance: --am-fail, not --am-red. Light is the default
+   under :root; dark is designed, not inverted, and applies when the system asks for it
+   unless the page says data-theme="light", or whenever the page says data-theme="dark".
+   data-contrast="more" forces what prefers-contrast: more asks for, and
+   data-contrast="normal" declines it. */
+
+:root {
+  color-scheme: light;
+
+  /* Type. Atkinson Hyperlegible Next and Mono (Braille Institute, SIL OFL 1.1), self-hosted
+     as woff2 when the binary embeds them; until then, and wherever they fail to load, the
+     system stacks after them are the design, not a degraded copy of it. */
+  --am-font-sans: "Atkinson Hyperlegible Next", system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
+  --am-font-mono: "Atkinson Hyperlegible Mono", ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  --am-text-title: 1.75rem;
+  --am-text-section: 1.25rem;
+  --am-text-sub: 1rem;
+  --am-text-body: 1rem;
+  --am-text-ui: 0.875rem;
+  --am-text-label: 0.8125rem;
+  --am-text-data: 0.8125rem;
+  --am-text-micro: 0.75rem;
+  --am-text-term: 0.875rem;
+  --am-leading-tight: 1.2;
+  --am-leading-ui: 1.45;
+  --am-leading-body: 1.6;
+  --am-leading-term: 1.2;
+  --am-weight-regular: 400;
+  --am-weight-strong: 600;
+  --am-measure: 68ch;
+
+  /* Space: a 4px step. Radii: two. Lines: one width, two in more contrast. */
+  --am-space-1: 0.25rem;
+  --am-space-2: 0.5rem;
+  --am-space-3: 0.75rem;
+  --am-space-4: 1rem;
+  --am-space-6: 1.5rem;
+  --am-space-8: 2rem;
+  --am-space-12: 3rem;
+  --am-space-16: 4rem;
+  --am-radius-sm: 4px;
+  --am-radius: 8px;
+  --am-line: 1px;
+  --am-focus-width: 2px;
+  --am-chip-edge: 40%;
+  --am-target: 24px;
+  --am-target-touch: 44px;
+
+  /* Motion. Zero unless the reader has said motion is welcome; see the block below. */
+  --am-dur-quick: 0ms;
+  --am-dur-move: 0ms;
+  --am-ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Neutrals: violet-biased, three levels, no shadows. */
+  --am-paper: #f6f5f9;
+  --am-surface: #ffffff;
+  --am-plate: #eeecf3;
+  --am-rule: #dedbe6;
+  --am-rule-soft: #ebe9f0;
+  --am-edge: #837e92;
+  --am-ink: #1a1824;
+  --am-body: #363343;
+  --am-muted: #605c6e;
+  /* Hues: one meaning each. Every value passes 4.5:1 as text on paper, surface, plate and its own tint. */
+  --am-accent: #4a3fc4;
+  --am-on-accent: #ffffff;
+  --am-accent-tint: #ecebfb;
+  --am-live: #09697f;
+  --am-live-tint: #e1f0f4;
+  --am-ok: #1a704d;
+  --am-ok-tint: #e3f1ea;
+  --am-warn: #875a00;
+  --am-warn-tint: #fbf0d6;
+  --am-await: #8d2a7e;
+  --am-await-tint: #f6e7f3;
+  --am-fail: #bd222b;
+  --am-fail-tint: #fce8e9;
+  --am-mark: #dcd8fb;
+  /* The terminal: the xterm theme. The six hues are ANSI's six colours. */
+  --am-term-bg: #faf9fd;
+  --am-term-fg: #24212f;
+  --am-term-cursor: #4a3fc4;
+  --am-term-cursor-accent: #faf9fd;
+  --am-term-selection: #d8d5f6;
+  --am-term-black: #24212f;
+  --am-term-red: #bd222b;
+  --am-term-green: #1a704d;
+  --am-term-yellow: #875a00;
+  --am-term-blue: #4a3fc4;
+  --am-term-magenta: #8d2a7e;
+  --am-term-cyan: #09697f;
+  --am-term-white: #57536a;
+  --am-term-bright-black: #65617a;
+  --am-term-bright-red: #a3141d;
+  --am-term-bright-green: #0f5d3d;
+  --am-term-bright-yellow: #6e4800;
+  --am-term-bright-blue: #352a9e;
+  --am-term-bright-magenta: #73196a;
+  --am-term-bright-cyan: #015466;
+  --am-term-bright-white: #706c84;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    /* Neutrals: violet-biased, three levels, no shadows. */
+    --am-paper: #121119;
+    --am-surface: #1a1923;
+    --am-plate: #23212e;
+    --am-rule: #353241;
+    --am-rule-soft: #292734;
+    --am-edge: #767188;
+    --am-ink: #f2f0f8;
+    --am-body: #d0ccdc;
+    --am-muted: #9e99ae;
+    /* Hues: one meaning each. Every value passes 4.5:1 as text on paper, surface, plate and its own tint. */
+    --am-accent: #a9a3ff;
+    --am-on-accent: #16141f;
+    --am-accent-tint: #2a2650;
+    --am-live: #4cc4dc;
+    --am-live-tint: #113039;
+    --am-ok: #5fcb9a;
+    --am-ok-tint: #143026;
+    --am-warn: #e8bd52;
+    --am-warn-tint: #332a10;
+    --am-await: #e590d7;
+    --am-await-tint: #371b33;
+    --am-fail: #ff7d86;
+    --am-fail-tint: #3d1b20;
+    --am-mark: #433d7a;
+    /* The terminal: the xterm theme. The six hues are ANSI's six colours. */
+    --am-term-bg: #14131c;
+    --am-term-fg: #e4e1ed;
+    --am-term-cursor: #a9a3ff;
+    --am-term-cursor-accent: #14131c;
+    --am-term-selection: #3b3666;
+    --am-term-black: #2d2a39;
+    --am-term-red: #ff7d86;
+    --am-term-green: #5fcb9a;
+    --am-term-yellow: #e8bd52;
+    --am-term-blue: #a9a3ff;
+    --am-term-magenta: #e590d7;
+    --am-term-cyan: #4cc4dc;
+    --am-term-white: #d0ccdc;
+    --am-term-bright-black: #8f8aa3;
+    --am-term-bright-red: #ffa3aa;
+    --am-term-bright-green: #8ee0b8;
+    --am-term-bright-yellow: #f6d685;
+    --am-term-bright-blue: #c9c5ff;
+    --am-term-bright-magenta: #f3b6ea;
+    --am-term-bright-cyan: #86dcec;
+    --am-term-bright-white: #ffffff;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  /* Neutrals: violet-biased, three levels, no shadows. */
+  --am-paper: #121119;
+  --am-surface: #1a1923;
+  --am-plate: #23212e;
+  --am-rule: #353241;
+  --am-rule-soft: #292734;
+  --am-edge: #767188;
+  --am-ink: #f2f0f8;
+  --am-body: #d0ccdc;
+  --am-muted: #9e99ae;
+  /* Hues: one meaning each. Every value passes 4.5:1 as text on paper, surface, plate and its own tint. */
+  --am-accent: #a9a3ff;
+  --am-on-accent: #16141f;
+  --am-accent-tint: #2a2650;
+  --am-live: #4cc4dc;
+  --am-live-tint: #113039;
+  --am-ok: #5fcb9a;
+  --am-ok-tint: #143026;
+  --am-warn: #e8bd52;
+  --am-warn-tint: #332a10;
+  --am-await: #e590d7;
+  --am-await-tint: #371b33;
+  --am-fail: #ff7d86;
+  --am-fail-tint: #3d1b20;
+  --am-mark: #433d7a;
+  /* The terminal: the xterm theme. The six hues are ANSI's six colours. */
+  --am-term-bg: #14131c;
+  --am-term-fg: #e4e1ed;
+  --am-term-cursor: #a9a3ff;
+  --am-term-cursor-accent: #14131c;
+  --am-term-selection: #3b3666;
+  --am-term-black: #2d2a39;
+  --am-term-red: #ff7d86;
+  --am-term-green: #5fcb9a;
+  --am-term-yellow: #e8bd52;
+  --am-term-blue: #a9a3ff;
+  --am-term-magenta: #e590d7;
+  --am-term-cyan: #4cc4dc;
+  --am-term-white: #d0ccdc;
+  --am-term-bright-black: #8f8aa3;
+  --am-term-bright-red: #ffa3aa;
+  --am-term-bright-green: #8ee0b8;
+  --am-term-bright-yellow: #f6d685;
+  --am-term-bright-blue: #c9c5ff;
+  --am-term-bright-magenta: #f3b6ea;
+  --am-term-bright-cyan: #86dcec;
+  --am-term-bright-white: #ffffff;
+}
+
+/* Motion is the enhancement and stillness the default, so the durations are set only
+   where the reader has not asked for reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  :root {
+    --am-dur-quick: 120ms;
+    --am-dur-move: 200ms;
+  }
+}
+
+/* More contrast: secondary text becomes body text, every rule becomes a boundary, lines
+   thicken, and chips drop their tints for a solid edge. Each value is a reference, so it
+   holds in both themes. The selector outranks the theme blocks above. */
+@media (prefers-contrast: more) {
+  :root:not([data-contrast="normal"]) {
+    --am-muted: var(--am-body);
+    --am-rule: var(--am-edge);
+    --am-rule-soft: var(--am-edge);
+    --am-line: 2px;
+    --am-focus-width: 3px;
+    --am-chip-edge: 100%;
+    --am-accent-tint: var(--am-surface);
+    --am-live-tint: var(--am-surface);
+    --am-ok-tint: var(--am-surface);
+    --am-warn-tint: var(--am-surface);
+    --am-await-tint: var(--am-surface);
+    --am-fail-tint: var(--am-surface);
+  }
+}
+
+:root[data-contrast="more"] {
+  --am-muted: var(--am-body);
+  --am-rule: var(--am-edge);
+  --am-rule-soft: var(--am-edge);
+  --am-line: 2px;
+  --am-focus-width: 3px;
+  --am-chip-edge: 100%;
+  --am-accent-tint: var(--am-surface);
+  --am-live-tint: var(--am-surface);
+  --am-ok-tint: var(--am-surface);
+  --am-warn-tint: var(--am-surface);
+  --am-await-tint: var(--am-surface);
+  --am-fail-tint: var(--am-surface);
+}
+
+/* ======================================================================
+   Components. Prefixed am- because they are the product's: the widgets of the
+   book's chapter 13 and what they are built from. Every value is a token.
+   ====================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+.am-glyph { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
+
+/* the chip: glyph, count, word. An exception, never a fact */
+.am-chip {
+  --hue: var(--am-ink);
+  --tint: transparent;
+  display: inline-flex; align-items: center; gap: 0.3em;
+  font: var(--am-weight-strong) var(--am-text-micro)/1 var(--am-font-sans);
+  color: var(--hue); background: var(--tint);
+  border: var(--am-line) solid color-mix(in srgb, var(--hue) var(--am-chip-edge), transparent);
+  border-radius: var(--am-radius-sm);
+  padding: 0.3em 0.5em; white-space: nowrap; flex: none;
+}
+.am-chip .am-glyph { width: 12px; height: 12px; }
+.am-chip-count { font-variant-numeric: tabular-nums; font-weight: 700; }
+.am-chip--live  { --hue: var(--am-live);  --tint: var(--am-live-tint); }
+.am-chip--ok    { --hue: var(--am-ok);    --tint: var(--am-ok-tint); }
+.am-chip--warn  { --hue: var(--am-warn);  --tint: var(--am-warn-tint); }
+.am-chip--await { --hue: var(--am-await); --tint: var(--am-await-tint); }
+.am-chip--fail  { --hue: var(--am-fail);  --tint: var(--am-fail-tint); }
+.am-chip--ink   { --hue: var(--am-body);  border-color: var(--am-edge); }
+.am-chip--provisional { border-style: dashed; border-color: var(--hue); background: transparent; }
+.is-narrow .am-chip-word {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+/* more contrast brings every clipped word back */
+@media (prefers-contrast: more) {
+  :root:not([data-contrast="normal"]) .is-narrow .am-chip-word { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+}
+:root[data-contrast="more"] .is-narrow .am-chip-word { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+
+/* a state glyph in a gutter: every row has one, so it is not a chip */
+.am-state { display: inline-grid; place-items: center; width: 20px; height: 20px; flex: none; }
+.am-state .am-glyph { width: 16px; height: 16px; }
+.am-state--live { color: var(--am-live); }
+.am-state--ok { color: var(--am-ok); }
+.am-state--warn { color: var(--am-warn); }
+.am-state--await { color: var(--am-await); }
+.am-state--fail { color: var(--am-fail); }
+.am-state--ink { color: var(--am-muted); }
+
+/* label and trust marks: facts, drawn as orders, in ink */
+.am-fact { display: inline-flex; align-items: center; gap: 0.35em; color: var(--am-body); white-space: nowrap; }
+.am-fact .am-glyph { width: 14px; height: 14px; color: var(--am-ink); }
+
+/* buttons: four roles */
+.am-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.4em;
+  font: var(--am-weight-strong) var(--am-text-ui)/1 var(--am-font-sans);
+  min-height: 2.25rem; padding: 0 0.95em;
+  border-radius: var(--am-radius-sm); border: var(--am-line) solid transparent;
+  cursor: pointer; text-decoration: none; white-space: nowrap;
+  transition: background-color var(--am-dur-quick) ease-out, border-color var(--am-dur-quick) ease-out;
+}
+.am-btn .am-glyph { width: 15px; height: 15px; }
+.am-btn--primary { background: var(--am-accent); color: var(--am-on-accent); }
+.am-btn--primary:hover { background: color-mix(in srgb, var(--am-accent) 88%, var(--am-ink)); }
+.am-btn--secondary { background: var(--am-surface); color: var(--am-ink); border-color: var(--am-edge); }
+.am-btn--secondary:hover { background: var(--am-plate); }
+.am-btn--quiet { background: transparent; color: var(--am-accent); padding-inline: 0.4em; }
+.am-btn--quiet:hover { background: var(--am-accent-tint); }
+.am-btn--danger { background: var(--am-surface); color: var(--am-fail); border-color: var(--am-fail); }
+.am-btn[disabled], .am-btn[aria-disabled="true"] { cursor: not-allowed; background: var(--am-plate); color: var(--am-muted); border-color: var(--am-rule); }
+.am-btn--icon { width: 2.25rem; padding: 0; }
+
+:focus-visible { outline: var(--am-focus-width) solid var(--am-accent); outline-offset: 2px; }
+
+/* forms */
+.am-field { display: grid; gap: var(--am-space-1); min-width: 0; align-content: start; }
+.am-field > .am-seg { justify-self: start; }
+.am-field > label, .am-legend {
+  font: var(--am-weight-strong) var(--am-text-label)/1.3 var(--am-font-sans); color: var(--am-ink);
+}
+.am-hint { font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+.am-err { font: var(--am-weight-strong) var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-fail); display: flex; gap: 0.3em; align-items: center; }
+.am-ctrl {
+  font: var(--am-text-ui)/1.3 var(--am-font-sans); color: var(--am-ink);
+  background: var(--am-surface); border: var(--am-line) solid var(--am-edge);
+  border-radius: var(--am-radius-sm); min-height: 2.25rem; padding: 0.45rem 0.6rem; width: 100%; min-width: 0;
+}
+.am-ctrl:focus-visible { outline-offset: 0; border-color: var(--am-accent); }
+.am-ctrl[aria-invalid="true"] { border-color: var(--am-fail); box-shadow: inset 0 0 0 1px var(--am-fail); }
+.am-ctrl[disabled] { background: var(--am-plate); color: var(--am-muted); border-color: var(--am-rule); }
+textarea.am-ctrl { min-height: 4.5rem; resize: vertical; line-height: 1.45; }
+select.am-ctrl { appearance: none; padding-right: 2rem;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(-45deg, transparent 50%, currentColor 50%);
+  background-position: right 0.95rem center, right 0.65rem center; background-size: 0.3rem 0.3rem; background-repeat: no-repeat; }
+.am-ctrl.is-mono, .am-mono { font-family: var(--am-font-mono); }
+
+.am-seg { display: inline-flex; border: var(--am-line) solid var(--am-edge); border-radius: var(--am-radius-sm); overflow: hidden; background: var(--am-surface); max-width: 100%; }
+.am-seg label { position: relative; display: block; }
+.am-seg input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.am-seg span {
+  display: flex; align-items: center; min-height: calc(2.25rem - 2 * var(--am-line)); padding: 0 0.8em;
+  font: var(--am-text-ui)/1 var(--am-font-sans); color: var(--am-body); border-left: var(--am-line) solid var(--am-rule);
+}
+.am-seg label:first-child span { border-left: 0; }
+.am-seg input:checked + span { background: var(--am-accent-tint); color: var(--am-accent); font-weight: var(--am-weight-strong); box-shadow: inset 0 -2px 0 var(--am-accent); }
+.am-seg input:focus-visible + span { outline: var(--am-focus-width) solid var(--am-accent); outline-offset: -3px; }
+
+.am-check { display: inline-flex; align-items: center; gap: 0.5em; font: var(--am-text-ui)/1.3 var(--am-font-sans); color: var(--am-ink); cursor: pointer; min-height: var(--am-target); }
+.am-check input { width: 1.05rem; height: 1.05rem; margin: 0; accent-color: var(--am-accent); }
+
+/* the launch form */
+.am-launch { display: grid; align-items: start; gap: var(--am-space-4); grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.am-launch > * { grid-column: span 6; }
+.am-launch .c2 { grid-column: span 2; }
+.am-launch .c3 { grid-column: span 3; }
+.am-launch-foot { display: flex; align-items: center; gap: var(--am-space-3); flex-wrap: wrap; }
+
+/* the command preview: the form, said as a command. Not syntax-coloured: hues are states */
+.am-cmd {
+  display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--am-space-2);
+  background: var(--am-plate); border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius-sm);
+  padding: var(--am-space-2) var(--am-space-2) var(--am-space-2) var(--am-space-3);
+}
+.am-cmd code { flex: 1 1 16rem; min-width: 0; font: var(--am-text-data)/1.6 var(--am-font-mono); color: var(--am-ink); overflow-wrap: break-word; white-space: pre-wrap; padding-top: 0.3rem; }
+.am-cmd .f { color: var(--am-muted); }
+.am-cmd .p { color: var(--am-muted); user-select: none; }
+.am-cmd .am-btn { min-height: 1.9rem; }
+
+/* session list */
+.am-list { border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); overflow: hidden; }
+.am-srow {
+  display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; column-gap: var(--am-space-3); row-gap: 2px;
+  align-items: center; padding: var(--am-space-3) var(--am-space-4);
+  border-top: var(--am-line) solid var(--am-rule-soft); text-decoration: none; color: inherit;
+}
+.am-srow:first-child { border-top: 0; }
+.am-srow:hover { background: var(--am-plate); }
+.am-srow .am-state { grid-row: 1; }
+.am-srow-title { font: var(--am-weight-strong) var(--am-text-ui)/1.35 var(--am-font-sans); color: var(--am-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.am-srow:hover .am-srow-title, .am-srow:focus-visible .am-srow-title { text-decoration: underline; text-underline-offset: 0.15em; }
+.am-srow-meta { grid-column: 2; font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+.am-srow-chips { grid-column: 3; grid-row: 1 / span 2; display: flex; gap: var(--am-space-1); justify-content: flex-end; flex-wrap: wrap; }
+.am-time { font-variant-numeric: tabular-nums; }
+
+/* the status strip: what crosses the line, on the frame's top edge */
+.am-strip {
+  display: flex;
+  background: var(--am-surface); border-bottom: var(--am-line) solid var(--am-rule);
+}
+.am-strip-cell { flex: 0 0 auto; padding: var(--am-space-2) var(--am-space-4); white-space: nowrap; border-left: var(--am-line) solid var(--am-rule-soft); min-width: 0; }
+.am-strip-cell:first-child { border-left: 0; }
+.am-strip-cell--ceiling { flex: 0 1 auto; }
+.am-strip-cell--ceiling .am-strip-v { white-space: nowrap; }
+.am-strip-k { display: block; font: var(--am-text-micro)/1.3 var(--am-font-sans); color: var(--am-muted); }
+.am-strip-v { display: flex; flex-wrap: wrap; align-items: center; gap: var(--am-space-1) var(--am-space-2); font: var(--am-weight-strong) var(--am-text-ui)/1.5 var(--am-font-sans); color: var(--am-ink); font-variant-numeric: tabular-nums; }
+.am-strip-v .am-sub { font-weight: var(--am-weight-regular); color: var(--am-body); }
+
+/* the session frame: bar, strip, terminal well, reading pane */
+.am-frame { border: var(--am-line) solid var(--am-edge); border-radius: var(--am-radius); overflow: hidden; background: var(--am-surface); }
+.am-bar { display: flex; align-items: center; gap: var(--am-space-3); padding: var(--am-space-2) var(--am-space-4); background: var(--am-plate); border-bottom: var(--am-line) solid var(--am-rule); min-width: 0; }
+.am-bar-home { font: 700 var(--am-text-ui)/1 var(--am-font-mono); color: var(--am-accent); text-decoration: none; }
+.am-bar-title { font: var(--am-weight-strong) var(--am-text-ui)/1.3 var(--am-font-sans); color: var(--am-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.am-split { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); min-height: 22rem; }
+.am-term {
+  background: var(--am-term-bg); color: var(--am-term-fg);
+  font: var(--am-text-term)/var(--am-leading-term) var(--am-font-mono);
+  padding: var(--am-space-3) var(--am-space-4); margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;
+}
+.am-term .k0 { color: var(--am-term-black); } .am-term .k1 { color: var(--am-term-red); } .am-term .k2 { color: var(--am-term-green); }
+.am-term .k3 { color: var(--am-term-yellow); } .am-term .k4 { color: var(--am-term-blue); } .am-term .k5 { color: var(--am-term-magenta); }
+.am-term .k6 { color: var(--am-term-cyan); } .am-term .k7 { color: var(--am-term-white); } .am-term .k8 { color: var(--am-term-bright-black); }
+.am-term .k9 { color: var(--am-term-bright-red); } .am-term .k10 { color: var(--am-term-bright-green); } .am-term .k11 { color: var(--am-term-bright-yellow); }
+.am-term .k12 { color: var(--am-term-bright-blue); } .am-term .k13 { color: var(--am-term-bright-magenta); } .am-term .k14 { color: var(--am-term-bright-cyan); }
+.am-term .k15 { color: var(--am-term-bright-white); }
+.am-term .b { font-weight: 700; }
+.am-term .sel { background: var(--am-term-selection); }
+.am-term .cur { background: var(--am-term-cursor); color: var(--am-term-cursor-accent); }
+.am-term .lnk { text-decoration: underline; text-underline-offset: 0.15em; }
+.am-pane { border-left: var(--am-line) solid var(--am-rule); background: var(--am-surface); display: flex; flex-direction: column; min-width: 0; }
+.am-pane-head { display: flex; align-items: center; gap: var(--am-space-2); padding: var(--am-space-2) var(--am-space-4); border-bottom: var(--am-line) solid var(--am-rule-soft); font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+.am-pane-body { padding: var(--am-space-4); overflow: auto; flex: 1; }
+.am-recent { border-top: var(--am-line) solid var(--am-rule-soft); padding: var(--am-space-2) var(--am-space-4); display: grid; gap: 0; font: var(--am-text-micro)/1.5 var(--am-font-sans); }
+.am-recent a { display: block; min-height: var(--am-target); line-height: var(--am-target); color: var(--am-accent); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.am-recent a:hover { text-decoration: underline; }
+.am-recent .is-open { color: var(--am-ink); font-weight: var(--am-weight-strong); }
+
+/* an entry, rendered: prose, at a measure */
+.am-entry-type { font: var(--am-text-micro)/1.3 var(--am-font-sans); color: var(--am-muted); }
+.am-entry h3, .am-entry-title { font: var(--am-weight-strong) var(--am-text-section)/1.25 var(--am-font-sans); color: var(--am-ink); margin: 0.15rem 0 var(--am-space-2); text-wrap: balance; }
+.am-entry-meta { display: flex; flex-wrap: wrap; gap: var(--am-space-1) var(--am-space-4); font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); margin-bottom: var(--am-space-4); padding-bottom: var(--am-space-3); border-bottom: var(--am-line) solid var(--am-rule-soft); }
+.am-id { font: var(--am-text-data)/1.4 var(--am-font-mono); color: var(--am-ink); }
+.am-prose { font: var(--am-text-body)/var(--am-leading-body) var(--am-font-sans); color: var(--am-body); max-width: var(--am-measure); }
+.am-prose p { margin: 0 0 0.85em; }
+.am-prose h4 { font: var(--am-weight-strong) var(--am-text-sub)/1.3 var(--am-font-sans); color: var(--am-ink); margin: 1.2em 0 0.4em; }
+.am-prose code { font: 0.875em var(--am-font-mono); background: var(--am-plate); color: var(--am-ink); padding: 0.05em 0.3em; border-radius: 3px; }
+.am-prose pre { background: var(--am-plate); border: var(--am-line) solid var(--am-rule-soft); border-radius: var(--am-radius-sm); padding: var(--am-space-3); overflow-x: auto; }
+.am-prose pre code { background: none; padding: 0; font-size: var(--am-text-data); line-height: 1.55; }
+.am-prose a { color: var(--am-accent); text-underline-offset: 0.15em; }
+.am-prose ul { padding-left: 1.2em; margin: 0 0 0.85em; }
+
+/* the doctor report */
+.am-doctor { display: grid; gap: var(--am-space-4); }
+.am-doctor-group h4 { font: var(--am-weight-strong) var(--am-text-sub)/1.3 var(--am-font-sans); color: var(--am-ink); margin: 0 0 var(--am-space-2); display: flex; gap: var(--am-space-2); align-items: baseline; }
+.am-doctor-group h4 small { font: var(--am-text-micro) var(--am-font-sans); color: var(--am-muted); }
+.am-check-row { display: grid; grid-template-columns: 20px minmax(9rem, 13rem) minmax(0, 1fr); gap: 2px var(--am-space-3); padding: var(--am-space-2) var(--am-space-3); border-top: var(--am-line) solid var(--am-rule-soft); align-items: start; }
+.am-check-row:first-of-type { border-top: 0; }
+.am-check-row .am-state { margin-top: 1px; }
+.am-check-what { font: var(--am-weight-strong) var(--am-text-ui)/1.45 var(--am-font-sans); color: var(--am-ink); overflow-wrap: anywhere; }
+.am-check-said { font: var(--am-text-ui)/1.45 var(--am-font-sans); color: var(--am-body); }
+.am-check-said .am-word { font-weight: var(--am-weight-strong); }
+.am-check-fix { grid-column: 3; font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+.am-check-fix code { font: var(--am-text-data) var(--am-font-mono); color: var(--am-ink); background: var(--am-plate); padding: 0.1em 0.35em; border-radius: 3px; }
+
+/* a profile */
+.am-profile { border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); padding: var(--am-space-4); display: grid; gap: var(--am-space-3); }
+.am-profile-name { font: 700 var(--am-text-sub)/1.2 var(--am-font-mono); color: var(--am-ink); }
+.am-profile dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--am-space-1) var(--am-space-4); margin: 0; font: var(--am-text-ui)/1.45 var(--am-font-sans); }
+.am-profile dt { color: var(--am-muted); }
+.am-profile dd { margin: 0; color: var(--am-ink); overflow-wrap: anywhere; }
+.am-profile-foot { display: flex; gap: var(--am-space-2); align-items: center; flex-wrap: wrap; }
+
+/* a reader result */
+.am-hits { list-style: none; margin: 0; padding: 0; max-width: none; border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); overflow: hidden; }
+.am-hit { padding: var(--am-space-3) var(--am-space-4); border-top: var(--am-line) solid var(--am-rule-soft); display: grid; gap: var(--am-space-1); }
+.am-hit:first-child { border-top: 0; }
+.am-hit.is-open { background: var(--am-accent-tint); box-shadow: inset 3px 0 0 var(--am-accent); }
+.am-hit-title { font: var(--am-weight-strong) var(--am-text-ui)/1.35 var(--am-font-sans); color: var(--am-ink); display: flex; gap: var(--am-space-2); align-items: baseline; flex-wrap: wrap; }
+.am-hit-sum { font: var(--am-text-ui)/1.45 var(--am-font-sans); color: var(--am-body); }
+.am-hit-meta { display: flex; gap: var(--am-space-1) var(--am-space-4); flex-wrap: wrap; font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); align-items: center; }
+mark { background: var(--am-mark); color: inherit; padding: 0 0.1em; border-radius: 2px; }
+
+/* empty, loading, alert, toast */
+.am-empty { border: var(--am-line) dashed var(--am-edge); border-radius: var(--am-radius); padding: var(--am-space-6) var(--am-space-4); background: var(--am-surface); display: grid; gap: var(--am-space-2); justify-items: start; }
+.am-empty b { font: var(--am-weight-strong) var(--am-text-sub)/1.3 var(--am-font-sans); color: var(--am-ink); }
+.am-empty p { margin: 0; font: var(--am-text-ui)/1.5 var(--am-font-sans); color: var(--am-body); max-width: 52ch; }
+.am-alert { --hue: var(--am-fail); --tint: var(--am-fail-tint); display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: var(--am-space-1) var(--am-space-3); padding: var(--am-space-3) var(--am-space-4); border: var(--am-line) solid color-mix(in srgb, var(--hue) 45%, transparent); border-left: 3px solid var(--hue); background: var(--tint); border-radius: var(--am-radius-sm); font: var(--am-text-ui)/1.5 var(--am-font-sans); color: var(--am-ink); }
+.am-alert > .am-glyph { color: var(--hue); width: 18px; height: 18px; margin-top: 2px; }
+.am-alert b { color: var(--am-ink); }
+.am-alert p { margin: 0; }
+.am-alert .t-micro { color: var(--am-body); }
+.am-alert .am-alert-act { grid-column: 2; display: flex; gap: var(--am-space-2); flex-wrap: wrap; margin-top: var(--am-space-1); }
+.am-alert--warn { --hue: var(--am-warn); --tint: var(--am-warn-tint); }
+.am-alert--live { --hue: var(--am-live); --tint: var(--am-live-tint); }
+.am-alert--ok { --hue: var(--am-ok); --tint: var(--am-ok-tint); }
+.am-busy { display: inline-flex; align-items: center; gap: 0.45em; font: var(--am-text-ui)/1.3 var(--am-font-sans); color: var(--am-muted); }
+.am-busy .am-glyph { width: 14px; height: 14px; }
+@media (prefers-reduced-motion: no-preference) {
+  .am-busy .am-glyph { animation: am-turn 900ms linear infinite; }
+}
+@keyframes am-turn { to { transform: rotate(360deg); } }
+.am-skel { display: block; height: 0.8rem; border-radius: 3px; background: var(--am-plate); }
+.am-kbd { font: var(--am-text-micro)/1 var(--am-font-mono); border: var(--am-line) solid var(--am-edge); border-bottom-width: 2px; border-radius: 4px; padding: 0.2em 0.4em; background: var(--am-surface); color: var(--am-ink); white-space: nowrap; }
+.am-tabs { display: flex; border-bottom: var(--am-line) solid var(--am-rule); background: var(--am-surface); }
+.am-tabs button { flex: 1; font: var(--am-weight-strong) var(--am-text-ui)/1 var(--am-font-sans); color: var(--am-muted); background: none; border: 0; min-height: var(--am-target-touch); border-bottom: 2px solid transparent; }
+.am-tabs button[aria-selected="true"] { color: var(--am-accent); border-bottom-color: var(--am-accent); }
+.am-tabs .am-chip { margin-left: 0.3em; }
+
+/* ---- the pages' frame and the pieces composing them, 2026-10-08 ---- */
+
+/* hidden means hidden, whatever display a component sets */
+[hidden] { display: none !important; }
+
+/* a word for a screen reader alone: the clipped chip word's technique, as a utility */
+.am-vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* the page itself: paper, body type, and a skip link that shows when it has focus */
+.am-body { margin: 0; background: var(--am-paper); color: var(--am-body); font: var(--am-text-body)/var(--am-leading-body) var(--am-font-sans); -webkit-text-size-adjust: 100%; }
+.am-body a:not([class]) { color: var(--am-accent); text-underline-offset: 0.15em; }
+.am-skip { position: absolute; left: -999px; top: 0; z-index: 10; }
+.am-skip:focus { left: var(--am-space-4); top: var(--am-space-2); background: var(--am-surface); color: var(--am-accent); padding: var(--am-space-2) var(--am-space-3); border: var(--am-line) solid var(--am-edge); border-radius: var(--am-radius-sm); font: var(--am-weight-strong) var(--am-text-ui)/1 var(--am-font-sans); }
+
+/* the page head: the mark, the pages, and whether this browser is paired */
+.am-top { display: flex; align-items: center; flex-wrap: wrap; gap: var(--am-space-1) var(--am-space-6); padding: var(--am-space-2) var(--am-space-4); background: var(--am-plate); border-bottom: var(--am-line) solid var(--am-rule); }
+.am-mark { display: inline-flex; align-items: center; gap: var(--am-space-2); min-height: 2.25rem; font: 700 var(--am-text-sub)/1 var(--am-font-mono); color: var(--am-ink); text-decoration: none; }
+.am-mark .am-glyph { width: 20px; height: 20px; color: var(--am-accent); }
+.am-nav { display: flex; flex-wrap: wrap; gap: var(--am-space-1); }
+.am-nav a { display: inline-flex; align-items: center; min-height: 2.25rem; padding: 0 var(--am-space-3); border-radius: var(--am-radius-sm); font: var(--am-text-ui)/1 var(--am-font-sans); color: var(--am-body); text-decoration: none; transition: background-color var(--am-dur-quick) ease-out; }
+.am-nav a:hover { background: var(--am-surface); color: var(--am-ink); }
+.am-nav a[aria-current="page"] { background: var(--am-accent-tint); color: var(--am-accent); font-weight: var(--am-weight-strong); }
+.am-top-end { margin-left: auto; display: flex; align-items: center; gap: var(--am-space-1); min-width: 0; font: var(--am-text-micro)/1.3 var(--am-font-sans); color: var(--am-muted); }
+.am-top-end .am-id { font-size: var(--am-text-micro); }
+.am-top-end .am-state { width: 16px; height: 16px; }
+
+/* a page's content: one column at a measure, regions 48 apart (32 on a phone) */
+.am-main { max-width: 76rem; margin: 0 auto; padding: var(--am-space-8) var(--am-space-4) var(--am-space-16); display: grid; gap: var(--am-space-8); min-width: 0; }
+.am-head { display: grid; gap: var(--am-space-2); }
+.am-title { font: 700 var(--am-text-title)/var(--am-leading-tight) var(--am-font-sans); color: var(--am-ink); letter-spacing: -0.01em; margin: 0; }
+.am-lead { margin: 0; font: var(--am-text-body)/var(--am-leading-body) var(--am-font-sans); color: var(--am-body); max-width: var(--am-measure); }
+.am-section { display: grid; gap: var(--am-space-3); align-content: start; min-width: 0; }
+.am-section-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: var(--am-space-1) var(--am-space-4); }
+.am-section-title { font: var(--am-weight-strong) var(--am-text-section)/1.25 var(--am-font-sans); color: var(--am-ink); margin: 0; }
+.am-sub-title { font: var(--am-weight-strong) var(--am-text-sub)/1.3 var(--am-font-sans); color: var(--am-ink); margin: 0; display: flex; gap: var(--am-space-2); align-items: baseline; }
+.am-sub-title small { font: var(--am-text-micro) var(--am-font-sans); color: var(--am-muted); font-variant-numeric: tabular-nums; }
+.am-foot { border-top: var(--am-line) solid var(--am-rule); padding-top: var(--am-space-4); display: flex; flex-wrap: wrap; gap: var(--am-space-3) var(--am-space-6); justify-content: space-between; align-items: center; font: var(--am-text-micro)/1.4 var(--am-font-sans); color: var(--am-muted); }
+@media (min-width: 720px) {
+  .am-main { padding-inline: var(--am-space-8); gap: var(--am-space-12); }
+}
+
+/* a panel: a surface with a rule round it, 16 inside */
+.am-panel { background: var(--am-surface); border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); padding: var(--am-space-4); display: grid; gap: var(--am-space-4); min-width: 0; }
+
+/* hints and alerts may carry a command */
+.am-hint code, .am-alert p code, .am-empty code, .am-lead code { font: var(--am-text-data) var(--am-font-mono); background: var(--am-plate); color: var(--am-ink); padding: 0.05em 0.3em; border-radius: 3px; overflow-wrap: anywhere; }
+.am-alert--await { --hue: var(--am-await); --tint: var(--am-await-tint); }
+.am-alert .am-cmd { margin-top: var(--am-space-1); background: var(--am-surface); }
+.am-btn--secondary:active { background: var(--am-rule-soft); }
+.am-btn[aria-busy="true"] { cursor: progress; }
+.am-seg .am-state { width: 16px; height: 16px; margin-right: 0.35em; }
+.am-seg .am-state .am-glyph { width: 12px; height: 12px; }
+.am-seg input[disabled] + span { color: var(--am-muted); background: var(--am-plate); cursor: not-allowed; }
+input[type="file"].am-ctrl { padding: 0.3rem 0.45rem; }
+input[type="file"].am-ctrl::file-selector-button { font: var(--am-weight-strong) var(--am-text-ui)/1 var(--am-font-sans); color: var(--am-ink); background: var(--am-surface); border: var(--am-line) solid var(--am-edge); border-radius: var(--am-radius-sm); padding: 0.4rem 0.7rem; margin-right: var(--am-space-2); cursor: pointer; }
+
+/* readiness: what the doctor found each harness has, per auth mode, before a launch */
+.am-ready { list-style: none; margin: 0; padding: 0; border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); background: var(--am-surface); overflow: hidden; }
+.am-ready-row { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); gap: var(--am-space-1) var(--am-space-3); padding: var(--am-space-2) var(--am-space-3); border-top: var(--am-line) solid var(--am-rule-soft); align-items: baseline; }
+.am-ready-row:first-child { border-top: 0; }
+.am-ready-row.is-open { background: var(--am-accent-tint); box-shadow: inset 3px 0 0 var(--am-accent); }
+.am-ready-h { font: var(--am-weight-strong) var(--am-text-data)/1.6 var(--am-font-mono); color: var(--am-ink); overflow-wrap: anywhere; }
+.am-ready-modes { display: flex; flex-wrap: wrap; gap: 0 var(--am-space-4); font: var(--am-text-ui)/1.6 var(--am-font-sans); color: var(--am-body); min-width: 0; }
+.am-ready-mode { display: inline-flex; align-items: center; gap: 0.3em; min-width: 0; overflow-wrap: anywhere; }
+.am-ready-mode .am-state { width: 16px; height: 16px; align-self: center; }
+.am-ready-mode b { font-weight: var(--am-weight-strong); color: var(--am-ink); }
+
+/* the session's facts in its bar: harness, model, profile */
+.am-bar { flex-wrap: wrap; row-gap: var(--am-space-1); }
+.am-bar-facts { display: flex; flex-wrap: wrap; gap: 0 var(--am-space-4); margin: 0; font: var(--am-text-micro)/1.4 var(--am-font-sans); min-width: 0; }
+.am-bar-facts div { display: flex; gap: var(--am-space-1); align-items: baseline; min-width: 0; }
+.am-bar-facts dt { color: var(--am-muted); }
+.am-bar-facts dd { margin: 0; font: var(--am-text-data)/1.4 var(--am-font-mono); color: var(--am-ink); overflow-wrap: anywhere; }
+.am-bar-state { display: inline-flex; align-items: center; gap: 0.3em; font: var(--am-weight-strong) var(--am-text-micro)/1 var(--am-font-sans); color: var(--am-body); white-space: nowrap; }
+.am-bar-state .am-state { width: 16px; height: 16px; }
+
+/* a task row: the ledger's state in the gutter, its title and facts, what can be done */
+.am-task { --depth: 0; display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; column-gap: var(--am-space-3); row-gap: var(--am-space-1); align-items: start; padding: var(--am-space-3) var(--am-space-4) var(--am-space-3) calc(var(--am-space-4) + var(--depth) * var(--am-space-6)); border-top: var(--am-line) solid var(--am-rule-soft); position: relative; }
+.am-task:first-child { border-top: 0; }
+.am-task .am-state { grid-row: 1; }
+.am-task-title { font: var(--am-weight-strong) var(--am-text-ui)/1.45 var(--am-font-sans); color: var(--am-ink); display: flex; flex-wrap: wrap; gap: 0 var(--am-space-2); align-items: baseline; min-width: 0; overflow-wrap: anywhere; }
+.am-task-title .am-id { font-weight: var(--am-weight-regular); font-size: var(--am-text-micro); color: var(--am-muted); }
+.am-task-meta { grid-column: 2; display: flex; flex-wrap: wrap; gap: 0 var(--am-space-3); font: var(--am-text-micro)/1.5 var(--am-font-sans); color: var(--am-muted); min-width: 0; }
+.am-task-meta .am-id { font-size: var(--am-text-micro); color: var(--am-body); }
+.am-task-meta b { color: var(--am-ink); font-weight: var(--am-weight-strong); }
+.am-task-acts { grid-column: 3; grid-row: 1 / span 2; display: flex; flex-wrap: wrap; gap: var(--am-space-2); justify-content: flex-end; }
+.am-task-body { grid-column: 2 / -1; font: var(--am-text-ui)/1.5 var(--am-font-sans); }
+.am-task-body summary { cursor: pointer; color: var(--am-accent); width: fit-content; min-height: var(--am-target); display: flex; align-items: center; }
+.am-task-body pre { white-space: pre-wrap; overflow-wrap: anywhere; font: var(--am-text-ui)/1.5 var(--am-font-sans); color: var(--am-body); margin: var(--am-space-2) 0 0; max-width: var(--am-measure); }
+.am-task.is-child::before { content: ""; position: absolute; top: 0; bottom: 0; left: calc(var(--am-space-4) + (var(--depth) - 1) * var(--am-space-6) + 9px); border-left: var(--am-line) solid var(--am-rule); }
+
+/* a layer that floats: the one place a shadow is allowed */
+.am-dialog { border: var(--am-line) solid var(--am-edge); border-radius: var(--am-radius); background: var(--am-surface); color: var(--am-body); padding: var(--am-space-4); width: min(36rem, calc(100vw - 2 * var(--am-space-4))); box-shadow: 0 var(--am-space-3) var(--am-space-8) color-mix(in srgb, var(--am-ink) 24%, transparent); }
+.am-dialog::backdrop { background: color-mix(in srgb, var(--am-paper) 72%, transparent); }
+.am-dialog form { display: grid; gap: var(--am-space-3); margin: 0; }
+.am-dialog p { margin: 0; font: var(--am-text-ui)/1.5 var(--am-font-sans); }
+.am-dialog-foot { display: flex; gap: var(--am-space-2); justify-content: flex-end; flex-wrap: wrap; }
+
+/* the reader's preferences: theme and contrast, as the book's switch has them */
+.am-prefs { display: flex; flex-wrap: wrap; gap: var(--am-space-3) var(--am-space-6); align-items: center; }
+.am-prefs .am-field { grid-auto-flow: column; align-items: center; gap: var(--am-space-2); }
+.am-prefs .am-seg span { min-height: 2rem; padding: 0 0.6em; font-size: var(--am-text-micro); }
+
+/* responsive: two breakpoints, 720 and 1100; chips clip their word below 480 */
+@media (max-width: 720px) {
+  .am-split { grid-template-columns: minmax(0, 1fr); }
+  .am-pane { border-left: 0; border-top: var(--am-line) solid var(--am-rule); }
+  .am-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .am-strip-cell { white-space: normal; }
+  .am-strip-cell:nth-child(n) { border-left: 0; border-top: var(--am-line) solid var(--am-rule-soft); }
+  .am-strip-cell:nth-child(-n+2) { border-top: 0; }
+  .am-strip-cell:nth-child(even) { border-left: var(--am-line) solid var(--am-rule-soft); }
+  .am-strip-cell:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .am-launch .c2, .am-launch .c3 { grid-column: span 6; }
+  .am-check-row { grid-template-columns: 20px minmax(0, 1fr); }
+  .am-check-said, .am-check-fix { grid-column: 2; }
+  .am-task { grid-template-columns: 20px minmax(0, 1fr); padding-left: calc(var(--am-space-3) + var(--depth) * var(--am-space-3)); padding-right: var(--am-space-3); }
+  .am-task.is-child::before { left: calc(var(--am-space-3) + (var(--depth) - 1) * var(--am-space-3) + 9px); }
+  .am-task-acts { grid-column: 2; grid-row: auto; justify-content: flex-start; order: 1; }
+  .am-task-body { order: 2; }
+  .am-srow { padding-inline: var(--am-space-3); }
+  .am-ready-row { grid-template-columns: 5.5rem minmax(0, 1fr); padding-inline: var(--am-space-3); }
+}
+@media (max-width: 1100px) {
+  .am-strip-cell { flex: 1 1 auto; }
+  .am-strip-v { white-space: normal; }
+}
+@media (max-width: 480px) {
+  .am-srow-chips .am-chip-word, .am-strip .am-chip-word { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+}
+@media (max-width: 480px) and (prefers-contrast: more) {
+  :root:not([data-contrast="normal"]) .am-srow-chips .am-chip-word, :root:not([data-contrast="normal"]) .am-strip .am-chip-word { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+}
+@media (max-width: 480px) {
+  :root[data-contrast="more"] .am-srow-chips .am-chip-word, :root[data-contrast="more"] .am-strip .am-chip-word { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+}
+
   .po-page { background: var(--am-paper); color: var(--am-body); font-family: var(--am-font-sans); font-size: var(--am-text-body); line-height: var(--am-leading-body); margin: 0; padding: var(--am-space-8) var(--am-space-4) var(--am-space-16); }
-  .po-sheet { max-width: 1320px; margin: 0 auto; }
+  .po-sheet { max-width: 1360px; margin: 0 auto; }
   .po-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--am-space-2) var(--am-space-8); margin-bottom: var(--am-space-6); }
   .po-head h1 { font-size: var(--am-text-title); font-weight: var(--am-weight-strong); line-height: var(--am-leading-tight); color: var(--am-ink); margin: 0; }
   .po-head p { margin: 0; max-width: var(--am-measure); color: var(--am-body); }
   .po-head a, .po-foot a, .po-col a { color: var(--am-accent); }
   .po-scroll { overflow-x: auto; background: var(--am-surface); border: var(--am-line) solid var(--am-rule); border-radius: var(--am-radius); }
-  .po-scroll svg { display: block; min-width: 1040px; width: 100%; height: auto; }
-  svg text { font-family: var(--am-font-sans); fill: var(--am-ink); }
+  .po-scroll svg { display: block; min-width: 1240px; width: 100%; height: auto; }
+  .po-svg text { font-family: var(--am-font-sans); fill: var(--am-ink); }
   .po-band { fill: var(--am-plate); }
-  .po-band-name { fill: var(--am-muted); font-size: 0.75rem; }
+  .po-band-name { fill: var(--am-muted); }
   .po-box { fill: var(--am-surface); stroke: var(--am-edge); stroke-width: 1; }
-  .po-name { font-size: 0.9375rem; font-weight: var(--am-weight-strong); }
-  .po-premise { fill: var(--am-muted); font-size: 0.6875rem; }
-  .po-note { fill: var(--am-body); font-size: 0.75rem; }
-  .po-small { fill: var(--am-muted); font-size: 0.6875rem; }
-  .po-loop { fill: var(--am-ink); font-size: 0.6875rem; font-style: italic; }
+  .po-name { font-weight: var(--am-weight-strong); }
+  .po-premise, .po-small { fill: var(--am-muted); }
+  .po-note { fill: var(--am-body); }
   .po-line { stroke: var(--am-ink); stroke-width: 1.4; fill: none; }
   .po-bar { fill: var(--am-surface); stroke: var(--am-ink); stroke-width: 1.4; }
-  .po-await { fill: var(--am-await-tint); stroke: var(--am-await); stroke-width: 1.6; }
-  .po-await-dot { fill: var(--am-await); }
-  .po-await-text { fill: var(--am-await); font-size: 0.75rem; font-weight: var(--am-weight-strong); }
+  .po-await { color: var(--am-await); }
+  .po-await-text { fill: var(--am-await); font-weight: var(--am-weight-strong); }
   .po-fail { color: var(--am-fail); }
-  .po-fail-text { fill: var(--am-fail); font-size: 0.75rem; font-weight: var(--am-weight-strong); }
+  .po-fail-text { fill: var(--am-fail); font-weight: var(--am-weight-strong); }
   .po-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--am-space-8); margin-top: var(--am-space-8); }
   .po-col h2 { font-size: var(--am-text-section); font-weight: var(--am-weight-strong); color: var(--am-ink); margin: 0 0 var(--am-space-3); line-height: var(--am-leading-tight); }
   .po-col p, .po-col li { font-size: var(--am-text-ui); line-height: var(--am-leading-ui); }
@@ -47,9 +698,7 @@
   .po-col th, .po-col td { text-align: left; padding: var(--am-space-1) var(--am-space-2) var(--am-space-1) 0; border-bottom: var(--am-line) solid var(--am-rule-soft); vertical-align: top; }
   .po-col th { font-weight: var(--am-weight-strong); color: var(--am-ink); }
   .po-col td.po-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .po-key { display: inline-block; width: 12px; height: 12px; border-radius: 50%; vertical-align: -1px; margin-right: 6px; }
-  .po-key.po-key-await { background: var(--am-await); }
-  .po-key.po-key-fail { border: 2px solid var(--am-fail); box-sizing: border-box; }
+  .po-key { display: inline-block; width: 1em; height: 1em; vertical-align: -0.15em; margin-right: var(--am-space-1); }
   .po-foot { margin-top: var(--am-space-12); font-size: var(--am-text-ui); color: var(--am-muted); max-width: var(--am-measure); }
   :focus-visible { outline: var(--am-focus-width) solid var(--am-accent); outline-offset: 2px; }
 </style>
@@ -62,161 +711,189 @@
 </header>
 
 <div class="po-scroll">
-<svg viewBox="0 0 1300 820" role="img" aria-labelledby="po-title po-desc" xmlns="http://www.w3.org/2000/svg">
+<svg class="po-svg" viewBox="0 0 1380 880" role="img" aria-labelledby="po-title po-desc" xmlns="http://www.w3.org/2000/svg">
 <title id="po-title">The design in five layers, read as three loops</title>
-<desc id="po-desc">People own domains and policy. Disposable agents (workers, orchestrators, a recall deputy, curators, auditors, an evaluator) call one serving layer per session: a task ledger with leases, retrieval, a screen on every write, telemetry, taps. A perimeter checks every call from an agent. Below sits the durable data: the record of entries at three trust tiers with policy and positions, and the historian of every event. Outside the fleet are model vendors, other memory servers, tool servers and trackers; nothing leaves by default, and every destination has a ceiling. Magenta marks where a person decides; red marks a call refused at the ceiling.</desc>
+<desc id="po-desc">People own domains and policy. Disposable agents (workers, orchestrators, a recall deputy, curators, auditors, an evaluator) call one serving layer per session: a task ledger with leases, retrieval, a screen on every write, telemetry, taps. A perimeter checks every call an agent makes through it. Below sits the durable data: the historian of every event, and the record of entries at three trust tiers with policy and positions, written from the historian by one materializer per domain. Outside the fleet are model vendors, other memory servers, tool servers and trackers; nothing leaves by default, and every destination has a ceiling. Magenta marks where a person decides; red marks a call refused over the ceiling.</desc>
 <defs>
   <marker id="po-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="fill: var(--am-ink)"/></marker>
   <symbol id="i-trust-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/></symbol>
   <symbol id="i-trust-1" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/><path d="M8 2.4a5.6 5.6 0 0 0 0 11.2Z" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-trust-2" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6" fill="currentColor"/></symbol>
   <symbol id="i-refused" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M3.7 12.3l8.6-8.6"/></symbol>
+  <symbol id="i-admit" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 13.8V2.4h7.2v11.4"/><path d="M1.6 8.1h6.6M6 5.9l2.2 2.2L6 10.3"/></symbol>
 </defs>
-
-<!-- bands -->
-<rect class="po-band" x="60" y="40" width="1200" height="110" rx="8"/>
-<text class="po-band-name" x="72" y="58">People: own domains, amend policy, approve what matters</text>
-<rect class="po-band" x="60" y="170" width="1200" height="120" rx="8"/>
-<text class="po-band-name" x="72" y="188">Agents: stateless and disposable; a standing role is a position in the record</text>
-<rect class="po-band" x="60" y="330" width="1200" height="160" rx="8"/>
-<text class="po-band-name" x="72" y="348">Serving layer</text>
-<text class="po-band-name" x="230" y="348">one memory server per session</text>
-<rect class="po-band" x="60" y="520" width="1200" height="140" rx="8"/>
-<text class="po-band-name" x="72" y="538">Durable data</text>
-<text class="po-band-name" x="343" y="538">versioned plain text with provenance</text>
-<rect class="po-band" x="60" y="720" width="1200" height="80" rx="8"/>
-<text class="po-band-name" x="72" y="738">Outside the fleet</text>
-
-<!-- people -->
-<rect class="po-box" x="80" y="70" width="170" height="52" rx="4"/><text class="po-name" x="90" y="92">Domain owners</text><text class="po-premise" x="90" y="110">ownership</text>
-<rect class="po-box" x="520" y="70" width="150" height="52" rx="4"/><text class="po-name" x="530" y="92">Guards</text><text class="po-premise" x="530" y="110">untrusted output</text>
-<circle class="po-await" cx="686" cy="96" r="7"/><circle class="po-await-dot" cx="686" cy="96" r="2.5"/>
-<text class="po-await-text" x="520" y="140">declassify: the guard approves each move to a lower label</text>
-<rect class="po-box" x="800" y="70" width="150" height="52" rx="4"/><text class="po-name" x="810" y="92">Policy owners</text><text class="po-premise" x="810" y="110">viability</text>
-<rect class="po-box" x="980" y="70" width="150" height="52" rx="4"/><text class="po-name" x="990" y="92">Horizon scanner</text><text class="po-premise" x="990" y="110">viability</text>
-
-<!-- agents -->
-<rect class="po-box" x="80" y="205" width="130" height="52" rx="4"/><text class="po-name" x="90" y="227">Workers</text><text class="po-premise" x="90" y="245">disposable</text>
-<rect class="po-box" x="220" y="205" width="140" height="52" rx="4"/><text class="po-name" x="230" y="227">Orchestrators</text><text class="po-premise" x="230" y="245">disposable</text>
-<rect class="po-box" x="370" y="205" width="130" height="52" rx="4"/><text class="po-name" x="380" y="227">Recall deputy</text><text class="po-premise" x="380" y="245">disposable</text>
-<rect class="po-box" x="520" y="205" width="120" height="52" rx="4"/><text class="po-name" x="530" y="227">Curators</text><text class="po-premise" x="530" y="245">viability</text>
-<rect class="po-box" x="660" y="205" width="120" height="52" rx="4"/><text class="po-name" x="670" y="227">Auditors</text><text class="po-premise" x="670" y="245">untrusted output</text>
-<rect class="po-box" x="800" y="205" width="120" height="52" rx="4"/><text class="po-name" x="810" y="227">Evaluator</text><text class="po-premise" x="810" y="245">evaluation</text>
-
-<!-- serving -->
-<rect class="po-box" x="80" y="355" width="160" height="52" rx="4"/><text class="po-name" x="90" y="377">Task ledger</text><text class="po-premise" x="90" y="395">disposable</text>
-<rect class="po-box" x="260" y="355" width="150" height="52" rx="4"/><text class="po-name" x="270" y="377">Retrieval</text><text class="po-premise" x="270" y="395">disposable</text>
-<rect class="po-box" x="520" y="355" width="150" height="52" rx="4"/><text class="po-name" x="530" y="377">Screen</text><text class="po-premise" x="530" y="395">untrusted output</text>
-<rect class="po-box" x="800" y="355" width="150" height="52" rx="4"/><text class="po-name" x="810" y="377">Telemetry</text><text class="po-premise" x="810" y="395">evaluation</text>
-<rect class="po-box" x="980" y="355" width="150" height="52" rx="4"/><text class="po-name" x="990" y="377">Taps</text><text class="po-premise" x="990" y="395">ownership</text>
-<rect class="po-bar" x="80" y="430" width="1160" height="40" rx="4"/>
-<text class="po-name" x="92" y="455" style="font-size: 0.8125rem">Perimeter</text>
-<text class="po-note" x="343" y="448">every call from an agent</text>
-<text class="po-note" x="343" y="462">is checked here</text>
-<text class="po-note" x="603" y="448">against labels, grants, limits</text>
-<text class="po-note" x="603" y="462">and the principal chain</text>
-<text class="po-note" x="908" y="448">self-improvement never widens</text>
-<text class="po-note" x="908" y="462">permission; only a person can</text>
-
-<!-- durable data -->
-<rect class="po-box" x="80" y="550" width="920" height="46" rx="4"/>
-<text class="po-name" x="90" y="570">The record</text>
-<text class="po-note" x="200" y="570">entries at three trust tiers</text>
-<use href="#i-trust-0" x="366" y="558" width="14" height="14"/><text class="po-note" x="384" y="570">raw</text>
-<use href="#i-trust-1" x="416" y="558" width="14" height="14"/><text class="po-note" x="434" y="570">curated</text>
-<use href="#i-trust-2" x="490" y="558" width="14" height="14"/><text class="po-note" x="508" y="570">verified</text>
-<text class="po-note" x="570" y="570">policy L0 to L3, positions, registry</text>
-<text class="po-premise" x="90" y="588">outlives its parts</text>
-<text class="po-small" x="200" y="588">trust rises only through gates, and is checked at the point of use; classification labels fall only through a guard</text>
-<rect class="po-box" x="80" y="606" width="920" height="40" rx="4"/>
-<text class="po-name" x="90" y="626">The historian</text>
-<text class="po-note" x="200" y="626">every write, read, send, curation and task operation, with offsets; lineage is a query over it</text>
-<text class="po-premise" x="90" y="641">untrusted output</text>
-
-<!-- outside -->
-<rect class="po-box" x="80" y="750" width="170" height="44" rx="4"/><text class="po-name" x="90" y="771">Model vendors</text><text class="po-premise" x="90" y="787">pinned, probed for drift</text>
-<rect class="po-box" x="440" y="750" width="260" height="44" rx="4"/><text class="po-name" x="450" y="771">Other memory servers</text><text class="po-premise" x="450" y="787">hosts behind the session's server</text>
-<rect class="po-box" x="800" y="750" width="150" height="44" rx="4"/><text class="po-name" x="810" y="771">Tool servers</text><text class="po-premise" x="810" y="787">declared per task</text>
-<rect class="po-box" x="980" y="750" width="170" height="44" rx="4"/><text class="po-name" x="990" y="771">Trackers, archives</text><text class="po-premise" x="990" y="787">items in, proposals out</text>
-
-<!-- the work loop -->
-<text class="po-loop" x="223" y="276">the work loop</text>
-<path class="po-line" d="M215 262V350" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
-<text class="po-small" x="223" y="292">workers and orchestrators:</text>
-<text class="po-small" x="223" y="306">claim with a lease, read</text>
-<text class="po-small" x="223" y="320">the least that answers,</text>
-<text class="po-small" x="223" y="334">write a handoff, then end</text>
-<text class="po-small" x="378" y="292">recall: a lookup on the</text>
-<text class="po-small" x="378" y="306">model the domain picks,</text>
-<text class="po-small" x="378" y="320">with the caller's permissions</text>
-<path class="po-line" d="M160 407V548" marker-end="url(#po-arrow)"/>
-<text class="po-small" x="168" y="508">tasks and handoffs</text>
-<path class="po-line" d="M335 407V548" marker-end="url(#po-arrow)"/>
-<text class="po-small" x="343" y="500">search, get:</text>
-<text class="po-small" x="343" y="514">summaries first</text>
-
-<!-- the trust loop -->
-<text class="po-loop" x="588" y="276">the trust loop</text>
-<path class="po-line" d="M580 257V353" marker-end="url(#po-arrow)"/>
-<text class="po-small" x="588" y="292">curate: summarise, merge,</text>
-<text class="po-small" x="588" y="306">verify, retire; curation</text>
-<text class="po-small" x="588" y="320">lifts raw to curated</text>
-<path class="po-line" d="M658 231H642" marker-end="url(#po-arrow)"/>
-<text class="po-small" x="648" y="198">check, on a different model</text>
-<path class="po-line" d="M595 407V548" marker-end="url(#po-arrow)"/>
-<text class="po-small" x="603" y="490">write: appended to the historian, screened;</text>
-<text class="po-small" x="603" y="504">unsafe content is quarantined; lands raw,</text>
-<text class="po-small" x="603" y="518">served with its tier visible; one materializer</text>
-<text class="po-small" x="603" y="532">per domain writes the record</text>
-
-<!-- the improvement loop -->
-<text class="po-loop" x="868" y="276">the improvement loop</text>
-<path class="po-line" d="M860 355V259" marker-end="url(#po-arrow)"/>
-<text class="po-small" x="868" y="292">measurements in; the evaluator</text>
-<text class="po-small" x="868" y="306">grades completions against</text>
-<text class="po-small" x="868" y="320">withheld scenarios</text>
-<text class="po-small" x="808" y="421">to the curator work queue</text>
-<path class="po-line" d="M900 548V472" marker-end="url(#po-arrow)"/>
-<text class="po-small" x="908" y="500">loaded as configuration</text>
-<text class="po-small" x="908" y="514">once verified</text>
-<path class="po-line" d="M875 122V150H1160V573H1002" marker-end="url(#po-arrow)"/>
-<path class="po-line" d="M1055 122V150"/>
-<path class="po-line" d="M920 250H1158" marker-end="url(#po-arrow)"/>
-<text class="po-small" x="928" y="262">proposals</text>
-<text class="po-small" x="1148" y="170" text-anchor="end">policy, proposals, approvals</text>
-<circle class="po-await" cx="1160" cy="214" r="8"/><circle class="po-await-dot" cx="1160" cy="214" r="3"/>
-<text class="po-await-text" x="1148" y="186" text-anchor="end">at the review gate a person decides:</text>
-<text class="po-await-text" x="1148" y="200" text-anchor="end">promotion to verified (or a senior</text>
-<text class="po-await-text" x="1148" y="214" text-anchor="end">agent where policy allows), a new</text>
-<text class="po-await-text" x="1148" y="228" text-anchor="end">rule over the ceiling, an exception,</text>
-<text class="po-await-text" x="1148" y="242" text-anchor="end">an irreversible act</text>
-
-<!-- nothing leaves by default -->
-<path class="po-line" d="M1055 407V428" marker-end="url(#po-arrow)"/>
-<path class="po-line" d="M1210 470V700"/>
-<use href="#i-refused" x="1183" y="588" width="14" height="14" class="po-fail"/>
-<text class="po-fail-text" x="1176" y="600" text-anchor="end">refused over the ceiling</text>
-<path class="po-line" d="M80 700H1240"/>
-<text class="po-note" x="80" y="694">nothing leaves by default: every destination, a model, a tool server or a tap, has a ceiling; the fleet proposes, a tracker's owner closes, a committer merges</text>
-<path class="po-line" d="M200 700V748" marker-end="url(#po-arrow)"/>
-<path class="po-line" d="M570 700V748" marker-end="url(#po-arrow)"/>
-<path class="po-line" d="M875 700V748" marker-end="url(#po-arrow)"/>
-<path class="po-line" d="M1065 700V748" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
+<rect class="po-band" x="60" y="40" width="1300" height="110" rx="8"/>
+<text class="po-band-name" font-size="14" x="72" y="59">People: own domains, amend policy, approve what matters</text>
+<rect class="po-band" x="60" y="170" width="1300" height="110" rx="8"/>
+<text class="po-band-name" font-size="14" x="72" y="189">Agents: stateless and disposable; a standing role is a position in the record</text>
+<rect class="po-band" x="60" y="370" width="1300" height="160" rx="8"/>
+<text class="po-band-name" font-size="14" x="72" y="389">Serving layer</text>
+<text class="po-band-name" font-size="14" x="610" y="389">one memory server per session</text>
+<rect class="po-band" x="60" y="580" width="1300" height="140" rx="8"/>
+<text class="po-band-name" font-size="14" x="72" y="599">Durable data</text>
+<text class="po-band-name" font-size="14" x="343" y="599">versioned plain text with provenance</text>
+<rect class="po-band" x="60" y="765" width="1300" height="80" rx="8"/>
+<text class="po-band-name" font-size="14" x="72" y="784">Outside the fleet</text>
+<rect class="po-box" x="80" y="70" width="200" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="90" y="92">People who amend policy</text>
+<text class="po-premise" font-size="13" x="90" y="111">viability</text>
+<rect class="po-box" x="300" y="70" width="170" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="310" y="92">Domain owners</text>
+<text class="po-premise" font-size="13" x="310" y="111">ownership</text>
+<text class="po-small" font-size="13" x="300" y="140">admit tasks; approve at L3</text>
+<rect class="po-box" x="520" y="70" width="150" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="530" y="92">Guards</text>
+<text class="po-premise" font-size="13" x="530" y="111">untrusted output</text>
+<use href="#i-admit" x="679" y="87" width="18" height="18" class="po-await"/>
+<text class="po-await-text" font-size="14" x="530" y="140">declassify: the guard approves each move down</text>
+<rect class="po-box" x="1000" y="70" width="150" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="1010" y="92">Horizon scanner</text>
+<text class="po-premise" font-size="13" x="1010" y="111">viability</text>
+<rect class="po-box" x="80" y="205" width="140" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="90" y="227">Workers</text>
+<text class="po-premise" font-size="13" x="90" y="246">disposable</text>
+<rect class="po-box" x="230" y="205" width="140" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="240" y="227">Orchestrators</text>
+<text class="po-premise" font-size="13" x="240" y="246">disposable</text>
+<rect class="po-box" x="380" y="205" width="130" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="390" y="227">Recall deputy</text>
+<text class="po-premise" font-size="13" x="390" y="246">disposable</text>
+<rect class="po-box" x="530" y="205" width="120" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="540" y="227">Curators</text>
+<text class="po-premise" font-size="13" x="540" y="246">viability</text>
+<rect class="po-box" x="670" y="205" width="120" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="680" y="227">Auditors</text>
+<text class="po-premise" font-size="13" x="680" y="246">untrusted output</text>
+<rect class="po-box" x="810" y="205" width="120" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="820" y="227">Evaluator</text>
+<text class="po-premise" font-size="13" x="820" y="246">evaluation</text>
+<rect class="po-box" x="80" y="395" width="160" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="90" y="417">Task ledger</text>
+<text class="po-premise" font-size="13" x="90" y="436">a chokepoint</text>
+<rect class="po-box" x="260" y="395" width="150" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="270" y="417">Retrieval</text>
+<text class="po-premise" font-size="13" x="270" y="436">a chokepoint</text>
+<rect class="po-box" x="520" y="395" width="160" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="530" y="417">Screen</text>
+<text class="po-premise" font-size="13" x="530" y="436">untrusted output</text>
+<rect class="po-box" x="800" y="395" width="150" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="810" y="417">Telemetry</text>
+<text class="po-premise" font-size="13" x="810" y="436">evaluation</text>
+<text class="po-small" font-size="13" x="808" y="462">to the curator work queue</text>
+<rect class="po-box" x="980" y="395" width="150" height="52" rx="4"/>
+<text class="po-name" font-size="16" x="990" y="417">Taps</text>
+<text class="po-premise" font-size="13" x="990" y="436">ownership</text>
+<rect class="po-bar" x="80" y="470" width="1200" height="40" rx="4"/>
+<text class="po-name" font-size="15" x="92" y="495">Perimeter</text>
+<text class="po-note" font-size="13" x="343" y="489">every call an agent makes</text>
+<text class="po-note" font-size="13" x="343" y="503">through it is checked</text>
+<text class="po-note" font-size="13" x="603" y="489">against labels, grants, limits</text>
+<text class="po-note" font-size="13" x="603" y="503">and the principal chain</text>
+<text class="po-note" font-size="13" x="908" y="489">self-improvement never widens</text>
+<text class="po-note" font-size="13" x="908" y="503">permission; only a person can</text>
+<rect class="po-box" x="80" y="605" width="920" height="40" rx="4"/>
+<text class="po-name" font-size="16" x="90" y="625">The historian</text>
+<text class="po-note" font-size="13" x="215" y="625">every write, read, send, curation and task operation, with offsets; lineage is a query over it</text>
+<text class="po-premise" font-size="13" x="90" y="640">untrusted output</text>
+<path class="po-line" d="M700 645V657" marker-end="url(#po-arrow)"/>
+<text class="po-small" font-size="13" x="708" y="657">one materializer per domain writes the record</text>
+<rect class="po-box" x="80" y="660" width="920" height="56" rx="4"/>
+<text class="po-name" font-size="16" x="90" y="680">The record</text>
+<text class="po-note" font-size="13" x="215" y="680">entries at three trust tiers</text>
+<use href="#i-trust-0" x="405" y="668" width="14" height="14"/>
+<text class="po-note" font-size="13" x="423" y="680">raw</text>
+<use href="#i-trust-1" x="455" y="668" width="14" height="14"/>
+<text class="po-note" font-size="13" x="473" y="680">curated</text>
+<use href="#i-trust-2" x="532" y="668" width="14" height="14"/>
+<text class="po-note" font-size="13" x="550" y="680">verified</text>
+<text class="po-note" font-size="13" x="620" y="680">policy L0 to L3, positions, registry</text>
+<text class="po-small" font-size="13" x="215" y="696">trust rises only through gates and is checked at the point of use; classification labels fall only through a guard</text>
+<text class="po-small" font-size="13" x="215" y="710">policy and agent definitions are loaded as configuration only once verified</text>
+<text class="po-premise" font-size="13" x="90" y="696">a chokepoint</text>
+<text class="po-premise" font-size="13" x="90" y="710">outlives its parts</text>
+<rect class="po-box" x="80" y="795" width="190" height="44" rx="4"/>
+<text class="po-name" font-size="16" x="90" y="817">Model vendors</text>
+<text class="po-premise" font-size="13" x="90" y="836">probed for drift</text>
+<rect class="po-box" x="440" y="795" width="280" height="44" rx="4"/>
+<text class="po-name" font-size="16" x="450" y="817">Other memory servers</text>
+<text class="po-premise" font-size="13" x="450" y="836">hosts behind the session's server</text>
+<rect class="po-box" x="800" y="795" width="150" height="44" rx="4"/>
+<text class="po-name" font-size="16" x="810" y="817">Tool servers</text>
+<text class="po-premise" font-size="13" x="810" y="836">declared per task</text>
+<rect class="po-box" x="980" y="795" width="180" height="44" rx="4"/>
+<text class="po-name" font-size="16" x="990" y="817">Trackers, archives</text>
+<text class="po-premise" font-size="13" x="990" y="836">items in, proposals out</text>
+<path class="po-line" d="M225 262V390" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M375 262V390" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
+<text class="po-small" font-size="13" x="88" y="294">the work loop:</text>
+<text class="po-small" font-size="13" x="88" y="309">claim with a lease,</text>
+<text class="po-small" font-size="13" x="88" y="324">read the least that</text>
+<text class="po-small" font-size="13" x="88" y="339">answers, write a</text>
+<text class="po-small" font-size="13" x="88" y="354">handoff, then end</text>
+<text class="po-small" font-size="13" x="388" y="294">recall: a lookup on the model</text>
+<text class="po-small" font-size="13" x="388" y="309">the domain picks, with the</text>
+<text class="po-small" font-size="13" x="388" y="324">caller's permissions</text>
+<path class="po-line" d="M160 447V603" marker-end="url(#po-arrow)"/>
+<text class="po-small" font-size="13" x="168" y="540">tasks and handoffs;</text>
+<text class="po-small" font-size="13" x="168" y="554">handoffs pass the</text>
+<text class="po-small" font-size="13" x="168" y="568">screen too</text>
+<path class="po-line" d="M335 447V603" marker-end="url(#po-arrow)"/>
+<text class="po-small" font-size="13" x="343" y="540">search, get: summaries first;</text>
+<text class="po-small" font-size="13" x="343" y="554">every read is an event too</text>
+<path class="po-line" d="M590 257V393" marker-end="url(#po-arrow)"/>
+<text class="po-small" font-size="13" x="598" y="294">the trust loop:</text>
+<text class="po-small" font-size="13" x="598" y="309">curate: summarise, merge, verify,</text>
+<text class="po-small" font-size="13" x="598" y="324">retire; lifts raw to curated</text>
+<path class="po-line" d="M668 231H652" marker-end="url(#po-arrow)"/>
+<text class="po-small" font-size="13" x="658" y="198">check, on a different model where a capable one is available</text>
+<path class="po-line" d="M600 447V603" marker-end="url(#po-arrow)"/>
+<text class="po-small" font-size="13" x="608" y="540">write: appended to the historian, then</text>
+<text class="po-small" font-size="13" x="608" y="554">screened; unsafe content is quarantined;</text>
+<text class="po-small" font-size="13" x="608" y="568">lands raw, served with its tier visible</text>
+<text class="po-small" font-size="13" x="818" y="294">the improvement loop:</text>
+<text class="po-small" font-size="13" x="818" y="308">the evaluator holds</text>
+<text class="po-small" font-size="13" x="818" y="322">withheld scenarios,</text>
+<text class="po-small" font-size="13" x="818" y="336">grades completions;</text>
+<text class="po-small" font-size="13" x="818" y="350">its grades gate</text>
+<text class="po-small" font-size="13" x="818" y="364">each change</text>
+<path class="po-line" d="M895 122V150H1220V688H1002" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M1075 122V150"/>
+<path class="po-line" d="M930 250H1218" marker-end="url(#po-arrow)"/>
+<text class="po-small" font-size="13" x="938" y="262">grades, which gate each change</text>
+<text class="po-small" font-size="13" x="1208" y="170" text-anchor="end">policy, proposals, approvals</text>
+<use href="#i-admit" x="1210" y="308" width="20" height="20" class="po-await"/>
+<text class="po-await-text" font-size="14" x="1206" y="282" text-anchor="end">a person decides, at a gate:</text>
+<text class="po-await-text" font-size="14" x="1206" y="297" text-anchor="end">promotion to verified (a senior</text>
+<text class="po-await-text" font-size="14" x="1206" y="312" text-anchor="end">agent where policy allows), a</text>
+<text class="po-await-text" font-size="14" x="1206" y="327" text-anchor="end">new rule over the rules ceiling,</text>
+<text class="po-await-text" font-size="14" x="1206" y="342" text-anchor="end">an exception, an irreversible act</text>
+<path class="po-line" d="M1055 447V468" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M1270 510V745"/>
+<use href="#i-refused" x="1278" y="586" width="16" height="16" class="po-fail"/>
+<text class="po-fail-text" font-size="14" x="1278" y="618">refused</text>
+<text class="po-fail-text" font-size="14" x="1278" y="632">over the</text>
+<text class="po-fail-text" font-size="14" x="1278" y="646">ceiling</text>
+<path class="po-line" d="M80 745H1320"/>
+<text class="po-note" font-size="13" x="80" y="738">nothing leaves by default: every destination, a model, a tool server or a tap, has a ceiling; the fleet proposes, a tracker's owner closes, a committer merges</text>
+<path class="po-line" d="M200 745V793" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M580 745V793" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M875 745V793" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
+<path class="po-line" d="M1070 745V793" marker-start="url(#po-arrow)" marker-end="url(#po-arrow)"/>
 </svg>
 </div>
 
 <div class="po-cols">
   <section class="po-col">
     <h2>Where colour appears</h2>
-    <p><span class="po-key po-key-await"></span>A person decides. Promotion to verified, where domain policy does not allow a senior agent; a new rule over the ceiling; an exception; an irreversible action; each move of content to a lower label, by the guard policy names, who is a person for the widest crossings. Everything an agent does is inside limits a person set.</p>
-    <p><span class="po-key po-key-fail"></span>Refused. A call over its destination's ceiling does not leave. Below the ceiling is the normal case and has no colour.</p>
-    <p>Arrows cross the perimeter bar because every call from an agent is checked there. The word under each part inside the fleet names the premise it serves: <em>disposable</em> agents, <em>untrusted output</em> from models, <em>ownership</em> that limits conflict, <em>viability</em> over years, <em>evaluation</em> built in, and data that <em>outlives its parts</em>. The outside boxes carry what reaches them. <a href="durable-memory-for-disposable-agents-complexity.md">Appendix H</a> sorts every part, rule and failure mode under those six premises.</p>
+    <p><svg class="po-key po-await" aria-hidden="true"><use href="#i-admit"/></svg>A person decides. Promotion to verified, where domain policy does not allow a senior agent; a new rule over the rules ceiling; an exception; an irreversible action; each move of content to a lower label, by the guard: the domain's owner by default, and a person for the widest crossings. The paper names more decisions for people (a domain boundary, a registry change, a raised share, a change to the evaluation suites); the two marks show the paths most entries and rules take.</p>
+    <p><svg class="po-key po-fail" aria-hidden="true"><use href="#i-refused"/></svg>Refused. A call over its destination's ceiling does not leave. Below the ceiling is the normal case and has no colour.</p>
+    <p>The perimeter bar sits between the serving layer and the data because every call an agent makes through the serving layer is checked before anything is read, written or sent. The people's path to the record crosses it too: an approval is checked again when the action runs. The word under each part names the premise it serves: <em>disposable</em> agents, <em>untrusted output</em> from models, <em>ownership</em> that limits conflict, <em>viability</em> over years, <em>evaluation</em> built in, and an institution that <em>outlives its parts</em>. A <em>chokepoint</em> serves several premises at once; the outside boxes carry what reaches them instead. <a href="durable-memory-for-disposable-agents-complexity.md">Appendix H</a> sorts the parts it names, and every rule and failure mode, under those six premises.</p>
   </section>
   <section class="po-col">
     <h2>What a smaller deployment leaves out</h2>
     <table>
       <tr><th>Setting</th><th>Keeps</th><th>Leaves undefended</th></tr>
-      <tr><td>One operator, trusted inputs, one machine</td><td>The disposable and evaluation parts: ledger, handoffs, T0 (the cached index), recall, metrics, replays</td><td class="po-num">30 of 38 failure modes</td></tr>
+      <tr><td>One operator, trusted inputs, one machine</td><td>The record and the serving layer, with the disposable and evaluation parts: ledger, handoffs, T0 (the cached index), recall, metrics, replays</td><td class="po-num">30 of 38 failure modes</td></tr>
       <tr><td>One team on shared infrastructure</td><td>Those, and the untrusted-output parts: labels, screen, gate, lineage, auditors</td><td class="po-num">19 of 38</td></tr>
       <tr><td>An organisation over years</td><td>The whole design</td><td class="po-num">none by choice</td></tr>
     </table>
@@ -239,7 +916,7 @@
 </div>
 
 <footer class="po-foot">
-  <p>A page of <em>Durable Memory for Disposable Agents</em>. The parts are few and the rules are where the system is large; the paper's own remedy for rule growth, a ceiling with a person signing each rule above it, applies to it. Colours and type are the tokens of amem, the implementation of the paper, and its <a href="design-book.html">design book</a> says what each colour means.</p>
+  <p>A page of <em>Durable Memory for Disposable Agents</em>. The parts are few and the rules are where the system is large; the paper's rule about rule growth applies to it, and Appendix H sets no ceiling. Colours and type are the tokens of amem, the implementation of the paper, and its <a href="design-book.html">design book</a> says what each colour means.</p>
 </footer>
 </main>
 </body>

@@ -120,6 +120,17 @@ mod tests {
     }
 
     #[test]
+    fn the_poster_inlines_the_tokens_and_components_whole() {
+        // docs/poster.html draws the paper's design in the tokens' colours and type, and
+        // is opened from anywhere: a copy with nothing beside it must still render
+        let poster = include_str!("../../../docs/poster.html");
+        assert!(
+            poster.contains(TOKENS),
+            "docs/poster.html must carry crates/web/static/tokens.css whole, as it is"
+        );
+    }
+
+    #[test]
     fn every_path_a_page_names_is_relative() {
         // the same files are served by amem and as a hosted copy on another origin, so a
         // leading slash would reach the host and not the page's own directory
