@@ -29,7 +29,7 @@ The script counts what the paper names. A role is a row of the [§2](durable-mem
 | Glossary terms (Appendix F) | 44 |
 | Diagrams | 9 |
 | Evidence rows (Appendix G) | 157 |
-| Evidence rows at Argued only | 65 |
+| Evidence rows at Argued only | 64 |
 
 Sixteen roles, twenty operations and forty-four terms fit on a page. Ninety-four rules and thirty-eight failure modes do not. The parts are few; the rules are where the system is large.
 
@@ -75,7 +75,7 @@ The failure-mode column sorts the 38 rows of [Appendix D](durable-memory-for-dis
 
 **Viability is where the argued design lives.** The fourth premise has the most failure modes and the fewest rules.
 
-Appendix G grades 65 of its 157 rows at Argued, the level for a property that rests on the paper's reasoning and no source, and by its own count most rows of [§7](durable-memory-for-disposable-agents.md#7-the-policy-stack) and [§12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales), where this premise's parts live, are Argued. Beer's claim is that a system stays viable only with all five of its systems, and 3, 3*, 4 and 5 are the ones this premise supplies, so the premise is not optional. The open choice in each row of the [§13](durable-memory-for-disposable-agents.md#13-related-work) table is whether the function is a mechanism or a person.
+Appendix G grades 64 of its 157 rows at Argued, the level for a property that rests on the paper's reasoning and no source, and by its own count most rows of [§7](durable-memory-for-disposable-agents.md#7-the-policy-stack) and [§12](durable-memory-for-disposable-agents.md#12-surviving-long-timescales), where this premise's parts live, are Argued. Beer's claim is that a system stays viable only with all five of its systems, and 3, 3*, 4 and 5 are the ones this premise supplies, so the premise is not optional. The open choice in each row of the [§13](durable-memory-for-disposable-agents.md#13-related-work) table is whether the function is a mechanism or a person.
 
 **Chokepoints are a class of their own.** One record, one ledger, one memory server per session ([§6](durable-memory-for-disposable-agents.md#one-server-per-session)) and one way out through taps and tool servers ([§4](durable-memory-for-disposable-agents.md#labels-and-flow)) serve several premises at once. The one server applies the labels once, checks the principal chain once, observes every call and enforces the limits in one place; the paper's reason is that enforcement split across servers leaves gaps. Each chokepoint is complexity spent to remove enforcement from every harness, tool and tap, and principle 4 is its statement.
 
