@@ -136,32 +136,92 @@ mod tests {
             style < copy && copy < poster.find("</style>").unwrap(),
             "the tokens must be inside the poster's style block, not quoted elsewhere"
         );
+        let before = &poster[..style];
+        assert!(
+            before.matches("<!--").count() == before.matches("-->").count(),
+            "the poster's style block sits inside a comment"
+        );
         // beyond that copy, the page names no colour of its own, defines no token of its
         // own, and fetches nothing
         let rest = poster.replacen(TOKENS, "", 1);
         assert!(!hex_colour(&rest), "the poster has a colour of its own");
-        let styles = rest
-            .split("<style>")
+        assert_eq!(
+            named_colour_in_styles(&rest),
+            None,
+            "the poster names a colour"
+        );
+        assert!(
+            !defines_a_token(&rest),
+            "the poster defines a token of its own"
+        );
+        assert!(
+            !rest.contains("<template"),
+            "the poster hides markup in a template, where its styles would not apply"
+        );
+        assert_eq!(
+            fetch_or_script(&rest),
+            None,
+            "the poster fetches or runs something"
+        );
+        assert_eq!(
+            colour_in_an_attribute(&rest),
+            None,
+            "a presentation attribute names a colour"
+        );
+    }
+
+    /// The first named colour in `page`'s own style blocks (with or without attributes
+    /// on the tag) and style attributes, double or single quoted.
+    fn named_colour_in_styles(page: &str) -> Option<&'static str> {
+        let styles = page
+            .split("<style")
             .skip(1)
             .filter_map(|s| s.split("</style>").next());
-        let attributes = rest
+        let attributes = page
             .split("style=\"")
             .skip(1)
             .filter_map(|s| s.split('"').next());
-        for css in styles.chain(attributes) {
-            if let Some(f) = named_colour(css) {
-                panic!("the poster names a colour: {f}");
-            }
+        let quoted = page
+            .split("style='")
+            .skip(1)
+            .filter_map(|s| s.split('\'').next());
+        styles
+            .chain(attributes)
+            .chain(quoted)
+            .find_map(named_colour)
+    }
+
+    /// The first thing in `page` that fetches, runs, or points off the page: a tag or
+    /// attribute that loads a resource, a `url()` that is not a fragment, or a glyph
+    /// reference to another document.
+    fn fetch_or_script(page: &str) -> Option<String> {
+        let lower = page.to_ascii_lowercase();
+        let banned = [
+            "<link", "<script", "<object", "<iframe", "<embed", "<image", "srcset", "src=",
+            "@import",
+        ];
+        if let Some(b) = banned.iter().find(|b| lower.contains(*b)) {
+            return Some((*b).to_string());
         }
-        assert!(
-            !rest.contains("--am-") || !rest.split("--am-").skip(1).any(|s| {
-                s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).next().map_or(false, |_| s.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '-').starts_with(':'))
-            }),
-            "the poster defines a token of its own"
-        );
-        for fetch in ["<link", "src=\"", "src='", "@import"] {
-            assert!(!rest.contains(fetch), "the poster fetches something: {fetch}");
+        if let Some(u) = lower.split("url(").skip(1).find(|u| !u.starts_with('#')) {
+            return Some(format!("url({}", &u[..u.len().min(40)]));
         }
+        page.split("<use href=\"")
+            .skip(1)
+            .find(|u| !u.starts_with('#'))
+            .map(|u| format!("<use href=\"{}", &u[..u.len().min(40)]))
+    }
+
+    /// The first `fill` or `stroke` presentation attribute whose value is a colour of its
+    /// own rather than `none` or `currentColor`.
+    fn colour_in_an_attribute(page: &str) -> Option<String> {
+        ["fill=\"", "stroke=\""].iter().find_map(|attr| {
+            page.split(attr)
+                .skip(1)
+                .filter_map(|s| s.split('"').next())
+                .find(|v| *v != "none" && *v != "currentColor")
+                .map(|v| format!("{attr}{v}"))
+        })
     }
 
     #[test]
@@ -195,6 +255,17 @@ mod tests {
     }
 
     /// A colour function or a colour by name, in CSS: a page's styles, or a style attribute.
+    /// Whether `text` declares a custom property of the token family (`--am-x:`),
+    /// with any spacing before the colon.
+    fn defines_a_token(text: &str) -> bool {
+        text.split("--am-").skip(1).any(|after| {
+            let name_end = after
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .unwrap_or(after.len());
+            after[name_end..].trim_start().starts_with(':')
+        })
+    }
+
     fn named_colour(css: &str) -> Option<&'static str> {
         const FUNCTIONS: [&str; 10] = [
             "rgb(",

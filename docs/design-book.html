@@ -18,7 +18,7 @@
    docs/design-book.html and docs/poster.html inline this whole file, because each is one
    self-contained page with nothing to fetch. The three change together, in the same
    commit: a token or a component added, renamed or re-valued here and not there (or
-   there and not here) is a bug in both, and a test in crates/web says so.
+   there and not here) is a bug in each, and a test in crates/web says so.
 
    Named for meaning, never appearance: --am-fail, not --am-red. Light is the default
    under :root; dark is designed, not inverted, and applies when the system asks for it
@@ -2375,7 +2375,7 @@ horizon.<span class="cur"> </span></pre>
         <tr><td><code>[hidden]</code> always hides</td><td>Components that set a display (alert, empty, field) otherwise ignore the attribute the pages use to show and hide them.</td><td><span class="bk-tag">New</span></td></tr>
         <tr><td>The theme and contrast switch is in the launch page's and the reader's footers</td><td>The book's own switch, on the two pages a person opens first; the choice is kept per browser and every page reads it before its first paint.</td><td><span class="bk-tag">Taken</span> from this book's rail</td></tr>
         <tr class="bk-group"><td colspan="3">2026-11-09, the poster</td></tr>
-        <tr><td>A drawing sets its text in the drawing's own units, and its minimum width keeps the smallest text at the micro role's 12px</td><td><code>docs/poster.html</code> draws the paper's design as an SVG whose boxes and arrows are geometry. Type in rem would follow the browser's text size while the geometry did not, and labels would collide; type in the drawing's units scales with the picture, and the page scrolls sideways before any text falls under 12px. The page's own prose stays in the role tokens.</td><td><span class="bk-tag">New</span></td></tr>
+        <tr><td>A drawing sets its text and glyphs in the drawing's own units, and its minimum width keeps the smallest text at the micro role's 12px</td><td><code>docs/poster.html</code> draws the paper's design as an SVG whose boxes and arrows are geometry. Type in rem would follow the browser's text size while the geometry did not, and labels would collide; type in the drawing's units scales with the picture, and the page scrolls sideways before any text falls under 12px. The page's own prose stays in the role tokens.</td><td><span class="bk-tag">New</span></td></tr>
         <tr><td>A decision that waits on a person is drawn in await with the admit glyph</td><td>The poster marks where a person decides: a promotion, a rule over the ceiling, an exception, an irreversible act, a move to a lower label. Each is a thing proposed and waiting to be admitted by a person, which is what the glyph and the hue already mean for a task; no new glyph meaning is added.</td><td><span class="bk-tag">Taken</span> the chip rule's hue and glyph</td></tr>
       </tbody>
     </table>
