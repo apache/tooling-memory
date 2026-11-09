@@ -1,6 +1,6 @@
 # Appendix H: How Much System This Is
 
-Appendix H of [*Durable Memory for Disposable Agents*](durable-memory-for-disposable-agents.md), kept in its own file because its counts change with every revision of the paper. The counts below are from the paper at commit `ab52e91` (4 November 2026), the revision before this appendix was added, produced by the inventory script in [WRITING.md](../WRITING.md). The sentence that points at this appendix adds 28 words to §1.
+Appendix H of [*Durable Memory for Disposable Agents*](durable-memory-for-disposable-agents.md), kept in its own file because its counts change with every revision of the paper. The counts below are from the paper at commit `ab52e91` (4 November 2026), the revision before this appendix was added, produced by the inventory script in [WRITING.md](../WRITING.md); the two evidence counts follow Appendix G as it stands on this revision. The sentence that points at this appendix adds 28 words to §1.
 
 ## Why count
 
