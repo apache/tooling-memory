@@ -1416,7 +1416,7 @@ The launcher installs three hooks in the settings of each harness, in the privat
 
 The third hook guards the projection, the read-only files of the record at `/memory`. A
 read of an entry file becomes a `get`. The hook refuses a search over the projection
-(PLAN.md, M4b). Gemini CLI and Qwen Code refuse their file tools a path outside the
+(the first plan, `spikes/plan-2026-10`, M4b). Gemini CLI and Qwen Code refuse their file tools a path outside the
 workspace. Thus the launcher includes the projection in their workspace. If it did not,
 the model would use a shell instead, which the hook does not see.
 
