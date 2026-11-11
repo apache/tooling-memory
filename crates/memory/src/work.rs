@@ -368,13 +368,7 @@ async fn one(
     };
     let output = output.map(|o| answer_of(session, o));
     let now = client.get_task(&task.id).await?;
-    file_outbox(
-        session,
-        client,
-        now.status == "completed",
-        Some(&task.domain),
-    )
-    .await?;
+    file_outbox(session, client, now.status == "done", Some(&task.domain)).await?;
     let output = output.unwrap_or_default();
     if !output.trim().is_empty() {
         crate::stops::answer(&output);
@@ -428,7 +422,7 @@ async fn settle(
 ) -> Fallible<i32> {
     let now = client.get_task(&task.id).await?;
     match now.status.as_str() {
-        "completed" => {
+        "done" => {
             eprintln!(
                 "amem: {} completed, handoff {}",
                 task.id,

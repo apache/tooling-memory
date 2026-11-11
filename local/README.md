@@ -77,7 +77,7 @@ session end, counts as a handoff when the launcher files it. The reason: a non-i
 launch whose outcome is only in its transcript leaves nothing for the next session. If you
 intend this, use `--no-handoff`.
 
-`make work` claims the next admitted task that the session may take. It makes the prompt
+`make work` claims the next open task that the session may take. It makes the prompt
 from:
 
 - T0
@@ -554,6 +554,51 @@ lint` applies the paper's conflict rules. It finds:
 - a rule that is not yet verified.
 
 With `--file`, `amem policy lint` files a bug on the lower layer for the owner.
+
+## The states of a task, and its claim: `amem task`
+
+A task has one of six states, with the names that the paper gives:
+
+| State | Meaning |
+| ----- | ------- |
+| `proposed` | Somebody filed the task. Triage did not admit it yet |
+| `open` | Triage admitted the task, and a session can claim it |
+| `blocked` | Triage admitted the task, but a task that it depends on is not done |
+| `claimed` | A session holds the task under a lease |
+| `done` | The holder completed the task with a handoff |
+| `invalidated` | Somebody closed the task and did not do it |
+
+The ledger moves a task between `open` and `blocked`:
+
+- When triage admits a task, the ledger looks at the tasks that it depends on. If one of
+  them is not done, the task becomes `blocked`.
+- When the last of those tasks is done, the blocked task becomes `open`.
+- When one of those tasks is invalidated, each open or blocked task that depends on it
+  goes back to `proposed`. The reason: the task rested on work that nobody will do.
+
+Each claim of a task gets a generation. The first claim has generation 1, the second has
+generation 2. A heartbeat, a completion and a release carry the generation of their
+claim. The ledger refuses one that carries an earlier generation, and gives the generation
+that is in force. Thus the ledger tells two sessions of one harness apart, although the
+two have the same name. The ledger reads the task and appends the event in one
+transaction, so a new claim cannot arrive between the two.
+
+- The memory server of a session remembers the generation of each claim that the session
+  made. The memory tools `heartbeat`, `complete` and `release` use it, so an agent does
+  not have to give it. An agent can give it with `generation`.
+- A command has no session. `amem task heartbeat`, `complete` and `release` need
+  `--generation`. `amem task claim-next` prints the task, and its `generation` is the
+  generation of the claim.
+- The board sends the generation that the page shows. A page that shows an earlier claim
+  is refused.
+
+A holder that lost its lease can still leave a handoff, with the memory tool
+`late_handoff` or `amem task late-handoff`. The ledger accepts it only from the name that
+held the claim of that generation. The handoff changes nothing of the task. `get_task`
+gives these handoffs, and the claims of the task that the ledger refused.
+
+Not built yet: an attempt key for each operation, a block on a new claim while an external
+effect is uncertain, and a `blocked` state for a task that waits on an outside event.
 
 ## The task fabric: `amem task rescore` and `stats`
 
@@ -1063,10 +1108,11 @@ Jaeger, with OTLP on 4318. The reference stack uses an OpenTelemetry collector t
 Parquet, which you query with DuckDB or DataFusion. That shape takes the same variable.
 
 On each backend, the ledger adds a `task.<transition>` span for each transition that takes
-effect. The transitions are created, admitted, claimed, heartbeat, released, handoff_left,
-completed, invalidated and posted. The span holds the task as it is at that time:
+effect. The transitions are created, admitted, blocked, unblocked, retriaged, claimed,
+claim_refused, heartbeat, released, handoff_left, late_handoff, completed, invalidated and
+posted. The span holds the task as it is at that time:
 
-- the id, the domain, the status, the priority and the attempts;
+- the id, the domain, the status, the priority and the generation;
 - who filed it, its holder and its origin;
 - the reason it was invalidated.
 

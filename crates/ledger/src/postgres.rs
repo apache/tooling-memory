@@ -17,8 +17,8 @@
 //! connections cannot both win the same task.
 
 use crate::{
-    claimable, parse_time, Error, Event, PromotionRecord, PromotionSpec, RawPromotion, RawTask,
-    Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Error, Event, Held, PromotionRecord, PromotionSpec,
+    RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use std::collections::HashMap;
@@ -329,6 +329,73 @@ impl Db {
         Ok(())
     }
 
+    /// Append an event of the holder under the claim in force: the task's row is locked,
+    /// read and the event appended in one transaction, so no claim comes between.
+    pub(crate) async fn append_held(
+        &mut self,
+        id: &str,
+        at: OffsetDateTime,
+        by: Held<'_>,
+        event: &Event,
+    ) -> Result<(), Error> {
+        let s = self.schema_of_task(id).await?;
+        let tx = self.client.transaction().await?;
+        let row = tx
+            .query_opt(
+                &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $1 FOR UPDATE"),
+                &[&id],
+            )
+            .await?
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        check_holder(&task_from_row(&row)?, by, at)?;
+        apply(&tx, &s, id, at, event).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Who the ledger gave the claim of `generation` to: the holder of the task's
+    /// `generation`th claim event, counted from one.
+    pub(crate) async fn claimant(
+        &self,
+        id: &str,
+        generation: u64,
+    ) -> Result<Option<String>, Error> {
+        let Some(before) = generation.checked_sub(1) else {
+            return Ok(None);
+        };
+        let s = self.schema_of_task(id).await?;
+        let row = self
+            .client
+            .query_opt(
+                &format!(
+                    "SELECT payload FROM {s}.events WHERE task_id = $1 AND kind = 'claimed'
+                     ORDER BY seq LIMIT 1 OFFSET $2"
+                ),
+                &[&id, &i64::try_from(before).unwrap_or(i64::MAX)],
+            )
+            .await?;
+        let payload: Option<String> = row.map(|r| r.try_get(0)).transpose()?;
+        Ok(match payload.map(|p| Event::parse(id, &p)).transpose()? {
+            Some(Event::Claimed { holder, .. }) => Some(holder),
+            _ => None,
+        })
+    }
+
+    /// The payloads of a task's events of one kind, oldest first.
+    pub(crate) async fn payloads_of(&self, id: &str, kind: &str) -> Result<Vec<String>, Error> {
+        let s = self.schema_of_task(id).await?;
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT payload FROM {s}.events WHERE task_id = $1 AND kind = $2 ORDER BY seq"
+                ),
+                &[&id, &kind],
+            )
+            .await?;
+        rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    }
+
     /// Record a promotion unless that promoter promoted that version of the entry to that
     /// tier already. The domain's lock is held from the check to the commit, so two
     /// processes recording the same promotion record it once.
@@ -490,7 +557,8 @@ impl Db {
         let Some(s) = self.schema(domain).await? else {
             return Ok(None);
         };
-        let claimable_now = "(status = 'admitted' OR (status = 'claimed' AND lease_until < $1))";
+        let claimable_now =
+            "(status IN ('open', 'blocked') OR (status = 'claimed' AND lease_until < $1))";
         let now_text = crate::fmt_time(now);
         let tx = self.client.transaction().await?;
         let rows = tx
@@ -632,7 +700,7 @@ impl Db {
         };
         self.select(
             &s,
-            "WHERE status = 'completed' AND origin IS NOT NULL AND posted_to IS NULL
+            "WHERE status = 'done' AND origin IS NOT NULL AND posted_to IS NULL
              ORDER BY created",
             &[],
         )
@@ -851,7 +919,7 @@ async fn deps_complete<C: GenericClient>(conn: &C, deps: &[String]) -> Result<bo
             )
             .await?;
         let status: Option<String> = row.map(|r| r.try_get(0)).transpose()?;
-        if status.as_deref() != Some("completed") {
+        if status.as_deref() != Some("done") {
             return Ok(false);
         }
     }
@@ -865,7 +933,7 @@ async fn awaits_continuation<C: GenericClient>(conn: &C, s: &str, id: &str) -> R
         .query_opt(
             &format!(
                 "SELECT 1 FROM {s}.tasks WHERE origin = $1
-                 AND status NOT IN ('completed', 'invalidated') LIMIT 1"
+                 AND status NOT IN ('done', 'invalidated') LIMIT 1"
             ),
             &[&crate::continues(id)],
         )
@@ -967,7 +1035,7 @@ async fn scrub_tasks_in<C: GenericClient>(
     let rows = conn
         .query(
             &format!(
-                "SELECT id, status IN ('completed', 'invalidated') FROM {s}.tasks
+                "SELECT id, status IN ('done', 'invalidated') FROM {s}.tasks
                  WHERE origin = $1 ORDER BY created FOR UPDATE"
             ),
             &[&origin],
@@ -1138,7 +1206,21 @@ async fn project<C: GenericClient>(
         Event::Promoted { spec, why_erased } => {
             return insert_promotion(conn, s, at, spec, *why_erased).await
         }
-        Event::Admitted => ("SET status = 'admitted' WHERE id = $1", vec![&id]),
+        Event::Admitted => ("SET status = 'open' WHERE id = $1", vec![&id]),
+        Event::Blocked { .. } => (
+            "SET status = 'blocked' WHERE id = $1 AND status = 'open'",
+            vec![&id],
+        ),
+        Event::Unblocked { .. } => (
+            "SET status = 'open' WHERE id = $1 AND status = 'blocked'",
+            vec![&id],
+        ),
+        Event::Retriaged { .. } => (
+            "SET status = 'proposed' WHERE id = $1 AND status IN ('open', 'blocked')",
+            vec![&id],
+        ),
+        // the record that someone tried, or spoke after its claim: nothing of the task moves
+        Event::ClaimRefused { .. } | Event::LateHandoff { .. } => return Ok(()),
         Event::Claimed { holder, .. } => (
             "SET status = 'claimed', holder = $2, lease_until = $3,
                 attempts = attempts + 1 WHERE id = $1",
@@ -1146,12 +1228,12 @@ async fn project<C: GenericClient>(
         ),
         Event::Heartbeat { .. } => ("SET lease_until = $2 WHERE id = $1", vec![&id, &until_text]),
         Event::Released => (
-            "SET status = 'admitted', holder = NULL, lease_until = NULL WHERE id = $1",
+            "SET status = 'open', holder = NULL, lease_until = NULL WHERE id = $1",
             vec![&id],
         ),
         Event::HandoffLeft { handoff } => ("SET handoff = $2 WHERE id = $1", vec![&id, handoff]),
         Event::Completed { handoff } => (
-            "SET status = 'completed', handoff = $2, lease_until = NULL WHERE id = $1",
+            "SET status = 'done', handoff = $2, lease_until = NULL WHERE id = $1",
             vec![&id, handoff],
         ),
         Event::Invalidated {

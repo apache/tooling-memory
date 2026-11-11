@@ -284,7 +284,7 @@ pub async fn completed(
     };
     let mut out = Vec::new();
     for domain in m.domains() {
-        for t in m.tasks(Some(&domain), dm_ledger::Status::Completed).await? {
+        for t in m.tasks(Some(&domain), dm_ledger::Status::Done).await? {
             if let Some(s) = t.handoff.as_deref().and_then(session_of) {
                 out.push((t.id.clone(), t.spec.title.clone(), s));
             }

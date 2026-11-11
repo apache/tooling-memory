@@ -477,7 +477,7 @@ mod tests {
             .unwrap();
         assert!(h.starts_with("mem-"));
         let t = client.release(&t.id, Some(&h)).await.unwrap();
-        assert_eq!(t.status, "admitted");
+        assert_eq!(t.status, "open");
         assert_eq!(t.handoff.as_deref(), Some(h.as_str()));
 
         let t = client.claim_next(None, 60).await.unwrap().unwrap();
@@ -502,7 +502,7 @@ mod tests {
             .await
             .unwrap();
         let t = client.complete(&t.id, &h2).await.unwrap();
-        assert_eq!(t.status, "completed");
+        assert_eq!(t.status, "done");
         let t = client.get_task(&t.id).await.unwrap();
         assert_eq!(t.handoff.as_deref(), Some(h2.as_str()));
 

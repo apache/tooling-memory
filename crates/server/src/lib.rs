@@ -276,6 +276,11 @@ pub struct Memory {
     held: Arc<OnceLock<String>>,
     /// How many entries this session has superseded: the blast-radius gate's count.
     superseded: Arc<AtomicUsize>,
+    /// The claims this session made, each task with the generation the ledger gave: the
+    /// session carries a claim's generation for the agent, and passes it with every
+    /// heartbeat, completion and release, so a session whose claim is over is refused
+    /// by its generation even when another session of the same name holds the task.
+    claims: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     /// What this session may read, as the policy computed it once and the index applies
     /// inside every query.
     scope: OnceLock<ReadFilter>,
@@ -436,6 +441,7 @@ impl Memory {
             policy: Arc::new(std::sync::RwLock::new(std::sync::Arc::new(policy))),
             held: Arc::new(OnceLock::new()),
             superseded: Arc::new(AtomicUsize::new(0)),
+            claims: Arc::default(),
             scope: OnceLock::new(),
             contexts_kept: Arc::new(AtomicUsize::new(0)),
             tools: OnceLock::new(),
@@ -484,6 +490,7 @@ impl Memory {
             policy: Arc::clone(&self.policy),
             held: Arc::clone(&self.held),
             superseded: Arc::clone(&self.superseded),
+            claims: Arc::clone(&self.claims),
             scope: OnceLock::from(scope),
             contexts_kept: Arc::clone(&self.contexts_kept),
             tools: self.tools.clone(),
@@ -1374,45 +1381,72 @@ impl Memory {
         if !d.allow {
             return Err(Error::Denied(d.reason));
         }
-        self.claim_proposal(&task).await?;
-        let entry = self.still_proposed(task_id).await?;
+        let by = self.claim_proposal(&task).await?;
+        let entry = self.still_proposed(task_id, by).await?;
         let promoted = self.set_tier(entry, TrustTier::Verified).await?;
         self.ledger
             .lock()
             .await
-            .complete(task_id, &self.author, &id)
+            .complete(task_id, self.under(by), &id)
             .await?;
         Ok(promoted)
     }
 
-    /// Take the proposal task, so no second approver acts on it at the same time.
-    async fn claim_proposal(&self, task: &Task) -> Result<(), Error> {
+    /// This session as the holder under the claim of `generation`.
+    fn under(&self, generation: u64) -> dm_ledger::Held<'_> {
+        dm_ledger::Held {
+            holder: &self.author,
+            generation,
+        }
+    }
+
+    /// The generation this session acts under on a task: the one the caller names, or
+    /// the one of the claim this session made. A session that made none and names none
+    /// holds nothing, whatever name it shares with the holder.
+    fn claim_of(&self, id: &str, generation: Option<u64>) -> Result<u64, Error> {
+        generation
+            .or_else(|| lock(&self.claims).get(id).copied())
+            .ok_or_else(|| {
+                Error::Ledger(dm_ledger::Error::NotHolder {
+                    id: id.to_string(),
+                    holder: format!(
+                        "{}, in a session that made no claim on it; name the generation of the claim",
+                        self.author
+                    ),
+                })
+            })
+    }
+
+    /// Take the proposal task, so no second approver acts on it at the same time. Returns
+    /// the generation of the claim.
+    async fn claim_proposal(&self, task: &Task) -> Result<u64, Error> {
         let mut l = self.ledger.lock().await;
         if task.status == dm_ledger::Status::Proposed {
             l.admit(&task.id).await?;
         }
-        l.claim(
-            &task.id,
-            &self.author,
-            Duration::minutes(5),
-            &task.spec.requirements,
-            self.handling()?,
-        )
-        .await?;
-        Ok(())
+        let claim = l
+            .claim(
+                &task.id,
+                &self.author,
+                Duration::minutes(5),
+                &task.spec.requirements,
+                self.handling()?,
+            )
+            .await?;
+        Ok(claim.generation)
     }
 
     /// The proposed entry as it is now, read after the claim. An erase or a replace may
     /// have landed while the claim was taken, and the version read before it must not be
     /// written back; if the proposal no longer holds, the claim is released.
-    async fn still_proposed(&self, task_id: &str) -> Result<Entry, Error> {
+    async fn still_proposed(&self, task_id: &str, by: u64) -> Result<Entry, Error> {
         let held = self.ledger.lock().await.get(task_id).await?;
         match self.proposal_entry(&held).await {
             Ok((_, current)) => Ok(current),
             Err(e) => {
                 let mut l = self.ledger.lock().await;
                 if l.get(task_id).await?.status == dm_ledger::Status::Claimed {
-                    l.release(task_id, &self.author, None).await?;
+                    l.release(task_id, self.under(by), None).await?;
                 }
                 Err(e)
             }
@@ -1446,7 +1480,7 @@ impl Memory {
                 task.id
             )));
         };
-        if task.status == dm_ledger::Status::Completed {
+        if task.status == dm_ledger::Status::Done {
             return Err(Error::Denied(format!(
                 "{} is Completed: the proposal was approved",
                 task.id
@@ -1867,7 +1901,7 @@ impl Memory {
             .ledger
             .lock()
             .await
-            .list(&domain, dm_ledger::Status::Admitted)
+            .list(&domain, dm_ledger::Status::Open)
             .await?
             .iter()
             .filter(|t| self.sees(t, handling))
@@ -2549,6 +2583,7 @@ impl Memory {
             .await?;
         if let Some(c) = &claim {
             lock(&self.session).observe(c.task.spec.classification);
+            lock(&self.claims).insert(c.task.id.clone(), c.generation);
         }
         Ok(claim)
     }
@@ -2567,6 +2602,7 @@ impl Memory {
             .claim(id, &self.author, lease, &self.manifest, handling)
             .await?;
         lock(&self.session).observe(c.task.spec.classification);
+        lock(&self.claims).insert(c.task.id.clone(), c.generation);
         Ok(c)
     }
 
@@ -2575,10 +2611,16 @@ impl Memory {
     /// # Errors
     ///
     /// A ledger error, including a lease already lost, or a task outside the grants.
-    pub async fn heartbeat(&self, id: &str, lease: Duration) -> Result<Task, Error> {
+    pub async fn heartbeat(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        lease: Duration,
+    ) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
         self.check_task(&l.get(id).await?)?;
-        let t = l.heartbeat(id, &self.author, lease).await?;
+        let by = self.under(self.claim_of(id, generation)?);
+        let t = l.heartbeat(id, by, lease).await?;
         self.observe_task(&t);
         Ok(t)
     }
@@ -2590,14 +2632,20 @@ impl Memory {
     ///
     /// [`Error::NotFound`] for a missing handoff, a ledger error, or a task outside the
     /// grants.
-    pub async fn complete(&self, id: &str, handoff: &str) -> Result<Task, Error> {
+    pub async fn complete(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        handoff: &str,
+    ) -> Result<Task, Error> {
         let task = self.ledger.lock().await.get(id).await?;
         self.check_task(&task)?;
         if self.store.get(&task.spec.domain, handoff).await?.is_none() {
             return Err(Error::NotFound(format!("handoff {handoff}")));
         }
         let mut l = self.ledger.lock().await;
-        let done = l.complete(id, &self.author, handoff).await?;
+        let by = self.under(self.claim_of(id, generation)?);
+        let done = l.complete(id, by, handoff).await?;
         // a continuation finishes the task it resumed, and that one the task it resumed in
         // turn: up the chain, while each is open and nobody holds it
         let mut by = done.clone();
@@ -2621,15 +2669,59 @@ impl Memory {
     /// # Errors
     ///
     /// A ledger error, or a task outside the grants.
-    pub async fn release(&self, id: &str, handoff: Option<&str>) -> Result<Task, Error> {
+    pub async fn release(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        handoff: Option<&str>,
+    ) -> Result<Task, Error> {
         if let Some(h) = handoff {
             self.get(h).await?; // the handoff must exist and be readable here
         }
         let mut l = self.ledger.lock().await;
         self.check_task(&l.get(id).await?)?;
-        let t = l.release(id, &self.author, handoff).await?;
+        let by = self.under(self.claim_of(id, generation)?);
+        let t = l.release(id, by, handoff).await?;
         self.observe_task(&t);
         Ok(t)
+    }
+
+    /// Leave a handoff on a task after this session's claim on it is over. The handoff
+    /// must exist and be readable here. The ledger checks that it gave this session's
+    /// name the claim of that generation.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for a missing handoff, a ledger error, or a task outside the
+    /// grants.
+    pub async fn handoff_after(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        handoff: &str,
+    ) -> Result<Task, Error> {
+        self.get(handoff).await?;
+        let mut l = self.ledger.lock().await;
+        self.check_task(&l.get(id).await?)?;
+        let by = self.under(self.claim_of(id, generation)?);
+        let t = l.handoff_after(id, by, handoff).await?;
+        self.observe_task(&t);
+        Ok(t)
+    }
+
+    /// What a task's record holds beside the task: the handoffs that earlier holders
+    /// left after their claims, and the claims of it that the ledger refused.
+    ///
+    /// # Errors
+    ///
+    /// A ledger error, or a task outside the grants.
+    pub async fn task_record(
+        &self,
+        id: &str,
+    ) -> Result<(Vec<dm_ledger::LateHandoff>, Vec<(String, String)>), Error> {
+        let l = self.ledger.lock().await;
+        self.check_task(&l.get(id).await?)?;
+        Ok((l.late_handoffs(id).await?, l.refused_claims(id).await?))
     }
 
     /// Close a task without doing it, and everything still open that was filed from it:
@@ -3259,7 +3351,7 @@ mod tests {
 
     async fn gate_tasks(m: &Memory, kind: &str) -> Vec<Task> {
         let mut out = Vec::new();
-        for st in [Status::Proposed, Status::Admitted] {
+        for st in [Status::Proposed, Status::Open] {
             out.extend(
                 m.tasks(None, st)
                     .await
@@ -3458,17 +3550,13 @@ mod tests {
             priority: 0,
         };
         let parent = owner.file_own(spec(&["github"])).await.unwrap().task;
-        assert_eq!(
-            parent.status,
-            Status::Admitted,
-            "the system's own, admitted"
-        );
+        assert_eq!(parent.status, Status::Open, "the system's own, admitted");
         let agent = Memory::open(dir.path()).unwrap().with_author("agent:test");
         let own = agent.create_task(spec(&[])).await.unwrap().task;
         assert_eq!(own.status, Status::Proposed, "a session on its own account");
         agent.set_held_task(&parent.id);
         let within = agent.create_task(spec(&["github"])).await.unwrap().task;
-        assert_eq!(within.status, Status::Admitted, "within what it holds");
+        assert_eq!(within.status, Status::Open, "within what it holds");
         let inflated = agent.create_task(spec(&["deploy"])).await.unwrap().task;
         assert_eq!(
             inflated.status,
@@ -3640,9 +3728,9 @@ mod tests {
         let mut out = Vec::new();
         for st in [
             Status::Proposed,
-            Status::Admitted,
+            Status::Open,
             Status::Claimed,
-            Status::Completed,
+            Status::Done,
             Status::Invalidated,
         ] {
             out.extend(m.tasks(None, st).await.unwrap());
@@ -5480,7 +5568,7 @@ mod tests {
             TrustTier::Verified
         );
         let closed = owner.ledger.lock().await.get(&task.id).await.unwrap();
-        assert_eq!(closed.status, Status::Completed);
+        assert_eq!(closed.status, Status::Done);
         assert_eq!(
             closed.holder.as_deref(),
             Some("human:test:me"),
@@ -6238,6 +6326,71 @@ mod tests {
         m.file_own(s).await.unwrap().task
     }
 
+    /// Two sessions of one name: the ledger cannot tell them apart by who they say they
+    /// are, and tells them apart by the claim each made.
+    #[tokio::test]
+    async fn a_session_whose_claim_is_over_is_refused_though_its_name_holds_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = mem(dir.path());
+        let second = Memory::open(dir.path()).unwrap();
+        let onlooker = Memory::open(dir.path()).unwrap();
+        let t = filed(&first, tspec("Long job", 0, None, &[], &[])).await;
+        let handoff = |text: &'static str| async {
+            let h = WriteRequest {
+                entry_type: EntryType::Handoff,
+                ..req(text)
+            };
+            first.write(h).await.unwrap().id
+        };
+        let lost = first
+            .claim(&t.id, Duration::milliseconds(20))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let held = second
+            .claim_next(None, Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((lost.generation, held.generation), (1, 2));
+        assert_eq!(held.task.holder, lost.task.holder, "one name");
+        let h = handoff("Half done; start at step 3.\n").await;
+        // the first session passes the generation of the claim it made, and is fenced
+        for refused in [
+            first.heartbeat(&t.id, None, Duration::minutes(5)).await,
+            first.complete(&t.id, None, &h).await,
+            first.release(&t.id, None, None).await,
+        ] {
+            assert!(
+                matches!(
+                    refused,
+                    Err(Error::Ledger(dm_ledger::Error::Fenced {
+                        given: 1,
+                        current: 2,
+                        ..
+                    }))
+                ),
+                "{:?}",
+                refused.map(|t| t.status)
+            );
+        }
+        // a session that made no claim holds nothing by its name alone
+        assert!(matches!(
+            onlooker.complete(&t.id, None, &h).await,
+            Err(Error::Ledger(dm_ledger::Error::NotHolder { .. }))
+        ));
+        // what the first learned still reaches the holder now
+        first.handoff_after(&t.id, None, &h).await.unwrap();
+        let (late, _) = second.task_record(&t.id).await.unwrap();
+        assert_eq!(late.len(), 1);
+        assert_eq!(
+            (late[0].generation, late[0].handoff.as_str()),
+            (1, h.as_str())
+        );
+        let done = second.complete(&t.id, None, &h).await.unwrap();
+        assert_eq!((done.status, done.generation), (Status::Done, 2));
+    }
+
     async fn done(m: &Memory, s: TaskSpec) {
         let t = filed(m, s).await;
         let mut l = m.ledger.lock().await;
@@ -6250,7 +6403,16 @@ mod tests {
         )
         .await
         .unwrap();
-        l.complete(&t.id, "w", "mem-x").await.unwrap();
+        l.complete(
+            &t.id,
+            dm_ledger::Held {
+                holder: "w",
+                generation: 1,
+            },
+            "mem-x",
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -6362,7 +6524,7 @@ mod tests {
             .await
             .unwrap();
         let st = m.task_stats(None).await.unwrap();
-        assert_eq!(st["by_family"]["filed"]["completed"], 1);
+        assert_eq!(st["by_family"]["filed"]["done"], 1);
         assert_eq!(st["by_family"]["curator"]["invalidated"], 1);
         assert_eq!(st["invalidated_because"]["obsolete"], 1);
         assert_eq!(st["unmatched_requirements"]["gpu"], 1, "{st}");
@@ -6399,7 +6561,7 @@ mod tests {
             .get(&first.children[0].id)
             .await
             .unwrap();
-        assert_eq!(child.status, Status::Admitted, "the first child stays open");
+        assert_eq!(child.status, Status::Open, "the first child stays open");
         let tree = m.task_tree(&parent.id).await.unwrap();
         let open: Vec<_> = tree
             .children
@@ -6441,7 +6603,7 @@ mod tests {
         let gpu = m.ledger.lock().await.get(&needs_gpu.id).await.unwrap();
         assert_eq!(
             gpu.status,
-            Status::Admitted,
+            Status::Open,
             "what needs a capability it lacks waits for one that has it"
         );
         assert!(
@@ -6771,13 +6933,17 @@ mod tests {
             .unwrap();
         assert_eq!(f.children.len(), 2);
         // the starter grants admit a session's own filings
-        assert!(f.children.iter().all(|c| c.status == Status::Admitted));
+        assert!(f.children.iter().all(|c| c.status == Status::Open));
         assert_eq!(
             f.children[0].spec.origin.as_deref(),
             Some(format!("task:{}", parent.id).as_str())
         );
         let continuation = f.continuation.clone().unwrap();
-        assert_eq!(continuation.status, Status::Admitted);
+        assert_eq!(
+            continuation.status,
+            Status::Blocked,
+            "it waits on the children"
+        );
         assert_eq!(continuation.spec.title, "Resume: Ship the import");
         assert_eq!(continuation.spec.requirements, vec!["tool:fs".to_string()]);
         assert_eq!(continuation.spec.priority, 3);
@@ -6894,7 +7060,7 @@ mod tests {
             .await
             .unwrap();
         let left = handoff("Delegated; the comparison waits on the summaries.\n").await;
-        m.release(&root.id, Some(&left)).await.unwrap();
+        m.release(&root.id, None, Some(&left)).await.unwrap();
         // the root waits on its continuation: the child is what a worker gets
         let c = m
             .claim_next(None, Duration::minutes(30))
@@ -6903,7 +7069,7 @@ mod tests {
             .unwrap();
         assert_eq!(c.task.id, f.children[0].id);
         assert!(m.claim(&root.id, Duration::minutes(30)).await.is_err());
-        m.complete(&c.task.id, &handoff("DR-19 is proposed.\n").await)
+        m.complete(&c.task.id, None, &handoff("DR-19 is proposed.\n").await)
             .await
             .unwrap();
         // the continuation delegates once more, and stops
@@ -6913,24 +7079,24 @@ mod tests {
             .fan_out(&first.id, &[("DR-22".into(), "Summarise DR-22.".into())])
             .await
             .unwrap();
-        m.release(&first.id, None).await.unwrap();
+        m.release(&first.id, None, None).await.unwrap();
         let c = m
             .claim_next(None, Duration::minutes(30))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(c.task.id, g.children[0].id, "not the waiting continuation");
-        m.complete(&c.task.id, &handoff("DR-22 is decided.\n").await)
+        m.complete(&c.task.id, None, &handoff("DR-22 is decided.\n").await)
             .await
             .unwrap();
         // the last continuation's completion closes the one it resumed, and the root
         let last = g.continuation.unwrap();
         m.claim(&last.id, Duration::minutes(30)).await.unwrap();
         let done = handoff("DR-19 is open where DR-22 is decided.\n").await;
-        m.complete(&last.id, &done).await.unwrap();
+        m.complete(&last.id, None, &done).await.unwrap();
         for id in [&first.id, &root.id] {
             let t = m.get_task(id).await.unwrap();
-            assert_eq!(t.status, Status::Completed, "{id}");
+            assert_eq!(t.status, Status::Done, "{id}");
             assert_eq!(t.handoff.as_deref(), Some(done.as_str()), "{id}");
         }
         assert!(m
@@ -6959,7 +7125,7 @@ mod tests {
             })
             .await
             .unwrap();
-        m.complete(&child.id, &h.id).await.unwrap();
+        m.complete(&child.id, None, &h.id).await.unwrap();
         // a grandchild under the continuation, still open
         let g = m
             .fan_out(
@@ -6983,7 +7149,7 @@ mod tests {
         );
         assert_eq!(
             m.get_task(&child.id).await.unwrap().status,
-            Status::Completed,
+            Status::Done,
             "what was done stays done"
         );
         let retry = m.retry_task(&parent.id).await.unwrap();
@@ -6998,7 +7164,7 @@ mod tests {
             retry.spec.body
         );
         assert!(retry.spec.body.contains(&h.id), "{}", retry.spec.body);
-        assert_eq!(retry.status, Status::Admitted);
+        assert_eq!(retry.status, Status::Open);
         assert_eq!(m.task_tree(&parent.id).await.unwrap().children.len(), 3);
     }
 
@@ -7040,18 +7206,18 @@ mod tests {
             .unwrap()
             .is_none());
         m.admit(&c.task.id).await.unwrap();
-        assert_eq!(m.tasks(None, Status::Admitted).await.unwrap().len(), 1);
+        assert_eq!(m.tasks(None, Status::Open).await.unwrap().len(), 1);
         let claim = m
             .claim_next(None, Duration::minutes(30))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(claim.task.id, c.task.id);
-        m.heartbeat(&c.task.id, Duration::minutes(30))
+        m.heartbeat(&c.task.id, None, Duration::minutes(30))
             .await
             .unwrap();
         assert!(matches!(
-            m.complete(&c.task.id, "mem-me-nonexistent").await,
+            m.complete(&c.task.id, None, "mem-me-nonexistent").await,
             Err(Error::NotFound(_))
         ));
         let h = m
@@ -7061,13 +7227,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let done = m.complete(&c.task.id, &h.id).await.unwrap();
-        assert_eq!(done.status, Status::Completed);
+        let done = m.complete(&c.task.id, None, &h.id).await.unwrap();
+        assert_eq!(done.status, Status::Done);
         assert_eq!(done.handoff.as_deref(), Some(h.id.as_str()));
-        assert_eq!(
-            m.get_task(&c.task.id).await.unwrap().status,
-            Status::Completed
-        );
+        assert_eq!(m.get_task(&c.task.id).await.unwrap().status, Status::Done);
         assert!(matches!(
             m.get_task("task-me-none").await,
             Err(Error::Ledger(_))
@@ -7341,9 +7504,9 @@ mod tests {
 
     const EVERY_STATUS: [Status; 5] = [
         Status::Proposed,
-        Status::Admitted,
+        Status::Open,
         Status::Claimed,
-        Status::Completed,
+        Status::Done,
         Status::Invalidated,
     ];
 
@@ -7359,13 +7522,22 @@ mod tests {
         if st != Status::Proposed {
             l.admit(id).await.unwrap();
         }
-        if matches!(st, Status::Claimed | Status::Completed) {
+        if matches!(st, Status::Claimed | Status::Done) {
             l.claim(id, "w", Duration::minutes(5), &[], Label::Restricted)
                 .await
                 .unwrap();
         }
-        if st == Status::Completed {
-            l.complete(id, "w", "mem-me-x").await.unwrap();
+        if st == Status::Done {
+            l.complete(
+                id,
+                dm_ledger::Held {
+                    holder: "w",
+                    generation: 1,
+                },
+                "mem-me-x",
+            )
+            .await
+            .unwrap();
         }
         if st == Status::Invalidated {
             l.invalidate(id, "obsolete", None).await.unwrap();
@@ -7444,7 +7616,7 @@ mod tests {
 
         let full = Memory::open(dir.path()).unwrap();
         assert_eq!(full.label(), Label::Public);
-        let admitted = full.tasks(None, Status::Admitted).await.unwrap();
+        let admitted = full.tasks(None, Status::Open).await.unwrap();
         assert!(admitted.iter().any(|t| t.id == hidden[1]), "{admitted:?}");
         assert_eq!(
             full.label(),
@@ -7482,7 +7654,16 @@ mod tests {
             )
             .await
             .unwrap();
-            l.complete(&hidden.id, "w", "mem-me-x").await.unwrap();
+            l.complete(
+                &hidden.id,
+                dm_ledger::Held {
+                    holder: "w",
+                    generation: 1,
+                },
+                "mem-me-x",
+            )
+            .await
+            .unwrap();
             (root, hidden)
         };
 
@@ -7568,7 +7749,7 @@ mod tests {
         m.file_own(restricted("Rotate the signing key"))
             .await
             .unwrap();
-        for st in [Status::Proposed, Status::Admitted] {
+        for st in [Status::Proposed, Status::Open] {
             m.tasks(None, st).await.unwrap();
         }
         assert_eq!(m.label(), Label::Restricted);
@@ -7579,7 +7760,7 @@ mod tests {
             Label::Public,
             "a view's label starts fresh, whatever the shared session read"
         );
-        for st in [Status::Proposed, Status::Admitted] {
+        for st in [Status::Proposed, Status::Open] {
             first.tasks(None, st).await.unwrap();
         }
         assert_eq!(first.label(), Label::Restricted);
@@ -7771,7 +7952,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status,
-            Status::Admitted,
+            Status::Open,
             "the hidden task is left as it was"
         );
     }
@@ -7828,7 +8009,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            owner.complete(&t.id, &h.id).await.unwrap();
+            owner.complete(&t.id, None, &h.id).await.unwrap();
         }
         let capped = Memory::open(dir.path())
             .unwrap()
@@ -7911,13 +8092,22 @@ mod tests {
         if st != Status::Proposed {
             l.admit(&t.id).await.unwrap();
         }
-        if matches!(st, Status::Claimed | Status::Completed) {
+        if matches!(st, Status::Claimed | Status::Done) {
             l.claim(&t.id, holder, Duration::minutes(5), &[], Label::Restricted)
                 .await
                 .unwrap();
         }
-        if st == Status::Completed {
-            l.complete(&t.id, holder, "mem-me-x").await.unwrap();
+        if st == Status::Done {
+            l.complete(
+                &t.id,
+                dm_ledger::Held {
+                    holder,
+                    generation: 1,
+                },
+                "mem-me-x",
+            )
+            .await
+            .unwrap();
         }
         t.id
     }
@@ -7977,7 +8167,7 @@ mod tests {
         let held = internal_in(&mem(dir.path()), Status::Claimed, "human:test:me").await;
         let full = Memory::open(dir.path()).unwrap();
         assert!(matches!(
-            full.complete(&held, "mem-me-none").await,
+            full.complete(&held, None, "mem-me-none").await,
             Err(Error::NotFound(_))
         ));
         assert_eq!(
@@ -7990,7 +8180,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_invalidation_does_not_raise_the_label() {
         let dir = tempfile::tempdir().unwrap();
-        let done = internal_in(&mem(dir.path()), Status::Completed, "w").await;
+        let done = internal_in(&mem(dir.path()), Status::Done, "w").await;
         let full = Memory::open(dir.path()).unwrap();
         assert!(matches!(
             full.invalidate(&done, "late", None).await,
@@ -8009,7 +8199,7 @@ mod tests {
         let theirs = internal_in(&mem(dir.path()), Status::Claimed, "w").await;
         let full = Memory::open(dir.path()).unwrap();
         assert!(matches!(
-            full.release(&theirs, None).await,
+            full.release(&theirs, None, None).await,
             Err(Error::Ledger(dm_ledger::Error::NotHolder { .. }))
         ));
         assert_eq!(
@@ -8297,7 +8487,10 @@ mod tests {
             full.claim(&held, Duration::minutes(5)).await,
             Err(Error::Ledger(dm_ledger::Error::WrongState { .. }))
         ));
-        assert!(full.heartbeat(&held, Duration::minutes(5)).await.is_err());
+        assert!(full
+            .heartbeat(&held, None, Duration::minutes(5))
+            .await
+            .is_err());
         assert!(full.admit(&held).await.is_err());
         assert_eq!(
             full.label(),
@@ -8524,7 +8717,7 @@ mod tests {
         let mut want = ids;
         want.sort();
         assert_eq!(found, want);
-        assert_eq!(m.tasks(None, Status::Admitted).await.unwrap().len(), 1);
+        assert_eq!(m.tasks(None, Status::Open).await.unwrap().len(), 1);
     }
 
     /// Every file under a directory, read as bytes.

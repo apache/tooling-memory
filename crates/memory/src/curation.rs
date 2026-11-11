@@ -214,10 +214,7 @@ async fn completed(
     domain: &str,
     t: &mut Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for task in memory
-        .tasks(Some(domain), dm_ledger::Status::Completed)
-        .await?
-    {
+    for task in memory.tasks(Some(domain), dm_ledger::Status::Done).await? {
         let curation = task
             .spec
             .origin

@@ -17,7 +17,7 @@ test('a task for a person is filed, admitted, claimed and completed with a hando
   await expect(row.getByRole('img', { name: 'proposed' })).toBeVisible();
   await row.getByRole('button', { name: 'Admit: Read the pane test handoff' }).click();
 
-  const admitted = page.getByRole('region', { name: /^Admitted/ }).locator('.am-task', { hasText: 'Read the pane test handoff' });
+  const admitted = page.getByRole('region', { name: /^Open/ }).locator('.am-task', { hasText: 'Read the pane test handoff' });
   await admitted.getByRole('button', { name: /^Claim/ }).click();
 
   const claimed = page.getByRole('region', { name: /^Claimed/ }).locator('.am-task', { hasText: 'Read the pane test handoff' });
@@ -27,9 +27,9 @@ test('a task for a person is filed, admitted, claimed and completed with a hando
   await dialog.getByLabel('Handoff').fill('Read it; nothing remains.');
   await dialog.getByRole('button', { name: 'Complete' }).click();
 
-  const done = page.getByRole('region', { name: /^Completed/ }).locator('.am-task', { hasText: 'Read the pane test handoff' });
+  const done = page.getByRole('region', { name: /^Done/ }).locator('.am-task', { hasText: 'Read the pane test handoff' });
   await expect(done).toContainText('handoff mem-');
-  await expect(done.getByRole('img', { name: 'completed' })).toBeVisible();
+  await expect(done.getByRole('img', { name: 'done' })).toBeVisible();
   // the handoff opens in the reader, on this domain's bundle, at the entry
   const link = done.getByRole('link', { name: /^mem-/ });
   const href = await link.getAttribute('href');

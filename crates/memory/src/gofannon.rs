@@ -363,7 +363,7 @@ mod tests {
         assert_eq!(calls[0]["input"]["task_id"], id.as_str());
         assert_eq!(calls.len(), 3, "start, running, completed");
         let t = owner.get_task(&id).await.unwrap();
-        assert_eq!(t.status, dm_ledger::Status::Completed);
+        assert_eq!(t.status, dm_ledger::Status::Done);
         let h = owner.get(&t.handoff.unwrap()).await.unwrap();
         assert!(
             h.body.contains("\"label\": \"bug\"") && h.body.contains("run-1"),
@@ -382,7 +382,7 @@ mod tests {
         p.task = Some(id.clone());
         assert_eq!(work(&m, &p).await.unwrap(), 1);
         let t = owner.get_task(&id).await.unwrap();
-        assert_eq!(t.status, dm_ledger::Status::Admitted);
+        assert_eq!(t.status, dm_ledger::Status::Open);
         let h = owner.get(&t.handoff.unwrap()).await.unwrap();
         assert!(
             h.body.contains("not a host the gofannon tool is granted"),

@@ -51,6 +51,15 @@ fn ok(value: Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::json(value)?]))
 }
 
+/// A granted claim as a tool returns it: the task, and the claim's generation and expiry.
+fn claim_json(c: &dm_ledger::Claim) -> Value {
+    json!({
+        "task": c.task,
+        "generation": c.generation,
+        "lease_until": rfc3339(c.lease_until),
+    })
+}
+
 fn rfc3339(t: time::OffsetDateTime) -> String {
     t.format(&Rfc3339).unwrap_or_default()
 }
@@ -312,7 +321,33 @@ pub struct ClaimNextParams {
     pub lease_seconds: Option<i64>,
 }
 
-/// Parameters of `claim` and `heartbeat`.
+/// Parameters of `heartbeat`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct HeartbeatParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of your claim, as `claim_next` or `claim` returned it. Optional in
+    /// the session that made the claim, which remembers it.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// Lease length in seconds, 10 to 86400. Default 1800.
+    #[serde(default)]
+    pub lease_seconds: Option<i64>,
+}
+
+/// Parameters of `late_handoff`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct LateHandoffParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of the claim you held. Optional in the session that made it.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// The id of the handoff entry you wrote with `write`.
+    pub handoff: String,
+}
+
+/// Parameters of `claim`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct LeaseParams {
     /// The task id.
@@ -327,6 +362,9 @@ pub struct LeaseParams {
 pub struct ReleaseParams {
     /// The task id.
     pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
     /// A handoff entry you wrote about what you did before stopping; the next claimant
     /// starts from it. Optional.
     #[serde(default)]
@@ -338,6 +376,9 @@ pub struct ReleaseParams {
 pub struct CompleteParams {
     /// The task id.
     pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
     /// The id of the handoff entry you wrote with `write` describing what happened.
     pub handoff: String,
 }
@@ -360,22 +401,23 @@ pub struct ListTasksParams {
     /// A granted domain; the only one when omitted.
     #[serde(default)]
     pub domain: Option<String>,
-    /// proposed, admitted, claimed, completed, or invalidated. Default admitted.
+    /// proposed, open, claimed, blocked, done, or invalidated. Default open.
     #[serde(default)]
     pub status: Option<String>,
 }
 
 fn task_status(s: Option<String>) -> Result<dm_ledger::Status, McpError> {
-    Ok(match s.as_deref().unwrap_or("admitted") {
+    Ok(match s.as_deref().unwrap_or("open") {
         "proposed" => dm_ledger::Status::Proposed,
-        "admitted" => dm_ledger::Status::Admitted,
+        "open" => dm_ledger::Status::Open,
         "claimed" => dm_ledger::Status::Claimed,
-        "completed" => dm_ledger::Status::Completed,
+        "done" => dm_ledger::Status::Done,
+        "blocked" => dm_ledger::Status::Blocked,
         "invalidated" => dm_ledger::Status::Invalidated,
         other => {
             return Err(McpError::invalid_params(
                 format!(
-                    "status {other:?} is not one of proposed, admitted, claimed, completed, invalidated"
+                    "status {other:?} is not one of proposed, open, claimed, blocked, done, invalidated"
                 ),
                 None,
             ))
@@ -787,7 +829,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Claim the highest-ranked task this session can take, under a lease. Heartbeat before the lease runs out; a lease nobody renews is lost at expiry and the task returns to the pool. Returns no task when nothing is claimable."
+        description = "Claim the highest-ranked task this session can take, under a lease. Heartbeat before the lease runs out; a lease nobody renews is lost at expiry and the task returns to the pool. The claim has a generation: this session passes it for you with heartbeat, complete and release, and a session whose claim is over is refused by it. Returns no task when nothing is claimable."
     )]
     async fn claim_next(&self, p: Parameters<ClaimNextParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -798,7 +840,7 @@ impl McpServer {
             .map_err(mcp_err)?;
         match c {
             None => ok(json!({ "task": null })),
-            Some(c) => ok(json!({ "task": c.task, "lease_until": rfc3339(c.lease_until) })),
+            Some(c) => ok(claim_json(&c)),
         }
     }
 
@@ -810,17 +852,17 @@ impl McpServer {
             .claim(&p.id, lease(p.lease_seconds))
             .await
             .map_err(mcp_err)?;
-        ok(json!({ "task": c.task, "lease_until": rfc3339(c.lease_until) }))
+        ok(claim_json(&c))
     }
 
     #[tool(
-        description = "Renew your lease on a task. Refused if the lease already expired: stop work, the task is back in the pool. The returned task shows whether it was invalidated meanwhile."
+        description = "Renew your lease on a task. Refused if the lease already expired, or the task was claimed again since: stop work, and leave what you learned with late_handoff. The returned task shows whether it was invalidated meanwhile."
     )]
-    async fn heartbeat(&self, p: Parameters<LeaseParams>) -> Result<CallToolResult, McpError> {
+    async fn heartbeat(&self, p: Parameters<HeartbeatParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
         let t = self
             .memory
-            .heartbeat(&p.id, lease(p.lease_seconds))
+            .heartbeat(&p.id, p.generation, lease(p.lease_seconds))
             .await
             .map_err(mcp_err)?;
         ok(json!({ "task": t }))
@@ -833,7 +875,7 @@ impl McpServer {
         let p = p.0;
         let t = self
             .memory
-            .complete(&p.id, &p.handoff)
+            .complete(&p.id, p.generation, &p.handoff)
             .await
             .map_err(mcp_err)?;
         ok(json!({ "task": t }))
@@ -846,7 +888,23 @@ impl McpServer {
         let p = p.0;
         let t = self
             .memory
-            .release(&p.id, p.handoff.as_deref())
+            .release(&p.id, p.generation, p.handoff.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Leave a handoff on a task after your claim on it is over: the lease ran out, or the task was claimed again. Write the handoff first with `write`. It changes nothing of the task; the next holder reads it with get_task."
+    )]
+    async fn late_handoff(
+        &self,
+        p: Parameters<LateHandoffParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .handoff_after(&p.id, p.generation, &p.handoff)
             .await
             .map_err(mcp_err)?;
         ok(json!({ "task": t }))
@@ -868,10 +926,17 @@ impl McpServer {
         ok(json!({ "task": t }))
     }
 
-    #[tool(description = "One task, with its status, holder, lease, and handoff.")]
+    #[tool(
+        description = "One task, with its status, holder, lease, generation and handoff, the handoffs that earlier holders left after their claims, and the claims of it that were refused."
+    )]
     async fn get_task(&self, p: Parameters<TaskIdParams>) -> Result<CallToolResult, McpError> {
         let t = self.memory.get_task(&p.0.id).await.map_err(mcp_err)?;
-        ok(json!({ "task": t }))
+        let (late, refused) = self.memory.task_record(&p.0.id).await.map_err(mcp_err)?;
+        let refused: Vec<Value> = refused
+            .into_iter()
+            .map(|(holder, why)| json!({ "holder": holder, "why": why }))
+            .collect();
+        ok(json!({ "task": t, "late_handoffs": late, "refused_claims": refused }))
     }
 
     #[tool(description = "Tasks in a domain with a status, ranked as the queue ranks them.")]
@@ -1137,7 +1202,7 @@ mod tests {
         assert_eq!(limit(Some(0)), 1);
         assert_eq!(limit(Some(10_000)), MAX_LIMIT);
         assert!(task_status(Some("nope".into())).is_err());
-        assert_eq!(task_status(None).unwrap(), dm_ledger::Status::Admitted);
+        assert_eq!(task_status(None).unwrap(), dm_ledger::Status::Open);
         assert!(confidence(Some("sure")).is_err());
         assert_eq!(
             confidence(Some("high")).unwrap(),
@@ -1339,7 +1404,7 @@ mod tests {
         };
         assert!(s.write(Parameters(bad_label)).await.is_err());
         let bad_status = ListTasksParams {
-            status: Some("done".into()),
+            status: Some("finished".into()),
             ..ListTasksParams::default()
         };
         assert!(s.list_tasks(Parameters(bad_status)).await.is_err());
@@ -1374,9 +1439,9 @@ mod tests {
         assert_eq!(claimed["task"]["id"], id);
         assert!(claimed["lease_until"].as_str().unwrap().ends_with('Z'));
 
-        s.heartbeat(Parameters(LeaseParams {
+        s.heartbeat(Parameters(HeartbeatParams {
             id: id.clone(),
-            ..LeaseParams::default()
+            ..HeartbeatParams::default()
         }))
         .await
         .unwrap();
@@ -1384,6 +1449,7 @@ mod tests {
         let missing = CompleteParams {
             id: id.clone(),
             handoff: "mem-me-missing".into(),
+            ..CompleteParams::default()
         };
         assert!(s.complete(Parameters(missing)).await.is_err());
         let h = write_handoff(&s, "Done.").await;
@@ -1391,11 +1457,12 @@ mod tests {
             &s.complete(Parameters(CompleteParams {
                 id: id.clone(),
                 handoff: h.clone(),
+                ..CompleteParams::default()
             }))
             .await
             .unwrap(),
         );
-        assert_eq!(done["task"]["status"], "completed");
+        assert_eq!(done["task"]["status"], "done");
         let got = payload(&s.get_task(Parameters(TaskIdParams { id })).await.unwrap());
         assert_eq!(got["task"]["handoff"], h);
     }
@@ -1417,11 +1484,12 @@ mod tests {
             &s.release(Parameters(ReleaseParams {
                 id: id.clone(),
                 handoff: None,
+                ..ReleaseParams::default()
             }))
             .await
             .unwrap(),
         );
-        assert_eq!(r["task"]["status"], "admitted");
+        assert_eq!(r["task"]["status"], "open");
         let inv = payload(
             &s.invalidate_task(Parameters(InvalidateParams {
                 id,

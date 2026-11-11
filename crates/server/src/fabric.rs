@@ -247,10 +247,12 @@ impl Memory {
         let domain = self.resolve_domain(domain)?;
         let (rubric, from) = self.rubric();
         let mut l = self.ledger.lock().await;
-        let mut open = l.list(&domain, Status::Admitted).await?;
+        let mut open = l.list(&domain, Status::Open).await?;
+        // a blocked task is ranked too: it lends its rank to what blocks it
+        open.extend(l.list(&domain, Status::Blocked).await?);
         open.extend(l.list(&domain, Status::Proposed).await?);
         let claimed = l.list(&domain, Status::Claimed).await?;
-        let completed = l.list(&domain, Status::Completed).await?;
+        let completed = l.list(&domain, Status::Done).await?;
         let now = OffsetDateTime::now_utc();
         let mut ranks: Ranks = HashMap::new();
         for t in &open {
@@ -340,9 +342,10 @@ impl Memory {
         let mut waiting = Vec::new();
         for status in [
             Status::Proposed,
-            Status::Admitted,
+            Status::Open,
+            Status::Blocked,
             Status::Claimed,
-            Status::Completed,
+            Status::Done,
             Status::Invalidated,
         ] {
             for t in self.read_tasks(l.list(&domain, status).await?)? {
@@ -357,8 +360,8 @@ impl Memory {
                             .entry(t.reason.clone().unwrap_or_default())
                             .or_default() += 1;
                     }
-                    Status::Completed => done_caps.extend(t.spec.requirements.clone()),
-                    Status::Admitted => waiting.push(t),
+                    Status::Done => done_caps.extend(t.spec.requirements.clone()),
+                    Status::Open | Status::Blocked => waiting.push(t),
                     _ => {}
                 }
             }

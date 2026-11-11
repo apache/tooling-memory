@@ -59,6 +59,9 @@ term here in the same commit as the first document that needs it.
 | ceiling | The highest label that a destination or a tap may get | limit (for a ceiling), cap (for a ceiling) |
 | destination | A place that the grants name for model calls: a model provider or a gateway | target (for a destination), endpoint (for a destination) |
 | trust tier | `raw`, `curated` or `verified`: how far an entry has been checked | label (for a tier) |
+| task state | `proposed`, `open`, `blocked`, `claimed`, `done` or `invalidated`: where a task is on the ledger | admitted (for `open`), completed (for `done`), status (for a state in prose) |
+| generation | The number of a claim of a task. Each claim gets the next number. A heartbeat, a completion and a release carry it, and the ledger refuses an earlier one | attempt (for a generation), fencing token |
+| late handoff | A handoff that a holder leaves on a task after its claim is over | |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |

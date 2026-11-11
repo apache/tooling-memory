@@ -157,9 +157,10 @@ impl From<LabelArg> for Label {
 #[derive(Clone, Copy, ValueEnum)]
 enum StatusArg {
     Proposed,
-    Admitted,
+    Open,
     Claimed,
-    Completed,
+    Blocked,
+    Done,
     Invalidated,
 }
 
@@ -167,9 +168,10 @@ impl From<StatusArg> for Status {
     fn from(s: StatusArg) -> Status {
         match s {
             StatusArg::Proposed => Status::Proposed,
-            StatusArg::Admitted => Status::Admitted,
+            StatusArg::Open => Status::Open,
             StatusArg::Claimed => Status::Claimed,
-            StatusArg::Completed => Status::Completed,
+            StatusArg::Blocked => Status::Blocked,
+            StatusArg::Done => Status::Done,
             StatusArg::Invalidated => Status::Invalidated,
         }
     }
@@ -1120,7 +1122,7 @@ enum TaskOp {
     Admit { id: String },
     /// Tasks with a status.
     List {
-        #[arg(long, value_enum, default_value = "admitted")]
+        #[arg(long, value_enum, default_value = "open")]
         status: StatusArg,
         #[arg(long)]
         domain: Option<String>,
@@ -1132,19 +1134,39 @@ enum TaskOp {
         #[arg(long, default_value_t = 1800)]
         lease_seconds: i64,
     },
-    /// Renew a lease.
+    /// Renew a lease, under the claim of the generation that `claim-next` printed.
     Heartbeat {
         id: String,
+        /// The generation of the claim: the task's `generation` when it was claimed.
+        #[arg(long)]
+        generation: u64,
         #[arg(long, default_value_t = 1800)]
         lease_seconds: i64,
     },
     /// Complete a task with a handoff entry id.
-    Complete { id: String, handoff: String },
+    Complete {
+        id: String,
+        handoff: String,
+        /// The generation of the claim.
+        #[arg(long)]
+        generation: u64,
+    },
     /// Give a task back, optionally with a handoff for the next claimant.
     Release {
         id: String,
+        /// The generation of the claim.
+        #[arg(long)]
+        generation: u64,
         #[arg(long)]
         handoff: Option<String>,
+    },
+    /// Leave a handoff on a task after the claim of that generation is over.
+    LateHandoff {
+        id: String,
+        handoff: String,
+        /// The generation of the claim that was held.
+        #[arg(long)]
+        generation: u64,
     },
     /// Close a task without doing it, and everything still open that was filed from it.
     Invalidate {
@@ -3895,7 +3917,7 @@ impl Session {
         std::fs::remove_file(&self.p.socket).ok();
         std::fs::remove_dir_all(&self.p.projection).ok();
         if let Some(id) = work::holding() {
-            self.p.memory.release(&id, None).await.ok();
+            self.p.memory.release(&id, None, None).await.ok();
         }
     }
 
@@ -4253,7 +4275,11 @@ async fn open_curation_tasks(
     domain: &str,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut n = 0;
-    for status in [dm_ledger::Status::Proposed, dm_ledger::Status::Admitted] {
+    for status in [
+        dm_ledger::Status::Proposed,
+        dm_ledger::Status::Open,
+        dm_ledger::Status::Blocked,
+    ] {
         n += m
             .tasks(Some(domain), status)
             .await?
@@ -4835,6 +4861,36 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
     }
 }
 
+/// What the holder of a claim does under it: each names the generation of the claim.
+async fn held_task(m: &Memory, op: TaskOp) -> Fallible {
+    match op {
+        TaskOp::Heartbeat {
+            id,
+            generation,
+            lease_seconds,
+        } => {
+            let lease = Duration::seconds(lease_seconds);
+            json(&m.heartbeat(&id, Some(generation), lease).await?)
+        }
+        TaskOp::Complete {
+            id,
+            handoff,
+            generation,
+        } => json(&m.complete(&id, Some(generation), &handoff).await?),
+        TaskOp::Release {
+            id,
+            generation,
+            handoff,
+        } => json(&m.release(&id, Some(generation), handoff.as_deref()).await?),
+        TaskOp::LateHandoff {
+            id,
+            handoff,
+            generation,
+        } => json(&m.handoff_after(&id, Some(generation), &handoff).await?),
+        _ => Ok(()),
+    }
+}
+
 /// `amem task rescore` and `amem task stats`: the fabric's ranking and its telemetry.
 async fn fabric_cmd(m: &Memory, op: TaskOp) -> Fallible {
     match op {
@@ -4885,11 +4941,10 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
                 Ok(())
             }
         },
-        TaskOp::Heartbeat { id, lease_seconds } => {
-            json(&m.heartbeat(&id, Duration::seconds(lease_seconds)).await?)
-        }
-        TaskOp::Complete { id, handoff } => json(&m.complete(&id, &handoff).await?),
-        TaskOp::Release { id, handoff } => json(&m.release(&id, handoff.as_deref()).await?),
+        op @ (TaskOp::Heartbeat { .. }
+        | TaskOp::Complete { .. }
+        | TaskOp::Release { .. }
+        | TaskOp::LateHandoff { .. }) => held_task(m, op).await,
         TaskOp::Invalidate { id, reason } => json(&m.invalidate(&id, &reason, None).await?),
         TaskOp::Tree { id } => json(&m.task_tree(&id).await?),
         TaskOp::Retry { id } => json(&m.retry_task(&id).await?),

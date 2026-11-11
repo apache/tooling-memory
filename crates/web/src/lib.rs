@@ -938,9 +938,9 @@ async fn tasks(State(app): State<App>) -> Response {
     let mut all = Vec::new();
     for status in [
         Status::Claimed,
-        Status::Admitted,
+        Status::Open,
         Status::Proposed,
-        Status::Completed,
+        Status::Done,
         Status::Invalidated,
     ] {
         match m.tasks(Some(&domain), status).await {
@@ -1016,6 +1016,10 @@ async fn claim_task(State(app): State<App>, Path(id): Path<String>) -> Response 
 struct Handoff {
     #[serde(default)]
     handoff: String,
+    /// The generation of the claim the page shows: a page that shows an earlier claim
+    /// is refused by it. Without one, the claim this server made is the one meant.
+    #[serde(default)]
+    generation: Option<u64>,
 }
 
 /// Complete a task the person holds: the handoff text becomes a handoff entry, and the
@@ -1058,7 +1062,7 @@ async fn complete_task(
         Ok(w) => w,
         Err(e) => return task_error(&e),
     };
-    match m.complete(&id, &written.id).await {
+    match m.complete(&id, h.generation, &written.id).await {
         Ok(t) => Json(json!({ "task": t, "handoff": written.id })).into_response(),
         Err(e) => task_error(&e),
     }
@@ -2250,7 +2254,7 @@ mod tests {
         .await;
         assert_eq!(status, 200, "{body}");
         let done: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(done["task"]["status"], "completed");
+        assert_eq!(done["task"]["status"], "done");
         assert!(done["handoff"].as_str().unwrap().starts_with("mem-"));
         let (status, tree) = get_json(addr, &format!("/api/tasks/{id}/tree")).await;
         assert_eq!(status, 200);

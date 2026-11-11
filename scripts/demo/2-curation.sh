@@ -12,11 +12,11 @@ a curate --auth gateway --model "$AUDITOR_MODEL" --sample 6 --contradictions --b
   | j "f\"  proposals {d['proposals']}, filed {d['filed']}; checked {d['checked']}, summaries rejected {d['rejected']}, contradictions {d['contradictions']}; quarantine reviewed {d['reviewed']}; canaries tripped {d['canaries_tripped']}; alarms {d['alarms']}; rescored {d['rescored']}\n  the auditor ({d['auditor_model']}) made {d['calls']} calls, {d['tokens_in']} tokens in and {d['tokens_out']} out, under a budget of {d['budget_tokens']}\""
 
 say "What it filed, as the rubric ranks it" "Curation does not edit the record itself: it files tasks on the same ledger every agent works from, ranked by the rubric."
-a task list --domain dom-demo --status admitted \
+a task list --domain dom-demo --status open \
   | j "'\n'.join(f\"  {t['priority']:>3}  {t['id']}  {t['title']}\" for t in d if (t.get('origin') or '').startswith(('curator:','auditor:')))"
 
 say "A curator run" "$WORKER_HARNESS on the gateway's $WORKER_MODEL claims the top curation task and does it. An entry rewritten while holding a curator's task lands one tier up, curated, and never further on an agent's word."
-top=$(a task list --domain dom-demo --status admitted | j "next((t['id'] for t in d if (t.get('origin') or '').startswith(('curator:','auditor:'))), '')")
+top=$(a task list --domain dom-demo --status open | j "next((t['id'] for t in d if (t.get('origin') or '').startswith(('curator:','auditor:'))), '')")
 if [ -n "$top" ]; then
   ( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --lease-seconds 900 --task "$top" 2>&1 | grep -E '^amem: (claimed|task|prefetched)' ) || true
 else

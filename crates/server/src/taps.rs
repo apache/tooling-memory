@@ -132,7 +132,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            m.complete(&task.id, &h.id).await.unwrap();
+            m.complete(&task.id, None, &h.id).await.unwrap();
         }
         task.id
     }
@@ -246,7 +246,7 @@ mod tests {
             })
             .await
             .unwrap();
-        owner.complete(&other, &h.id).await.unwrap();
+        owner.complete(&other, None, &h.id).await.unwrap();
         (owner, other)
     }
 
@@ -342,7 +342,16 @@ mod tests {
             )
             .await
             .unwrap();
-            l.complete(&t.id, "w", &h.id).await.unwrap();
+            l.complete(
+                &t.id,
+                dm_ledger::Held {
+                    holder: "w",
+                    generation: 1,
+                },
+                &h.id,
+            )
+            .await
+            .unwrap();
             t.id
         };
         let tap = Memory::open(dir.path())
@@ -404,7 +413,16 @@ mod tests {
             )
             .await
             .unwrap();
-            l.complete(&t.id, "w", &h.id).await.unwrap();
+            l.complete(
+                &t.id,
+                dm_ledger::Held {
+                    holder: "w",
+                    generation: 1,
+                },
+                &h.id,
+            )
+            .await
+            .unwrap();
             t.id
         };
         let tap = Memory::open(dir.path())
