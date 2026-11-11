@@ -54,6 +54,26 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
     }
 }
 
+/// The text of one entry file of a bundle, read up to the bound an entry holds and no
+/// further: what the file system says of a file's size is not asked, since a file that
+/// is no regular file answers nothing true.
+fn read_entry(path: &Path, name: &str) -> Result<String, Error> {
+    use std::io::Read;
+    let max = crate::MAX_ENTRY_BYTES;
+    let file = std::fs::File::open(path).map_err(io(path))?;
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io(path))?;
+    if bytes.len() > max {
+        return Err(Error::Invalid(format!(
+            "{name} has more than {max} bytes; an entry holds at most that"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|e| io(path)(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
 /// The outcome of an export.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Exported {
@@ -431,16 +451,7 @@ fn check_entries(
     for m in &manifest.entries {
         plain_name(&m.path)?;
         let path = src.join(&m.path);
-        // a file's rendered frontmatter is a few hundred bytes of the bound's megabytes
-        let size = std::fs::metadata(&path).map_err(io(&path))?.len();
-        if size > crate::MAX_ENTRY_BYTES as u64 + 64 * 1024 {
-            return Err(Error::Invalid(format!(
-                "{} has {size} bytes; an entry holds at most {}",
-                m.path,
-                crate::MAX_ENTRY_BYTES
-            )));
-        }
-        let text = std::fs::read_to_string(&path).map_err(io(&path))?;
+        let text = read_entry(&path, &m.path)?;
         if digest(&text) != m.digest {
             return Err(Error::Invalid(format!(
                 "{} does not match its manifest digest",

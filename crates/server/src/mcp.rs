@@ -47,6 +47,33 @@ fn mcp_err(e: Error) -> McpError {
     }
 }
 
+/// The most bytes a reply may take as one line of the transport. The transport drops a
+/// longer line and answers nothing, and the caller waits; under this, with room for the
+/// envelope, a reply that is too long is refused in words.
+pub const MAX_REPLY_BYTES: usize = 12 * 1024 * 1024;
+
+/// A reply as it was, or a refusal that says how long it was. The length is the reply's
+/// own serialised form: its text is a JSON string inside JSON, so a quote costs more
+/// bytes on the line than in the entry.
+fn bounded(reply: Result<CallToolResponse, McpError>) -> Result<CallToolResponse, McpError> {
+    let reply = reply?;
+    // only a completed call carries content; the other kinds are a few fields
+    let CallToolResponse::Complete(result) = &reply else {
+        return Ok(reply);
+    };
+    let bytes = serde_json::to_vec(result).map_or(usize::MAX, |v| v.len());
+    if bytes > MAX_REPLY_BYTES {
+        return Err(McpError::invalid_params(
+            format!(
+                "the reply has {bytes} bytes and a reply holds at most {MAX_REPLY_BYTES}: \
+                 ask for less, with a smaller limit or one entry at a time"
+            ),
+            None,
+        ));
+    }
+    Ok(reply)
+}
+
 fn ok(value: Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::json(value)?]))
 }
@@ -895,11 +922,10 @@ fn t0_uri(domain: &str) -> String {
     format!("memory://t0/{domain}")
 }
 
-#[tool_handler(router = self.tool_router)]
-impl ServerHandler for McpServer {
-    /// Every call goes through the router, as the macro would route it; a harness's call
-    /// is kept on the session's tape, and in a re-run answered from the tape first.
-    async fn call_tool(
+impl McpServer {
+    /// One call through the router; a harness's call is kept on the session's tape, and in
+    /// a re-run answered from the tape first.
+    async fn routed(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
@@ -950,6 +976,19 @@ impl ServerHandler for McpServer {
             eprintln!("amem: {tool} was not kept on the tape: {e}");
         }
         result
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for McpServer {
+    /// Every call goes through the router, as the macro would route it; a harness's call
+    /// is kept on the session's tape, and in a re-run answered from the tape first.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        bounded(self.routed(request, context).await)
     }
 
     fn get_info(&self) -> ServerConfig {

@@ -453,6 +453,47 @@ mod tests {
         (dir, memory, client)
     }
 
+    /// A reply the transport would drop is refused in words, and the connection goes on:
+    /// each entry here is inside the bound an entry holds.
+    #[tokio::test]
+    async fn a_reply_too_long_for_the_transport_is_refused_in_words() {
+        let (_dir, memory, client) = pair().await;
+        let within = std::time::Duration::from_secs(120);
+        let write = |body: String| {
+            let memory = memory.clone();
+            async move {
+                let req = dm_server::WriteRequest {
+                    body,
+                    ..dm_server::WriteRequest::default()
+                };
+                memory.write(req).await.unwrap().id
+            }
+        };
+        // a quote takes more bytes on the line than in the entry
+        let quotes = write("\"\"\"\" ".repeat(760 * 1024)).await;
+        let got = tokio::time::timeout(within, client.call("get", json!({ "id": quotes })))
+            .await
+            .expect("an answer, not silence");
+        let why = got.unwrap_err().to_string();
+        assert!(why.contains("a reply holds at most"), "{why}");
+        // several entries in one reply: each title is a heading of megabytes
+        for _ in 0..5 {
+            write(format!("# {}\n\nneedle\n", "word ".repeat(600 * 1024))).await;
+        }
+        let got = tokio::time::timeout(within, client.call("list", json!({})))
+            .await
+            .expect("an answer, not silence");
+        let why = got.unwrap_err().to_string();
+        assert!(why.contains("a reply holds at most"), "{why}");
+        // the same connection still answers, and a plain entry of that size comes back
+        let plain = write("word ".repeat(760 * 1024)).await;
+        let got = tokio::time::timeout(within, client.get(&plain))
+            .await
+            .expect("an answer")
+            .unwrap();
+        assert!(got.body.len() >= 3 * 1024 * 1024);
+    }
+
     #[tokio::test]
     async fn the_ledger_round_trip_through_the_tool_surface() {
         let (_dir, memory, client) = pair().await;
