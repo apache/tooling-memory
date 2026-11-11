@@ -7468,6 +7468,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bundle_of_another_format_is_refused_and_nothing_lands() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Memory::init(a_dir.path(), "human:test:alice", "dom-a").unwrap();
+        a.write(WriteRequest {
+            classification: Some(Label::Public),
+            ..req("Alice decided.\n")
+        })
+        .await
+        .unwrap();
+        let bundle_dir = tempfile::tempdir().unwrap();
+        a.export(None, Label::Internal, bundle_dir.path())
+            .await
+            .unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Memory::init(b_dir.path(), "human:test:bob", "dom-b").unwrap();
+        let manifest = bundle_dir.path().join("manifest.yaml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert!(text.contains(dm_core::manifest::FORMAT));
+        let old = text.replace(dm_core::manifest::FORMAT, "durable-memory/bundle/0");
+        std::fs::write(&manifest, old).unwrap();
+        let refused = b.import(bundle_dir.path(), None).await;
+        assert!(
+            matches!(&refused, Err(Error::Bundle(bundle::Error::Invalid(why))) if why.contains("bundle/0")),
+            "{:?}",
+            refused.map(|i| i.written)
+        );
+        assert_eq!(b.search("Alice", None, 10).await.unwrap().len(), 0);
+        // the same bundle in this format lands
+        std::fs::write(&manifest, text).unwrap();
+        assert_eq!(
+            b.import(bundle_dir.path(), None)
+                .await
+                .unwrap()
+                .written
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn a_handling_cap_lowers_what_the_session_reads() {
         let dir = tempfile::tempdir().unwrap();
         {

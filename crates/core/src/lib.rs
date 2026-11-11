@@ -274,6 +274,26 @@ pub enum Error {
 
 const FENCE: &str = "---";
 
+/// Whether a frontmatter block has the key `source`, its own or one a merge key brings.
+fn names_source(block: &serde_norway::Value) -> bool {
+    use serde_norway::Value;
+    let name = |key: &Value| match key {
+        Value::Tagged(t) => t.value.as_str().map(str::to_string),
+        other => other.as_str().map(str::to_string),
+    };
+    let Some(map) = block.as_mapping() else {
+        return false;
+    };
+    map.iter().any(|(key, value)| match name(key).as_deref() {
+        Some("source") => true,
+        Some("<<") => match value {
+            Value::Sequence(merged) => merged.iter().any(names_source),
+            one => names_source(one),
+        },
+        _ => false,
+    })
+}
+
 impl Entry {
     /// Parse `---\nyaml\n---\nbody`.
     ///
@@ -307,8 +327,11 @@ impl Entry {
             return Err(Error::NoFrontmatter);
         }
         // an entry of the format that named this field `source`: read as it stands, it
-        // would lose its citations without a word
-        if yaml.lines().any(|l| l.starts_with("source:")) {
+        // would lose its citations without a word. The key is looked for in the parsed
+        // block, since YAML spells one key many ways and a line of a value is no key. The
+        // block is read a second time for this alone: typed through it, a title of `2026`
+        // would be a number and no title
+        if serde_norway::from_str::<serde_norway::Value>(&yaml).is_ok_and(|b| names_source(&b)) {
             return Err(Error::Invalid(
                 "the `source` field is `cites` in this format; this entry is of an older one"
                     .into(),
@@ -494,9 +517,51 @@ mod tests {
             Entry::parse(&new).unwrap().front.cites,
             ["https://example.org/a"]
         );
-        // the word in a body is text, not the field
+        // however YAML spells the key
+        for spelt in [
+            "\"source\":\n- a\n",
+            "'source':\n- a\n",
+            "source :\n- a\n",
+            "? source\n: - a\n",
+            "!!str source:\n- a\n",
+            "!x source:\n- a\n",
+            "<<: {source: [a]}\n",
+            "<<:\n- {source: [a]}\n",
+            "cites:\n- b\n\"source\":\n- a\n",
+        ] {
+            let refused = Entry::parse(&format!("{head}{spelt}---\n\nA fact.\n"));
+            assert!(
+                matches!(&refused, Err(Error::Invalid(_))),
+                "{spelt:?}: {refused:?}"
+            );
+        }
+        let flow = "---\n{id: mem-x-1, type: fact, domain: dom-x, author: 'human:local:me', created: 2026-10-01T10:00:00Z, source: [a]}\n---\n\nA fact.\n";
+        assert!(matches!(Entry::parse(flow), Err(Error::Invalid(_))));
+        let indented = head.replace("---\n", "").replace('\n', "\n  ");
+        let indented = format!("---\n  {indented}source: [a]\n---\n\nA fact.\n");
+        assert!(
+            matches!(Entry::parse(&indented), Err(Error::Invalid(_))),
+            "{indented}"
+        );
+    }
+
+    #[test]
+    fn text_that_is_not_the_old_key_is_read_as_before() {
+        let head = "---\nid: mem-x-1\ntype: fact\ndomain: dom-x\nauthor: human:local:me\ncreated: 2026-10-01T10:00:00Z\n";
+        // a value that YAML would read as a number is still the text the field holds
+        let number = format!("{head}title: 2026\ncites:\n- 61\n---\n\nA fact.\n");
+        let number = Entry::parse(&number).unwrap();
+        assert_eq!(number.front.title.as_deref(), Some("2026"));
+        assert_eq!(number.front.cites, ["61"]);
+        // the word in a body, or in a value that runs over a line, is text and no field
         let body = format!("{head}---\n\nsource: a line of the body\n");
         assert!(Entry::parse(&body).unwrap().front.cites.is_empty());
+        let value =
+            format!("{head}summary: \"first line\nsource: of the river\"\n---\n\nA fact.\n");
+        assert_eq!(
+            Entry::parse(&value).unwrap().front.summary.as_deref(),
+            Some("first line source: of the river")
+        );
     }
 
     #[test]
