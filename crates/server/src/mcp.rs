@@ -215,7 +215,7 @@ pub struct WriteParams {
     pub domain: Option<String>,
     /// Links or citations this was distilled from.
     #[serde(default)]
-    pub source: Vec<String>,
+    pub cites: Vec<String>,
     /// high, medium, or low.
     #[serde(default)]
     pub confidence: Option<String>,
@@ -543,7 +543,7 @@ impl McpServer {
             "created": rfc3339(f.created),
             "trust_tier": f.trust_tier.to_string(),
             "classification": f.classification.to_string(),
-            "source": f.source,
+            "cites": f.cites,
             "supersedes": f.supersedes,
             "review_by": f.review_by.map(|d| d.to_string()),
             "title": e.title(),
@@ -579,7 +579,7 @@ impl McpServer {
             entry_type: parse("entry_type", p.entry_type)?.unwrap_or_default(),
             title: p.title,
             body: p.body,
-            source: p.source,
+            cites: p.cites,
             confidence: confidence(p.confidence.as_deref())?,
             classification: parse("classification", p.classification)?,
             supersedes: p.supersedes,
@@ -646,7 +646,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "One turn of a session's transcript, by citation: an entry's source `transcript:<session>#<turn>`. Served only when an entry you may read cites that turn; reading it raises your label as a get does. Recover from handoffs, not transcripts; this is for checking where an entry came from."
+        description = "One turn of a session's transcript, by citation: an entry's `cites` `transcript:<session>#<turn>`. Served only when an entry you may read cites that turn; reading it raises your label as a get does. Recover from handoffs, not transcripts; this is for checking where an entry came from."
     )]
     async fn transcript_turn(&self, p: Parameters<TurnParams>) -> Result<CallToolResult, McpError> {
         let r = self
@@ -1244,7 +1244,7 @@ mod tests {
             &s.write(Parameters(WriteParams {
                 body: "# Stopped at step 3\n\nResume with the digests.\n".into(),
                 entry_type: Some("handoff".into()),
-                source: vec!["https://example.org/run/1".into()],
+                cites: vec!["https://example.org/run/1".into()],
                 confidence: Some("high".into()),
                 classification: Some("public".into()),
                 review_by: Some("2027-01-01".into()),

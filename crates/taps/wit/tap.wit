@@ -46,8 +46,8 @@ interface memory {
         title: string,
         /// Markdown.
         body: string,
-        /// Links or citations this was distilled from.
-        source: list<string>,
+        /// What this drew on: links or entry ids.
+        cites: list<string>,
     }
 
     /// Write a proposal. Returns the new entry's id.

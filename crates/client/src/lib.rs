@@ -121,7 +121,7 @@ pub struct NewEntry<'a> {
     /// high, medium, or low.
     pub confidence: Option<&'a str>,
     /// Where it was distilled from.
-    pub source: Vec<String>,
+    pub cites: Vec<String>,
     /// A granted domain; the only one when omitted.
     pub domain: Option<&'a str>,
 }
@@ -282,7 +282,7 @@ impl MemoryClient {
                 "write",
                 json!({
                     "body": entry.body, "title": entry.title, "entry_type": entry.kind,
-                    "confidence": entry.confidence, "source": entry.source, "domain": entry.domain,
+                    "confidence": entry.confidence, "cites": entry.cites, "domain": entry.domain,
                 }),
             )
             .await?;
@@ -490,7 +490,7 @@ mod tests {
                 title: "Mined: the import has five steps",
                 body: "Five steps, the fourth is the slow one.",
                 confidence: Some("low"),
-                source: vec!["transcript:/home/user/.claude/projects/p/s.jsonl".into()],
+                cites: vec!["transcript:/home/user/.claude/projects/p/s.jsonl".into()],
                 domain: None,
             })
             .await

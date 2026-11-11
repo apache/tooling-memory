@@ -146,7 +146,7 @@ pub struct WriteRequest {
     pub body: String,
     /// Links or citations.
     #[serde(default)]
-    pub source: Vec<String>,
+    pub cites: Vec<String>,
     /// The author's confidence.
     #[serde(default)]
     pub confidence: Option<Confidence>,
@@ -307,7 +307,7 @@ const STAMP_STEP: Duration = Duration::minutes(1);
 /// it second. The last stamp is this service's own, so writes from another process on
 /// the same record are ordered by their own clocks. A stamp can run up to
 /// [`STAMP_STEP`] ahead of the clock, and a source file edited in that window has an
-/// mtime before the entry's `created`, so the librarian's source-change check misses it.
+/// mtime before the entry's `created`, so the curator's source-change check misses it.
 fn next_stamp(last: &mut OffsetDateTime, now: OffsetDateTime) -> OffsetDateTime {
     let at = if now > *last || *last - now > STAMP_STEP {
         now
@@ -874,7 +874,7 @@ impl Memory {
     }
 
     /// Every entry of a domain the archive holds, active or not, newest first: the
-    /// audit's view, for the librarian's own telemetry.
+    /// audit's view, for the curator's own telemetry.
     ///
     /// # Errors
     ///
@@ -1009,7 +1009,7 @@ impl Memory {
         };
         let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
         // facts decay fast and carry mandatory review dates (the paper, §4): one written
-        // without a date gets one ninety days out, which the librarian enforces
+        // without a date gets one ninety days out, which the curator enforces
         let review_by = req.review_by.or_else(|| {
             (req.entry_type == EntryType::Fact).then(|| now.date() + Duration::days(90))
         });
@@ -1020,7 +1020,7 @@ impl Memory {
                 domain: domain.clone(),
                 author: self.author.clone(),
                 created: now,
-                source: req.source,
+                cites: req.cites,
                 confidence: req.confidence,
                 trust_tier: tier,
                 review_by,
@@ -1067,7 +1067,7 @@ impl Memory {
     }
 
     /// The tier a write lands at: curated when it replaces an entry in a session working
-    /// a librarian's or the checker's task, which is what curation is; raw otherwise.
+    /// a curator's or the auditor's task, which is what curation is; raw otherwise.
     async fn tier_for_write(&self, supersedes: bool) -> TrustTier {
         if !supersedes {
             return TrustTier::Raw;
@@ -1079,7 +1079,7 @@ impl Memory {
             t.spec
                 .origin
                 .as_deref()
-                .is_some_and(|o| o.starts_with("librarian:") || o.starts_with("checker:"))
+                .is_some_and(|o| o.starts_with("curator:") || o.starts_with("auditor:"))
         });
         if curating {
             TrustTier::Curated
@@ -2034,8 +2034,8 @@ impl Memory {
         self.file_in(&mut l, spec, filing, held.as_ref()).await
     }
 
-    /// File a task the system files on the owner's behalf, as the librarian's survey,
-    /// the checker and the canaries do; admitted at once where the domain's grant
+    /// File a task the system files on the owner's behalf, as the curator's survey,
+    /// the auditor and the canaries do; admitted at once where the domain's grant
     /// admits its own filings, else born proposed for the owner to admit.
     ///
     /// # Errors
@@ -3048,7 +3048,7 @@ impl Memory {
                     continue;
                 };
                 let names_it = cites(&e.body, id)
-                    || e.front.source.iter().any(|s| cites(s, id))
+                    || e.front.cites.iter().any(|s| cites(s, id))
                     || e.front.supersedes.as_deref() == Some(id)
                     || read_then_wrote.contains(&other);
                 if !names_it || e.front.status == Some(Status::Erased) {
@@ -3590,7 +3590,7 @@ mod tests {
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
         let agent = Memory::open(dir.path())
             .unwrap()
-            .with_author("agent:librarian");
+            .with_author("agent:curator");
         let own = agent.write(req("The agent's fact.\n")).await.unwrap().id;
         let r = agent
             .promote(&theirs, TrustTier::Curated, "checked")
@@ -3630,9 +3630,9 @@ mod tests {
 
     const WHY: &str = "checked against the tree";
 
-    /// A session of the librarian, which did not write the owner's entries.
-    fn librarian(dir: &Path) -> Memory {
-        Memory::open(dir).unwrap().with_author("agent:librarian")
+    /// A session of the curator, which did not write the owner's entries.
+    fn curator(dir: &Path) -> Memory {
+        Memory::open(dir).unwrap().with_author("agent:curator")
     }
 
     /// Every task in the session's domain, whatever its status.
@@ -3656,7 +3656,7 @@ mod tests {
         let owner = mem(dir.path());
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
         let raw = owner.get(&theirs).await.unwrap();
-        let agent = librarian(dir.path());
+        let agent = curator(dir.path());
         let before = all_tasks(&agent).await;
         agent
             .promote(&theirs, TrustTier::Curated, WHY)
@@ -3671,7 +3671,7 @@ mod tests {
         assert_eq!(r.entry, theirs);
         assert_eq!(r.why, WHY);
         assert_eq!(r.tier, TrustTier::Curated);
-        assert_eq!(r.by, "agent:librarian");
+        assert_eq!(r.by, "agent:curator");
         assert_eq!(r.author, "human:test:me");
         assert_eq!(
             r.digest,
@@ -3693,14 +3693,14 @@ mod tests {
             .write(WriteRequest {
                 title: Some("The owner's fact".into()),
                 summary: Some("What the owner found.".into()),
-                source: vec!["https://example.org/fact".into()],
+                cites: vec!["https://example.org/fact".into()],
                 ..req("The owner's fact.\n")
             })
             .await
             .unwrap()
             .id;
         let old = owner.get(&theirs).await.unwrap();
-        librarian(dir.path())
+        curator(dir.path())
             .promote(&theirs, TrustTier::Curated, WHY)
             .await
             .unwrap();
@@ -3748,7 +3748,7 @@ mod tests {
         let owner = mem(dir.path());
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
         let kept = ledger_read_only(dir.path());
-        let refused = librarian(dir.path())
+        let refused = curator(dir.path())
             .promote(&theirs, TrustTier::Curated, WHY)
             .await;
         put_back(kept);
@@ -3758,7 +3758,7 @@ mod tests {
             TrustTier::Raw,
             "no promotion without its record"
         );
-        let agent = librarian(dir.path());
+        let agent = curator(dir.path());
         agent
             .promote(&theirs, TrustTier::Curated, WHY)
             .await
@@ -3784,7 +3784,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        let agent = librarian(dir.path());
+        let agent = curator(dir.path());
         let refused =
             with_record_read_only(dir.path(), agent.promote(&theirs, TrustTier::Curated, WHY))
                 .await;
@@ -3815,15 +3815,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        let first = librarian(dir.path());
+        let first = curator(dir.path());
         let refused =
             with_record_read_only(dir.path(), first.promote(&theirs, TrustTier::Curated, WHY))
                 .await;
         assert!(refused.is_err());
-        let checker = Memory::open(dir.path())
+        let auditor = Memory::open(dir.path())
             .unwrap()
-            .with_author("agent:checker");
-        checker
+            .with_author("agent:auditor");
+        auditor
             .promote(
                 &theirs,
                 TrustTier::Curated,
@@ -3831,7 +3831,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let said: Vec<(String, String)> = checker
+        let said: Vec<(String, String)> = auditor
             .promotions(&theirs)
             .await
             .unwrap()
@@ -3841,9 +3841,9 @@ mod tests {
         assert_eq!(
             said,
             vec![
-                ("agent:librarian".to_string(), WHY.to_string()),
+                ("agent:curator".to_string(), WHY.to_string()),
                 (
-                    "agent:checker".to_string(),
+                    "agent:auditor".to_string(),
                     "read it against the release notes".to_string()
                 ),
             ],
@@ -3856,7 +3856,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        let agent = librarian(dir.path());
+        let agent = curator(dir.path());
         agent
             .promote(&theirs, TrustTier::Curated, WHY)
             .await
@@ -3872,7 +3872,7 @@ mod tests {
         agent.reindex().await.unwrap();
         assert_eq!(agent.promotions(&theirs).await.unwrap(), before);
         assert_eq!(
-            librarian(dir.path()).promotions(&theirs).await.unwrap(),
+            curator(dir.path()).promotions(&theirs).await.unwrap(),
             before
         );
     }
@@ -3882,7 +3882,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let old = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        librarian(dir.path())
+        curator(dir.path())
             .promote(&old, TrustTier::Curated, WHY)
             .await
             .unwrap();
@@ -3894,7 +3894,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let reader = librarian(dir.path());
+        let reader = curator(dir.path());
         let kept = reader.promotions(&old).await.unwrap();
         assert_eq!(kept.len(), 1, "the why outlives the version it promoted");
         assert_eq!(kept[0].record.spec.why, WHY);
@@ -3907,11 +3907,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        librarian(dir.path())
+        curator(dir.path())
             .promote(&theirs, TrustTier::Curated, WHY)
             .await
             .unwrap();
-        let reader = librarian(dir.path());
+        let reader = curator(dir.path());
         reader.promotions(&theirs).await.unwrap();
         let after = reader
             .write(req("Something learned from the why.\n"))
@@ -3946,18 +3946,18 @@ mod tests {
             .await
             .unwrap()
             .id;
-        // a librarian that has read restricted text writes its why at restricted
-        let lib = librarian(dir.path());
+        // a curator that has read restricted text writes its why at restricted
+        let lib = curator(dir.path());
         lib.get(&secret).await.unwrap();
         assert_eq!(lib.label(), Label::Restricted);
         lib.promote(&public, TrustTier::Curated, WHY).await.unwrap();
-        let capped = librarian(dir.path()).with_handling_cap(Label::Public);
+        let capped = curator(dir.path()).with_handling_cap(Label::Public);
         assert!(
             capped.promotions(&public).await.unwrap().is_empty(),
             "a public reader does not get a restricted why"
         );
         assert_eq!(capped.label(), Label::Public, "and its label stays public");
-        let full = librarian(dir.path());
+        let full = curator(dir.path());
         let got = full.promotions(&public).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].record.spec.classification, Label::Restricted);
@@ -3980,11 +3980,11 @@ mod tests {
             .await
             .unwrap()
             .id;
-        librarian(dir.path())
+        curator(dir.path())
             .promote(&secret, TrustTier::Curated, WHY)
             .await
             .unwrap();
-        let capped = librarian(dir.path()).with_handling_cap(Label::Public);
+        let capped = curator(dir.path()).with_handling_cap(Label::Public);
         assert!(
             matches!(capped.promotions(&secret).await, Err(Error::NotFound(_))),
             "a session that may not read the entry may not read why it was promoted"
@@ -3994,7 +3994,7 @@ mod tests {
             capped.promotions("mem-none").await,
             Err(Error::NotFound(_))
         ));
-        let full = librarian(dir.path());
+        let full = curator(dir.path());
         assert_eq!(full.label(), Label::Public);
         assert_eq!(full.promotions(&secret).await.unwrap().len(), 1);
         assert_eq!(
@@ -4014,7 +4014,7 @@ mod tests {
             kept[0].spec.why.is_empty() && kept[0].why_erased,
             "{kept:?}"
         );
-        assert_eq!(kept[0].spec.by, "agent:librarian", "who stays");
+        assert_eq!(kept[0].spec.by, "agent:curator", "who stays");
         let conn = rusqlite::Connection::open(root.join(LEDGER_FILE)).unwrap();
         let mut stmt = conn.prepare("SELECT payload FROM events").unwrap();
         let payloads: Vec<String> = stmt
@@ -4038,7 +4038,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        librarian(dir.path())
+        curator(dir.path())
             .promote(
                 &secret,
                 TrustTier::Curated,
@@ -4066,7 +4066,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        librarian(dir.path())
+        curator(dir.path())
             .promote(&secret, TrustTier::Curated, "tried it on the vault")
             .await
             .unwrap();
@@ -4124,7 +4124,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let Promotion::Proposed { task } = librarian(dir.path())
+        let Promotion::Proposed { task } = curator(dir.path())
             .promote(&x, TrustTier::Verified, WHY)
             .await
             .unwrap()
@@ -4136,10 +4136,10 @@ mod tests {
             owner.approve(&task.id).await.is_err(),
             "the first proposal is stale"
         );
-        let checker = Memory::open(dir.path())
+        let auditor = Memory::open(dir.path())
             .unwrap()
-            .with_author("agent:checker");
-        let Promotion::Proposed { task: again } = checker
+            .with_author("agent:auditor");
+        let Promotion::Proposed { task: again } = auditor
             .promote(&x, TrustTier::Verified, "read it as it stands")
             .await
             .unwrap()
@@ -4164,8 +4164,8 @@ mod tests {
         assert_eq!(
             by,
             vec![
-                ("agent:librarian".to_string(), false),
-                ("agent:checker".to_string(), true)
+                ("agent:curator".to_string(), false),
+                ("agent:auditor".to_string(), true)
             ]
         );
     }
@@ -4191,13 +4191,13 @@ mod tests {
             classification: Label::Internal,
             priority: 3,
         };
-        let refused = librarian(dir.path()).create_task(squat.clone()).await;
+        let refused = curator(dir.path()).create_task(squat.clone()).await;
         assert!(
             matches!(&refused, Err(Error::Denied(why)) if why.contains("promote")),
             "a session files no approval task: {refused:?}"
         );
         // as a build from before records were kept filed it
-        let filed = librarian(dir.path()).file_own(squat).await.unwrap().task;
+        let filed = curator(dir.path()).file_own(squat).await.unwrap().task;
         let refused = owner.approve(&filed.id).await;
         assert!(
             matches!(&refused, Err(Error::Denied(why)) if why.contains("not a proposal to verify a version")),
@@ -4209,7 +4209,7 @@ mod tests {
         );
         assert!(owner.promotions(&x).await.unwrap().is_empty(), "no record");
         // a real proposal is a task of its own, closes the old one, and is approved
-        let Promotion::Proposed { task } = librarian(dir.path())
+        let Promotion::Proposed { task } = curator(dir.path())
             .promote(&x, TrustTier::Verified, WHY)
             .await
             .unwrap()
@@ -4240,7 +4240,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let Promotion::Proposed { task } = librarian(dir.path())
+        let Promotion::Proposed { task } = curator(dir.path())
             .promote(&x, TrustTier::Verified, "checked it on the vault")
             .await
             .unwrap()
@@ -4285,7 +4285,7 @@ mod tests {
                 .await
                 .unwrap()
                 .id;
-            let lib = librarian(dir.path());
+            let lib = curator(dir.path());
             // the steps of promote, by hand, with the erasure between them
             let (_, entry) = lib.find(&x).await.unwrap();
             owner.erase(&x, Reason::Requested).await.unwrap();
@@ -4326,7 +4326,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let lib = librarian(dir.path());
+        let lib = curator(dir.path());
         let (_, entry) = lib.find(&x).await.unwrap();
         let first = owner.erase(&x, Reason::Requested).await.unwrap();
         assert_eq!(first.promotion_whys_removed, 0);
@@ -4383,7 +4383,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let lib = librarian(dir.path());
+        let lib = curator(dir.path());
         lib.get(&secret).await.unwrap();
         let Promotion::Proposed { task: hidden } =
             lib.promote(&x, TrustTier::Verified, WHY).await.unwrap()
@@ -4391,11 +4391,11 @@ mod tests {
             panic!("verified is proposed")
         };
         assert_eq!(hidden.spec.classification, Label::Restricted);
-        let capped = librarian(dir.path()).with_handling_cap(Label::Public);
+        let capped = curator(dir.path()).with_handling_cap(Label::Public);
         let refused = capped.promote(&x, TrustTier::Verified, WHY).await;
         assert!(
             matches!(&refused, Err(Error::Denied(why)) if !why.contains(&hidden.id)
-                && !why.contains("agent:librarian")),
+                && !why.contains("agent:curator")),
             "{refused:?}"
         );
         assert_eq!(capped.label(), Label::Public);
@@ -4423,7 +4423,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let lib = librarian(dir.path());
+        let lib = curator(dir.path());
         let Promotion::Proposed { task } = lib.promote(&x, TrustTier::Verified, WHY).await.unwrap()
         else {
             panic!("verified is proposed")
@@ -4477,7 +4477,7 @@ mod tests {
             .unwrap()
             .id;
         let why = "checked against the tree and the release notes";
-        let Promotion::Proposed { task } = librarian(dir.path())
+        let Promotion::Proposed { task } = curator(dir.path())
             .promote(&id, TrustTier::Verified, why)
             .await
             .unwrap()
@@ -4489,7 +4489,7 @@ mod tests {
         let r = &proposed[0].record.spec;
         assert_eq!(
             (r.tier, r.why.as_str(), r.by.as_str()),
-            (TrustTier::Verified, why, "agent:librarian")
+            (TrustTier::Verified, why, "agent:curator")
         );
         assert!(!proposed[0].landed, "not until a person approves it");
         assert!(
@@ -4513,7 +4513,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let x = owner.write(req("A fact.\n")).await.unwrap().id;
-        let Promotion::Proposed { task } = librarian(dir.path())
+        let Promotion::Proposed { task } = curator(dir.path())
             .promote(&x, TrustTier::Verified, WHY)
             .await
             .unwrap()
@@ -4531,8 +4531,8 @@ mod tests {
             1,
             "bob's refused proposal was recorded"
         );
-        // the librarian asking again gets its own task back, and no second record
-        let Promotion::Proposed { task: again } = librarian(dir.path())
+        // the curator asking again gets its own task back, and no second record
+        let Promotion::Proposed { task: again } = curator(dir.path())
             .promote(&x, TrustTier::Verified, "still holds")
             .await
             .unwrap()
@@ -4546,17 +4546,17 @@ mod tests {
             .invalidate(&task.id, "does not hold", None)
             .await
             .unwrap();
-        let checker = Memory::open(dir.path())
+        let auditor = Memory::open(dir.path())
             .unwrap()
-            .with_author("agent:checker");
-        let refused = checker
+            .with_author("agent:auditor");
+        let refused = auditor
             .promote(&x, TrustTier::Verified, "I say it holds")
             .await;
         assert!(matches!(refused, Err(Error::Denied(_))), "{refused:?}");
         assert_eq!(
             recorded(&owner, &x).await,
             1,
-            "the checker's refused proposal was recorded"
+            "the auditor's refused proposal was recorded"
         );
     }
 
@@ -4573,7 +4573,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let x = owner.write(req("A fact.\n")).await.unwrap().id;
-        let Promotion::Proposed { task } = librarian(dir.path())
+        let Promotion::Proposed { task } = curator(dir.path())
             .promote(&x, TrustTier::Verified, WHY)
             .await
             .unwrap()
@@ -4619,7 +4619,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let Promotion::Proposed { task } = librarian(dir.path())
+        let Promotion::Proposed { task } = curator(dir.path())
             .promote(
                 &secret,
                 TrustTier::Verified,
@@ -4673,7 +4673,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        librarian(dir.path())
+        curator(dir.path())
             .promote(
                 &secret,
                 TrustTier::Verified,
@@ -4723,7 +4723,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let Promotion::Proposed { task } = librarian(dir.path())
+        let Promotion::Proposed { task } = curator(dir.path())
             .promote(&secret, TrustTier::Verified, "checked it on the vault")
             .await
             .unwrap()
@@ -4744,7 +4744,7 @@ mod tests {
         assert_eq!(kept[0].id, task.id, "the task keeps its id");
         assert_eq!(kept[0].status, Status::Invalidated, "and is closed");
         assert_eq!(
-            kept[0].spec.created_by, "agent:librarian",
+            kept[0].spec.created_by, "agent:curator",
             "who filed it stays"
         );
         assert!(
@@ -4774,12 +4774,12 @@ mod tests {
             .unwrap()
             .id;
         // as origin/main files it: no record, the why in the body, the title in the title
-        let filed = librarian(dir.path())
+        let filed = curator(dir.path())
             .file_own(TaskSpec {
                 domain: "dom-me".into(),
                 title: format!("Approve: verified for The vault opens with {marker}"),
                 body: format!(
-                    "`agent:librarian` proposes that `{secret}`, written by `human:test:me`, be promoted to verified.\n\ntried {marker} on the vault\n\nRead it with `amem get {secret}`."
+                    "`agent:curator` proposes that `{secret}`, written by `human:test:me`, be promoted to verified.\n\ntried {marker} on the vault\n\nRead it with `amem get {secret}`."
                 ),
                 requirements: vec!["human".into()],
                 depends_on: Vec::new(),
@@ -4809,7 +4809,7 @@ mod tests {
         );
     }
 
-    /// The owner's entry, promoted by the librarian with `why`, exported at `max`.
+    /// The owner's entry, promoted by the curator with `why`, exported at `max`.
     async fn promoted_then_exported(
         why: &str,
         max: Label,
@@ -4817,7 +4817,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let id = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        librarian(dir.path())
+        curator(dir.path())
             .promote(&id, TrustTier::Curated, why)
             .await
             .unwrap();
@@ -4977,7 +4977,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        librarian(dir.path())
+        curator(dir.path())
             .promote(&id, TrustTier::Curated, WHY)
             .await
             .unwrap();
@@ -5063,7 +5063,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let lib = librarian(dir.path());
+        let lib = curator(dir.path());
         lib.promote(&kept, TrustTier::Curated, WHY).await.unwrap();
         lib.promote(&gone, TrustTier::Curated, &format!("tried {marker}"))
             .await
@@ -5094,7 +5094,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let x = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        let lib = librarian(dir.path());
+        let lib = curator(dir.path());
         lib.promote(&x, TrustTier::Curated, WHY).await.unwrap();
         let b1 = tempfile::tempdir().unwrap();
         owner
@@ -5177,7 +5177,7 @@ mod tests {
         let there = mem(home.path());
         there.import(bundle.path(), None).await.unwrap();
         // the entry moves on here: verified, so its text is no longer the bundle's
-        let Promotion::Proposed { task } = librarian(home.path())
+        let Promotion::Proposed { task } = curator(home.path())
             .promote(&x, TrustTier::Verified, "checked it here")
             .await
             .unwrap()
@@ -5307,7 +5307,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let lib = librarian(dir.path());
+        let lib = curator(dir.path());
         lib.promote(&secret, TrustTier::Curated, "the restricted entry's why")
             .await
             .unwrap();
@@ -5339,7 +5339,7 @@ mod tests {
             .unwrap()
             .id;
         let kept = owner.write(req("The owner's fact.\n")).await.unwrap().id;
-        let lib = librarian(dir.path());
+        let lib = curator(dir.path());
         lib.promote(&secret, TrustTier::Curated, &format!("tried {marker}"))
             .await
             .unwrap();
@@ -5382,7 +5382,7 @@ mod tests {
             .await
             .unwrap()
             .id;
-        librarian(dir.path())
+        curator(dir.path())
             .promote(&secret, TrustTier::Curated, &format!("tried {marker}"))
             .await
             .unwrap();
@@ -5414,7 +5414,7 @@ mod tests {
         let theirs = owner.write(req("The owner's fact.\n")).await.unwrap().id;
         let agent = Memory::open(dir.path())
             .unwrap()
-            .with_author("agent:librarian");
+            .with_author("agent:curator");
         for to in [TrustTier::Curated, TrustTier::Verified] {
             let err = agent.promote(&theirs, to, " ").await.unwrap_err();
             assert!(err.to_string().contains("why"), "{to}: {err}");
@@ -5449,7 +5449,7 @@ mod tests {
             .id;
         let agent = Memory::open(dir.path())
             .unwrap()
-            .with_author("agent:librarian");
+            .with_author("agent:curator");
         let Promotion::Proposed { task } = agent
             .promote(&id, TrustTier::Verified, "checked against the tree")
             .await
@@ -5510,12 +5510,12 @@ mod tests {
         assert!(err.to_string().contains("verified"), "{err}");
     }
 
-    /// An entry written by the owner and proposed for verified by the librarian: the
+    /// An entry written by the owner and proposed for verified by the curator: the
     /// entry's id and the proposal task.
     async fn proposed(dir: &Path, owner: &Memory, body: &str) -> (String, Task) {
         let id = owner.write(req(body)).await.unwrap().id;
-        let librarian = Memory::open(dir).unwrap().with_author("agent:librarian");
-        let Promotion::Proposed { task } = librarian
+        let curator = Memory::open(dir).unwrap().with_author("agent:curator");
+        let Promotion::Proposed { task } = curator
             .promote(&id, TrustTier::Verified, "checked against the tree")
             .await
             .unwrap()
@@ -5615,11 +5615,11 @@ mod tests {
             Ok(other) => panic!("verified is proposed, not set: {other:?}"),
             Err(e) => assert!(e.to_string().contains(&task.id), "{e}"),
         }
-        // the librarian asking again is the same proposal
-        let librarian = Memory::open(dir.path())
+        // the curator asking again is the same proposal
+        let curator = Memory::open(dir.path())
             .unwrap()
-            .with_author("agent:librarian");
-        let Promotion::Proposed { task: again } = librarian
+            .with_author("agent:curator");
+        let Promotion::Proposed { task: again } = curator
             .promote(&id, TrustTier::Verified, "still holds")
             .await
             .unwrap()
@@ -5718,10 +5718,10 @@ mod tests {
             .invalidate(&task.id, "does not hold", None)
             .await
             .unwrap();
-        let librarian = Memory::open(dir.path())
+        let curator = Memory::open(dir.path())
             .unwrap()
-            .with_author("agent:librarian");
-        for who in [&librarian, &owner] {
+            .with_author("agent:curator");
+        for who in [&curator, &owner] {
             match who.promote(&id, TrustTier::Verified, "again").await {
                 Ok(Promotion::Proposed { task: t }) => assert!(
                     !t.status.is_terminal(),
@@ -5738,7 +5738,7 @@ mod tests {
             .promote(&id, TrustTier::Curated, "read it")
             .await
             .unwrap();
-        let Promotion::Proposed { task: fresh } = librarian
+        let Promotion::Proposed { task: fresh } = curator
             .promote(&id, TrustTier::Verified, "holds")
             .await
             .unwrap()
@@ -6007,7 +6007,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_librarians_rewrite_lands_curated() {
+    async fn a_curators_rewrite_lands_curated() {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let old = owner
@@ -6018,11 +6018,11 @@ mod tests {
         let task = owner
             .file_own(TaskSpec {
                 domain: "dom-me".into(),
-                title: "Librarian: rewrite".into(),
+                title: "Curator: rewrite".into(),
                 body: "b".into(),
                 requirements: Vec::new(),
                 depends_on: Vec::new(),
-                origin: Some("librarian:resummarise".into()),
+                origin: Some("curator:resummarise".into()),
                 upstream_event: Some("x".into()),
                 created_by: String::new(),
                 classification: Label::Public,
@@ -6033,7 +6033,7 @@ mod tests {
             .task;
         let lib = Memory::open(dir.path())
             .unwrap()
-            .with_author("agent:librarian");
+            .with_author("agent:curator");
         lib.set_held_task(&task.id);
         let new = lib
             .write(WriteRequest {
@@ -6267,7 +6267,7 @@ mod tests {
         .await;
         let curation = filed(
             &m,
-            tspec("Resummarise", -1, Some("librarian:resummarise"), &[], &[]),
+            tspec("Resummarise", -1, Some("curator:resummarise"), &[], &[]),
         )
         .await;
         let alarm = filed(
@@ -6328,7 +6328,7 @@ mod tests {
         let id = owner
             .write(WriteRequest {
                 entry_type: EntryType::Policy,
-                ..req("# This period\n\n```policy\nid = \"pol-L1-007\"\nlayer = 1\nrule = \"Prioritise subagent work over curation.\"\nintent = \"Delivery this period.\"\n\n[rubric]\nmaintenance_floor = 0.0\n\n[rubric.origin_weights]\n\"task:\" = 3\n\"librarian:\" = -2\n```\n")
+                ..req("# This period\n\n```policy\nid = \"pol-L1-007\"\nlayer = 1\nrule = \"Prioritise subagent work over curation.\"\nintent = \"Delivery this period.\"\n\n[rubric]\nmaintenance_floor = 0.0\n\n[rubric.origin_weights]\n\"task:\" = 3\n\"curator:\" = -2\n```\n")
             })
             .await
             .unwrap()
@@ -6340,7 +6340,7 @@ mod tests {
         assert_eq!(from, "pol-L1-007");
         assert_eq!(rubric.origin_weight(Some("task:task-x")), 3);
         let sub = filed(&owner, tspec("Sub", 0, Some("task:task-parent"), &[], &[])).await;
-        let lib = filed(&owner, tspec("Lib", 0, Some("librarian:merge"), &[], &[])).await;
+        let lib = filed(&owner, tspec("Lib", 0, Some("curator:merge"), &[], &[])).await;
         let r = owner.rescore(None).await.unwrap();
         assert_eq!(r.rubric, "pol-L1-007");
         let to = |id: &str| r.changed.iter().find(|c| c.id == id).map(|c| c.to);
@@ -6354,7 +6354,7 @@ mod tests {
         let m = mem(dir.path());
         done(&m, tspec("Shipped", 0, None, &[], &["deploy"])).await;
         filed(&m, tspec("Needs GPU", 0, None, &[], &["gpu"])).await;
-        let dead = filed(&m, tspec("Stale", 0, Some("librarian:verify"), &[], &[])).await;
+        let dead = filed(&m, tspec("Stale", 0, Some("curator:verify"), &[], &[])).await;
         m.ledger
             .lock()
             .await
@@ -6363,7 +6363,7 @@ mod tests {
             .unwrap();
         let st = m.task_stats(None).await.unwrap();
         assert_eq!(st["by_family"]["filed"]["completed"], 1);
-        assert_eq!(st["by_family"]["librarian"]["invalidated"], 1);
+        assert_eq!(st["by_family"]["curator"]["invalidated"], 1);
         assert_eq!(st["invalidated_because"]["obsolete"], 1);
         assert_eq!(st["unmatched_requirements"]["gpu"], 1, "{st}");
         assert!(st["unmatched_requirements"].get("deploy").is_none());
@@ -7810,7 +7810,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = mem(dir.path());
         let survey = TaskSpec {
-            origin: Some("librarian:stale".into()),
+            origin: Some("curator:stale".into()),
             upstream_event: Some("ev-1".into()),
             ..spec("Survey")
         };
@@ -8041,7 +8041,7 @@ mod tests {
                 .create(tspec(
                     "Resummarise",
                     -1,
-                    Some("librarian:resummarise"),
+                    Some("curator:resummarise"),
                     &[],
                     &[],
                 ))
@@ -8561,7 +8561,7 @@ mod tests {
         let c = m.write(req("Unrelated, and stays so.\n")).await.unwrap();
         let d = m
             .write(WriteRequest {
-                source: vec![a.id.clone()],
+                cites: vec![a.id.clone()],
                 ..req("Distilled from the vault entry.\n")
             })
             .await

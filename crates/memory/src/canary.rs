@@ -46,7 +46,7 @@ pub fn planted(root: &Path) -> Result<Vec<Canary>, Box<dyn std::error::Error>> {
     Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?)
 }
 
-/// The known-correct texts, numbered: each is a plain fact a librarian has no reason to
+/// The known-correct texts, numbered: each is a plain fact a curator has no reason to
 /// touch, with a summary that already entails it.
 fn text(n: usize) -> (String, String, String) {
     (
@@ -82,7 +82,7 @@ pub async fn plant(
                 entry_type: EntryType::Fact,
                 title: Some(title),
                 body: body.clone(),
-                source: vec!["canary".into()],
+                cites: vec!["canary".into()],
                 // a canary is not for review: its decay clock is the check
                 review_by: Some(
                     time::OffsetDateTime::now_utc().date() + time::Duration::days(3650),
@@ -160,7 +160,7 @@ pub async fn file(
                 domain: domain.to_string(),
                 title: format!("Canary tripped: {id}"),
                 body: format!(
-                    "The canary `{id}` was altered: {what}. A canary is a planted entry no curation pass should touch. Find which run changed it, from the entries that supersede it and the tasks that were worked, and judge whether that run's other writes are to be trusted; the record keeps every version, so what was changed can be inspected and reverted. This is for the owner, not for a librarian."
+                    "The canary `{id}` was altered: {what}. A canary is a planted entry no curation pass should touch. Find which run changed it, from the entries that supersede it and the tasks that were worked, and judge whether that run's other writes are to be trusted; the record keeps every version, so what was changed can be inspected and reverted. This is for the owner, not for a curator."
                 ),
                 requirements: vec!["human".into()],
                 depends_on: Vec::new(),

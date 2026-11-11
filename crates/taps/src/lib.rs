@@ -272,7 +272,7 @@ impl Host for State {
             entry_type,
             title: Some(p.title),
             body: p.body,
-            source: p.source,
+            cites: p.cites,
             confidence: Some(Confidence::Low),
             ..WriteRequest::default()
         };

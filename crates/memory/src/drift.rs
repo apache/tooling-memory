@@ -1062,7 +1062,7 @@ async fn probe_cmd(
     if auth == AuthMode::Subscription {
         return Err("a login is the harness's own; probe with --auth gateway or key".into());
     }
-    let provider = crate::checker_destination(auth, provider);
+    let provider = crate::auditor_destination(auth, provider);
     let p = crate::prepare_launch(
         root,
         Harness::Command,

@@ -45,11 +45,11 @@ pub struct Rescore {
     pub floor: f64,
 }
 
-/// Whether a task is curation: the survey's, the checker's, the telemetry's.
+/// Whether a task is curation: the survey's, the auditor's, the telemetry's.
 #[must_use]
 pub fn maintenance(t: &Task) -> bool {
     t.spec.origin.as_deref().is_some_and(|o| {
-        o.starts_with("librarian:") || o.starts_with("checker:") || o.starts_with("telemetry:")
+        o.starts_with("curator:") || o.starts_with("auditor:") || o.starts_with("telemetry:")
     })
 }
 

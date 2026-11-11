@@ -2590,7 +2590,7 @@ mod tests {
         let (status, manifest) =
             http(addr, "GET", "/bundle/dom-me/internal/manifest.yaml", None).await;
         assert_eq!(status, 200, "{manifest}");
-        assert!(manifest.contains("durable-memory/bundle/0") && manifest.contains(&w.id));
+        assert!(manifest.contains("durable-memory/bundle/1") && manifest.contains(&w.id));
         let (status, text) = http(
             addr,
             "GET",

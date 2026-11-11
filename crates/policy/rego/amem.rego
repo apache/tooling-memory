@@ -173,11 +173,11 @@ read_filter := base_filter
 
 # ---- promotion: raw to curated to verified ----
 
-# Curated means a librarian has summarised, merged or checked an entry: anyone but its
+# Curated means a curator has summarised, merged or checked an entry: anyone but its
 # author may say so, and the owner always may. Verified is the review gate: it is
 # proposed, which files a task for a person, and approved by a person who did not
 # propose it. An agent never approves. This is the paper's defence against an exploit
-# found once becoming fleet-wide best practice: a librarian can propose but never
+# found once becoming fleet-wide best practice: a curator can propose but never
 # approve its own promotion.
 promotes_own if input.promote.author == input.principal.id
 
@@ -194,7 +194,7 @@ promote_decision := {"allow": true, "admit": false, "review": "none", "reason": 
 	class == "owner"
 }
 
-promote_decision := {"allow": false, "admit": false, "review": "none", "reason": "an author does not curate its own entry; a librarian or the owner does"} if {
+promote_decision := {"allow": false, "admit": false, "review": "none", "reason": "an author does not curate its own entry; a curator or the owner does"} if {
 	input.promote.phase == "direct"
 	input.promote.to == "curated"
 	promotes_own

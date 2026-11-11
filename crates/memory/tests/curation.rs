@@ -1,6 +1,6 @@
 //! The model-driven commands end to end through a fake gateway: a curation cycle (the
-//! survey, the checker, the contradiction hunt, the quarantine's reader, drift and the
-//! telemetry), the checker on its own, the librarian's survey and telemetry, the drift
+//! survey, the auditor, the contradiction hunt, the quarantine's reader, drift and the
+//! telemetry), the auditor on its own, the curator's survey and telemetry, the drift
 //! probes, and replay. The fake answers each kind of question the way its parser expects,
 //! and can be repointed, as a vendor swapping the model behind a name would look.
 
@@ -107,10 +107,10 @@ fn serve(stream: std::net::TcpStream, repointed: &AtomicBool, calls: &AtomicUsiz
     let model = if repointed {
         "fake-other"
     } else {
-        "fake-checker"
+        "fake-auditor"
     };
     let reply = if head.starts_with("GET /v1/models") {
-        serde_json::json!({"data": [{"id": "fake-checker"}, {"id": "fake-other"}]})
+        serde_json::json!({"data": [{"id": "fake-auditor"}, {"id": "fake-other"}]})
     } else {
         calls.fetch_add(1, Ordering::SeqCst);
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
@@ -118,7 +118,7 @@ fn serve(stream: std::net::TcpStream, repointed: &AtomicBool, calls: &AtomicUsiz
         let input = 40 + prompt.len() as u64 / 4 + u64::from(repointed) * 25;
         serde_json::json!({
             "model": model,
-            "system_fingerprint": if repointed { "fp-other" } else { "fp-checker" },
+            "system_fingerprint": if repointed { "fp-other" } else { "fp-auditor" },
             "choices": [{
                 "message": {"role": "assistant", "content": answer(&prompt, repointed)},
                 "finish_reason": "stop"
@@ -209,7 +209,7 @@ impl Fixture {
     fn write(&self, kind: &str, title: &str, body: &str, source: Option<&str>) -> Output {
         let mut args = vec!["write", "--kind", kind, "--title", title];
         if let Some(s) = source {
-            args.extend(["--source", s]);
+            args.extend(["--cites", s]);
         }
         self.run(&args, Some(body))
     }
@@ -281,7 +281,7 @@ const GATEWAY: [&str; 6] = [
     "--provider",
     "llmao",
     "--model",
-    "fake-checker",
+    "fake-auditor",
 ];
 
 fn fixture() -> Fixture {
@@ -386,11 +386,11 @@ fn a_curation_cycle_files_what_each_pass_finds_and_drift_once_the_model_is_repoi
     assert_eq!(log.lines().count(), 2, "{log}");
 
     the_ledger_holds_what_the_passes_filed(&f);
-    // the librarian's telemetry, read and filed
-    let t = f.json(&["librarian", "--domain", "dom-me", "--telemetry"]);
+    // the curator's telemetry, read and filed
+    let t = f.json(&["curator", "--domain", "dom-me", "--telemetry"]);
     assert_eq!(t["by_author"]["human:test:me"]["writes"], 6, "{t}");
     f.ok(
-        &["librarian", "--domain", "dom-me", "--telemetry", "--file"],
+        &["curator", "--domain", "dom-me", "--telemetry", "--file"],
         None,
     );
 }
@@ -412,19 +412,15 @@ fn each_pass_found_its_case(cycle: &serde_json::Value) {
 
 fn the_ledger_holds_what_the_passes_filed(f: &Fixture) {
     let tasks = f.ok(&["task", "list", "--domain", "dom-me"], None);
-    for wanted in [
-        "which the checker rejected",
-        "Librarian: reconcile",
-        "drift",
-    ] {
+    for wanted in ["which the auditor rejected", "Curator: reconcile", "drift"] {
         assert!(tasks.contains(wanted), "{wanted}: {tasks}");
     }
 }
 
 #[test]
-fn the_checker_alone_reports_and_files_and_the_librarian_surveys() {
+fn the_auditor_alone_reports_and_files_and_the_curator_surveys() {
     let f = fixture();
-    let mut args = vec!["check"];
+    let mut args = vec!["audit"];
     args.extend(GATEWAY);
     args.extend([
         "--domain",
@@ -454,14 +450,14 @@ fn the_checker_alone_reports_and_files_and_the_librarian_surveys() {
     );
 
     let workdir = f.work.to_str().unwrap().to_string();
-    let survey = f.json(&["librarian", "--domain", "dom-me", "--workdir", &workdir]);
+    let survey = f.json(&["curator", "--domain", "dom-me", "--workdir", &workdir]);
     let text = survey.to_string();
     for kind in ["resummarise", "merge", "verify"] {
         assert!(text.contains(kind), "{kind}: {survey}");
     }
     f.ok(
         &[
-            "librarian",
+            "curator",
             "--domain",
             "dom-me",
             "--workdir",
@@ -478,7 +474,7 @@ fn a_working_tree_that_is_not_there_is_an_error_not_a_quiet_survey() {
     let gone = f.work.join("no-such-tree");
     let out = f.run(
         &[
-            "librarian",
+            "curator",
             "--domain",
             "dom-me",
             "--workdir",
@@ -506,7 +502,7 @@ fn drift_probes_stay_quiet_on_one_model_and_fire_on_another() {
         "--provider",
         "llmao",
         "--model",
-        "fake-checker",
+        "fake-auditor",
         "--repeat",
         "2",
     ];
@@ -518,7 +514,7 @@ fn drift_probes_stay_quiet_on_one_model_and_fire_on_another() {
         "--provider",
         "llmao",
         "--model",
-        "fake-checker",
+        "fake-auditor",
     ]);
     assert!(
         !quiet["verdict"].as_str().unwrap().contains("vendor drift"),
@@ -532,7 +528,7 @@ fn drift_probes_stay_quiet_on_one_model_and_fire_on_another() {
         "--provider",
         "llmao",
         "--model",
-        "fake-checker",
+        "fake-auditor",
     ]);
     assert!(
         fired["verdict"].as_str().unwrap().contains("drift"),
@@ -551,7 +547,7 @@ fn drift_probes_stay_quiet_on_one_model_and_fire_on_another() {
 #[test]
 fn replay_resends_a_sessions_recorded_calls_and_scores_them() {
     let f = fixture();
-    let mut args = vec!["check"];
+    let mut args = vec!["audit"];
     args.extend(GATEWAY);
     args.extend(["--domain", "dom-me", "--sample", "2"]);
     f.json(&args);

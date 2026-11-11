@@ -1,9 +1,9 @@
-//! The librarian's own telemetry, and the curation cycle. The paper has curation
-//! monitored by the system rather than by the librarians: demotion rates, how much a
+//! The curator's own telemetry, and the curation cycle. The paper has curation
+//! monitored by the system rather than by the curators: demotion rates, how much a
 //! summary drifted against how much the body changed, and anomalies alerted per
-//! librarian identity. Here the signals are computed from the record and the ledger,
-//! which librarians do not write to except through entries that `supersedes` another,
-//! so a librarian cannot suppress them. A cycle runs the survey, the checker, the
+//! curator identity. Here the signals are computed from the record and the ledger,
+//! which curators do not write to except through entries that `supersedes` another,
+//! so a curator cannot suppress them. A cycle runs the survey, the auditor, the
 //! canaries and this telemetry together under a budget, and logs what it did.
 
 use dm_server::Memory;
@@ -222,7 +222,7 @@ async fn completed(
             .spec
             .origin
             .as_deref()
-            .is_some_and(|o| o.starts_with("librarian:") || o.starts_with("checker:"));
+            .is_some_and(|o| o.starts_with("curator:") || o.starts_with("auditor:"));
         if let (true, Some(holder)) = (curation, &task.holder) {
             t.by_author
                 .entry(holder.clone())
@@ -258,7 +258,7 @@ fn rates(t: &mut Telemetry) {
                 kind: "body-heavy".into(),
                 who: who.clone(),
                 why: format!(
-                    "{who} changed the body in {} of {} curations; a librarian's rewrites should mostly be summaries",
+                    "{who} changed the body in {} of {} curations; a curator's rewrites should mostly be summaries",
                     s.body_changed, s.curations
                 ),
             });
@@ -292,7 +292,7 @@ pub async fn file_alarms(
                 domain: t.domain.clone(),
                 title: format!("Curation alarm, {}: {}", a.kind, a.who),
                 body: format!(
-                    "{}\n\nThe librarian's telemetry, computed from the record and the ledger rather than written by any librarian, raised this. Inspect the entries named and the tasks `{}` completed; every curation is a reversible write, so what was changed can be reverted. This is for the owner.",
+                    "{}\n\nThe curator's telemetry, computed from the record and the ledger rather than written by any curator, raised this. Inspect the entries named and the tasks `{}` completed; every curation is a reversible write, so what was changed can be reverted. This is for the owner.",
                     a.why, a.who
                 ),
                 requirements: vec!["human".into()],
@@ -326,12 +326,12 @@ pub struct Cycle {
     pub contradictions: usize,
     pub canaries_tripped: usize,
     pub alarms: usize,
-    pub checker_model: String,
+    pub auditor_model: String,
     /// Model calls the cycle made, and the tokens they took, as the egress metered them.
     pub calls: u64,
     pub tokens_in: u64,
     pub tokens_out: u64,
-    /// The cycle's token budget; the checker stops at it.
+    /// The cycle's token budget; the auditor stops at it.
     pub budget_tokens: u64,
     /// Held writes the quarantine's reader reviewed this cycle, and how many of them it
     /// called malicious.
@@ -339,7 +339,7 @@ pub struct Cycle {
     pub malicious: usize,
     /// Open tasks the rubric moved this cycle.
     pub rescored: usize,
-    /// The vendor-drift verdict on the checker's model, when the cycle probed it.
+    /// The vendor-drift verdict on the auditor's model, when the cycle probed it.
     pub drift: Option<String>,
 }
 
