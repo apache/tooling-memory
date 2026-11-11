@@ -148,8 +148,8 @@ two weeks. It is also the reason that none of it is the production shape.
   bundle and no restore drill.
 - **Smaller pieces.** The search tool ran only against a fake of Brave's API. It never
   ran against the live provider.
-- **Platforms.** Confinement on macOS is dry-coded. Its Seatbelt profile comes from
-  the plan. Unit tests check the profile on Linux, but it did not run on a Mac yet. The
+- **Platforms.** Confinement on macOS ran only on a CI runner. CI runs the Seatbelt
+  tests there. No harness ran under Seatbelt yet. The
   bridge to Gofannon is built against the Gofannon REST surface and a fake of it. It did
   not connect to a live deployment yet. It uses the Gofannon session cookie, which is the
   only credential that Gofannon issues. A Gofannon agent makes its own model calls,
@@ -355,7 +355,7 @@ It runs them in one of these:
 - in native Linux namespaces from the harness image, after `make unpack` puts the image
   in place. Every harness except Antigravity is in the harness image.
 - under WSL containers
-- under Seatbelt on macOS. This did not run on a Mac yet.
+- under Seatbelt on macOS. This ran only on a CI runner, and with no harness.
 
 Auth is `key`, `gateway`, or `subscription`. `subscription` is the harness's own login,
 which the egress passes through. Where the egress forwards and does not tunnel, it meters
@@ -567,7 +567,7 @@ Claude login. Until now, a few parts ran only against stand-ins:
 
 - the Gofannon bridge, against a fake of its service
 - the search tool, against a fake of its service
-- Seatbelt, which did not run on a Mac
+- Seatbelt, which ran only on a CI runner, with no harness
 
 The first list above says this, with the rest of what is not built. The list after it
 gives what works only at demo scale. [PLAN.md](PLAN.md) holds the decisions, the order
