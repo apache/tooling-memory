@@ -192,11 +192,13 @@ async fn exchange(
     // connection open whatever the request asked, so reading to a close would wait forever
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // the web launcher waits `WAIT` for the companion before it answers that the
+    // companion did not: an answer may take that long and be right, so this waits longer
+    let deadline = tokio::time::Instant::now() + dm_web::companion::WAIT + Duration::from_secs(15);
     loop {
         let n = tokio::time::timeout_at(deadline, s.read(&mut buf))
             .await
-            .expect("an answer within thirty seconds")
+            .expect("an answer within the launcher's own wait and fifteen seconds")
             .unwrap();
         if n == 0 {
             break;
