@@ -108,9 +108,9 @@ two weeks. It is also the reason that none of it is the production shape.
   - accelerator time, which only the gateway can count
   - bytes stored
   - CPU or memory limits on the sandbox
-- **The task record, in part.** A claim has no generation. The ledger refuses a stale
-  holder by its name and its lease time only, and two sessions of one harness have the
-  same name. A task has no `blocked` state: the ledger computes a block when a session
+- **The task record, in part.** A claim has no generation. The ledger accepts a caller
+  when the caller's name is the name of the holder and the lease of the task has not
+  expired. It checks nothing else, and two sessions of one harness have the same name. A task has no `blocked` state: the ledger computes a block when a session
   claims. The ledger does not record a refused claim. An uncertain external effect does
   not stop a new claim.
 - **Task definitions and autonomy levels.** A task does not name a task definition, and
@@ -131,8 +131,8 @@ two weeks. It is also the reason that none of it is the production shape.
   that a tap brought in is among them. A session does not record that it read outside
   content.
 - **Curation and audit, in part.** No curation task demotes an entry, checks an owner or
-  a cross-link, or curates policy. Nothing checks that the auditor's model differs from
-  the curator's model. The auditor does not read handoffs.
+  a cross-link, or curates policy. No test on planted faults qualifies the auditor's
+  model. The auditor does not read handoffs.
 - **Access freshness.** A session keeps its read filter until it ends. A change to the
   grants or to a policy does not stop a session.
 - **The improvement loop.** The only gate on a platform artifact is that a person
@@ -148,7 +148,7 @@ two weeks. It is also the reason that none of it is the production shape.
   bundle and no restore drill.
 - **Smaller pieces.** The search tool ran only against a fake of Brave's API. It never
   ran against the live provider.
-- **Platforms and CI.** Confinement on macOS is dry-coded. Its Seatbelt profile comes from
+- **Platforms.** Confinement on macOS is dry-coded. Its Seatbelt profile comes from
   the plan. Unit tests check the profile on Linux, but it did not run on a Mac yet. The
   bridge to Gofannon is built against the Gofannon REST surface and a fake of it. It did
   not connect to a live deployment yet. It uses the Gofannon session cookie, which is the
@@ -498,8 +498,8 @@ stages only Markdown, the hook runs only the guard's tests. `make check` runs th
 - unsafe-code and taps checks
 
 `make verify` adds `cargo deny`, `machete`, coverage with a minimum of 90% on lines, and
-the WebAssembly build. CI runs these checks on each pull request, and it runs the tests
-on Linux, macOS and Windows.
+the WebAssembly build. CI runs these checks on each pull request that changes more than
+Markdown, and it runs the tests on Linux, macOS and Windows.
 
 Two of those tests reach outside the workspace. A host can cause either of them to fail
 for reasons that are not related to the change that you make.
@@ -560,8 +560,9 @@ export CHROME="$(ls -d ~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome |
 
 ## Status
 
-On 12 October 2026, the paper's contracts are built and tested from end to end on one
-laptop. The demo runs them live against real harnesses, on the Foundation's gateway and a
+On 12 October 2026, the contracts that the paper had on that date were built and tested
+from end to end on one laptop. The paper gained more parts in November 2026, and the
+first list above names them. The demo runs them live against real harnesses, on the Foundation's gateway and a
 Claude login. Until now, a few parts ran only against stand-ins:
 
 - the Gofannon bridge, against a fake of its service

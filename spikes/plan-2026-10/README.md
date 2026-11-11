@@ -1,6 +1,6 @@
 # The first plan, 1 October to 10 November 2026
 
-This is `PLAN.md` as it stood at commit `2f0c405`, kept as a record. It is the register of milestones M0 to M16 that other documents cite by number. The plan in force is [PLAN.md](../../PLAN.md). Nothing here is kept up to date, and its section numbers are those of the paper at the time.
+This is `PLAN.md` as it stood at commit `2f0c405`, kept as a record. It is the register of milestones M0 to M19 that other documents cite by number. The plan in force is [PLAN.md](../../PLAN.md). Nothing here is kept up to date, and its section numbers are those of the paper at the time.
 
 Written 1 October 2026. The first target is a developer weekend on 10 and 11 October 2026: working code that a few people can run, read, and extend.
 
