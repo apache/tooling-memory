@@ -585,17 +585,28 @@ transaction, so a new claim cannot arrive between the two.
 
 - The memory server of a session remembers the generation of each claim that the session
   made. The memory tools `heartbeat`, `complete` and `release` use it, so an agent does
-  not have to give it. An agent can give it with `generation`.
+  not have to give it. A session that made a claim on a task acts only under that claim.
+  If it gives a different generation, the memory server refuses it.
 - A command has no session. `amem task heartbeat`, `complete` and `release` need
   `--generation`. `amem task claim-next` prints the task, and its `generation` is the
   generation of the claim.
 - The board sends the generation that the page shows. A page that shows an earlier claim
   is refused.
 
+The generation is not a secret. `get_task` shows it to each reader of the task. It tells
+one claim from a different claim. A command or a page that gives a generation says which
+claim it acts under, and the owner is responsible for that.
+
 A holder that lost its lease can still leave a handoff, with the memory tool
 `late_handoff` or `amem task late-handoff`. The ledger accepts it only from the name that
-held the claim of that generation. The handoff changes nothing of the task. `get_task`
-gives these handoffs, and the claims of the task that the ledger refused.
+held the claim of that generation, and only while the task is not closed. The handoff
+must be a handoff entry, and it changes nothing of the task. `get_task` gives these
+handoffs, and `amem work` puts them in the prompt of the next holder. `get_task` also
+gives the claims of the task that the ledger refused.
+
+The ledger does not admit a task that depends on an invalidated task. An erasure that
+invalidates a task sends the tasks that it blocked back to `proposed`, as each
+invalidation does.
 
 Not built yet: an attempt key for each operation, a block on a new claim while an external
 effect is uncertain, and a `blocked` state for a task that waits on an outside event.

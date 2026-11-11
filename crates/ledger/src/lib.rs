@@ -474,6 +474,15 @@ fn redact_event(id: &str, payload: &str, redaction: &Redaction) -> Result<Option
         Event::Completed { handoff } if handoff != redaction.reason => Event::Completed {
             handoff: redaction.reason.clone(),
         },
+        Event::LateHandoff {
+            holder,
+            generation,
+            handoff,
+        } if handoff != redaction.reason => Event::LateHandoff {
+            holder,
+            generation,
+            handoff: redaction.reason.clone(),
+        },
         _ => return Ok(None),
     };
     Ok(Some(redacted.payload(id)?))
@@ -856,6 +865,17 @@ impl Ledger {
                 op: "admit",
             });
         }
+        // a task that rests on work nobody will do has nothing to wait for: it stays
+        // proposed, for whoever filed it to change or withdraw
+        for d in &task.spec.depends_on {
+            if matches!(self.get(d).await, Ok(t) if t.status == Status::Invalidated) {
+                return Err(Error::WrongState {
+                    id: id.to_string(),
+                    status: task.status,
+                    op: "admit while a task it depends on is invalidated",
+                });
+            }
+        }
         self.append(id, &Event::Admitted).await?;
         let waits_on = self.not_done(&task.spec.depends_on).await?;
         if !waits_on.is_empty() {
@@ -944,12 +964,7 @@ impl Ledger {
         let until = now + lease;
         let claimed = on_backend!(&mut self.backend, db => db.claim(id, now, holder, until, manifest, handling));
         if let Err(Error::WrongState { status, .. }) = &claimed {
-            // a claim that lost is part of the task's record
-            let refused = Event::ClaimRefused {
-                holder: holder.to_string(),
-                why: format!("the task was {}", status.as_str()),
-            };
-            self.append_at(id, now, &refused).await?;
+            self.record_refusal(id, holder, *status, now).await?;
         }
         claimed?;
         self.trace("claimed", id).await;
@@ -959,6 +974,36 @@ impl Ledger {
             task,
             lease_until: until,
         })
+    }
+
+    /// A claim that lost is part of the task's record, while the task can still be
+    /// claimed by someone: once per holder and reason in a row, so asking again and again
+    /// adds nothing.
+    async fn record_refusal(
+        &mut self,
+        id: &str,
+        holder: &str,
+        status: Status,
+        now: OffsetDateTime,
+    ) -> Result<(), Error> {
+        if status.is_terminal() {
+            return Ok(());
+        }
+        let why = match status {
+            Status::Claimed => "another holder's lease was live".to_string(),
+            Status::Proposed => "the task was not admitted".to_string(),
+            // open or blocked, and still not this session's to take
+            _ => "the session did not meet its requirements or its handling, or a task it depends on was not done".to_string(),
+        };
+        let last = self.refused_claims(id).await?.pop();
+        if last.as_ref() == Some(&(holder.to_string(), why.clone())) {
+            return Ok(());
+        }
+        let refused = Event::ClaimRefused {
+            holder: holder.to_string(),
+            why,
+        };
+        self.append_at(id, now, &refused).await
     }
 
     /// Renew a lease. Refused when the caller does not hold the task or the lease has
@@ -1103,11 +1148,11 @@ impl Ledger {
             && task.generation == by.generation
             && task.holder.as_deref() == Some(by.holder)
             && task.lease_until.is_some_and(|t| t >= now);
-        if in_force {
+        if in_force || task.status.is_terminal() {
             return Err(Error::WrongState {
                 id: id.to_string(),
                 status: task.status,
-                op: "leave a late handoff under a claim in force",
+                op: "leave a late handoff: the claim is in force, or the task is closed",
             });
         }
         let was = on_backend!(&self.backend, db => db.claimant(id, by.generation))?;
@@ -1117,10 +1162,19 @@ impl Ledger {
                 holder: by.holder.to_string(),
             });
         }
-        let late = Event::LateHandoff {
+        let said = LateHandoff {
             holder: by.holder.to_string(),
             generation: by.generation,
             handoff: handoff.to_string(),
+        };
+        // the same handoff left twice is on the record once
+        if self.late_handoffs(id).await?.contains(&said) {
+            return Ok(task);
+        }
+        let late = Event::LateHandoff {
+            holder: said.holder,
+            generation: said.generation,
+            handoff: said.handoff,
         };
         self.append_at(id, now, &late).await?;
         self.get(id).await
@@ -1196,13 +1250,20 @@ impl Ledger {
         .await?;
         // what rested on it goes back to triage, unless someone holds it: a holder learns
         // at its next heartbeat that the task it works on changed under it
+        self.retriage_dependents(id).await?;
+        self.get(id).await
+    }
+
+    /// `id` was invalidated: each task blocked on it goes back to triage. A task that is
+    /// open has no dependency that is not done, and one that is held is its holder's.
+    async fn retriage_dependents(&mut self, id: &str) -> Result<(), Error> {
         for t in self.dependents(id).await? {
-            if matches!(t.status, Status::Blocked | Status::Open) {
+            if t.status == Status::Blocked {
                 let because = id.to_string();
                 self.append(&t.id, &Event::Retriaged { because }).await?;
             }
         }
-        self.get(id).await
+        Ok(())
     }
 
     /// One task.
@@ -1426,7 +1487,21 @@ impl Ledger {
         redaction: &Redaction,
     ) -> Result<usize, Error> {
         let now = self.now();
-        on_backend!(&mut self.backend, db => db.scrub_tasks(now, domain, origin, redaction))
+        let n =
+            on_backend!(&mut self.backend, db => db.scrub_tasks(now, domain, origin, redaction))?;
+        self.retriage_after_scrub(domain, origin).await?;
+        Ok(n)
+    }
+
+    /// A scrub invalidates the open tasks filed from an origin: what was blocked on one
+    /// of them goes back to triage, as after any invalidation.
+    async fn retriage_after_scrub(&mut self, domain: &str, origin: &str) -> Result<(), Error> {
+        for t in self.with_origin(domain, origin).await? {
+            if t.status == Status::Invalidated {
+                self.retriage_dependents(&t.id).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Both scrubs of an erasure, [`Ledger::scrub_promotions`] of `entry` and
@@ -1450,6 +1525,7 @@ impl Ledger {
             &mut self.backend,
             db => db.scrub_entry(now, domain, entry, origin, redaction)
         )?;
+        self.retriage_after_scrub(domain, origin).await?;
         Ok(Scrubbed {
             records,
             tasks,
@@ -1645,6 +1721,13 @@ mod tests {
     }
 
     on_both! {
+        a_dependent_in_another_domain_is_opened_and_retriaged_too,
+        a_blocked_task_whose_dependencies_are_done_is_claimable_whatever_its_state_says,
+        a_task_closed_by_its_continuation_opens_what_waited_on_it,
+        a_late_handoff_needs_a_lost_lease_and_an_open_task_and_is_kept_once,
+        a_refused_claim_is_recorded_once_and_not_on_a_closed_task,
+        an_erasure_takes_a_late_handoff_too,
+        a_task_is_not_admitted_onto_an_invalidated_dependency,
         a_claim_made_since_fences_the_holder_of_an_earlier_one_whatever_its_name,
         a_handoff_is_left_after_a_claim_only_by_who_held_it,
         a_refused_claim_of_a_named_task_is_on_its_record,
@@ -1821,6 +1904,166 @@ mod tests {
         assert_eq!(l.list("dom-a", Status::Done).await.unwrap().len(), 1);
     }
 
+    fn in_domain(domain: &str, title: &str, after: &[&Task]) -> TaskSpec {
+        TaskSpec {
+            domain: domain.into(),
+            depends_on: after.iter().map(|t| t.id.clone()).collect(),
+            ..spec(title)
+        }
+    }
+
+    async fn a_dependent_in_another_domain_is_opened_and_retriaged_too(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let done = admitted(&mut l, in_domain("dom-a", "Will be done", &[])).await;
+        let dropped = admitted(&mut l, in_domain("dom-a", "Will be dropped", &[])).await;
+        let opens = admitted(&mut l, in_domain("dom-b", "Waits across", &[&done])).await;
+        let returns = admitted(&mut l, in_domain("dom-b", "Rests across", &[&dropped])).await;
+        assert_eq!(
+            (opens.status, returns.status),
+            (Status::Blocked, Status::Blocked)
+        );
+        claim(&mut l, &done.id, "s", mins(5)).await.unwrap();
+        l.complete(&done.id, held("s", 1), "mem-a-1").await.unwrap();
+        assert_eq!(l.get(&opens.id).await.unwrap().status, Status::Open);
+        l.invalidate(&dropped.id, "obsolete", None).await.unwrap();
+        assert_eq!(l.get(&returns.id).await.unwrap().status, Status::Proposed);
+    }
+
+    /// The state is what the events said; the claim asks the dependencies themselves, so
+    /// a task left blocked after its last dependency closed is not lost.
+    async fn a_blocked_task_whose_dependencies_are_done_is_claimable_whatever_its_state_says(
+        b: &Site,
+    ) {
+        let (mut l, _) = b.ledger().await;
+        let first = admitted(&mut l, spec("First")).await;
+        let waits = admitted(&mut l, in_domain("dom-a", "Waits", &[&first])).await;
+        claim(&mut l, &first.id, "s", mins(5)).await.unwrap();
+        l.complete(&first.id, held("s", 1), "mem-a-1")
+            .await
+            .unwrap();
+        // as if the event that opens it had not reached it
+        l.append(&waits.id, &Event::Blocked { on: Vec::new() })
+            .await
+            .unwrap();
+        assert_eq!(l.get(&waits.id).await.unwrap().status, Status::Blocked);
+        let c = next(&mut l, "s", mins(5)).await.unwrap();
+        assert_eq!(c.task.id, waits.id);
+        // and the events that open and send back move only a task that waits
+        l.append(
+            &waits.id,
+            &Event::Retriaged {
+                because: first.id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        l.append(&waits.id, &Event::Blocked { on: Vec::new() })
+            .await
+            .unwrap();
+        assert_eq!(l.get(&waits.id).await.unwrap().status, Status::Claimed);
+    }
+
+    async fn a_task_closed_by_its_continuation_opens_what_waited_on_it(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let (parent, child, cont) = delegated(&mut l).await;
+        let waits = admitted(&mut l, in_domain("dom-a", "After the parent", &[&parent])).await;
+        assert_eq!(waits.status, Status::Blocked);
+        claim(&mut l, &child.id, "s2", mins(5)).await.unwrap();
+        l.complete_as(&child.id, "s2", "mem-a-child").await.unwrap();
+        claim(&mut l, &cont.id, "s3", mins(5)).await.unwrap();
+        l.complete_as(&cont.id, "s3", "mem-a-done").await.unwrap();
+        l.complete_by_continuation(&parent.id, &cont.id, "mem-a-done")
+            .await
+            .unwrap();
+        assert_eq!(l.get(&waits.id).await.unwrap().status, Status::Open);
+    }
+
+    async fn a_late_handoff_needs_a_lost_lease_and_an_open_task_and_is_kept_once(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Long job")).await;
+        claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        *now.lock().unwrap() = T0 + mins(31);
+        // the lease ran out and nobody has claimed since: the claim is over
+        l.handoff_after(&t.id, held("s1", 1), "mem-a-late")
+            .await
+            .unwrap();
+        l.handoff_after(&t.id, held("s1", 1), "mem-a-late")
+            .await
+            .unwrap();
+        assert_eq!(l.late_handoffs(&t.id).await.unwrap().len(), 1, "kept once");
+        claim(&mut l, &t.id, "s2", mins(30)).await.unwrap();
+        l.complete(&t.id, held("s2", 2), "mem-a-h").await.unwrap();
+        // a closed task has no next holder to read it
+        assert!(is_wrong_state(
+            &l.handoff_after(&t.id, held("s1", 1), "mem-a-more").await
+        ));
+    }
+
+    async fn a_refused_claim_is_recorded_once_and_not_on_a_closed_task(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("One holder")).await;
+        claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        for _ in 0..3 {
+            assert!(is_wrong_state(&claim(&mut l, &t.id, "s2", mins(30)).await));
+        }
+        let refused = l.refused_claims(&t.id).await.unwrap();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].1, "another holder's lease was live");
+        l.complete(&t.id, held("s1", 1), "mem-a-h").await.unwrap();
+        assert!(is_wrong_state(&claim(&mut l, &t.id, "s3", mins(30)).await));
+        assert_eq!(l.refused_claims(&t.id).await.unwrap().len(), 1);
+    }
+
+    async fn an_erasure_takes_a_late_handoff_too(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let quoting = task_quoting_the_secret("promote:mem-a-1", "v1");
+        let t = admitted(&mut l, quoting).await;
+        claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        *now.lock().unwrap() = T0 + mins(31);
+        let late = format!("late: {SECRET}");
+        l.handoff_after(&t.id, held("s1", 1), &late).await.unwrap();
+        l.scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+            .await
+            .unwrap();
+        let kept = l.late_handoffs(&t.id).await.unwrap();
+        assert_eq!(kept[0].handoff, redaction().reason);
+        assert!(b.payloads().await.iter().all(|p| !p.contains(SECRET)));
+    }
+
+    async fn a_task_is_not_admitted_onto_an_invalidated_dependency(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let gone = admitted(&mut l, spec("Gone")).await;
+        l.invalidate(&gone.id, "obsolete", None).await.unwrap();
+        let rests = l
+            .create(in_domain("dom-a", "Rests on it", &[&gone]))
+            .await
+            .unwrap()
+            .task;
+        assert!(is_wrong_state(&l.admit(&rests.id).await));
+        assert_eq!(l.get(&rests.id).await.unwrap().status, Status::Proposed);
+    }
+
+    /// A ledger file whose rows have the state names of before `open` and `done`.
+    #[tokio::test]
+    async fn on_sqlite_a_projection_with_state_names_of_an_older_ledger_is_rebuilt_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ledger.db");
+        let id = {
+            let mut l = Ledger::open(&file).unwrap();
+            admitted(&mut l, spec("Old")).await.id
+        };
+        rusqlite::Connection::open(&file)
+            .unwrap()
+            .execute("UPDATE tasks SET status = 'admitted'", [])
+            .unwrap();
+        let l = Ledger::open(&file).unwrap();
+        let open = l.list("dom-a", Status::Open).await.unwrap();
+        assert_eq!(
+            open.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            [id.as_str()]
+        );
+    }
+
     fn is_fenced<T>(r: &Result<T, Error>, given: u64, current: u64) -> bool {
         matches!(r, Err(Error::Fenced { given: g, current: c, .. }) if *g == given && *c == current)
     }
@@ -1956,7 +2199,10 @@ mod tests {
         let refused = l.refused_claims(&t.id).await.unwrap();
         assert_eq!(
             refused,
-            [("s2".to_string(), "the task was claimed".to_string())]
+            [(
+                "s2".to_string(),
+                "another holder's lease was live".to_string()
+            )]
         );
         let held_still = l.get(&t.id).await.unwrap();
         assert_eq!(

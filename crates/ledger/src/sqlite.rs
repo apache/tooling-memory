@@ -119,9 +119,22 @@ impl Db {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN posted_to TEXT;")?;
         }
         migrate_promotions(&conn)?;
-        Ok(Db {
+        // a projection whose state names this code does not have, as a ledger from before
+        // the states were `open` and `done`: read as it stands, its tasks would be in no
+        // list and no queue, without a word. The events say what each task is
+        let stale: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN
+                 ('proposed', 'open', 'claimed', 'blocked', 'done', 'invalidated')",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut db = Db {
             conn: Mutex::new(conn),
-        })
+        };
+        if stale > 0 {
+            db.rebuild()?;
+        }
+        Ok(db)
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {

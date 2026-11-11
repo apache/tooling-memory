@@ -939,6 +939,7 @@ async fn tasks(State(app): State<App>) -> Response {
     for status in [
         Status::Claimed,
         Status::Open,
+        Status::Blocked,
         Status::Proposed,
         Status::Done,
         Status::Invalidated,
@@ -1976,9 +1977,12 @@ mod tests {
         let root = dir.path().join("memory");
         let owner = Memory::init(&root, "human:test:me", "dom-me").unwrap();
         let mut hidden = String::new();
+        let mut filed: Vec<String> = Vec::new();
         for (title, classification) in [
             ("Rotate the signing key", dm_core::Label::Restricted),
             ("Tidy the docs", dm_core::Label::Public),
+            // waits on the one before it, so the ledger holds it as blocked
+            ("Publish the docs", dm_core::Label::Public),
         ] {
             let t = owner
                 .file_own(dm_ledger::TaskSpec {
@@ -1986,7 +1990,11 @@ mod tests {
                     title: title.into(),
                     body: "Do it.".into(),
                     requirements: vec!["human".into()],
-                    depends_on: vec![],
+                    depends_on: if title == "Publish the docs" {
+                        filed.last().cloned().into_iter().collect()
+                    } else {
+                        vec![]
+                    },
                     origin: None,
                     upstream_event: None,
                     created_by: String::new(),
@@ -1999,6 +2007,7 @@ mod tests {
             if t.status == dm_ledger::Status::Proposed {
                 owner.admit(&t.id).await.unwrap();
             }
+            filed.push(t.id.clone());
             if classification == dm_core::Label::Restricted {
                 hidden = t.id;
             }
@@ -2019,6 +2028,10 @@ mod tests {
         let (_, all) = get_json(addr, "/api/tasks").await;
         let all = all.to_string();
         assert!(all.contains("Tidy the docs"), "{all}");
+        assert!(
+            all.contains("Publish the docs") && all.contains(r#""status":"blocked""#),
+            "a blocked task is on the board: {all}"
+        );
         assert!(!all.contains("signing key"), "{all}");
         for path in ["tree", "claim"] {
             let method = if path == "tree" { "GET" } else { "POST" };
@@ -2245,11 +2258,21 @@ mod tests {
         )
         .await;
         assert_eq!(status, 400, "a handoff needs a body");
+        // a page that shows a claim other than the one in force is refused by it
         let (status, body) = http(
             addr,
             "POST",
             &format!("/api/tasks/{id}/complete"),
-            Some(r#"{"handoff":"Signed off; ship it."}"#),
+            Some(r#"{"handoff":"From a page that shows an earlier claim.","generation":7}"#),
+        )
+        .await;
+        assert_ne!(status, 200, "{body}");
+        assert!(body.contains("generation"), "{body}");
+        let (status, body) = http(
+            addr,
+            "POST",
+            &format!("/api/tasks/{id}/complete"),
+            Some(r#"{"handoff":"Signed off; ship it.","generation":1}"#),
         )
         .await;
         assert_eq!(status, 200, "{body}");

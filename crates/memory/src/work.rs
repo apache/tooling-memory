@@ -566,6 +566,30 @@ const OPENING: &str =
      so before each decision that changes something, choosing between entries, writing, \
      completing or releasing, say in one plain sentence why.";
 
+/// What holders whose claims were over still left for whoever holds the task next, as
+/// a part of the prompt: empty when nobody left anything.
+async fn late_handoffs_of(client: &MemoryClient, task: &str) -> String {
+    let mut p = String::new();
+    let Ok(record) = client
+        .call("get_task", serde_json::json!({ "id": task }))
+        .await
+    else {
+        return p;
+    };
+    for late in record["late_handoffs"].as_array().into_iter().flatten() {
+        let Some(h) = late["handoff"].as_str() else {
+            continue;
+        };
+        if let Ok(e) = client.get(h).await {
+            p.push_str(&format!(
+                "\n# What an earlier holder left after its claim ({h})\n\n{}\n",
+                e.body.trim()
+            ));
+        }
+    }
+    p
+}
+
 async fn prompt_for(
     client: &MemoryClient,
     task: &Task,
@@ -590,6 +614,7 @@ async fn prompt_for(
             ));
         }
     }
+    p.push_str(&late_handoffs_of(client, &task.id).await);
     if !task.depends_on.is_empty() {
         p.push_str("\n# What the tasks this one depends on left behind\n");
         p.push_str(

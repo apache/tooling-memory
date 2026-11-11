@@ -204,7 +204,33 @@ impl Db {
         };
         db.migrate_shared_tables().await?;
         db.add_promotion_tables().await?;
+        db.rebuild_stale_projections().await?;
         Ok(db)
+    }
+
+    /// Rebuild the projection of each domain whose tasks have a state name this code does
+    /// not have, as a ledger from before the states were `open` and `done`: read as it
+    /// stands, such a task would be in no list and no queue, without a word.
+    async fn rebuild_stale_projections(&mut self) -> Result<(), Error> {
+        for (domain, s) in self.schemas().await? {
+            let row = self
+                .client
+                .query_one(
+                    &format!(
+                        "SELECT COUNT(*) FROM {s}.tasks WHERE status NOT IN
+                             ('proposed', 'open', 'claimed', 'blocked', 'done', 'invalidated')"
+                    ),
+                    &[],
+                )
+                .await?;
+            let stale: i64 = row.try_get(0)?;
+            if stale > 0 {
+                let tx = self.client.transaction().await?;
+                rebuild_domain(&tx, &domain, &s).await?;
+                tx.commit().await?;
+            }
+        }
+        Ok(())
     }
 
     /// Give a promotions table to each domain schema made before promotions were
@@ -707,22 +733,27 @@ impl Db {
         .await
     }
 
+    /// The tasks that depend on `id`, in whichever domain: a dependency may be in
+    /// another domain's schema than its dependents.
     pub(crate) async fn dependents(&self, id: &str) -> Result<Vec<Task>, Error> {
-        let Some(s) = schema_of_task_in(&self.client, id).await? else {
-            return Ok(Vec::new());
-        };
-        self.select(
-            &s,
-            &format!(
-                "WHERE id IN (
-                     SELECT t.id FROM {s}.tasks t,
-                         jsonb_array_elements_text(t.depends_on::jsonb) AS d(value)
-                     WHERE d.value = $1)
-                 ORDER BY created"
-            ),
-            &[&id],
-        )
-        .await
+        let mut out = Vec::new();
+        for (_, s) in self.schemas().await? {
+            out.extend(
+                self.select(
+                    &s,
+                    &format!(
+                        "WHERE id IN (
+                             SELECT t.id FROM {s}.tasks t,
+                                 jsonb_array_elements_text(t.depends_on::jsonb) AS d(value)
+                             WHERE d.value = $1)
+                         ORDER BY created"
+                    ),
+                    &[&id],
+                )
+                .await?,
+            );
+        }
+        Ok(out)
     }
 
     /// Every domain's schema.

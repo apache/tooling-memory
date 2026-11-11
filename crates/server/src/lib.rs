@@ -1400,21 +1400,32 @@ impl Memory {
         }
     }
 
-    /// The generation this session acts under on a task: the one the caller names, or
-    /// the one of the claim this session made. A session that made none and names none
-    /// holds nothing, whatever name it shares with the holder.
+    /// The generation this session acts under on a task: the one of the claim this
+    /// session made, or, in a session that made none, the one the caller names. A
+    /// session that made a claim acts under that claim and no other: the generation of
+    /// the claim in force is on the task for anyone to read, so a session whose claim is
+    /// over could otherwise name it and pass. A session that made none and names none
+    /// holds nothing, whatever name it shares with the holder. The generation tells
+    /// claims apart; it is no secret, and a caller that names one says which claim it
+    /// means, as the owner's command line and the board do.
     fn claim_of(&self, id: &str, generation: Option<u64>) -> Result<u64, Error> {
-        generation
-            .or_else(|| lock(&self.claims).get(id).copied())
-            .ok_or_else(|| {
-                Error::Ledger(dm_ledger::Error::NotHolder {
-                    id: id.to_string(),
-                    holder: format!(
-                        "{}, in a session that made no claim on it; name the generation of the claim",
-                        self.author
-                    ),
-                })
+        let own = lock(&self.claims).get(id).copied();
+        if let (Some(named), Some(own)) = (generation, own) {
+            if named != own {
+                return Err(Error::Denied(format!(
+                    "this session claimed {id} at generation {own}, and acts under that claim only; it named generation {named}"
+                )));
+            }
+        }
+        generation.or(own).ok_or_else(|| {
+            Error::Ledger(dm_ledger::Error::NotHolder {
+                id: id.to_string(),
+                holder: format!(
+                    "{}, in a session that made no claim on it; name the generation of the claim",
+                    self.author
+                ),
             })
+        })
     }
 
     /// Take the proposal task, so no second approver acts on it at the same time. Returns
@@ -2700,7 +2711,9 @@ impl Memory {
         generation: Option<u64>,
         handoff: &str,
     ) -> Result<Task, Error> {
-        self.get(handoff).await?;
+        if self.get(handoff).await?.front.entry_type != EntryType::Handoff {
+            return Err(Error::Denied(format!("{handoff} is not a handoff entry")));
+        }
         let mut l = self.ledger.lock().await;
         self.check_task(&l.get(id).await?)?;
         let by = self.under(self.claim_of(id, generation)?);
@@ -6374,12 +6387,25 @@ mod tests {
                 refused.map(|t| t.status)
             );
         }
+        // the generation in force is on the task for anyone to read: the first session
+        // may not name it and pass, since it acts under the claim it made
+        let named = first.complete(&t.id, Some(2), &h).await;
+        assert!(
+            matches!(&named, Err(Error::Denied(why)) if why.contains("generation 1")),
+            "{:?}",
+            named.map(|t| t.status)
+        );
         // a session that made no claim holds nothing by its name alone
         assert!(matches!(
             onlooker.complete(&t.id, None, &h).await,
             Err(Error::Ledger(dm_ledger::Error::NotHolder { .. }))
         ));
-        // what the first learned still reaches the holder now
+        // what the first learned still reaches the holder now, as a handoff entry
+        let plain = first.write(req("Not a handoff.\n")).await.unwrap().id;
+        assert!(matches!(
+            first.handoff_after(&t.id, None, &plain).await,
+            Err(Error::Denied(_))
+        ));
         first.handoff_after(&t.id, None, &h).await.unwrap();
         let (late, _) = second.task_record(&t.id).await.unwrap();
         assert_eq!(late.len(), 1);
