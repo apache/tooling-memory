@@ -307,14 +307,20 @@ impl Entry {
             return Err(Error::NoFrontmatter);
         }
         // an entry of the format that named this field `source`: read as it stands, it
-        // would lose its citations without a word
-        if yaml.lines().any(|l| l.starts_with("source:")) {
+        // would lose its citations without a word. The key is looked for in the parsed
+        // block, since YAML spells one key many ways and a line of a value is no key
+        let block: serde_norway::Value = serde_norway::from_str(&yaml)?;
+        let is_source = |key: &serde_norway::Value| match key {
+            serde_norway::Value::Tagged(t) => t.value.as_str() == Some("source"),
+            other => other.as_str() == Some("source"),
+        };
+        if block.as_mapping().is_some_and(|m| m.keys().any(is_source)) {
             return Err(Error::Invalid(
                 "the `source` field is `cites` in this format; this entry is of an older one"
                     .into(),
             ));
         }
-        let front: Frontmatter = serde_norway::from_str(&yaml)?;
+        let front: Frontmatter = serde_norway::from_value(block)?;
         if front.id.is_empty() || front.domain.is_empty() {
             return Err(Error::Invalid("id and domain are required".into()));
         }
@@ -494,9 +500,38 @@ mod tests {
             Entry::parse(&new).unwrap().front.cites,
             ["https://example.org/a"]
         );
-        // the word in a body is text, not the field
+        // however YAML spells the key
+        for spelt in [
+            "\"source\":\n- a\n",
+            "'source':\n- a\n",
+            "source :\n- a\n",
+            "? source\n: - a\n",
+            "!!str source:\n- a\n",
+            "cites:\n- b\n\"source\":\n- a\n",
+        ] {
+            let refused = Entry::parse(&format!("{head}{spelt}---\n\nA fact.\n"));
+            assert!(
+                matches!(&refused, Err(Error::Invalid(_))),
+                "{spelt:?}: {refused:?}"
+            );
+        }
+        let flow = "---\n{id: mem-x-1, type: fact, domain: dom-x, author: 'human:local:me', created: 2026-10-01T10:00:00Z, source: [a]}\n---\n\nA fact.\n";
+        assert!(matches!(Entry::parse(flow), Err(Error::Invalid(_))));
+        let indented = head.replace("---\n", "").replace('\n', "\n  ");
+        let indented = format!("---\n  {indented}source: [a]\n---\n\nA fact.\n");
+        assert!(
+            matches!(Entry::parse(&indented), Err(Error::Invalid(_))),
+            "{indented}"
+        );
+        // the word in a body, or in a value that runs over a line, is text and no field
         let body = format!("{head}---\n\nsource: a line of the body\n");
         assert!(Entry::parse(&body).unwrap().front.cites.is_empty());
+        let value =
+            format!("{head}summary: \"first line\nsource: of the river\"\n---\n\nA fact.\n");
+        assert_eq!(
+            Entry::parse(&value).unwrap().front.summary.as_deref(),
+            Some("first line source: of the river")
+        );
     }
 
     #[test]

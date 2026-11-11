@@ -199,8 +199,10 @@ pub struct PromoteParams {
     pub why: String,
 }
 
-/// Parameters of `write`.
+/// Parameters of `write`. A parameter this does not have is refused: dropped without a
+/// word, a caller's `source` of an older format would lose the entry its citations.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WriteParams {
     /// The Markdown body. Required.
     pub body: String,
@@ -1235,6 +1237,16 @@ mod tests {
             .await
             .unwrap();
         id
+    }
+
+    #[test]
+    fn write_refuses_a_parameter_it_does_not_have() {
+        let old =
+            serde_json::from_value::<WriteParams>(json!({"body": "A fact.", "source": ["a"]}));
+        let why = old.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(why.contains("source") && why.contains("cites"), "{why}");
+        let new = serde_json::from_value::<WriteParams>(json!({"body": "A fact.", "cites": ["a"]}));
+        assert_eq!(new.unwrap().cites, ["a"]);
     }
 
     #[tokio::test]
