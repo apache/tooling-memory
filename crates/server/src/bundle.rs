@@ -431,6 +431,15 @@ fn check_entries(
     for m in &manifest.entries {
         plain_name(&m.path)?;
         let path = src.join(&m.path);
+        // a file's rendered frontmatter is a few hundred bytes of the bound's megabytes
+        let size = std::fs::metadata(&path).map_err(io(&path))?.len();
+        if size > crate::MAX_ENTRY_BYTES as u64 + 64 * 1024 {
+            return Err(Error::Invalid(format!(
+                "{} has {size} bytes; an entry holds at most {}",
+                m.path,
+                crate::MAX_ENTRY_BYTES
+            )));
+        }
         let text = std::fs::read_to_string(&path).map_err(io(&path))?;
         if digest(&text) != m.digest {
             return Err(Error::Invalid(format!(

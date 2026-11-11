@@ -52,6 +52,10 @@ pub mod transcripts;
 
 /// The grants file, relative to the root.
 pub const GRANTS_FILE: &str = "grants.toml";
+/// The most bytes an entry may hold, frontmatter and body together. The transport drops a
+/// message above its own bound and answers nothing; an entry this size fits a `get`
+/// reply under that bound, JSON escapes included, so a refusal comes here, in words.
+pub const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 /// The index, relative to the root.
 pub const INDEX_FILE: &str = "state/index.db";
 /// The ledger, relative to the root.
@@ -999,6 +1003,12 @@ impl Memory {
         let domain = self.resolve_domain(req.domain.as_deref())?;
         if req.body.trim().is_empty() {
             return Err(Error::Denied("an entry needs a body".into()));
+        }
+        if req.body.len() > MAX_ENTRY_BYTES {
+            return Err(Error::Denied(format!(
+                "an entry holds at most {MAX_ENTRY_BYTES} bytes; this body has {}",
+                req.body.len()
+            )));
         }
         let tier = self.tier_for_write(req.supersedes.is_some()).await;
         let classification = {
@@ -3228,6 +3238,21 @@ mod tests {
         let w = m.write(req("Written after the step.\n")).await.unwrap();
         let e = m.store.get("dom-me", &w.id).await.unwrap().unwrap();
         assert_eq!(e.front.created, ahead + Duration::nanoseconds(1));
+    }
+
+    #[tokio::test]
+    async fn a_body_above_the_bound_is_refused_and_one_at_the_bound_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let over = m.write(req(&"a".repeat(MAX_ENTRY_BYTES + 1))).await;
+        assert!(
+            matches!(&over, Err(Error::Denied(why)) if why.contains("at most")),
+            "{:?}",
+            over.map(|w| w.id)
+        );
+        let w = m.write(req(&"a".repeat(MAX_ENTRY_BYTES))).await.unwrap();
+        let kept = m.store.get("dom-me", &w.id).await.unwrap().unwrap();
+        assert_eq!(kept.body.trim_end().len(), MAX_ENTRY_BYTES);
     }
 
     #[tokio::test]
@@ -7282,6 +7307,28 @@ mod tests {
             Err(Error::Bundle(bundle::Error::Invalid(_)))
         ));
         assert_eq!(c.search("Alice", None, 10).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_entry_file_above_the_bound_is_refused_by_its_size() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Memory::init(a_dir.path(), "human:test:alice", "dom-a").unwrap();
+        let w = a.write(req("Alice's note.\n")).await.unwrap();
+        let bundle_dir = tempfile::tempdir().unwrap();
+        a.export(None, Label::Internal, bundle_dir.path())
+            .await
+            .unwrap();
+        let p = bundle_dir.path().join(format!("{}.md", w.id));
+        assert!(p.exists(), "the bundle holds the entry");
+        std::fs::write(&p, "a".repeat(MAX_ENTRY_BYTES + 1024 * 1024)).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Memory::init(b_dir.path(), "human:test:bob", "dom-b").unwrap();
+        let big = b.import(bundle_dir.path(), None).await;
+        assert!(
+            matches!(&big, Err(Error::Bundle(bundle::Error::Invalid(why))) if why.contains("at most")),
+            "{:?}",
+            big.map(|i| i.written)
+        );
     }
 
     #[tokio::test]
