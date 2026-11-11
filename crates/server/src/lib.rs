@@ -53,9 +53,23 @@ pub mod transcripts;
 /// The grants file, relative to the root.
 pub const GRANTS_FILE: &str = "grants.toml";
 /// The most bytes an entry may hold as the record keeps it, frontmatter and body
-/// together. `write` and `import` hold the same bound. It keeps one entry well inside
-/// what a reply can carry; [`mcp::MAX_REPLY_BYTES`] bounds the reply itself.
+/// together; a bundle's entry file holds no more. It keeps one entry well inside what a
+/// reply can carry; [`mcp::MAX_REPLY_BYTES`] bounds the reply itself.
 pub const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+/// The most bytes a new entry may hold: under [`MAX_ENTRY_BYTES`] by the room its
+/// frontmatter may grow into later, when it is promoted, replaced or flagged, so an
+/// entry `write` kept is still one a bundle carries.
+pub const MAX_WRITE_BYTES: usize = MAX_ENTRY_BYTES - 4 * 1024;
+
+/// Whether a new entry of `size` rendered bytes may be written.
+fn check_write_size(size: usize) -> Result<(), Error> {
+    if size > MAX_WRITE_BYTES {
+        return Err(Error::Denied(format!(
+            "a new entry holds at most {MAX_WRITE_BYTES} bytes, frontmatter and body together; this one has {size}"
+        )));
+    }
+    Ok(())
+}
 /// The index, relative to the root.
 pub const INDEX_FILE: &str = "state/index.db";
 /// The ledger, relative to the root.
@@ -1038,12 +1052,7 @@ impl Memory {
             },
             body: req.body,
         };
-        let size = entry.render().len();
-        if size > MAX_ENTRY_BYTES {
-            return Err(Error::Denied(format!(
-                "an entry holds at most {MAX_ENTRY_BYTES} bytes, frontmatter and body together; this one has {size}"
-            )));
-        }
+        check_write_size(entry.render().len())?;
         self.gate(&entry).await?;
         self.put_logged(&entry).await?;
         self.index_put(&entry).await?;
@@ -3241,28 +3250,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_entry_above_the_bound_is_refused_and_one_at_the_bound_is_kept() {
+    async fn an_entry_above_the_bound_is_refused_and_one_under_it_is_kept() {
+        // the rule, at its edge
+        assert!(check_write_size(MAX_WRITE_BYTES).is_ok());
+        assert!(matches!(
+            check_write_size(MAX_WRITE_BYTES + 1),
+            Err(Error::Denied(why)) if why.contains("at most")
+        ));
+        // and write holds it, on the entry as the record keeps it. A timestamp renders at
+        // more than one length, so these two stay some bytes clear of the edge
         let dir = tempfile::tempdir().unwrap();
         let m = mem(dir.path());
-        // the bound is on the entry as the record keeps it, so find what its frontmatter takes
         let probe = m.write(req("a\n")).await.unwrap();
         let probe = m.store.get("dom-me", &probe.id).await.unwrap().unwrap();
-        // a timestamp renders at more than one length, so stay some bytes clear of the bound
-        let front = probe.render().len() - probe.body.len();
-        let fits = MAX_ENTRY_BYTES - front - 64;
+        let fits = MAX_WRITE_BYTES - (probe.render().len() - probe.body.len()) - 64;
         let over = m.write(req(&"a".repeat(fits + 128))).await;
-        assert!(
-            matches!(&over, Err(Error::Denied(why)) if why.contains("at most")),
-            "{:?}",
-            over.map(|w| w.id)
-        );
+        assert!(matches!(over, Err(Error::Denied(_))));
         let w = m.write(req(&"a".repeat(fits))).await.unwrap();
+        // what write kept, a promotion may grow, and a bundle still carries it
+        m.promote(&w.id, TrustTier::Curated, "read").await.unwrap();
         let kept = m.store.get("dom-me", &w.id).await.unwrap().unwrap();
-        let size = kept.render().len();
-        assert!(
-            size <= MAX_ENTRY_BYTES && size > MAX_ENTRY_BYTES - 256,
-            "{size}"
-        );
+        assert!(kept.render().len() <= MAX_ENTRY_BYTES);
         // a title counts as the body does
         let titled = m
             .write(WriteRequest {
@@ -7328,31 +7336,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_holds_the_bound_that_write_holds() {
+    async fn import_takes_an_entry_file_at_the_bound_and_refuses_one_byte_more() {
         let a_dir = tempfile::tempdir().unwrap();
         let a = Memory::init(a_dir.path(), "human:test:alice", "dom-a").unwrap();
-        let probe = a.write(req("a\n")).await.unwrap();
-        let probe = a.store.get("dom-a", &probe.id).await.unwrap().unwrap();
-        let fits = MAX_ENTRY_BYTES - (probe.render().len() - probe.body.len()) - 64;
-        let w = a.write(req(&"a".repeat(fits))).await.unwrap();
+        let w = a.write(req("Alice's note.\n")).await.unwrap();
         let bundle_dir = tempfile::tempdir().unwrap();
         a.export(None, Label::Internal, bundle_dir.path())
             .await
             .unwrap();
-        // an entry at the bound, which write kept, lands
+        // the entry's file grown to `size` bytes, with the manifest's digest to match
+        let p = bundle_dir.path().join(format!("{}.md", w.id));
+        let manifest = bundle_dir.path().join("manifest.yaml");
+        let grow_to = |size: usize| {
+            let old = std::fs::read_to_string(&p).unwrap();
+            let text = format!("{old}{}", "a".repeat(size - old.len()));
+            let listed = std::fs::read_to_string(&manifest).unwrap();
+            assert!(listed.contains(&dm_core::digest(&old)));
+            let listed = listed.replace(&dm_core::digest(&old), &dm_core::digest(&text));
+            std::fs::write(&manifest, listed).unwrap();
+            std::fs::write(&p, text).unwrap();
+        };
+        grow_to(MAX_ENTRY_BYTES);
         let b_dir = tempfile::tempdir().unwrap();
         let b = Memory::init(b_dir.path(), "human:test:bob", "dom-b").unwrap();
         let landed = b.import(bundle_dir.path(), None).await.unwrap();
-        assert_eq!(
-            landed.written.len(),
-            2,
-            "the probe and the entry at the bound"
-        );
-        // the same file above the bound is refused for its size: the digest is not reached
-        let p = bundle_dir.path().join(format!("{}.md", w.id));
-        let mut text = std::fs::read_to_string(&p).unwrap();
-        text.push_str(&"a".repeat(256));
-        std::fs::write(&p, text).unwrap();
+        assert_eq!(landed.written.len(), 1, "an entry at the bound lands");
+        grow_to(MAX_ENTRY_BYTES + 1);
         let c_dir = tempfile::tempdir().unwrap();
         let c = Memory::init(c_dir.path(), "human:test:carol", "dom-c").unwrap();
         let big = c.import(bundle_dir.path(), None).await;
@@ -7360,6 +7369,31 @@ mod tests {
             matches!(&big, Err(Error::Bundle(bundle::Error::Invalid(why))) if why.contains("at most")),
             "{:?}",
             big.map(|i| i.written)
+        );
+    }
+
+    /// A bundle's entry that is no regular file is refused before it is opened: a pipe
+    /// would hold the import for ever, and a device has no end.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_refuses_an_entry_that_is_no_regular_file() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Memory::init(a_dir.path(), "human:test:alice", "dom-a").unwrap();
+        let w = a.write(req("Alice's note.\n")).await.unwrap();
+        let bundle_dir = tempfile::tempdir().unwrap();
+        a.export(None, Label::Internal, bundle_dir.path())
+            .await
+            .unwrap();
+        let p = bundle_dir.path().join(format!("{}.md", w.id));
+        std::fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &p).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Memory::init(b_dir.path(), "human:test:bob", "dom-b").unwrap();
+        let refused = b.import(bundle_dir.path(), None).await;
+        assert!(
+            matches!(&refused, Err(Error::Bundle(bundle::Error::Invalid(why))) if why.contains("regular file")),
+            "{:?}",
+            refused.map(|i| i.written)
         );
     }
 

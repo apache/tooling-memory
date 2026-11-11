@@ -56,7 +56,11 @@ pub const MAX_REPLY_BYTES: usize = 12 * 1024 * 1024;
 /// own serialised form: its text is a JSON string inside JSON, so a quote costs more
 /// bytes on the line than in the entry.
 fn bounded(reply: Result<CallToolResponse, McpError>) -> Result<CallToolResponse, McpError> {
-    let reply = reply?;
+    let reply = match reply {
+        Ok(reply) => reply,
+        // a refusal that quotes what the caller sent is as long as what the caller sent
+        Err(e) => return Err(short_refusal(e)),
+    };
     // only a completed call carries content; the other kinds are a few fields
     let CallToolResponse::Complete(result) = &reply else {
         return Ok(reply);
@@ -72,6 +76,24 @@ fn bounded(reply: Result<CallToolResponse, McpError>) -> Result<CallToolResponse
         ));
     }
     Ok(reply)
+}
+
+/// The most bytes a refusal may take: room for a sentence and the names in it.
+const MAX_REFUSAL_BYTES: usize = 64 * 1024;
+
+/// A refusal as it was, or its first words when it is longer than a refusal may be.
+fn short_refusal(e: McpError) -> McpError {
+    let bytes = serde_json::to_vec(&e).map_or(usize::MAX, |v| v.len());
+    if bytes <= MAX_REFUSAL_BYTES {
+        return e;
+    }
+    let began: String = e.message.chars().take(200).collect();
+    McpError::invalid_params(
+        format!(
+            "refused, with a reason of {bytes} bytes, which is too long to send; it began: {began}"
+        ),
+        None,
+    )
 }
 
 fn ok(value: Value) -> Result<CallToolResult, McpError> {

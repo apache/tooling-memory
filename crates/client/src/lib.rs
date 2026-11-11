@@ -485,6 +485,18 @@ mod tests {
             .expect("an answer, not silence");
         let why = got.unwrap_err().to_string();
         assert!(why.contains("a reply holds at most"), "{why}");
+        // a refusal that quotes megabytes of what the caller sent is cut to its first words
+        let depth = "\u{7f}".repeat(3 * 1024 * 1024);
+        let asked = client.call("search", json!({ "query": "needle", "depth": depth }));
+        let got = tokio::time::timeout(within, asked)
+            .await
+            .expect("an answer, not silence");
+        let why = got.unwrap_err().to_string();
+        assert!(
+            why.contains("too long to send") && why.len() < 4096,
+            "{}",
+            why.len()
+        );
         // the same connection still answers, and a plain entry of that size comes back
         let plain = write("word ".repeat(760 * 1024)).await;
         let got = tokio::time::timeout(within, client.get(&plain))
