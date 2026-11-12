@@ -68,7 +68,7 @@ Landed so far:
 |---|---|---|
 | 0 | #69 | Nothing |
 | 1 | #71 | Nothing |
-| 2 | #73 | An attempt key on every operation; an uncertain external effect blocking reassignment; waiting on an outside event as a state; the record's remaining fields (`parent`, `scores`, `implements`, `reversibility`, `artifacts_touched`, `policy_context`) |
+| 2 | #73, and attempt keys for a claim and a completion in #77 | An attempt key on the other operations; an uncertain external effect blocking reassignment; waiting on an outside event as a state; the record's remaining fields (`parent`, `scores`, `implements`, `reversibility`, `artifacts_touched`, `policy_context`) |
 | 3 | #74 | A suite that gates a version of a definition; the data scope enforced; a definition required by default, once the system's own filings name one; tools offered a few at boot and the rest by search |
 | 6 | #78 | `check_policy` selecting rules by the action; the unused-rule check over one review period; the approver of an exception checked against the layer breached; a new version of a rule keeping its place under the ceiling; a decision that survives an enforced module that fails; the author and the date of an imported rule not trusted; a verified rule that stays in force while its next version waits for review |
 | 10 | this pull request | A stop for only the sessions that a change to the grants affects; rendered files removed when a session stops; the harness of a stopped session stopped; an expiry on a grant |

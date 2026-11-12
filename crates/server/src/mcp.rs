@@ -42,7 +42,9 @@ fn mcp_err(e: Error) -> McpError {
         Error::Ledger(
             dm_ledger::Error::NotFound(_)
             | dm_ledger::Error::WrongState { .. }
-            | dm_ledger::Error::NotHolder { .. },
+            | dm_ledger::Error::NotHolder { .. }
+            | dm_ledger::Error::Fenced { .. }
+            | dm_ledger::Error::AttemptSpent { .. },
         ) => McpError::invalid_params(e.to_string(), None),
         other => McpError::internal_error(other.to_string(), None),
     }
@@ -378,6 +380,10 @@ pub struct ClaimNextParams {
     /// Lease length in seconds, 10 to 86400. Default 1800. Heartbeat before it runs out.
     #[serde(default)]
     pub lease_seconds: Option<i64>,
+    /// A key of your own for this attempt. If you did not get the answer, call again
+    /// with the same key: you get the same claim, not a second task.
+    #[serde(default)]
+    pub attempt: Option<String>,
 }
 
 /// Parameters of `heartbeat`.
@@ -475,6 +481,10 @@ pub struct CompleteParams {
     pub generation: Option<u64>,
     /// The id of the handoff entry you wrote with `write` describing what happened.
     pub handoff: String,
+    /// A key of your own for this attempt. If you did not get the answer, call again
+    /// with the same key: the task is completed one time.
+    #[serde(default)]
+    pub attempt: Option<String>,
 }
 
 /// Parameters of `invalidate_task`.
@@ -939,7 +949,11 @@ impl McpServer {
         let p = p.0;
         let c = self
             .memory
-            .claim_next(p.domain.as_deref(), lease(p.lease_seconds))
+            .claim_next_once(
+                p.domain.as_deref(),
+                lease(p.lease_seconds),
+                p.attempt.as_deref(),
+            )
             .await
             .map_err(mcp_err)?;
         match c {
@@ -979,7 +993,7 @@ impl McpServer {
         let p = p.0;
         let t = self
             .memory
-            .complete(&p.id, p.generation, &p.handoff)
+            .complete_once(&p.id, p.generation, &p.handoff, p.attempt.as_deref())
             .await
             .map_err(mcp_err)?;
         ok(json!({ "task": t }))
@@ -1557,6 +1571,69 @@ mod tests {
         assert_eq!(filed["exception"]["task"]["requirements"][0], "human");
         let none = s.propose_amendment(Parameters(amend(""))).await;
         assert!(none.is_err());
+    }
+
+    /// The same call made twice under one key, as after an answer that did not arrive.
+    #[tokio::test]
+    async fn a_claim_and_a_completion_asked_twice_under_a_key_happen_once() {
+        let (_dir, s) = server().await;
+        for title in ["First", "Second"] {
+            let filed = payload(
+                &s.create_task(Parameters(CreateTaskParams {
+                    title: title.into(),
+                    body: "Do it.".into(),
+                    ..CreateTaskParams::default()
+                }))
+                .await
+                .unwrap(),
+            );
+            let id = filed["task"]["id"].as_str().unwrap();
+            s.memory.admit(id).await.unwrap();
+        }
+        let claim = || async {
+            payload(
+                &s.claim_next(Parameters(ClaimNextParams {
+                    attempt: Some("try-1".into()),
+                    ..ClaimNextParams::default()
+                }))
+                .await
+                .unwrap(),
+            )
+        };
+        let first = claim().await;
+        let again = claim().await;
+        assert_eq!(again["task"]["id"], first["task"]["id"]);
+        assert_eq!(again["generation"], 1);
+        let id = first["task"]["id"].as_str().unwrap().to_string();
+        let h = write_handoff(&s, "Done.").await;
+        let complete = |id: String, h: String| async {
+            s.complete(Parameters(CompleteParams {
+                id,
+                handoff: h,
+                attempt: Some("done-1".into()),
+                ..CompleteParams::default()
+            }))
+            .await
+        };
+        let done = payload(&complete(id.clone(), h.clone()).await.unwrap());
+        let done_again = payload(&complete(id.clone(), h.clone()).await.unwrap());
+        assert_eq!(done_again["task"], done["task"]);
+        assert_eq!(done["task"]["status"], "done");
+        // the key claimed that task, whose claim is over: it claims nothing more
+        let spent = s
+            .claim_next(Parameters(ClaimNextParams {
+                attempt: Some("try-1".into()),
+                ..ClaimNextParams::default()
+            }))
+            .await;
+        let why = spent
+            .err()
+            .map(|e| e.message.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            why,
+            "the attempt key try-1 was used before, and that attempt is over"
+        );
     }
 
     #[test]

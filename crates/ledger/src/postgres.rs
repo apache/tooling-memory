@@ -17,8 +17,9 @@
 //! connections cannot both win the same task.
 
 use crate::{
-    check_holder, claimable, parse_time, Error, Event, Held, PromotionRecord, PromotionSpec,
-    RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
+    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
+    PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use std::collections::HashMap;
@@ -428,6 +429,32 @@ impl Db {
         })
     }
 
+    /// The handoff a task was completed with under an attempt key, if it was.
+    pub(crate) async fn completed_under(
+        &self,
+        task: &str,
+        key: &str,
+    ) -> Result<Option<String>, Error> {
+        let s = self.schema_of_task(task).await?;
+        let row = self
+            .client
+            .query_opt(
+                &format!(
+                    "SELECT payload FROM {s}.events
+                     WHERE task_id = $1 AND kind = 'completed'
+                       AND payload::jsonb ->> 'attempt' = $2
+                     ORDER BY seq LIMIT 1"
+                ),
+                &[&task, &key],
+            )
+            .await?;
+        let payload: Option<String> = row.map(|r| r.try_get(0)).transpose()?;
+        Ok(match payload.map(|p| Event::parse(task, &p)).transpose()? {
+            Some(Event::Completed { handoff, .. }) => Some(handoff),
+            _ => None,
+        })
+    }
+
     /// The payloads of a task's events of one kind, oldest first.
     pub(crate) async fn payloads_of(&self, id: &str, kind: &str) -> Result<Vec<String>, Error> {
         let s = self.schema_of_task(id).await?;
@@ -596,11 +623,11 @@ impl Db {
         &mut self,
         domain: &str,
         now: OffsetDateTime,
-        holder: &str,
+        who: Claimant<'_>,
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Option<Taken>, Error> {
         let Some(s) = self.schema(domain).await? else {
             return Ok(None);
         };
@@ -609,6 +636,29 @@ impl Db {
         // after a later one with more
         let claimable_now = "status IN ('open', 'blocked', 'claimed')";
         let tx = self.client.transaction().await?;
+        // the claim this key made in this domain, looked for under the domain's lock, so
+        // two connections with one key make one claim
+        if let Some(key) = who.attempt {
+            lock_domain(&tx, domain).await?;
+            let before = tx
+                .query_opt(
+                    &format!(
+                        "SELECT task_id, payload FROM {s}.events
+                         WHERE kind = 'claimed' AND payload::jsonb ->> 'attempt' = $1
+                         ORDER BY seq LIMIT 1"
+                    ),
+                    &[&key],
+                )
+                .await?;
+            if let Some(row) = before {
+                let (id, payload): (String, String) = (row.try_get(0)?, row.try_get(1)?);
+                let generation = match Event::parse(&id, &payload)? {
+                    Event::Claimed { generation, .. } => generation,
+                    _ => 0,
+                };
+                return Ok(Some(Taken::Again { id, generation }));
+            }
+        }
         let rows = tx
             .query(
                 &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE {claimable_now}"),
@@ -624,10 +674,9 @@ impl Db {
             if !claimable(&seen, now, manifest, handling) {
                 continue;
             }
-            let who = (holder, until);
-            if take(&tx, &s, &seen.id, now, who, manifest, handling).await? {
+            if take(&tx, &s, &seen.id, now, (who, until), manifest, handling).await? {
                 tx.commit().await?;
-                return Ok(Some(seen.id));
+                return Ok(Some(Taken::New(seen.id)));
             }
         }
         Ok(None)
@@ -641,6 +690,13 @@ impl Db {
         now: OffsetDateTime,
         who: (&str, OffsetDateTime),
     ) -> Result<bool, Error> {
+        let who = (
+            Claimant {
+                holder: who.0,
+                attempt: None,
+            },
+            who.1,
+        );
         let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
         let taken = take(&tx, &s, id, now, who, &[], Label::Restricted).await?;
@@ -652,7 +708,7 @@ impl Db {
         &mut self,
         id: &str,
         now: OffsetDateTime,
-        holder: &str,
+        who: Claimant<'_>,
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
@@ -678,8 +734,10 @@ impl Db {
             });
         }
         let claimed = Event::Claimed {
-            holder: holder.to_string(),
+            holder: who.holder.to_string(),
             until,
+            generation: task.generation + 1,
+            attempt: who.attempt.map(str::to_string),
         };
         apply(&tx, &s, id, now, &claimed).await?;
         tx.commit().await?;
@@ -867,7 +925,7 @@ async fn take<C: GenericClient>(
     s: &str,
     id: &str,
     now: OffsetDateTime,
-    who: (&str, OffsetDateTime),
+    who: (Claimant<'_>, OffsetDateTime),
     manifest: &[String],
     handling: Label,
 ) -> Result<bool, Error> {
@@ -888,8 +946,10 @@ async fn take<C: GenericClient>(
         return Ok(false);
     }
     let claimed = Event::Claimed {
-        holder: who.0.to_string(),
+        holder: who.0.holder.to_string(),
         until: who.1,
+        generation: task.generation + 1,
+        attempt: who.0.attempt.map(str::to_string),
     };
     apply(tx, s, &task.id, now, &claimed).await?;
     Ok(true)
@@ -1319,7 +1379,7 @@ async fn project<C: GenericClient>(
             vec![&id],
         ),
         Event::HandoffLeft { handoff } => ("SET handoff = $2 WHERE id = $1", vec![&id, handoff]),
-        Event::Completed { handoff } => (
+        Event::Completed { handoff, .. } => (
             "SET status = 'done', handoff = $2, lease_until = NULL WHERE id = $1",
             vec![&id, handoff],
         ),

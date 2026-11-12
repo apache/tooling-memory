@@ -1549,6 +1549,41 @@ impl Memory {
         Ok(promoted)
     }
 
+    /// The key the ledger keeps for a caller's attempt key: the caller's own, which is a
+    /// short name, under this session. One session's key is thus no other session's,
+    /// whoever its author is. The ledger looks a key up among claims or among
+    /// completions, so one key serves both.
+    fn attempt_key(&self, key: &str) -> Result<String, Error> {
+        let plain = !key.is_empty()
+            && key.len() <= 64
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !plain {
+            return Err(Error::Denied(
+                "an attempt key is 1 to 64 ASCII letters, digits, dots, hyphens or underscores"
+                    .into(),
+            ));
+        }
+        Ok(format!("{}:{key}", self.session_id))
+    }
+
+    /// A refusal of an attempt key, in the caller's own words: the ledger's names the
+    /// key as it is kept, which the caller did not type.
+    fn in_own_words<T>(
+        answer: Result<T, dm_ledger::Error>,
+        attempt: Option<&str>,
+    ) -> Result<T, Error> {
+        answer.map_err(|e| match (e, attempt) {
+            (dm_ledger::Error::AttemptSpent { .. }, Some(key)) => {
+                Error::Ledger(dm_ledger::Error::AttemptSpent {
+                    key: key.to_string(),
+                })
+            }
+            (e, _) => Error::Ledger(e),
+        })
+    }
+
     /// This session as the holder under the claim of `generation`.
     fn under(&self, generation: u64) -> dm_ledger::Held<'_> {
         dm_ledger::Held {
@@ -2833,14 +2868,38 @@ impl Memory {
         domain: Option<&str>,
         lease: Duration,
     ) -> Result<Option<Claim>, Error> {
+        self.claim_next_once(domain, lease, None).await
+    }
+
+    /// [`Memory::claim_next`] under an attempt key: a caller that did not hear the answer
+    /// asks again with the same key and gets the same claim, not a second task.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::claim_next`]; a ledger error when the key's claim is over.
+    pub async fn claim_next_once(
+        &self,
+        domain: Option<&str>,
+        lease: Duration,
+        attempt: Option<&str>,
+    ) -> Result<Option<Claim>, Error> {
         let domain = self.resolve_domain(domain)?;
         let handling = self.handling()?;
-        let claim = self
-            .ledger
-            .lock()
-            .await
-            .claim_next(&domain, &self.author, lease, &self.capabilities(), handling)
-            .await?;
+        let can = self.capabilities();
+        let kept = attempt.map(|k| self.attempt_key(k)).transpose()?;
+        let mut l = self.ledger.lock().await;
+        let claim = match &kept {
+            Some(key) => Self::in_own_words(
+                l.claim_next_once(&domain, &self.author, lease, (&can, handling), key)
+                    .await,
+                attempt,
+            )?,
+            None => {
+                l.claim_next(&domain, &self.author, lease, &can, handling)
+                    .await?
+            }
+        };
+        drop(l);
         if let Some(c) = &claim {
             lock(&self.session).observe(c.task.spec.classification);
             lock(&self.claims).insert(c.task.id.clone(), c.generation);
@@ -2898,14 +2957,46 @@ impl Memory {
         generation: Option<u64>,
         handoff: &str,
     ) -> Result<Task, Error> {
-        let task = self.ledger.lock().await.get(id).await?;
+        self.complete_once(id, generation, handoff, None).await
+    }
+
+    /// [`Memory::complete`] under an attempt key: asked again with the same key, it
+    /// gives the completed task back, and the task is completed once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::complete`]; a ledger error when the key was used for another task.
+    pub async fn complete_once(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        handoff: &str,
+        attempt: Option<&str>,
+    ) -> Result<Task, Error> {
+        // the ledger stays locked from the read of the task to its completion: a second
+        // call under the same key then reads what the first one left
+        let mut l = self.ledger.lock().await;
+        let task = l.get(id).await?;
         self.check_task(&task)?;
         if self.store.get(&task.spec.domain, handoff).await?.is_none() {
             return Err(Error::NotFound(format!("handoff {handoff}")));
         }
-        let mut l = self.ledger.lock().await;
+        let kept = attempt.map(|k| self.attempt_key(k)).transpose()?;
+        // a completion asked again under its key comes after this session forgot the
+        // claim: the task's own generation then stands in, and the ledger answers by
+        // the key, or refuses a task that is done as it would anyone. Nothing more
+        // happens for it: the task, and what its completion closed, are as they were
+        if let (Some(key), dm_ledger::Status::Done) = (&kept, task.status) {
+            let by = self.under(task.generation);
+            let same = Self::in_own_words(l.complete_once(id, by, handoff, key).await, attempt)?;
+            self.observe_task(&same);
+            return Ok(same);
+        }
         let by = self.under(self.claim_of(id, generation)?);
-        let done = l.complete(id, by, handoff).await?;
+        let done = match &kept {
+            Some(key) => Self::in_own_words(l.complete_once(id, by, handoff, key).await, attempt)?,
+            None => l.complete(id, by, handoff).await?,
+        };
         lock(&self.claims).remove(id);
         // a continuation finishes the task it resumed, and that one the task it resumed in
         // turn: up the chain, while each is open and nobody holds it
@@ -7547,6 +7638,137 @@ mod tests {
         );
         let done = second.complete(&t.id, None, &h).await.unwrap();
         assert_eq!((done.status, done.generation), (Status::Done, 2));
+    }
+
+    /// An attempt key is one session's: another session of the same author, with the
+    /// same words, makes its own claim and learns nothing of the first.
+    #[tokio::test]
+    async fn an_attempt_key_is_a_session_s_and_gives_nothing_above_its_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = mem(dir.path());
+        let mut secret = tspec("Rotate the signing key", 5, None, &[], &[]);
+        secret.classification = Label::Restricted;
+        let secret = filed(&first, secret).await;
+        let plain = filed(&first, tspec("Tidy the docs", 0, None, &[], &[])).await;
+        let lease = Duration::minutes(5);
+        let held = first
+            .claim_next_once(None, lease, Some("try-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.task.id, secret.id);
+        let again = first
+            .claim_next_once(None, lease, Some("try-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((again.task.id, again.generation), (held.task.id, 1));
+        // a second session of the same author, capped below the task, with the same key
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let theirs = capped
+            .claim_next_once(None, lease, Some("try-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            theirs.task.id, plain.id,
+            "its own claim, of what it may hold"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        // a key is a short name, not text
+        for bad in ["", "two words", "a/b", "cl\u{e9}", &"k".repeat(65)] {
+            let refused = first.claim_next_once(None, lease, Some(bad)).await;
+            assert!(matches!(refused, Err(Error::Denied(_))), "{bad:?}");
+        }
+    }
+
+    /// A completion asked again is the same completion or none: it changes nothing, and
+    /// another session's same words are not that key.
+    #[tokio::test]
+    async fn a_completion_asked_again_under_its_key_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let t = filed(&m, tspec("Once", 0, None, &[], &[])).await;
+        let handoff = |text: &'static str| async {
+            let h = WriteRequest {
+                entry_type: EntryType::Handoff,
+                ..req(text)
+            };
+            m.write(h).await.unwrap().id
+        };
+        let h = handoff("Done.\n").await;
+        let other = handoff("Something else.\n").await;
+        m.claim(&t.id, Duration::minutes(5)).await.unwrap();
+        let done = m
+            .complete_once(&t.id, None, &h, Some("done-1"))
+            .await
+            .unwrap();
+        let again = m
+            .complete_once(&t.id, None, &h, Some("done-1"))
+            .await
+            .unwrap();
+        assert_eq!(again, done);
+        // the same key with another handoff is refused, and the record keeps the first
+        let changed = m.complete_once(&t.id, None, &other, Some("done-1")).await;
+        assert!(
+            matches!(
+                changed,
+                Err(Error::Ledger(dm_ledger::Error::AttemptSpent { .. }))
+            ),
+            "{:?}",
+            changed.map(|t| t.handoff)
+        );
+        // a session that never held the task has no such key: the task is done, to it
+        let onlooker = Memory::open(dir.path()).unwrap();
+        let replayed = onlooker
+            .complete_once(&t.id, None, &other, Some("done-1"))
+            .await;
+        assert!(
+            matches!(
+                replayed,
+                Err(Error::Ledger(dm_ledger::Error::WrongState { .. }))
+            ),
+            "{:?}",
+            replayed.map(|t| t.handoff)
+        );
+        assert_eq!(
+            m.get_task(&t.id).await.unwrap().handoff.as_deref(),
+            Some(h.as_str())
+        );
+    }
+
+    /// A completion asked again closes nothing that the first call left open.
+    #[tokio::test]
+    async fn a_completion_asked_again_closes_no_task_up_its_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let parent = filed(&m, tspec("Parent", 0, None, &[], &[])).await;
+        let h = WriteRequest {
+            entry_type: EntryType::Handoff,
+            ..req("Done.\n")
+        };
+        let h = m.write(h).await.unwrap().id;
+        let lease = Duration::minutes(5);
+        // the parent is held, so the continuation's completion does not close it
+        m.claim(&parent.id, lease).await.unwrap();
+        let origin = format!("continues:{}", parent.id);
+        let next = filed(&m, tspec("Continuation", 0, Some(&origin), &[], &[])).await;
+        m.claim(&next.id, lease).await.unwrap();
+        m.complete_once(&next.id, None, &h, Some("done-1"))
+            .await
+            .unwrap();
+        m.release(&parent.id, None, None).await.unwrap();
+        let again = m
+            .complete_once(&next.id, None, &h, Some("done-1"))
+            .await
+            .unwrap();
+        assert_eq!(again.status, dm_ledger::Status::Done);
+        assert_eq!(
+            m.get_task(&parent.id).await.unwrap().status,
+            dm_ledger::Status::Open
+        );
     }
 
     async fn done(m: &Memory, s: TaskSpec) {

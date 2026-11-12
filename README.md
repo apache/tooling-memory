@@ -110,7 +110,8 @@ two weeks. It is also the reason that none of it is the production shape.
   - CPU or memory limits on the sandbox
 - **The task record, in part.** A claim has a generation, and the ledger refuses a
   holder that gives an earlier one. A task can be `blocked` on a task that it depends on.
-  These parts are not built: an attempt key for each operation, a block on a new claim
+  A claim and a completion can carry an attempt key. These parts are not built: an
+  attempt key for the other operations, a block on a new claim
   while an external effect is uncertain, and a `blocked` state for a task that waits on an
   outside event. The generation does not prove who the caller is.
 - **Task definitions, in part, and autonomy levels.** A task can name a task definition.
