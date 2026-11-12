@@ -549,7 +549,7 @@ impl Memory {
                     continue;
                 }
                 let mut text = e.body.clone();
-                for s in &e.front.source {
+                for s in &e.front.cites {
                     text.push('\n');
                     text.push_str(s);
                 }

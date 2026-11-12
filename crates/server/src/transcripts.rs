@@ -3,7 +3,7 @@
 //! A session's transcript is kept in the record, in the session's domain, beside the
 //! entries and never as one: it is not indexed, not in T0, and no search, list or recall
 //! returns it. It is reached only by citation, by turn: an entry distilled from it names
-//! `transcript:<session>#<turn>` in its `source`, and [`Memory::transcript_turn`] serves
+//! `transcript:<session>#<turn>` in its `cites`, and [`Memory::transcript_turn`] serves
 //! a turn some entry the reader may read cites, under the reader's filter, raising the
 //! reader's label to the transcript's classification as a `get` does.
 //!
@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use time::{Duration, OffsetDateTime};
 
-/// How a citation of a transcript begins in an entry's `source`.
+/// How a citation of a transcript begins in an entry's `cites`.
 pub const CITATION: &str = "transcript:";
 /// Where sweeps and early erasures say what they dropped, under the root.
 pub const LOG: &str = "state/transcripts.jsonl";
@@ -1278,7 +1278,7 @@ fn excerpt_removed(entry: &str, x: &Excerpt) -> Removed {
 }
 
 fn add_citations(out: &mut Citations, e: &Entry, domain: &str) {
-    for s in &e.front.source {
+    for s in &e.front.cites {
         if let Some((session, turns)) = cited(s) {
             let list = out.entry(session.to_string()).or_default();
             match list.iter_mut().find(|(id, _, _)| *id == e.front.id) {
@@ -1365,7 +1365,7 @@ mod tests {
         m.write(WriteRequest {
             body: body.into(),
             entry_type: EntryType::Handoff,
-            source: cite(session, turns),
+            cites: cite(session, turns),
             ..WriteRequest::default()
         })
         .await
@@ -1521,7 +1521,7 @@ mod tests {
             body: "Handoff: see the transcript.\n".into(),
             entry_type: EntryType::Handoff,
             classification: Some(Label::Public),
-            source: cite(&k.session, &[2]),
+            cites: cite(&k.session, &[2]),
             ..WriteRequest::default()
         })
         .await

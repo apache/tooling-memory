@@ -74,7 +74,7 @@ pub enum Action {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Filing {
-    /// The system on the owner's behalf: the survey, the checker, the canaries.
+    /// The system on the owner's behalf: the survey, the auditor, the canaries.
     Own,
     /// A session filing from a task it holds: a subagent, a continuation.
     Held,

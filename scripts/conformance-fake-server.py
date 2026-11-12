@@ -399,7 +399,7 @@ class Fake:
         records = []
         if lines:
             records.append({
-                "domain": DOMAIN, "entry": lines[0][0], "tier": "curated", "by": "agent:fake:librarian",
+                "domain": DOMAIN, "entry": lines[0][0], "tier": "curated", "by": "agent:fake:curator",
                 "author": "human:fake:owner", "why": "checked against the tree", "classification": "internal",
                 "digest": lines[0][2], "new_digest": lines[0][2], "why_erased": False,
                 "at": "2026-10-08T00:00:00Z",
@@ -410,7 +410,7 @@ class Fake:
         if FLAW == "highest-wrong":
             highest = "public" if highest != "public" else "internal"
         out = [
-            "format: durable-memory/bundle/0",
+            "format: durable-memory/bundle/1",
             f"domain: {DOMAIN}",
             "exported_at: 2026-10-08T00:00:00Z",
             "exported_by: human:fake:owner",

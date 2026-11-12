@@ -205,9 +205,9 @@ other tasks. The board page of the web launcher lists tasks by status, under wha
 them. It marks the tasks for a person. It lets the person admit, claim, complete with a
 handoff, invalidate or retry them.
 
-## The librarian: `amem librarian`
+## The curator: `amem curator`
 
-In the paper, the librarian is a permanent group of agents on a cheap model. These agents:
+In the paper, the curator is a permanent group of agents on a cheap model. These agents:
 
 - verify stale facts
 - merge duplicates
@@ -215,7 +215,7 @@ In the paper, the librarian is a permanent group of agents on a cheap model. The
 - split files that are too large
 - act on telemetry.
 
-The first step here is a survey that writes nothing. `amem librarian` reads a domain and
+The first step here is a survey that writes nothing. `amem curator` reads a domain and
 the read log. It proposes, as JSON, what needs curation:
 
 - summaries that the index should not serve: a table, a heading or a clipped first
@@ -227,7 +227,7 @@ the read log. It proposes, as JSON, what needs curation:
 - questions searched for more than once that found nothing: authoring tasks.
 
 With `--file`, each proposal becomes a task on the ledger, at low priority. The task has
-`origin: librarian:<kind>` and a hash of what it concerns. Thus a survey that runs twice
+`origin: curator:<kind>` and a hash of what it concerns. Thus a survey that runs twice
 files each task once. `amem work` on a cheap model then does the curation with the memory
 tools. Each task body says what to do, and how the change stays reversible. The new entry
 `supersedes` the old one and changes no facts. A verify proposes, and never promotes to
@@ -235,17 +235,17 @@ tools. Each task body says what to do, and how the change stays reversible. The 
 
 This implementation has three of the paper's containments:
 
-- The checker, `amem check`, is the independent counterpart of the librarian. It uses a
+- The auditor, `amem audit`, is the independent counterpart of the curator. It uses a
   destination and a model of its own. That model should not be the model that wrote the
-  summaries. The checker samples a domain's entries, asks whether each summary entails its
+  summaries. The auditor samples a domain's entries, asks whether each summary entails its
   body, and writes nothing. With `--file`, a rejected summary becomes a task for a
-  librarian session, with the checker's model and reason on it.
+  curator session, with the auditor's model and reason on it.
 - Canaries are entries with known content and summaries. `amem canary plant` puts them in
   a domain, and records them with their digests under the record's state. `amem canary
   check` reads each canary back. It exits with code 3 when a canary was altered,
   superseded, demoted or erased. With `--file`, it files a task for the owner that
   requires `human` and names what changed.
-- The source-change trigger. An entry's `source` can name a file, as `file:<path>` under
+- The source-change trigger. An entry's `cites` can name a file, as `file:<path>` under
   `--workdir`, relative or absolute. A path outside `--workdir`, or a link that
   leads out of it, names nothing. An absolute path is a path on the host that runs
   the survey, not inside a confined session. A `--workdir` that is not a directory
@@ -258,7 +258,7 @@ three times or more are a merge candidate. If readers open the body of an entry 
 times or more after the index served its summary, that summary did not say enough. The
 survey proposes a re-summarise that says what the readers looked for.
 
-The checker also looks for contradictions, with `amem check --contradictions`. For each
+The auditor also looks for contradictions, with `amem audit --contradictions`. For each
 sampled entry, it takes the two other entries that a search for its title puts beside it.
 It asks its model whether each pair can both be true, and it asks once for each pair. A
 contradiction becomes a task to reconcile the two entries, at a priority above the
@@ -269,9 +269,9 @@ place:
   that no longer holds.
 - Demote the stale entry with a tombstone.
 
-The librarian's own telemetry is what the paper calls the watch on the watchers. It comes
-from the record and the ledger. No librarian writes it, so a librarian cannot suppress it.
-`amem librarian --telemetry` counts these values for each author:
+The curator's own telemetry is what the paper calls the watch on the watchers. It comes
+from the record and the ledger. No curator writes it, so a curator cannot suppress it.
+`amem curator --telemetry` counts these values for each author:
 
 - the active entries that supersede another entry
 - how many of those entries left the body as it was, how many changed it, and by how much
@@ -294,15 +294,15 @@ steps:
 
 1. It runs the survey, and files the survey's proposals up to the gap under
    `--budget-tasks` open curation tasks.
-2. It runs the checker on `--sample` entries, and with `--contradictions`, the
+2. It runs the auditor on `--sample` entries, and with `--contradictions`, the
    contradiction hunt. The egress counts each model call against `--budget-tokens`. At
-   that number, the checker stops.
+   that number, the auditor stops.
 3. It checks the canaries.
 4. It computes the telemetry and files its alarms.
 5. It adds a line to `state/curation.jsonl` with what it found, filed and spent.
 
 `--every <seconds>` runs the cycle at that interval until you stop it. The read log does
-not record the librarian's reads during a cycle, so curation does not count as retrieval.
+not record the curator's reads during a cycle, so curation does not count as retrieval.
 `amem work` on a cheap model works the tasks that a cycle files. `file_own` admits them
 where the domain's grant says `admit_own`. Otherwise, it leaves them proposed for the
 owner.
@@ -312,7 +312,7 @@ two with the same method under different titles, two that disagreed about whethe
 harness is the default, one that cited `file:Makefile`, and two canaries. There were also
 three searches that returned the pair together, and three opens of one body. The survey
 proposed the merge from co-retrieval, the re-summarise from the opened body, and the
-verify from the touched Makefile. A cycle with the gateway's gemma as the checker filed
+verify from the touched Makefile. A cycle with the gateway's gemma as the auditor filed
 eight tasks and found the contradiction. It rejected two summaries, and spent 2.4k tokens
 in ten calls. Codex on the gateway's Qwen claimed the contradiction first. It read both
 entries and found the commit that removed the default harness. It wrote the corrected
@@ -321,8 +321,8 @@ a handoff. A second session rewrote a summary and did not change its body. The t
 then counted two curations for `agent:codex`: one that changed only the summary, and one
 that changed the body. It counted two completed tasks and no alarms. Both canaries were
 intact. A second cycle with a budget of six open tasks filed no more tasks. In that cycle,
-with a budget of 1,500 tokens, the checker stopped after five entries, as the log line
-shows. The librarian left one side remark in its handoff: the Makefile's usage examples
+with a budget of 1,500 tokens, the auditor stopped after five entries, as the log line
+shows. The curator left one side remark in its handoff: the Makefile's usage examples
 still implied a default harness. That remark was correct, and the issue is now fixed.
 
 ## The perimeter: policy, admission and the gates
@@ -345,7 +345,7 @@ can try a rule before you trust it. The policy never encodes judgement. It conta
 machine can check.
 
 Admission. Task creation is cheap and has no gate. Admission is not. The system files some
-tasks for the owner: the tasks of the survey, the checker and the canaries. Such a task is
+tasks for the owner: the tasks of the survey, the auditor and the canaries. Such a task is
 admitted where the domain's grant says `admit_own`. A session can also file a task from a
 task that it holds: a subagent, a continuation or a retry. The same grant admits such a
 task only when its requirements are within the requirements of the held task. A task that
@@ -387,7 +387,7 @@ Detection. The write log, `state/writes.jsonl`, records which session wrote whic
 It is beside the read log, which now names the entries that each read served. `amem taint
 <id>` follows the reach of an entry: the sessions that read it, and the entries that those
 sessions wrote after they read it. This is the paper's lineage for erasure. It is also the
-first place to look when you find that an entry is poisoned. The librarian's telemetry
+first place to look when you find that an entry is poisoned. The curator's telemetry
 adds two alarms, from the logs only:
 
 - `write-rate`: an author writes thirty or more entries in an hour.
@@ -433,8 +433,8 @@ narrowed this way finds, gets and lists nothing above public, while the owner se
 everything.
 
 The quarantine's reader. The scan uses patterns. It cannot tell the difference between a
-handoff that reports an injection and the injection itself. With `amem check
---quarantine`, the checker's model, not the writer's model, reads each held write that has
+handoff that reports an injection and the injection itself. With `amem audit
+--quarantine`, the auditor's model, not the writer's model, reads each held write that has
 no review yet. It says what the write is:
 
 - `malicious`: it tries to direct whoever reads it
@@ -460,11 +460,11 @@ writes:
 Each entry is raw when it is written. The trust tiers above raw have the meanings that the
 paper gives them.
 
-Curated means that a librarian summarised, merged or checked an entry. An entry becomes
+Curated means that a curator summarised, merged or checked an entry. An entry becomes
 curated in two ways:
 
-- A write that supersedes an entry lands curated when the session holds a librarian's task
-  or the checker's task.
+- A write that supersedes an entry lands curated when the session holds a curator's task
+  or the auditor's task.
 - Anyone except the entry's author can mark the entry curated, with the `promote` memory
   tool or with `amem promote <id> --to curated --why "<what you checked>"`.
 
@@ -508,7 +508,7 @@ key the next time it opens. A PostgreSQL ledger gets them the next time a proces
 connects, in each domain schema that lacks them. Commit 9944964 kept each why in a
 completed `promoted:` task. Those tasks stay as they are.
 
-When an entry holds, the librarian's verify task now ends in such a proposal. The rules
+When an entry holds, the curator's verify task now ends in such a proposal. The rules
 are Rego, in the built-in policy. Each step is a logged decision. A promotion is a new
 version of the entry, and the history of the entry keeps the old version. This is the
 paper's defence against an exploit that becomes practice across the fleet. An agent
@@ -602,7 +602,7 @@ whoever files it.
 - the requirements of waiting tasks that no completed task ever carried, which is a
   capability gap;
 - for each creator, the filings held back because they asked for more than the creator
-  holds. This is the paper's requirements inflation. The librarian's telemetry flags it at
+  holds. This is the paper's requirements inflation. The curator's telemetry flags it at
   three.
 
 ## When an entry has moved: redirects
@@ -652,7 +652,7 @@ and write logs:
 | wasted reads | bodies that the session opened and that its handoff does not cite |
 
 "Used" here means cited by id in the handoff. The paper samples a cheap-model judge
-instead. The read log also records who read, the owner or an agent. The librarian's relay
+instead. The read log also records who read, the owner or an agent. The curator's relay
 alarm uses this.
 
 Prefetch also occurs at fetch time. This is the paper's rule 4. Over MCP, `get` carries
@@ -978,7 +978,7 @@ qwen3-8b against qwen3.8-27b fired these detectors: input tokens on all eight pr
 reported model and fingerprint, and a flip rate of 1.0 over a floor of 0.0.
 
 Reasoning models think inside `max_tokens`. When the limit cuts a probe, the probe says
-so. `amem curate --drift` probes the checker's model in each cycle against its first run,
+so. `amem curate --drift` probes the auditor's model in each cycle against its first run,
 and files confirmed drift. Not yet: logprob divergence, change-point detection over many
 runs.
 
@@ -1034,7 +1034,7 @@ not drop them.
 ## Traces: OpenTelemetry
 
 `amem` sends OpenTelemetry traces. It also records the usage in SQLite. `amem` continues
-to record the usage in SQLite until the librarian's signals come from the stream. There
+to record the usage in SQLite until the curator's signals come from the stream. There
 are three spans:
 
 - `model.call`: one for each model call that the egress meters, from the start of the
@@ -1083,7 +1083,7 @@ type, and the system keeps the clocks:
 Here, this is how it works:
 
 - When a fact has no `review_by`, it gets one ninety days after the write.
-- The `review_by` of each entry is in the index. The librarian proposes a verify for each
+- The `review_by` of each entry is in the index. The curator proposes a verify for each
   entry whose date is past. It also proposes a verify for each raw entry that is older
   than thirty days and has no date.
 - A search hit and a T0 line mark an entry whose review is due. Thus the agent that reads
@@ -1095,11 +1095,11 @@ Here, this is how it works:
   do first. It must verify their handoffs, and the entries that they cite, against what
   the task assumes. It must send a mismatch back to the board in a handoff, and not absorb
   it.
-- The checker samples summaries against bodies, on a model of its own.
+- The auditor samples summaries against bodies, on a model of its own.
 - Canaries catch a curation pass that changes what it must not change.
 - An entry can name the file that it comes from, as `file:<path>`. When that file changes,
-  the librarian proposes a verify for the entry.
-- The contradiction hunt of the checker gives a model the entries that a search puts side
+  the curator proposes a verify for the entry.
+- The contradiction hunt of the auditor gives a model the entries that a search puts side
   by side. When they cannot both be true, it files a reconcile.
 
 ## Evaluation: `scripts/eval.py`
@@ -1451,7 +1451,7 @@ entries: facts, decisions, conventions and methods.
 The entries go in at the raw tier, with low confidence, and with the transcript as their
 source. They wait for a person to confirm or drop them. Nothing that is mined is trusted
 when it arrives. The default model is a small model for each destination, and
-`--mine-model` overrides it. Mining is a librarian's job, and the paper puts librarians on
+`--mine-model` overrides it. Mining is a curator's job, and the paper puts curators on
 the cheap class.
 
 `--mine-via auto` selects one of two routes:

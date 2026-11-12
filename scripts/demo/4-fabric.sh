@@ -22,11 +22,11 @@ maintenance_floor = 0.2
 [rubric.origin_weights]
 "task:" = 2
 "continues:" = 3
-"librarian:" = -1
+"curator:" = -1
 ```
 POL
 )
-a approve "$(agent agent:librarian promote "{\"id\": \"$strategy\", \"to\": \"verified\", \"why\": \"agreed for this period\"}" | j "d['task']['id']")" >/dev/null
+a approve "$(agent agent:curator promote "{\"id\": \"$strategy\", \"to\": \"verified\", \"why\": \"agreed for this period\"}" | j "d['task']['id']")" >/dev/null
 echo "  pol-L1-007 is verified and in force"
 
 say "A small queue" "A task blocked on another, and a small unrelated one. On admission the blocker rises above what it blocks: a move along the ledger's edge, made by the ledger, not by a worker."

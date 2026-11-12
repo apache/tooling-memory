@@ -581,7 +581,7 @@ impl Memory {
                 continue;
             }
             spent += cost;
-            p.links = mem_ids(&entry.front.source);
+            p.links = mem_ids(&entry.front.cites);
             p.body = Some(entry.body.clone());
             lock(&self.cache).insert(&p.id, dm_core::digest(&entry.render()));
         }
@@ -872,7 +872,7 @@ mod tests {
         m.write(WriteRequest {
             title: Some(title.into()),
             body: body.into(),
-            source,
+            cites: source,
             ..WriteRequest::default()
         })
         .await
@@ -1367,7 +1367,7 @@ mod tests {
         m.write(WriteRequest {
             title: Some("Open policy".into()),
             body: "The open policy cites the table.\n".into(),
-            source: vec![internal.clone()],
+            cites: vec![internal.clone()],
             classification: Some(Label::Public),
             ..WriteRequest::default()
         })

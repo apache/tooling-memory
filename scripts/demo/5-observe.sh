@@ -3,7 +3,7 @@
 # task transitions; the paper's read metrics; vendor-drift probes; and transcripts kept
 # as sources, reached only by citation. Each part runs when this build has it.
 . "$(dirname "$0")/lib.sh"
-act 5 "Watching it" "What the system shows about itself: traces of every model call, read, decision and task transition; the paper's read metrics; probes for a vendor changing a model under its name; transcripts kept as sources; and replay of a session's decisions on another model." "the system itself: a loopback OpenTelemetry sink counting spans; the drift probes, run against $WORKER_MODEL and then $CHECKER_MODEL; the egress, whose recorded decision contexts are replayed; and $WORKER_MODEL, replaying a session another model ran."
+act 5 "Watching it" "What the system shows about itself: traces of every model call, read, decision and task transition; the paper's read metrics; probes for a vendor changing a model under its name; transcripts kept as sources; and replay of a session's decisions on another model." "the system itself: a loopback OpenTelemetry sink counting spans; the drift probes, run against $WORKER_MODEL and then $AUDITOR_MODEL; the egress, whose recorded decision contexts are replayed; and $WORKER_MODEL, replaying a session another model ran."
 has() { a "$1" --help >/dev/null 2>&1; }
 
 say "Traces" "Every model call, read, policy decision and task transition is an OpenTelemetry span, sent when a collector is named. Here a small loopback sink counts them."
@@ -40,9 +40,9 @@ if has drift && gateway; then
   a drift probe --auth gateway --model "$WORKER_MODEL" >/dev/null
   echo "  $WORKER_MODEL, two runs of the same pinned probes:"
   a drift check --provider llmao --model "$WORKER_MODEL" | python3 -c "import json,sys; d=json.load(sys.stdin); $show_drift"
-  echo "  a repoint, as a vendor swapping the model behind a name would look: $CHECKER_MODEL against $WORKER_MODEL's baseline"
-  a drift probe --auth gateway --model "$CHECKER_MODEL" >/dev/null
-  a drift check --provider llmao --model "$CHECKER_MODEL" --baseline-model "$WORKER_MODEL" | python3 -c "import json,sys; d=json.load(sys.stdin); $show_drift"
+  echo "  a repoint, as a vendor swapping the model behind a name would look: $AUDITOR_MODEL against $WORKER_MODEL's baseline"
+  a drift probe --auth gateway --model "$AUDITOR_MODEL" >/dev/null
+  a drift check --provider llmao --model "$AUDITOR_MODEL" --baseline-model "$WORKER_MODEL" | python3 -c "import json,sys; d=json.load(sys.stdin); $show_drift"
 fi
 
 if has transcript; then

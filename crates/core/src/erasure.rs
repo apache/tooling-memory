@@ -66,7 +66,7 @@ pub fn stub(entry: &Entry, reason: Reason) -> Entry {
     }
     if reason == Reason::Requested {
         front.author = "erased".into();
-        front.source.clear();
+        front.cites.clear();
     }
     Entry {
         front,
@@ -218,21 +218,21 @@ mod tests {
 
     #[test]
     fn a_stub_keeps_the_frontmatter_and_nothing_the_body_said() {
-        let text = "---\nid: mem-me-1\ntype: fact\ndomain: dom-me\nauthor: human:test:me\ncreated: 2026-10-01T10:00:00Z\nsource:\n- https://example.test/x\nsummary: the secret summary\ntitle: Alice's diagnosis\n---\nThe secret body.\n";
+        let text = "---\nid: mem-me-1\ntype: fact\ndomain: dom-me\nauthor: human:test:me\ncreated: 2026-10-01T10:00:00Z\ncites:\n- https://example.test/x\nsummary: the secret summary\ntitle: Alice's diagnosis\n---\nThe secret body.\n";
         let e = Entry::parse(text).unwrap();
         let s = stub(&e, Reason::Mistaken);
         assert_eq!(s.front.status, Some(Status::Erased));
         assert_eq!(s.body, "");
         assert_eq!(s.front.summary, None);
         assert_eq!(s.front.author, "human:test:me");
-        assert_eq!(s.front.source.len(), 1);
+        assert_eq!(s.front.cites.len(), 1);
         assert_eq!(s.front.title.as_deref(), Some("Alice's diagnosis"));
         let rendered = s.render();
         assert!(!rendered.contains("secret"), "{rendered}");
         assert_eq!(Entry::parse(&rendered).unwrap(), s, "a stub round-trips");
         let r = stub(&e, Reason::Requested);
         assert_eq!(r.front.author, "erased");
-        assert!(r.front.source.is_empty());
+        assert!(r.front.cites.is_empty());
         assert_eq!(r.front.title, None, "a title is about the person too");
         assert_eq!(stub(&e, Reason::Sensitive).front.title, None);
         assert!(stub(&e, Reason::Legal).front.title.is_some());

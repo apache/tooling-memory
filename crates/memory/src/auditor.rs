@@ -1,15 +1,15 @@
-//! The checker: the librarian's independent counterpart. The paper's audit agents
+//! The auditor: the curator's independent counterpart. The paper's audit agents
 //! verify that a summary entails its body, sampled continuously, on a different base
-//! model and prompt lineage than the librarians, sharing no writable state with them.
-//! Here the checker samples a domain's entries, asks a model of its own whether each
+//! model and prompt lineage than the curators, sharing no writable state with them.
+//! Here the auditor samples a domain's entries, asks a model of its own whether each
 //! summary entails its body, and writes nothing to the record: a summary found wanting
-//! becomes a task for a librarian run, with the checker's model and reason on it.
+//! becomes a task for a curator run, with the auditor's model and reason on it.
 
 use dm_egress::Egress;
 use dm_server::Memory;
 use serde::Serialize;
 
-/// What the checker found about one entry.
+/// What the auditor found about one entry.
 #[derive(Clone, Debug, Serialize)]
 pub struct Verdict {
     pub id: String,
@@ -24,16 +24,16 @@ pub struct Verdict {
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
     pub domain: String,
-    /// The checker's model: by design not the one that wrote the summaries.
+    /// The auditor's model: by design not the one that wrote the summaries.
     pub model: String,
     pub checked: Vec<Verdict>,
 }
 
-/// The question put to the checker's model, one entry at a time.
+/// The question put to the auditor's model, one entry at a time.
 #[must_use]
 pub fn question(title: &str, summary: &str, body: &str) -> String {
     format!(
-        "You are a checker auditing an index. Below are an entry's body and the one-line summary a search index serves for it. Does the summary entail the body: does it say nothing the body does not say, and leave out nothing a reader deciding whether to open the entry would need? Answer on the first line with exactly `yes` or `no`, and on the second line one sentence of reason.\n\n## Title\n\n{title}\n\n## Summary\n\n{summary}\n\n## Body\n\n{body}"
+        "You are an auditor auditing an index. Below are an entry's body and the one-line summary a search index serves for it. Does the summary entail the body: does it say nothing the body does not say, and leave out nothing a reader deciding whether to open the entry would need? Answer on the first line with exactly `yes` or `no`, and on the second line one sentence of reason.\n\n## Title\n\n{title}\n\n## Summary\n\n{summary}\n\n## Body\n\n{body}"
     )
 }
 
@@ -101,7 +101,7 @@ pub async fn check(
 }
 
 /// A token budget for one cycle's model calls, read back from the egress's own
-/// metering of this session: what the checker has spent is what the egress saw.
+/// metering of this session: what the auditor has spent is what the egress saw.
 pub struct Spend<'a> {
     pub egress: &'a Egress,
     pub session: &'a str,
@@ -128,7 +128,7 @@ impl Spend<'_> {
     }
 }
 
-/// The newest entries of a domain that are not handoffs: what the checker samples.
+/// The newest entries of a domain that are not handoffs: what the auditor samples.
 ///
 /// # Errors
 ///
@@ -169,7 +169,7 @@ pub async fn sample_of(
     Ok(hits)
 }
 
-/// Two entries the checker found at odds.
+/// Two entries the auditor found at odds.
 #[derive(Clone, Debug, Serialize)]
 pub struct Contradiction {
     pub a: String,
@@ -181,7 +181,7 @@ pub struct Contradiction {
 #[must_use]
 pub fn contradiction_question(a_title: &str, a_body: &str, b_title: &str, b_body: &str) -> String {
     format!(
-        "You are a checker auditing a record. Below are two entries that a search puts side by side. Do they contradict each other: does one state as true what the other states as false, or give a different answer to the same question? Two entries that merely cover different things, or one of which is more detailed, do not contradict. Answer on the first line with exactly `yes` or `no`, and on the second line one sentence naming the claim at odds.\n\n## Entry A: {a_title}\n\n{a_body}\n\n## Entry B: {b_title}\n\n{b_body}"
+        "You are an auditor auditing a record. Below are two entries that a search puts side by side. Do they contradict each other: does one state as true what the other states as false, or give a different answer to the same question? Two entries that merely cover different things, or one of which is more detailed, do not contradict. Answer on the first line with exactly `yes` or `no`, and on the second line one sentence naming the claim at odds.\n\n## Entry A: {a_title}\n\n{a_body}\n\n## Entry B: {b_title}\n\n{b_body}"
     )
 }
 
@@ -245,10 +245,10 @@ pub async fn hunt(
     Ok(found)
 }
 
-/// The task that has a curator settle a contradiction the checker found.
+/// The task that has a curator settle a contradiction the auditor found.
 fn reconcile_body(model: &str, c: &Contradiction) -> String {
     format!(
-        "The checker, on {model}, found `{}` and `{}` at odds: {}\n\nRead both with `get`. Find out which is right, from the record and the working tree. `write` the corrected entry with `supersedes` naming the wrong one: its body says what is right, and its `source` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If both are right about different things, give each a title that says which. Change no facts you cannot verify. Leave a handoff that names the entry you wrote and the one it supersedes, and says what was wrong and how you know; keep that out of the entry, so whoever checks it judges it on its sources first.",
+        "The auditor, on {model}, found `{}` and `{}` at odds: {}\n\nRead both with `get`. Find out which is right, from the record and the working tree. `write` the corrected entry with `supersedes` naming the wrong one: its body says what is right, and its `cites` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If both are right about different things, give each a title that says which. Change no facts you cannot verify. Leave a handoff that names the entry you wrote and the one it supersedes, and says what was wrong and how you know; keep that out of the entry, so whoever checks it judges it on its sources first.",
         c.a,
         c.b,
         if c.why.is_empty() { "no claim named" } else { &c.why }
@@ -271,11 +271,11 @@ pub async fn file_contradictions(
         let created = memory
             .file_own(dm_ledger::TaskSpec {
                 domain: domain.to_string(),
-                title: format!("Librarian: reconcile {} and {}", c.a, c.b),
+                title: format!("Curator: reconcile {} and {}", c.a, c.b),
                 body: reconcile_body(model, c),
                 requirements: Vec::new(),
                 depends_on: Vec::new(),
-                origin: Some("checker:contradiction".into()),
+                origin: Some("auditor:contradiction".into()),
                 upstream_event: Some(
                     dm_core::digest(&format!("{}\n{}", c.a, c.b))[..16].to_string(),
                 ),
@@ -291,7 +291,7 @@ pub async fn file_contradictions(
     Ok(ids)
 }
 
-/// File a task for each summary the checker found wanting, with the checker's model
+/// File a task for each summary the auditor found wanting, with the auditor's model
 /// and reason, deduplicated on the entry and the summary it judged.
 ///
 /// # Errors
@@ -312,16 +312,16 @@ pub async fn file(
         let created = memory
             .file_own(dm_ledger::TaskSpec {
                 domain: report.domain.clone(),
-                title: format!("Librarian: rewrite the summary of {}, which the checker rejected", v.id),
+                title: format!("Curator: rewrite the summary of {}, which the auditor rejected", v.id),
                 body: format!(
-                    "The checker, on {}, judged that the summary the index serves for `{id}` does not entail its body: {}\n\nRead `{id}` with `get`. Write a one- or two-sentence summary that says what the body says and no more. Then `write` the entry again with the same body and type, your summary as `summary`, and `supersedes: {id}`. Do not change the body. Leave a handoff naming the new entry.",
+                    "The auditor, on {}, judged that the summary the index serves for `{id}` does not entail its body: {}\n\nRead `{id}` with `get`. Write a one- or two-sentence summary that says what the body says and no more. Then `write` the entry again with the same body and type, your summary as `summary`, and `supersedes: {id}`. Do not change the body. Leave a handoff naming the new entry.",
                     report.model,
                     if v.why.is_empty() { "no reason given" } else { &v.why },
                     id = v.id
                 ),
                 requirements: Vec::new(),
                 depends_on: Vec::new(),
-                origin: Some("checker:summary".into()),
+                origin: Some("auditor:summary".into()),
                 upstream_event: Some(dm_core::digest(&format!("{}\n{summary}", v.id))[..16].to_string()),
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
@@ -367,6 +367,6 @@ mod tests {
             b: "mem-t-2".into(),
             why: "one says MoinMoin stays, the other that it went".into(),
         };
-        crate::librarian::tests::reasoning_goes_to_the_handoff(&reconcile_body("m", &c));
+        crate::curator::tests::reasoning_goes_to_the_handoff(&reconcile_body("m", &c));
     }
 }

@@ -1,4 +1,4 @@
-//! The quarantine's reader: a model of the checker's, not the writer's, reads each write
+//! The quarantine's reader: a model of the auditor's, not the writer's, reads each write
 //! the gates held and says what it is. The scan is patterns and cannot tell a handoff
 //! that reports an injection from the injection itself; a model can, mostly. Its verdict
 //! is advice beside the owner's task, never a release: judgement is not encoded in the

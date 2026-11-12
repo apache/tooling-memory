@@ -5,7 +5,7 @@ the demo. The step numbers match the headings that the demo prints. The figures 
 a run on 12 October 2026. Counts and token figures change a little from run to run.
 Anything that a model decides can change more:
 
-- the checker's verdicts
+- the auditor's verdicts
 - what the harness sessions do
 - the replay in 5.5
 - the answers in act 6
@@ -50,11 +50,11 @@ offline.
   - the re-runs in act 8, one of them on gemma4-26b.
 - **qwen3.8-27b on its own**. The system calls it directly: to answer a question in 1.5,
   as the model that 5.3 probes, and as the model that 5.5 replays against.
-- **gemma4-26b**, the checker. It reads summaries in act 2 and held writes in act 3. In
+- **gemma4-26b**, the auditor. It reads summaries in act 2 and held writes in act 3. In
   5.3, it takes the role of a different model, swapped in behind the name qwen3.8-27b.
   In act 8, it is the other model that a session is re-enacted on.
 - **Scripted agents**: `agent:rogue`, `agent:release`, `agent:reader`, `agent:a`,
-  `agent:librarian` and `agent:architect`. These are the demo script. The script uses
+  `agent:curator` and `agent:architect`. These are the demo script. The script uses
   the same tools that an agent would use. No model is behind them. Say so.
 - **GitHub**, in act 9: its public API. A tap with no credential reads it.
 - **The system**: the memory server, the ledger, the policy and the egress (below), and
@@ -138,7 +138,7 @@ entry.
 
 ## Act 2 · Curation and trust tiers
 
-On stage: gemma4-26b checking, Codex doing a curation task, `agent:librarian` (scripted)
+On stage: gemma4-26b checking, Codex doing a curation task, `agent:curator` (scripted)
 nominating, and you approving.
 
 Memory that nobody maintains becomes out of date. This act shows who maintains it, and
@@ -149,15 +149,15 @@ gemma4-26b checked six summaries against their entries and rejected four. It use
 2,700 tokens in seven calls.
 
 **2.2 What it filed.** Curation does not edit anything itself. It files tasks on the
-ledger, the same as any other work: eight from the survey, and four from the checker's
+ledger, the same as any other work: eight from the survey, and four from the auditor's
 rejections.
 
 **2.3 A curation task.** Codex on qwen3.8-27b takes the top task and rewrites the
 summary. What it writes goes into the record as curated, and not higher.
 
-**2.4 Verified.** `agent:librarian` nominates that entry for verified. `agent:librarian`
+**2.4 Verified.** `agent:curator` nominates that entry for verified. `agent:curator`
 is the script, not Codex. Only a person who did not nominate the entry can approve it, so
-you approve it. Then `agent:librarian` tries to rewrite the verified entry. The policy
+you approve it. Then `agent:curator` tries to rewrite the verified entry. The policy
 holds that write, and does not write it. You will see it again in 3.3.
 
 **2.5 Telemetry.** This shows what each curator did. The count comes from the record,
@@ -176,9 +176,9 @@ The policy holds it in quarantine. Search never sees it.
 **3.2 A false alarm.** `agent:release` writes a harmless release signature. The policy
 holds it too, on purpose: a false hold costs little.
 
-**3.3 The checker's verdicts.** gemma4-26b reads each held write and gives a verdict: one
+**3.3 The auditor's verdicts.** gemma4-26b reads each held write and gives a verdict: one
 malicious, two benign. One of the benign writes is the rewrite that the policy held in
-2.4. The checker only advises. You decide.
+2.4. The auditor only advises. You decide.
 
 **3.4 Taint.** This step answers a question: if an entry turned out to be bad, who read
 it, and what did they write after? Here `agent:reader` read one and wrote a note. Thus
@@ -193,7 +193,7 @@ session sees it in T0.
 
 **3.7 The lint.** This shows how often each rule blocked or allowed something.
 
-**3.8 Spend limits.** For this step, the egress gives the checker a spend limit of 400
+**3.8 Spend limits.** For this step, the egress gives the auditor a spend limit of 400
 tokens at the gateway. The call that goes over the limit still goes out. The egress
 refuses the next call. By then, more than 550 tokens are spent.
 
