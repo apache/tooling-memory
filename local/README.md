@@ -610,6 +610,53 @@ invalidation does.
 Not built yet: an attempt key for each operation, a block on a new claim while an external
 effect is uncertain, and a `blocked` state for a task that waits on an outside event.
 
+## Task definitions: `platform task`
+
+A task definition is the record for one kind of work. It is an artifact in the platform
+domain, in a fenced block with the info string `platform task <name>`. The block is TOML:
+
+```toml
+purpose = "Answer a question from the record, with the entries it rests on."
+tools = ["tool:fetch"]
+scope = ["dom-demo"]
+acceptance = ["The handoff names each entry the answer rests on."]
+outputs = ["handoff"]
+autonomy = "person"
+```
+
+A definition is in force when its entry is active and a person verified it. Its version
+is its place among the verified definitions of that name, and the first is version 1.
+
+A task names a definition with `amem task create --definition <name>`, or with
+`definition` in the memory tool `create_task`. Then:
+
+- The task records the definition with its version, for example `answer-from-record@1`.
+- The task takes the acceptance checks of the definition, if it gives none. Give checks
+  for one task with `--accept`.
+- The task requires the tools that the definition declares. Thus only a session that has
+  those tools can claim it.
+- A session that holds the task can call only the tools that the definition declares.
+  The memory server refuses a different tool.
+- `amem work` puts the definition and the checks in the prompt, below "Done when".
+
+A task cannot name a definition that is not in force. The memory server refuses it, and
+files nothing.
+
+By default, triage also admits a task that names no definition. The tasks that the
+system files for itself name none yet. To require a definition, set this in `grants.toml`:
+
+```toml
+[gates]
+require_definition = true
+```
+
+Then a task with no definition, or with no acceptance checks, stays `proposed`.
+`create_task` gives the reason in `not_admitted_because`, and `amem task admit` refuses
+the task with the same reason.
+
+Not built yet: the autonomy level has no effect, no suite gates a version of a
+definition, and the data scope is not enforced.
+
 ## The task fabric: `amem task rescore` and `stats`
 
 An L1 policy entry can carry the rubric that it compiles into, as a `[rubric]` table in

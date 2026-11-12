@@ -331,12 +331,18 @@ includes the definition. Its handoff ends with the definition's line. That is ho
 can tell that Codex followed the definition. If a model does not follow it, the step
 says so.
 
-**7.5 The suite.** The recall suite comes from the platform, not from a file. All three
+**7.5 A task definition.** A kind of work is also a record in the platform domain. It
+gives the purpose of the work, the tools that the work can use, and the checks that say
+when a task is done. `agent:architect` proposes one. A task that names it is refused,
+because nobody verified it. After you approve it, the same task is filed. The task shows
+the definition with its version, and the checks that it took from the definition.
+
+**7.6 The suite.** The recall suite comes from the platform, not from a file. All three
 questions find their entry in the top eight, however they are asked. When the question
 is keywords, the entry comes first every time (mean reciprocal rank 1.00). When the
 question is as written, the entry ranks lower (0.67).
 
-**7.6 What it cost.** Tokens are one resource. The task took 61 seconds of wall clock and
+**7.7 What it cost.** Tokens are one resource. The task took 61 seconds of wall clock and
 4.0 seconds of CPU. The CPU time was 2.4 in the sandbox and 1.6 in the launcher, which
 includes the egress. Its largest process had a peak of 158 MiB. It made 6 model calls,
 about 223,000 tokens including cached input. It spent 53 of its 61 seconds waiting on

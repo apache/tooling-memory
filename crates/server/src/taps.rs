@@ -116,6 +116,7 @@ mod tests {
                 created_by: String::new(),
                 classification: label,
                 priority: 0,
+                ..TaskSpec::default()
             })
             .await
             .unwrap()
@@ -227,6 +228,7 @@ mod tests {
                 created_by: String::new(),
                 classification: Label::Internal,
                 priority: 0,
+                ..dm_ledger::TaskSpec::default()
             })
             .await
             .unwrap()
@@ -328,6 +330,7 @@ mod tests {
                     created_by: String::new(),
                     classification: Label::Restricted,
                     priority: 0,
+                    ..TaskSpec::default()
                 })
                 .await
                 .unwrap()
@@ -399,6 +402,7 @@ mod tests {
                     created_by: String::new(),
                     classification: Label::Internal,
                     priority: 0,
+                    ..TaskSpec::default()
                 })
                 .await
                 .unwrap()

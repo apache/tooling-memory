@@ -285,6 +285,13 @@ pub struct CreateTaskParams {
     /// Higher is claimed first. Default 0.
     #[serde(default)]
     pub priority: Option<i64>,
+    /// The task definition this kind of work runs under, by name. The task takes the
+    /// definition's acceptance criteria and requires the tools it declares.
+    #[serde(default)]
+    pub definition: Option<String>,
+    /// Checks that say this task is done, in place of its definition's.
+    #[serde(default)]
+    pub acceptance: Vec<String>,
 }
 
 /// Parameters that name a task.
@@ -784,9 +791,19 @@ impl McpServer {
             created_by: String::new(),
             classification: dm_core::Label::Public,
             priority: p.priority.unwrap_or(0),
+            definition: p.definition,
+            acceptance: p.acceptance,
         };
         let c = self.memory.create_task(spec).await.map_err(mcp_err)?;
-        ok(json!({ "task": c.task, "deduplicated": c.deduplicated }))
+        // what a task that stays proposed lacks goes back to whoever filed it
+        let gap = (c.task.status == dm_ledger::Status::Proposed)
+            .then(|| self.memory.admission_gap(&c.task.spec))
+            .flatten();
+        ok(json!({
+            "task": c.task,
+            "deduplicated": c.deduplicated,
+            "not_admitted_because": gap,
+        }))
     }
 
     #[tool(
@@ -1551,6 +1568,7 @@ mod tests {
                     created_by: String::new(),
                     classification,
                     priority: 0,
+                    ..dm_ledger::TaskSpec::default()
                 })
                 .await
                 .unwrap()
@@ -1612,6 +1630,7 @@ mod tests {
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
                 priority: 0,
+                ..dm_ledger::TaskSpec::default()
             })
             .await
             .unwrap()

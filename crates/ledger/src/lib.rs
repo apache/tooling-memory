@@ -155,7 +155,7 @@ impl Status {
 }
 
 /// What a caller files. Everything else on a [`Task`] the ledger fills in.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
     /// The domain whose ledger partition holds it.
     pub domain: String,
@@ -183,6 +183,33 @@ pub struct TaskSpec {
     /// Higher is claimed first.
     #[serde(default)]
     pub priority: i64,
+    /// The task definition this task runs under, as `<name>@<version>`: the record in
+    /// the platform's domain for its kind of work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+    /// The checks that say this task is done, its own or those its definition gave it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
+}
+
+/// The fields of a task that the ledger keeps and never queries by, as one JSON column.
+#[derive(Default, Serialize, Deserialize)]
+struct Extra {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    definition: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    acceptance: Vec<String>,
+}
+
+impl TaskSpec {
+    /// The `extra` column of this spec's row.
+    pub(crate) fn extra(&self) -> String {
+        let extra = Extra {
+            definition: self.definition.clone(),
+            acceptance: self.acceptance.clone(),
+        };
+        serde_json::to_string(&extra).unwrap_or_default()
+    }
 }
 
 /// A task as the ledger holds it.
@@ -589,7 +616,7 @@ impl RawPromotion {
 const TASK_COLUMNS: &str =
     "id, domain, title, body, requirements, depends_on, origin, upstream_event,
     created_by, label_rank, priority, created, status, holder, lease_until, attempts, handoff,
-    reason, superseded_by, posted_to";
+    reason, superseded_by, posted_to, extra";
 
 /// A task row as the database returns it, before the ledger has checked it.
 struct RawTask {
@@ -613,6 +640,7 @@ struct RawTask {
     reason: Option<String>,
     superseded_by: Option<String>,
     posted_to: Option<String>,
+    extra: Option<String>,
 }
 
 impl RawTask {
@@ -626,6 +654,14 @@ impl RawTask {
         };
         let requirements = json_list(&self.requirements, "requirements")?;
         let depends_on = json_list(&self.depends_on, "depends_on")?;
+        // a row from before the column has none, and reads as a task with nothing more
+        let extra: Extra = match self.extra.as_deref() {
+            None | Some("") => Extra::default(),
+            Some(text) => serde_json::from_str(text).map_err(|_| Error::BadRow {
+                id: id.clone(),
+                what: format!("extra {text:?}"),
+            })?,
+        };
         Ok(Task {
             spec: TaskSpec {
                 domain: self.domain,
@@ -638,6 +674,8 @@ impl RawTask {
                 created_by: self.created_by,
                 classification: label_from_rank(&id, self.label_rank)?,
                 priority: self.priority,
+                definition: extra.definition,
+                acceptance: extra.acceptance,
             },
             created: parse_time(&id, &self.created)?,
             status: Status::parse(&id, &self.status)?,
@@ -1786,6 +1824,7 @@ mod tests {
             created_by: "human:test:me".into(),
             classification: Label::Public,
             priority: 0,
+            ..TaskSpec::default()
         }
     }
 

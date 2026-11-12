@@ -299,6 +299,7 @@ pub async fn file_alarms(
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
                 priority: 5,
+                ..dm_ledger::TaskSpec::default()
             })
             .await?;
         if !created.deduplicated {

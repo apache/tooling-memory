@@ -80,6 +80,16 @@ pub struct Gates {
     /// Whether replacing a verified entry needs an approver who is not the proposer.
     #[serde(default = "default_true")]
     pub verified_needs_approver: bool,
+    /// Whether a task is admitted only when it names a task definition in force and has
+    /// acceptance criteria. Off unless the owner turns it on: the tasks the system files
+    /// for itself name no definition yet.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_definition: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn default_max_supersedes() -> usize {
@@ -95,6 +105,7 @@ impl Default for Gates {
         Gates {
             max_supersedes_per_session: default_max_supersedes(),
             verified_needs_approver: default_true(),
+            require_definition: false,
         }
     }
 }

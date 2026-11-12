@@ -597,6 +597,27 @@ async fn late_handoffs_of(client: &MemoryClient, task: &str) -> String {
     p
 }
 
+/// The task's definition and the checks that say it is done, as a part of the prompt.
+fn checks_of(task: &Task) -> String {
+    let mut out = String::new();
+    if let Some(d) = task.raw["definition"].as_str() {
+        out.push_str(&format!("\nTask definition: {d}\n"));
+    }
+    let accept: Vec<&str> = task.raw["acceptance"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    if !accept.is_empty() {
+        out.push_str("\n# Done when\n\n");
+        for check in accept {
+            out.push_str(&format!("- {check}\n"));
+        }
+    }
+    out
+}
+
 async fn prompt_for(
     client: &MemoryClient,
     task: &Task,
@@ -610,6 +631,7 @@ async fn prompt_for(
         task.title,
         task.body.trim()
     ));
+    p.push_str(&checks_of(task));
     if !task.requirements.is_empty() {
         p.push_str(&format!("\nRequires: {}\n", task.requirements.join(", ")));
     }

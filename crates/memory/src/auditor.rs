@@ -282,6 +282,7 @@ pub async fn file_contradictions(
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
                 priority: 1,
+                ..dm_ledger::TaskSpec::default()
             })
             .await?;
         if !created.deduplicated {
@@ -326,6 +327,7 @@ pub async fn file(
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
                 priority: 0,
+                ..dm_ledger::TaskSpec::default()
             })
             .await?;
         if !created.deduplicated {

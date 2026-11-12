@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS {s}.tasks (
     handoff        TEXT,
     reason         TEXT,
     superseded_by  TEXT,
-    posted_to      TEXT
+    posted_to      TEXT,
+    extra          TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON {s}.tasks (status, priority DESC, created);
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_origin ON {s}.tasks (origin, upstream_event)
@@ -176,6 +177,7 @@ fn task_from_row(row: &Row) -> Result<Task, Error> {
         reason: row.try_get(17)?,
         superseded_by: row.try_get(18)?,
         posted_to: row.try_get(19)?,
+        extra: row.try_get(20)?,
     }
     .into_task()
 }
@@ -213,6 +215,12 @@ impl Db {
     /// stands, such a task would be in no list and no queue, without a word.
     async fn rebuild_stale_projections(&mut self) -> Result<(), Error> {
         for (domain, s) in self.schemas().await? {
+            // a schema from before a task carried more than the ledger queries by
+            self.client
+                .batch_execute(&format!(
+                    "ALTER TABLE {s}.tasks ADD COLUMN IF NOT EXISTS extra TEXT"
+                ))
+                .await?;
             let row = self
                 .client
                 .query_one(
@@ -1160,8 +1168,8 @@ async fn insert_task<C: GenericClient>(
     conn.execute(
         &format!(
             "INSERT INTO {s}.tasks (id, domain, title, body, requirements, depends_on, origin,
-                upstream_event, created_by, label_rank, priority, created, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'proposed')"
+                upstream_event, created_by, label_rank, priority, created, status, extra)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'proposed', $13)"
         ),
         &[
             &id,
@@ -1176,6 +1184,7 @@ async fn insert_task<C: GenericClient>(
             &(spec.classification as i64),
             &spec.priority,
             &crate::fmt_time(at),
+            &spec.extra(),
         ],
     )
     .await?;

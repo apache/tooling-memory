@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     handoff        TEXT,
     reason         TEXT,
     superseded_by  TEXT,
-    posted_to      TEXT
+    posted_to      TEXT,
+    extra          TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON tasks (domain, status, priority DESC, created);
 DROP INDEX IF EXISTS tasks_origin;
@@ -88,6 +89,7 @@ fn task_from_row(row: &Row<'_>) -> Result<Task, Error> {
         reason: row.get(17)?,
         superseded_by: row.get(18)?,
         posted_to: row.get(19)?,
+        extra: row.get(20)?,
     }
     .into_task()
 }
@@ -117,6 +119,15 @@ impl Db {
         )?;
         if has_posted == 0 {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN posted_to TEXT;")?;
+        }
+        // and one from before a task carried more than the ledger queries by
+        let has_extra: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'extra'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_extra == 0 {
+            conn.execute_batch("ALTER TABLE tasks ADD COLUMN extra TEXT;")?;
         }
         migrate_promotions(&conn)?;
         // a projection whose state names this code does not have, as a ledger from before
@@ -755,8 +766,8 @@ fn insert_task(
     let depends_on = serde_json::to_string(&spec.depends_on).unwrap_or_default();
     conn.execute(
         "INSERT INTO tasks (id, domain, title, body, requirements, depends_on, origin,
-            upstream_event, created_by, label_rank, priority, created, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'proposed')",
+            upstream_event, created_by, label_rank, priority, created, status, extra)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'proposed', ?13)",
         params![
             id,
             spec.domain,
@@ -770,6 +781,7 @@ fn insert_task(
             spec.classification as i64,
             spec.priority,
             crate::fmt_time(at),
+            spec.extra(),
         ],
     )?;
     Ok(())

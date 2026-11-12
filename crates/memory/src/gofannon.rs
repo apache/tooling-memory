@@ -340,6 +340,7 @@ mod tests {
             created_by: String::new(),
             classification: dm_core::Label::Public,
             priority: 0,
+            ..dm_ledger::TaskSpec::default()
         })
         .await
         .unwrap()

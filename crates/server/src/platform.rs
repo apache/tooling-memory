@@ -10,7 +10,8 @@
 //! ```
 //! ````
 //!
-//! The info string is `platform <kind> <name>`. Four kinds are read today: an `agent`
+//! The info string is `platform <kind> <name>`. Five kinds are read today: a `task`
+//! definition, TOML, the record for one kind of work ([`TaskDefinition`]); an `agent`
 //! definition, instructions added to a harness's work prompt (named for the harness's
 //! binary, or `default`); a `template`, the opening of the work prompt (`work`); an
 //! `eval` suite, a golden suite's TOML; and a `harness` configuration, JSON, of which
@@ -24,7 +25,71 @@ use dm_core::{Entry, TrustTier};
 use serde::Serialize;
 
 /// The kinds of artifact the launcher reads.
-pub const KINDS: &[&str] = &["agent", "template", "eval", "harness"];
+pub const KINDS: &[&str] = &["agent", "template", "eval", "harness", "task"];
+
+/// What a completion of a task needs before it counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Autonomy {
+    /// A person's verdict. Where every definition starts.
+    #[default]
+    Person,
+    /// A review by a session on another model than the author's.
+    Review,
+    /// The acceptance checks alone.
+    Checks,
+}
+
+/// A task definition: the record for one kind of work. A task names one, and what a
+/// session that claims the task may use comes from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDefinition {
+    /// Its name, from the block's info string.
+    #[serde(skip_deserializing)]
+    pub name: String,
+    /// Which verified definition of that name this is, counted from one.
+    #[serde(skip_deserializing)]
+    pub version: u32,
+    /// The entry it is in.
+    #[serde(skip_deserializing)]
+    pub entry: String,
+    /// What the work is for, in a sentence: review reads the tools against it.
+    #[serde(default)]
+    pub purpose: String,
+    /// The capabilities the work needs, as a task's requirements name them
+    /// (`tool:fetch`). A session that holds a task of this definition calls no tool
+    /// outside them.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// The domains the work reads.
+    #[serde(default)]
+    pub scope: Vec<String>,
+    /// The checks that say a task of this kind is done. A task that gives none of its
+    /// own takes these.
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    /// What the work leaves behind.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+    /// What a completion needs before it counts.
+    #[serde(default)]
+    pub autonomy: Autonomy,
+}
+
+impl TaskDefinition {
+    /// How a task names this definition: `<name>@<version>`.
+    #[must_use]
+    pub fn reference(&self) -> String {
+        format!("{}@{}", self.name, self.version)
+    }
+}
+
+/// The name in a task's `definition`, with or without its `@<version>`.
+#[must_use]
+pub fn definition_name(reference: &str) -> &str {
+    reference.split('@').next().unwrap_or(reference)
+}
 
 /// One artifact, as an entry holds it.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -190,6 +255,121 @@ impl Memory {
         }
         Ok(found)
     }
+
+    /// The task definition named `name` that is in force: the newest in an active entry
+    /// a person verified. Its version is its place among the verified definitions of
+    /// that name, replaced ones counted, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A store error, or [`Error::Denied`] when the block in force is not a definition
+    /// this code reads, with what is wrong in it.
+    pub async fn task_definition(&self, name: &str) -> Result<Option<TaskDefinition>, Error> {
+        let mut verified: Vec<(Artifact, bool)> = Vec::new();
+        for e in self.platform_entries().await? {
+            if e.front.trust_tier != TrustTier::Verified {
+                continue;
+            }
+            for a in artifacts_in(&e) {
+                if a.kind == "task" && a.name == name {
+                    verified.push((a, e.is_active()));
+                }
+            }
+        }
+        verified.sort_by(|a, b| a.0.created.cmp(&b.0.created));
+        let Some(at) = verified.iter().rposition(|(_, active)| *active) else {
+            return Ok(None);
+        };
+        let artifact = &verified[at].0;
+        let mut def: TaskDefinition = toml::from_str(&artifact.text).map_err(|e| {
+            Error::Denied(format!(
+                "the task definition {name} in {} does not read: {e}",
+                artifact.entry
+            ))
+        })?;
+        def.name = name.to_string();
+        def.version = u32::try_from(at + 1).unwrap_or(u32::MAX);
+        def.entry.clone_from(&artifact.entry);
+        Ok(Some(def))
+    }
+
+    /// Bind a task to the definition it names: the name must be in force, the task then
+    /// names it at its version, takes its acceptance criteria if it gave none, and
+    /// requires what the definition declares, so only a session that has those claims it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] when no definition of that name is in force.
+    pub(crate) async fn bind_definition(
+        &self,
+        spec: &mut dm_ledger::TaskSpec,
+    ) -> Result<(), Error> {
+        let Some(named) = spec.definition.clone() else {
+            return Ok(());
+        };
+        let name = definition_name(&named);
+        let Some(def) = self.task_definition(name).await? else {
+            return Err(Error::Denied(format!(
+                "no task definition {name} is in force: a verified entry of the platform's domain defines one"
+            )));
+        };
+        spec.definition = Some(def.reference());
+        if spec.acceptance.is_empty() {
+            spec.acceptance.clone_from(&def.acceptance);
+        }
+        for tool in &def.tools {
+            if !spec.requirements.contains(tool) {
+                spec.requirements.push(tool.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Why triage does not admit a task, when what it lacks is a definition or a way to
+    /// check it: the missing items, for whoever filed it. None when nothing is missing.
+    #[must_use]
+    pub fn admission_gap(&self, spec: &dm_ledger::TaskSpec) -> Option<String> {
+        if spec.definition.is_none() {
+            return self
+                .grants
+                .gates
+                .require_definition
+                .then(|| "it names no task definition".to_string());
+        }
+        spec.acceptance
+            .is_empty()
+            .then(|| "it has no acceptance criteria, its own or its definition's".to_string())
+    }
+
+    /// Whether the task this session holds lets it call `tool`: a task under a
+    /// definition reaches only the tools the definition declares.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] when the held task's definition does not declare the tool.
+    pub(crate) async fn definition_allows(&self, tool: &str) -> Result<(), Error> {
+        let Some(held) = self.held.get() else {
+            return Ok(());
+        };
+        let Ok(task) = self.ledger.lock().await.get(held).await else {
+            return Ok(());
+        };
+        let Some(named) = task.spec.definition else {
+            return Ok(());
+        };
+        let name = definition_name(&named);
+        let declared = self
+            .task_definition(name)
+            .await?
+            .is_some_and(|d| d.tools.iter().any(|t| t == &format!("tool:{tool}")));
+        if declared {
+            Ok(())
+        } else {
+            Err(Error::Denied(format!(
+                "the task definition {named} does not declare tool:{tool}; a task reaches only the tools its definition declares"
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +491,170 @@ mod tests {
         g.platform = Some("dom-me".into());
         let back = dm_policy::Grants::parse(&g.render().unwrap()).unwrap();
         assert_eq!(back.platform.as_deref(), Some("dom-me"));
+    }
+    const REVIEW: &str = "# Review a change\n\n```platform task review-change\npurpose = \"Read a change against the decisions it touches.\"\ntools = [\"tool:fetch\"]\nscope = [\"dom-me\"]\nacceptance = [\"The handoff names each decision the change touches.\"]\noutputs = [\"handoff\"]\n```\n";
+
+    fn task(title: &str, definition: Option<&str>) -> dm_ledger::TaskSpec {
+        dm_ledger::TaskSpec {
+            domain: "dom-me".into(),
+            title: title.into(),
+            body: "Do it.".into(),
+            definition: definition.map(str::to_string),
+            ..dm_ledger::TaskSpec::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_definition_is_in_force_once_verified_and_counts_its_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = root(dir.path());
+        written(&m, REVIEW, false).await;
+        assert_eq!(m.task_definition("review-change").await.unwrap(), None);
+        let first = written(&m, REVIEW, true).await;
+        let def = m.task_definition("review-change").await.unwrap().unwrap();
+        assert_eq!(
+            (def.reference().as_str(), def.entry.as_str()),
+            ("review-change@1", first.as_str())
+        );
+        assert_eq!(def.tools, ["tool:fetch"]);
+        assert_eq!(
+            def.autonomy,
+            Autonomy::Person,
+            "where every definition starts"
+        );
+        // a verified replacement is the next version; the one it replaced still counts
+        let wider = REVIEW.replace("[\"tool:fetch\"]", "[\"tool:fetch\", \"tool:search\"]");
+        let second = m
+            .write(WriteRequest {
+                body: wider,
+                domain: Some("dom-plat".into()),
+                entry_type: dm_core::EntryType::Convention,
+                supersedes: Some(first),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        // the owner replaced the entry, as only the owner replaces a verified one unheld,
+        // and nothing is in force until the replacement is verified in its turn
+        assert_eq!(m.task_definition("review-change").await.unwrap(), None);
+        let mut e = m.store.get("dom-plat", &second).await.unwrap().unwrap();
+        e.front.trust_tier = TrustTier::Verified;
+        m.store.put(&e).await.unwrap();
+        let def = m.task_definition("review-change").await.unwrap().unwrap();
+        assert_eq!(def.reference(), "review-change@2");
+        assert_eq!(def.tools, ["tool:fetch", "tool:search"]);
+        // a block that is no definition is refused in words, not read as an empty one
+        written(&m, "```platform task broken\ntool = \"x\"\n```\n", true).await;
+        let broken = m.task_definition("broken").await;
+        assert!(
+            matches!(&broken, Err(Error::Denied(why)) if why.contains("broken")),
+            "{broken:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_takes_its_definition_s_version_checks_and_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = root(dir.path());
+        written(&m, REVIEW, true).await;
+        let filed = m
+            .create_task(task("Review the importer", Some("review-change")))
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(filed.spec.definition.as_deref(), Some("review-change@1"));
+        assert_eq!(
+            filed.spec.acceptance,
+            ["The handoff names each decision the change touches."]
+        );
+        assert_eq!(filed.spec.requirements, ["tool:fetch"]);
+        // its own checks stand in place of the definition's
+        let mut own = task("Review the exporter", Some("review-change@1"));
+        own.acceptance = vec!["The handoff lists the files read.".into()];
+        let own = m.create_task(own).await.unwrap().task;
+        assert_eq!(own.spec.acceptance, ["The handoff lists the files read."]);
+        // a name nothing verified defines is refused, and nothing is filed
+        let unknown = m.create_task(task("Deploy", Some("deploy"))).await;
+        assert!(matches!(&unknown, Err(Error::Denied(why)) if why.contains("deploy")));
+        let l = m.ledger.lock().await;
+        let all = l
+            .list("dom-me", dm_ledger::Status::Proposed)
+            .await
+            .unwrap()
+            .len()
+            + l.list("dom-me", dm_ledger::Status::Open)
+                .await
+                .unwrap()
+                .len();
+        assert_eq!(all, 2);
+    }
+
+    #[tokio::test]
+    async fn where_the_owner_asks_for_it_a_task_without_a_definition_stays_proposed() {
+        let dir = tempfile::tempdir().unwrap();
+        root(dir.path());
+        let path = dir.path().join(crate::GRANTS_FILE);
+        let mut g = dm_policy::Grants::load(&path).unwrap();
+        g.gates.require_definition = true;
+        std::fs::write(&path, g.render().unwrap()).unwrap();
+        let m = Memory::open(dir.path()).unwrap();
+        written(&m, REVIEW, true).await;
+        let bare = m.file_own(task("Tidy", None)).await.unwrap().task;
+        assert_eq!(bare.status, dm_ledger::Status::Proposed);
+        assert_eq!(
+            m.admission_gap(&bare.spec).as_deref(),
+            Some("it names no task definition")
+        );
+        let refused = m.admit(&bare.id).await;
+        assert!(matches!(&refused, Err(Error::Denied(why)) if why.contains("task definition")));
+        let defined = m
+            .file_own(task("Review", Some("review-change")))
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(
+            defined.status,
+            dm_ledger::Status::Open,
+            "the owner's filing is admitted"
+        );
+        // a definition with no checks gives a task nothing to be checked by
+        written(
+            &m,
+            "```platform task loose\npurpose = \"Anything.\"\n```\n",
+            true,
+        )
+        .await;
+        let loose = m.file_own(task("Loose", Some("loose"))).await.unwrap().task;
+        assert_eq!(loose.status, dm_ledger::Status::Proposed);
+        assert!(m.admission_gap(&loose.spec).unwrap().contains("acceptance"));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_holds_a_defined_task_reaches_only_the_tools_it_declares() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = root(dir.path());
+        written(&m, REVIEW, true).await;
+        let defined = m
+            .file_own(task("Review", Some("review-change")))
+            .await
+            .unwrap()
+            .task;
+        let bare = m.file_own(task("Tidy", None)).await.unwrap().task;
+        let holding = |id: &str| {
+            let session = Memory::open(dir.path()).unwrap();
+            session.set_held_task(id);
+            session
+        };
+        let on_defined = holding(&defined.id);
+        on_defined.definition_allows("fetch").await.unwrap();
+        let refused = on_defined.definition_allows("search").await;
+        assert!(
+            matches!(&refused, Err(Error::Denied(why)) if why.contains("tool:search") && why.contains("review-change@1")),
+            "{refused:?}"
+        );
+        // a task under no definition is held as before, and so is no task at all
+        holding(&bare.id).definition_allows("search").await.unwrap();
+        m.definition_allows("search").await.unwrap();
     }
 }

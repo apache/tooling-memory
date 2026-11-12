@@ -125,6 +125,7 @@ async fn done(root: &Path, origin: Option<&str>, label: Label, text: &str) -> St
             created_by: String::new(),
             classification: label,
             priority: 0,
+            ..TaskSpec::default()
         })
         .await
         .unwrap()

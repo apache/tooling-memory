@@ -1015,6 +1015,7 @@ pub async fn file(
             created_by: String::new(),
             classification: dm_core::Label::Public,
             priority: 5,
+            ..dm_ledger::TaskSpec::default()
         })
         .await?;
     Ok((!created.deduplicated).then_some(created.task.id))

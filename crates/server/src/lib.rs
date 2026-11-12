@@ -1273,6 +1273,7 @@ impl Memory {
                 created_by: String::new(),
                 classification: entry.front.classification,
                 priority: 3,
+                ..TaskSpec::default()
             },
             Filing::Own,
             None,
@@ -1757,6 +1758,7 @@ impl Memory {
                 created_by: String::new(),
                 classification: entry.front.classification,
                 priority: 5,
+                ..TaskSpec::default()
             })
             .await;
         match filed {
@@ -2090,7 +2092,8 @@ impl Memory {
         filing: Filing,
         parent: Option<&Task>,
     ) -> Result<Created, Error> {
-        let spec = self.stamp(spec, filing, parent)?;
+        let mut spec = self.stamp(spec, filing, parent)?;
+        self.bind_definition(&mut spec).await?;
         let created = l.create(spec).await?;
         // a filing that names a task already there is handed that task, and admits it on
         // its say, only when this session may see it; the answer names nothing of it.
@@ -2142,7 +2145,11 @@ impl Memory {
     /// A ledger error, or a task outside the grants.
     pub async fn admit(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.check_task(&l.get(id).await?)?;
+        let task = l.get(id).await?;
+        self.check_task(&task)?;
+        if let Some(gap) = self.admission_gap(&task.spec) {
+            return Err(Error::Denied(format!("{id} is not admitted: {gap}")));
+        }
         let admitted = l.admit(id).await?;
         self.rank_edges(&mut l, &admitted).await?;
         self.observe_task(&admitted);
@@ -2189,7 +2196,8 @@ impl Memory {
         filing: Filing,
         parent: Option<&Task>,
     ) -> Result<Task, Error> {
-        if task.status != dm_ledger::Status::Proposed {
+        // a task nobody can check stays proposed, whatever the policy says of its filer
+        if task.status != dm_ledger::Status::Proposed || self.admission_gap(&task.spec).is_some() {
             return Ok(task);
         }
         let d = self.decide(&Input {
@@ -2264,13 +2272,12 @@ impl Memory {
                     domain: parent.spec.domain.clone(),
                     title: title.clone(),
                     body: body.clone(),
-                    requirements: Vec::new(),
-                    depends_on: Vec::new(),
                     origin: Some(format!("task:{}", parent.id)),
                     upstream_event: Some(hash),
                     created_by: self.author.clone(),
                     classification: parent.spec.classification.max(self.label()),
                     priority: parent.spec.priority,
+                    ..TaskSpec::default()
                 })
                 .await?;
             // the ledger dedups on the parent and the hash whatever the task's status: a
@@ -2403,6 +2410,7 @@ impl Memory {
             created_by: self.author.clone(),
             classification: parent.spec.classification.max(self.label()),
             priority: parent.spec.priority,
+            ..TaskSpec::default()
         })
         .await?;
         let continuation = self
@@ -2561,6 +2569,7 @@ impl Memory {
                 created_by: self.author.clone(),
                 classification,
                 priority: root.spec.priority,
+                ..TaskSpec::default()
             })
             .await?;
         let retry = self
@@ -3562,6 +3571,7 @@ mod tests {
             created_by: String::new(),
             classification: Label::Public,
             priority: 0,
+            ..TaskSpec::default()
         };
         let parent = owner.file_own(spec(&["github"])).await.unwrap().task;
         assert_eq!(parent.status, Status::Open, "the system's own, admitted");
@@ -4292,6 +4302,7 @@ mod tests {
             created_by: String::new(),
             classification: Label::Internal,
             priority: 3,
+            ..TaskSpec::default()
         };
         let refused = curator(dir.path()).create_task(squat.clone()).await;
         assert!(
@@ -4890,6 +4901,7 @@ mod tests {
                 created_by: String::new(),
                 classification: Label::Internal,
                 priority: 3,
+                ..TaskSpec::default()
             })
             .await
             .unwrap()
@@ -5911,6 +5923,7 @@ mod tests {
                 created_by: String::new(),
                 classification: Label::Internal,
                 priority: 3,
+                ..TaskSpec::default()
             })
             .await;
         assert!(forged.is_err(), "{forged:?}");
@@ -5930,6 +5943,7 @@ mod tests {
             created_by: "tap:issues".into(),
             classification: Label::Internal,
             priority: 3,
+            ..TaskSpec::default()
         }
     }
 
@@ -6129,6 +6143,7 @@ mod tests {
                 created_by: String::new(),
                 classification: Label::Public,
                 priority: -1,
+                ..TaskSpec::default()
             })
             .await
             .unwrap()
@@ -6266,6 +6281,7 @@ mod tests {
                 created_by: String::new(),
                 classification: Label::Public,
                 priority: 0,
+                ..TaskSpec::default()
             })
             .await
             .unwrap()
@@ -6333,6 +6349,7 @@ mod tests {
             created_by: String::new(),
             classification: Label::Public,
             priority,
+            ..TaskSpec::default()
         }
     }
 
@@ -6788,6 +6805,7 @@ mod tests {
             created_by: String::new(),
             classification: Label::Public,
             priority: 0,
+            ..TaskSpec::default()
         }
     }
 
