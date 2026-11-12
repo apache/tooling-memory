@@ -1418,6 +1418,23 @@ impl Memory {
         Ok(promoted)
     }
 
+    /// The key the ledger keeps for a caller's attempt key: the caller's own, which is a
+    /// short name, under this session and the operation. One session's key is thus no
+    /// other session's, whoever its author is, and a claim's key is no completion's.
+    fn attempt_key(&self, op: &str, key: &str) -> Result<String, Error> {
+        let plain = !key.is_empty()
+            && key.len() <= 64
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !plain {
+            return Err(Error::Denied(
+                "an attempt key is 1 to 64 letters, digits, dots, hyphens or underscores".into(),
+            ));
+        }
+        Ok(format!("{op}:{}:{key}", self.session_id))
+    }
+
     /// This session as the holder under the claim of `generation`.
     fn under(&self, generation: u64) -> dm_ledger::Held<'_> {
         dm_ledger::Held {
@@ -1869,19 +1886,23 @@ impl Memory {
     /// session that read it is what to look at next.
     #[must_use]
     pub fn taint(&self, id: &str) -> Taint {
+        // times are compared as times: as text, `…00.12Z` sorts after `…00.123Z`, and a
+        // write a thousandth of a second after a read would not follow from it. A read
+        // whose time does not read still names its reader, and counts as the earliest
+        // there is, so nothing that session wrote is left out
+        let when = |at: &str| {
+            OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+        };
         let reads = reads::all(&self.root).unwrap_or_default();
-        let mut first_read: std::collections::BTreeMap<String, String> =
+        let mut first_read: std::collections::BTreeMap<String, OffsetDateTime> =
             std::collections::BTreeMap::new();
         for r in &reads {
+            let read_at = when(&r.at).unwrap_or(OffsetDateTime::UNIX_EPOCH);
             if r.ids.iter().any(|i| i == id) {
                 first_read
                     .entry(r.session.clone())
-                    .and_modify(|at| {
-                        if r.at < *at {
-                            *at = r.at.clone();
-                        }
-                    })
-                    .or_insert_with(|| r.at.clone());
+                    .and_modify(|at| *at = (*at).min(read_at))
+                    .or_insert(read_at);
             }
         }
         let mut written = Vec::new();
@@ -1889,7 +1910,10 @@ impl Memory {
             if w.id == id {
                 continue;
             }
-            if first_read.get(&w.session).is_some_and(|at| w.at > *at) {
+            let after = when(&w.at)
+                .zip(first_read.get(&w.session))
+                .is_some_and(|(wrote, read)| wrote > *read);
+            if after {
                 written.push(w.id);
             }
         }
@@ -2667,8 +2691,9 @@ impl Memory {
         let domain = self.resolve_domain(domain)?;
         let handling = self.handling()?;
         let can = self.capabilities();
+        let attempt = attempt.map(|k| self.attempt_key("claim", k)).transpose()?;
         let mut l = self.ledger.lock().await;
-        let claim = match attempt {
+        let claim = match &attempt {
             Some(key) => {
                 l.claim_next_once(&domain, &self.author, lease, (&can, handling), key)
                     .await?
@@ -2758,17 +2783,21 @@ impl Memory {
             return Err(Error::NotFound(format!("handoff {handoff}")));
         }
         let mut l = self.ledger.lock().await;
+        let attempt = attempt
+            .map(|k| self.attempt_key("complete", k))
+            .transpose()?;
         // a completion asked again under its key comes after this session forgot the
         // claim: the task's own generation then stands in, and the ledger answers by
-        // the key, or refuses a task that is done as it would anyone
-        let again = attempt.is_some() && task.status == dm_ledger::Status::Done;
-        let generation = if again {
-            task.generation
-        } else {
-            self.claim_of(id, generation)?
-        };
-        let by = self.under(generation);
-        let done = match attempt {
+        // the key, or refuses a task that is done as it would anyone. Nothing more
+        // happens for it: the task, and what its completion closed, are as they were
+        if let (Some(key), dm_ledger::Status::Done) = (&attempt, task.status) {
+            let by = self.under(task.generation);
+            let same = l.complete_once(id, by, handoff, key).await?;
+            self.observe_task(&same);
+            return Ok(same);
+        }
+        let by = self.under(self.claim_of(id, generation)?);
+        let done = match &attempt {
             Some(key) => l.complete_once(id, by, handoff, key).await?,
             None => l.complete(id, by, handoff).await?,
         };
@@ -3482,6 +3511,35 @@ mod tests {
             })
             .await;
         assert!(matches!(titled, Err(Error::Denied(_))));
+    }
+
+    /// A read and a later write whose times, as text, sort the other way: the write's has
+    /// one more digit.
+    #[test]
+    fn a_write_follows_a_read_by_time_whatever_the_times_look_like_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let read = r#"{"at":"2026-10-01T10:00:00.12Z","session":"s1","tool":"get","hits":1,"tokens":1,"ids":["mem-me-read"]}"#;
+        std::fs::write(reads::path(dir.path()), format!("{read}\n")).unwrap();
+        let lines = [
+            r#"{"at":"2026-10-01T10:00:00.123Z","session":"s1","id":"mem-me-after","author":"a"}"#,
+            r#"{"at":"2026-10-01T10:00:00.1Z","session":"s1","id":"mem-me-before","author":"a"}"#,
+            r#"{"at":"2026-10-01T10:00:01Z","session":"s2","id":"mem-me-other","author":"a"}"#,
+        ];
+        std::fs::write(state.join("writes.jsonl"), lines.join("\n") + "\n").unwrap();
+        let t = m.taint("mem-me-read");
+        assert_eq!(t.readers, ["s1"]);
+        assert_eq!(t.written, ["mem-me-after"]);
+        // a read whose time does not read is still a read: its session is a reader, and
+        // what it wrote is not known to be from before
+        let unread =
+            r#"{"at":"","session":"s2","tool":"get","hits":1,"tokens":1,"ids":["mem-me-read"]}"#;
+        std::fs::write(reads::path(dir.path()), format!("{read}\n{unread}\n")).unwrap();
+        let t = m.taint("mem-me-read");
+        assert_eq!(t.readers, ["s1", "s2"]);
+        assert_eq!(t.written, ["mem-me-after", "mem-me-other"]);
     }
 
     #[tokio::test]
@@ -6564,6 +6622,105 @@ mod tests {
         );
         let done = second.complete(&t.id, None, &h).await.unwrap();
         assert_eq!((done.status, done.generation), (Status::Done, 2));
+    }
+
+    /// An attempt key is one session's: another session of the same author, with the
+    /// same words, makes its own claim and learns nothing of the first.
+    #[tokio::test]
+    async fn an_attempt_key_is_a_session_s_and_gives_nothing_above_its_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = mem(dir.path());
+        let mut secret = tspec("Rotate the signing key", 5, None, &[], &[]);
+        secret.classification = Label::Restricted;
+        let secret = filed(&first, secret).await;
+        let plain = filed(&first, tspec("Tidy the docs", 0, None, &[], &[])).await;
+        let lease = Duration::minutes(5);
+        let held = first
+            .claim_next_once(None, lease, Some("try-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.task.id, secret.id);
+        let again = first
+            .claim_next_once(None, lease, Some("try-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((again.task.id, again.generation), (held.task.id, 1));
+        // a second session of the same author, capped below the task, with the same key
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Public);
+        let theirs = capped
+            .claim_next_once(None, lease, Some("try-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            theirs.task.id, plain.id,
+            "its own claim, of what it may hold"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        // a key is a short name, not text
+        for bad in ["", "two words", "a/b", &"k".repeat(65)] {
+            let refused = first.claim_next_once(None, lease, Some(bad)).await;
+            assert!(matches!(refused, Err(Error::Denied(_))), "{bad:?}");
+        }
+    }
+
+    /// A completion asked again is the same completion or none: it changes nothing, and
+    /// another session's same words are not that key.
+    #[tokio::test]
+    async fn a_completion_asked_again_under_its_key_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let t = filed(&m, tspec("Once", 0, None, &[], &[])).await;
+        let handoff = |text: &'static str| async {
+            let h = WriteRequest {
+                entry_type: EntryType::Handoff,
+                ..req(text)
+            };
+            m.write(h).await.unwrap().id
+        };
+        let h = handoff("Done.\n").await;
+        let other = handoff("Something else.\n").await;
+        m.claim(&t.id, Duration::minutes(5)).await.unwrap();
+        let done = m
+            .complete_once(&t.id, None, &h, Some("done-1"))
+            .await
+            .unwrap();
+        let again = m
+            .complete_once(&t.id, None, &h, Some("done-1"))
+            .await
+            .unwrap();
+        assert_eq!(again, done);
+        // the same key with another handoff is refused, and the record keeps the first
+        let changed = m.complete_once(&t.id, None, &other, Some("done-1")).await;
+        assert!(
+            matches!(
+                changed,
+                Err(Error::Ledger(dm_ledger::Error::AttemptSpent { .. }))
+            ),
+            "{:?}",
+            changed.map(|t| t.handoff)
+        );
+        // a session that never held the task has no such key: the task is done, to it
+        let onlooker = Memory::open(dir.path()).unwrap();
+        let replayed = onlooker
+            .complete_once(&t.id, None, &other, Some("done-1"))
+            .await;
+        assert!(
+            matches!(
+                replayed,
+                Err(Error::Ledger(dm_ledger::Error::WrongState { .. }))
+            ),
+            "{:?}",
+            replayed.map(|t| t.handoff)
+        );
+        assert_eq!(
+            m.get_task(&t.id).await.unwrap().handoff.as_deref(),
+            Some(h.as_str())
+        );
     }
 
     async fn done(m: &Memory, s: TaskSpec) {

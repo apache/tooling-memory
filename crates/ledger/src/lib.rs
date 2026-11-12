@@ -83,14 +83,13 @@ pub enum Error {
         /// The generation of the claim in force.
         current: u64,
     },
-    /// The attempt key was used before, for another operation or another task, or for
-    /// a claim that is over: the same key cannot claim or complete a second time.
-    #[error("the attempt key {key} was used for {id}, and that attempt is over")]
+    /// The attempt key was used before, and that attempt is over or was for something
+    /// else: the same key does not claim or complete a second time. The refusal names
+    /// the key and nothing of what it was used for.
+    #[error("the attempt key {key} was used before, and that attempt is over")]
     AttemptSpent {
         /// The key.
         key: String,
-        /// The task it was used for.
-        id: String,
     },
     /// Another connection holds the write-ahead log, so text just removed may still be
     /// in it. Run the operation again.
@@ -305,6 +304,13 @@ pub struct Claim {
 pub(crate) struct Claimant<'a> {
     pub(crate) holder: &'a str,
     pub(crate) attempt: Option<&'a str>,
+}
+
+/// What a backend's `claim_next` did: claimed a task, or found the claim the caller's
+/// attempt key made before, with its generation.
+pub(crate) enum Taken {
+    New(String),
+    Again { id: String, generation: u64 },
 }
 
 /// A holder and the generation of the claim it acts under.
@@ -742,6 +748,19 @@ fn claimable(task: &Task, now: OffsetDateTime, manifest: &[String], handling: La
 }
 
 /// Whether `by` acts under the claim in force: its generation first, since a claim made
+/// The queue's order: the highest priority first, and of equal priorities the task
+/// filed first. The times are compared as times; as text, one with fewer digits of a
+/// second sorts after a later one with more.
+pub(crate) fn in_queue_order(tasks: &mut [Task]) {
+    tasks.sort_by(|a, b| {
+        b.spec
+            .priority
+            .cmp(&a.spec.priority)
+            .then(a.created.cmp(&b.created))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 /// since is the reason to stop whoever the caller is, then its name and the lease.
 pub(crate) fn check_holder(task: &Task, by: Held<'_>, now: OffsetDateTime) -> Result<(), Error> {
     if by.generation != task.generation {
@@ -1000,13 +1019,15 @@ impl Ledger {
     }
 
     /// [`Ledger::claim_next`] under an attempt key. A caller that did not hear the answer
-    /// asks again with the same key: while the claim that key made is in force, it gets
-    /// that claim back, and no second task.
+    /// asks again with the same key: while the claim that key made in this domain is in
+    /// force for this caller, it gets that claim back, and no second task. The key is
+    /// looked up in the transaction that claims, so two callers with one key make one
+    /// claim.
     ///
     /// # Errors
     ///
-    /// [`Error::AttemptSpent`] when the key's claim is over, or the key was used for
-    /// something else; a database error.
+    /// [`Error::AttemptSpent`] when the key's claim is over, or is not one this caller
+    /// could have made; a database error.
     pub async fn claim_next_once(
         &mut self,
         domain: &str,
@@ -1015,13 +1036,6 @@ impl Ledger {
         (manifest, handling): (&[String], Label),
         attempt: &str,
     ) -> Result<Option<Claim>, Error> {
-        let seen = on_backend!(&self.backend, db => db.attempt_in(domain, attempt))?;
-        if let Some((id, event)) = seen {
-            return self
-                .same_claim(&id, holder, attempt, &event)
-                .await
-                .map(Some);
-        }
         let who = Claimant {
             holder,
             attempt: Some(attempt),
@@ -1030,25 +1044,24 @@ impl Ledger {
             .await
     }
 
-    /// The claim an attempt key made, if it is still in force for this holder.
+    /// The claim an attempt key made, if it is still in force and is one this caller
+    /// could hold: its holder, its generation and a live lease, within the caller's
+    /// handling and manifest. Anything else is a key that is spent.
     async fn same_claim(
         &self,
-        id: &str,
-        holder: &str,
-        attempt: &str,
-        event: &Event,
+        (id, generation): (&str, u64),
+        who: Claimant<'_>,
+        manifest: &[String],
+        handling: Label,
     ) -> Result<Claim, Error> {
         let task = self.get(id).await?;
         let now = self.now();
-        let in_force = match event {
-            Event::Claimed { generation, .. } => {
-                task.status == Status::Claimed
-                    && task.generation == *generation
-                    && task.holder.as_deref() == Some(holder)
-                    && task.lease_until.is_some_and(|t| t >= now)
-            }
-            _ => false,
-        };
+        let in_force = task.status == Status::Claimed
+            && task.generation == generation
+            && task.holder.as_deref() == Some(who.holder)
+            && task.lease_until.is_some_and(|t| t >= now)
+            && task.spec.classification <= handling
+            && task.spec.requirements.iter().all(|r| manifest.contains(r));
         match (in_force, task.lease_until) {
             (true, Some(lease_until)) => Ok(Claim {
                 generation: task.generation,
@@ -1056,8 +1069,7 @@ impl Ledger {
                 lease_until,
             }),
             _ => Err(Error::AttemptSpent {
-                key: attempt.to_string(),
-                id: id.to_string(),
+                key: who.attempt.unwrap_or_default().to_string(),
             }),
         }
     }
@@ -1072,12 +1084,10 @@ impl Ledger {
     ) -> Result<Option<Claim>, Error> {
         let now = self.now();
         let until = now + lease;
-        let claimed = on_backend!(&mut self.backend, db => db.claim_next(domain, now, who, until, manifest, handling))?;
-        if let Some(id) = &claimed {
-            self.trace("claimed", id).await;
-        }
-        match claimed {
-            Some(id) => {
+        let taken = on_backend!(&mut self.backend, db => db.claim_next(domain, now, who, until, manifest, handling))?;
+        match taken {
+            Some(Taken::New(id)) => {
+                self.trace("claimed", &id).await;
                 let task = self.get(&id).await?;
                 Ok(Some(Claim {
                     generation: task.generation,
@@ -1085,6 +1095,10 @@ impl Ledger {
                     lease_until: until,
                 }))
             }
+            Some(Taken::Again { id, generation }) => self
+                .same_claim((&id, generation), who, manifest, handling)
+                .await
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -1226,13 +1240,13 @@ impl Ledger {
     }
 
     /// [`Ledger::complete`] under an attempt key. A caller that did not hear the answer
-    /// asks again with the same key, and gets the completed task back: the task is
-    /// completed once.
+    /// asks again with the same key and the same handoff, and gets the completed task
+    /// back: the task is completed once.
     ///
     /// # Errors
     ///
-    /// As [`Ledger::complete`]; [`Error::AttemptSpent`] when the key was used for
-    /// another task or another operation.
+    /// As [`Ledger::complete`]; [`Error::AttemptSpent`] when the key completed this task
+    /// with another handoff.
     pub async fn complete_once(
         &mut self,
         id: &str,
@@ -1240,19 +1254,14 @@ impl Ledger {
         handoff: &str,
         attempt: &str,
     ) -> Result<Task, Error> {
-        let seen = on_backend!(&self.backend, db => db.attempt_of(id, attempt))?;
-        if let Some((task, event)) = seen {
-            let same = task == id && matches!(event, Event::Completed { .. });
-            return if same {
-                self.get(id).await
-            } else {
-                Err(Error::AttemptSpent {
-                    key: attempt.to_string(),
-                    id: task,
-                })
-            };
+        let before = on_backend!(&self.backend, db => db.completed_under(id, attempt))?;
+        match before {
+            Some(with) if with == handoff => self.get(id).await,
+            Some(_) => Err(Error::AttemptSpent {
+                key: attempt.to_string(),
+            }),
+            None => self.complete_keyed(id, by, handoff, Some(attempt)).await,
         }
-        self.complete_keyed(id, by, handoff, Some(attempt)).await
     }
 
     /// Close a task its continuation finished: the continuation `by` resumed it and is
@@ -1923,7 +1932,10 @@ mod tests {
 
     on_both! {
         a_claim_asked_twice_under_one_key_is_one_claim,
+        a_key_gives_no_task_above_the_caller_s_handling,
         a_completion_asked_twice_under_one_key_is_one_completion,
+        of_two_tasks_of_one_priority_the_one_filed_first_is_claimed_first,
+        a_lease_that_ran_out_half_a_second_ago_is_lost_to_claim_next,
         a_dependent_in_another_domain_is_opened_and_retriaged_too,
         a_blocked_task_whose_dependencies_are_done_is_claimable_whatever_its_state_says,
         a_task_closed_by_its_continuation_opens_what_waited_on_it,
@@ -2370,6 +2382,8 @@ mod tests {
     async fn a_claim_asked_twice_under_one_key_is_one_claim(b: &Site) {
         let (mut l, now) = b.ledger().await;
         let first = admitted(&mut l, spec("First")).await;
+        // filed a second later, so the queue's order between the two is by time
+        *now.lock().unwrap() = T0 + Duration::seconds(1);
         let second = admitted(&mut l, spec("Second")).await;
         let c = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
         let again = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
@@ -2383,34 +2397,71 @@ mod tests {
             Status::Open,
             "no second task"
         );
-        // the key is this holder's claim, and nobody else's way to it
-        assert!(is_spent(&next_once(&mut l, "s2", "key-1").await));
-        // a new key is a new claim
-        let other = next_once(&mut l, "s1", "key-2").await.unwrap().unwrap();
-        assert_eq!(other.task.id, second.id);
-        a_key_whose_claim_is_over_claims_nothing(&mut l, &now).await;
+        a_key_is_its_holder_s_and_its_domain_s(&mut l, &second).await;
+        a_key_whose_claim_is_over_claims_nothing(&mut l, &first, &now).await;
     }
 
-    async fn a_key_whose_claim_is_over_claims_nothing(l: &mut Ledger, now: &Mutex<OffsetDateTime>) {
-        // once the claim the key made is over, the key claims nothing more
+    /// The key gives its claim back only to who could have made it, and the refusal says
+    /// nothing of the task.
+    async fn a_key_is_its_holder_s_and_its_domain_s(l: &mut Ledger, second: &Task) {
+        let other_holder = next_once(l, "s2", "key-1").await;
+        assert!(is_spent(&other_holder));
+        let said = other_holder
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(!said.contains("task-"), "{said}");
+        // a caller whose handling or manifest the task is beyond is no holder of it
+        let low = l
+            .claim_next_once("dom-a", "s1", mins(30), (&[], Label::Public), "key-1")
+            .await;
+        assert!(low.is_ok(), "the task is public: {low:?}");
+        // the same key in another domain is another key
+        let elsewhere = l
+            .claim_next_once("dom-b", "s1", mins(30), (&[], Label::Restricted), "key-1")
+            .await
+            .unwrap();
+        assert!(
+            elsewhere.is_none(),
+            "nothing to claim there, and no claim of dom-a"
+        );
+        // a new key is a new claim
+        let other = next_once(l, "s1", "key-2").await.unwrap().unwrap();
+        assert_eq!(other.task.id, second.id);
+    }
+
+    async fn a_key_whose_claim_is_over_claims_nothing(
+        l: &mut Ledger,
+        first: &Task,
+        now: &Mutex<OffsetDateTime>,
+    ) {
+        // the claim the key made is lost, and its holder claims the task again without
+        // the key: a live lease of the same name, at the next generation
         *now.lock().unwrap() = T0 + mins(31);
+        let reclaimed = claim(l, &first.id, "s1", mins(30)).await.unwrap();
+        assert_eq!(reclaimed.generation, 2);
         assert!(is_spent(&next_once(l, "s1", "key-1").await));
         // and a rebuild keeps what the key means
         l.rebuild().await.unwrap();
         assert!(is_spent(&next_once(l, "s1", "key-1").await));
     }
 
-    async fn a_key_completes_no_other_task(l: &mut Ledger, t: &Task, other: &Task) {
-        // the key completed that task: it completes no other
-        let reused = l
-            .complete_once(&other.id, held("s1", 1), "mem-a-h", "done-1")
+    /// A restricted task claimed under a key is not handed to a caller below it.
+    async fn a_key_gives_no_task_above_the_caller_s_handling(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let mut secret = spec("Rotate the key");
+        secret.classification = Label::Restricted;
+        let secret = admitted(&mut l, secret).await;
+        let c = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
+        assert_eq!(c.task.id, secret.id);
+        let capped = l
+            .claim_next_once("dom-a", "s1", mins(30), (&[], Label::Public), "key-1")
             .await;
-        assert!(is_spent(&reused));
-        assert_eq!(l.get(&other.id).await.unwrap().status, Status::Claimed);
-        // without a key, a second completion is refused as it was
-        assert!(is_wrong_state(
-            &l.complete(&t.id, held("s1", 1), "mem-a-h").await
-        ));
+        assert!(
+            is_spent(&capped),
+            "{:?}",
+            capped.map(|c| c.map(|c| c.task.id))
+        );
     }
 
     async fn a_completion_asked_twice_under_one_key_is_one_completion(b: &Site) {
@@ -2430,7 +2481,92 @@ mod tests {
             .unwrap();
         assert_eq!(again, done);
         assert_eq!(l.event_count().await.unwrap(), before + 1, "one event");
-        a_key_completes_no_other_task(&mut l, &t, &other).await;
+        a_key_completes_once_and_with_one_handoff(&mut l, &t, &other).await;
+    }
+
+    async fn a_key_completes_once_and_with_one_handoff(l: &mut Ledger, t: &Task, other: &Task) {
+        // asked again with another handoff, it is not the same completion
+        let changed = l
+            .complete_once(&t.id, held("s1", 1), "mem-a-other", "done-1")
+            .await;
+        assert!(is_spent(&changed));
+        assert_eq!(
+            l.get(&t.id).await.unwrap().handoff.as_deref(),
+            Some("mem-a-h")
+        );
+        // a key is a task's: the same words complete another task as a first attempt
+        let elsewhere = l
+            .complete_once(&other.id, held("s1", 1), "mem-a-h", "done-1")
+            .await
+            .unwrap();
+        assert_eq!(elsewhere.status, Status::Done);
+        // a claim's key is no completion's
+        let claimed_under = admitted(l, spec("Third")).await;
+        let c = next_once(l, "s1", "both").await.unwrap().unwrap();
+        assert_eq!(c.task.id, claimed_under.id);
+        l.complete_once(&c.task.id, held("s1", 1), "mem-a-h", "both")
+            .await
+            .unwrap();
+        // without a key, a second completion is refused as it was
+        assert!(is_wrong_state(
+            &l.complete(&t.id, held("s1", 1), "mem-a-h").await
+        ));
+    }
+
+    /// The lease ends on a whole second and the clock stands a half second after: the two
+    /// times, as text, sort the other way.
+    async fn a_lease_that_ran_out_half_a_second_ago_is_lost_to_claim_next(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Long job")).await;
+        claim(&mut l, &t.id, "s1", mins(5)).await.unwrap();
+        *now.lock().unwrap() = T0 + mins(5) - Duration::milliseconds(500);
+        assert!(next(&mut l, "s2", mins(5)).await.is_none(), "still held");
+        *now.lock().unwrap() = T0 + mins(5) + Duration::milliseconds(500);
+        let c = next(&mut l, "s2", mins(5)).await.unwrap();
+        assert_eq!((c.task.id.as_str(), c.generation), (t.id.as_str(), 2));
+    }
+
+    /// Filed half a second apart: the earlier time has fewer digits of a second, and
+    /// as text sorts after the later one.
+    async fn of_two_tasks_of_one_priority_the_one_filed_first_is_claimed_first(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let early = admitted(&mut l, spec("Early")).await;
+        *now.lock().unwrap() = T0 + Duration::milliseconds(500);
+        let late = admitted(&mut l, spec("Late")).await;
+        assert_eq!(next(&mut l, "s", mins(5)).await.unwrap().task.id, early.id);
+        assert_eq!(next(&mut l, "s", mins(5)).await.unwrap().task.id, late.id);
+    }
+
+    /// The candidate was claimed by another connection, and that committed, between the
+    /// read of the queue and the lock of its row.
+    #[tokio::test]
+    async fn on_postgres_a_candidate_claimed_meanwhile_is_not_taken() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        let t = admitted(&mut l, spec("One holder")).await;
+        let other = admitted(&mut l, spec("Free")).await;
+        let now = l.now();
+        claim(&mut l, &t.id, "first", mins(30)).await.unwrap();
+        let Backend::Postgres(db) = &mut l.backend else {
+            unreachable!("a ledger connected to PostgreSQL");
+        };
+        let until = now + mins(30);
+        assert!(!db.take_alone(&t.id, now, ("second", until)).await.unwrap());
+        assert!(db
+            .take_alone(&other.id, now, ("second", until))
+            .await
+            .unwrap());
+        let held = l.get(&t.id).await.unwrap();
+        assert_eq!(
+            (held.holder.as_deref(), held.generation),
+            (Some("first"), 1)
+        );
+        assert_eq!(
+            l.get(&other.id).await.unwrap().holder.as_deref(),
+            Some("second")
+        );
     }
 
     fn is_fenced<T>(r: &Result<T, Error>, given: u64, current: u64) -> bool {

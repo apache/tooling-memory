@@ -5,8 +5,8 @@
 
 use crate::{
     check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS,
-    TASK_COLUMNS,
+    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
+    PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -225,35 +225,23 @@ impl Db {
         })
     }
 
-    /// The first claim or completion made under an attempt key: its task and its event.
-    /// One file holds every domain, so the domain is not asked.
-    pub(crate) fn attempt_in(
-        &self,
-        _domain: &str,
-        key: &str,
-    ) -> Result<Option<(String, Event)>, Error> {
-        let row: Option<(String, String)> = self
+    /// The handoff a task was completed with under an attempt key, if it was.
+    pub(crate) fn completed_under(&self, task: &str, key: &str) -> Result<Option<String>, Error> {
+        let payload: Option<String> = self
             .conn()
             .query_row(
-                "SELECT task_id, payload FROM events
-                 WHERE kind IN ('claimed', 'completed')
-                   AND json_extract(payload, '$.attempt') = ?1
+                "SELECT payload FROM events
+                 WHERE task_id = ?1 AND kind = 'completed'
+                   AND json_extract(payload, '$.attempt') = ?2
                  ORDER BY seq LIMIT 1",
-                params![key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                params![task, key],
+                |r| r.get(0),
             )
             .optional()?;
-        row.map(|(id, payload)| Ok((id.clone(), Event::parse(&id, &payload)?)))
-            .transpose()
-    }
-
-    /// As [`Db::attempt_in`], for the domain of a task.
-    pub(crate) fn attempt_of(
-        &self,
-        _task: &str,
-        key: &str,
-    ) -> Result<Option<(String, Event)>, Error> {
-        self.attempt_in("", key)
+        Ok(match payload.map(|p| Event::parse(task, &p)).transpose()? {
+            Some(Event::Completed { handoff, .. }) => Some(handoff),
+            _ => None,
+        })
     }
 
     /// The payloads of a task's events of one kind, oldest first.
@@ -405,19 +393,43 @@ impl Db {
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Option<Taken>, Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // the claim this key made in this domain, looked for in the transaction that
+        // would claim, so two callers with one key make one claim
+        if let Some(key) = who.attempt {
+            let before: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT e.task_id, e.payload FROM events e
+                     JOIN tasks t ON t.id = e.task_id
+                     WHERE t.domain = ?1 AND e.kind = 'claimed'
+                       AND json_extract(e.payload, '$.attempt') = ?2
+                     ORDER BY e.seq LIMIT 1",
+                    params![domain, key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((id, payload)) = before {
+                let generation = match Event::parse(&id, &payload)? {
+                    Event::Claimed { generation, .. } => generation,
+                    _ => 0,
+                };
+                return Ok(Some(Taken::Again { id, generation }));
+            }
+        }
         let candidates: Vec<Task> = {
             let mut stmt = tx.prepare(&format!(
+                // every task that may be claimable. Whether a claimed one's lease has run
+                // out is asked of the parsed time below: as text, a time with fewer
+                // digits of a second sorts after a later one with more
                 "SELECT {TASK_COLUMNS} FROM tasks
-                 WHERE domain = ?1 AND (status IN ('open', 'blocked') OR (status = 'claimed' AND lease_until < ?2))
-                 ORDER BY priority DESC, created"
+                 WHERE domain = ?1 AND status IN ('open', 'blocked', 'claimed')"
             ))?;
-            let rows = stmt.query_map(params![domain, crate::fmt_time(now)], |r| {
-                Ok(task_from_row(r))
-            })?;
-            rows.map(|r| r?).collect::<Result<_, _>>()?
+            let rows = stmt.query_map(params![domain], |r| Ok(task_from_row(r)))?;
+            let mut found: Vec<Task> = rows.map(|r| r?).collect::<Result<_, _>>()?;
+            crate::in_queue_order(&mut found);
+            found
         };
         for task in candidates {
             if !claimable(&task, now, manifest, handling)
@@ -438,7 +450,7 @@ impl Db {
                 },
             )?;
             tx.commit()?;
-            return Ok(Some(task.id));
+            return Ok(Some(Taken::New(task.id)));
         }
         Ok(None)
     }

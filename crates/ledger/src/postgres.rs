@@ -18,8 +18,8 @@
 
 use crate::{
     check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS,
-    TASK_COLUMNS,
+    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
+    PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use std::collections::HashMap;
@@ -429,54 +429,30 @@ impl Db {
         })
     }
 
-    /// The first claim or completion in a domain made under an attempt key: its task and
-    /// its event.
-    pub(crate) async fn attempt_in(
+    /// The handoff a task was completed with under an attempt key, if it was.
+    pub(crate) async fn completed_under(
         &self,
-        domain: &str,
+        task: &str,
         key: &str,
-    ) -> Result<Option<(String, Event)>, Error> {
-        let Some(s) = self.schema(domain).await? else {
-            return Ok(None);
-        };
+    ) -> Result<Option<String>, Error> {
+        let s = self.schema_of_task(task).await?;
         let row = self
             .client
             .query_opt(
                 &format!(
-                    "SELECT task_id, payload FROM {s}.events
-                     WHERE kind IN ('claimed', 'completed')
-                       AND payload::jsonb ->> 'attempt' = $1
+                    "SELECT payload FROM {s}.events
+                     WHERE task_id = $1 AND kind = 'completed'
+                       AND payload::jsonb ->> 'attempt' = $2
                      ORDER BY seq LIMIT 1"
                 ),
-                &[&key],
+                &[&task, &key],
             )
             .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let (id, payload): (String, String) = (row.try_get(0)?, row.try_get(1)?);
-        let event = Event::parse(&id, &payload)?;
-        Ok(Some((id, event)))
-    }
-
-    /// As [`Db::attempt_in`], for the domain of a task.
-    pub(crate) async fn attempt_of(
-        &self,
-        task: &str,
-        key: &str,
-    ) -> Result<Option<(String, Event)>, Error> {
-        let row = self
-            .client
-            .query_opt(
-                "SELECT domain FROM public.ledger_tasks WHERE id = $1",
-                &[&task],
-            )
-            .await?;
-        let Some(row) = row else {
-            return Err(Error::NotFound(task.to_string()));
-        };
-        let domain: String = row.try_get(0)?;
-        self.attempt_in(&domain, key).await
+        let payload: Option<String> = row.map(|r| r.try_get(0)).transpose()?;
+        Ok(match payload.map(|p| Event::parse(task, &p)).transpose()? {
+            Some(Event::Completed { handoff, .. }) => Some(handoff),
+            _ => None,
+        })
     }
 
     /// The payloads of a task's events of one kind, oldest first.
@@ -651,58 +627,81 @@ impl Db {
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Option<Taken>, Error> {
         let Some(s) = self.schema(domain).await? else {
             return Ok(None);
         };
-        let claimable_now =
-            "(status IN ('open', 'blocked') OR (status = 'claimed' AND lease_until < $1))";
-        let now_text = crate::fmt_time(now);
+        // every task that may be claimable. Whether a claimed one's lease has run out is
+        // asked of the parsed time: as text, a time with fewer digits of a second sorts
+        // after a later one with more
+        let claimable_now = "status IN ('open', 'blocked', 'claimed')";
         let tx = self.client.transaction().await?;
+        // the claim this key made in this domain, looked for under the domain's lock, so
+        // two connections with one key make one claim
+        if let Some(key) = who.attempt {
+            lock_domain(&tx, domain).await?;
+            let before = tx
+                .query_opt(
+                    &format!(
+                        "SELECT task_id, payload FROM {s}.events
+                         WHERE kind = 'claimed' AND payload::jsonb ->> 'attempt' = $1
+                         ORDER BY seq LIMIT 1"
+                    ),
+                    &[&key],
+                )
+                .await?;
+            if let Some(row) = before {
+                let (id, payload): (String, String) = (row.try_get(0)?, row.try_get(1)?);
+                let generation = match Event::parse(&id, &payload)? {
+                    Event::Claimed { generation, .. } => generation,
+                    _ => 0,
+                };
+                return Ok(Some(Taken::Again { id, generation }));
+            }
+        }
         let rows = tx
             .query(
-                &format!(
-                    "SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE {claimable_now}
-                     ORDER BY priority DESC, created"
-                ),
-                &[&now_text],
+                &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE {claimable_now}"),
+                &[],
             )
             .await?;
-        for row in &rows {
-            let seen = task_from_row(row)?;
+        let mut candidates = rows
+            .iter()
+            .map(task_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::in_queue_order(&mut candidates);
+        for seen in candidates {
             if !claimable(&seen, now, manifest, handling) {
                 continue;
             }
-            let Some(locked) = tx
-                .query_opt(
-                    &format!(
-                        "SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $2 AND {claimable_now}
-                         FOR UPDATE SKIP LOCKED"
-                    ),
-                    &[&now_text, &seen.id],
-                )
-                .await?
-            else {
-                continue;
-            };
-            let task = task_from_row(&locked)?;
-            if !claimable(&task, now, manifest, handling)
-                || !deps_complete(&tx, &task.spec.depends_on).await?
-                || awaits_continuation(&tx, &s, &task.id).await?
-            {
-                continue;
+            if take(&tx, &s, &seen.id, now, (who, until), manifest, handling).await? {
+                tx.commit().await?;
+                return Ok(Some(Taken::New(seen.id)));
             }
-            let claimed = Event::Claimed {
-                holder: who.holder.to_string(),
-                until,
-                generation: task.generation + 1,
-                attempt: who.attempt.map(str::to_string),
-            };
-            apply(&tx, &s, &task.id, now, &claimed).await?;
-            tx.commit().await?;
-            return Ok(Some(task.id));
         }
         Ok(None)
+    }
+
+    /// [`take`] in a transaction of its own, for a test of what it refuses.
+    #[cfg(test)]
+    pub(crate) async fn take_alone(
+        &mut self,
+        id: &str,
+        now: OffsetDateTime,
+        who: (&str, OffsetDateTime),
+    ) -> Result<bool, Error> {
+        let who = (
+            Claimant {
+                holder: who.0,
+                attempt: None,
+            },
+            who.1,
+        );
+        let s = self.schema_of_task(id).await?;
+        let tx = self.client.transaction().await?;
+        let taken = take(&tx, &s, id, now, who, &[], Label::Restricted).await?;
+        tx.commit().await?;
+        Ok(taken)
     }
 
     pub(crate) async fn claim(
@@ -914,6 +913,46 @@ impl Db {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// Lock one candidate's row and claim it for `who`, a holder and the end of its lease, if
+/// the task is still claimable now that the row is held. The candidate was read before
+/// the lock: another connection may have claimed it and committed since, and this check
+/// is then all that stands between the task and a second holder. A row another
+/// connection holds is passed over.
+async fn take<C: GenericClient>(
+    tx: &C,
+    s: &str,
+    id: &str,
+    now: OffsetDateTime,
+    who: (Claimant<'_>, OffsetDateTime),
+    manifest: &[String],
+    handling: Label,
+) -> Result<bool, Error> {
+    let locked = tx
+        .query_opt(
+            &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $1 FOR UPDATE SKIP LOCKED"),
+            &[&id],
+        )
+        .await?;
+    let Some(locked) = locked else {
+        return Ok(false);
+    };
+    let task = task_from_row(&locked)?;
+    if !claimable(&task, now, manifest, handling)
+        || !deps_complete(tx, &task.spec.depends_on).await?
+        || awaits_continuation(tx, s, &task.id).await?
+    {
+        return Ok(false);
+    }
+    let claimed = Event::Claimed {
+        holder: who.0.holder.to_string(),
+        until: who.1,
+        generation: task.generation + 1,
+        attempt: who.0.attempt.map(str::to_string),
+    };
+    apply(tx, s, &task.id, now, &claimed).await?;
+    Ok(true)
 }
 
 /// Take a domain's lock until the transaction ends.
