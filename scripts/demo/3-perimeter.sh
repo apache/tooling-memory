@@ -160,9 +160,29 @@ for line in sys.stdin:
 '
 fi
 
+say "A grant withdrawn mid-session" "A session is valid only while its grants read as they did when it started. The owner lowers the handling of the record while an agent's session is open. The session's next read is refused, and so is its next write: a request made after a revocation cannot use the old grant. A new session starts under the grants as they are."
+cp "$root/grants.toml" "$root/grants.toml.before-revoke"
+sed 's/^handling = .*/handling = "public"/' "$root/grants.toml" > "$root/grants.toml.lowered"
+agent agent:a steps "[
+  {\"tool\": \"search\", \"arguments\": {\"query\": \"decision\", \"limit\": 50}},
+  {\"run\": \"mv '$root/grants.toml.lowered' '$root/grants.toml'\"},
+  {\"tool\": \"search\", \"arguments\": {\"query\": \"decision\", \"limit\": 50}},
+  {\"tool\": \"write\", \"arguments\": {\"title\": \"A late note\", \"body\": \"Written after the grant was withdrawn.\"}}
+]" | python3 -c "
+import json, sys
+for line in sys.stdin:
+    d = json.loads(line)
+    if d['ok']:
+        print(f\"  {d['tool']}: {len(d['result']['hits'])} hits, under the grants the session started with\")
+    else:
+        print(f\"  {d['tool']}: {d['refused'][:150]}\")
+"
+echo "  a new session, under the grants as they are now: $(agent agent:a search '{"query": "decision", "limit": 50}' | j "len(d['hits'])") hits"
+mv "$root/grants.toml.before-revoke" "$root/grants.toml"
+
 say "Reads are the policy's too" "A root's policy can narrow what agents read, here to public entries, and the narrowing is compiled into the search query itself, not applied after."
 mkdir -p "$root/policy"
 sed 's/^read_filter := base_filter$/read_filter := object.union(base_filter, {"handling": "public"}) if class == "agent"\n\nread_filter := base_filter if class != "agent"/' \
   "$here/crates/policy/rego/amem.rego" > "$root/policy/local.rego"
-echo "  an agent searching 'decision': $(agent agent:a search '{"query": "decision", "limit": 50}' | j 'len(d)') hits; the owner: $(a search decision --limit 50 | j 'len(d)')"
+echo "  an agent searching 'decision': $(agent agent:a search '{"query": "decision", "limit": 50}' | j "len(d['hits'])") hits; the owner: $(a search decision --limit 50 | j 'len(d)')"
 rm -r "$root/policy"

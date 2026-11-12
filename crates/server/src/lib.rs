@@ -73,6 +73,23 @@ fn check_write_size(size: usize) -> Result<(), Error> {
 }
 /// The index, relative to the root.
 pub const INDEX_FILE: &str = "state/index.db";
+/// What changes whenever a session changes the policy: every other session compares it
+/// with what it last loaded.
+pub const POLICY_STAMP_FILE: &str = "state/policy.stamp";
+
+/// The policy stamp as the root holds it now: what the last change to a policy entry
+/// left, and the digest of the root's own policy files. A file that cannot be read
+/// gives a stamp no session has seen, so the session loads the policy again and is
+/// refused there.
+fn policy_stamp(root: &Path) -> String {
+    let entries = std::fs::read_to_string(root.join(POLICY_STAMP_FILE)).unwrap_or_default();
+    let own = match Policy::root_text(root) {
+        Ok(Some(text)) => dm_core::digest(&text),
+        Ok(None) => String::new(),
+        Err(e) => format!("unreadable: {e}"),
+    };
+    format!("{entries}|{own}")
+}
 /// The ledger, relative to the root.
 pub const LEDGER_FILE: &str = "state/ledger.db";
 
@@ -112,6 +129,10 @@ pub enum Error {
     /// The grants do not allow it.
     #[error("not allowed: {0}")]
     Denied(String),
+    /// The session's authority is no longer what it started with, or cannot be shown:
+    /// the session stops, and a new one starts under the grants as they are now.
+    #[error("stopped: {0}")]
+    Stale(String),
     /// Not there, or not for this session to see. The two are deliberately the same.
     #[error("not found: {0}")]
     NotFound(String),
@@ -304,7 +325,15 @@ pub struct Memory {
     claims: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     /// What this session may read, as the policy computed it once and the index applies
     /// inside every query.
-    scope: OnceLock<ReadFilter>,
+    /// It is kept with the version of the policy that computed it, and is computed
+    /// again when the policy in force is another.
+    scope: Mutex<Option<(String, ReadFilter)>>,
+    /// The digest of the grants file this session was opened from. The session is
+    /// valid only while the file reads the same.
+    grants_stamp: String,
+    /// The policy stamp this session last loaded its policy at: what
+    /// `state/policy.stamp` read then. Shared with the session's views.
+    policy_seen: Arc<Mutex<String>>,
     /// How many decision contexts this session has kept.
     contexts_kept: Arc<AtomicUsize>,
     /// The tools this session may call, when the launcher hosts them.
@@ -426,7 +455,9 @@ impl Memory {
     ///
     /// A missing or bad grants file, or a store, index, or ledger that will not open.
     pub fn open(root: &Path) -> Result<Memory, Error> {
-        let grants = Grants::load(&root.join(GRANTS_FILE))?;
+        let grants_text = std::fs::read_to_string(root.join(GRANTS_FILE)).map_err(io(root))?;
+        let grants = Grants::parse(&grants_text)?;
+        let policy_seen = policy_stamp(root);
         std::fs::create_dir_all(root.join("state")).map_err(io(root))?;
         let store = Store::open_dir(root)?;
         let index = Index::open(&root.join(INDEX_FILE))?;
@@ -463,7 +494,9 @@ impl Memory {
             held: Arc::default(),
             superseded: Arc::new(AtomicUsize::new(0)),
             claims: Arc::default(),
-            scope: OnceLock::new(),
+            scope: Mutex::new(None),
+            grants_stamp: dm_core::digest(&grants_text),
+            policy_seen: Arc::new(Mutex::new(policy_seen)),
             contexts_kept: Arc::new(AtomicUsize::new(0)),
             tools: OnceLock::new(),
             playback: OnceLock::new(),
@@ -490,6 +523,7 @@ impl Memory {
     /// When the policy fails to give the read scope.
     pub fn for_request(&self) -> Result<Memory, Error> {
         let scope = self.session_filter()?;
+        let version = self.policy().version().to_string();
         let mut session = self.grants.session();
         session.handling = session.handling.min(scope.handling);
         Ok(Memory {
@@ -512,7 +546,9 @@ impl Memory {
             held: Arc::clone(&self.held),
             superseded: Arc::clone(&self.superseded),
             claims: Arc::clone(&self.claims),
-            scope: OnceLock::from(scope),
+            scope: Mutex::new(Some((version, scope))),
+            grants_stamp: self.grants_stamp.clone(),
+            policy_seen: Arc::clone(&self.policy_seen),
             contexts_kept: Arc::clone(&self.contexts_kept),
             tools: self.tools.clone(),
             playback: self.playback.clone(),
@@ -526,8 +562,12 @@ impl Memory {
     /// away and never add them. The session's handling is capped at it as well. The
     /// decision is logged like any other.
     fn session_filter(&self) -> Result<ReadFilter, Error> {
-        if let Some(f) = self.scope.get() {
-            return Ok(f.clone());
+        self.fresh()?;
+        let policy = self.policy();
+        if let Some((version, f)) = lock(&self.scope).as_ref() {
+            if version == policy.version() {
+                return Ok(f.clone());
+            }
         }
         let input = Input {
             action: Action::Read,
@@ -542,8 +582,7 @@ impl Memory {
             spend: None,
             fetch: None,
         };
-        let f = self
-            .policy()
+        let f = policy
             .read_scope(&input)?
             .narrow(&self.grants.read_filter());
         {
@@ -562,13 +601,70 @@ impl Memory {
                     f.handling,
                     f.min_tier
                 ),
-                policy: self.policy().version().to_string(),
+                policy: policy.version().to_string(),
                 cites: Vec::new(),
                 denials: Vec::new(),
                 advisories: Vec::new(),
             },
         );
-        Ok(self.scope.get_or_init(|| f).clone())
+        // what a pack pushed under another filter is no note for this one
+        if lock(&self.scope).is_some() {
+            *lock(&self.cache) = recall::Cache::default();
+        }
+        *lock(&self.scope) = Some((policy.version().to_string(), f.clone()));
+        Ok(f)
+    }
+
+    /// Show that this session's authority is current, before anything is released
+    /// under it: the grants file reads as it did when the session opened, and the
+    /// policy is the one in force. A session whose grants changed stops, because a
+    /// request made after a revocation cannot use the old grant; a new session starts
+    /// under the grants as they are. A policy another session changed is loaded here,
+    /// and the read filter follows it. When neither can be shown, the answer is no.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stale`] when the grants changed or cannot be read, or the policy
+    /// cannot be loaded again.
+    pub fn fresh(&self) -> Result<(), Error> {
+        let now = std::fs::read_to_string(self.root.join(GRANTS_FILE)).map_err(|e| {
+            Error::Stale(format!(
+                "the grants cannot be read ({e}), so this session's access cannot be shown"
+            ))
+        })?;
+        if dm_core::digest(&now) != self.grants_stamp {
+            return Err(Error::Stale(
+                "the grants changed after this session started. A session keeps no grant \
+                 that was changed under it: start a new session"
+                    .into(),
+            ));
+        }
+        let stamp = policy_stamp(&self.root);
+        let mut seen = lock(&self.policy_seen);
+        if *seen != stamp {
+            self.load_policy_again().map_err(|e| {
+                Error::Stale(format!(
+                    "the policy changed and cannot be loaded again ({e}), so this \
+                     session's access cannot be shown"
+                ))
+            })?;
+            *seen = stamp;
+        }
+        Ok(())
+    }
+
+    /// Compile the policy from the record as it is now, through an index handle of its
+    /// own: the caller may hold this session's.
+    fn load_policy_again(&self) -> Result<(), Error> {
+        let index = Index::open(&self.root.join(INDEX_FILE))?;
+        let entries = policy_entries(&index, &self.root, &self.grants);
+        let p = Policy::load(&self.root, &self.grants)?.with_record(
+            &self.grants,
+            entries,
+            OffsetDateTime::now_utc(),
+        )?;
+        *self.policy.write().unwrap_or_else(PoisonError::into_inner) = std::sync::Arc::new(p);
+        Ok(())
     }
 
     /// The task this session runs on: a launcher sets it before the harness starts,
@@ -608,7 +704,16 @@ impl Memory {
             entries,
             OffsetDateTime::now_utc(),
         )?;
+        let version = p.version().to_string();
         *self.policy.write().unwrap_or_else(PoisonError::into_inner) = std::sync::Arc::new(p);
+        // every other session learns from the stamp that the policy is another now
+        let stamp = format!(
+            "{version} {}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        let path = self.root.join(POLICY_STAMP_FILE);
+        std::fs::write(&path, &stamp).map_err(io(&path))?;
+        *lock(&self.policy_seen) = policy_stamp(&self.root);
         Ok(())
     }
 
@@ -623,6 +728,7 @@ impl Memory {
     /// Ask the policy, and log the decision under the record's state: every allow and
     /// deny, with the policy version that produced it, as the paper has decision logs.
     fn decide(&self, input: &Input) -> Result<Decision, Error> {
+        self.fresh()?;
         let mut input = input.clone();
         input.held_task = self.held_task();
         let d = self.policy().decide(&input)?;
@@ -660,6 +766,7 @@ impl Memory {
             }),
             fetch: None,
         };
+        self.fresh()?;
         let d = self.policy().decide(&input)?;
         if !d.allow {
             self.log_decision(&input, &d);
@@ -738,7 +845,7 @@ impl Memory {
         self.author = author.into();
         self.reads.set_author(&self.author);
         // the read scope is the principal's; a new author is asked afresh
-        self.scope = OnceLock::new();
+        self.scope = Mutex::new(None);
         self
     }
 
@@ -3791,6 +3898,124 @@ mod tests {
                 .any(|s| attr(s, "policy.action") == Some(Value::from("file_task"))),
             "the owner's task filing is a decision too"
         );
+    }
+
+    /// The built-in policy with agents narrowed to public entries.
+    fn narrowed_policy() -> String {
+        dm_policy::decide::BUILTIN.replace(
+            "read_filter := base_filter\n",
+            "read_filter := object.union(base_filter, {\"handling\": \"public\"}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n",
+        )
+    }
+
+    fn is_stale<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::Stale(_)))
+    }
+
+    /// A session keeps no grant that was changed under it: after a change to the
+    /// grants file, every read, write and claim of the session is refused, and a new
+    /// session works under the grants as they are.
+    #[tokio::test]
+    async fn a_session_stops_when_its_grants_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        owner.write(req("Backoff is exponential.\n")).await.unwrap();
+        let t = filed(&owner, tspec("Tidy", 0, None, &[], &[])).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 1);
+        let view = agent.for_request().unwrap();
+        let path = dir.path().join(GRANTS_FILE);
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{before}\n[spend.gateway]\nsession_tokens = 400\n"),
+        )
+        .unwrap();
+        assert!(is_stale(&agent.search("backoff", None, 10).await));
+        assert!(is_stale(&agent.t0(None).await));
+        assert!(is_stale(&agent.list(None, None, 10).await));
+        assert!(is_stale(&agent.write(req("A late note.\n")).await));
+        assert!(is_stale(&agent.claim(&t.id, Duration::minutes(5)).await));
+        assert!(is_stale(&agent.check_spend("gateway", 0, 0)));
+        assert!(
+            is_stale(&view.search("backoff", None, 10).await),
+            "a view of it too"
+        );
+        assert!(is_stale(&agent.for_request()));
+        let fresh = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert_eq!(fresh.search("backoff", None, 10).await.unwrap().len(), 1);
+        // a grants file that cannot be read shows nothing, so the answer is no
+        std::fs::remove_file(&path).unwrap();
+        assert!(is_stale(&fresh.search("backoff", None, 10).await));
+        // the file as it was is the authority the first session started with
+        std::fs::write(&path, before).unwrap();
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 1);
+    }
+
+    /// A rule that another session puts in force reaches a session that is already
+    /// open: its next decision is made under the policy as it is now.
+    #[tokio::test]
+    async fn an_open_session_decides_under_a_rule_verified_after_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let supersede = |of: &str| WriteRequest {
+            entry_type: EntryType::Decision,
+            supersedes: Some(of.to_string()),
+            ..req("Use something else on a laptop.\n")
+        };
+        let d2 = agent.write(supersede(&d1)).await.unwrap().id;
+        let rule = policy_entry(&owner, &rule_text("pol-L2-070", 2, "")).await;
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        verify(&owner, &curator, &rule).await;
+        let refused = agent.write(supersede(&d2)).await.unwrap_err().to_string();
+        assert!(refused.contains("pol-L2-070"), "{refused}");
+    }
+
+    /// A change to the root's own policy reaches an open session's read filter: its
+    /// next search is made under the narrower filter, and under the wider one again
+    /// when the file is gone.
+    #[tokio::test]
+    async fn an_open_session_reads_under_the_root_s_policy_as_it_is_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        owner
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("Backoff is exponential, public.\n")
+            })
+            .await
+            .unwrap();
+        let internal = owner
+            .write(req("Backoff is exponential, internal.\n"))
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 2);
+        std::fs::create_dir_all(dir.path().join("policy")).unwrap();
+        std::fs::write(dir.path().join("policy/local.rego"), narrowed_policy()).unwrap();
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 1);
+        assert!(agent.get(&internal).await.is_err());
+        // a policy that will not compile shows nothing, so the answer is no
+        std::fs::write(
+            dir.path().join("policy/local.rego"),
+            "package amem\nnot rego {",
+        )
+        .unwrap();
+        assert!(is_stale(&agent.search("backoff", None, 10).await));
+        std::fs::remove_dir_all(dir.path().join("policy")).unwrap();
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

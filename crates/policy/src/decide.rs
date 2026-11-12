@@ -366,6 +366,10 @@ pub struct Policy {
     refused: Vec<(String, String)>,
     /// The rules the ceiling holds at advisory.
     held_back: Vec<String>,
+    /// The data the record gave the engine, and when each exception in it lapses: an
+    /// expiry is read against the clock at each decision, never compiled in.
+    data: serde_json::Value,
+    lapses: Vec<(String, time::OffsetDateTime)>,
 }
 
 impl std::fmt::Debug for Policy {
@@ -399,6 +403,20 @@ impl Policy {
     /// A policy that will not compile, or a file that cannot be read.
     pub fn load(root: &Path, grants: &Grants) -> Result<Policy, Error> {
         let dir = root.join("policy");
+        match Policy::root_text(root)? {
+            Some(text) => Policy::compile(&text, &dir.display().to_string(), grants),
+            None => Policy::builtin(grants),
+        }
+    }
+
+    /// The text of a root's own policy, its `policy/*.rego` in the order of their
+    /// names; none when the root has no such file and the built-in policy stands.
+    ///
+    /// # Errors
+    ///
+    /// A policy file that cannot be read.
+    pub fn root_text(root: &Path) -> Result<Option<String>, Error> {
+        let dir = root.join("policy");
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .map(|d| {
                 d.filter_map(Result::ok)
@@ -408,7 +426,7 @@ impl Policy {
             })
             .unwrap_or_default();
         if files.is_empty() {
-            return Policy::builtin(grants);
+            return Ok(None);
         }
         files.sort();
         let mut text = String::new();
@@ -419,7 +437,7 @@ impl Policy {
             })?);
             text.push('\n');
         }
-        Policy::compile(&text, &dir.display().to_string(), grants)
+        Ok(Some(text))
     }
 
     /// This policy with the record's policy entries: each verified entry's module is
@@ -486,6 +504,12 @@ impl Policy {
         });
         self.engine = Policy::with_data(self.engine, &data)?;
         self.version = digest(&texts);
+        self.lapses = entries
+            .iter()
+            .filter(|e| e.in_force(now))
+            .filter_map(|e| Some((e.meta.id.clone(), e.lapses()?)))
+            .collect();
+        self.data = data;
         self.entries = entries;
         self.held_back = over;
         Ok(self)
@@ -555,6 +579,8 @@ impl Policy {
             entries: Vec::new(),
             refused: Vec::new(),
             held_back: Vec::new(),
+            data: serde_json::Value::Null,
+            lapses: Vec::new(),
         })
     }
 
@@ -582,12 +608,35 @@ impl Policy {
     ///
     /// When the policy fails to evaluate or its answer is not a scope.
     pub fn read_scope(&self, input: &Input) -> Result<ReadScope, Error> {
-        let json = self.eval("data.amem.read_filter", input)?;
+        let json = self.eval(
+            "data.amem.read_filter",
+            input,
+            time::OffsetDateTime::now_utc(),
+        )?;
         serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))
     }
 
-    fn eval(&self, rule: &str, input: &Input) -> Result<String, Error> {
-        let mut engine = self.engine.clone();
+    /// The engine as it stands at `now`: without the exceptions that have lapsed since
+    /// the policy was compiled.
+    fn engine_at(&self, now: time::OffsetDateTime) -> Result<regorus::Engine, Error> {
+        let lapsed: Vec<&str> = self
+            .lapses
+            .iter()
+            .filter(|(_, at)| *at <= now)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if lapsed.is_empty() {
+            return Ok(self.engine.clone());
+        }
+        let mut data = self.data.clone();
+        if let Some(list) = data["exceptions"].as_array_mut() {
+            list.retain(|e| !lapsed.contains(&e["id"].as_str().unwrap_or_default()));
+        }
+        Policy::with_data(self.engine.clone(), &data)
+    }
+
+    fn eval(&self, rule: &str, input: &Input, now: time::OffsetDateTime) -> Result<String, Error> {
+        let mut engine = self.engine_at(now)?;
         let value = regorus::Value::from_json_str(
             &serde_json::to_string(input).map_err(|e| Error::Policy(e.to_string()))?,
         )
@@ -606,7 +655,17 @@ impl Policy {
     ///
     /// When the policy fails to evaluate or its decision is not the shape expected.
     pub fn decide(&self, input: &Input) -> Result<Decision, Error> {
-        let json = self.eval("data.amem.decision", input)?;
+        self.decide_at(input, time::OffsetDateTime::now_utc())
+    }
+
+    /// Decide one request as the clock reads `now`: an exception that has lapsed by
+    /// then lets nothing through, whenever the policy was compiled.
+    ///
+    /// # Errors
+    ///
+    /// As [`Policy::decide`].
+    pub fn decide_at(&self, input: &Input, now: time::OffsetDateTime) -> Result<Decision, Error> {
+        let json = self.eval("data.amem.decision", input, now)?;
         let mut d: Decision =
             serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))?;
         d.policy = self.version.clone();
@@ -921,7 +980,11 @@ mod tests {
     }
 
     fn supersede_decision(p: &Policy, held: Option<&str>) -> Decision {
-        p.decide(&Input {
+        p.decide(&supersede_input(held)).unwrap()
+    }
+
+    fn supersede_input(held: Option<&str>) -> Input {
+        Input {
             action: Action::Write,
             principal: Principal {
                 id: "agent:x".into(),
@@ -942,8 +1005,49 @@ mod tests {
             held_task: held.map(str::to_string),
             spend: None,
             fetch: None,
-        })
-        .unwrap()
+        }
+    }
+
+    /// An expiry is read against the clock at each decision: a policy compiled while
+    /// an exception was in force refuses once the exception has lapsed.
+    #[test]
+    fn an_exception_lapses_at_its_expiry_whenever_the_policy_was_compiled() {
+        use dm_core::TrustTier::Verified;
+        let g = grants();
+        let rule = rule_entry("pol-L2-031", 2, Verified, "", true);
+        let exception = |id: &str, expires: &str| {
+            rule_entry(
+                id,
+                2,
+                Verified,
+                &format!(
+                    "breaches = \"pol-L2-031\"\nscope_task = \"task-t-1\"\nexpires = \"{expires}\""
+                ),
+                false,
+            )
+        };
+        let compiled = time::macros::datetime!(2026-11-01 00:00 UTC);
+        let short = exception("exc-2026-010", "2026-11-02T00:00:00Z");
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![rule.clone(), short.clone()], compiled)
+            .unwrap();
+        let input = supersede_input(Some("task-t-1"));
+        let before = time::macros::datetime!(2026-11-01 12:00 UTC);
+        let at = time::macros::datetime!(2026-11-02 00:00 UTC);
+        assert!(p.decide_at(&input, before).unwrap().allow);
+        let d = p.decide_at(&input, at).unwrap();
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(d.cites, ["pol-L2-031"]);
+        // an exception that still runs is kept when another lapses
+        let long = exception("exc-2026-011", "2026-12-01T00:00:00Z");
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![rule, short, long], compiled)
+            .unwrap();
+        let d = p.decide_at(&input, at).unwrap();
+        assert!(d.allow, "{d:?}");
+        assert_eq!(d.cites, ["exc-2026-011"]);
     }
 
     fn with(g: &Grants, entries: Vec<crate::record::Entry>) -> Policy {

@@ -139,8 +139,10 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Curation and audit, in part.** No curation task demotes an entry, checks an owner or
   a cross-link, or curates policy. No test on planted faults qualifies the auditor's
   model. The auditor does not read handoffs.
-- **Access freshness.** A session keeps its read filter until it ends. A change to the
-  grants or to a policy does not stop a session.
+- **Access freshness, in part.** Any change to the grants file stops each open session,
+  not only a session that the change affects. The files that a session rendered before
+  the change stay on disk. A harness that a stopped session started continues to run,
+  and each of its memory calls is refused. A grant has no expiry of its own.
 - **The improvement loop.** The only gate on a platform artifact is that a person
   verifies it. There is no performance gate, no safety gate, and no check that a change
   adds no permission.

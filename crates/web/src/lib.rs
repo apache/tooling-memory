@@ -227,8 +227,9 @@ struct App {
     config: Config,
     /// The board's session for its life: the handles, the session id for the read and
     /// write logs, and the read scope. Each request gets a view of it with a label of
-    /// its own ([`App::session`]).
-    memory: Arc<Memory>,
+    /// its own ([`App::session`]). When the grants change, that session stops, as
+    /// every session does, and the board opens a new one ([`App::memory`]).
+    memory: Arc<std::sync::RwLock<Arc<Memory>>>,
     sessions: Arc<Mutex<BTreeMap<String, Arc<Session>>>>,
     /// Bundle exports run one at a time: each replaces a directory by renaming.
     exports: Arc<tokio::sync::Mutex<()>>,
@@ -502,7 +503,33 @@ impl App {
     /// only: a listing does not classify what a later request files or writes, as one
     /// long-lived label would.
     fn session(&self) -> Result<Memory, dm_server::Error> {
-        self.memory.for_request()
+        self.memory().for_request()
+    }
+
+    /// The board's session, under the grants as they are now. A session whose grants
+    /// changed has stopped; the board is the owner's, so it opens a new one in its
+    /// place. When a new one cannot be opened, the stopped one is given and refuses.
+    fn memory(&self) -> Arc<Memory> {
+        let now = Arc::clone(
+            &self
+                .memory
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if !matches!(now.fresh(), Err(dm_server::Error::Stale(_))) {
+            return now;
+        }
+        match open_board(&self.config.root) {
+            Ok(new) => {
+                let new = Arc::new(new);
+                *self
+                    .memory
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&new);
+                new
+            }
+            Err(_) => now,
+        }
     }
 
     fn start(&self, req: &NewSession) -> Result<Arc<Session>, Error> {
@@ -1125,7 +1152,7 @@ async fn reader_asset(Path(name): Path<String>) -> Response {
 
 /// The domains the record grants, for the reader's picker.
 async fn domains(State(app): State<App>) -> Json<Vec<String>> {
-    Json(app.memory.domains())
+    Json(app.memory().domains())
 }
 
 /// A bundle file name: letters, digits, dot, underscore and hyphen, not starting with a
@@ -1159,13 +1186,14 @@ fn admit_bundle_request(
     if !plain_file_name(file) {
         return Err((StatusCode::NOT_FOUND, "no such file".into()));
     }
-    if !app.memory.domains().iter().any(|d| d == domain) {
+    let memory = app.memory();
+    if !memory.domains().iter().any(|d| d == domain) {
         return Err((
             StatusCode::FORBIDDEN,
             format!("domain {domain} is not granted"),
         ));
     }
-    let handling = app.memory.grants().handling;
+    let handling = memory.grants().handling;
     if label > handling {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1273,15 +1301,19 @@ async fn bundle_file(
     }
 }
 
+/// The board's session on a record. The browser is the owner, a person: a task
+/// addressed to a person, one that requires `human`, is one the board may claim.
+fn open_board(root: &std::path::Path) -> Result<Memory, dm_server::Error> {
+    Ok(Memory::open(root)?.with_manifest(vec!["human".into()]))
+}
+
 /// The router, for serving or for tests.
 ///
 /// # Errors
 ///
 /// When the record cannot be opened.
 pub fn router(config: Config) -> Result<Router, Error> {
-    // the browser is the owner, a person: a task addressed to a person, one that
-    // requires `human`, is one the board may claim
-    let memory = Arc::new(Memory::open(&config.root)?.with_manifest(vec!["human".into()]));
+    let memory = Arc::new(std::sync::RwLock::new(Arc::new(open_board(&config.root)?)));
     let access = config.access.clone();
     let app = App {
         config,
@@ -2221,6 +2253,24 @@ mod tests {
             after_one,
             "a board poll logged a decision; the read scope is decided once for the board"
         );
+    }
+
+    /// The board's session stops when the grants change, as every session does, and
+    /// the board opens a new one: it answers under the grants as they are now.
+    #[tokio::test]
+    async fn the_board_opens_a_new_session_when_the_grants_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let (status, _) = get_json(addr, "/api/tasks").await;
+        assert_eq!(status, 200);
+        let grants = dir.path().join("memory/grants.toml");
+        let text = std::fs::read_to_string(&grants).unwrap();
+        let more = format!("{text}\n[spend.gateway]\nsession_tokens = 400\n");
+        std::fs::write(&grants, more).unwrap();
+        let (status, tasks) = get_json(addr, "/api/tasks").await;
+        assert_eq!(status, 200, "the board reads under a new session: {tasks}");
+        let (status, domains) = get_json(addr, "/api/domains").await;
+        assert_eq!((status, domains), (200, serde_json::json!(["dom-me"])));
     }
 
     #[tokio::test]

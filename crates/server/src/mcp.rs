@@ -34,6 +34,7 @@ const MAX_LIMIT: usize = 100;
 fn mcp_err(e: Error) -> McpError {
     match e {
         Error::Denied(_)
+        | Error::Stale(_)
         | Error::NotFound(_)
         | Error::Gone(_)
         | Error::Moved { .. }
