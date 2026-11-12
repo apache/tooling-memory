@@ -54,6 +54,34 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
     }
 }
 
+/// The text of one entry file of a bundle. Only a regular file is opened: a pipe would
+/// hold the open until someone wrote to it, and a link leads where the bundle did not
+/// say. It is read up to the bound an entry holds and no further, whatever size the
+/// file system gives for it.
+fn read_entry(path: &Path, name: &str) -> Result<String, Error> {
+    use std::io::Read;
+    let max = crate::MAX_ENTRY_BYTES;
+    if !std::fs::symlink_metadata(path)
+        .map_err(io(path))?
+        .file_type()
+        .is_file()
+    {
+        return Err(Error::Invalid(format!("{name} is not a regular file")));
+    }
+    let file = std::fs::File::open(path).map_err(io(path))?;
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io(path))?;
+    if bytes.len() > max {
+        return Err(Error::Invalid(format!(
+            "{name} has more than {max} bytes; an entry holds at most that"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|e| io(path)(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
 /// The outcome of an export.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Exported {
@@ -431,7 +459,7 @@ fn check_entries(
     for m in &manifest.entries {
         plain_name(&m.path)?;
         let path = src.join(&m.path);
-        let text = std::fs::read_to_string(&path).map_err(io(&path))?;
+        let text = read_entry(&path, &m.path)?;
         if digest(&text) != m.digest {
             return Err(Error::Invalid(format!(
                 "{} does not match its manifest digest",
