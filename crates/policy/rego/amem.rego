@@ -368,20 +368,15 @@ base_decision := erase_decision if input.action == "erase"
 # `deny contains {"policy": <id>, "reason": <why>}` for a request. A denial wins over
 # the decision above unless an exception in force covers it: an exception entry,
 # verified and unexpired, that breaches that policy and is scoped to the task this
-# session holds. An L0 rule takes no exception. Every decision says which policies it
-# cites, the denials or the exceptions used: the paper's citation and override rates.
+# session holds. A rule of the L0 core takes no exception. Every decision says which
+# policies it cites, the denials or the exceptions used: the paper's citation and
+# override rates. Only the modules of enforced rules are loaded here. The module of an
+# advisory rule is evaluated apart, so nothing it says can refuse, whatever rule it
+# names.
 core_policy(pid) if {
 	some p in data.policies
 	p.id == pid
 	p.core == true
-}
-
-# An advisory rule is evaluated and reported, and refuses nothing. A rule the data does
-# not list, a built-in one, is enforced.
-advisory_policy(pid) if {
-	some p in data.policies
-	p.id == pid
-	p.status == "advisory"
 }
 
 excepted(pid) if {
@@ -399,15 +394,7 @@ all_denials contains d if some d in builtin_denials
 rule_denials contains d if {
 	some d in all_denials
 	not excepted(d.policy)
-	not advisory_policy(d.policy)
 }
-
-advisory_denials contains d if {
-	some d in all_denials
-	advisory_policy(d.policy)
-}
-
-advisory_list := [d | some d in advisory_denials]
 
 denial_list := [d | some d in rule_denials]
 
@@ -426,7 +413,7 @@ denied_list := [p | some d in rule_denials; p := d.policy]
 
 denied_reasons := [r | some d in rule_denials; r := sprintf("%v: %v", [d.policy, d.reason])]
 
-decision := object.union(base_decision, {"cites": used_list, "advisories": advisory_list}) if {
+decision := object.union(base_decision, {"cites": used_list}) if {
 	count(rule_denials) == 0
 }
 
@@ -437,7 +424,6 @@ decision := {
 	"reason": concat("; ", denied_reasons),
 	"cites": denied_list,
 	"denials": denial_list,
-	"advisories": advisory_list,
 } if {
 	count(rule_denials) > 0
 }

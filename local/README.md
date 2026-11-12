@@ -547,20 +547,24 @@ Thus an agent can propose a rule, but the rule is in no decision until a person 
 it. `amem` loads no module from an entry below verified. A step from advisory to
 enforced is a new version of the entry, with `status = "enforced"`. The new version
 supersedes the old version, so the rule is proposed until a person verifies the new
-version. `amem` evaluates the module of an advisory rule with each decision. It writes what the module would refuse to the decision
-log (`advisories`), and it refuses nothing for that rule. `amem` refuses a module outside
-the rules package, or a module that does not load. It names that module and leaves it
-out, and the base policy stays in force.
+version. `amem` evaluates the module of an advisory rule with each decision, apart from
+the modules of the enforced rules. It writes what the module would refuse to the decision
+log (`advisories`). An advisory module refuses nothing, whatever rule its denial names.
+`amem` refuses a module outside the rules package, or a module that does not load. It
+names that module and leaves it out, and the base policy stays in force.
 
 A session loads the policy when it starts, and again when it changes a policy entry
 itself. A change that a different session makes applies to the sessions that start after
 the change.
 
 `[gates] max_enforced_rules` in `grants.toml` is a ceiling on the enforced rules of one
-domain. There is no ceiling by default. `amem` counts the rules of a domain in the order
-of their ids. A rule over the ceiling is advisory. A rule with `signed_off_by` in its
-block is enforced and is not counted, so a sign-off admits one rule and does not raise
-the ceiling.
+domain. There is no ceiling by default. `amem` counts the enforced rules of a domain from
+the oldest entry to the newest. A rule over the ceiling is advisory, so a new rule does
+not push out an older rule. `amem` does not count a rule in the L0 core, and the ceiling
+never holds such a rule back. `amem` also does not count a verified rule with
+`signed_off_by` in its block, when that name is a person. Thus a sign-off admits one rule
+and does not raise the ceiling. The person who verifies that version of the rule gives
+the sign-off its force.
 
 An L0 rule is in the core unless its block says `core = false`. A rule in the core takes
 no exception.
@@ -574,28 +578,38 @@ Three memory tools use the rules. Each tool is also a command:
 - `check_policy` (`amem policy check <action>`) gives the rules in force for a domain:
   the enforced rules and the advisory rules of layers 0 to 2, and the domain's own L3
   rules. Each rule has its id, layer, rule, intent and status. `amem` does not select
-  the rules by the action. The read log records that the session asked.
+  the rules by the action. The read log records that the session asked. A session
+  reads a rule as it reads an entry. For a rule above the handling of the session, the
+  answer gives the id, layer and status, and `withheld`, and not the text.
 - `file_exception` (`amem policy except <policy id> --task --scope --expiry
-  --justification`) writes an exception and proposes it for verified. The answer names
-  the approver: the owner of the rule for layers 2 and 3, and the owner of the record
-  for layers 0 and 1 and for a rule with no owner. `amem approve` on the task of the answer puts the exception in
-  force. `amem` does not check that the person who approves is the approver that the
-  answer names.
+  --justification`) writes an exception in the domain of the rule and proposes it for
+  verified. The scope and the justification are words. `amem` refuses a request with a
+  code fence in them. The answer names the approver: the owner of the rule for layers 2
+  and 3, and the owner of the record for layers 0 and 1 and for a rule with no owner.
+  `amem approve` on the task of the answer puts the exception in force. A person who
+  did not file the exception approves it. `amem` does not check that this person is
+  the approver that the answer names.
 - `propose_amendment` (`amem policy amend <policy id> --evidence`) files a task for a
-  person. The task names the owner of the rule and carries the evidence. The same
-  evidence for the same rule is one task.
+  person. The task names the owner of the rule and carries the evidence. The task has
+  the classification of the rule's entry. One filer has one open amendment for one rule:
+  a second call gives the same task.
+
+When two entries have the same policy id, these tools use the entry that is in force.
 
 `amem policy reset` retires the rules of a domain that have no person in their lineage.
 Only the owner of the record can run it. A rule has a person in its lineage when a
-person wrote its entry, promoted it, or approved its promotion. The reset keeps those
-rules. For each other rule, the reset writes a new version with `status = "retired"`
-that supersedes the old version. The reset does not change exceptions.
+person wrote its entry, promoted it to curated, or approved its promotion to verified. A
+proposal that nobody approved does not count. The reset keeps those rules. For each
+other rule, the reset writes a new version with `status = "retired"` that supersedes the
+old version. The reset does not change exceptions or the rules of other domains.
+
+An exception with `status = "retired"` in its block is not in force.
 
 A denial from a record rule wins over the built-in decision, unless an exception covers
 the task that the session holds. Each decision names the policies that it rests on: the
 policies that refused it, or the exceptions that it used. Thus the decision log gives the
-citations and the overrides of each policy. T0 carries the policy digest, L0 in full, the
-verified rules by id, and the exceptions in force.
+citations and the overrides of each policy. T0 carries the policy digest: the verified
+rules of the L0 core in full, the other rules in force by id, and the exceptions in force.
 
 `amem policy list` shows the layer, trust tier and status of each policy. `amem policy
 lint` applies the paper's conflict rules. It finds:
@@ -606,9 +620,8 @@ lint` applies the paper's conflict rules. It finds:
 - a rule that is not yet verified;
 - an enforced or advisory rule with no owner (`no-owner`);
 - an enforced or advisory rule after its `review_by` date (`review-due`);
-- a rule whose status is lower than its block says (`held-back`);
 - a rule that the ceiling holds at advisory (`over-ceiling`);
-- an enforced rule that no decision in the decision log cites (`unused`).
+- an enforced rule with a module that refused nothing in the decision log (`unused`).
 
 It also gives, for each rule, how often it refused, how often an exception let a write
 through, and how often the rule advised.

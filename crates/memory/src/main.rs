@@ -1074,8 +1074,8 @@ enum PolicyOp {
         #[arg(long)]
         domain: Option<String>,
     },
-    /// Ask for an exception to a rule, for one task, until an expiry. A person approves
-    /// it with `amem approve`.
+    /// Ask for an exception to a rule, for one task, until an expiry. A person who did
+    /// not ask for it approves it with `amem approve`.
     Except {
         /// The policy id of the rule to breach.
         breaches: String,
@@ -1091,8 +1091,6 @@ enum PolicyOp {
         /// Why it is needed.
         #[arg(long)]
         justification: String,
-        #[arg(long)]
-        domain: Option<String>,
     },
     /// Propose an amendment to a rule: a task for the rule's owner, with the evidence.
     Amend {
@@ -4705,87 +4703,12 @@ fn policy_list(m: &Memory) -> serde_json::Value {
     })
 }
 
-/// Citations and overrides per policy, from the decision log: how often each rule
-/// refused something, and how often an exception let something through.
-fn policy_rates(root: &Path) -> serde_json::Value {
-    let text = std::fs::read_to_string(root.join("state/decisions.jsonl")).unwrap_or_default();
-    let mut cited: std::collections::BTreeMap<String, (u64, u64, u64)> =
-        std::collections::BTreeMap::new();
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let allow = v["allow"].as_bool().unwrap_or(false);
-        for id in v["cites"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|c| c.as_str())
-        {
-            let row = cited.entry(id.to_string()).or_default();
-            if allow {
-                row.1 += 1;
-            } else {
-                row.0 += 1;
-            }
-        }
-        // what an advisory rule would have refused, had it been enforced
-        for id in v["advisories"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|a| a["policy"].as_str())
-        {
-            cited.entry(id.to_string()).or_default().2 += 1;
-        }
-    }
-    serde_json::json!(cited
-        .into_iter()
-        .map(|(id, (refused, overridden, advised))| serde_json::json!({"id": id, "refused": refused, "let_through": overridden, "advised": advised}))
-        .collect::<Vec<_>>())
-}
-
-/// The findings that need the grants and the decision log: a rule held at advisory by
-/// the ceiling on enforced rules, and an enforced rule that no decision in the log
-/// cites, which goes to its owner to retire or to say why it stays.
-fn ceiling_and_use(m: &Memory, p: &dm_policy::decide::Policy) -> Vec<dm_policy::record::Finding> {
-    let mut out = Vec::new();
-    for id in p.over_ceiling(m.grants()) {
-        out.push(dm_policy::record::Finding {
-            why: format!(
-                "{id} is over the ceiling on enforced rules and is advisory: a person signs this one rule off with signed_off_by, or a rule is retired"
-            ),
-            policy: id,
-            kind: "over-ceiling".into(),
-        });
-    }
-    let rates = policy_rates(m.root());
-    let cited: Vec<&str> = rates
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r["id"].as_str())
-        .collect();
-    for e in p.entries().iter().filter(|e| e.enforced()) {
-        if !cited.contains(&e.meta.id.as_str()) {
-            out.push(dm_policy::record::Finding {
-                policy: e.meta.id.clone(),
-                kind: "unused".into(),
-                why: format!(
-                    "{} is enforced and no decision in the log cites it: its owner retires it, or says why it stays",
-                    e.meta.id
-                ),
-            });
-        }
-    }
-    out
-}
-
 /// `amem policy check`, `except`, `amend` and `reset`: the rule lifecycle.
 async fn rule_cmd(m: &Memory, op: PolicyOp) -> Fallible {
     match op {
         PolicyOp::Check { action, domain } => {
-            json(&serde_json::json!({ "rules": m.check_policy(&action, domain.as_deref())? }))
+            let rules = m.check_policy(&action, domain.as_deref()).await?;
+            json(&serde_json::json!({ "rules": rules }))
         }
         PolicyOp::Except {
             breaches,
@@ -4793,7 +4716,6 @@ async fn rule_cmd(m: &Memory, op: PolicyOp) -> Fallible {
             scope,
             expiry,
             justification,
-            domain,
         } => {
             let ask = dm_server::rules::ExceptionRequest {
                 breaches,
@@ -4801,7 +4723,6 @@ async fn rule_cmd(m: &Memory, op: PolicyOp) -> Fallible {
                 scope,
                 expires: expiry,
                 justification,
-                domain,
             };
             json(&m.file_exception(ask).await?)
         }
@@ -4823,47 +4744,14 @@ async fn rule_cmd(m: &Memory, op: PolicyOp) -> Fallible {
 
 /// `amem policy lint`.
 async fn policy_lint(m: &Memory, file: bool) -> Fallible {
-    let p = m.policy();
-    let mut findings = dm_policy::record::lint(p.entries(), time::OffsetDateTime::now_utc());
-    findings.extend(
-        p.refused()
-            .iter()
-            .map(|(id, why)| dm_policy::record::Finding {
-                policy: id.clone(),
-                kind: "module-refused".into(),
-                why: format!("{id}'s module would not load: {why}"),
-            }),
-    );
-    findings.extend(ceiling_and_use(m, &p));
-    let mut filed = Vec::new();
-    if file {
-        let domain = m.resolve_domain(None)?;
-        for f in findings.iter().filter(|f| f.kind != "inert") {
-            let created = m
-                .file_own(dm_ledger::TaskSpec {
-                    domain: domain.clone(),
-                    title: format!("Policy bug, {}: {}", f.kind, f.policy),
-                    body: format!(
-                        "{}\n\nAcross layers the higher wins and the lower is fixed: amend or supersede {} so it agrees, or file an exception with a scope, an expiry and an approver. Within a layer, resolve from the stated intents and record the trade-off.",
-                        f.why, f.policy
-                    ),
-                    requirements: vec!["human".into()],
-                    depends_on: Vec::new(),
-                    origin: Some(format!("policy:{}", f.kind)),
-                    upstream_event: Some(f.policy.clone()),
-                    created_by: String::new(),
-                    classification: dm_core::Label::Internal,
-                    priority: 4,
-                    ..dm_ledger::TaskSpec::default()
-                })
-                .await?;
-            if !created.deduplicated {
-                filed.push(created.task.id);
-            }
-        }
-    }
+    let findings = m.policy_findings();
+    let filed = if file {
+        m.file_policy_findings(&findings).await?
+    } else {
+        Vec::new()
+    };
     json(&serde_json::json!({
-        "findings": findings, "rates": policy_rates(m.root()), "filed": filed,
+        "findings": findings, "rates": m.policy_rates(), "filed": filed,
     }))
 }
 

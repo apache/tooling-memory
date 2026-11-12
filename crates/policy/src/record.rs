@@ -205,6 +205,9 @@ pub struct Entry {
     /// The domain its entry is in; empty for one that came from no record.
     #[serde(default)]
     pub domain: String,
+    /// When its entry was written, where the record says.
+    #[serde(skip)]
+    pub created: Option<time::OffsetDateTime>,
 }
 
 impl Entry {
@@ -237,10 +240,12 @@ impl Entry {
         self.state() == Status::Advisory && self.rego.is_some() && !self.meta.is_exception()
     }
 
-    /// Whether, as an exception, it is in force at `now`: verified, not expired.
+    /// Whether, as an exception, it is in force at `now`: verified, not expired, and
+    /// not retired.
     #[must_use]
     pub fn in_force(&self, now: time::OffsetDateTime) -> bool {
         self.meta.is_exception()
+            && self.meta.status != Some(Status::Retired)
             && self.tier == dm_core::TrustTier::Verified
             && self.meta.expires.as_deref().is_some_and(|e| {
                 time::OffsetDateTime::parse(e, &time::format_description::well_known::Rfc3339)
@@ -274,6 +279,7 @@ pub fn parse(entry_id: &str, tier: dm_core::TrustTier, body: &str) -> Result<Ent
         meta,
         rego: fenced(body, "rego").map(str::to_string),
         domain: String::new(),
+        created: None,
     })
 }
 
@@ -321,9 +327,9 @@ pub struct Finding {
     /// The policy id the finding is about.
     pub policy: String,
     /// What kind: `implements-unknown`, `higher-layer-conflict`, `exception-on-core`,
-    /// `exception-expired`, `inert`, `module-refused`, `no-owner`, `review-due`,
-    /// `held-back`; and from the caller, which has the grants and the decision log,
-    /// `over-ceiling` and `unused`.
+    /// `exception-expired`, `inert`, `module-refused`, `no-owner`, `review-due`; and
+    /// from the caller, which has the grants and the decision log, `over-ceiling` and
+    /// `unused`.
     pub kind: String,
     /// One sentence.
     pub why: String,
@@ -449,21 +455,6 @@ fn lifecycle_findings(e: &Entry, now: time::OffsetDateTime) -> Vec<Finding> {
                 m.review_by.as_deref().unwrap_or_default()
             ),
         });
-    }
-    if let Some(said) = m.status {
-        if said != state {
-            out.push(Finding {
-                policy: m.id.clone(),
-                kind: "held-back".into(),
-                why: format!(
-                    "{} says {} and its entry is {}: it is {} until the entry is reviewed that far",
-                    m.id,
-                    said.as_str(),
-                    e.tier,
-                    state.as_str()
-                ),
-            });
-        }
     }
     out
 }
