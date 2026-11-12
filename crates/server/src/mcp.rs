@@ -1476,7 +1476,10 @@ mod tests {
             .err()
             .map(|e| e.message.to_string())
             .unwrap_or_default();
-        assert!(why.contains("try-1"), "{why}");
+        assert_eq!(
+            why,
+            "the attempt key try-1 was used before, and that attempt is over"
+        );
     }
 
     #[test]

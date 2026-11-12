@@ -1933,6 +1933,7 @@ mod tests {
     on_both! {
         a_claim_asked_twice_under_one_key_is_one_claim,
         a_key_gives_no_task_above_the_caller_s_handling,
+        two_connections_under_one_key_make_one_claim,
         a_completion_asked_twice_under_one_key_is_one_completion,
         of_two_tasks_of_one_priority_the_one_filed_first_is_claimed_first,
         a_lease_that_ran_out_half_a_second_ago_is_lost_to_claim_next,
@@ -2438,6 +2439,8 @@ mod tests {
         // the claim the key made is lost, and its holder claims the task again without
         // the key: a live lease of the same name, at the next generation
         *now.lock().unwrap() = T0 + mins(31);
+        // a lapsed lease alone ends the claim: the key gets nothing, and no new task
+        assert!(is_spent(&next_once(l, "s1", "key-1").await));
         let reclaimed = claim(l, &first.id, "s1", mins(30)).await.unwrap();
         assert_eq!(reclaimed.generation, 2);
         assert!(is_spent(&next_once(l, "s1", "key-1").await));
@@ -2462,6 +2465,38 @@ mod tests {
             "{:?}",
             capped.map(|c| c.map(|c| c.task.id))
         );
+        // nor to a caller that lacks what the task requires
+        let mut needs = spec("Train the model");
+        needs.requirements = vec!["gpu".into()];
+        let needs = admitted(&mut l, needs).await;
+        let gpu = ["gpu".to_string()];
+        let with = l
+            .claim_next_once("dom-a", "s1", mins(30), (&gpu, Label::Restricted), "key-2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(with.task.id, needs.id);
+        assert!(is_spent(&next_once(&mut l, "s1", "key-2").await));
+    }
+
+    /// Two ledgers over the same tables, one caller asking both with one key at the same
+    /// time: one claim, and no second task.
+    async fn two_connections_under_one_key_make_one_claim(b: &Site) {
+        let (mut l1, _) = b.ledger().await;
+        let (mut l2, _) = b.ledger().await;
+        for round in 1..=15 {
+            admitted(&mut l1, spec("One")).await;
+            admitted(&mut l1, spec("Other")).await;
+            let key = format!("key-{round}");
+            let (c1, c2) = tokio::join!(
+                next_once(&mut l1, "s1", &key),
+                next_once(&mut l2, "s1", &key),
+            );
+            let (c1, c2) = (c1.unwrap().unwrap(), c2.unwrap().unwrap());
+            assert_eq!(c1.task.id, c2.task.id, "round {round}");
+            let held = l1.list("dom-a", Status::Claimed).await.unwrap();
+            assert_eq!(held.len(), round, "one claim a round");
+        }
     }
 
     async fn a_completion_asked_twice_under_one_key_is_one_completion(b: &Site) {
