@@ -291,7 +291,7 @@ pub struct Memory {
     /// The task this session holds, when the launcher runs it on one: what it files
     /// from is judged against that task's requirements. Shared by the views of a
     /// session ([`Memory::for_request`]), as every count below that is kept per session.
-    held: Arc<OnceLock<String>>,
+    held: Arc<Mutex<Option<String>>>,
     /// How many entries this session has superseded: the blast-radius gate's count.
     superseded: Arc<AtomicUsize>,
     /// The claims this session made, each task with the generation the ledger gave: the
@@ -315,7 +315,7 @@ pub struct Memory {
     last_stamp: Arc<Mutex<OffsetDateTime>>,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -457,7 +457,7 @@ impl Memory {
             projection: None,
             written: (AtomicUsize::new(0), AtomicUsize::new(0)),
             policy: Arc::new(std::sync::RwLock::new(std::sync::Arc::new(policy))),
-            held: Arc::new(OnceLock::new()),
+            held: Arc::default(),
             superseded: Arc::new(AtomicUsize::new(0)),
             claims: Arc::default(),
             scope: OnceLock::new(),
@@ -567,9 +567,15 @@ impl Memory {
     }
 
     /// The task this session runs on: a launcher sets it before the harness starts,
-    /// so a task the session files is judged against the one it holds.
+    /// so a task the session files is judged against the one it holds. A launcher that
+    /// works one task after another sets it for each: the task held is the latest set.
     pub fn set_held_task(&self, id: &str) {
-        let _ = self.held.set(id.to_string());
+        *lock(&self.held) = Some(id.to_string());
+    }
+
+    /// The task this session runs on, when a launcher set one.
+    pub(crate) fn held_task(&self) -> Option<String> {
+        lock(&self.held).clone()
     }
 
     /// The policy in force: the base, and the record's verified policy entries.
@@ -613,7 +619,7 @@ impl Memory {
     /// deny, with the policy version that produced it, as the paper has decision logs.
     fn decide(&self, input: &Input) -> Result<Decision, Error> {
         let mut input = input.clone();
-        input.held_task = self.held.get().cloned();
+        input.held_task = self.held_task();
         let d = self.policy().decide(&input)?;
         self.log_decision(&input, &d);
         Ok(d)
@@ -641,7 +647,7 @@ impl Memory {
             parent: None,
             write: None,
             promote: None,
-            held_task: self.held.get().cloned(),
+            held_task: self.held_task(),
             spend: Some(dm_policy::decide::SpendInput {
                 destination: destination.to_string(),
                 session_tokens,
@@ -1098,7 +1104,7 @@ impl Memory {
         if !supersedes {
             return TrustTier::Raw;
         }
-        let Some(held) = self.held.get() else {
+        let Some(held) = &self.held_task() else {
             return TrustTier::Raw;
         };
         let curating = self.ledger.lock().await.get(held).await.is_ok_and(|t| {
@@ -2078,8 +2084,8 @@ impl Memory {
             )));
         }
         let mut l = self.ledger.lock().await;
-        let held = match self.held.get() {
-            Some(id) => l.get(id).await.ok(),
+        let held = match self.held_task() {
+            Some(id) => l.get(&id).await.ok(),
             None => None,
         };
         let filing = if held.is_some() {
@@ -2174,10 +2180,16 @@ impl Memory {
         let mut l = self.ledger.lock().await;
         let task = l.get(id).await?;
         self.check_task(&task)?;
-        // the owner is the triage here, and may admit a task that names no definition: the
-        // system's own filings name none. Nobody admits one whose definition is gone
+        // the owner is the triage here, and may admit a task that lacks a definition or
+        // its checks: the system's own filings name none. Nobody else passes that gap,
+        // and nobody admits a task whose definition is gone
         if let Some(gone) = self.definition_gone(&task.spec).await? {
             return Err(Error::Denied(format!("{id} is not admitted: {gone}")));
+        }
+        if self.author != self.grants.owner {
+            if let Some(gap) = self.admission_gap(&task.spec) {
+                return Err(Error::Denied(format!("{id} is not admitted: {gap}")));
+            }
         }
         let admitted = l.admit(id).await?;
         self.rank_edges(&mut l, &admitted).await?;
@@ -2226,10 +2238,7 @@ impl Memory {
         parent: Option<&Task>,
     ) -> Result<Task, Error> {
         // a task nobody can check stays proposed, whatever the policy says of its filer
-        if task.status != dm_ledger::Status::Proposed
-            || self.admission_gap(&task.spec).is_some()
-            || self.definition_gone(&task.spec).await?.is_some()
-        {
+        if task.status != dm_ledger::Status::Proposed || self.admission_gap(&task.spec).is_some() {
             return Ok(task);
         }
         let d = self.decide(&Input {
@@ -2317,9 +2326,10 @@ impl Memory {
         }
         let mut children = Vec::new();
         for (title, body, hash) in asked {
-            let created = l
-                .create(self.child_of(&parent, &title, &body, hash))
-                .await?;
+            // bound as any filing is: the child requires the tools its definition declares
+            let mut spec = self.child_of(&parent, &title, &body, hash);
+            self.bind_definition(&mut spec).await?;
+            let created = l.create(spec).await?;
             // the ledger dedups on the parent and the hash whatever the task's status: a
             // task it hands back is not this call's, and one this session may not read
             // is withheld, never handed out
@@ -2598,22 +2608,27 @@ impl Memory {
                 ));
             }
         }
-        let created = l
-            .create(TaskSpec {
-                domain: root.spec.domain.clone(),
-                title: root.spec.title.clone(),
-                body,
-                requirements: root.spec.requirements.clone(),
-                depends_on: Vec::new(),
-                origin: Some(format!("retries:{}", root.id)),
-                upstream_event: None,
-                created_by: self.author.clone(),
-                classification,
-                priority: root.spec.priority,
-                definition: root.spec.definition.clone(),
-                acceptance: root.spec.acceptance.clone(),
-            })
-            .await?;
+        let mut spec = TaskSpec {
+            domain: root.spec.domain.clone(),
+            title: root.spec.title.clone(),
+            body,
+            requirements: root.spec.requirements.clone(),
+            origin: Some(format!("retries:{}", root.id)),
+            created_by: self.author.clone(),
+            classification,
+            priority: root.spec.priority,
+            // the definition by its name: a retry runs under the one in force now, which
+            // may be a later entry than the one the first attempt named
+            definition: root
+                .spec
+                .definition
+                .as_deref()
+                .map(|d| platform::definition_name(d).to_string()),
+            acceptance: root.spec.acceptance.clone(),
+            ..TaskSpec::default()
+        };
+        self.bind_definition(&mut spec).await?;
+        let created = l.create(spec).await?;
         let retry = self
             .admit_per_policy(&mut l, created.task, Filing::Held, Some(&root))
             .await?;
@@ -8663,7 +8678,7 @@ mod tests {
         assert!(err.to_string().contains("blast radius"), "{err}");
         agent.set_held_task("task-me-held");
         assert_eq!(
-            second.held.get().map(String::as_str),
+            second.held_task().as_deref(),
             Some("task-me-held"),
             "the held task is the session's, shared with its views"
         );

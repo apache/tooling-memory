@@ -664,8 +664,14 @@ require_definition = true
 Then triage does not admit a task with no definition, or with no acceptance checks. The
 task stays `proposed`, and `create_task` gives the reason in `not_admitted_because`. The
 owner can still admit such a task with `amem task admit`, because the tasks that the
-system files name no definition. Nobody can admit a task whose definition is no longer
-in force.
+system files name no definition. No other session can. Nobody can admit a task whose
+definition is no longer in force.
+
+When the entry of a definition is replaced, demoted or erased, the tasks that named it
+keep that entry. Their holders can call no tool, and a session that holds one cannot file
+a task under it. To continue the work, verify a new entry for the name, invalidate the
+task, and file it again with `amem task retry`. The retry runs under the definition that
+is then in force.
 
 Not built yet: the autonomy level has no effect, no suite gates a version of a
 definition, and the data scope is not enforced. An erasure of the entry of a definition

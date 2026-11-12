@@ -338,12 +338,12 @@ impl Memory {
     /// The domain this session's records go to: the domain of the task it holds, else
     /// the only granted one; none when there is neither.
     pub(crate) async fn recording_domain(&self) -> Option<String> {
-        match self.held.get() {
+        match self.held_task() {
             Some(id) => self
                 .ledger
                 .lock()
                 .await
-                .get(id)
+                .get(&id)
                 .await
                 .ok()
                 .map(|t| t.spec.domain),
