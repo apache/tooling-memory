@@ -243,14 +243,18 @@ pub struct Decision {
     pub reason: String,
     /// The record's policies this decision rests on: those that refused it, or the
     /// exceptions it used.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "as_texts")]
     pub cites: Vec<String>,
     /// The digest of the policy text that decided.
     #[serde(default)]
     pub policy: String,
     /// Each rule that refused, with what a caller needs to act on the refusal: the
     /// rule, why, a reason code, and what would pass.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "as_denials",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub denials: Vec<Denial>,
     /// What the advisory rules would have refused, had they been enforced. They refuse
     /// nothing: this is how a rule is watched before it is given teeth.
@@ -291,6 +295,35 @@ fn text_of(v: serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// A denial out of whatever a module put in its `deny` set: an object's fields, or
+/// for anything else its JSON as the reason.
+fn denial_of(v: serde_json::Value) -> Denial {
+    match v {
+        serde_json::Value::Object(_) => serde_json::from_value(v).unwrap_or_else(|e| Denial {
+            policy: String::new(),
+            reason: e.to_string(),
+            code: None,
+            remedy: None,
+        }),
+        other => Denial {
+            policy: String::new(),
+            reason: text_of(other),
+            code: None,
+            remedy: None,
+        },
+    }
+}
+
+fn as_denials<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Denial>, D::Error> {
+    let list = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(list.into_iter().map(denial_of).collect())
+}
+
+fn as_texts<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let list = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(list.into_iter().map(text_of).collect())
 }
 
 fn as_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -400,9 +433,10 @@ pub struct Policy {
     refused: Vec<(String, String)>,
     /// The entries of the rules the ceiling holds at advisory.
     held_back: Vec<String>,
-    /// The base with the modules of the advisory rules alone, when there are any. What
-    /// they deny is reported and never joins the decision.
-    watch: Option<regorus::Engine>,
+    /// One engine for each advisory rule: the base with that rule's module alone. What
+    /// it denies is reported and never joins the decision, and a module that fails
+    /// takes no other rule's report with it.
+    watch: Vec<(String, regorus::Engine)>,
 }
 
 impl std::fmt::Debug for Policy {
@@ -480,8 +514,8 @@ impl Policy {
         // an advisory rule's module is evaluated with every decision, in an engine of
         // its own: what it denies is reported, and whatever rule it names it cannot
         // refuse
-        let mut watch = self.engine.clone();
-        let mut watched = false;
+        let base = self.engine.clone();
+        let mut watch = Vec::new();
         for e in entries.iter().filter(|e| e.enforced() || e.advisory()) {
             let Some(rego) = &e.rego else { continue };
             if !crate::record::module_is_confined(rego) {
@@ -491,19 +525,21 @@ impl Policy {
             }
             let name = format!("{}.rego", e.entry_id);
             let mut trial = if advisory(e) {
-                watch.clone()
+                base.clone()
             } else {
                 self.engine.clone()
             };
+            // the version says which modules are loaded and what each one does: the
+            // same module refuses as an enforced rule and reports as an advisory one
+            let how = if advisory(e) { "advisory" } else { "enforced" };
             match trial.add_policy(name, rego.clone()) {
-                Ok(_) if advisory(e) => {
-                    watch = trial;
-                    watched = true;
-                    texts.push_str(rego);
-                }
                 Ok(_) => {
-                    self.engine = trial;
-                    texts.push_str(rego);
+                    texts.push_str(&format!("\n# {} {how}\n{rego}", e.meta.id));
+                    if advisory(e) {
+                        watch.push((e.meta.id.clone(), trial));
+                    } else {
+                        self.engine = trial;
+                    }
                 }
                 Err(err) => self.refused.push((e.meta.id.clone(), err.to_string())),
             }
@@ -532,11 +568,10 @@ impl Policy {
             "grants": grants, "policies": policies, "exceptions": exceptions,
         });
         self.engine = Policy::with_data(self.engine, &data)?;
-        self.watch = if watched {
-            Some(Policy::with_data(watch, &data)?)
-        } else {
-            None
-        };
+        self.watch = watch
+            .into_iter()
+            .map(|(id, engine)| Ok((id, Policy::with_data(engine, &data)?)))
+            .collect::<Result<_, Error>>()?;
         self.version = digest(&texts);
         self.entries = entries;
         self.held_back = over;
@@ -569,41 +604,47 @@ impl Policy {
         ids
     }
 
-    /// What the advisory rules deny for a request. An advisory module that fails to
-    /// evaluate reports that, and changes no decision.
+    /// What the advisory rules deny for a request, each module asked on its own. A
+    /// module that fails to evaluate reports that under its rule, and changes no
+    /// decision and no other rule's report. A denial that names no rule is its
+    /// module's rule's.
     fn advisories(&self, input: &Input) -> Vec<Denial> {
-        let Some(watch) = &self.watch else {
+        let Ok(input) = serde_json::to_string(input) else {
             return Vec::new();
         };
-        let failed = |why: String| {
-            vec![Denial {
-                policy: String::new(),
-                reason: format!("an advisory module did not evaluate: {why}"),
-                code: Some("advisory-failed".into()),
-                remedy: None,
-            }]
-        };
-        let mut engine = watch.clone();
-        let value = match serde_json::to_string(input)
-            .map_err(|e| e.to_string())
-            .and_then(|j| regorus::Value::from_json_str(&j).map_err(|e| e.to_string()))
-        {
-            Ok(v) => v,
-            Err(why) => return failed(why),
-        };
-        engine.set_input(value);
-        let said = engine
-            .eval_rule("data.amem.rules.deny".to_string())
-            .map_err(|e| e.to_string())
-            .and_then(|v| v.to_json_str().map_err(|e| e.to_string()))
-            .and_then(|j| serde_json::from_str::<Vec<Denial>>(&j).map_err(|e| e.to_string()));
-        match said {
-            Ok(mut list) => {
-                list.sort_by(|a, b| (&a.policy, &a.reason).cmp(&(&b.policy, &b.reason)));
-                list
+        let mut out = Vec::new();
+        for (id, watch) in &self.watch {
+            let mut engine = watch.clone();
+            let said = regorus::Value::from_json_str(&input)
+                .map_err(|e| e.to_string())
+                .and_then(|value| {
+                    engine.set_input(value);
+                    engine
+                        .eval_rule("data.amem.rules.deny".to_string())
+                        .map_err(|e| e.to_string())
+                })
+                .and_then(|v| v.to_json_str().map_err(|e| e.to_string()))
+                .and_then(|j| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(&j).map_err(|e| e.to_string())
+                });
+            match said {
+                Ok(list) => out.extend(list.into_iter().map(|v| {
+                    let mut d = denial_of(v);
+                    if d.policy.is_empty() {
+                        d.policy.clone_from(id);
+                    }
+                    d
+                })),
+                Err(why) => out.push(Denial {
+                    policy: id.clone(),
+                    reason: format!("the advisory module did not evaluate: {why}"),
+                    code: Some("advisory-failed".into()),
+                    remedy: None,
+                }),
             }
-            Err(why) => failed(why),
         }
+        out.sort_by(|a, b| (&a.policy, &a.reason).cmp(&(&b.policy, &b.reason)));
+        out
     }
 
     fn with_data(
@@ -652,7 +693,7 @@ impl Policy {
             entries: Vec::new(),
             refused: Vec::new(),
             held_back: Vec::new(),
-            watch: None,
+            watch: Vec::new(),
         })
     }
 
@@ -1271,6 +1312,57 @@ mod tests {
         );
         let d = supersede_decision(&with(&g, vec![watch]), None);
         assert!(d.allow && d.advisories.len() == 1, "{d:?}");
+        // a denial whose rule is not a string, and one that is no object at all
+        for said in [
+            "{\"policy\": {\"a\": 1}, \"reason\": 3}",
+            "\"x\"",
+            "7",
+            "[1, 2]",
+        ] {
+            let module = format!("deny contains {said} if true");
+            let d = supersede_decision(
+                &with(&g, vec![rule_with("pol-L2-061", "enforced", &module)]),
+                None,
+            );
+            assert!(!d.allow, "{said}: {d:?}");
+            assert_eq!(d.denials.len(), 1, "{said}: {d:?}");
+        }
+    }
+
+    /// Each advisory module is asked on its own: one that fails, or that has no
+    /// `deny`, reports that and takes no other rule's report with it.
+    #[test]
+    fn a_bad_advisory_module_takes_no_other_report_with_it() {
+        let g = grants();
+        let good = rule_with(
+            "pol-L2-070",
+            "advisory",
+            "deny contains {\"policy\": \"pol-L2-070\", \"reason\": \"always\"} if true",
+        );
+        for bad in ["deny contains \"x\" if true", "deny := 5", "allow := true"] {
+            let p = with(
+                &g,
+                vec![good.clone(), rule_with("pol-L2-071", "advisory", bad)],
+            );
+            let d = supersede_decision(&p, None);
+            assert!(d.allow, "{bad}: {d:?}");
+            assert!(
+                d.advisories
+                    .iter()
+                    .any(|a| a.policy == "pol-L2-070" && a.reason == "always"),
+                "{bad}: {d:?}"
+            );
+            assert!(
+                d.advisories.iter().any(|a| a.policy == "pol-L2-071"),
+                "{bad}: {d:?}"
+            );
+        }
+        // the version says what each module does
+        let module = "deny contains {\"reason\": \"always\"} if true";
+        let advisory = with(&g, vec![rule_with("pol-L2-072", "advisory", module)]);
+        let enforced = with(&g, vec![rule_with("pol-L2-072", "enforced", module)]);
+        assert_ne!(advisory.version(), enforced.version());
+        assert_ne!(advisory.version(), Policy::builtin(&g).unwrap().version());
     }
 
     /// An exception whose block says retired is in force for nothing.
