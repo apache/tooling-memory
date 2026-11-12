@@ -1117,6 +1117,13 @@ enum TaskOp {
         depends_on: Vec<String>,
         #[arg(long, default_value_t = 0)]
         priority: i64,
+        /// The task definition this kind of work runs under, by name.
+        #[arg(long)]
+        definition: Option<String>,
+        /// A check that says this task is done; repeat for more. Without one, the task
+        /// takes those of its definition.
+        #[arg(long = "accept")]
+        acceptance: Vec<String>,
     },
     /// Admit a proposed task.
     Admit { id: String },
@@ -4715,6 +4722,7 @@ async fn policy_lint(m: &Memory, file: bool) -> Fallible {
                     created_by: String::new(),
                     classification: dm_core::Label::Internal,
                     priority: 4,
+                    ..dm_ledger::TaskSpec::default()
                 })
                 .await?;
             if !created.deduplicated {
@@ -4909,6 +4917,8 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
             requirements,
             depends_on,
             priority,
+            definition,
+            acceptance,
         } => {
             let c = m
                 .create_task(TaskSpec {
@@ -4922,6 +4932,8 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
                     created_by: String::new(),
                     classification: Label::Public,
                     priority,
+                    definition,
+                    acceptance,
                 })
                 .await?;
             json(&c.task)

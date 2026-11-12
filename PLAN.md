@@ -62,6 +62,15 @@ One package is one branch and one pull request. A package that adds a mechanism 
 | 14 | The surface of Appendix A | 5, 7 | Appendix A | `get` by anchor and by version, with `related` and its weights; `search` with filters and snippets; `recall` with `context_tokens` and `answer_kind`; `approve`, `erase`, `export` and `declassify` as memory tools | Act 1 |
 | 15 | Long timescales | 2, 7 | §7 Keeping strategy in touch with the world; §9 outage; §12; Appendix E Recovery | The identity form `human:<authority>,<date>:<id>`; an ownership registry that flags a domain without an owner; personal domains; recovery bundles with a claim epoch, and a restore drill; work from T0 during an outage; a scheduled task that gathers evidence for the horizon scanner, who is a person | Act 10: a restore drill |
 
+Landed so far:
+
+| # | Pull request | What is still open in the package |
+|---|---|---|
+| 0 | #69 | Nothing |
+| 1 | #71 | Nothing |
+| 2 | #73 | An attempt key on every operation; an uncertain external effect blocking reassignment; waiting on an outside event as a state; the record's remaining fields (`parent`, `scores`, `implements`, `reversibility`, `artifacts_touched`, `policy_context`) |
+| 3 | the pull request after #73 | A suite that gates a version of a definition; the data scope enforced; a definition required by default, once the system's own filings name one; tools offered a few at boot and the rest by search |
+
 What stays unbuilt after these, and stays on README's list: federation across domains, authentication of people, logprob-based drift, and accelerator time, which only a gateway can count. So do the items on that list that need another machine or an outside service more than they need code: the limits on re-enactment, harness settings and decomposition templates in the platform domain, bytes stored and resource limits on the sandbox, the authoring of agent definitions, the search tool against its live provider, a harness under Seatbelt on a Mac, and the Gofannon bridge against a live deployment, whose agents make model calls that the egress does not meter.
 
 ## Toward the production shape

@@ -15,6 +15,7 @@ dm-store = { version = "0.1.0", path = "../store" }
 rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0.151"
+toml = "1.1.6"
 thiserror.workspace = true
 time = { version = "0.3.55", features = ["formatting", "serde-well-known", "macros"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-std", "fs"] }

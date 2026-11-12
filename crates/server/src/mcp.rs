@@ -334,6 +334,13 @@ pub struct CreateTaskParams {
     /// Higher is claimed first. Default 0.
     #[serde(default)]
     pub priority: Option<i64>,
+    /// The task definition this kind of work runs under, by name. The task takes the
+    /// definition's acceptance criteria and requires the tools it declares.
+    #[serde(default)]
+    pub definition: Option<String>,
+    /// Checks that say this task is done, in place of its definition's.
+    #[serde(default)]
+    pub acceptance: Vec<String>,
 }
 
 /// Parameters that name a task.
@@ -833,9 +840,19 @@ impl McpServer {
             created_by: String::new(),
             classification: dm_core::Label::Public,
             priority: p.priority.unwrap_or(0),
+            definition: p.definition,
+            acceptance: p.acceptance,
         };
         let c = self.memory.create_task(spec).await.map_err(mcp_err)?;
-        ok(json!({ "task": c.task, "deduplicated": c.deduplicated }))
+        // what a task that stays proposed lacks goes back to whoever filed it
+        let gap = (c.task.status == dm_ledger::Status::Proposed)
+            .then(|| self.memory.admission_gap(&c.task.spec))
+            .flatten();
+        ok(json!({
+            "task": c.task,
+            "deduplicated": c.deduplicated,
+            "not_admitted_because": gap,
+        }))
     }
 
     #[tool(
@@ -1365,6 +1382,29 @@ mod tests {
         id
     }
 
+    /// What a task that stays proposed lacks goes back to whoever filed it.
+    #[tokio::test]
+    async fn create_task_says_why_a_task_was_not_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let path = dir.path().join(crate::GRANTS_FILE);
+        let mut g = dm_policy::Grants::load(&path).unwrap();
+        g.gates.require_definition = true;
+        std::fs::write(&path, g.render().unwrap()).unwrap();
+        let s = McpServer::new(Arc::new(Memory::open(dir.path()).unwrap()));
+        let filed = payload(
+            &s.create_task(Parameters(CreateTaskParams {
+                title: "Tidy".into(),
+                body: "Do it.".into(),
+                ..CreateTaskParams::default()
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(filed["task"]["status"], "proposed");
+        assert_eq!(filed["not_admitted_because"], "it names no task definition");
+    }
+
     #[test]
     fn write_refuses_a_parameter_it_does_not_have() {
         let old =
@@ -1612,6 +1652,7 @@ mod tests {
                     created_by: String::new(),
                     classification,
                     priority: 0,
+                    ..dm_ledger::TaskSpec::default()
                 })
                 .await
                 .unwrap()
@@ -1673,6 +1714,7 @@ mod tests {
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
                 priority: 0,
+                ..dm_ledger::TaskSpec::default()
             })
             .await
             .unwrap()

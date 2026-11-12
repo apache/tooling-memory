@@ -980,6 +980,7 @@ async fn file_task(State(app): State<App>, Json(req): Json<FileTask>) -> Respons
         created_by: String::new(),
         classification: dm_core::Label::Public,
         priority: req.priority.unwrap_or(0),
+        ..dm_ledger::TaskSpec::default()
     };
     match m.create_task(spec).await {
         Ok(c) => Json(json!({ "task": c.task, "deduplicated": c.deduplicated })).into_response(),
@@ -2010,6 +2011,7 @@ mod tests {
                     created_by: String::new(),
                     classification,
                     priority: 0,
+                    ..dm_ledger::TaskSpec::default()
                 })
                 .await
                 .unwrap()
@@ -2076,6 +2078,7 @@ mod tests {
                 created_by: String::new(),
                 classification: dm_core::Label::Restricted,
                 priority: 0,
+                ..dm_ledger::TaskSpec::default()
             })
             .await
             .unwrap()

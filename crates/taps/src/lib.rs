@@ -216,6 +216,7 @@ impl Host for State {
                 .get(&self.domain)
                 .map_or(dm_core::Label::Public, |d| d.default_classification),
             priority: t.priority,
+            ..dm_ledger::TaskSpec::default()
         };
         Ok(match self.memory.create_task(spec).await {
             Ok(c) => Ok(Filed {

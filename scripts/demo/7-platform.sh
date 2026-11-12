@@ -58,6 +58,23 @@ if gateway; then
   fi
 fi
 
+say "A task definition" "A kind of work is a record in the platform domain too: what it is for, the tools it may use, and the checks that say it is done. A task names its definition, takes its checks and requires its tools. A definition an agent proposed is not in force until a person verifies it, and a task cannot name one that is not in force."
+tdef=$(agent agent:architect write "$(python3 - <<'PY'
+import json
+block = "```platform task answer-from-record\npurpose = \"Answer a question from the record, with the entries it rests on.\"\ntools = []\nscope = [\"dom-demo\"]\nacceptance = [\"The handoff names each entry the answer rests on.\"]\noutputs = [\"handoff\"]\n```\n"
+print(json.dumps({"title": "How a question is answered from the record", "domain": "dom-platform",
+                  "entry_type": "convention", "body": "# Answer from the record\n\n" + block}))
+PY
+)" | j "d['id']")
+echo "  proposed by agent:architect, not verified; a task that names it:"
+a task create "Which decision set the lease length?" --domain dom-demo --definition answer-from-record 2>&1 | sed 's/^/    /' || true
+t=$(agent agent:architect promote "{\"id\": \"$tdef\", \"to\": \"verified\", \"why\": \"the checks say what an answer must show\"}" | j "d['task']['id']")
+a approve "$t" >/dev/null
+echo "  verified by you; the same task now:"
+defined=$(a task create "Which decision set the lease length?" --domain dom-demo --definition answer-from-record)
+echo "$defined" | j "f\"    {d['id']} runs under {d['definition']}; done when: {d['acceptance'][0]}\""
+a task invalidate "$(echo "$defined" | j "d['id']")" --reason "obsolete: shown" >/dev/null
+
 say "The suite" "The recall suite, loaded from the platform rather than a file: each question asked as written, stripped, and by its keywords, scored through the pack with no model."
 a golden --platform recall 2>/dev/null | sed 's/^/  /'
 

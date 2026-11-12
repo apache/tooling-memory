@@ -169,6 +169,7 @@ pub async fn file(
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
                 priority: 10,
+                ..dm_ledger::TaskSpec::default()
             })
             .await?;
         if !created.deduplicated {

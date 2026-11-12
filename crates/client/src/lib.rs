@@ -590,6 +590,7 @@ mod tests {
             created_by: "human:test:me".into(),
             priority: 0,
             classification: Default::default(),
+            ..dm_ledger::TaskSpec::default()
         }
     }
 

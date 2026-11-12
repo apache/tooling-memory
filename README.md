@@ -108,14 +108,17 @@ two weeks. It is also the reason that none of it is the production shape.
   - accelerator time, which only the gateway can count
   - bytes stored
   - CPU or memory limits on the sandbox
-- **The task record, in part.** A claim has no generation. The ledger accepts a caller
-  when the caller's name is the name of the holder and the lease of the task has not
-  expired. It checks nothing else, and two sessions of one harness have the same name. A task has no `blocked` state: the ledger computes a block when a session
-  claims. The ledger does not record a refused claim. An uncertain external effect does
-  not stop a new claim.
-- **Task definitions and autonomy levels.** A task does not name a task definition, and
-  triage admits a task without one. A session gets its tools from the grants file, not
-  from a definition. There is no autonomy level, no held-out suite and no evaluator.
+- **The task record, in part.** A claim has a generation, and the ledger refuses a
+  holder that gives an earlier one. A task can be `blocked` on a task that it depends on.
+  These parts are not built: an attempt key for each operation, a block on a new claim
+  while an external effect is uncertain, and a `blocked` state for a task that waits on an
+  outside event. The generation does not prove who the caller is.
+- **Task definitions, in part, and autonomy levels.** A task can name a task definition.
+  It then takes the checks of the definition, and its holder can call only the tools that
+  the definition declares. Triage requires a definition only when the grants say so,
+  because the tasks that the system files name none. No suite gates a version of a
+  definition, and the data scope is not enforced. The autonomy level has no effect, and
+  there is no held-out suite and no evaluator.
 - **Positions.** There is no `position` entry, and a task cannot be pinned.
 - **Approval events.** An approval is the completion of a promotion task. It has no
   scope and no expiry, and the perimeter does not check it when an action runs. There is

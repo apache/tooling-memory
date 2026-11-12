@@ -610,6 +610,73 @@ invalidation does.
 Not built yet: an attempt key for each operation, a block on a new claim while an external
 effect is uncertain, and a `blocked` state for a task that waits on an outside event.
 
+## Task definitions: `platform task`
+
+A task definition is the record for one kind of work. It is an artifact in the platform
+domain, in a fenced block with the info string `platform task <name>`. The block is TOML:
+
+```toml
+purpose = "Answer a question from the record, with the entries it rests on."
+tools = ["tool:fetch"]
+scope = ["dom-demo"]
+acceptance = ["The handoff names each entry the answer rests on."]
+outputs = ["handoff"]
+autonomy = "person"
+```
+
+A definition is in force when its entry is active and a person verified it. When two
+such entries define one name, the newer entry is in force. The version of a definition is
+the id of its entry. An entry never changes, so a task that names a version names one
+text.
+
+A task names a definition with `amem task create --definition <name>`, or with
+`definition` in the memory tool `create_task`. Then:
+
+- The task records the definition with its version, for example
+  `answer-from-record@mem-platform-7k2q9x4b`.
+- The task gets the classification of the entry of the definition, if that is higher.
+- The task takes the acceptance checks of the definition, if it gives none. Give checks
+  for one task with `--accept`.
+- The task requires the tools that the definition declares. Thus only a session that has
+  those tools can claim it.
+- A session that holds the task can call only the tools that the definition declares.
+  The memory server refuses a different tool. It uses the definition that the task
+  named. If that entry is replaced, demoted or erased, the session can call no tool.
+- A task that a session files while it holds the task gets the same definition and
+  checks. This applies to a subagent task, its continuation and a retry.
+
+A tool has the form `tool:<name>`, where the name is the name of a tap that the grants
+give as a tool, for example `tool:fetch` and `tool:search`. A session can claim a task
+that requires a tool when the grants give it that tool.
+- `amem work` puts the definition and the checks in the prompt, below "Done when".
+
+A task cannot name a definition that is not in force. The memory server refuses it, and
+files nothing. It gives the same refusal for a definition that the session cannot read.
+
+By default, triage also admits a task that names no definition. The tasks that the
+system files for itself name none yet. To require a definition, set this in `grants.toml`:
+
+```toml
+[gates]
+require_definition = true
+```
+
+Then triage does not admit a task with no definition, or with no acceptance checks. The
+task stays `proposed`, and `create_task` gives the reason in `not_admitted_because`. The
+owner can still admit such a task with `amem task admit`, because the tasks that the
+system files name no definition. No other session can. Nobody can admit a task whose
+definition is no longer in force.
+
+When the entry of a definition is replaced, demoted or erased, the tasks that named it
+keep that entry. Their holders can call no tool, and a session that holds one cannot file
+a task under it. To continue the work, verify a new entry for the name, invalidate the
+task, and file it again with `amem task retry`. The retry runs under the definition that
+is then in force.
+
+Not built yet: the autonomy level has no effect, no suite gates a version of a
+definition, and the data scope is not enforced. An erasure of the entry of a definition
+does not remove the checks that tasks took from it.
+
 ## The task fabric: `amem task rescore` and `stats`
 
 An L1 policy entry can carry the rubric that it compiles into, as a `[rubric]` table in
