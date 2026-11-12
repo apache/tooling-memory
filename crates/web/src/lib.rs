@@ -1050,6 +1050,16 @@ async fn complete_task(
         )
             .into_response();
     }
+    if h.generation.is_some_and(|g| g != task.generation) {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "{id} is at generation {}; this page shows the claim of an earlier one",
+                task.generation
+            ),
+        )
+            .into_response();
+    }
     let written = m
         .write(dm_server::WriteRequest {
             domain: Some(task.spec.domain.clone()),
@@ -2266,8 +2276,13 @@ mod tests {
             Some(r#"{"handoff":"From a page that shows an earlier claim.","generation":7}"#),
         )
         .await;
-        assert_ne!(status, 200, "{body}");
+        assert_eq!(status, 409, "{body}");
         assert!(body.contains("generation"), "{body}");
+        let (_, listed) = get_json(addr, "/api/entries").await;
+        assert!(
+            !listed.to_string().contains("Handoff:"),
+            "a refused completion wrote a handoff: {listed}"
+        );
         let (status, body) = http(
             addr,
             "POST",

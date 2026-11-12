@@ -585,8 +585,7 @@ transaction, so a new claim cannot arrive between the two.
 
 - The memory server of a session remembers the generation of each claim that the session
   made. The memory tools `heartbeat`, `complete` and `release` use it, so an agent does
-  not have to give it. A session that made a claim on a task acts only under that claim.
-  If it gives a different generation, the memory server refuses it.
+  not have to give it. An agent can give it with `generation`.
 - A command has no session. `amem task heartbeat`, `complete` and `release` need
   `--generation`. `amem task claim-next` prints the task, and its `generation` is the
   generation of the claim.

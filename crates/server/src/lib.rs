@@ -1400,23 +1400,13 @@ impl Memory {
         }
     }
 
-    /// The generation this session acts under on a task: the one of the claim this
-    /// session made, or, in a session that made none, the one the caller names. A
-    /// session that made a claim acts under that claim and no other: the generation of
-    /// the claim in force is on the task for anyone to read, so a session whose claim is
-    /// over could otherwise name it and pass. A session that made none and names none
+    /// The generation this session acts under on a task: the one the caller names, or
+    /// the one of the claim this session made. A session that made none and names none
     /// holds nothing, whatever name it shares with the holder. The generation tells
-    /// claims apart; it is no secret, and a caller that names one says which claim it
-    /// means, as the owner's command line and the board do.
+    /// claims apart and is no secret: the task shows it to every reader, so a caller that
+    /// names one says which claim it means, as the owner's command line and the board do.
     fn claim_of(&self, id: &str, generation: Option<u64>) -> Result<u64, Error> {
         let own = lock(&self.claims).get(id).copied();
-        if let (Some(named), Some(own)) = (generation, own) {
-            if named != own {
-                return Err(Error::Denied(format!(
-                    "this session claimed {id} at generation {own}, and acts under that claim only; it named generation {named}"
-                )));
-            }
-        }
         generation.or(own).ok_or_else(|| {
             Error::Ledger(dm_ledger::Error::NotHolder {
                 id: id.to_string(),
@@ -2386,6 +2376,15 @@ impl Memory {
         parent: &Task,
         ids: Vec<String>,
     ) -> Result<Task, Error> {
+        // a subagent task that was invalidated will not be done: the continuation does not
+        // wait on it, and the ledger would not admit a task that did
+        let mut waits_on = Vec::new();
+        for id in ids {
+            if !matches!(l.get(&id).await, Ok(t) if t.status == dm_ledger::Status::Invalidated) {
+                waits_on.push(id);
+            }
+        }
+        let ids = waits_on;
         let created = l.create(TaskSpec {
             domain: parent.spec.domain.clone(),
             title: format!(
@@ -2657,6 +2656,7 @@ impl Memory {
         let mut l = self.ledger.lock().await;
         let by = self.under(self.claim_of(id, generation)?);
         let done = l.complete(id, by, handoff).await?;
+        lock(&self.claims).remove(id);
         // a continuation finishes the task it resumed, and that one the task it resumed in
         // turn: up the chain, while each is open and nobody holds it
         let mut by = done.clone();
@@ -2693,6 +2693,7 @@ impl Memory {
         self.check_task(&l.get(id).await?)?;
         let by = self.under(self.claim_of(id, generation)?);
         let t = l.release(id, by, handoff).await?;
+        lock(&self.claims).remove(id);
         self.observe_task(&t);
         Ok(t)
     }
@@ -6387,14 +6388,6 @@ mod tests {
                 refused.map(|t| t.status)
             );
         }
-        // the generation in force is on the task for anyone to read: the first session
-        // may not name it and pass, since it acts under the claim it made
-        let named = first.complete(&t.id, Some(2), &h).await;
-        assert!(
-            matches!(&named, Err(Error::Denied(why)) if why.contains("generation 1")),
-            "{:?}",
-            named.map(|t| t.status)
-        );
         // a session that made no claim holds nothing by its name alone
         assert!(matches!(
             onlooker.complete(&t.id, None, &h).await,

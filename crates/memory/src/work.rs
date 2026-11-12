@@ -576,14 +576,21 @@ async fn late_handoffs_of(client: &MemoryClient, task: &str) -> String {
     else {
         return p;
     };
-    for late in record["late_handoffs"].as_array().into_iter().flatten() {
+    // the newest few, each cut as a dependency's handoff is: an earlier holder can leave
+    // one after another while the task is open
+    let late: Vec<_> = record["late_handoffs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    for late in late.iter().rev().take(3).rev() {
         let Some(h) = late["handoff"].as_str() else {
             continue;
         };
         if let Ok(e) = client.get(h).await {
             p.push_str(&format!(
                 "\n# What an earlier holder left after its claim ({h})\n\n{}\n",
-                e.body.trim()
+                tail_of(&e.body, 4000)
             ));
         }
     }

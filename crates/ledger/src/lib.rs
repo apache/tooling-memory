@@ -963,8 +963,8 @@ impl Ledger {
         let now = self.now();
         let until = now + lease;
         let claimed = on_backend!(&mut self.backend, db => db.claim(id, now, holder, until, manifest, handling));
-        if let Err(Error::WrongState { status, .. }) = &claimed {
-            self.record_refusal(id, holder, *status, now).await?;
+        if matches!(claimed, Err(Error::WrongState { .. })) {
+            self.record_refusal(id, holder, now).await?;
         }
         claimed?;
         self.trace("claimed", id).await;
@@ -977,23 +977,32 @@ impl Ledger {
     }
 
     /// A claim that lost is part of the task's record, while the task can still be
-    /// claimed by someone: once per holder and reason in a row, so asking again and again
-    /// adds nothing.
+    /// claimed by someone. The reason names the claim it lost to, so the same holder
+    /// refused twice under one claim is on the record once, and again under the next.
     async fn record_refusal(
         &mut self,
         id: &str,
         holder: &str,
-        status: Status,
         now: OffsetDateTime,
     ) -> Result<(), Error> {
-        if status.is_terminal() {
+        let task = self.get(id).await?;
+        if task.status.is_terminal() {
             return Ok(());
         }
-        let why = match status {
-            Status::Claimed => "another holder's lease was live".to_string(),
-            Status::Proposed => "the task was not admitted".to_string(),
-            // open or blocked, and still not this session's to take
-            _ => "the session did not meet its requirements or its handling, or a task it depends on was not done".to_string(),
+        let lease_live = task.lease_until.is_some_and(|t| t >= now);
+        let why = if task.status == Status::Claimed && lease_live {
+            format!(
+                "the lease of the claim of generation {} was live",
+                task.generation
+            )
+        } else if task.status == Status::Proposed {
+            "the task was not admitted".to_string()
+        } else {
+            // claimable by someone, and still not this session's to take
+            format!(
+                "after the claim of generation {}, the session did not meet the task's requirements or its handling, or a task it depends on was not done",
+                task.generation
+            )
         };
         let last = self.refused_claims(id).await?.pop();
         if last.as_ref() == Some(&(holder.to_string(), why.clone())) {
@@ -1254,11 +1263,12 @@ impl Ledger {
         self.get(id).await
     }
 
-    /// `id` was invalidated: each task blocked on it goes back to triage. A task that is
-    /// open has no dependency that is not done, and one that is held is its holder's.
+    /// `id` was invalidated: each task that waits on it goes back to triage. That is a
+    /// blocked task, and an open one too: a ledger from before tasks were blocked holds
+    /// its waiting tasks as open. A task that is held is its holder's.
     async fn retriage_dependents(&mut self, id: &str) -> Result<(), Error> {
         for t in self.dependents(id).await? {
-            if t.status == Status::Blocked {
+            if matches!(t.status, Status::Blocked | Status::Open) {
                 let because = id.to_string();
                 self.append(&t.id, &Event::Retriaged { because }).await?;
             }
@@ -1728,6 +1738,9 @@ mod tests {
         a_refused_claim_is_recorded_once_and_not_on_a_closed_task,
         an_erasure_takes_a_late_handoff_too,
         a_task_is_not_admitted_onto_an_invalidated_dependency,
+        an_open_task_of_an_older_ledger_is_retriaged_with_its_dependency,
+        an_erasure_that_invalidates_a_task_sends_back_what_it_blocked,
+        a_projection_with_a_state_name_of_an_older_ledger_is_rebuilt_at_open,
         a_claim_made_since_fences_the_holder_of_an_earlier_one_whatever_its_name,
         a_handoff_is_left_after_a_claim_only_by_who_held_it,
         a_refused_claim_of_a_named_task_is_on_its_record,
@@ -2008,10 +2021,23 @@ mod tests {
         }
         let refused = l.refused_claims(&t.id).await.unwrap();
         assert_eq!(refused.len(), 1, "{refused:?}");
-        assert_eq!(refused[0].1, "another holder's lease was live");
-        l.complete(&t.id, held("s1", 1), "mem-a-h").await.unwrap();
-        assert!(is_wrong_state(&claim(&mut l, &t.id, "s3", mins(30)).await));
-        assert_eq!(l.refused_claims(&t.id).await.unwrap().len(), 1);
+        assert_eq!(
+            refused[0].1,
+            "the lease of the claim of generation 1 was live"
+        );
+        refused_again_under_the_next_claim(&mut l, &t.id).await;
+    }
+
+    async fn refused_again_under_the_next_claim(l: &mut Ledger, id: &str) {
+        // under the next claim, the same holder refused again is on the record again
+        l.release(id, held("s1", 1), None).await.unwrap();
+        claim(l, id, "s3", mins(30)).await.unwrap();
+        assert!(is_wrong_state(&claim(l, id, "s2", mins(30)).await));
+        let refused = l.refused_claims(id).await.unwrap();
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        l.complete(id, held("s3", 2), "mem-a-h").await.unwrap();
+        assert!(is_wrong_state(&claim(l, id, "s4", mins(30)).await));
+        assert_eq!(l.refused_claims(id).await.unwrap().len(), 2);
     }
 
     async fn an_erasure_takes_a_late_handoff_too(b: &Site) {
@@ -2043,20 +2069,65 @@ mod tests {
         assert_eq!(l.get(&rests.id).await.unwrap().status, Status::Proposed);
     }
 
-    /// A ledger file whose rows have the state names of before `open` and `done`.
-    #[tokio::test]
-    async fn on_sqlite_a_projection_with_state_names_of_an_older_ledger_is_rebuilt_at_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ledger.db");
+    /// A ledger from before tasks were blocked admitted a waiting task as open.
+    async fn an_open_task_of_an_older_ledger_is_retriaged_with_its_dependency(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let gone = admitted(&mut l, spec("Will be dropped")).await;
+        let rests = l
+            .create(in_domain("dom-a", "Rests on it", &[&gone]))
+            .await
+            .unwrap()
+            .task;
+        l.append(&rests.id, &Event::Admitted).await.unwrap();
+        assert_eq!(l.get(&rests.id).await.unwrap().status, Status::Open);
+        l.invalidate(&gone.id, "obsolete", None).await.unwrap();
+        assert_eq!(l.get(&rests.id).await.unwrap().status, Status::Proposed);
+    }
+
+    async fn an_erasure_that_invalidates_a_task_sends_back_what_it_blocked(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let erased = admitted(&mut l, task_quoting_the_secret("promote:mem-a-1", "v1")).await;
+        let rests = admitted(&mut l, in_domain("dom-a", "Rests on it", &[&erased])).await;
+        assert_eq!(rests.status, Status::Blocked);
+        l.scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+            .await
+            .unwrap();
+        assert_eq!(l.get(&erased.id).await.unwrap().status, Status::Invalidated);
+        assert_eq!(l.get(&rests.id).await.unwrap().status, Status::Proposed);
+    }
+
+    /// Every task row's state set to a name this code does not have.
+    async fn make_stale(b: &Site) {
+        match b {
+            Site::Sqlite(dir) => {
+                rusqlite::Connection::open(dir.path().join("ledger.db"))
+                    .unwrap()
+                    .execute("UPDATE tasks SET status = 'admitted'", [])
+                    .unwrap();
+            }
+            Site::Postgres(server) => {
+                let c = pg_client(server).await;
+                let schemas = c
+                    .query("SELECT schema FROM public.ledger_domains", &[])
+                    .await
+                    .unwrap();
+                for row in schemas {
+                    let s: String = row.get(0);
+                    c.execute(&format!("UPDATE {s}.tasks SET status = 'admitted'"), &[])
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    async fn a_projection_with_a_state_name_of_an_older_ledger_is_rebuilt_at_open(b: &Site) {
         let id = {
-            let mut l = Ledger::open(&file).unwrap();
+            let mut l = b.open().await;
             admitted(&mut l, spec("Old")).await.id
         };
-        rusqlite::Connection::open(&file)
-            .unwrap()
-            .execute("UPDATE tasks SET status = 'admitted'", [])
-            .unwrap();
-        let l = Ledger::open(&file).unwrap();
+        make_stale(b).await;
+        let l = b.open().await;
         let open = l.list("dom-a", Status::Open).await.unwrap();
         assert_eq!(
             open.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
@@ -2201,7 +2272,7 @@ mod tests {
             refused,
             [(
                 "s2".to_string(),
-                "another holder's lease was live".to_string()
+                "the lease of the claim of generation 1 was live".to_string()
             )]
         );
         let held_still = l.get(&t.id).await.unwrap();
