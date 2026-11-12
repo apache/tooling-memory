@@ -4,8 +4,9 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, Error, Event, Held, PromotionRecord, PromotionSpec,
-    RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
+    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
+    PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -224,6 +225,25 @@ impl Db {
         })
     }
 
+    /// The handoff a task was completed with under an attempt key, if it was.
+    pub(crate) fn completed_under(&self, task: &str, key: &str) -> Result<Option<String>, Error> {
+        let payload: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT payload FROM events
+                 WHERE task_id = ?1 AND kind = 'completed'
+                   AND json_extract(payload, '$.attempt') = ?2
+                 ORDER BY seq LIMIT 1",
+                params![task, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match payload.map(|p| Event::parse(task, &p)).transpose()? {
+            Some(Event::Completed { handoff, .. }) => Some(handoff),
+            _ => None,
+        })
+    }
+
     /// The payloads of a task's events of one kind, oldest first.
     pub(crate) fn payloads_of(&self, id: &str, kind: &str) -> Result<Vec<String>, Error> {
         let conn = self.conn();
@@ -369,13 +389,35 @@ impl Db {
         &mut self,
         domain: &str,
         now: OffsetDateTime,
-        holder: &str,
+        who: Claimant<'_>,
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Option<Taken>, Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // the claim this key made in this domain, looked for in the transaction that
+        // would claim, so two callers with one key make one claim
+        if let Some(key) = who.attempt {
+            let before: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT e.task_id, e.payload FROM events e
+                     JOIN tasks t ON t.id = e.task_id
+                     WHERE t.domain = ?1 AND e.kind = 'claimed'
+                       AND json_extract(e.payload, '$.attempt') = ?2
+                     ORDER BY e.seq LIMIT 1",
+                    params![domain, key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((id, payload)) = before {
+                let generation = match Event::parse(&id, &payload)? {
+                    Event::Claimed { generation, .. } => generation,
+                    _ => 0,
+                };
+                return Ok(Some(Taken::Again { id, generation }));
+            }
+        }
         let candidates: Vec<Task> = {
             let mut stmt = tx.prepare(&format!(
                 // every task that may be claimable. Whether a claimed one's lease has run
@@ -401,12 +443,14 @@ impl Db {
                 &task.id,
                 now,
                 &Event::Claimed {
-                    holder: holder.to_string(),
+                    holder: who.holder.to_string(),
                     until,
+                    generation: task.generation + 1,
+                    attempt: who.attempt.map(str::to_string),
                 },
             )?;
             tx.commit()?;
-            return Ok(Some(task.id));
+            return Ok(Some(Taken::New(task.id)));
         }
         Ok(None)
     }
@@ -415,7 +459,7 @@ impl Db {
         &mut self,
         id: &str,
         now: OffsetDateTime,
-        holder: &str,
+        who: Claimant<'_>,
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
@@ -438,8 +482,10 @@ impl Db {
             id,
             now,
             &Event::Claimed {
-                holder: holder.to_string(),
+                holder: who.holder.to_string(),
                 until,
+                generation: task.generation + 1,
+                attempt: who.attempt.map(str::to_string),
             },
         )?;
         tx.commit()?;
@@ -853,7 +899,7 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         | Event::Retriaged { .. }
         | Event::ClaimRefused { .. }
         | Event::LateHandoff { .. } => project_waiting(conn, id, event)?,
-        Event::Claimed { holder, until } => {
+        Event::Claimed { holder, until, .. } => {
             conn.execute(
                 "UPDATE tasks SET status = 'claimed', holder = ?2, lease_until = ?3,
                     attempts = attempts + 1 WHERE id = ?1",
@@ -879,7 +925,7 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
                 params![id, handoff],
             )?;
         }
-        Event::Completed { handoff } => {
+        Event::Completed { handoff, .. } => {
             conn.execute(
                 "UPDATE tasks SET status = 'done', handoff = ?2, lease_until = NULL
                  WHERE id = ?1",
