@@ -488,14 +488,22 @@ impl Policy {
     /// A policy file that cannot be read.
     pub fn root_text(root: &Path) -> Result<Option<String>, Error> {
         let dir = root.join("policy");
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .map(|d| {
-                d.filter_map(Result::ok)
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|x| x == "rego"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // no directory is no policy of the root's own; one that cannot be read is an
+        // error, since the built-in policy may allow what the root's would not
+        let mut files: Vec<_> = match std::fs::read_dir(&dir) {
+            Ok(d) => d
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "rego"))
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(Error::Io {
+                    path: dir.display().to_string(),
+                    source: e,
+                })
+            }
+        };
         if files.is_empty() {
             return Ok(None);
         }

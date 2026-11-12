@@ -1781,6 +1781,10 @@ mod tests {
         assert_eq!(invalid.code, also.code);
         assert_eq!(invalid.code, ledger.code);
         assert_ne!(invalid.code, internal.code);
+        // a stopped session is told so in words it can act on, as a refusal is
+        let stopped = mcp_err(Error::Stale("the grants changed".into()));
+        assert_eq!(stopped.code, invalid.code);
+        assert!(stopped.message.contains("stopped: the grants changed"));
         assert_eq!(t0_uri("dom-a"), "memory://t0/dom-a");
     }
 

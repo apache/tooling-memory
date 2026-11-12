@@ -144,7 +144,9 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Access freshness, in part.** Any change to the grants file stops each open session,
   not only a session that the change affects. The files that a session rendered before
   the change stay on disk. A harness that a stopped session started continues to run,
-  and each of its memory calls is refused. A grant has no expiry of its own.
+  and each of its memory calls and model calls is refused. A read that waits does not
+  check again before it gives its answer. Some commands of the owner do not do the
+  check. A grant has no expiry of its own.
 - **The improvement loop.** The only gate on a platform artifact is that a person
   verifies it. There is no performance gate, no safety gate, and no check that a change
   adds no permission.

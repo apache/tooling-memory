@@ -521,6 +521,8 @@ impl App {
         }
         match open_board(&self.config.root) {
             Ok(new) => {
+                // the tasks the board held are still the owner's to complete
+                new.adopt_claims(&now);
                 let new = Arc::new(new);
                 *self
                     .memory
@@ -946,7 +948,7 @@ async fn board() -> Html<&'static str> {
 fn task_error(e: &dm_server::Error) -> Response {
     let status = match e {
         dm_server::Error::NotFound(_) => StatusCode::NOT_FOUND,
-        dm_server::Error::Denied(_) => StatusCode::FORBIDDEN,
+        dm_server::Error::Denied(_) | dm_server::Error::Stale(_) => StatusCode::FORBIDDEN,
         dm_server::Error::Ledger(_) => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };

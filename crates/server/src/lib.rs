@@ -587,8 +587,10 @@ impl Memory {
             .read_scope(&input)?
             .narrow(&self.grants.read_filter());
         {
+            // from the grants each time, so a filter that widens again widens the
+            // session's handling with it
             let mut s = lock(&self.session);
-            s.handling = s.handling.min(f.handling);
+            s.handling = self.grants.session().handling.min(f.handling);
         }
         self.log_decision(
             &input,
@@ -657,7 +659,9 @@ impl Memory {
     /// Compile the policy from the record as it is now, through an index handle of its
     /// own: the caller may hold this session's.
     fn load_policy_again(&self) -> Result<(), Error> {
-        let index = Index::open(&self.root.join(INDEX_FILE))?;
+        let index = Index::open_reader(&self.root.join(INDEX_FILE))?;
+        // an index that cannot be read shows no rules, which is not the same as none
+        index.list(&self.grants.read_filter(), Some(EntryType::Policy), 1)?;
         let entries = policy_entries(&index, &self.root, &self.grants);
         let p = Policy::load(&self.root, &self.grants)?.with_record(
             &self.grants,
@@ -848,6 +852,14 @@ impl Memory {
         // the read scope is the principal's; a new author is asked afresh
         self.scope = Mutex::new(None);
         self
+    }
+
+    /// Take over the claims another session of the same holder made: for a session
+    /// opened in the place of one that stopped, so the tasks it held are still its own
+    /// to complete or release.
+    pub fn adopt_claims(&self, from: &Memory) {
+        let theirs = lock(&from.claims).clone();
+        lock(&self.claims).extend(theirs);
     }
 
     /// The capabilities this session's manifest carries, matched against task
@@ -1181,7 +1193,11 @@ impl Memory {
             body: req.body,
         };
         check_write_size(entry.render().len())?;
-        self.gate(&entry).await?;
+        let replaced = self.gate(&entry).await?;
+        // a policy entry written, or one replaced by an entry of any kind, changes what
+        // is in force
+        let policy_changed = entry.front.entry_type == EntryType::Policy
+            || replaced.is_some_and(|old| old.front.entry_type == EntryType::Policy);
         self.put_logged(&entry).await?;
         self.index_put(&entry).await?;
         if let Some(old) = &entry.front.supersedes {
@@ -1199,7 +1215,7 @@ impl Memory {
             entry.front.supersedes.as_deref(),
         );
         self.refresh_projection().await;
-        if entry.front.entry_type == EntryType::Policy {
+        if policy_changed {
             self.reload_policy().await?;
         }
         self.written.0.fetch_add(1, Ordering::Relaxed);
@@ -1962,6 +1978,9 @@ impl Memory {
             self.put_logged(&entry).await?;
             self.index_put(&entry).await?;
             self.refresh_projection().await;
+            if entry.front.entry_type == EntryType::Policy || entry.front.supersedes.is_some() {
+                self.reload_policy().await?;
+            }
             Some(Written {
                 id: entry.front.id.clone(),
                 classification: entry.front.classification,
@@ -3451,6 +3470,7 @@ impl Memory {
         src: &Path,
         into_domain: Option<&str>,
     ) -> Result<bundle::Imported, Error> {
+        self.fresh()?;
         let domain = self.resolve_domain(into_domain)?;
         let default = self
             .grants
@@ -3491,6 +3511,8 @@ impl Memory {
             .await?;
         self.restore_promotions(&imported.promotions).await?;
         self.refresh_projection().await;
+        // an import can land a rule or an exception, or replace one
+        self.reload_policy().await?;
         Ok(imported)
     }
 
@@ -4047,6 +4069,90 @@ mod tests {
         assert!(is_stale(&agent.search("backoff", None, 10).await));
         std::fs::remove_dir_all(dir.path().join("policy")).unwrap();
         assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 2);
+        // the session's handling widened with the filter: the entry is read by id again
+        agent.get(&internal).await.unwrap();
+    }
+
+    /// A root's policy directory that cannot be read is no reason to fall back to the
+    /// built-in policy: the session is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_root_policy_that_cannot_be_read_refuses_the_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        owner.write(req("Backoff is exponential.\n")).await.unwrap();
+        let policy = dir.path().join("policy");
+        std::fs::create_dir_all(&policy).unwrap();
+        std::fs::write(policy.join("local.rego"), narrowed_policy()).unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert!(agent.search("backoff", None, 10).await.unwrap().is_empty());
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // a process that reads every directory whatever its mode cannot show this
+        let blind = std::fs::read_dir(&policy).is_err();
+        let after = agent.search("backoff", None, 10).await;
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if blind {
+            assert!(is_stale(&after), "{:?}", after.map(|h| h.len()));
+        }
+    }
+
+    /// A stopped session imports nothing. An import, and an entry of any kind that
+    /// replaces a rule, change what is in force for the sessions that are open.
+    #[tokio::test]
+    async fn an_import_and_a_replaced_rule_reach_the_open_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        let rule = policy_entry(&owner, &rule_text("pol-L2-071", 2, "")).await;
+        verify(&owner, &curator, &rule).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let supersede = |of: &str| WriteRequest {
+            entry_type: EntryType::Decision,
+            supersedes: Some(of.to_string()),
+            ..req("Use something else on a laptop.\n")
+        };
+        assert!(
+            agent.write(supersede(&d1)).await.is_err(),
+            "the rule refuses"
+        );
+        // the owner replaces the rule with a note, which is no policy entry
+        let stamp = || std::fs::read_to_string(dir.path().join(POLICY_STAMP_FILE)).unwrap();
+        let before = stamp();
+        let owner = Memory::open(dir.path()).unwrap();
+        owner
+            .write(WriteRequest {
+                supersedes: Some(rule.clone()),
+                ..req("The rule is withdrawn.\n")
+            })
+            .await
+            .unwrap();
+        assert_ne!(stamp(), before, "the stamp says the policy changed");
+        agent.write(supersede(&d1)).await.unwrap();
+        // an import stamps too, and a stopped session imports nothing
+        let bundle = dir.path().join("out");
+        owner.export(None, Label::Internal, &bundle).await.unwrap();
+        let before = stamp();
+        owner.import(&bundle, None).await.unwrap();
+        assert_ne!(stamp(), before);
+        let grants = dir.path().join(GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(
+            &grants,
+            format!("{text}\n[spend.gateway]\nsession_tokens = 4\n"),
+        )
+        .unwrap();
+        assert!(is_stale(&owner.import(&bundle, None).await));
     }
 
     #[tokio::test]

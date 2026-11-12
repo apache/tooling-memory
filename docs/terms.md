@@ -50,7 +50,7 @@ term here in the same commit as the first document that needs it.
 | grant | One table in the grants: `[domains.<name>]`, `[destinations.<name>]` or `[taps.<name>]` | permission |
 | policy | The Rego rules that decide each action: write, read, erase, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
 | perimeter | The policy, the grants and the parts that enforce them, as one part of the design | |
-| stopped (session) | A session whose grants changed after it started. Each call of the session is refused, and a new session starts under the grants as they are | revoked session, stale session |
+| stopped (session) | A session whose grants changed after it started. Each read, decision, tool call and model call of the session is refused, and a new session starts under the grants as they are | revoked session, stale session |
 | policy stamp | `state/policy.stamp` and the digest of the root's `policy/*.rego`: what a session compares to know that the policy changed | |
 | rule | One policy entry in the record: an id, a layer, the rule, its intent, an owner and, where a machine can check it, a module | |
 | status (of a rule) | Where a rule is in its life: `proposed` (in no decision), `advisory` (reports, refuses nothing), `enforced` (refuses) or `retired` | state (of a rule) |

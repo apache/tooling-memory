@@ -640,15 +640,18 @@ at the full decision log, not at one review period.
 
 ## Access freshness
 
-A session is valid only while its authority is what the session started with. Before
-each read, each decision and each spend check, `amem` does these checks:
+A session is valid only while its authority is what the session started with. `amem`
+does these checks before each read through the read filter, each decision, each spend
+check, each call of a hosted tool, each import, and each request through the egress:
 
 - **The grants.** `amem` reads `grants.toml` and compares its digest with the digest
   from the start of the session. If the file changed, the session stops: each call
   gives `stopped: the grants changed after this session started`. A new session starts
   under the grants as they are. If the file has its first text again, the session is
   valid again. If `amem` cannot read the file, it refuses the call.
-- **The policy.** `state/policy.stamp` changes when a session changes a policy entry.
+- **The policy.** `state/policy.stamp` changes when a session writes, promotes or erases
+  a policy entry, replaces a policy entry with an entry of any type, imports a bundle,
+  or resets the rules.
   The stamp also includes the digest of the root's `policy/*.rego`. When the stamp is
   not the stamp that the session loaded, the session loads the policy again. The read
   filter of the session has the version of the policy that computed it, and `amem`
@@ -667,6 +670,13 @@ under the grants as they are.
 
 `amem` does not look for which grant changed: any change to `grants.toml` stops each
 open session of that record.
+
+The check is before the read. A read that waits, for example on the index, does not
+check again before it gives its answer. Only `recall` with a deputy does.
+
+Some commands of the owner and of the launcher do not do the check: for example
+`amem transcript`, `amem tape`, `amem source`, `amem quarantine`, `amem taint`,
+`amem policy lint` and `amem policy reset`. No memory tool is in this group.
 
 ## The states of a task, and its claim: `amem task`
 

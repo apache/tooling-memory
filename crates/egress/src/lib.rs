@@ -399,6 +399,10 @@ impl Egress {
         body: Bytes,
     ) -> Result<Relayed, Error> {
         let inner = &self.inner;
+        inner
+            .memory
+            .fresh()
+            .map_err(|e| Error::Refused(e.to_string()))?;
         let dest = inner
             .tools
             .get(tool)
@@ -834,13 +838,23 @@ fn over_budget(inner: &Inner, destination: &str) -> Option<String> {
         .telemetry
         .spent(destination, None, Some(day_ago))
         .unwrap_or(0);
+    // a check that cannot be made is a refusal: a session that has stopped, or a
+    // policy that does not evaluate, sends nothing
     match inner.memory.check_spend(destination, session, day) {
         Ok(d) if !d.allow => Some(d.reason),
-        _ => None,
+        Ok(_) => None,
+        Err(e) => Some(e.to_string()),
     }
 }
 
 fn admit(inner: &Inner, destination: &str) -> Result<Destination, Box<Response>> {
+    if let Err(e) = inner.memory.fresh() {
+        return Err(Box::new(error_json(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &e.to_string(),
+        )));
+    }
     let Some(dest) = inner.destinations.get(destination) else {
         return Err(Box::new(error_json(
             StatusCode::NOT_FOUND,
@@ -1033,6 +1047,9 @@ async fn tunnel_for(
             message,
         ))
     };
+    if let Err(e) = inner.memory.fresh() {
+        return Err(refuse(&e.to_string()));
+    }
     let Some((host, port)) = host_and_port(authority) else {
         return Err(Box::new(error_json(
             StatusCode::BAD_REQUEST,
@@ -1881,6 +1898,56 @@ mod tests {
             e.call("nowhere", "v1/x", &serde_json::json!({})).await,
             Err(Error::Refused(_))
         ));
+    }
+
+    /// A session whose grants changed has stopped: no model call of it leaves, by the
+    /// library or by the router.
+    #[tokio::test]
+    async fn a_stopped_session_sends_no_model_call() {
+        let fake = Router::new().route(
+            "/v1/chat/completions",
+            any(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":4,"completion_tokens":2}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("m");
+        Memory::init(&root, "human:test:me", "dom-me").unwrap();
+        let m = Arc::new(Memory::open(&root).unwrap().with_author("agent:a"));
+        let mut d = HashMap::new();
+        d.insert(
+            "openai".to_string(),
+            Destination::forward(format!("http://{addr}"), Auth::PassThrough),
+        );
+        let e = Egress::new(m, d, &dir.path().join("t.db")).unwrap();
+        let ask = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        let grants = root.join("grants.toml");
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("{text}\n# the owner changed the grants\n")).unwrap();
+        assert!(e.call("openai", "v1/chat/completions", &ask).await.is_err());
+        let r = e
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(ask.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let said = String::from_utf8_lossy(&body);
+        assert!(said.contains("stopped"), "{said}");
     }
 
     #[tokio::test]
