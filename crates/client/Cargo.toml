@@ -7,7 +7,7 @@ repository.workspace = true
 description = "A typed MCP client for the memory server: the ledger and the record as the launcher and an orchestrator use them"
 
 [dependencies]
-rmcp = { version = "3.5.0", features = ["client", "transport-async-rw"] }
+rmcp = { version = "3.9.0", features = ["client", "transport-async-rw"] }
 serde_json = "1.0.151"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "io-util", "macros"] }
