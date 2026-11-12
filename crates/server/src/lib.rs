@@ -1827,8 +1827,9 @@ impl Memory {
     #[must_use]
     pub fn taint(&self, id: &str) -> Taint {
         // times are compared as times: as text, `…00.12Z` sorts after `…00.123Z`, and a
-        // write a thousandth of a second after a read would not follow from it. A line
-        // whose time does not read is left out
+        // write a thousandth of a second after a read would not follow from it. A read
+        // whose time does not read still names its reader, and counts as the earliest
+        // there is, so nothing that session wrote is left out
         let when = |at: &str| {
             OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
         };
@@ -1836,7 +1837,7 @@ impl Memory {
         let mut first_read: std::collections::BTreeMap<String, OffsetDateTime> =
             std::collections::BTreeMap::new();
         for r in &reads {
-            let Some(read_at) = when(&r.at) else { continue };
+            let read_at = when(&r.at).unwrap_or(OffsetDateTime::UNIX_EPOCH);
             if r.ids.iter().any(|i| i == id) {
                 first_read
                     .entry(r.session.clone())
@@ -3306,6 +3307,14 @@ mod tests {
         let t = m.taint("mem-me-read");
         assert_eq!(t.readers, ["s1"]);
         assert_eq!(t.written, ["mem-me-after"]);
+        // a read whose time does not read is still a read: its session is a reader, and
+        // what it wrote is not known to be from before
+        let unread =
+            r#"{"at":"","session":"s2","tool":"get","hits":1,"tokens":1,"ids":["mem-me-read"]}"#;
+        std::fs::write(reads::path(dir.path()), format!("{read}\n{unread}\n")).unwrap();
+        let t = m.taint("mem-me-read");
+        assert_eq!(t.readers, ["s1", "s2"]);
+        assert_eq!(t.written, ["mem-me-after", "mem-me-other"]);
     }
 
     #[tokio::test]
