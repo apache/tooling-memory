@@ -938,9 +938,10 @@ async fn tasks(State(app): State<App>) -> Response {
     let mut all = Vec::new();
     for status in [
         Status::Claimed,
-        Status::Admitted,
+        Status::Open,
+        Status::Blocked,
         Status::Proposed,
-        Status::Completed,
+        Status::Done,
         Status::Invalidated,
     ] {
         match m.tasks(Some(&domain), status).await {
@@ -1016,6 +1017,10 @@ async fn claim_task(State(app): State<App>, Path(id): Path<String>) -> Response 
 struct Handoff {
     #[serde(default)]
     handoff: String,
+    /// The generation of the claim the page shows: a page that shows an earlier claim
+    /// is refused by it. Without one, the claim this server made is the one meant.
+    #[serde(default)]
+    generation: Option<u64>,
 }
 
 /// Complete a task the person holds: the handoff text becomes a handoff entry, and the
@@ -1045,6 +1050,16 @@ async fn complete_task(
         )
             .into_response();
     }
+    if h.generation.is_some_and(|g| g != task.generation) {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "{id} is at generation {}; this page shows the claim of an earlier one",
+                task.generation
+            ),
+        )
+            .into_response();
+    }
     let written = m
         .write(dm_server::WriteRequest {
             domain: Some(task.spec.domain.clone()),
@@ -1058,7 +1073,7 @@ async fn complete_task(
         Ok(w) => w,
         Err(e) => return task_error(&e),
     };
-    match m.complete(&id, &written.id).await {
+    match m.complete(&id, h.generation, &written.id).await {
         Ok(t) => Json(json!({ "task": t, "handoff": written.id })).into_response(),
         Err(e) => task_error(&e),
     }
@@ -1972,9 +1987,12 @@ mod tests {
         let root = dir.path().join("memory");
         let owner = Memory::init(&root, "human:test:me", "dom-me").unwrap();
         let mut hidden = String::new();
+        let mut filed: Vec<String> = Vec::new();
         for (title, classification) in [
             ("Rotate the signing key", dm_core::Label::Restricted),
             ("Tidy the docs", dm_core::Label::Public),
+            // waits on the one before it, so the ledger holds it as blocked
+            ("Publish the docs", dm_core::Label::Public),
         ] {
             let t = owner
                 .file_own(dm_ledger::TaskSpec {
@@ -1982,7 +2000,11 @@ mod tests {
                     title: title.into(),
                     body: "Do it.".into(),
                     requirements: vec!["human".into()],
-                    depends_on: vec![],
+                    depends_on: if title == "Publish the docs" {
+                        filed.last().cloned().into_iter().collect()
+                    } else {
+                        vec![]
+                    },
                     origin: None,
                     upstream_event: None,
                     created_by: String::new(),
@@ -1995,6 +2017,7 @@ mod tests {
             if t.status == dm_ledger::Status::Proposed {
                 owner.admit(&t.id).await.unwrap();
             }
+            filed.push(t.id.clone());
             if classification == dm_core::Label::Restricted {
                 hidden = t.id;
             }
@@ -2015,6 +2038,10 @@ mod tests {
         let (_, all) = get_json(addr, "/api/tasks").await;
         let all = all.to_string();
         assert!(all.contains("Tidy the docs"), "{all}");
+        assert!(
+            all.contains("Publish the docs") && all.contains(r#""status":"blocked""#),
+            "a blocked task is on the board: {all}"
+        );
         assert!(!all.contains("signing key"), "{all}");
         for path in ["tree", "claim"] {
             let method = if path == "tree" { "GET" } else { "POST" };
@@ -2241,16 +2268,31 @@ mod tests {
         )
         .await;
         assert_eq!(status, 400, "a handoff needs a body");
+        // a page that shows a claim other than the one in force is refused by it
         let (status, body) = http(
             addr,
             "POST",
             &format!("/api/tasks/{id}/complete"),
-            Some(r#"{"handoff":"Signed off; ship it."}"#),
+            Some(r#"{"handoff":"From a page that shows an earlier claim.","generation":7}"#),
+        )
+        .await;
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("generation"), "{body}");
+        let (_, listed) = get_json(addr, "/api/entries").await;
+        assert!(
+            !listed.to_string().contains("Handoff:"),
+            "a refused completion wrote a handoff: {listed}"
+        );
+        let (status, body) = http(
+            addr,
+            "POST",
+            &format!("/api/tasks/{id}/complete"),
+            Some(r#"{"handoff":"Signed off; ship it.","generation":1}"#),
         )
         .await;
         assert_eq!(status, 200, "{body}");
         let done: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(done["task"]["status"], "completed");
+        assert_eq!(done["task"]["status"], "done");
         assert!(done["handoff"].as_str().unwrap().starts_with("mem-"));
         let (status, tree) = get_json(addr, &format!("/api/tasks/{id}/tree")).await;
         assert_eq!(status, 200);

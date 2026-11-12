@@ -326,7 +326,7 @@ async fn metrics_of(
     let mut completed = std::collections::BTreeSet::new();
     for d in memory.domains() {
         let done = memory
-            .tasks(Some(&d), dm_ledger::Status::Completed)
+            .tasks(Some(&d), dm_ledger::Status::Done)
             .await
             .unwrap_or_default();
         completed.extend(done.into_iter().filter_map(|t| t.handoff));

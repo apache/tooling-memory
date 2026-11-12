@@ -368,13 +368,7 @@ async fn one(
     };
     let output = output.map(|o| answer_of(session, o));
     let now = client.get_task(&task.id).await?;
-    file_outbox(
-        session,
-        client,
-        now.status == "completed",
-        Some(&task.domain),
-    )
-    .await?;
+    file_outbox(session, client, now.status == "done", Some(&task.domain)).await?;
     let output = output.unwrap_or_default();
     if !output.trim().is_empty() {
         crate::stops::answer(&output);
@@ -428,7 +422,7 @@ async fn settle(
 ) -> Fallible<i32> {
     let now = client.get_task(&task.id).await?;
     match now.status.as_str() {
-        "completed" => {
+        "done" => {
             eprintln!(
                 "amem: {} completed, handoff {}",
                 task.id,
@@ -572,6 +566,37 @@ const OPENING: &str =
      so before each decision that changes something, choosing between entries, writing, \
      completing or releasing, say in one plain sentence why.";
 
+/// What holders whose claims were over still left for whoever holds the task next, as
+/// a part of the prompt: empty when nobody left anything.
+async fn late_handoffs_of(client: &MemoryClient, task: &str) -> String {
+    let mut p = String::new();
+    let Ok(record) = client
+        .call("get_task", serde_json::json!({ "id": task }))
+        .await
+    else {
+        return p;
+    };
+    // the newest few, each cut as a dependency's handoff is: an earlier holder can leave
+    // one after another while the task is open
+    let late: Vec<_> = record["late_handoffs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    for late in late.iter().rev().take(3).rev() {
+        let Some(h) = late["handoff"].as_str() else {
+            continue;
+        };
+        if let Ok(e) = client.get(h).await {
+            p.push_str(&format!(
+                "\n# What an earlier holder left after its claim ({h})\n\n{}\n",
+                tail_of(&e.body, 4000)
+            ));
+        }
+    }
+    p
+}
+
 async fn prompt_for(
     client: &MemoryClient,
     task: &Task,
@@ -596,6 +621,7 @@ async fn prompt_for(
             ));
         }
     }
+    p.push_str(&late_handoffs_of(client, &task.id).await);
     if !task.depends_on.is_empty() {
         p.push_str("\n# What the tasks this one depends on left behind\n");
         p.push_str(

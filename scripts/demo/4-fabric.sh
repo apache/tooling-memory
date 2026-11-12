@@ -35,7 +35,25 @@ ranked=$(a task create "Cut the release" --domain dom-demo --priority 8 --after 
 plain=$(a task create "Tidy the README" --domain dom-demo --priority 1 --body "Small." | j "d['id']")
 for t in "$blocker" "$ranked" "$plain"; do a task admit "$t" >/dev/null; done
 echo "  admitted: the blocker rose above what it blocks, a move along the ledger's edge, not a worker's"
-a task list --status admitted | j "'\n'.join(f\"  {t['priority']:>3}  {t['title']:<24} {'(blocks Cut the release)' if t['id'] == '$blocker' else ''}\" for t in (d if isinstance(d, list) else d.get('tasks', [])) if t['id'] in ('$blocker', '$ranked', '$plain'))"
+for st in open blocked; do
+  a task list --status $st | j "'\n'.join(f\"  {t['priority']:>3}  {t['status']:<8} {t['title']:<24} {'(blocks Cut the release)' if t['id'] == '$blocker' else ''}\" for t in (d if isinstance(d, list) else d.get('tasks', [])) if t['id'] in ('$blocker', '$ranked', '$plain'))"
+done
+echo "  Cut the release is blocked, not open: no session can claim it until the fixtures are done"
+
+say "A claim has a generation" "Every claim of a task gets the next generation, and what a holder does under a claim carries it. A holder whose lease ran out is refused by its generation, even when the session that took the task has the same name. What it learned still reaches the next holder, as a handoff left after its claim."
+fenced=$(a task create "Check the mirror list" --domain dom-demo --priority 50 --body "One claim is lost, and one more is made." | j "d['id']")
+a task admit "$fenced" >/dev/null
+first=$(a task claim-next --domain dom-demo --lease-seconds 1 | j "d['generation']")
+sleep 2
+second=$(a task claim-next --domain dom-demo --lease-seconds 600 | j "d['generation']")
+echo "  claimed at generation $first with a lease of one second; the lease ran out, and the same name claimed it at generation $second"
+note=$(a write --kind handoff --domain dom-demo --title "Handoff: the mirror list, first pass" --body "Two mirrors answered; the third timed out. Start with the third." | j "d['id']")
+echo "  the first holder completes, under generation $first:"
+a task complete "$fenced" "$note" --generation "$first" 2>&1 | sed 's/^/    /' || true
+a task late-handoff "$fenced" "$note" --generation "$first" >/dev/null
+echo "  refused. Its handoff is left on the task for the holder now: late-handoff, generation $first"
+a task release "$fenced" --generation "$second" >/dev/null
+a task invalidate "$fenced" --reason "obsolete: shown" >/dev/null
 say "The rescore" "Each cycle the queue is ranked again; every move is a ledger event with its reason, and curation's share of the work is held to its floor."
 a task rescore | j "f\"  rubric {d['rubric']}; curation's share of the completed work {d['maintenance_share']:.0%} against a floor of {d['floor']:.0%}\n\" + '\n'.join(f\"  {c['from']:>3} -> {c['to']:<3} {c['title']:<40} {c['why']}\" for c in d['changed'])"
 
@@ -46,17 +64,17 @@ if [ -n "${HARNESS:-}" ]; then
   ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" $MODEL_ARG --lease-seconds 900 --task "$parent" 2>&1 | grep -E '^amem: (claimed|task|board|filed)' ) || true
   tree() {
     a task tree "$parent" | j "'\n'.join(f\"  {c['id']}  {(c.get('origin') or '').split(':')[0]:<10} {c['status']:<11} {c['title']}\" for c in d.get('children', []))"
-    a task get "$parent" | j "f\"  {d['id']}  original   {d['status']:<11} {d['title']}\" + ('  (waits on its continuation)' if d['status'] == 'admitted' else '  (closed by its continuation, with its handoff)' if d['status'] == 'completed' else '')"
+    a task get "$parent" | j "f\"  {d['id']}  original   {d['status']:<11} {d['title']}\" + ('  (waits on its continuation)' if d['status'] == 'open' else '  (closed by its continuation, with its handoff)' if d['status'] == 'done' else '')"
   }
   tree
-  kids=$(a task tree "$parent" | j "' '.join(c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('task:') and c['status']=='admitted')")
+  kids=$(a task tree "$parent" | j "' '.join(c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('task:') and c['status']=='open')")
   if [ -n "$kids" ]; then
     say "The board runs the subagents' tasks" "$WORKER_HARNESS on the gateway's $WORKER_MODEL takes each subagent task, one at a time, and files its report as the handoff."
     for k in $kids; do
       ( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --lease-seconds 900 --task "$k" 2>&1 | grep -E '^amem: (claimed|task)' ) || true
     done
-    cont=$(a task tree "$parent" | j "next((c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('continues:') and c['status']=='admitted'), '')")
-    open=$(a task tree "$parent" | j "' '.join(c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('task:') and c['status']!='completed')")
+    cont=$(a task tree "$parent" | j "next((c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('continues:') and c['status']=='open'), '')")
+    open=$(a task tree "$parent" | j "' '.join(c['id'] for c in d.get('children', []) if (c.get('origin') or '').startswith('task:') and c['status']!='done')")
     if [ -n "$cont" ] && [ -z "$open" ]; then
       say "Fan-in" "The continuation waited for both; it runs now, with their handoffs in its prompt, and completes with a handoff of its own. Its completion closes the original task it resumed, with the same handoff."
       ( cd "$(mktemp -d)" && a work --harness "$HARNESS" --auth "${AUTH:-subscription}" $MODEL_ARG --lease-seconds 900 --task "$cont" 2>&1 | grep -E '^amem: (claimed|task)' ) || true

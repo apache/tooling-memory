@@ -637,7 +637,7 @@ class Run:
             tid = t["id"]
             s.refused("claim", id=tid, lease_seconds=lease)  # proposed: not yet claimable
             t = task_of(s.call("admit_task", id=tid), "admit_task")
-            self.check(t.get("status") == "admitted", f"admit_task left it {t.get('status')!r}")
+            self.check(t.get("status") == "open", f"admit_task left it {t.get('status')!r}")
             t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease, "the admitted task")
             self.check(
                 t.get("id") == tid,
@@ -652,11 +652,11 @@ class Run:
             self.check(t.get("status") == "claimed", f"heartbeat left it {t.get('status')!r}")
             s.refused("complete", id=tid, handoff=f"{h}-nope")
             t = task_of(s.call("complete", id=tid, handoff=h), "complete")
-            self.check(t.get("status") == "completed", f"complete left it {t.get('status')!r}")
+            self.check(t.get("status") == "done", f"complete left it {t.get('status')!r}")
             self.check(t.get("handoff") == h, f"the completed task carries handoff {t.get('handoff')!r}")
             t = task_of(s.call("get_task", id=tid), "get_task")
-            self.check(t.get("status") == "completed", f"get_task says {t.get('status')!r}")
-            done = s.call("list_tasks", domain=d, status="completed")
+            self.check(t.get("status") == "done", f"get_task says {t.get('status')!r}")
+            done = s.call("list_tasks", domain=d, status="done")
             tasks = done.get("tasks") if isinstance(done, dict) else done
             self.check(isinstance(tasks, list), f"list_tasks: no list in {short(done)}")
             self.check(tid in ids(tasks), "list_tasks completed lacks the task")
@@ -703,7 +703,7 @@ class Run:
                 f"an expired lease did not return the task to the pool: {short(t)}",
             )
             t = task_of(s.call("release", id=tid2, handoff=h), "release")
-            self.check(t.get("status") == "admitted", f"release left it {t.get('status')!r}")
+            self.check(t.get("status") == "open", f"release left it {t.get('status')!r}")
             t = self.claimed(s.call("claim_next", domain=d, lease_seconds=lease), "claim_next", lease, "the released task back from the pool")
             self.check(t.get("id") == tid2, "a released task did not come back from the pool")
             self.check(t.get("handoff") == h, f"the released task came back with handoff {t.get('handoff')!r}, not the one left")
@@ -879,8 +879,8 @@ class Run:
                 t = task_of(s.call("get_task", id=tid), "get_task")
             except ToolError as e:
                 raise Fail(f"after reindex the ledger lost the completed task: {e}") from None
-            self.check(t.get("status") == "completed", f"after reindex the task is {t.get('status')!r}")
-            done_tasks = s.call("list_tasks", domain=d, status="completed")
+            self.check(t.get("status") == "done", f"after reindex the task is {t.get('status')!r}")
+            done_tasks = s.call("list_tasks", domain=d, status="done")
             tasks = done_tasks.get("tasks") if isinstance(done_tasks, dict) else done_tasks
             self.check(tid in ids(tasks or []), "after reindex the ledger lost the completed task")
         finally:

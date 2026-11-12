@@ -213,15 +213,24 @@ fn step_tasks(d: &Demo) {
         "null",
         "one holder"
     );
-    ok(&d.root, &["task", "heartbeat", &id], None);
-    let done = json(&ok(&d.root, &["task", "complete", &id, &d.handoff], None));
-    assert_eq!(done["status"], "completed");
-    assert_eq!(done["handoff"], d.handoff);
-    let completed = json(&ok(
+    assert_eq!(claimed["generation"], 1, "the first claim");
+    // a command that names no generation, or an earlier one, holds nothing
+    fails(&d.root, &["task", "heartbeat", &id]);
+    let why = fails(&d.root, &["task", "heartbeat", &id, "--generation", "0"]);
+    assert!(why.contains("generation"), "{why}");
+    ok(
         &d.root,
-        &["task", "list", "--status", "completed"],
+        &["task", "heartbeat", &id, "--generation", "1"],
+        None,
+    );
+    let done = json(&ok(
+        &d.root,
+        &["task", "complete", &id, &d.handoff, "--generation", "1"],
         None,
     ));
+    assert_eq!(done["status"], "done");
+    assert_eq!(done["handoff"], d.handoff);
+    let completed = json(&ok(&d.root, &["task", "list", "--status", "done"], None));
     assert_eq!(completed.as_array().unwrap().len(), 1);
 }
 
@@ -402,7 +411,7 @@ fn an_erasure_takes_the_proposal_to_verify_the_entry_off_the_board() {
             .map(|t| t["id"].as_str().unwrap().to_string())
             .collect()
     };
-    for open in ["proposed", "admitted", "claimed"] {
+    for open in ["proposed", "open", "claimed"] {
         assert!(
             !listed(open).contains(&task),
             "{task} is still {open} after the erasure"

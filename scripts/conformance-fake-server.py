@@ -199,7 +199,7 @@ class Fake:
         raise Refused(f"task {tid} not found")
 
     def claimable(self, t, now):
-        if t["status"] == "admitted":
+        if t["status"] == "open":
             return True
         if t["status"] == "claimed" and FLAW == "second-claim":
             return True
@@ -255,7 +255,7 @@ class Fake:
             t = self.task(a["id"])
             if t["status"] != "proposed":
                 raise Refused(f"task is {t['status']}, not proposed")
-            t["status"] = "admitted"
+            t["status"] = "open"
             return {"task": t}
         if name == "claim_next":
             lease = a.get("lease_seconds") or 1800
@@ -291,7 +291,7 @@ class Fake:
             held = t["status"] == "claimed" and t["_deadline"] >= now
             if not held and FLAW != "complete-anyone":
                 raise Refused(f"task is {t['status']} and the lease is not held")
-            t["status"] = "completed"
+            t["status"] = "done"
             t["handoff"] = a["handoff"]
             return {"task": t}
         if name == "release":
@@ -300,8 +300,8 @@ class Fake:
                 self.get(a["handoff"])
                 t["handoff"] = a["handoff"]
             if FLAW == "release-lies":
-                return {"task": dict(t, status="admitted")}
-            t["status"] = "admitted"
+                return {"task": dict(t, status="open")}
+            t["status"] = "open"
             t["holder"] = None
             t["lease_until"] = None
             t["_deadline"] = None
@@ -314,7 +314,7 @@ class Fake:
         if name == "get_task":
             return {"task": self.task(a["id"])}
         if name == "list_tasks":
-            status = a.get("status") or "admitted"
+            status = a.get("status") or "open"
             return {"tasks": [t for t in self.state["tasks"] if t["status"] == status]}
         if name in ("fan_out", "task_tree", "retry_task"):
             raise Refused(f"{name} is not implemented by the fake")

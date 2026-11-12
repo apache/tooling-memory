@@ -145,14 +145,15 @@ const state = (tone, name, label) => el('span', `am-state am-state--${tone}`, gl
 const id = (t) => el('span', 'am-id', t);
 
 // ---- the ledger's states, in its own words, each with its gutter glyph ----
-const ORDER = ['claimed', 'admitted', 'proposed', 'completed', 'invalidated'];
-const WORDS = { claimed: 'Claimed, under a lease', admitted: 'Admitted, claimable', proposed: 'Proposed, waiting for admission', completed: 'Completed, with a handoff', invalidated: 'Invalidated' };
-const GUTTER = { claimed: ['live', 'lease'], admitted: ['ink', 'queued'], proposed: ['await', 'admit'], completed: ['ok', 'done'], invalidated: ['ink', 'invalid'] };
+const ORDER = ['claimed', 'open', 'blocked', 'proposed', 'done', 'invalidated'];
+const WORDS = { claimed: 'Claimed, under a lease', open: 'Open, claimable', blocked: 'Blocked, waiting on something outside the task', proposed: 'Proposed, waiting for admission', done: 'Done, with a handoff', invalidated: 'Invalidated' };
+const GUTTER = { claimed: ['live', 'lease'], open: ['ink', 'queued'], blocked: ['ink', 'queued'], proposed: ['await', 'admit'], done: ['ok', 'done'], invalidated: ['ink', 'invalid'] };
 const EMPTY = {
-  claimed: ['Nothing claimed. A session claims an admitted task with ', el('code', null, 'amem work'), '; Claim here takes one for a person.'],
-  admitted: 'Nothing claimable. Admit a proposal, or file a task above.',
+  claimed: ['Nothing claimed. A session claims an open task with ', el('code', null, 'amem work'), '; Claim here takes one for a person.'],
+  open: 'Nothing claimable. Admit a proposal, or file a task above.',
+  blocked: 'Nothing blocked.',
   proposed: 'No proposals waiting.',
-  completed: 'Nothing completed yet.',
+  done: 'Nothing done yet.',
   invalidated: 'Nothing invalidated.',
 };
 
@@ -263,10 +264,10 @@ function render(t, d, open) {
 
   const acts = [];
   if (t.status === 'proposed') acts.push(['Admit', 'secondary', () => act('admit', t)]);
-  if (t.status === 'admitted') acts.push(['Claim', 'secondary', () => act('claim', t)]);
+  if (t.status === 'open') acts.push(['Claim', 'secondary', () => act('claim', t)]);
   if (t.status === 'claimed') acts.push(['Complete', 'secondary', () => completeWith(t)]);
-  if (t.status !== 'completed' && t.status !== 'invalidated') acts.push(['Invalidate', 'danger', () => act('invalidate', t, { reason: 'closed from the board' })]);
-  if (t.status === 'invalidated' || t.status === 'completed') acts.push(['Retry', 'secondary', () => act('retry', t)]);
+  if (t.status !== 'done' && t.status !== 'invalidated') acts.push(['Invalidate', 'danger', () => act('invalidate', t, { reason: 'closed from the board' })]);
+  if (t.status === 'invalidated' || t.status === 'done') acts.push(['Retry', 'secondary', () => act('retry', t)]);
   const buttons = el('span', 'am-task-acts', ...acts.map(([word, role, fn]) => {
     const b = el('button', `am-btn am-btn--${role}`, word);
     b.type = 'button';
@@ -295,7 +296,7 @@ function completeWith(t) {
   dlg.showModal();
   dlg.onclose = async () => {
     if (dlg.returnValue !== 'ok') return;
-    await act('complete', t, { handoff: $('handoff-text').value });
+    await act('complete', t, { handoff: $('handoff-text').value, generation: t.generation });
   };
 }
 

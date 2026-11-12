@@ -740,7 +740,7 @@ fn work_leaves_a_completed_task_complete() {
     );
     assert!(stderr.contains("completed, handoff mem-"), "{stderr}");
     let t = cli(&root, &["task", "get", &id]);
-    assert_eq!(t["status"], "completed");
+    assert_eq!(t["status"], "done");
     let h = t["handoff"].as_str().unwrap();
     let e = cli_text(&root, &["get", h]);
     assert!(e.contains("all five steps"), "{e}");
@@ -766,7 +766,7 @@ fn work_files_the_output_and_releases_when_the_harness_stops_short() {
         "{stderr}"
     );
     let t = cli(&root, &["task", "get", &id]);
-    assert_eq!(t["status"], "admitted", "back in the pool: {t}");
+    assert_eq!(t["status"], "open", "back in the pool: {t}");
     let h = t["handoff"]
         .as_str()
         .expect("the handoff rides with the task");
@@ -1459,7 +1459,7 @@ fn a_worker_told_to_stop_releases_its_task_with_a_handoff_and_claims_no_other() 
     assert_eq!(claimed.len(), 1, "one task claimed: {err}");
     for id in &ids {
         let t = cli(&root, &["task", "get", id]);
-        assert_eq!(t["status"], "admitted", "in the pool: {t}");
+        assert_eq!(t["status"], "open", "in the pool: {t}");
         if claimed.contains(&id) {
             assert!(t["handoff"].as_str().is_some(), "with a handoff: {t}");
         } else {
@@ -1483,7 +1483,7 @@ fn a_task_and_a_printing_sleeper(root: &Path, dir: &Path) -> (String, PathBuf) {
 #[cfg(target_os = "linux")]
 fn released(root: &Path, id: &str) -> (bool, bool) {
     let t = cli(root, &["task", "get", id]);
-    (t["status"] == "admitted", t["handoff"].as_str().is_some())
+    (t["status"] == "open", t["handoff"].as_str().is_some())
 }
 
 /// A launcher piped into a reader that has gone: the answer it prints after a stop

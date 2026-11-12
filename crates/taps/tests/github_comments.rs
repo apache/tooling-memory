@@ -145,7 +145,7 @@ async fn done(root: &Path, origin: Option<&str>, label: Label, text: &str) -> St
         })
         .await
         .unwrap();
-    owner.complete(&task.id, &handoff.id).await.unwrap();
+    owner.complete(&task.id, None, &handoff.id).await.unwrap();
     task.id
 }
 

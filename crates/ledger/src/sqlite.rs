@@ -4,8 +4,8 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    claimable, parse_time, Error, Event, PromotionRecord, PromotionSpec, RawPromotion, RawTask,
-    Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Error, Event, Held, PromotionRecord, PromotionSpec,
+    RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -119,9 +119,22 @@ impl Db {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN posted_to TEXT;")?;
         }
         migrate_promotions(&conn)?;
-        Ok(Db {
+        // a projection whose state names this code does not have, as a ledger from before
+        // the states were `open` and `done`: read as it stands, its tasks would be in no
+        // list and no queue, without a word. The events say what each task is
+        let stale: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN
+                 ('proposed', 'open', 'claimed', 'blocked', 'done', 'invalidated')",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut db = Db {
             conn: Mutex::new(conn),
-        })
+        };
+        if stale > 0 {
+            db.rebuild()?;
+        }
+        Ok(db)
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -160,6 +173,53 @@ impl Db {
         apply(&tx, id, at, event)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Append an event of the holder under the claim in force: the task is read and the
+    /// event appended in one transaction taken for writing, so no claim comes between.
+    pub(crate) fn append_held(
+        &mut self,
+        id: &str,
+        at: OffsetDateTime,
+        by: Held<'_>,
+        event: &Event,
+    ) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        check_holder(&get_in(&tx, id)?, by, at)?;
+        apply(&tx, id, at, event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Who the ledger gave the claim of `generation` to: the holder of the task's
+    /// `generation`th claim event, counted from one.
+    pub(crate) fn claimant(&self, id: &str, generation: u64) -> Result<Option<String>, Error> {
+        let Some(before) = generation.checked_sub(1) else {
+            return Ok(None);
+        };
+        let payload: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT payload FROM events WHERE task_id = ?1 AND kind = 'claimed'
+                 ORDER BY seq LIMIT 1 OFFSET ?2",
+                params![id, i64::try_from(before).unwrap_or(i64::MAX)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match payload.map(|p| Event::parse(id, &p)).transpose()? {
+            Some(Event::Claimed { holder, .. }) => Some(holder),
+            _ => None,
+        })
+    }
+
+    /// The payloads of a task's events of one kind, oldest first.
+    pub(crate) fn payloads_of(&self, id: &str, kind: &str) -> Result<Vec<String>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT payload FROM events WHERE task_id = ?1 AND kind = ?2 ORDER BY seq")?;
+        let rows = stmt.query_map(params![id, kind], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Record a promotion unless that promoter promoted that version of the entry to that
@@ -308,7 +368,7 @@ impl Db {
         let candidates: Vec<Task> = {
             let mut stmt = tx.prepare(&format!(
                 "SELECT {TASK_COLUMNS} FROM tasks
-                 WHERE domain = ?1 AND (status = 'admitted' OR (status = 'claimed' AND lease_until < ?2))
+                 WHERE domain = ?1 AND (status IN ('open', 'blocked') OR (status = 'claimed' AND lease_until < ?2))
                  ORDER BY priority DESC, created"
             ))?;
             let rows = stmt.query_map(params![domain, crate::fmt_time(now)], |r| {
@@ -407,7 +467,7 @@ impl Db {
 
     pub(crate) fn unposted(&self, domain: &str) -> Result<Vec<Task>, Error> {
         self.select(
-            "WHERE domain = ?1 AND status = 'completed' AND origin IS NOT NULL
+            "WHERE domain = ?1 AND status = 'done' AND origin IS NOT NULL
                AND posted_to IS NULL
              ORDER BY created",
             &[&domain],
@@ -554,7 +614,7 @@ fn scrub_tasks_in(
 ) -> Result<(usize, usize), Error> {
     let tasks: Vec<(String, bool)> = {
         let mut stmt = tx.prepare(
-            "SELECT id, status IN ('completed', 'invalidated') FROM tasks
+            "SELECT id, status IN ('done', 'invalidated') FROM tasks
              WHERE domain = ?1 AND origin = ?2 ORDER BY created",
         )?;
         let rows = stmt.query_map(params![domain, origin], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -654,7 +714,7 @@ fn deps_complete(conn: &Connection, deps: &[String]) -> Result<bool, Error> {
                 r.get(0)
             })
             .optional()?;
-        if status.as_deref() != Some("completed") {
+        if status.as_deref() != Some("done") {
             return Ok(false);
         }
     }
@@ -667,7 +727,7 @@ fn awaits_continuation(conn: &Connection, task: &Task) -> Result<bool, Error> {
     Ok(conn
         .query_row(
             "SELECT 1 FROM tasks WHERE domain = ?1 AND origin = ?2
-             AND status NOT IN ('completed', 'invalidated') LIMIT 1",
+             AND status NOT IN ('done', 'invalidated') LIMIT 1",
             params![task.spec.domain, crate::continues(&task.id)],
             |_| Ok(()),
         )
@@ -743,6 +803,26 @@ fn insert_promotion(
     Ok(())
 }
 
+/// The projection of the events that move a task between waiting and claimable, and of
+/// the two that only record something.
+fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Error> {
+    let sql = match event {
+        Event::Blocked { .. } => {
+            "UPDATE tasks SET status = 'blocked' WHERE id = ?1 AND status = 'open'"
+        }
+        Event::Unblocked { .. } => {
+            "UPDATE tasks SET status = 'open' WHERE id = ?1 AND status = 'blocked'"
+        }
+        Event::Retriaged { .. } => {
+            "UPDATE tasks SET status = 'proposed' WHERE id = ?1 AND status IN ('open', 'blocked')"
+        }
+        // the record that someone tried, or spoke after its claim: nothing of the task moves
+        _ => return Ok(()),
+    };
+    conn.execute(sql, params![id])?;
+    Ok(())
+}
+
 /// Update the projection for one event. Replay calls this and nothing else.
 fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Result<(), Error> {
     match event {
@@ -750,10 +830,15 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         Event::Created { id: new_id, spec } => insert_task(conn, new_id, at, spec)?,
         Event::Admitted => {
             conn.execute(
-                "UPDATE tasks SET status = 'admitted' WHERE id = ?1",
+                "UPDATE tasks SET status = 'open' WHERE id = ?1",
                 params![id],
             )?;
         }
+        Event::Blocked { .. }
+        | Event::Unblocked { .. }
+        | Event::Retriaged { .. }
+        | Event::ClaimRefused { .. }
+        | Event::LateHandoff { .. } => project_waiting(conn, id, event)?,
         Event::Claimed { holder, until } => {
             conn.execute(
                 "UPDATE tasks SET status = 'claimed', holder = ?2, lease_until = ?3,
@@ -769,7 +854,7 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         }
         Event::Released => {
             conn.execute(
-                "UPDATE tasks SET status = 'admitted', holder = NULL, lease_until = NULL
+                "UPDATE tasks SET status = 'open', holder = NULL, lease_until = NULL
                  WHERE id = ?1",
                 params![id],
             )?;
@@ -782,7 +867,7 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         }
         Event::Completed { handoff } => {
             conn.execute(
-                "UPDATE tasks SET status = 'completed', handoff = ?2, lease_until = NULL
+                "UPDATE tasks SET status = 'done', handoff = ?2, lease_until = NULL
                  WHERE id = ?1",
                 params![id, handoff],
             )?;
