@@ -29,7 +29,8 @@ term here in the same commit as the first document that needs it.
 | gateway | A model gateway outside `amem` that the egress forwards to, such as LiteLLM or llm.apache.org | proxy (for a gateway) |
 | relay | The process in the sandbox that connects a loopback port to the egress socket | |
 | web launcher | The loopback web server that `amem` with no command, or `amem web`, starts, and the pages it serves | web terminal, the UI, dashboard |
-| librarian | `amem librarian`: a survey of the record, with no model, that files curation tasks for `amem work` to do | curator (for this part) |
+| curator | An agent that does a curation task. `amem curator` is the survey of the curators: it reads the record, with no model, and files curation tasks for `amem work` to do | librarian |
+| auditor | `amem audit`: a model that is not the model of the curators. It judges summaries against their bodies, looks for contradictions and reads held writes. It writes nothing to the record | checker |
 | harness | A program that runs a model as an agent: Claude Code, Codex, and the others | client (for a harness) |
 | agent | A model that a harness runs, in one session | harness |
 | tool server | `amem tool-server`: it runs tools for launchers on other hosts | |
@@ -106,6 +107,5 @@ a different thing. Name that thing in full where it could be read as the term.
 | proxy | `HTTPS_PROXY`, LiteLLM's proxy, or a product with "proxy" in its name | the name in code font |
 | user | A Unix user, or the person who gives an agent a request | Unix user |
 | board | The task board: the `/board` page, and `--subagents board` | the board |
-| librarian | In the paper's sense, an agent that curates | the paper's librarians |
 | run | One harness process in a session, one evaluation run, or one demo run | harness run, evaluation run |
-| telemetry | OpenTelemetry data, or the librarian's signals | OpenTelemetry, the librarian's telemetry |
+| telemetry | OpenTelemetry data, or the curator's signals | OpenTelemetry, the curator's telemetry |

@@ -91,7 +91,7 @@ web: build
 	GH_TOKEN="$${GH_TOKEN:-$$(gh auth token 2>/dev/null)}" \
 	target/release/amem --root "$$MEMORY_ROOT" web $(if $(HARNESS),--harness $(HARNESS),) --auth $(AUTH) --backend $(BACKEND)
 
-# One curation cycle on the record: the survey filed, the checker on a sample through
+# One curation cycle on the record: the survey filed, the auditor on a sample through
 # the gateway, the canaries checked, the telemetry's alarms filed. EVERY=<seconds> loops.
 curate: build
 	@set -a; . ./$(LOCAL_ENV); set +a; \

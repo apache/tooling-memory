@@ -8,13 +8,14 @@
 //! needs from its own environment, filled from the root's `credentials.env`, and never
 //! passes them inside.
 
+mod auditor;
 mod board;
 mod browser;
 mod canary;
-mod checker;
 mod cost;
 mod credentials;
 mod curation;
+mod curator;
 mod deputy;
 mod doctor;
 mod drift;
@@ -25,7 +26,6 @@ mod harness_usage;
 mod hooks;
 mod hosted;
 mod image;
-mod librarian;
 mod mcp_http;
 mod mcp_meta;
 mod mine;
@@ -466,10 +466,10 @@ enum Command {
         #[arg(long)]
         task: Option<String>,
     },
-    /// The librarian's survey: what in a domain needs curation, from the record and
+    /// The curator's survey: what in a domain needs curation, from the record and
     /// the read log, as proposals; with --file, each becomes a task for a run to do with
     /// the memory server's own tools, born proposed unless the domain admits its own.
-    Librarian {
+    Curator {
         #[arg(long)]
         domain: Option<String>,
         /// File each proposal as a task on the ledger.
@@ -485,12 +485,12 @@ enum Command {
         /// entry was written calls for a verify. Defaults to the current directory.
         #[arg(long)]
         workdir: Option<PathBuf>,
-        /// The librarian's own telemetry instead of a survey: curation per author from
+        /// The curator's own telemetry instead of a survey: curation per author from
         /// the record and the ledger, and the alarms it raises; --file files them.
         #[arg(long)]
         telemetry: bool,
     },
-    /// One curation cycle under a budget: the survey filed, the checker on a sample,
+    /// One curation cycle under a budget: the survey filed, the auditor on a sample,
     /// contradictions hunted, the canaries checked, the telemetry's alarms filed, and a
     /// line in state/curation.jsonl; with --every, again at that interval. The tasks it
     /// files are worked by `amem work` on a cheap model.
@@ -501,10 +501,10 @@ enum Command {
         auth: AuthArg,
         #[arg(long)]
         provider: Option<String>,
-        /// The checker's model, a different one than the librarian runs on.
+        /// The auditor's model, a different one than the curator runs on.
         #[arg(long)]
         model: Option<String>,
-        /// Entries the checker samples each cycle.
+        /// Entries the auditor samples each cycle.
         #[arg(long, default_value_t = 8)]
         sample: usize,
         /// Hunt contradictions too, on the same sample.
@@ -513,10 +513,10 @@ enum Command {
         /// Curation tasks that may be open at once; the survey files up to the gap.
         #[arg(long, default_value_t = 20)]
         budget_tasks: usize,
-        /// Tokens a cycle's model calls may take in all; the checker stops at it.
+        /// Tokens a cycle's model calls may take in all; the auditor stops at it.
         #[arg(long, default_value_t = 200_000)]
         budget_tokens: u64,
-        /// Run the vendor-drift probes on the checker's model each cycle, against its
+        /// Run the vendor-drift probes on the auditor's model each cycle, against its
         /// baseline, filing confirmed drift for the owner. Uses probes/drift.toml in the
         /// working directory.
         #[arg(long)]
@@ -528,16 +528,16 @@ enum Command {
         #[arg(long)]
         every: Option<u64>,
     },
-    /// The checker: a model of its own, not the librarian's, judges whether each
+    /// The auditor: a model of its own, not the curator's, judges whether each
     /// summary the index serves entails its body, on a sample of a domain; it writes
-    /// nothing, and with --file a rejected summary becomes a task for a librarian run.
-    Check {
+    /// nothing, and with --file a rejected summary becomes a task for a curator run.
+    Audit {
         #[arg(long, value_enum, default_value = "key")]
         auth: AuthArg,
         /// The destination; openai by default, llmao with --auth gateway.
         #[arg(long)]
         provider: Option<String>,
-        /// The checker's model. Make it a different one than wrote the summaries.
+        /// The auditor's model. Make it a different one than wrote the summaries.
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
@@ -855,7 +855,7 @@ enum Command {
         #[arg(long, value_enum)]
         classification: Option<LabelArg>,
         #[arg(long)]
-        source: Vec<String>,
+        cites: Vec<String>,
         #[arg(long)]
         supersedes: Option<String>,
     },
@@ -1450,7 +1450,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
             profiles::show(&profiles::load(&root, &command_words())?, as_json)
         }
         cmd @ (Command::Mine { .. }
-        | Command::Check { .. }
+        | Command::Audit { .. }
         | Command::Curate { .. }
         | Command::Replay { .. }
         | Command::Models { .. }
@@ -2552,7 +2552,7 @@ async fn list_models(
 async fn tools_cmd(root: &Path, command: Command) -> Fallible {
     match command {
         Command::Models { auth, provider } => models_cmd(root, auth, provider).await,
-        cmd @ (Command::Check { .. } | Command::Curate { .. } | Command::Replay { .. }) => {
+        cmd @ (Command::Audit { .. } | Command::Curate { .. } | Command::Replay { .. }) => {
             curation_cmd(root, cmd).await
         }
         Command::Mine {
@@ -2669,7 +2669,7 @@ async fn replay_cmd(
     model: Option<String>,
 ) -> Fallible {
     let auth = AuthMode::from(auth);
-    let provider = checker_destination(auth, provider);
+    let provider = auditor_destination(auth, provider);
     let p = prepare_launch(
         root,
         Harness::Command,
@@ -2710,10 +2710,10 @@ async fn replay_cmd(
     json(&run)
 }
 
-/// The curation commands: the checker, and the cycle.
+/// The curation commands: the auditor, and the cycle.
 async fn curation_cmd(root: &Path, command: Command) -> Fallible {
     match command {
-        Command::Check {
+        Command::Audit {
             auth,
             provider,
             model,
@@ -4100,7 +4100,7 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
             domain,
             body,
             classification,
-            source,
+            cites,
             supersedes,
         } => {
             let w = m
@@ -4109,7 +4109,7 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
                     entry_type: kind.into(),
                     title,
                     body: body_or_stdin(body)?,
-                    source,
+                    cites,
                     confidence: None,
                     classification: classification.map(Into::into),
                     supersedes,
@@ -4220,7 +4220,7 @@ async fn canary_cmd(m: &Memory, op: CanaryOp) -> Fallible {
     }
 }
 
-/// `amem check`: the checker over a sample of a domain, through a destination of its own.
+/// `amem audit`: the auditor over a sample of a domain, through a destination of its own.
 /// A curation cycle's settings.
 struct CuratePlan {
     domain: Option<String>,
@@ -4235,8 +4235,8 @@ struct CuratePlan {
     workdir: Option<PathBuf>,
 }
 
-/// The destination a checker or a cycle speaks to, from the auth mode and provider given.
-fn checker_destination(auth: AuthMode, provider: Option<String>) -> String {
+/// The destination an auditor or a cycle speaks to, from the auth mode and provider given.
+fn auditor_destination(auth: AuthMode, provider: Option<String>) -> String {
     provider.unwrap_or_else(|| {
         if auth == AuthMode::Gateway {
             "llmao".to_string()
@@ -4247,7 +4247,7 @@ fn checker_destination(auth: AuthMode, provider: Option<String>) -> String {
 }
 
 /// How many curation tasks are open: proposed or admitted, filed by the survey, the
-/// checker or the telemetry.
+/// auditor or the telemetry.
 async fn open_curation_tasks(
     m: &Memory,
     domain: &str,
@@ -4260,8 +4260,8 @@ async fn open_curation_tasks(
             .iter()
             .filter(|t| {
                 t.spec.origin.as_deref().is_some_and(|o| {
-                    o.starts_with("librarian:")
-                        || o.starts_with("checker:")
+                    o.starts_with("curator:")
+                        || o.starts_with("auditor:")
                         || o.starts_with("telemetry:")
                 })
             })
@@ -4270,20 +4270,20 @@ async fn open_curation_tasks(
     Ok(n)
 }
 
-/// The summaries of a domain's newest entries, for the checker's tasks.
+/// The summaries of a domain's newest entries, for the auditor's tasks.
 async fn summaries_of(
     m: &Memory,
     domain: &str,
     n: usize,
 ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
-    Ok(checker::sample_of(m, domain, n)
+    Ok(auditor::sample_of(m, domain, n)
         .await?
         .iter()
         .map(|h| (h.id.clone(), h.summary.clone()))
         .collect())
 }
 
-/// `amem librarian --telemetry`: the librarian's own telemetry, its alarms filed with --file.
+/// `amem curator --telemetry`: the curator's own telemetry, its alarms filed with --file.
 async fn telemetry_cmd(m: &Memory, domain: Option<&str>, file: bool) -> Fallible {
     let t = curation::telemetry(m, domain).await?;
     let filed = if file {
@@ -4311,8 +4311,8 @@ async fn curate_loop(root: &Path, plan: &CuratePlan, every: Option<u64>) -> Fall
     }
 }
 
-/// The checker's part of a cycle: the sample judged, contradictions hunted, both filed.
-async fn checker_pass(
+/// The auditor's part of a cycle: the sample judged, contradictions hunted, both filed.
+async fn auditor_pass(
     p: &Prepared,
     plan: &CuratePlan,
     domain: &str,
@@ -4320,12 +4320,12 @@ async fn checker_pass(
     cycle: &mut curation::Cycle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let m = &p.memory;
-    let spend = checker::Spend {
+    let spend = auditor::Spend {
         egress: &p.egress,
         session: m.session_id(),
         limit: plan.budget_tokens,
     };
-    let report = checker::check(
+    let report = auditor::check(
         &p.egress,
         m,
         &p.provider,
@@ -4338,9 +4338,9 @@ async fn checker_pass(
     cycle.checked = report.checked.len();
     cycle.rejected = report.checked.iter().filter(|v| !v.entails).count();
     let summaries = summaries_of(m, domain, plan.sample).await?;
-    checker::file(m, &report, &summaries).await?;
+    auditor::file(m, &report, &summaries).await?;
     if plan.contradictions {
-        let found = checker::hunt(
+        let found = auditor::hunt(
             &p.egress,
             m,
             &p.provider,
@@ -4351,7 +4351,7 @@ async fn checker_pass(
         )
         .await?;
         cycle.contradictions = found.len();
-        checker::file_contradictions(m, domain, model, &found).await?;
+        auditor::file_contradictions(m, domain, model, &found).await?;
     }
     if !spend.exhausted() {
         let reviewed = review::review(&p.egress, m, &p.provider, model, plan.sample).await?;
@@ -4404,7 +4404,7 @@ async fn owner_pass(
 /// `amem curate`: one cycle, logged.
 async fn curate_cmd(root: &Path, plan: &CuratePlan) -> Fallible {
     let auth = AuthMode::from(plan.auth);
-    let provider = checker_destination(auth, plan.provider.clone());
+    let provider = auditor_destination(auth, plan.provider.clone());
     let p = prepare_launch(
         root,
         Harness::Command,
@@ -4425,29 +4425,29 @@ async fn curate_cmd(root: &Path, plan: &CuratePlan) -> Fallible {
         domain: domain.clone(),
         budget_tasks: plan.budget_tasks,
         budget_tokens: plan.budget_tokens,
-        checker_model: model.clone(),
+        auditor_model: model.clone(),
         ..curation::Cycle::default()
     };
     // the survey, filed up to the budget's gap
     cycle.open_before = open_curation_tasks(m, &domain).await?;
-    let options = librarian::Options {
+    let options = curator::Options {
         source_root: plan.workdir.clone(),
-        ..librarian::Options::default()
+        ..curator::Options::default()
     };
-    let mut survey = librarian::survey(m, root, Some(&domain), &options).await?;
+    let mut survey = curator::survey(m, root, Some(&domain), &options).await?;
     cycle.proposals = survey.proposals.len();
     let room = plan.budget_tasks.saturating_sub(cycle.open_before);
     survey.proposals.truncate(room);
-    let (filed, already) = librarian::file(m, &survey).await?;
+    let (filed, already) = curator::file(m, &survey).await?;
     cycle.filed = filed.len();
     cycle.already_filed = already;
-    checker_pass(&p, plan, &domain, &model, &mut cycle).await?;
+    auditor_pass(&p, plan, &domain, &model, &mut cycle).await?;
     owner_pass(m, root, &domain, &mut cycle).await?;
     curation::log_cycle(root, &cycle)?;
     json(&cycle)
 }
 
-/// What a checker run does besides judging summaries.
+/// What an auditor run does besides judging summaries.
 struct CheckWhat {
     /// File what it finds as tasks.
     file: bool,
@@ -4467,7 +4467,7 @@ async fn check_cmd(
     what: CheckWhat,
 ) -> Fallible {
     let auth = AuthMode::from(auth);
-    let provider = checker_destination(auth, provider);
+    let provider = auditor_destination(auth, provider);
     let p = prepare_launch(
         root,
         Harness::Command,
@@ -4479,7 +4479,7 @@ async fn check_cmd(
     .await?;
     p.memory.disable_read_log();
     let model = model::resolve(&p.egress, &p.provider, model.as_deref()).await;
-    let report = checker::check(
+    let report = auditor::check(
         &p.egress,
         &p.memory,
         &p.provider,
@@ -4490,7 +4490,7 @@ async fn check_cmd(
     )
     .await?;
     let found = if what.contradictions {
-        checker::hunt(
+        auditor::hunt(
             &p.egress,
             &p.memory,
             &p.provider,
@@ -4511,9 +4511,9 @@ async fn check_cmd(
     let mut filed = Vec::new();
     if what.file {
         let summaries = summaries_of(&p.memory, &report.domain, sample).await?;
-        filed = checker::file(&p.memory, &report, &summaries).await?;
+        filed = auditor::file(&p.memory, &report, &summaries).await?;
         filed
-            .extend(checker::file_contradictions(&p.memory, &report.domain, &model, &found).await?);
+            .extend(auditor::file_contradictions(&p.memory, &report.domain, &model, &found).await?);
     }
     json(&serde_json::json!({
         "domain": report.domain,
@@ -4701,8 +4701,8 @@ async fn policy_lint(m: &Memory, file: bool) -> Fallible {
     }))
 }
 
-/// `amem librarian`: the survey, or the survey filed as tasks.
-async fn librarian_cmd(
+/// `amem curator`: the survey, or the survey filed as tasks.
+async fn curator_cmd(
     m: &Memory,
     domain: Option<&str>,
     file: bool,
@@ -4710,15 +4710,15 @@ async fn librarian_cmd(
     split_chars: usize,
     workdir: Option<PathBuf>,
 ) -> Fallible {
-    let options = librarian::Options {
+    let options = curator::Options {
         stale_days,
         split_chars,
         source_root: workdir,
-        ..librarian::Options::default()
+        ..curator::Options::default()
     };
-    let survey = librarian::survey(m, m.root(), domain, &options).await?;
+    let survey = curator::survey(m, m.root(), domain, &options).await?;
     if file {
-        let (ids, already) = librarian::file(m, &survey).await?;
+        let (ids, already) = curator::file(m, &survey).await?;
         json(&serde_json::json!({
             "domain": survey.domain,
             "entries": survey.entries,
@@ -4769,7 +4769,7 @@ async fn bundle_cmd(m: &Memory, command: Command) -> Fallible {
 async fn maintain(m: &Memory, command: Command) -> Fallible {
     match command {
         cmd @ (Command::Export { .. } | Command::Import { .. }) => bundle_cmd(m, cmd).await,
-        Command::Librarian {
+        Command::Curator {
             domain,
             file,
             stale_days,
@@ -4777,13 +4777,13 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
             workdir,
             telemetry,
         } => {
-            // the survey's reads are the librarian's, not a session's
+            // the survey's reads are the curator's, not a session's
             m.disable_read_log();
             if telemetry {
                 return telemetry_cmd(m, domain.as_deref(), file).await;
             }
             let workdir = workdir.or_else(|| std::env::current_dir().ok());
-            librarian_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
+            curator_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
         }
         cmd @ (Command::Canary { .. }
         | Command::Erase { .. }
@@ -4802,7 +4802,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Image { .. }
         | Command::Web { .. }
         | Command::Mine { .. }
-        | Command::Check { .. }
+        | Command::Audit { .. }
         | Command::Curate { .. }
         | Command::Replay { .. }
         | Command::Models { .. }

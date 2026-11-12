@@ -1756,7 +1756,7 @@ mod tests {
             domain: "dom-a".into(),
             entry: entry.into(),
             tier: TrustTier::Curated,
-            by: "agent:librarian".into(),
+            by: "agent:curator".into(),
             author: "human:test:me".into(),
             why: "checked against the tree".into(),
             classification: Label::Internal,
@@ -1822,7 +1822,7 @@ mod tests {
         let first = promotion("mem-a-1", "d1");
         assert!(l.record_promotion(&first).await.unwrap());
         let second = PromotionSpec {
-            by: "agent:checker".into(),
+            by: "agent:auditor".into(),
             why: "read it against the release notes".into(),
             ..first.clone()
         };
@@ -1851,7 +1851,7 @@ mod tests {
             ..promotion("mem-a-1", "d1")
         };
         let second = PromotionSpec {
-            by: "agent:checker".into(),
+            by: "agent:auditor".into(),
             why: format!("tried {SECRET} on the vault"),
             ..first.clone()
         };
@@ -2144,7 +2144,7 @@ mod tests {
 
     #[test]
     fn a_promoted_payload_from_before_the_new_digest_still_parses() {
-        let old = r#"{"kind":"promoted","domain":"dom-a","entry":"mem-a-1","tier":"curated","by":"agent:librarian","author":"human:test:me","why":"checked","classification":"internal","digest":"d1"}"#;
+        let old = r#"{"kind":"promoted","domain":"dom-a","entry":"mem-a-1","tier":"curated","by":"agent:curator","author":"human:test:me","why":"checked","classification":"internal","digest":"d1"}"#;
         let Event::Promoted { spec, why_erased } = Event::parse("promotion:mem-a-1", old).unwrap()
         else {
             panic!("not a promotion");
@@ -2193,9 +2193,9 @@ mod tests {
              CREATE UNIQUE INDEX promotions_version ON {table} ({key});
              INSERT INTO {dot}events (task_id, kind, at, payload) VALUES ('promotion:mem-a-1',
                  'promoted', '2026-10-01T10:00:00Z',
-                 '{{\"kind\":\"promoted\",\"domain\":\"dom-a\",\"entry\":\"mem-a-1\",\"tier\":\"curated\",\"by\":\"agent:librarian\",\"author\":\"human:test:me\",\"why\":\"checked\",\"classification\":\"internal\",\"digest\":\"d1\"}}');
+                 '{{\"kind\":\"promoted\",\"domain\":\"dom-a\",\"entry\":\"mem-a-1\",\"tier\":\"curated\",\"by\":\"agent:curator\",\"author\":\"human:test:me\",\"why\":\"checked\",\"classification\":\"internal\",\"digest\":\"d1\"}}');
              INSERT INTO {table} (domain, entry, tier, promoter, author, why, label_rank,
-                 digest, {new_digest_column}at) VALUES ('dom-a', 'mem-a-1', 'curated', 'agent:librarian',
+                 digest, {new_digest_column}at) VALUES ('dom-a', 'mem-a-1', 'curated', 'agent:curator',
                  'human:test:me', 'checked', 1, 'd1', {new_digest_value}'2026-10-01T10:00:00Z');"
         )
     }
@@ -2234,7 +2234,7 @@ mod tests {
         assert_eq!(old[0].spec.new_digest, "", "{shape}");
         assert!(!old[0].why_erased, "{shape}");
         let second = PromotionSpec {
-            by: "agent:checker".into(),
+            by: "agent:auditor".into(),
             ..promotion("mem-a-1", "d1")
         };
         assert!(
@@ -2866,7 +2866,7 @@ mod tests {
             );
             c.batch_execute(&back_to_old).await.unwrap();
             let second = PromotionSpec {
-                by: "agent:checker".into(),
+                by: "agent:auditor".into(),
                 ..promotion("mem-a-1", "d1")
             };
             assert!(

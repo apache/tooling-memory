@@ -17,8 +17,8 @@ agent() { python3 "$here/scripts/demo/mcp.py" "$memory" "$root" "$@"; }
 export LLMAO_URL=${LLMAO_URL:-https://llm.apache.org}
 export LLMAO_KEY=${LLMAO_KEY:-$(cat "$here/local/.virtual-key" 2>/dev/null || true)}
 gateway() { [ -n "$LLMAO_KEY" ]; }
-# the models the acts use on the gateway: a checker, and a cheap worker
-CHECKER_MODEL=${CHECKER_MODEL:-gemma4-26b}
+# the models the acts use on the gateway: an auditor, and a cheap worker
+AUDITOR_MODEL=${AUDITOR_MODEL:-gemma4-26b}
 WORKER_MODEL=${WORKER_MODEL:-qwen3.8-27b}
 WORKER_HARNESS=${WORKER_HARNESS:-codex}
 # A gateway run has to name the model: the gateway serves what it serves, and pi and

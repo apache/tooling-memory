@@ -6,7 +6,7 @@
 # run kept to the original. Replay (5.5) resends recorded model calls; this runs the
 # whole session.
 . "$(dirname "$0")/lib.sh"
-act 8 "Run it again" "A session recorded in act 6 run again from its tape: once on its own model, as a control, and once on another, each scored on how far it kept to the original's memory calls, beside its answer, tokens and time." "$WORKER_HARNESS, re-running a session from act 6 on $WORKER_MODEL and then on $CHECKER_MODEL; the tape, answering its memory calls; and the report."
+act 8 "Run it again" "A session recorded in act 6 run again from its tape: once on its own model, as a control, and once on another, each scored on how far it kept to the original's memory calls, beside its answer, tokens and time." "$WORKER_HARNESS, re-running a session from act 6 on $WORKER_MODEL and then on $AUDITOR_MODEL; the tape, answering its memory calls; and the report."
 
 say "The tapes" "Each prompted session's prompt, harness, model and memory calls, kept with the transcripts and on their clock unless pinned."
 tape=$(a reenact tapes | j "next((t['session'] for t in d if t.get('prompt') and t.get('harness') == '$WORKER_HARNESS' and t.get('model') == '$WORKER_MODEL'), '')")
@@ -24,8 +24,8 @@ if gateway; then
   }
   say "The same model again" "The control: $WORKER_HARNESS on $WORKER_MODEL, as the original ran. A model is not deterministic, so even this may differ."
   run "$WORKER_MODEL" || true
-  say "Another model" "$WORKER_HARNESS on $CHECKER_MODEL, answered from the same tape: whether it asks memory the same things, and comes to the same answer."
-  run "$CHECKER_MODEL" || true
+  say "Another model" "$WORKER_HARNESS on $AUDITOR_MODEL, answered from the same tape: whether it asks memory the same things, and comes to the same answer."
+  run "$AUDITOR_MODEL" || true
   say "Side by side" "Every run of the session, each harness and model against the original."
   a reenact report "$tape" | sed 's/^/  /'
 fi

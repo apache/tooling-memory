@@ -63,7 +63,7 @@ impl Cite {
     }
 }
 
-const INSTRUCTIONS: &str = "You are a librarian for a shared memory record used by agents and people. \
+const INSTRUCTIONS: &str = "You are a curator for a shared memory record used by agents and people. \
 Read the transcript excerpt and extract only knowledge that would help a future session that has \
 not seen it: facts about the codebase or system, decisions and their reasons, conventions, methods \
 that worked. Leave out chit-chat, tool noise, and anything already obvious from the task text. \
@@ -113,7 +113,7 @@ pub async fn write_proposals(
                     p.body.trim()
                 ),
                 confidence: Some("low"),
-                source: cite.sources(p),
+                cites: cite.sources(p),
                 domain: None,
             })
             .await?;
@@ -251,7 +251,7 @@ mod tests {
         assert!(b["messages"][0]["content"]
             .as_str()
             .unwrap()
-            .contains("librarian"));
+            .contains("curator"));
         let (p, _) = request("gemini", "gemini-2.5-flash", "x");
         assert_eq!(p, "v1beta/models/gemini-2.5-flash:generateContent");
     }

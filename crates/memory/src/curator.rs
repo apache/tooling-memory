@@ -1,9 +1,9 @@
-//! The librarian's first rung: a survey of the record and its telemetry that proposes
+//! The curator's first rung: a survey of the record and its telemetry that proposes
 //! curation, and files each proposal as a task for a cheap-model run to do with the
-//! memory server's own tools. The paper's librarian verifies stale facts, merges
+//! memory server's own tools. The paper's curator verifies stale facts, merges
 //! duplicates, writes and maintains the summaries the index serves, splits oversized
 //! files, and acts on telemetry: failed queries become authoring tasks. Everything here
-//! stays within the paper's containment: the librarian proposes, a task is born
+//! stays within the paper's containment: the curator proposes, a task is born
 //! proposed unless the domain admits its own filings, every curation write is an entry
 //! that `supersedes` another and deletes nothing, and the survey itself writes nothing.
 
@@ -33,11 +33,11 @@ pub enum Kind {
 impl Kind {
     fn title(self) -> &'static str {
         match self {
-            Kind::Resummarise => "Librarian: rewrite the summary of",
-            Kind::Merge => "Librarian: merge",
-            Kind::Verify => "Librarian: verify",
-            Kind::Split => "Librarian: split",
-            Kind::Author => "Librarian: write what was asked for and not found",
+            Kind::Resummarise => "Curator: rewrite the summary of",
+            Kind::Merge => "Curator: merge",
+            Kind::Verify => "Curator: verify",
+            Kind::Split => "Curator: split",
+            Kind::Author => "Curator: write what was asked for and not found",
         }
     }
 
@@ -150,7 +150,7 @@ fn under_root(p: &Path, root: &Path) -> Option<std::path::PathBuf> {
 
 /// Whether a source file changed after the entry was written: the source-change trigger.
 fn source_changed(e: &Entry, root: &Path) -> Option<(String, time::OffsetDateTime)> {
-    for s in &e.front.source {
+    for s in &e.front.cites {
         let Some(path) = source_file(s, root) else {
             continue;
         };
@@ -320,7 +320,7 @@ fn survey_entry(
         });
     }
     // a canary is planted to be left alone
-    if e.front.source.iter().any(|s| s == "canary") {
+    if e.front.cites.iter().any(|s| s == "canary") {
         return;
     }
     let changed = options
@@ -359,7 +359,7 @@ fn survey_entry(
 /// The task that has a curator check a stale entry and correct or re-date it.
 fn verify_body(id: &str) -> String {
     format!(
-        "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}`: its body says what holds now, and its `source` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If it holds, also call `promote` on the entry that write made, the id your `write` returned and not `{id}`, which it replaced, with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff that names the entry you wrote and the one it supersedes, and says what you found and how you know; keep that out of the entry, so whoever checks it judges it on its sources first."
+        "Read `{id}` with `get`. Check whether what it says still holds, against the record (`search`) and the working tree. If it holds, `write` it again unchanged with `supersedes: {id}` and a `review_by` a few months out. If it does not, write the corrected entry with `supersedes: {id}`: its body says what holds now, and its `cites` names what shows it, as `file:<path>` relative to the working tree or as an entry id. If it holds, also call `promote` on the entry that write made, the id your `write` returned and not `{id}`, which it replaced, with `to: verified` and one sentence of why: that files a proposal a person approves; you never promote to verified yourself. Leave a handoff that names the entry you wrote and the one it supersedes, and says what you found and how you know; keep that out of the entry, so whoever checks it judges it on its sources first."
     )
 }
 
@@ -407,7 +407,7 @@ fn authoring(root: &Path, out: &mut Vec<Proposal>) {
     }
 }
 
-/// File the proposals as tasks, one each, with `origin: librarian:<kind>` and a hash of
+/// File the proposals as tasks, one each, with `origin: curator:<kind>` and a hash of
 /// what they concern, so a survey run twice files each once. Returns the tasks' ids and
 /// how many were already there.
 ///
@@ -438,7 +438,7 @@ pub async fn file(
                 body: format!("{}\n\n_{}_", p.body, p.why),
                 requirements: Vec::new(),
                 depends_on: Vec::new(),
-                origin: Some(format!("librarian:{}", p.kind.name())),
+                origin: Some(format!("curator:{}", p.kind.name())),
                 upstream_event: Some(dm_core::digest(&subject)[..16].to_string()),
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
@@ -590,7 +590,7 @@ pub(crate) mod tests {
                 domain: "dom-t".into(),
                 author: "a".into(),
                 created: time::OffsetDateTime::now_utc() + time::Duration::seconds(5),
-                source: vec!["file:notes.md".into(), "transcript:/x.jsonl".into()],
+                cites: vec!["file:notes.md".into(), "transcript:/x.jsonl".into()],
                 confidence: None,
                 trust_tier: TrustTier::Raw,
                 review_by: None,
@@ -624,7 +624,7 @@ pub(crate) mod tests {
                 domain: "dom-t".into(),
                 author: "a".into(),
                 created: time::OffsetDateTime::now_utc(),
-                source: Vec::new(),
+                cites: Vec::new(),
                 confidence: None,
                 trust_tier: TrustTier::Raw,
                 review_by: Some(time::OffsetDateTime::now_utc().date() - time::Duration::days(1)),
@@ -736,7 +736,7 @@ pub(crate) mod tests {
     /// The rule both curation tasks that correct an entry follow: every sentence that asks
     /// for the reasoning sends it to the handoff or keeps it out; what the entry is told to
     /// hold carries no reasons; the task says to keep them out of the entry; the entry's
-    /// evidence is its `source`, in a form the librarian resolves; and the handoff names the
+    /// evidence is its `cites`, in a form the curator resolves; and the handoff names the
     /// entry written, so the reasoning can be found from it. A check on wording, so it
     /// catches the wordings it knows, and its own test lists them.
     pub(crate) fn reasoning_goes_to_the_handoff(body: &str) {
@@ -787,7 +787,7 @@ pub(crate) mod tests {
             "the task does not keep the reasons out of the entry: {body}"
         );
         assert!(
-            body.contains("`source`") && body.contains("`file:<path>`"),
+            body.contains("`cites`") && body.contains("`file:<path>`"),
             "the evidence and its form are not named: {body}"
         );
         assert!(

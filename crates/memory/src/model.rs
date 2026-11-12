@@ -4,7 +4,7 @@
 
 use serde_json::{json, Value};
 
-/// The default model per destination, small and cheap: a librarian's or a deputy's job.
+/// The default model per destination, small and cheap: a curator's or a deputy's job.
 #[must_use]
 pub fn default_model(destination: &str) -> &'static str {
     match destination {
@@ -96,7 +96,7 @@ pub fn request(destination: &str, model: &str, prompt: &str) -> (String, Value) 
 
 /// As [`request`], with the sampling pinned in the destination's own names: what the
 /// drift probes send, so a prompt is asked the same way on every run. Mining, the
-/// checker and the deputy keep the destination's defaults through [`request`].
+/// auditor and the deputy keep the destination's defaults through [`request`].
 #[must_use]
 pub fn request_sampled(
     destination: &str,

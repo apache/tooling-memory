@@ -660,7 +660,7 @@ mod tests {
                 domain: "dom-a".into(),
                 entry: id.into(),
                 tier: TrustTier::Curated,
-                by: "agent:librarian".into(),
+                by: "agent:curator".into(),
                 author: "human:test:me".into(),
                 why: format!("why {id} was promoted"),
                 classification: Label::Public,
