@@ -51,7 +51,7 @@ Three constraints follow and shape the rest of the design.
 
 **How to read this paper.** [§2](#2-the-design-at-a-glance) describes the whole design in two pages. [§3](#3-memory) to [§12](#12-surviving-long-timescales) take one part each and add detail, always starting from why it exists. [§13](#13-related-work) places the design in related work.
 
-The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full, and a glossary. [Appendix G](durable-memory-for-disposable-agents-appendix.md), in its own file, gives the evidence behind each property of the design and how strong it is. [Appendix H](durable-memory-for-disposable-agents-complexity.md), also in its own file, counts the parts of the design and says what each premise buys and costs. A companion case study, [*Seeding a Foundation*](seeding-a-foundation.md), applies the design to the Apache Software Foundation.
+The appendices hold the interface, the seeding plan, the ledger's exact semantics, the failure modes, the rules in full, and a glossary. [Appendix G](durable-memory-for-disposable-agents-appendix.md), in its own file, gives the evidence behind each property of the design and how strong it is. [Appendix H](durable-memory-for-disposable-agents-complexity.md), also in its own file, counts the parts of the design and says what each premise buys and costs. A one-page [poster](poster.html) draws the design and marks where a person decides. A companion case study, [*Seeding a Foundation*](seeding-a-foundation.md), applies the design to the Apache Software Foundation.
 
 ---
 
