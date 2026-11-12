@@ -141,21 +141,22 @@ impl Memory {
         domain: Option<&str>,
     ) -> Result<Vec<RuleInForce>, Error> {
         let domain = self.resolve_domain(domain)?;
-        let readable: Vec<String> = self
-            .list(None, Some(EntryType::Policy), 1000)
-            .await?
-            .into_iter()
-            .map(|h| h.id)
-            .collect();
+        // the policy entries this session may read; its label rises only to the rules
+        // whose text it is given
+        let readable = {
+            let f = self.filter_for(None)?;
+            let ix = self.index.lock().await;
+            ix.list(&f, Some(EntryType::Policy), 1000)?
+        };
         let p = self.policy();
-        let mut rules: Vec<RuleInForce> = p
+        let mut rules: Vec<(&str, RuleInForce)> = p
             .entries()
             .iter()
             .filter(|e| !e.meta.is_exception())
             .filter(|e| e.meta.layer < 3 || e.domain == domain)
             .filter(|e| live(p.state_of(e)))
             .map(|e| {
-                let withheld = !readable.contains(&e.entry_id);
+                let withheld = !readable.iter().any(|h| h.id == e.entry_id);
                 let text = |s: &str| {
                     if withheld {
                         String::new()
@@ -163,7 +164,7 @@ impl Memory {
                         s.to_string()
                     }
                 };
-                RuleInForce {
+                let rule = RuleInForce {
                     policy_id: e.meta.id.clone(),
                     layer: e.meta.layer,
                     rule: text(&e.meta.rule),
@@ -172,26 +173,38 @@ impl Memory {
                     checked: e.rego.is_some(),
                     owner: e.meta.owner.clone().filter(|_| !withheld),
                     withheld,
-                }
+                };
+                (e.entry_id.as_str(), rule)
             })
             .collect();
-        // an enforced entry of an id before an advisory one of the same id
-        rules.sort_by(|a, b| {
-            (a.layer, &a.policy_id, a.status != Status::Enforced).cmp(&(
-                b.layer,
+        // one row for an id: an enforced entry before an advisory one
+        rules.sort_by(|(_, a), (_, b)| {
+            (&a.policy_id, a.status != Status::Enforced, a.layer).cmp(&(
                 &b.policy_id,
                 b.status != Status::Enforced,
+                b.layer,
             ))
         });
-        rules.dedup_by(|a, b| a.policy_id == b.policy_id);
-        self.reads
-            .text("check_policy", &format!("{action} in {domain}"));
-        Ok(rules)
+        rules.dedup_by(|(_, a), (_, b)| a.policy_id == b.policy_id);
+        rules.sort_by(|(_, a), (_, b)| (a.layer, &a.policy_id).cmp(&(b.layer, &b.policy_id)));
+        let read: Vec<dm_index::Hit> = readable
+            .iter()
+            .filter(|h| rules.iter().any(|(entry, r)| *entry == h.id && !r.withheld))
+            .cloned()
+            .collect();
+        self.observe(&read);
+        self.reads.hits(
+            "check_policy",
+            Some(&format!("{action} in {domain}")),
+            &read,
+        );
+        Ok(rules.into_iter().map(|(_, r)| r).collect())
     }
 
-    /// The rule of a policy id: the entry in force when one is, so an entry nobody
-    /// reviewed that reuses the id does not speak for the rule. It is read as this
-    /// session, so a rule the session may not read is not found.
+    /// The rule of a policy id: the entry in force, or else a verified one. An entry
+    /// that nobody verified speaks for no rule, whatever id it carries, so a rule with
+    /// no verified entry is not found. It is read as this session, so a rule the
+    /// session may not read is not found either.
     async fn rule(&self, policy_id: &str) -> Result<(record::Entry, dm_core::Entry), Error> {
         let p = self.policy();
         let rank = |e: &record::Entry| match (p.state_of(e), e.tier) {
@@ -203,7 +216,7 @@ impl Memory {
         let found = p
             .entries()
             .iter()
-            .filter(|e| e.meta.id == policy_id && !e.meta.is_exception())
+            .filter(|e| e.meta.id == policy_id && !e.meta.is_exception() && rank(e) < 3)
             .min_by_key(|e| (rank(e), e.entry_id.clone()))
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("policy {policy_id}")))?;
@@ -227,12 +240,14 @@ impl Memory {
     /// no code fence, an expiry that is a time to come, and a task to hold for. Gives
     /// the task and the time of the check.
     fn exception_asked(&self, ask: &ExceptionRequest) -> Result<(String, OffsetDateTime), Error> {
-        if [&ask.scope, &ask.justification]
-            .iter()
-            .any(|words| words.contains("```") || words.contains("~~~"))
-        {
+        if [&ask.scope, &ask.justification].iter().any(|words| {
+            ["```", "~~~", "\n", "\r", "<"]
+                .iter()
+                .any(|mark| words.contains(mark))
+        }) {
             return Err(Error::Denied(
-                "the scope and the justification of an exception are words, with no code fence"
+                "the scope and the justification of an exception are words on one line, with \
+                 no code fence and no markup"
                     .into(),
             ));
         }
@@ -352,9 +367,15 @@ impl Memory {
         }
         let domain = entry.front.domain.clone();
         let origin = format!("{AMENDMENT_ORIGIN}{}", rule.meta.id);
-        for status in [dm_ledger::Status::Proposed, dm_ledger::Status::Open] {
-            let open = self.tasks(Some(&domain), status).await?;
-            if let Some(task) = open.into_iter().find(|t| {
+        // looked for on the ledger, by origin and filer: the session reads no other task
+        for status in [
+            dm_ledger::Status::Proposed,
+            dm_ledger::Status::Open,
+            dm_ledger::Status::Claimed,
+            dm_ledger::Status::Blocked,
+        ] {
+            let waiting = self.ledger.lock().await.list(&domain, status).await?;
+            if let Some(task) = waiting.into_iter().find(|t| {
                 t.spec.origin.as_deref() == Some(origin.as_str())
                     && t.spec.created_by == self.author
             }) {
@@ -414,9 +435,12 @@ impl Memory {
             .map(|p| p.spec.by);
         let approvals = format!("{}{}", crate::PROPOSAL_ORIGIN, rule.entry_id);
         let approved = l.list(&rule.domain, dm_ledger::Status::Done).await?;
+        // a done approval task whose entry is verified was approved: one that a person
+        // closed without approving left the entry where it was
+        let verified = entry.front.trust_tier == TrustTier::Verified;
         let approvers = approved
             .into_iter()
-            .filter(|t| t.spec.origin.as_deref() == Some(approvals.as_str()))
+            .filter(|t| verified && t.spec.origin.as_deref() == Some(approvals.as_str()))
             .filter_map(|t| t.holder);
         Ok(curators.chain(approvers).find(|by| is_person(by, owner)))
     }

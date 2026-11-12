@@ -298,7 +298,18 @@ pub fn with_status(body: &str, status: Status) -> Result<String, String> {
     let mut table: toml::Table = toml::from_str(block).map_err(|e| format!("policy block: {e}"))?;
     table.insert("status".into(), toml::Value::String(status.as_str().into()));
     let new = toml::to_string(&table).map_err(|e| format!("policy block: {e}"))?;
-    Ok(body.replacen(block, new.trim_end(), 1))
+    // the block itself, by where it is: the same text can stand earlier in the body
+    let at = block.as_ptr() as usize - body.as_ptr() as usize;
+    let out = format!(
+        "{}{}{}",
+        &body[..at],
+        new.trim_end(),
+        &body[at + block.len()..]
+    );
+    match parse("", dm_core::TrustTier::Raw, &out) {
+        Ok(e) if e.meta.status == Some(status) => Ok(out),
+        _ => Err("the policy block does not read back with the new status".into()),
+    }
 }
 
 /// The body of a policy entry: a heading, what a person reads, and the block.
@@ -496,6 +507,18 @@ mod tests {
         };
         assert!(v.enforced());
         assert!(parse("x", TrustTier::Raw, "no block").is_err());
+        // a new status goes into the block, wherever else its text stands in the body
+        let block = "id = \"pol-L2-031\"\nlayer = 2";
+        let twice = format!("```toml\n{block}\n```\n\n```policy\n{block}\n```\n");
+        let retired = with_status(&twice, Status::Retired).unwrap();
+        assert_eq!(
+            parse("x", TrustTier::Raw, &retired).unwrap().meta.status,
+            Some(Status::Retired)
+        );
+        assert!(
+            retired.starts_with(&format!("```toml\n{block}\n```")),
+            "{retired}"
+        );
         assert!(
             parse("x", TrustTier::Raw, &body("layer = 2", None)).is_err(),
             "no id"

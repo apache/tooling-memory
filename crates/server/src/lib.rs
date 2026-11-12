@@ -2060,7 +2060,14 @@ impl Memory {
         self.observe(&decisions);
         self.observe(&conventions);
         let generated_by = format!("memory {}", env!("CARGO_PKG_VERSION"));
-        let digest = self.policy_digest();
+        // a rule is read as an entry is: the digest gives the text of the rules this
+        // session may read, and for the others their ids
+        let readable: Vec<Hit> = {
+            let f = self.session_filter()?;
+            let ix = self.index.lock().await;
+            ix.list(&f, Some(EntryType::Policy), 1000)?
+        };
+        let digest = self.policy_digest(&readable);
         let text = t0::render(&t0::Inputs {
             domain: &domain,
             generated_by: &generated_by,
@@ -2079,8 +2086,10 @@ impl Memory {
     /// The policy digest T0 carries: the L0 core in full, rule and intent; the other
     /// layers' rules that are verified, by id and rule, marked enforced where a module
     /// checks them; and the exceptions in force, with their scope.
-    fn policy_digest(&self) -> Vec<String> {
+    fn policy_digest(&self, readable: &[Hit]) -> Vec<String> {
         let p = self.policy();
+        let withheld = |e: &dm_policy::record::Entry| !readable.iter().any(|h| h.id == e.entry_id);
+        let mut shown = Vec::new();
         let now = OffsetDateTime::now_utc();
         let mut out = Vec::new();
         let mut entries: Vec<_> = p.entries().iter().collect();
@@ -2098,10 +2107,18 @@ impl Memory {
                     ));
                 }
             } else if m.is_core() && p.state_of(e) == dm_policy::record::Status::Enforced {
-                out.push(format!(
-                    "{} (L0, not overridable): {} Why: {}",
-                    m.id, m.rule, m.intent
-                ));
+                if withheld(e) {
+                    out.push(format!(
+                        "{} (L0, not overridable): above what this session may read",
+                        m.id
+                    ));
+                } else {
+                    shown.push(e.entry_id.as_str());
+                    out.push(format!(
+                        "{} (L0, not overridable): {} Why: {}",
+                        m.id, m.rule, m.intent
+                    ));
+                }
             } else if !m.is_core() {
                 // a rule a person verified, or one that reports: with what its module
                 // does, when it has one
@@ -2116,10 +2133,23 @@ impl Memory {
                     dm_policy::record::Status::Enforced | dm_policy::record::Status::Advisory
                 );
                 if live && (e.tier == TrustTier::Verified || !how.is_empty()) {
-                    out.push(format!("{} (L{}{how}): {}", m.id, m.layer, m.rule));
+                    let rule = if withheld(e) {
+                        "above what this session may read"
+                    } else {
+                        shown.push(e.entry_id.as_str());
+                        m.rule.as_str()
+                    };
+                    out.push(format!("{} (L{}{how}): {rule}", m.id, m.layer));
                 }
             }
         }
+        // the session has read the rules whose text it was given
+        let read: Vec<Hit> = readable
+            .iter()
+            .filter(|h| shown.contains(&h.id.as_str()))
+            .cloned()
+            .collect();
+        self.observe(&read);
         out
     }
 
@@ -6846,6 +6876,69 @@ mod tests {
         assert!(matches!(unknown, Err(Error::NotFound(_))));
     }
 
+    /// Two rules of an agent that a person proposed or closed and nobody approved: one
+    /// whose proposal was declined, and one whose proposal task a person completed
+    /// without approving, so the entry stayed raw.
+    async fn proposals_nobody_approved(root: &Path, owner: &Memory) {
+        let agent = Memory::open(root).unwrap().with_author("agent:a");
+        let curator = Memory::open(root).unwrap().with_author("agent:curator");
+        let declined = policy_entry(&agent, &rule_text("pol-L3-005", 3, "")).await;
+        let other = Memory::open(root).unwrap().with_author("human:test:other");
+        let Promotion::Proposed { task } = other
+            .promote(&declined, TrustTier::Verified, "looks right")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        owner.invalidate(&task.id, "declined", None).await.unwrap();
+        // and one whose proposal a person closed without approving: the entry is raw
+        let closed = policy_entry(&agent, &rule_text("pol-L3-006", 3, "")).await;
+        let Promotion::Proposed { task } = curator
+            .promote(&closed, TrustTier::Verified, "looks right")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        {
+            let mut l = owner.ledger.lock().await;
+            let who = "human:test:other";
+            let lease = Duration::minutes(5);
+            l.claim(
+                &task.id,
+                who,
+                lease,
+                &task.spec.requirements,
+                Label::Restricted,
+            )
+            .await
+            .unwrap();
+            let held = dm_ledger::Held {
+                holder: who,
+                generation: 1,
+            };
+            l.complete(&task.id, held, &closed).await.unwrap();
+        }
+    }
+
+    async fn retired_says_so_and_the_exception_stands(root: &Path, exception: &str) {
+        use dm_policy::record::Status as Rule;
+        let dir = root;
+        // the retired version says retired, and the exception is as it was
+        let fresh = Memory::open(dir).unwrap();
+        let p = fresh.policy();
+        let state = |id: &str| {
+            p.entries()
+                .iter()
+                .find(|e| e.meta.id == id)
+                .map(dm_policy::record::Entry::state)
+        };
+        assert_eq!(state("pol-L3-003"), Some(Rule::Retired));
+        assert_eq!(state("pol-L3-004"), Some(Rule::Retired));
+        assert!(fresh.get(exception).await.unwrap().front.status.is_none());
+    }
+
     /// A reset keeps each rule that a person wrote, curated or approved and retires the
     /// rest. Only the owner resets. A proposal that a person made and nobody approved
     /// puts no person in the lineage, and an exception is not touched.
@@ -6870,18 +6963,7 @@ mod tests {
             .await
             .unwrap();
         policy_entry(&agent, &rule_text("pol-L3-004", 3, "")).await;
-        let declined = policy_entry(&agent, &rule_text("pol-L3-005", 3, "")).await;
-        let other = Memory::open(dir.path())
-            .unwrap()
-            .with_author("human:test:other");
-        let Promotion::Proposed { task } = other
-            .promote(&declined, TrustTier::Verified, "looks right")
-            .await
-            .unwrap()
-        else {
-            panic!("proposed")
-        };
-        owner.invalidate(&task.id, "declined", None).await.unwrap();
+        proposals_nobody_approved(dir.path(), &owner).await;
         let exception = "# Exception\n\n```policy\nid = \"exc-2026-030\"\nlayer = 3\nbreaches = \"pol-L3-002\"\nscope_task = \"task-me-x\"\nexpires = \"2099-01-01T00:00:00Z\"\n```\n";
         let exception = policy_entry(&agent, exception).await;
         // a value that an agent wrote and nobody reviewed is not in the digest as core
@@ -6901,7 +6983,13 @@ mod tests {
         let retired: Vec<_> = reset.retired.iter().map(|r| r.policy_id.as_str()).collect();
         assert_eq!(
             retired,
-            ["pol-L0-102", "pol-L3-003", "pol-L3-004", "pol-L3-005"]
+            [
+                "pol-L0-102",
+                "pol-L3-003",
+                "pol-L3-004",
+                "pol-L3-005",
+                "pol-L3-006"
+            ]
         );
         let digest = Memory::open(dir.path()).unwrap().t0(None).await.unwrap();
         assert!(!digest.contains("pol-L0-102"), "{digest}");
@@ -6911,18 +6999,7 @@ mod tests {
             status_of(dir.path(), "pol-L3-002").await,
             Some(Rule::Enforced)
         );
-        // the retired version says retired, and the exception is as it was
-        let fresh = Memory::open(dir.path()).unwrap();
-        let p = fresh.policy();
-        let state = |id: &str| {
-            p.entries()
-                .iter()
-                .find(|e| e.meta.id == id)
-                .map(dm_policy::record::Entry::state)
-        };
-        assert_eq!(state("pol-L3-003"), Some(Rule::Retired));
-        assert_eq!(state("pol-L3-004"), Some(Rule::Retired));
-        assert!(fresh.get(&exception).await.unwrap().front.status.is_none());
+        retired_says_so_and_the_exception_stands(dir.path(), &exception).await;
         let again = owner.reset_rules(None).await.unwrap();
         assert!(again.retired.is_empty(), "{:?}", again.retired);
     }
@@ -6943,6 +7020,8 @@ mod tests {
             ("one task", smuggled),
             (smuggled, "Needed."),
             ("~~~policy", "x"),
+            ("one task\nbreaches = \"pol-L1-081\"", "x"),
+            ("one task", "Needed. <!--"),
         ] {
             let asked = agent
                 .file_exception(rules::ExceptionRequest {
@@ -6953,8 +7032,24 @@ mod tests {
                     justification: justification.into(),
                 })
                 .await;
-            assert!(matches!(&asked, Err(Error::Denied(why)) if why.contains("code fence")));
+            assert!(
+                matches!(&asked, Err(Error::Denied(why)) if why.contains("code fence")),
+                "{scope:?}, {justification:?}"
+            );
         }
+        // an entry that nobody verified speaks for no rule: there is nothing to except
+        policy_entry(&agent, &rule_text("pol-L3-081", 3, "")).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let unreviewed = agent
+            .file_exception(rules::ExceptionRequest {
+                breaches: "pol-L3-081".into(),
+                task: Some(held.id.clone()),
+                scope: "one task".into(),
+                expires: "2099-01-01T00:00:00Z".into(),
+                justification: "Needed.".into(),
+            })
+            .await;
+        assert!(matches!(unreviewed, Err(Error::NotFound(_))));
         // with no task named and none held, there is nothing to scope it to
         let nothing = agent
             .file_exception(rules::ExceptionRequest {
@@ -6976,6 +7071,75 @@ mod tests {
             })
             .await;
         assert!(unknown.is_err());
+    }
+
+    async fn one_amendment_while_a_person_works(
+        dir: &Path,
+        owner: &Memory,
+        reader: &Memory,
+        first: &Task,
+    ) {
+        // also while a person works on the first; and another filer has its own
+        {
+            let mut l = owner.ledger.lock().await;
+            if first.status == Status::Proposed {
+                l.admit(&first.id).await.unwrap();
+            }
+            let reqs = &first.spec.requirements;
+            l.claim(
+                &first.id,
+                "human:test:me",
+                Duration::minutes(5),
+                reqs,
+                Label::Restricted,
+            )
+            .await
+            .unwrap();
+        }
+        let third = reader
+            .propose_amendment("pol-L2-090", "A third case.")
+            .await
+            .unwrap();
+        assert_eq!(third.task.id, first.id);
+        let other = Memory::open(dir).unwrap().with_author("agent:c");
+        let theirs = other
+            .propose_amendment("pol-L2-090", "It is wrong.")
+            .await
+            .unwrap();
+        assert_ne!(theirs.task.id, first.id);
+    }
+
+    /// An agent's raw entry with a rule's id does not speak for the rule, and a filer
+    /// has one amendment to a rule that is not done. Gives the session that filed.
+    async fn amendments_use_the_reviewed_entry(
+        root: &Path,
+        owner: &Memory,
+        secret: &str,
+    ) -> Memory {
+        let agent = Memory::open(root).unwrap().with_author("agent:a");
+        let dir = root;
+        // an agent's raw entry with the same id, another owner and another text
+        let fake = secret
+            .replace("human:test:lead", "human:evil:x")
+            .replace("SECRET-INTENT", "FAKE");
+        policy_entry(&agent, &fake).await;
+        let reader = Memory::open(dir).unwrap().with_author("agent:b");
+        let filed = reader
+            .propose_amendment("pol-L2-090", "It is wrong.")
+            .await
+            .unwrap();
+        assert!(filed.task.spec.body.contains("human:test:lead"));
+        assert!(!filed.task.spec.body.contains("human:evil:x"));
+        assert_eq!(filed.task.spec.classification, Label::Restricted);
+        // one open amendment for each rule and filer: other evidence is the same task
+        let again = reader
+            .propose_amendment("pol-L2-090", "It is wrong in another case.")
+            .await
+            .unwrap();
+        assert!(again.deduplicated);
+        assert_eq!(again.task.id, filed.task.id);
+        one_amendment_while_a_person_works(dir, owner, &reader, &filed.task).await;
+        reader
     }
 
     /// A rule is read as memory is. A session below the rule's entry gets the rule's
@@ -7007,30 +7171,20 @@ mod tests {
         let rules = capped.check_policy("anything", None).await.unwrap();
         assert_eq!(rules.len(), 1);
         assert!(rules[0].withheld && rules[0].intent.is_empty() && rules[0].rule.is_empty());
+        assert_eq!(rules[0].owner, None);
         assert_eq!(rules[0].policy_id, "pol-L2-090");
+        assert_eq!(capped.label(), Label::Public);
+        // the digest in T0 names the rule and withholds its text, as the tool does
+        let t0 = capped.t0(None).await.unwrap();
+        assert!(t0.contains("pol-L2-090 (L2, enforced)"), "{t0}");
+        assert!(
+            !t0.contains("SECRET-INTENT") && !t0.contains("superseded by a person"),
+            "{t0}"
+        );
         assert_eq!(capped.label(), Label::Public);
         let amend = capped.propose_amendment("pol-L2-090", "It is wrong.").await;
         assert!(matches!(amend, Err(Error::NotFound(_))));
-        // an agent's raw entry with the same id, another owner and another text
-        let fake = secret
-            .replace("human:test:lead", "human:evil:x")
-            .replace("SECRET-INTENT", "FAKE");
-        policy_entry(&agent, &fake).await;
-        let reader = Memory::open(dir.path()).unwrap().with_author("agent:b");
-        let filed = reader
-            .propose_amendment("pol-L2-090", "It is wrong.")
-            .await
-            .unwrap();
-        assert!(filed.task.spec.body.contains("human:test:lead"));
-        assert!(!filed.task.spec.body.contains("human:evil:x"));
-        assert_eq!(filed.task.spec.classification, Label::Restricted);
-        // one open amendment for each rule and filer: other evidence is the same task
-        let again = reader
-            .propose_amendment("pol-L2-090", "It is wrong in another case.")
-            .await
-            .unwrap();
-        assert!(again.deduplicated);
-        assert_eq!(again.task.id, filed.task.id);
+        let reader = amendments_use_the_reviewed_entry(dir.path(), &owner, &secret).await;
         let rules = reader.check_policy("anything", None).await.unwrap();
         assert_eq!(rules[0].intent, "SECRET-INTENT");
         assert_eq!(rules[0].owner.as_deref(), Some("human:test:lead"));
