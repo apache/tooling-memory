@@ -583,9 +583,10 @@ impl Db {
         let Some(s) = self.schema(domain).await? else {
             return Ok(None);
         };
-        let claimable_now =
-            "(status IN ('open', 'blocked') OR (status = 'claimed' AND lease_until < $1))";
-        let now_text = crate::fmt_time(now);
+        // every task that may be claimable. Whether a claimed one's lease has run out is
+        // asked of the parsed time: as text, a time with fewer digits of a second sorts
+        // after a later one with more
+        let claimable_now = "status IN ('open', 'blocked', 'claimed')";
         let tx = self.client.transaction().await?;
         let rows = tx
             .query(
@@ -593,7 +594,7 @@ impl Db {
                     "SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE {claimable_now}
                      ORDER BY priority DESC, created"
                 ),
-                &[&now_text],
+                &[],
             )
             .await?;
         for row in &rows {
@@ -604,10 +605,10 @@ impl Db {
             let Some(locked) = tx
                 .query_opt(
                     &format!(
-                        "SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $2 AND {claimable_now}
+                        "SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $1 AND {claimable_now}
                          FOR UPDATE SKIP LOCKED"
                     ),
-                    &[&now_text, &seen.id],
+                    &[&seen.id],
                 )
                 .await?
             else {

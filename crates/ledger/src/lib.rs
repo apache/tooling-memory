@@ -1731,6 +1731,7 @@ mod tests {
     }
 
     on_both! {
+        a_lease_that_ran_out_half_a_second_ago_is_lost_to_claim_next,
         a_dependent_in_another_domain_is_opened_and_retriaged_too,
         a_blocked_task_whose_dependencies_are_done_is_claimable_whatever_its_state_says,
         a_task_closed_by_its_continuation_opens_what_waited_on_it,
@@ -2133,6 +2134,19 @@ mod tests {
             open.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
             [id.as_str()]
         );
+    }
+
+    /// The lease ends on a whole second and the clock stands a half second after: the two
+    /// times, as text, sort the other way.
+    async fn a_lease_that_ran_out_half_a_second_ago_is_lost_to_claim_next(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Long job")).await;
+        claim(&mut l, &t.id, "s1", mins(5)).await.unwrap();
+        *now.lock().unwrap() = T0 + mins(5) - Duration::milliseconds(500);
+        assert!(next(&mut l, "s2", mins(5)).await.is_none(), "still held");
+        *now.lock().unwrap() = T0 + mins(5) + Duration::milliseconds(500);
+        let c = next(&mut l, "s2", mins(5)).await.unwrap();
+        assert_eq!((c.task.id.as_str(), c.generation), (t.id.as_str(), 2));
     }
 
     fn is_fenced<T>(r: &Result<T, Error>, given: u64, current: u64) -> bool {
