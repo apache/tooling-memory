@@ -27,60 +27,77 @@ read_one=$(a list --kind decision --limit 3 | j "d[-1]['id']")
 agent agent:reader batch "[{\"tool\": \"get\", \"arguments\": {\"id\": \"$read_one\"}}, {\"tool\": \"write\", \"arguments\": {\"title\": \"Drawn from what I read\", \"body\": \"A conclusion drawn from the decision just read.\"}}]" >/dev/null
 a taint "$read_one" | j "f\"  {d['id']}: read by {len(d['readers'])} session(s), who wrote {d['written']} after reading it\""
 
-say "Policy is memory" "A rule written as an entry, with a Rego module. While it is raw it is inert; once an agent proposes it and the owner approves it for verified, it is enforced, and a write it forbids is held."
-rule=$(a write --kind policy --title "pol-L2-031 Decisions are superseded by a person" <<'POL' | j "d['id']"
+say "Policy is memory" "A rule is an entry, with an owner, a review date and a Rego module. A rule written after an incident enters as advisory. It is in a decision only once a person verified it, and each step up is a version that a person verifies."
+rule_text() { cat <<POL
 # Decisions are superseded by a person, not an agent
 
-```policy
+\`\`\`policy
 id = "pol-L2-031"
 layer = 2
 rule = "Decisions are superseded by a person, not an agent."
 intent = "An agent rewrote a standing decision mid-task; the why outlives the what."
-```
+owner = "human:demo:practice-lead"
+status = "$1"
+review_by = "2027-06-30"
+\`\`\`
 
-```rego
+\`\`\`rego
 package amem.rules
 import rego.v1
-deny contains {"policy": "pol-L2-031", "reason": "an agent superseded a decision"} if {
+deny contains {"policy": "pol-L2-031", "reason": "an agent superseded a decision", "code": "decision-by-agent", "remedy": "propose the change to the owner of the decision, or file an exception for the task"} if {
 	input.principal.class == "agent"
 	input.write.supersedes_type == "decision"
 }
-```
-POL
-)
-a policy list | j "'\n'.join(f\"  {p['id']}  L{p['layer']}  {p['tier']:<8}  {'enforced' if p['enforced'] else 'inert'}  {p['rule']}\" for p in d['policies'])"
-d1=$(a write --kind decision --title "Laptops run SQLite" --body "The ledger runs on SQLite on a laptop." | j "d['id']")
-echo "  while it is raw, an agent may still supersede a decision:"
-d2=$(agent agent:a write "{\"title\": \"Laptops run Postgres\", \"body\": \"The ledger runs on Postgres.\", \"entry_type\": \"decision\", \"supersedes\": \"$d1\"}" | j "d['id']")
-echo "  $d2 replaced $d1"
-proposal=$(agent agent:curator promote "{\"id\": \"$rule\", \"to\": \"verified\", \"why\": \"the incident record supports it\"}" | j "d['task']['id']")
-a approve "$proposal" >/dev/null
-echo "  an agent proposed it for verified and the owner approved; now it is enforced:"
-a policy list | j "'\n'.join(f\"  {p['id']}  {p['tier']}  {'enforced' if p['enforced'] else 'inert'}\" for p in d['policies'])"
-agent agent:a write "{\"title\": \"Laptops run files\", \"body\": \"Plain files.\", \"entry_type\": \"decision\", \"supersedes\": \"$d2\"}" | sed 's/^/  /' || true
-
-say "An exception" "A rule can be excepted for one task, until a date, and only once a person approves the exception. Every session loads the policy digest with T0, so the exception is visible, not hidden."
-held=$(a task create "Replace the laptop decision" --domain dom-demo --body "The task is to replace it." | j "d['id']")
-exc=$(a write --kind policy --title "exc-2026-001 The laptop decision task" <<POL | j "d['id']"
-# An exception to pol-L2-031 for one task
-
-\`\`\`policy
-id = "exc-2026-001"
-layer = 2
-breaches = "pol-L2-031"
-scope_task = "$held"
-expires = "2026-12-31T00:00:00Z"
-intent = "The task exists to replace that decision."
 \`\`\`
 POL
-)
-a approve "$(agent agent:curator promote "{\"id\": \"$exc\", \"to\": \"verified\", \"why\": \"scoped to one task\"}" | j "d['task']['id']")" >/dev/null
-echo "  holding $held, the agent may:"
-agent agent:a write "{\"title\": \"Laptops run files\", \"body\": \"Plain files.\", \"entry_type\": \"decision\", \"supersedes\": \"$d2\"}" "$held" | j "f\"  wrote {d['id']}\"" || true
+}
+verified() { a approve "$(agent agent:curator promote "{\"id\": \"$1\", \"to\": \"verified\", \"why\": \"$2\"}" | j "d['task']['id']")" >/dev/null; }
+rules() { a policy list | j "'\n'.join(f\"  {p['id']}  L{p['layer']}  {p['tier']:<8}  {p['status']:<9}  {p['rule']}\" for p in d['policies'])"; }
+rule=$(rule_text advisory | a write --kind policy --title "pol-L2-031 Decisions are superseded by a person" | j "d['id']")
+rules
+d1=$(a write --kind decision --title "Laptops run SQLite" --body "The ledger runs on SQLite on a laptop." | j "d['id']")
+echo "  while it is proposed, it is in no decision, and an agent supersedes a decision:"
+d2=$(agent agent:a write "{\"title\": \"Laptops run Postgres\", \"body\": \"The ledger runs on Postgres.\", \"entry_type\": \"decision\", \"supersedes\": \"$d1\"}" | j "d['id']")
+echo "  $d2 replaced $d1"
+verified "$rule" "the incident record supports it"
+echo "  an agent proposed it for verified and the owner approved; now it is advisory. It reports, and it refuses nothing:"
+rules
+d3=$(agent agent:a write "{\"title\": \"Laptops run DuckDB\", \"body\": \"The ledger runs on DuckDB.\", \"entry_type\": \"decision\", \"supersedes\": \"$d2\"}" | j "d['id']")
+grep '"action":"write"' "$root/state/decisions.jsonl" | tail -1 | j "f\"  the decision log: write allowed; would refuse: {', '.join(x['policy'] + ' (' + x.get('code', '') + ')' for x in d['advisories'])}\""
+rule=$(rule_text enforced | a write --kind policy --title "pol-L2-031 Decisions are superseded by a person" --supersedes "$rule" | j "d['id']")
+echo "  the owner writes the version that says enforced; until a person verifies that version, it is proposed:"
+rules
+verified "$rule" "one month as advisory, and each report was a real case"
+echo "  verified; now it is enforced:"
+rules
+echo "  the refusal names the rule, a reason code and what would pass:"
+agent agent:a write "{\"title\": \"Laptops run files\", \"body\": \"Plain files.\", \"entry_type\": \"decision\", \"supersedes\": \"$d3\"}" | sed 's/^/  /' || true
+
+say "Before an action that cannot be taken back" "An agent asks which rules are in force, and reads each rule with its intent. An agent that finds a rule wrong in the case before it proposes an amendment: a task for the rule's owner, with the evidence."
+agent agent:a check_policy "{\"action\": \"supersede a decision\"}" | j "'\n'.join(f\"  {r['policy_id']}  L{r['layer']}  {r['status']}: {r['rule']} Why: {r['intent']}\" for r in d['rules'])"
+agent agent:a propose_amendment "{\"policy_id\": \"pol-L2-031\", \"evidence\": \"$d3 is the agent's own decision of an hour ago; the rule refuses its author a correction.\"}" | j "f\"  {d['task']['id']}  {d['task']['title']}, for a person: {d['task']['requirements']}\""
+
+say "An exception" "A rule can be excepted for one task, until an expiry, and only once a person approves the exception. The agent asks; the approver is the rule's owner. Every session loads the policy digest with T0, so the exception is visible, not hidden."
+held=$(a task create "Replace the laptop decision" --domain dom-demo --body "The task is to replace it." | j "d['id']")
+exception=$(agent agent:a file_exception "{\"breaches\": \"pol-L2-031\", \"task\": \"$held\", \"scope\": \"the one replacement this task exists for\", \"expiry\": \"2027-12-31T00:00:00Z\", \"justification\": \"The task exists to replace that decision.\"}")
+printf '%s' "$exception" | j "f\"  {d['exception']['policy_id']} filed, to be approved by {d['exception']['approver']}\""
+echo "  until a person approves it, the task is still refused:"
+agent agent:a write "{\"title\": \"Laptops run files\", \"body\": \"Plain files.\", \"entry_type\": \"decision\", \"supersedes\": \"$d3\"}" "$held" | sed 's/^/  /' | cut -c1-160 || true
+a approve "$(printf '%s' "$exception" | j "d['exception']['task']['id']")" >/dev/null
+echo "  approved; holding $held, the agent may:"
+agent agent:a write "{\"title\": \"Laptops run files\", \"body\": \"Plain files.\", \"entry_type\": \"decision\", \"supersedes\": \"$d3\"}" "$held" | j "f\"  wrote {d['id']}\"" || true
 echo "  the policy digest every session loads first, in T0:"
 a t0 | sed -n '/## Policy digest/,/## Pointers/p' | sed '$d' | sed 's/^/  /'
-say "The lint" "Each rule and exception with how often it refused and let through, counted from the decision log, so a rule nobody hits or an exception everybody uses shows up."
-a policy lint | j "'\n'.join([f\"  {f['policy']}: {f['kind']}\" for f in d['findings']] + [f\"  {r['id']}: refused {r['refused']}, let through {r['let_through']}\" for r in d['rates']])"
+
+say "A reset" "Rules are cheapest to add when something has just gone wrong. When the stack has grown past use, the owner retires in one step every rule that no person wrote or promoted, and keeps the rest."
+agent agent:a write "{\"title\": \"pol-L3-900 No writes on a Friday\", \"entry_type\": \"policy\", \"body\": \"# No writes on a Friday\n\n\`\`\`policy\nid = \\\"pol-L3-900\\\"\nlayer = 3\nrule = \\\"No entry is written on a Friday.\\\"\nintent = \\\"A write on a Friday went wrong once.\\\"\nstatus = \\\"enforced\\\"\n\`\`\`\n\"}" >/dev/null
+agent agent:curator promote "{\"id\": \"$(a policy list | j "[p['entry'] for p in d['policies'] if p['id'] == 'pol-L3-900'][0]")\", \"to\": \"curated\", \"why\": \"it parses\"}" >/dev/null
+rules
+a policy reset --domain dom-demo | j "'\n'.join([f\"  kept {k['policy_id']}: {k['person']} is in its lineage\" for k in d['kept']] + [f\"  retired {r}\" for r in d['retired']])"
+rules
+
+say "The lint" "Each rule and exception with how often it refused, let through and advised, counted from the decision log, so a rule nobody hits or an exception everybody uses shows up. A rule past its review date, a rule without an owner and an enforced rule that no decision cites are findings for the owner."
+a policy lint | j "'\n'.join([f\"  {f['policy']}: {f['kind']}\" for f in d['findings']] + [f\"  {r['id']}: refused {r['refused']}, let through {r['let_through']}, advised {r['advised']}\" for r in d['rates']])"
 
 if gateway; then
   say "Spend limits" "A budget per destination and session in the grants. The egress, the only way out, checks what the session has spent before each model call leaves: the call that crosses the limit still goes, the next one is refused."

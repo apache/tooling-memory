@@ -123,9 +123,12 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Approval events.** An approval is the completion of a promotion task. It has no
   scope and no expiry, and the perimeter does not check it when an action runs. There is
   no `declassify` and no guard.
-- **The rule lifecycle.** A rule is enforced when a person verified it and it has a
-  module. A rule has no status, no owner who is a person, and no review date that the
-  policy uses. There is no ceiling on rules, no reset, and no `check_policy` tool.
+- **The rule lifecycle, in part.** `check_policy` gives all the rules in force for a
+  domain. It does not select rules by the action. The lint reports a rule after its
+  review date and an unused rule, from the full decision log and not from one review
+  period. The approver of an exception is a name in the answer. `amem` does not check
+  that this person approves. The order of rules under the ceiling is the order of their
+  ids. While the next version of a rule waits for its review, the rule is in no decision.
 - **Lineage, in part.** An entry does not record its session. `amem taint` compares the
   time of a read with the time of a later write, and it goes forward only. Reads and
   sends are not in the event log. A write that the scan refuses is a file under `state/`,

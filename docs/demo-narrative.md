@@ -76,7 +76,7 @@ offline.
 - **Egress**: the only way out to a model. Every model call goes through it, from a
   harness or from the system itself, on to the model's provider or the gateway. The
   egress checks, logs and meters each call. Web fetches do not go through it. They leave
-  through the memory server's own fetch tool (3.9).
+  through the memory server's own fetch tool (3.11).
 - **Harness**: the agent program that a model works in, such as Claude Code or Codex.
 - **Gateway**: llm.apache.org, the Foundation's LLM gateway. It serves the open models
   in this demo.
@@ -90,7 +90,7 @@ offline.
   (act 8).
 - **Tap**: a component that connects to an outside system. It runs as a WebAssembly
   component, and it can reach only what its grant names. The fetch tool in
-  3.9 is a tap. The GitHub tap in act 9 is another.
+  3.11 is a tap. The GitHub tap in act 9 is another.
 - **Event log**: every write and erasure in order, by id and digest, never a body. The
   index can be rebuilt from the event log and the record (act 10).
 - **Bundle**: entries exported at or below a label, as Markdown and a manifest, for
@@ -185,24 +185,42 @@ it, and what did they write after? Here `agent:reader` read one and wrote a note
 the list shows the note.
 
 **3.5 Policy is memory.** A rule written as an entry: a person, not an agent, supersedes
-decisions. While the rule is raw, it does nothing, and `agent:a` supersedes a decision.
-After you verify the rule, the policy holds the same kind of write.
+decisions. The rule has an owner and a review date. Its block says `advisory`, as for a
+rule that someone writes after an incident. The rule goes up one step at each review:
 
-**3.6 An exception.** You approve an exception for one task, until a set date. Every
-session sees it in T0.
+- While the rule is raw, it is proposed. It does nothing, and `agent:a` supersedes a
+  decision.
+- After you verify the rule, it is advisory. `agent:a` supersedes a decision again. The
+  decision log says that the rule would refuse that write.
+- You write the version of the rule that says `enforced`. Until you verify that version,
+  the rule is proposed again.
+- After you verify that version, the rule is enforced. The policy holds the same kind of
+  write. The refusal gives the rule, a reason code and what would pass.
 
-**3.7 The lint.** This shows how often each rule blocked or allowed something.
+**3.6 Before an action.** `agent:a` asks which rules are in force, and gets each rule
+with its intent. Then `agent:a` proposes an amendment to the rule. The amendment is a
+task for a person, and it names the owner of the rule.
 
-**3.8 Spend limits.** For this step, the egress gives the auditor a spend limit of 400
+**3.7 An exception.** `agent:a` asks for an exception for one task, until a set time.
+The task is still refused. You approve the exception, and then the task goes through.
+Every session sees the exception in T0.
+
+**3.8 A reset.** `agent:a` writes a rule, and `agent:curator` promotes it to curated. No
+person wrote or promoted that rule. You reset the rules of the domain. The reset retires that rule.
+It keeps the rule that you verified.
+
+**3.9 The lint.** This shows how often each rule blocked, allowed or advised something.
+
+**3.10 Spend limits.** For this step, the egress gives the auditor a spend limit of 400
 tokens at the gateway. The call that goes over the limit still goes out. The egress
 refuses the next call. By then, more than 550 tokens are spent.
 
-**3.9 Fetch.** `agent:reader` fetches web pages through memory. No grant names
+**3.11 Fetch.** `agent:reader` fetches web pages through memory. No grant names
 example.com. After `agent:reader` has read internal entries, it can reach only trusted
 hosts, because a URL could leak what it read. The repeated fetch comes from the stored
 copy. Nothing leaves.
 
-**3.10 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
+**3.12 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
 finds one hit. Your own search reaches the cap of 50 results.
 
 ## Act 4 · The task fabric

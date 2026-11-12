@@ -44,6 +44,7 @@ pub mod prefetch;
 pub mod projection;
 pub mod reads;
 pub mod recall;
+pub mod rules;
 pub mod sources;
 pub mod t0;
 pub mod tape;
@@ -233,7 +234,9 @@ fn policy_entries(ix: &Index, root: &Path, grants: &Grants) -> Vec<dm_policy::re
                 .join(&h.domain)
                 .join(format!("{}.md", h.id));
             let entry = Entry::parse(&std::fs::read_to_string(path).ok()?).ok()?;
-            dm_policy::record::parse(&h.id, h.trust_tier, &entry.body).ok()
+            let mut rule = dm_policy::record::parse(&h.id, h.trust_tier, &entry.body).ok()?;
+            rule.domain = h.domain;
+            Some(rule)
         })
         .collect()
 }
@@ -561,6 +564,8 @@ impl Memory {
                 ),
                 policy: self.policy().version().to_string(),
                 cites: Vec::new(),
+                denials: Vec::new(),
+                advisories: Vec::new(),
             },
         );
         Ok(self.scope.get_or_init(|| f).clone())
@@ -678,6 +683,8 @@ impl Memory {
             "reason": d.reason,
             "policy": d.policy,
             "cites": d.cites,
+            "denials": d.denials,
+            "advisories": d.advisories,
             "held_task": input.held_task,
         });
         reads::append_line(&self.root.join("state/decisions.jsonl"), &line.to_string());
@@ -1982,14 +1989,27 @@ impl Memory {
                         m.expires.as_deref().unwrap_or("?")
                     ));
                 }
-            } else if m.layer == 0 {
+            } else if m.is_core() {
                 out.push(format!(
                     "{} (L0, not overridable): {} Why: {}",
                     m.id, m.rule, m.intent
                 ));
-            } else if e.tier == TrustTier::Verified {
-                let how = if e.enforced() { ", enforced" } else { "" };
-                out.push(format!("{} (L{}{how}): {}", m.id, m.layer, m.rule));
+            } else {
+                // a rule a person verified, or one that reports: with what its module
+                // does, when it has one
+                let state = p.state_of(e);
+                let how = match (state, e.rego.is_some()) {
+                    (dm_policy::record::Status::Enforced, true) => ", enforced",
+                    (dm_policy::record::Status::Advisory, true) => ", advisory",
+                    _ => "",
+                };
+                let live = matches!(
+                    state,
+                    dm_policy::record::Status::Enforced | dm_policy::record::Status::Advisory
+                );
+                if live && (e.tier == TrustTier::Verified || !how.is_empty()) {
+                    out.push(format!("{} (L{}{how}): {}", m.id, m.layer, m.rule));
+                }
             }
         }
         out
@@ -6381,6 +6401,254 @@ mod tests {
             "{t0}"
         );
         an_exception_lets_one_task_through(dir.path(), &owner, &agent, &d2).await;
+    }
+
+    /// A rule whose block says enforced, with a module that gives a code and a remedy.
+    fn rule_text(id: &str, layer: u8, extra: &str) -> String {
+        format!(
+            "# A rule\n\n```policy\nid = \"{id}\"\nlayer = {layer}\nrule = \"Decisions are superseded by a person, not an agent.\"\nintent = \"An agent rewrote a standing decision mid-task.\"\nowner = \"human:test:lead\"\nstatus = \"enforced\"\n{extra}```\n\n```rego\npackage amem.rules\nimport rego.v1\ndeny contains {{\"policy\": \"{id}\", \"reason\": \"an agent superseded a decision\", \"code\": \"decision-by-agent\", \"remedy\": \"propose the change to the owner of the decision\"}} if {{\n\tinput.principal.class == \"agent\"\n\tinput.write.supersedes_type == \"decision\"\n}}\n```\n"
+        )
+    }
+
+    async fn policy_entry(m: &Memory, body: &str) -> String {
+        m.write(WriteRequest {
+            entry_type: EntryType::Policy,
+            ..req(body)
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// An agent supersedes the newest decision of the record's one chain.
+    async fn agent_supersedes(root: &Path, of: &str) -> Result<Written, Error> {
+        let agent = Memory::open(root).unwrap().with_author("agent:a");
+        agent
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                supersedes: Some(of.to_string()),
+                ..req("Use something else on a laptop.\n")
+            })
+            .await
+    }
+
+    /// Where a rule is, to a session opened now.
+    fn status_of(root: &Path, id: &str) -> Option<dm_policy::record::Status> {
+        let m = Memory::open(root).unwrap();
+        m.check_policy("supersede a decision", None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.policy_id == id)
+            .map(|r| r.status)
+    }
+
+    /// A rule goes up one reviewed step at a time, and is in a decision only once a
+    /// person verified the version that says so. Advisory reports and refuses nothing;
+    /// enforced refuses, and says what would pass.
+    #[tokio::test]
+    async fn a_rule_is_proposed_then_advisory_then_enforced() {
+        use dm_policy::record::Status as Rule;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let advisory = rule_text("pol-L2-050", 2, "").replace("\"enforced\"", "\"advisory\"");
+        let rule = policy_entry(&agent, &advisory).await;
+        // a curator's check puts no module in a decision: the rule is still proposed
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        curator
+            .promote(&rule, TrustTier::Curated, "checked")
+            .await
+            .unwrap();
+        assert_eq!(status_of(dir.path(), "pol-L2-050"), None);
+        let d2 = agent_supersedes(dir.path(), &d1).await.unwrap().id;
+        let log = || std::fs::read_to_string(dir.path().join("state/decisions.jsonl")).unwrap();
+        assert!(!log().contains("pol-L2-050"), "in no decision yet");
+        // a person verifies it: advisory, which reports and refuses nothing
+        verify(&owner, &curator, &rule).await;
+        assert_eq!(status_of(dir.path(), "pol-L2-050"), Some(Rule::Advisory));
+        let d3 = agent_supersedes(dir.path(), &d2).await.unwrap().id;
+        let all = log();
+        let reported = all.lines().last().unwrap_or_default();
+        assert!(
+            reported.contains("\"allow\":true")
+                && reported.contains("\"advisories\":[{")
+                && reported.contains("pol-L2-050"),
+            "{reported}"
+        );
+        // the step up is a new version, which a person verifies: enforced
+        let owner = Memory::open(dir.path()).unwrap();
+        let enforced = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Policy,
+                supersedes: Some(rule.clone()),
+                ..req(&rule_text("pol-L2-050", 2, ""))
+            })
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(status_of(dir.path(), "pol-L2-050"), None, "under review");
+        verify(&owner, &curator, &enforced).await;
+        assert_eq!(status_of(dir.path(), "pol-L2-050"), Some(Rule::Enforced));
+        let refused = agent_supersedes(dir.path(), &d3)
+            .await
+            .unwrap_err()
+            .to_string();
+        for part in [
+            "pol-L2-050",
+            "(code decision-by-agent)",
+            "To pass: propose the change to the owner of the decision.",
+        ] {
+            assert!(refused.contains(part), "{part}: {refused}");
+        }
+    }
+
+    /// An exception is asked for one task until a time, is nothing until a person
+    /// approves it, and is refused for the L0 core.
+    #[tokio::test]
+    async fn an_exception_is_filed_for_a_task_and_waits_for_its_approver() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let core = "# A value\n\n```policy\nid = \"pol-L0-001\"\nlayer = 0\nrule = \"The record is never rewritten in place.\"\nintent = \"History is what an audit reads.\"\n```\n";
+        for body in [rule_text("pol-L2-051", 2, ""), core.to_string()] {
+            let rule = policy_entry(&owner, &body).await;
+            verify(&owner, &agent, &rule).await;
+        }
+        let held = owner
+            .file_own(tspec("Replace the decision", 0, None, &[], &[]))
+            .await
+            .unwrap()
+            .task;
+        let ask = |breaches: &str, expires: &str| rules::ExceptionRequest {
+            breaches: breaches.into(),
+            task: Some(held.id.clone()),
+            scope: "this one replacement".into(),
+            expires: expires.into(),
+            justification: "The task is to replace the decision.".into(),
+            domain: None,
+        };
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let core = agent
+            .file_exception(ask("pol-L0-001", "2099-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(&core, Err(Error::Denied(why)) if why.contains("L0 core")));
+        let past = agent
+            .file_exception(ask("pol-L2-051", "2020-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(&past, Err(Error::Denied(why)) if why.contains("time to come")));
+        let unknown = agent
+            .file_exception(ask("pol-L2-999", "2099-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(unknown, Err(Error::NotFound(_))));
+        let filed = agent
+            .file_exception(ask("pol-L2-051", "2099-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(filed.approver, "human:test:lead", "the owner of an L2 rule");
+        assert!(filed.policy_id.starts_with("exc-"));
+        // filed is not approved: the task is still refused
+        let inside = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        inside.set_held_task(&held.id);
+        let supersede = || WriteRequest {
+            entry_type: EntryType::Decision,
+            supersedes: Some(d1.clone()),
+            ..req("Use files on a laptop.\n")
+        };
+        assert!(inside.write(supersede()).await.is_err());
+        owner.approve(&filed.task.id).await.unwrap();
+        let inside = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        inside.set_held_task(&held.id);
+        inside.write(supersede()).await.unwrap();
+    }
+
+    /// An amendment is a task for a person that names the rule's owner; the same
+    /// evidence twice is one task.
+    #[tokio::test]
+    async fn an_amendment_is_a_task_for_the_rule_s_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let rule = policy_entry(&owner, &rule_text("pol-L2-052", 2, "")).await;
+        verify(&owner, &agent, &rule).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let evidence = "The rule refused a decision that its own owner asked to replace.";
+        let first = agent
+            .propose_amendment("pol-L2-052", evidence)
+            .await
+            .unwrap();
+        assert_eq!(first.task.spec.origin.as_deref(), Some("amend:pol-L2-052"));
+        assert_eq!(first.task.spec.requirements, ["human"]);
+        assert!(first.task.spec.body.contains("human:test:lead"));
+        assert!(first.task.spec.body.contains(evidence));
+        let again = agent
+            .propose_amendment("pol-L2-052", evidence)
+            .await
+            .unwrap();
+        assert!(again.deduplicated);
+        assert_eq!(again.task.id, first.task.id);
+        let none = agent.propose_amendment("pol-L2-052", " ").await;
+        assert!(matches!(none, Err(Error::Denied(_))));
+        let unknown = agent.propose_amendment("pol-L2-999", evidence).await;
+        assert!(matches!(unknown, Err(Error::NotFound(_))));
+    }
+
+    /// A reset keeps each rule that a person wrote or promoted and retires the rest,
+    /// and only the owner resets.
+    #[tokio::test]
+    async fn a_reset_keeps_the_rules_with_a_person_in_their_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        // written by a person; written by an agent and verified by a person; written by
+        // an agent and curated by an agent; written by an agent and never reviewed
+        policy_entry(&owner, &rule_text("pol-L3-001", 3, "")).await;
+        let verified = policy_entry(&agent, &rule_text("pol-L3-002", 3, "")).await;
+        verify(&owner, &curator, &verified).await;
+        let curated = policy_entry(&agent, &rule_text("pol-L3-003", 3, "")).await;
+        curator
+            .promote(&curated, TrustTier::Curated, "checked")
+            .await
+            .unwrap();
+        policy_entry(&agent, &rule_text("pol-L3-004", 3, "")).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert!(matches!(
+            agent.reset_rules(None).await,
+            Err(Error::Denied(_))
+        ));
+        let owner = Memory::open(dir.path()).unwrap();
+        let reset = owner.reset_rules(None).await.unwrap();
+        let kept: Vec<_> = reset.kept.iter().map(|k| k.policy_id.as_str()).collect();
+        assert_eq!(kept, ["pol-L3-001", "pol-L3-002"]);
+        assert_eq!(reset.retired, ["pol-L3-003", "pol-L3-004"]);
+        assert!(reset.kept.iter().all(|k| k.person == "human:test:me"));
+        assert_eq!(status_of(dir.path(), "pol-L3-003"), None, "retired");
+        assert_eq!(
+            status_of(dir.path(), "pol-L3-002"),
+            Some(dm_policy::record::Status::Enforced)
+        );
+        let again = owner.reset_rules(None).await.unwrap();
+        assert!(again.retired.is_empty(), "{:?}", again.retired);
     }
 
     async fn an_exception_lets_one_task_through(

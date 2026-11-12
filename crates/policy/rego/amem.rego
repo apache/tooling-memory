@@ -373,7 +373,15 @@ base_decision := erase_decision if input.action == "erase"
 core_policy(pid) if {
 	some p in data.policies
 	p.id == pid
-	p.layer == 0
+	p.core == true
+}
+
+# An advisory rule is evaluated and reported, and refuses nothing. A rule the data does
+# not list, a built-in one, is enforced.
+advisory_policy(pid) if {
+	some p in data.policies
+	p.id == pid
+	p.status == "advisory"
 }
 
 excepted(pid) if {
@@ -391,7 +399,17 @@ all_denials contains d if some d in builtin_denials
 rule_denials contains d if {
 	some d in all_denials
 	not excepted(d.policy)
+	not advisory_policy(d.policy)
 }
+
+advisory_denials contains d if {
+	some d in all_denials
+	advisory_policy(d.policy)
+}
+
+advisory_list := [d | some d in advisory_denials]
+
+denial_list := [d | some d in rule_denials]
 
 exceptions_used contains x if {
 	some d in all_denials
@@ -408,7 +426,7 @@ denied_list := [p | some d in rule_denials; p := d.policy]
 
 denied_reasons := [r | some d in rule_denials; r := sprintf("%v: %v", [d.policy, d.reason])]
 
-decision := object.union(base_decision, {"cites": used_list}) if {
+decision := object.union(base_decision, {"cites": used_list, "advisories": advisory_list}) if {
 	count(rule_denials) == 0
 }
 
@@ -418,6 +436,8 @@ decision := {
 	"review": "human",
 	"reason": concat("; ", denied_reasons),
 	"cites": denied_list,
+	"denials": denial_list,
+	"advisories": advisory_list,
 } if {
 	count(rule_denials) > 0
 }

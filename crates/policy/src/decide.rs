@@ -248,6 +248,74 @@ pub struct Decision {
     /// The digest of the policy text that decided.
     #[serde(default)]
     pub policy: String,
+    /// Each rule that refused, with what a caller needs to act on the refusal: the
+    /// rule, why, a reason code, and what would pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denials: Vec<Denial>,
+    /// What the advisory rules would have refused, had they been enforced. They refuse
+    /// nothing: this is how a rule is watched before it is given teeth.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<Denial>,
+}
+
+/// One rule's refusal, as its module states it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Denial {
+    /// The rule.
+    pub policy: String,
+    /// Why, in a sentence.
+    #[serde(default)]
+    pub reason: String,
+    /// A short code for the reason, the same for every refusal of its kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// What would pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+}
+
+impl Denial {
+    /// The refusal in a sentence a caller can act on: the rule, why, the code, and what
+    /// would pass.
+    #[must_use]
+    pub fn said(&self) -> String {
+        let mut out = format!("{}: {}", self.policy, self.reason);
+        if let Some(code) = &self.code {
+            out.push_str(&format!(" (code {code})"));
+        }
+        if let Some(remedy) = &self.remedy {
+            out.push_str(&format!(". To pass: {}.", remedy.trim_end_matches('.')));
+        }
+        out
+    }
+}
+
+/// The enforced rules over a ceiling, which is a domain's: in each domain, counted in
+/// the order of their ids, each one past the ceiling that carries no sign-off of its
+/// own. A signed-off rule is enforced and takes no place under the ceiling.
+fn over_ceiling(entries: &[crate::record::Entry], ceiling: Option<usize>) -> Vec<String> {
+    let Some(ceiling) = ceiling else {
+        return Vec::new();
+    };
+    let mut by_domain: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for e in entries
+        .iter()
+        .filter(|e| e.enforced() && e.meta.signed_off_by.is_none())
+    {
+        by_domain
+            .entry(e.domain.as_str())
+            .or_default()
+            .push(e.meta.id.as_str());
+    }
+    let mut over = Vec::new();
+    for counted in by_domain.values_mut() {
+        counted.sort_unstable();
+        counted.dedup();
+        over.extend(counted.iter().skip(ceiling).map(|id| (*id).to_string()));
+    }
+    over.sort();
+    over
 }
 
 /// What a session may read, as the policy computes it: the conditions an entry must
@@ -296,6 +364,8 @@ pub struct Policy {
     entries: Vec<crate::record::Entry>,
     /// Modules a verified entry carried that would not load, and why.
     refused: Vec<(String, String)>,
+    /// The rules the ceiling holds at advisory.
+    held_back: Vec<String>,
 }
 
 impl std::fmt::Debug for Policy {
@@ -367,7 +437,10 @@ impl Policy {
         now: time::OffsetDateTime,
     ) -> Result<Policy, Error> {
         let mut texts = self.text.clone();
-        for e in entries.iter().filter(|e| e.enforced()) {
+        let over = over_ceiling(&entries, grants.gates.max_enforced_rules);
+        // an advisory rule's module is loaded with the enforced ones: it is evaluated
+        // with every decision, and the base reports what it says without refusing
+        for e in entries.iter().filter(|e| e.enforced() || e.advisory()) {
             let Some(rego) = &e.rego else { continue };
             if !crate::record::module_is_confined(rego) {
                 self.refused
@@ -386,7 +459,18 @@ impl Policy {
         let policies: Vec<_> = entries
             .iter()
             .filter(|e| !e.meta.is_exception())
-            .map(|e| serde_json::json!({"id": e.meta.id, "layer": e.meta.layer}))
+            .map(|e| {
+                // a rule over the ceiling that nobody signed off is held at advisory
+                let status = if over.contains(&e.meta.id) {
+                    crate::record::Status::Advisory
+                } else {
+                    e.state()
+                };
+                serde_json::json!({
+                    "id": e.meta.id, "layer": e.meta.layer,
+                    "core": e.meta.is_core(), "status": status.as_str(),
+                })
+            })
             .collect();
         let exceptions: Vec<_> = entries
             .iter()
@@ -403,7 +487,26 @@ impl Policy {
         self.engine = Policy::with_data(self.engine, &data)?;
         self.version = digest(&texts);
         self.entries = entries;
+        self.held_back = over;
         Ok(self)
+    }
+
+    /// Where a rule is in its life under this policy: as its entry says, or advisory
+    /// when the ceiling on enforced rules holds it back.
+    #[must_use]
+    pub fn state_of(&self, rule: &crate::record::Entry) -> crate::record::Status {
+        if self.held_back.contains(&rule.meta.id) {
+            crate::record::Status::Advisory
+        } else {
+            rule.state()
+        }
+    }
+
+    /// The rules held at advisory because the grants' ceiling on enforced rules is
+    /// reached and no person signed them off.
+    #[must_use]
+    pub fn over_ceiling(&self, grants: &Grants) -> Vec<String> {
+        over_ceiling(&self.entries, grants.gates.max_enforced_rules)
     }
 
     fn with_data(
@@ -451,6 +554,7 @@ impl Policy {
             source: source.to_string(),
             entries: Vec::new(),
             refused: Vec::new(),
+            held_back: Vec::new(),
         })
     }
 
@@ -506,6 +610,10 @@ impl Policy {
         let mut d: Decision =
             serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))?;
         d.policy = self.version.clone();
+        if !d.allow && !d.denials.is_empty() {
+            let said: Vec<String> = d.denials.iter().map(Denial::said).collect();
+            d.reason = said.join("; ");
+        }
         Ok(d)
     }
 }
@@ -836,6 +944,140 @@ mod tests {
             fetch: None,
         })
         .unwrap()
+    }
+
+    fn with(g: &Grants, entries: Vec<crate::record::Entry>) -> Policy {
+        Policy::builtin(g)
+            .unwrap()
+            .with_record(g, entries, time::OffsetDateTime::now_utc())
+            .unwrap()
+    }
+
+    /// A rule's life: proposed and retired rules are in no decision, an advisory rule is
+    /// reported and refuses nothing, and an enforced one refuses.
+    #[test]
+    fn a_rule_refuses_only_once_enforced_and_is_watched_while_advisory() {
+        use dm_core::TrustTier::{Curated, Raw, Verified};
+        let g = grants();
+        let rule = |tier, status: &str| {
+            rule_entry(
+                "pol-L2-031",
+                2,
+                tier,
+                &format!("status = \"{status}\""),
+                true,
+            )
+        };
+        // below verified a rule is in no decision: nobody's module is evaluated that a
+        // person has not verified
+        for (tier, status) in [
+            (Raw, "advisory"),
+            (Raw, "enforced"),
+            (Curated, "advisory"),
+            (Curated, "enforced"),
+            (Verified, "proposed"),
+            (Verified, "retired"),
+        ] {
+            let d = supersede_decision(&with(&g, vec![rule(tier, status)]), None);
+            assert!(
+                d.allow && d.advisories.is_empty(),
+                "{status} at {tier}: {d:?}"
+            );
+        }
+        let d = supersede_decision(&with(&g, vec![rule(Verified, "advisory")]), None);
+        assert!(d.allow, "{d:?}");
+        assert_eq!(d.advisories.len(), 1, "{d:?}");
+        assert_eq!(d.advisories[0].policy, "pol-L2-031");
+        assert!(d.cites.is_empty() && d.denials.is_empty(), "{d:?}");
+        let d = supersede_decision(&with(&g, vec![rule(Verified, "enforced")]), None);
+        assert!(!d.allow && d.advisories.is_empty(), "{d:?}");
+    }
+
+    /// A refusal says what would pass: the rule's module gives a code and a remedy, and
+    /// the decision carries them.
+    #[test]
+    fn a_denial_carries_the_rule_s_reason_code_and_remedy() {
+        let g = grants();
+        let body = "```policy\nid = \"pol-L2-040\"\nlayer = 2\n```\n\n```rego\npackage amem.rules\nimport rego.v1\ndeny contains {\"policy\": \"pol-L2-040\", \"reason\": \"an agent superseded a decision\", \"code\": \"decision-by-agent\", \"remedy\": \"propose the change to the decision's owner\"} if {\n\tinput.principal.class == \"agent\"\n\tinput.write.supersedes_type == \"decision\"\n}\n```\n";
+        let rule = crate::record::parse("mem-p-40", dm_core::TrustTier::Verified, body).unwrap();
+        let d = supersede_decision(&with(&g, vec![rule]), None);
+        assert!(!d.allow);
+        assert_eq!(
+            d.denials,
+            vec![Denial {
+                policy: "pol-L2-040".into(),
+                reason: "an agent superseded a decision".into(),
+                code: Some("decision-by-agent".into()),
+                remedy: Some("propose the change to the decision's owner".into()),
+            }]
+        );
+    }
+
+    /// The ceiling: the rules past it, in the order of their ids, are held at advisory
+    /// until a person signs one off, and a signature admits that rule alone.
+    #[test]
+    fn a_rule_over_the_ceiling_is_advisory_until_a_person_signs_it_off() {
+        use dm_core::TrustTier::Verified;
+        let mut g = grants();
+        g.gates.max_enforced_rules = Some(1);
+        // two rules that refuse the same thing; a third that never fires takes a place
+        let first = rule_entry("pol-L2-001", 2, Verified, "", true);
+        let second = rule_entry("pol-L2-002", 2, Verified, "", true);
+        let p = with(&g, vec![second.clone(), first.clone()]);
+        assert_eq!(p.over_ceiling(&g), ["pol-L2-002"]);
+        let d = supersede_decision(&p, None);
+        assert_eq!(d.cites, ["pol-L2-001"], "the first refuses: {d:?}");
+        assert_eq!(d.advisories.len(), 1);
+        assert_eq!(d.advisories[0].policy, "pol-L2-002");
+        // signed off, the second is enforced, and takes no place under the ceiling
+        let signed = rule_entry(
+            "pol-L2-002",
+            2,
+            Verified,
+            "signed_off_by = \"human:test:lead\"",
+            true,
+        );
+        let third = rule_entry("pol-L2-003", 2, Verified, "", true);
+        let p = with(&g, vec![first, signed, third]);
+        assert_eq!(
+            p.over_ceiling(&g),
+            ["pol-L2-003"],
+            "the signature raised nothing"
+        );
+        let mut cites = supersede_decision(&p, None).cites;
+        cites.sort();
+        assert_eq!(cites, ["pol-L2-001", "pol-L2-002"]);
+        assert_eq!(p.state_of(&p.entries()[2]), crate::record::Status::Advisory);
+        assert_eq!(p.state_of(&p.entries()[0]), crate::record::Status::Enforced);
+        // the ceiling is a domain's: the same rules in two domains are each under it
+        let mut elsewhere = rule_entry("pol-L2-004", 2, Verified, "", true);
+        elsewhere.domain = "dom-other".into();
+        let here = rule_entry("pol-L2-001", 2, Verified, "", true);
+        let apart = with(&g, vec![here, elsewhere]);
+        assert!(apart.over_ceiling(&g).is_empty());
+        // with no ceiling, all three refuse
+        g.gates.max_enforced_rules = None;
+        assert!(p.over_ceiling(&g).is_empty());
+    }
+
+    /// The core of L0 takes no exception; an L0 rule marked as outside the core takes one.
+    #[test]
+    fn only_the_marked_core_of_l0_takes_no_exception() {
+        use dm_core::TrustTier::Verified;
+        let g = grants();
+        let exc = rule_entry(
+            "exc-2026-003",
+            0,
+            Verified,
+            "breaches = \"pol-L0-002\"\nscope_task = \"task-t-1\"\nexpires = \"2099-01-01T00:00:00Z\"",
+            false,
+        );
+        let outside = rule_entry("pol-L0-002", 0, Verified, "core = false", true);
+        let p = with(&g, vec![outside, exc.clone()]);
+        assert!(supersede_decision(&p, Some("task-t-1")).allow);
+        let core = rule_entry("pol-L0-002", 0, Verified, "core = true", true);
+        let p = with(&g, vec![core, exc]);
+        assert!(!supersede_decision(&p, Some("task-t-1")).allow);
     }
 
     #[test]

@@ -1067,6 +1067,47 @@ enum PolicyOp {
         #[arg(long)]
         file: bool,
     },
+    /// The rules in force for an action in a domain, enforced and advisory.
+    Check {
+        /// What is about to be done, in a few words.
+        action: String,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Ask for an exception to a rule, for one task, until an expiry. A person approves
+    /// it with `amem approve`.
+    Except {
+        /// The policy id of the rule to breach.
+        breaches: String,
+        /// The one task the exception holds for.
+        #[arg(long)]
+        task: String,
+        /// What it covers, in words.
+        #[arg(long)]
+        scope: String,
+        /// When it lapses, RFC 3339.
+        #[arg(long)]
+        expiry: String,
+        /// Why it is needed.
+        #[arg(long)]
+        justification: String,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Propose an amendment to a rule: a task for the rule's owner, with the evidence.
+    Amend {
+        /// The policy id of the rule.
+        policy_id: String,
+        /// What happened, and the ids of the entries that show it.
+        #[arg(long)]
+        evidence: String,
+    },
+    /// Retire every rule of a domain that no person wrote or promoted, and keep the
+    /// rest. The owner's act.
+    Reset {
+        #[arg(long)]
+        domain: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4589,6 +4630,7 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         Command::Policy {
             op: PolicyOp::Lint { file },
         } => policy_lint(m, file).await,
+        Command::Policy { op } => rule_cmd(m, op).await,
         Command::Quarantine {
             op: QuarantineOp::List,
         } => json(
@@ -4648,7 +4690,11 @@ fn policy_list(m: &Memory) -> serde_json::Value {
             serde_json::json!({
                 "id": e.meta.id, "entry": e.entry_id, "layer": e.meta.layer, "tier": e.tier,
                 "rule": e.meta.rule, "exception": e.meta.is_exception(),
-                "enforced": e.enforced(), "in_force": e.in_force(now),
+                "enforced": e.enforced() && p.state_of(e) == dm_policy::record::Status::Enforced,
+                "in_force": e.in_force(now),
+                "status": if e.meta.is_exception() { "exception" } else { p.state_of(e).as_str() },
+                "owner": e.meta.owner,
+                "review_by": e.meta.review_by,
                 "breaches": e.meta.breaches, "scope_task": e.meta.scope_task,
             })
         })
@@ -4663,7 +4709,7 @@ fn policy_list(m: &Memory) -> serde_json::Value {
 /// refused something, and how often an exception let something through.
 fn policy_rates(root: &Path) -> serde_json::Value {
     let text = std::fs::read_to_string(root.join("state/decisions.jsonl")).unwrap_or_default();
-    let mut cited: std::collections::BTreeMap<String, (u64, u64)> =
+    let mut cited: std::collections::BTreeMap<String, (u64, u64, u64)> =
         std::collections::BTreeMap::new();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -4683,11 +4729,96 @@ fn policy_rates(root: &Path) -> serde_json::Value {
                 row.0 += 1;
             }
         }
+        // what an advisory rule would have refused, had it been enforced
+        for id in v["advisories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a["policy"].as_str())
+        {
+            cited.entry(id.to_string()).or_default().2 += 1;
+        }
     }
     serde_json::json!(cited
         .into_iter()
-        .map(|(id, (refused, overridden))| serde_json::json!({"id": id, "refused": refused, "let_through": overridden}))
+        .map(|(id, (refused, overridden, advised))| serde_json::json!({"id": id, "refused": refused, "let_through": overridden, "advised": advised}))
         .collect::<Vec<_>>())
+}
+
+/// The findings that need the grants and the decision log: a rule held at advisory by
+/// the ceiling on enforced rules, and an enforced rule that no decision in the log
+/// cites, which goes to its owner to retire or to say why it stays.
+fn ceiling_and_use(m: &Memory, p: &dm_policy::decide::Policy) -> Vec<dm_policy::record::Finding> {
+    let mut out = Vec::new();
+    for id in p.over_ceiling(m.grants()) {
+        out.push(dm_policy::record::Finding {
+            why: format!(
+                "{id} is over the ceiling on enforced rules and is advisory: a person signs this one rule off with signed_off_by, or a rule is retired"
+            ),
+            policy: id,
+            kind: "over-ceiling".into(),
+        });
+    }
+    let rates = policy_rates(m.root());
+    let cited: Vec<&str> = rates
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r["id"].as_str())
+        .collect();
+    for e in p.entries().iter().filter(|e| e.enforced()) {
+        if !cited.contains(&e.meta.id.as_str()) {
+            out.push(dm_policy::record::Finding {
+                policy: e.meta.id.clone(),
+                kind: "unused".into(),
+                why: format!(
+                    "{} is enforced and no decision in the log cites it: its owner retires it, or says why it stays",
+                    e.meta.id
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// `amem policy check`, `except`, `amend` and `reset`: the rule lifecycle.
+async fn rule_cmd(m: &Memory, op: PolicyOp) -> Fallible {
+    match op {
+        PolicyOp::Check { action, domain } => {
+            json(&serde_json::json!({ "rules": m.check_policy(&action, domain.as_deref())? }))
+        }
+        PolicyOp::Except {
+            breaches,
+            task,
+            scope,
+            expiry,
+            justification,
+            domain,
+        } => {
+            let ask = dm_server::rules::ExceptionRequest {
+                breaches,
+                task: Some(task),
+                scope,
+                expires: expiry,
+                justification,
+                domain,
+            };
+            json(&m.file_exception(ask).await?)
+        }
+        PolicyOp::Amend {
+            policy_id,
+            evidence,
+        } => {
+            let created = m.propose_amendment(&policy_id, &evidence).await?;
+            json(&serde_json::json!({
+                "task": created.task, "deduplicated": created.deduplicated,
+            }))
+        }
+        PolicyOp::Reset { domain } => json(&m.reset_rules(domain.as_deref()).await?),
+        PolicyOp::Show | PolicyOp::Eval { .. } | PolicyOp::List | PolicyOp::Lint { .. } => {
+            unreachable!("routed by perimeter_cmd")
+        }
+    }
 }
 
 /// `amem policy lint`.
@@ -4703,6 +4834,7 @@ async fn policy_lint(m: &Memory, file: bool) -> Fallible {
                 why: format!("{id}'s module would not load: {why}"),
             }),
     );
+    findings.extend(ceiling_and_use(m, &p));
     let mut filed = Vec::new();
     if file {
         let domain = m.resolve_domain(None)?;
