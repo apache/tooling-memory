@@ -1826,19 +1826,22 @@ impl Memory {
     /// session that read it is what to look at next.
     #[must_use]
     pub fn taint(&self, id: &str) -> Taint {
+        // times are compared as times: as text, `…00.12Z` sorts after `…00.123Z`, and a
+        // write a thousandth of a second after a read would not follow from it. A line
+        // whose time does not read is left out
+        let when = |at: &str| {
+            OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+        };
         let reads = reads::all(&self.root).unwrap_or_default();
-        let mut first_read: std::collections::BTreeMap<String, String> =
+        let mut first_read: std::collections::BTreeMap<String, OffsetDateTime> =
             std::collections::BTreeMap::new();
         for r in &reads {
+            let Some(read_at) = when(&r.at) else { continue };
             if r.ids.iter().any(|i| i == id) {
                 first_read
                     .entry(r.session.clone())
-                    .and_modify(|at| {
-                        if r.at < *at {
-                            *at = r.at.clone();
-                        }
-                    })
-                    .or_insert_with(|| r.at.clone());
+                    .and_modify(|at| *at = (*at).min(read_at))
+                    .or_insert(read_at);
             }
         }
         let mut written = Vec::new();
@@ -1846,7 +1849,10 @@ impl Memory {
             if w.id == id {
                 continue;
             }
-            if first_read.get(&w.session).is_some_and(|at| w.at > *at) {
+            let after = when(&w.at)
+                .zip(first_read.get(&w.session))
+                .is_some_and(|(wrote, read)| wrote > *read);
+            if after {
                 written.push(w.id);
             }
         }
@@ -3279,6 +3285,27 @@ mod tests {
             })
             .await;
         assert!(matches!(titled, Err(Error::Denied(_))));
+    }
+
+    /// A read and a later write whose times, as text, sort the other way: the write's has
+    /// one more digit.
+    #[test]
+    fn a_write_follows_a_read_by_time_whatever_the_times_look_like_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let read = r#"{"at":"2026-10-01T10:00:00.12Z","session":"s1","tool":"get","hits":1,"tokens":1,"ids":["mem-me-read"]}"#;
+        std::fs::write(reads::path(dir.path()), format!("{read}\n")).unwrap();
+        let lines = [
+            r#"{"at":"2026-10-01T10:00:00.123Z","session":"s1","id":"mem-me-after","author":"a"}"#,
+            r#"{"at":"2026-10-01T10:00:00.1Z","session":"s1","id":"mem-me-before","author":"a"}"#,
+            r#"{"at":"2026-10-01T10:00:01Z","session":"s2","id":"mem-me-other","author":"a"}"#,
+        ];
+        std::fs::write(state.join("writes.jsonl"), lines.join("\n") + "\n").unwrap();
+        let t = m.taint("mem-me-read");
+        assert_eq!(t.readers, ["s1"]);
+        assert_eq!(t.written, ["mem-me-after"]);
     }
 
     #[tokio::test]
