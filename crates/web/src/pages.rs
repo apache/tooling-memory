@@ -11,7 +11,8 @@ pub const READER: &str = include_str!("../static/reader.html");
 pub const AMEM_JS: &str = include_str!("../static/amem.js");
 /// The board: tasks by status, each under the task it was filed from.
 pub const BOARD: &str = include_str!("../static/board.html");
-/// The design tokens every page links: docs/design-book.html holds the same values.
+/// The design tokens every page links: docs/design-book.html and docs/poster.html carry
+/// the same file whole.
 pub const TOKENS: &str = include_str!("../static/tokens.css");
 
 /// The reader's core, built from `crates/reader` by this crate's build script: the
@@ -120,6 +121,110 @@ mod tests {
     }
 
     #[test]
+    fn the_poster_inlines_the_tokens_and_components_whole() {
+        // docs/poster.html draws the paper's design in the tokens' colours and type, and
+        // is opened from anywhere: a copy with nothing beside it must still render in them
+        let poster = include_str!("../../../docs/poster.html");
+        assert_eq!(
+            poster.matches(TOKENS).count(),
+            1,
+            "docs/poster.html must carry crates/web/static/tokens.css whole, once, as it is"
+        );
+        let style = poster.find("<style>").expect("a style block");
+        let copy = poster.find(TOKENS).unwrap();
+        assert!(
+            style < copy && copy < poster.find("</style>").unwrap(),
+            "the tokens must be inside the poster's style block, not quoted elsewhere"
+        );
+        let before = &poster[..style];
+        assert!(
+            before.matches("<!--").count() == before.matches("-->").count(),
+            "the poster's style block sits inside a comment"
+        );
+        // beyond that copy, the page names no colour of its own, defines no token of its
+        // own, and fetches nothing
+        let rest = poster.replacen(TOKENS, "", 1);
+        assert!(!hex_colour(&rest), "the poster has a colour of its own");
+        assert_eq!(
+            named_colour_in_styles(&rest),
+            None,
+            "the poster names a colour"
+        );
+        assert!(
+            !defines_a_token(&rest),
+            "the poster defines a token of its own"
+        );
+        assert!(
+            !rest.contains("<template"),
+            "the poster hides markup in a template, where its styles would not apply"
+        );
+        assert_eq!(
+            fetch_or_script(&rest),
+            None,
+            "the poster fetches or runs something"
+        );
+        assert_eq!(
+            colour_in_an_attribute(&rest),
+            None,
+            "a presentation attribute names a colour"
+        );
+    }
+
+    /// The first named colour in `page`'s own style blocks (with or without attributes
+    /// on the tag) and style attributes, double or single quoted.
+    fn named_colour_in_styles(page: &str) -> Option<&'static str> {
+        let styles = page
+            .split("<style")
+            .skip(1)
+            .filter_map(|s| s.split("</style>").next());
+        let attributes = page
+            .split("style=\"")
+            .skip(1)
+            .filter_map(|s| s.split('"').next());
+        let quoted = page
+            .split("style='")
+            .skip(1)
+            .filter_map(|s| s.split('\'').next());
+        styles
+            .chain(attributes)
+            .chain(quoted)
+            .find_map(named_colour)
+    }
+
+    /// The first thing in `page` that fetches, runs, or points off the page: a tag or
+    /// attribute that loads a resource, a `url()` that is not a fragment, or a glyph
+    /// reference to another document.
+    fn fetch_or_script(page: &str) -> Option<String> {
+        let lower = page.to_ascii_lowercase();
+        let banned = [
+            "<link", "<script", "<object", "<iframe", "<embed", "<image", "srcset", "src=",
+            "@import",
+        ];
+        if let Some(b) = banned.iter().find(|b| lower.contains(*b)) {
+            return Some((*b).to_string());
+        }
+        if let Some(u) = lower.split("url(").skip(1).find(|u| !u.starts_with('#')) {
+            return Some(format!("url({}", &u[..u.len().min(40)]));
+        }
+        page.split("<use href=\"")
+            .skip(1)
+            .find(|u| !u.starts_with('#'))
+            .map(|u| format!("<use href=\"{}", &u[..u.len().min(40)]))
+    }
+
+    /// The first `fill` or `stroke` presentation attribute whose value is a colour of its
+    /// own rather than `none` or `currentColor`.
+    fn colour_in_an_attribute(page: &str) -> Option<String> {
+        ["fill=\"", "stroke=\""].iter().find_map(|attr| {
+            page.split(attr)
+                .skip(1)
+                .filter_map(|s| s.split('"').next())
+                .find(|v| *v != "none" && *v != "currentColor")
+                .map(|v| format!("{attr}{v}"))
+        })
+    }
+
+    #[test]
     fn every_path_a_page_names_is_relative() {
         // the same files are served by amem and as a hosted copy on another origin, so a
         // leading slash would reach the host and not the page's own directory
@@ -150,6 +255,17 @@ mod tests {
     }
 
     /// A colour function or a colour by name, in CSS: a page's styles, or a style attribute.
+    /// Whether `text` declares a custom property of the token family (`--am-x:`),
+    /// with any spacing before the colon.
+    fn defines_a_token(text: &str) -> bool {
+        text.split("--am-").skip(1).any(|after| {
+            let name_end = after
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .unwrap_or(after.len());
+            after[name_end..].trim_start().starts_with(':')
+        })
+    }
+
     fn named_colour(css: &str) -> Option<&'static str> {
         const FUNCTIONS: [&str; 10] = [
             "rgb(",

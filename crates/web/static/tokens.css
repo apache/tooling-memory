@@ -1,9 +1,9 @@
 /* amem design tokens, and the components the pages are composed of.
 
-   docs/design-book.html inlines this whole file, because the book is one self-contained
-   page with nothing to fetch. The two change together, in the same commit: a token or a
-   component added, renamed or re-valued here and not there (or there and not here) is a
-   bug in both, and a test in crates/web says so.
+   docs/design-book.html and docs/poster.html inline this whole file, because each is one
+   self-contained page with nothing to fetch. The three change together, in the same
+   commit: a token or a component added, renamed or re-valued here and not there (or
+   there and not here) is a bug in each, and a test in crates/web says so.
 
    Named for meaning, never appearance: --am-fail, not --am-red. Light is the default
    under :root; dark is designed, not inverted, and applies when the system asks for it

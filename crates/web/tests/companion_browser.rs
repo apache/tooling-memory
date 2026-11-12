@@ -192,11 +192,18 @@ async fn exchange(
     // connection open whatever the request asked, so reading to a close would wait forever
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // a fetch may take as long as the web launcher waits for the companion and be right:
+    // the launcher answers for itself after `WAIT`. Nothing else asked here has such a wait
+    let wait = if path == dm_web::companion::FETCH_PATH {
+        dm_web::companion::WAIT + Duration::from_secs(15)
+    } else {
+        Duration::from_secs(30)
+    };
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
         let n = tokio::time::timeout_at(deadline, s.read(&mut buf))
             .await
-            .expect("an answer within thirty seconds")
+            .unwrap_or_else(|_| panic!("{method} {path} at {addr}: no answer within {wait:?}"))
             .unwrap();
         if n == 0 {
             break;
