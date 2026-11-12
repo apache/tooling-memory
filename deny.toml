@@ -7,11 +7,6 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# `instant` is unmaintained. It is reached only through the download client of the
-# embedded PostgreSQL the ledger's tests run against, a dev-dependency pinned at 0.20.0
-# (crates/ledger/Cargo.toml says why); the versions that drop it need a reqwest the
-# egress cannot move to yet. Never part of `amem`.
-ignore = [{ id = "RUSTSEC-2024-0384", reason = "test-only, via postgresql_embedded 0.20.0" }]
 
 [licenses]
 version = 2
