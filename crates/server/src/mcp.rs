@@ -1382,6 +1382,29 @@ mod tests {
         id
     }
 
+    /// What a task that stays proposed lacks goes back to whoever filed it.
+    #[tokio::test]
+    async fn create_task_says_why_a_task_was_not_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let path = dir.path().join(crate::GRANTS_FILE);
+        let mut g = dm_policy::Grants::load(&path).unwrap();
+        g.gates.require_definition = true;
+        std::fs::write(&path, g.render().unwrap()).unwrap();
+        let s = McpServer::new(Arc::new(Memory::open(dir.path()).unwrap()));
+        let filed = payload(
+            &s.create_task(Parameters(CreateTaskParams {
+                title: "Tidy".into(),
+                body: "Do it.".into(),
+                ..CreateTaskParams::default()
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(filed["task"]["status"], "proposed");
+        assert_eq!(filed["not_admitted_because"], "it names no task definition");
+    }
+
     #[test]
     fn write_refuses_a_parameter_it_does_not_have() {
         let old =

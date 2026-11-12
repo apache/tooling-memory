@@ -48,12 +48,13 @@ pub struct TaskDefinition {
     /// Its name, from the block's info string.
     #[serde(skip_deserializing)]
     pub name: String,
-    /// Which verified definition of that name this is, counted from one.
-    #[serde(skip_deserializing)]
-    pub version: u32,
-    /// The entry it is in.
+    /// The entry it is in. The entry's id is the definition's version: an entry is never
+    /// edited, so a task that names `<name>@<entry>` names one text for good.
     #[serde(skip_deserializing)]
     pub entry: String,
+    /// The classification of that entry: a task that takes its checks is no lower.
+    #[serde(skip_deserializing)]
+    pub classification: dm_core::Label,
     /// What the work is for, in a sentence: review reads the tools against it.
     #[serde(default)]
     pub purpose: String,
@@ -78,14 +79,43 @@ pub struct TaskDefinition {
 }
 
 impl TaskDefinition {
-    /// How a task names this definition: `<name>@<version>`.
+    /// How a task names this definition: `<name>@<entry>`.
     #[must_use]
     pub fn reference(&self) -> String {
-        format!("{}@{}", self.name, self.version)
+        format!("{}@{}", self.name, self.entry)
     }
 }
 
-/// The name in a task's `definition`, with or without its `@<version>`.
+/// The definition an entry holds under `name`, when the entry is active and verified
+/// and the block reads as one.
+fn definition_in(e: &Entry, name: &str) -> Option<Result<TaskDefinition, ()>> {
+    if !e.is_active() || e.front.trust_tier != TrustTier::Verified {
+        return None;
+    }
+    let block = artifacts_in(e)
+        .into_iter()
+        .find(|a| a.kind == "task" && a.name == name)?;
+    let parsed = toml::from_str::<TaskDefinition>(&block.text)
+        .ok()
+        // a tool is named as a task's requirements name it
+        .filter(|d| {
+            d.tools
+                .iter()
+                .all(|t| t.starts_with("tool:") && t.len() > 5)
+        });
+    Some(
+        parsed
+            .map(|mut d| {
+                d.name = name.to_string();
+                d.entry.clone_from(&e.front.id);
+                d.classification = e.front.classification;
+                d
+            })
+            .ok_or(()),
+    )
+}
+
+/// The name in a task's `definition`, with or without its `@<entry>`.
 #[must_use]
 pub fn definition_name(reference: &str) -> &str {
     reference.split('@').next().unwrap_or(reference)
@@ -256,50 +286,62 @@ impl Memory {
         Ok(found)
     }
 
-    /// The task definition named `name` that is in force: the newest in an active entry
-    /// a person verified. Its version is its place among the verified definitions of
-    /// that name, replaced ones counted, oldest first.
+    /// The task definition named `name` that is in force: the one in the newest active
+    /// entry a person verified.
     ///
     /// # Errors
     ///
-    /// A store error, or [`Error::Denied`] when the block in force is not a definition
-    /// this code reads, with what is wrong in it.
+    /// A store error, or [`Error::Denied`] when the block in force does not read as a
+    /// definition. The refusal names the definition and says nothing of its text.
     pub async fn task_definition(&self, name: &str) -> Result<Option<TaskDefinition>, Error> {
-        let mut verified: Vec<(Artifact, bool)> = Vec::new();
+        let mut newest: Option<Entry> = None;
         for e in self.platform_entries().await? {
-            if e.front.trust_tier != TrustTier::Verified {
-                continue;
-            }
-            for a in artifacts_in(&e) {
-                if a.kind == "task" && a.name == name {
-                    verified.push((a, e.is_active()));
-                }
+            let later = newest
+                .as_ref()
+                .is_none_or(|n| e.front.created > n.front.created);
+            if later && definition_in(&e, name).is_some() {
+                newest = Some(e);
             }
         }
-        verified.sort_by(|a, b| a.0.created.cmp(&b.0.created));
-        let Some(at) = verified.iter().rposition(|(_, active)| *active) else {
-            return Ok(None);
-        };
-        let artifact = &verified[at].0;
-        let mut def: TaskDefinition = toml::from_str(&artifact.text).map_err(|e| {
-            Error::Denied(format!(
-                "the task definition {name} in {} does not read: {e}",
-                artifact.entry
-            ))
-        })?;
-        def.name = name.to_string();
-        def.version = u32::try_from(at + 1).unwrap_or(u32::MAX);
-        def.entry.clone_from(&artifact.entry);
-        Ok(Some(def))
+        newest
+            .and_then(|e| definition_in(&e, name))
+            .transpose()
+            .map_err(|()| unreadable(name))
     }
 
-    /// Bind a task to the definition it names: the name must be in force, the task then
-    /// names it at its version, takes its acceptance criteria if it gave none, and
-    /// requires what the definition declares, so only a session that has those claims it.
+    /// The definition a task names as `<name>@<entry>`, while that entry is still active
+    /// and verified; none once it was replaced, demoted or erased.
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] when no definition of that name is in force.
+    /// A store error, or [`Error::Denied`] when the block does not read as a definition.
+    pub async fn pinned_definition(&self, named: &str) -> Result<Option<TaskDefinition>, Error> {
+        let name = definition_name(named);
+        let Some((_, entry)) = named.split_once('@') else {
+            return self.task_definition(name).await;
+        };
+        let Some(domain) = self.platform_domain() else {
+            return Ok(None);
+        };
+        let Some(e) = self.store.get(&domain, entry).await? else {
+            return Ok(None);
+        };
+        definition_in(&e, name)
+            .transpose()
+            .map_err(|()| unreadable(name))
+    }
+
+    /// Bind a task to the definition it names. The definition must be in force, and the
+    /// session must be one that may read its entry. The task then names it with its
+    /// entry, takes its acceptance criteria if it gave none, is classified no lower than
+    /// the entry, and requires what the definition declares, so only a session that has
+    /// those claims it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] when no definition of that name is in force for this session.
+    /// A definition the session may not read is refused in the same words as one that
+    /// does not exist.
     pub(crate) async fn bind_definition(
         &self,
         spec: &mut dm_ledger::TaskSpec,
@@ -308,12 +350,23 @@ impl Memory {
             return Ok(());
         };
         let name = definition_name(&named);
-        let Some(def) = self.task_definition(name).await? else {
-            return Err(Error::Denied(format!(
+        let none = || {
+            Error::Denied(format!(
                 "no task definition {name} is in force: a verified entry of the platform's domain defines one"
-            )));
+            ))
         };
+        let def = match self.pinned_definition(&named).await {
+            Ok(Some(def)) => def,
+            Ok(None) | Err(Error::Denied(_)) => return Err(none()),
+            Err(e) => return Err(e),
+        };
+        // read as any entry is: refused above the session's handling, and the session's
+        // label rises to what it read
+        if self.get(&def.entry).await.is_err() {
+            return Err(none());
+        }
         spec.definition = Some(def.reference());
+        spec.classification = spec.classification.max(def.classification);
         if spec.acceptance.is_empty() {
             spec.acceptance.clone_from(&def.acceptance);
         }
@@ -325,8 +378,9 @@ impl Memory {
         Ok(())
     }
 
-    /// Why triage does not admit a task, when what it lacks is a definition or a way to
-    /// check it: the missing items, for whoever filed it. None when nothing is missing.
+    /// Why triage does not admit a task on its own, when what it lacks is a definition
+    /// or a way to check it: the missing items, for whoever filed it. None when nothing
+    /// is missing.
     #[must_use]
     pub fn admission_gap(&self, spec: &dm_ledger::TaskSpec) -> Option<String> {
         if spec.definition.is_none() {
@@ -341,28 +395,48 @@ impl Memory {
             .then(|| "it has no acceptance criteria, its own or its definition's".to_string())
     }
 
+    /// Whether the definition a task names is out of force: replaced, demoted or erased
+    /// since the task was filed. Such a task is not admitted by anyone.
+    pub(crate) async fn definition_gone(
+        &self,
+        spec: &dm_ledger::TaskSpec,
+    ) -> Result<Option<String>, Error> {
+        let Some(named) = &spec.definition else {
+            return Ok(None);
+        };
+        Ok(match self.pinned_definition(named).await {
+            Ok(Some(_)) => None,
+            Ok(None) | Err(Error::Denied(_)) => {
+                Some(format!("its task definition {named} is no longer in force"))
+            }
+            Err(e) => return Err(e),
+        })
+    }
+
     /// Whether the task this session holds lets it call `tool`: a task under a
-    /// definition reaches only the tools the definition declares.
+    /// definition reaches only the tools that definition declares, as the task named
+    /// it. A session that holds no task, or a task under no definition, is held to the
+    /// grants alone.
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] when the held task's definition does not declare the tool.
+    /// [`Error::Denied`] when the definition does not declare the tool or is no longer
+    /// in force; a ledger or store error when the task or the definition cannot be
+    /// read, since a check that could not look has not passed.
     pub(crate) async fn definition_allows(&self, tool: &str) -> Result<(), Error> {
         let Some(held) = self.held.get() else {
             return Ok(());
         };
-        let Ok(task) = self.ledger.lock().await.get(held).await else {
-            return Ok(());
-        };
+        let task = self.ledger.lock().await.get(held).await?;
         let Some(named) = task.spec.definition else {
             return Ok(());
         };
-        let name = definition_name(&named);
-        let declared = self
-            .task_definition(name)
-            .await?
-            .is_some_and(|d| d.tools.iter().any(|t| t == &format!("tool:{tool}")));
-        if declared {
+        let Some(def) = self.pinned_definition(&named).await? else {
+            return Err(Error::Denied(format!(
+                "the task definition {named} is no longer in force, so its task reaches no tool"
+            )));
+        };
+        if def.tools.iter().any(|t| t == &format!("tool:{tool}")) {
             Ok(())
         } else {
             Err(Error::Denied(format!(
@@ -370,6 +444,27 @@ impl Memory {
             )))
         }
     }
+
+    /// What this session can do, as the ledger matches it to a task's requirements: the
+    /// manifest it was given, and each tool the grants give it.
+    #[must_use]
+    pub(crate) fn capabilities(&self) -> Vec<String> {
+        let mut all = self.manifest.clone();
+        for (name, tap) in &self.grants.taps {
+            let tool = format!("tool:{name}");
+            if tap.tool && !all.contains(&tool) {
+                all.push(tool);
+            }
+        }
+        all
+    }
+}
+
+/// The refusal for a block that is no task definition: its name, and nothing of its text.
+fn unreadable(name: &str) -> Error {
+    Error::Denied(format!(
+        "the task definition {name} does not read as one: it has a key this code does not know, or a tool that is not `tool:<name>`"
+    ))
 }
 
 #[cfg(test)]
@@ -504,73 +599,85 @@ mod tests {
         }
     }
 
+    async fn verify(m: &Memory, id: &str) {
+        let mut e = m.store.get("dom-plat", id).await.unwrap().unwrap();
+        e.front.trust_tier = TrustTier::Verified;
+        m.store.put(&e).await.unwrap();
+    }
+
+    /// A session of this root that holds `id`.
+    fn holding(dir: &std::path::Path, id: &str) -> Memory {
+        let session = Memory::open(dir).unwrap();
+        session.set_held_task(id);
+        session
+    }
+
     #[tokio::test]
-    async fn a_task_definition_is_in_force_once_verified_and_counts_its_versions() {
+    async fn a_task_definition_is_in_force_once_verified_and_the_newest_one_is() {
         let dir = tempfile::tempdir().unwrap();
         let m = root(dir.path());
         written(&m, REVIEW, false).await;
         assert_eq!(m.task_definition("review-change").await.unwrap(), None);
         let first = written(&m, REVIEW, true).await;
         let def = m.task_definition("review-change").await.unwrap().unwrap();
-        assert_eq!(
-            (def.reference().as_str(), def.entry.as_str()),
-            ("review-change@1", first.as_str())
-        );
+        assert_eq!(def.reference(), format!("review-change@{first}"));
         assert_eq!(def.tools, ["tool:fetch"]);
         assert_eq!(
             def.autonomy,
             Autonomy::Person,
             "where every definition starts"
         );
-        // a verified replacement is the next version; the one it replaced still counts
+        // two verified entries define it: the newer is in force, and the older is still
+        // what a task that named it means
         let wider = REVIEW.replace("[\"tool:fetch\"]", "[\"tool:fetch\", \"tool:search\"]");
-        let second = m
-            .write(WriteRequest {
-                body: wider,
-                domain: Some("dom-plat".into()),
-                entry_type: dm_core::EntryType::Convention,
-                supersedes: Some(first),
-                ..WriteRequest::default()
-            })
-            .await
-            .unwrap()
-            .id;
-        // the owner replaced the entry, as only the owner replaces a verified one unheld,
-        // and nothing is in force until the replacement is verified in its turn
-        assert_eq!(m.task_definition("review-change").await.unwrap(), None);
-        let mut e = m.store.get("dom-plat", &second).await.unwrap().unwrap();
-        e.front.trust_tier = TrustTier::Verified;
-        m.store.put(&e).await.unwrap();
+        let second = written(&m, &wider, true).await;
         let def = m.task_definition("review-change").await.unwrap().unwrap();
-        assert_eq!(def.reference(), "review-change@2");
+        assert_eq!(def.entry, second);
         assert_eq!(def.tools, ["tool:fetch", "tool:search"]);
-        // a block that is no definition is refused in words, not read as an empty one
-        written(&m, "```platform task broken\ntool = \"x\"\n```\n", true).await;
-        let broken = m.task_definition("broken").await;
-        assert!(
-            matches!(&broken, Err(Error::Denied(why)) if why.contains("broken")),
-            "{broken:?}"
-        );
+        let pinned = format!("review-change@{first}");
+        let old = m.pinned_definition(&pinned).await.unwrap().unwrap();
+        assert_eq!(old.tools, ["tool:fetch"]);
     }
 
     #[tokio::test]
-    async fn a_task_takes_its_definition_s_version_checks_and_tools() {
+    async fn a_block_that_is_no_definition_is_refused_and_its_text_is_not_quoted() {
         let dir = tempfile::tempdir().unwrap();
         let m = root(dir.path());
-        written(&m, REVIEW, true).await;
+        for body in [
+            "```platform task broken\nsecret_key_bluebird = \"TOPSECRET\"\n```\n",
+            "```platform task broken\ntools = [\"fetch\"]\n```\n",
+        ] {
+            let id = written(&m, body, true).await;
+            let refused = m.task_definition("broken").await;
+            assert!(
+                matches!(&refused, Err(Error::Denied(why)) if why.contains("broken") && !why.contains("bluebird")),
+                "{refused:?}"
+            );
+            let bound = m.create_task(task("Uses it", Some("broken"))).await;
+            assert!(matches!(&bound, Err(Error::Denied(why)) if !why.contains("bluebird")));
+            m.store.demote("dom-plat", &id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_takes_its_definition_s_entry_checks_and_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = root(dir.path());
+        let entry = written(&m, REVIEW, true).await;
         let filed = m
             .create_task(task("Review the importer", Some("review-change")))
             .await
             .unwrap()
             .task;
-        assert_eq!(filed.spec.definition.as_deref(), Some("review-change@1"));
+        let named = format!("review-change@{entry}");
+        assert_eq!(filed.spec.definition.as_deref(), Some(named.as_str()));
         assert_eq!(
             filed.spec.acceptance,
             ["The handoff names each decision the change touches."]
         );
         assert_eq!(filed.spec.requirements, ["tool:fetch"]);
         // its own checks stand in place of the definition's
-        let mut own = task("Review the exporter", Some("review-change@1"));
+        let mut own = task("Review the exporter", Some(&named));
         own.acceptance = vec!["The handoff lists the files read.".into()];
         let own = m.create_task(own).await.unwrap().task;
         assert_eq!(own.spec.acceptance, ["The handoff lists the files read."]);
@@ -590,8 +697,45 @@ mod tests {
         assert_eq!(all, 2);
     }
 
+    /// A definition above a session's handling is, to that session, one that does not
+    /// exist, and a task that takes its checks is classified as its entry is.
     #[tokio::test]
-    async fn where_the_owner_asks_for_it_a_task_without_a_definition_stays_proposed() {
+    async fn a_definition_is_read_under_the_filter_and_its_task_is_no_lower() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = root(dir.path());
+        let id = m
+            .write(WriteRequest {
+                body: REVIEW.into(),
+                domain: Some("dom-plat".into()),
+                entry_type: dm_core::EntryType::Convention,
+                classification: Some(dm_core::Label::Restricted),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        verify(&m, &id).await;
+        let low = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(dm_core::Label::Public);
+        let hidden = low.create_task(task("Review", Some("review-change"))).await;
+        let missing = low.create_task(task("Review", Some("no-such"))).await;
+        let words = |r: &Result<crate::Created, Error>| match r {
+            Err(Error::Denied(why)) => why.replace("review-change", "X").replace("no-such", "X"),
+            other => format!("{:?}", other.as_ref().map(|c| &c.task.id)),
+        };
+        assert_eq!(words(&hidden), words(&missing), "the same refusal for both");
+        assert!(words(&hidden).contains("no task definition X is in force"));
+        let filed = m
+            .create_task(task("Review", Some("review-change")))
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(filed.spec.classification, dm_core::Label::Restricted);
+    }
+
+    #[tokio::test]
+    async fn where_the_owner_asks_for_it_a_task_without_a_definition_is_not_admitted_on_its_own() {
         let dir = tempfile::tempdir().unwrap();
         root(dir.path());
         let path = dir.path().join(crate::GRANTS_FILE);
@@ -599,15 +743,18 @@ mod tests {
         g.gates.require_definition = true;
         std::fs::write(&path, g.render().unwrap()).unwrap();
         let m = Memory::open(dir.path()).unwrap();
-        written(&m, REVIEW, true).await;
+        let entry = written(&m, REVIEW, true).await;
         let bare = m.file_own(task("Tidy", None)).await.unwrap().task;
         assert_eq!(bare.status, dm_ledger::Status::Proposed);
         assert_eq!(
             m.admission_gap(&bare.spec).as_deref(),
             Some("it names no task definition")
         );
-        let refused = m.admit(&bare.id).await;
-        assert!(matches!(&refused, Err(Error::Denied(why)) if why.contains("task definition")));
+        // the owner is the triage, and admits it by hand
+        assert_eq!(
+            m.admit(&bare.id).await.unwrap().status,
+            dm_ledger::Status::Open
+        );
         let defined = m
             .file_own(task("Review", Some("review-change")))
             .await
@@ -616,7 +763,7 @@ mod tests {
         assert_eq!(
             defined.status,
             dm_ledger::Status::Open,
-            "the owner's filing is admitted"
+            "admitted on its own"
         );
         // a definition with no checks gives a task nothing to be checked by
         written(
@@ -628,33 +775,126 @@ mod tests {
         let loose = m.file_own(task("Loose", Some("loose"))).await.unwrap().task;
         assert_eq!(loose.status, dm_ledger::Status::Proposed);
         assert!(m.admission_gap(&loose.spec).unwrap().contains("acceptance"));
+        // and nobody admits a task whose definition has left force since it was filed
+        let mut waits = task("Later", Some("review-change"));
+        waits.requirements = vec!["human".into()];
+        let waits = m.create_task(waits).await.unwrap().task;
+        m.store.demote("dom-plat", &entry).await.unwrap();
+        if waits.status == dm_ledger::Status::Proposed {
+            let refused = m.admit(&waits.id).await;
+            assert!(
+                matches!(&refused, Err(Error::Denied(why)) if why.contains("no longer in force")),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            m.definition_gone(&waits.spec).await.unwrap(),
+            Some(format!(
+                "its task definition review-change@{entry} is no longer in force"
+            ))
+        );
     }
 
     #[tokio::test]
     async fn a_session_that_holds_a_defined_task_reaches_only_the_tools_it_declares() {
         let dir = tempfile::tempdir().unwrap();
         let m = root(dir.path());
-        written(&m, REVIEW, true).await;
+        let entry = written(&m, REVIEW, true).await;
         let defined = m
             .file_own(task("Review", Some("review-change")))
             .await
             .unwrap()
             .task;
         let bare = m.file_own(task("Tidy", None)).await.unwrap().task;
-        let holding = |id: &str| {
-            let session = Memory::open(dir.path()).unwrap();
-            session.set_held_task(id);
-            session
-        };
-        let on_defined = holding(&defined.id);
-        on_defined.definition_allows("fetch").await.unwrap();
-        let refused = on_defined.definition_allows("search").await;
+        let on_defined = std::sync::Arc::new(holding(dir.path(), &defined.id));
+        // through the call a tool goes through: refused for the definition before the
+        // grants are asked, and for the grants when the definition lets it by
+        let undeclared = on_defined.use_tool("search", serde_json::json!({})).await;
         assert!(
-            matches!(&refused, Err(Error::Denied(why)) if why.contains("tool:search") && why.contains("review-change@1")),
-            "{refused:?}"
+            matches!(&undeclared, Err(Error::Denied(why)) if why.contains("does not declare tool:search")),
+            "{undeclared:?}"
+        );
+        let declared = on_defined.use_tool("fetch", serde_json::json!({})).await;
+        assert!(
+            matches!(&declared, Err(Error::Denied(why)) if why.contains("no tool fetch is granted")),
+            "{declared:?}"
         );
         // a task under no definition is held as before, and so is no task at all
-        holding(&bare.id).definition_allows("search").await.unwrap();
+        holding(dir.path(), &bare.id)
+            .definition_allows("search")
+            .await
+            .unwrap();
         m.definition_allows("search").await.unwrap();
+        // a wider definition verified later widens nothing for a task that named the first
+        let wider = REVIEW.replace("[\"tool:fetch\"]", "[\"tool:fetch\", \"tool:search\"]");
+        written(&m, &wider, true).await;
+        assert!(on_defined.definition_allows("search").await.is_err());
+        // once the entry it named is out of force, the task reaches no tool
+        m.store.demote("dom-plat", &entry).await.unwrap();
+        let gone = on_defined.definition_allows("fetch").await;
+        assert!(matches!(&gone, Err(Error::Denied(why)) if why.contains("no longer in force")));
+        // and a check that cannot read the task has not passed
+        assert!(holding(dir.path(), "task-me-nothere")
+            .definition_allows("fetch")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn what_a_defined_task_files_runs_under_its_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = root(dir.path());
+        let entry = written(&m, REVIEW, true).await;
+        let named = format!("review-change@{entry}");
+        let parent = m
+            .file_own(task("Review", Some("review-change")))
+            .await
+            .unwrap()
+            .task;
+        let session = holding(dir.path(), &parent.id);
+        let own = session
+            .create_task(task("A follow-up", None))
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(own.spec.definition.as_deref(), Some(named.as_str()));
+        assert_eq!(own.spec.acceptance, parent.spec.acceptance);
+        let fanned = m
+            .fan_out(&parent.id, &[("Read one".into(), "Read the first.".into())])
+            .await
+            .unwrap();
+        let child = &fanned.children[0];
+        assert_eq!(child.spec.definition.as_deref(), Some(named.as_str()));
+        let continuation = fanned.continuation.unwrap();
+        assert_eq!(
+            continuation.spec.definition.as_deref(),
+            Some(named.as_str())
+        );
+        assert_eq!(continuation.spec.acceptance, parent.spec.acceptance);
+    }
+
+    #[tokio::test]
+    async fn a_session_s_capabilities_hold_the_tools_the_grants_give_it() {
+        let dir = tempfile::tempdir().unwrap();
+        root(dir.path());
+        let path = dir.path().join(crate::GRANTS_FILE);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let with_tool = format!(
+            "{text}\n[taps.fetch]\ndomain = \"dom-me\"\nhosts = []\nceiling = \"public\"\ntool = true\n"
+        );
+        std::fs::write(&path, with_tool).unwrap();
+        let m = Memory::open(dir.path())
+            .unwrap()
+            .with_manifest(vec!["human".into()]);
+        assert_eq!(m.capabilities(), ["human", "tool:fetch"]);
+        written(&m, REVIEW, true).await;
+        // so a task that requires what its definition declares is one this session claims
+        let t = m
+            .file_own(task("Review", Some("review-change")))
+            .await
+            .unwrap()
+            .task;
+        let claimed = m.claim(&t.id, time::Duration::minutes(5)).await.unwrap();
+        assert_eq!(claimed.task.id, t.id);
     }
 }

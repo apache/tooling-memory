@@ -2112,6 +2112,14 @@ impl Memory {
         parent: Option<&Task>,
     ) -> Result<Created, Error> {
         let mut spec = self.stamp(spec, filing, parent)?;
+        // what a session files while it holds a task is that task's work: it runs under
+        // the same definition, and is checked the same way, unless it names its own
+        if let (Filing::Held, Some(p), None) = (filing, parent, &spec.definition) {
+            spec.definition.clone_from(&p.spec.definition);
+            if spec.acceptance.is_empty() {
+                spec.acceptance.clone_from(&p.spec.acceptance);
+            }
+        }
         self.bind_definition(&mut spec).await?;
         let created = l.create(spec).await?;
         // a filing that names a task already there is handed that task, and admits it on
@@ -2166,8 +2174,10 @@ impl Memory {
         let mut l = self.ledger.lock().await;
         let task = l.get(id).await?;
         self.check_task(&task)?;
-        if let Some(gap) = self.admission_gap(&task.spec) {
-            return Err(Error::Denied(format!("{id} is not admitted: {gap}")));
+        // the owner is the triage here, and may admit a task that names no definition: the
+        // system's own filings name none. Nobody admits one whose definition is gone
+        if let Some(gone) = self.definition_gone(&task.spec).await? {
+            return Err(Error::Denied(format!("{id} is not admitted: {gone}")));
         }
         let admitted = l.admit(id).await?;
         self.rank_edges(&mut l, &admitted).await?;
@@ -2216,7 +2226,10 @@ impl Memory {
         parent: Option<&Task>,
     ) -> Result<Task, Error> {
         // a task nobody can check stays proposed, whatever the policy says of its filer
-        if task.status != dm_ledger::Status::Proposed || self.admission_gap(&task.spec).is_some() {
+        if task.status != dm_ledger::Status::Proposed
+            || self.admission_gap(&task.spec).is_some()
+            || self.definition_gone(&task.spec).await?.is_some()
+        {
             return Ok(task);
         }
         let d = self.decide(&Input {
@@ -2243,6 +2256,24 @@ impl Memory {
             Ok(admitted)
         } else {
             Ok(task)
+        }
+    }
+
+    /// The task a fan-out files for one subagent: its parent's work, under the parent's
+    /// definition and checks, no higher in rank, and named by the hash of what it asks.
+    fn child_of(&self, parent: &Task, title: &str, body: &str, hash: String) -> TaskSpec {
+        TaskSpec {
+            domain: parent.spec.domain.clone(),
+            title: title.to_string(),
+            body: body.to_string(),
+            origin: Some(format!("task:{}", parent.id)),
+            upstream_event: Some(hash),
+            created_by: self.author.clone(),
+            classification: parent.spec.classification.max(self.label()),
+            priority: parent.spec.priority,
+            definition: parent.spec.definition.clone(),
+            acceptance: parent.spec.acceptance.clone(),
+            ..TaskSpec::default()
         }
     }
 
@@ -2287,17 +2318,7 @@ impl Memory {
         let mut children = Vec::new();
         for (title, body, hash) in asked {
             let created = l
-                .create(TaskSpec {
-                    domain: parent.spec.domain.clone(),
-                    title: title.clone(),
-                    body: body.clone(),
-                    origin: Some(format!("task:{}", parent.id)),
-                    upstream_event: Some(hash),
-                    created_by: self.author.clone(),
-                    classification: parent.spec.classification.max(self.label()),
-                    priority: parent.spec.priority,
-                    ..TaskSpec::default()
-                })
+                .create(self.child_of(&parent, &title, &body, hash))
                 .await?;
             // the ledger dedups on the parent and the hash whatever the task's status: a
             // task it hands back is not this call's, and one this session may not read
@@ -2429,7 +2450,8 @@ impl Memory {
             created_by: self.author.clone(),
             classification: parent.spec.classification.max(self.label()),
             priority: parent.spec.priority,
-            ..TaskSpec::default()
+            definition: parent.spec.definition.clone(),
+            acceptance: parent.spec.acceptance.clone(),
         })
         .await?;
         let continuation = self
@@ -2588,7 +2610,8 @@ impl Memory {
                 created_by: self.author.clone(),
                 classification,
                 priority: root.spec.priority,
-                ..TaskSpec::default()
+                definition: root.spec.definition.clone(),
+                acceptance: root.spec.acceptance.clone(),
             })
             .await?;
         let retry = self
@@ -2617,7 +2640,7 @@ impl Memory {
             .ledger
             .lock()
             .await
-            .claim_next(&domain, &self.author, lease, &self.manifest, handling)
+            .claim_next(&domain, &self.author, lease, &self.capabilities(), handling)
             .await?;
         if let Some(c) = &claim {
             lock(&self.session).observe(c.task.spec.classification);
@@ -2637,7 +2660,7 @@ impl Memory {
         self.check_task(&l.get(id).await?)?;
         let handling = self.handling()?;
         let c = l
-            .claim(id, &self.author, lease, &self.manifest, handling)
+            .claim(id, &self.author, lease, &self.capabilities(), handling)
             .await?;
         lock(&self.session).observe(c.task.spec.classification);
         lock(&self.claims).insert(c.task.id.clone(), c.generation);

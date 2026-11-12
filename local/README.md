@@ -624,23 +624,34 @@ outputs = ["handoff"]
 autonomy = "person"
 ```
 
-A definition is in force when its entry is active and a person verified it. Its version
-is its place among the verified definitions of that name, and the first is version 1.
+A definition is in force when its entry is active and a person verified it. When two
+such entries define one name, the newer entry is in force. The version of a definition is
+the id of its entry. An entry never changes, so a task that names a version names one
+text.
 
 A task names a definition with `amem task create --definition <name>`, or with
 `definition` in the memory tool `create_task`. Then:
 
-- The task records the definition with its version, for example `answer-from-record@1`.
+- The task records the definition with its version, for example
+  `answer-from-record@mem-platform-7k2q9x4b`.
+- The task gets the classification of the entry of the definition, if that is higher.
 - The task takes the acceptance checks of the definition, if it gives none. Give checks
   for one task with `--accept`.
 - The task requires the tools that the definition declares. Thus only a session that has
   those tools can claim it.
 - A session that holds the task can call only the tools that the definition declares.
-  The memory server refuses a different tool.
+  The memory server refuses a different tool. It uses the definition that the task
+  named. If that entry is replaced, demoted or erased, the session can call no tool.
+- A task that a session files while it holds the task gets the same definition and
+  checks. This applies to a subagent task, its continuation and a retry.
+
+A tool has the form `tool:<name>`, where the name is the name of a tap that the grants
+give as a tool, for example `tool:fetch` and `tool:search`. A session can claim a task
+that requires a tool when the grants give it that tool.
 - `amem work` puts the definition and the checks in the prompt, below "Done when".
 
 A task cannot name a definition that is not in force. The memory server refuses it, and
-files nothing.
+files nothing. It gives the same refusal for a definition that the session cannot read.
 
 By default, triage also admits a task that names no definition. The tasks that the
 system files for itself name none yet. To require a definition, set this in `grants.toml`:
@@ -650,12 +661,15 @@ system files for itself name none yet. To require a definition, set this in `gra
 require_definition = true
 ```
 
-Then a task with no definition, or with no acceptance checks, stays `proposed`.
-`create_task` gives the reason in `not_admitted_because`, and `amem task admit` refuses
-the task with the same reason.
+Then triage does not admit a task with no definition, or with no acceptance checks. The
+task stays `proposed`, and `create_task` gives the reason in `not_admitted_because`. The
+owner can still admit such a task with `amem task admit`, because the tasks that the
+system files name no definition. Nobody can admit a task whose definition is no longer
+in force.
 
 Not built yet: the autonomy level has no effect, no suite gates a version of a
-definition, and the data scope is not enforced.
+definition, and the data scope is not enforced. An erasure of the entry of a definition
+does not remove the checks that tasks took from it.
 
 ## The task fabric: `amem task rescore` and `stats`
 

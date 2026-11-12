@@ -215,12 +215,25 @@ impl Db {
     /// stands, such a task would be in no list and no queue, without a word.
     async fn rebuild_stale_projections(&mut self) -> Result<(), Error> {
         for (domain, s) in self.schemas().await? {
-            // a schema from before a task carried more than the ledger queries by
-            self.client
-                .batch_execute(&format!(
-                    "ALTER TABLE {s}.tasks ADD COLUMN IF NOT EXISTS extra TEXT"
-                ))
-                .await?;
+            // a schema from before a task carried more than the ledger queries by: asked
+            // of the catalog first, so a connect takes no lock on a table that has it
+            let has_extra = self
+                .client
+                .query_opt(
+                    "SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = $1 AND table_name = 'tasks' AND column_name = 'extra'",
+                    // the catalog holds the name without the quotes the schema is written in
+                    &[&s.trim_matches('"')],
+                )
+                .await?
+                .is_some();
+            if !has_extra {
+                self.client
+                    .batch_execute(&format!(
+                        "ALTER TABLE {s}.tasks ADD COLUMN IF NOT EXISTS extra TEXT"
+                    ))
+                    .await?;
+            }
             let row = self
                 .client
                 .query_one(

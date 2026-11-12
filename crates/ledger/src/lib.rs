@@ -2135,6 +2135,34 @@ mod tests {
         assert_eq!(l.get(&rests.id).await.unwrap().status, Status::Proposed);
     }
 
+    /// A ledger file from before a task carried a definition: no `extra` column.
+    #[tokio::test]
+    async fn on_sqlite_a_ledger_from_before_the_extra_column_is_given_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ledger.db");
+        let id = {
+            let mut l = Ledger::open(&file).unwrap();
+            admitted(&mut l, spec("Old")).await.id
+        };
+        rusqlite::Connection::open(&file)
+            .unwrap()
+            .execute_batch("ALTER TABLE tasks DROP COLUMN extra;")
+            .unwrap();
+        let mut l = Ledger::open(&file).unwrap();
+        assert_eq!(l.get(&id).await.unwrap().spec.definition, None);
+        let mut defined = spec("New");
+        defined.definition = Some("review-change@mem-p-1".into());
+        defined.acceptance = vec!["It is checked.".into()];
+        let new = l.create(defined.clone()).await.unwrap().task;
+        assert_eq!(new.spec.definition, defined.definition);
+        // a rebuild reads the same out of the events
+        l.rebuild().await.unwrap();
+        assert_eq!(
+            l.get(&new.id).await.unwrap().spec.acceptance,
+            defined.acceptance
+        );
+    }
+
     /// Every task row's state set to a name this code does not have.
     async fn make_stale(b: &Site) {
         match b {
