@@ -53,7 +53,7 @@ the research. By 25 October, `main` had fixes for all five. Each row names the p
 
 ## The contract any replacement has to hold
 
-The contract comes from `crates/sandbox/src/lib.rs` and from PLAN.md M5, M6 and M8:
+The contract comes from `crates/sandbox/src/lib.rs` and from M5, M6 and M8 of the first plan (`spikes/plan-2026-10`):
 
 1. **No network.** The harness has no interface but loopback. Its only way out is one unix
    socket to the egress. The socket comes in as a bind mount, and `amem relay` relays it to a

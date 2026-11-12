@@ -5,7 +5,8 @@ make the record continue to exist after every agent, harness, model and vendor t
 written with. This repository holds the reference implementation and the plan to build it.
 
 The paper in [docs/](docs/durable-memory-for-disposable-agents.md) gives the design.
-[PLAN.md](PLAN.md) gives the plan, with the first milestone.
+[PLAN.md](PLAN.md) gives the plan: what the paper asks for that the code does not have,
+and the order in which that gets built.
 [docs/reference-stack.md](docs/reference-stack.md) gives the stack that this
 implementation grows into.
 
@@ -107,16 +108,52 @@ two weeks. It is also the reason that none of it is the production shape.
   - accelerator time, which only the gateway can count
   - bytes stored
   - CPU or memory limits on the sandbox
+- **The task record, in part.** A claim has no generation. The ledger accepts a caller
+  when the caller's name is the name of the holder and the lease of the task has not
+  expired. It checks nothing else, and two sessions of one harness have the same name. A task has no `blocked` state: the ledger computes a block when a session
+  claims. The ledger does not record a refused claim. An uncertain external effect does
+  not stop a new claim.
+- **Task definitions and autonomy levels.** A task does not name a task definition, and
+  triage admits a task without one. A session gets its tools from the grants file, not
+  from a definition. There is no autonomy level, no held-out suite and no evaluator.
+- **Positions.** There is no `position` entry, and a task cannot be pinned.
+- **Approval events.** An approval is the completion of a promotion task. It has no
+  scope and no expiry, and the perimeter does not check it when an action runs. There is
+  no `declassify` and no guard.
+- **The rule lifecycle.** A rule is enforced when a person verified it and it has a
+  module. A rule has no status, no owner who is a person, and no review date that the
+  policy uses. There is no ceiling on rules, no reset, and no `check_policy` tool.
+- **Lineage, in part.** An entry does not record its session. `amem taint` compares the
+  time of a read with the time of a later write, and it goes forward only. Reads and
+  sends are not in the event log. A write that the scan refuses is a file under `state/`,
+  not an event in the log.
+- **Raw reach.** Each session that reads a domain reads its raw entries, and the content
+  that a tap brought in is among them. A session does not record that it read outside
+  content.
+- **Curation and audit, in part.** No curation task demotes an entry, checks an owner or
+  a cross-link, or curates policy. No test on planted faults qualifies the auditor's
+  model. The auditor does not read handoffs.
+- **Access freshness.** A session keeps its read filter until it ends. A change to the
+  grants or to a policy does not stop a session.
+- **The improvement loop.** The only gate on a platform artifact is that a person
+  verifies it. There is no performance gate, no safety gate, and no check that a change
+  adds no permission.
+- **Measurement, in part.** `amem` computes four read metrics, cost and usage. The paper
+  names 21 metrics. Upkeep share, induced work and the landing queue are not built. The
+  only limit is a spend limit in tokens.
+- **The evaluation arms.** Act 6 compares memory with an empty record. The paper's five
+  arms, the paired seeds and the margin are not built. No scorecard is kept in the
+  platform domain.
+- **Long timescales.** There is no ownership registry, no personal domain, no recovery
+  bundle and no restore drill.
 - **Smaller pieces.** The search tool ran only against a fake of Brave's API. It never
   ran against the live provider.
-- **Platforms and CI.** Confinement on macOS is dry-coded. Its Seatbelt profile comes from
-  the plan. Unit tests check the profile on Linux, but it did not run on a Mac yet. The
+- **Platforms.** Confinement on macOS ran only on a CI runner. CI runs the Seatbelt
+  tests there. No harness ran under Seatbelt yet. The
   bridge to Gofannon is built against the Gofannon REST surface and a fake of it. It did
   not connect to a live deployment yet. It uses the Gofannon session cookie, which is the
   only credential that Gofannon issues. A Gofannon agent makes its own model calls,
-  outside the egress, so the egress does not meter them. Since a billing failure, CI does
-  not run. The pre-commit hook gates every change locally, and `make verify` runs
-  only by hand.
+  outside the egress, so the egress does not meter them.
 
 ### What is built but works only at demo scale
 
@@ -194,7 +231,7 @@ The code hides none of this:
 - The conformance suite states the contracts.
 - The reference stack in [docs/reference-stack.md](docs/reference-stack.md) names each
   production backend.
-- The register in [PLAN.md](PLAN.md) gives the order.
+- [PLAN.md](PLAN.md) gives the order.
 
 Production backends go in behind the same crates, and they must pass the same suite. The
 evaluation harness and `amem savings` give the numbers for each swap. The purpose is that
@@ -318,7 +355,7 @@ It runs them in one of these:
 - in native Linux namespaces from the harness image, after `make unpack` puts the image
   in place. Every harness except Antigravity is in the harness image.
 - under WSL containers
-- under Seatbelt on macOS. This did not run on a Mac yet.
+- under Seatbelt on macOS. This ran only on a CI runner, and with no harness.
 
 Auth is `key`, `gateway`, or `subscription`. `subscription` is the harness's own login,
 which the egress passes through. Where the egress forwards and does not tunnel, it meters
@@ -342,7 +379,8 @@ egress.
 ## The parts, and their commands
 
 [local/README.md](local/README.md) describes most parts, each under its own heading. At
-this time, only the register in [PLAN.md](PLAN.md) describes re-enactment, the event log,
+this time, only the register in [spikes/plan-2026-10](spikes/plan-2026-10/README.md)
+describes re-enactment, the event log,
 the platform domain and the Gofannon bridge.
 
 | Part | What it does | Commands |
@@ -460,8 +498,8 @@ stages only Markdown, the hook runs only the guard's tests. `make check` runs th
 - unsafe-code and taps checks
 
 `make verify` adds `cargo deny`, `machete`, coverage with a minimum of 90% on lines, and
-the WebAssembly build. Since a billing failure, CI does not run. Thus the hook is the
-gate, and `make verify` runs only by hand.
+the WebAssembly build. CI runs these checks on each pull request that changes more than
+Markdown, and it runs the tests on Linux, macOS and Windows.
 
 Two of those tests reach outside the workspace. A host can cause either of them to fail
 for reasons that are not related to the change that you make.
@@ -522,17 +560,18 @@ export CHROME="$(ls -d ~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome |
 
 ## Status
 
-On 12 October 2026, the paper's contracts are built and tested from end to end on one
-laptop. The demo runs them live against real harnesses, on the Foundation's gateway and a
+On 12 October 2026, the contracts that the paper had on that date were built and tested
+from end to end on one laptop. The paper gained more parts in November 2026, and the
+first list above names them. The demo runs them live against real harnesses, on the Foundation's gateway and a
 Claude login. Until now, a few parts ran only against stand-ins:
 
 - the Gofannon bridge, against a fake of its service
 - the search tool, against a fake of its service
-- Seatbelt, which did not run on a Mac
+- Seatbelt, which ran only on a CI runner, with no harness
 
 The first list above says this, with the rest of what is not built. The list after it
-gives what works only at demo scale. [PLAN.md](PLAN.md) holds the decisions, the register,
-and the order in which production backends go in.
+gives what works only at demo scale. [PLAN.md](PLAN.md) holds the decisions, the order
+of the work that is not built, and the order in which production backends go in.
 
 [docs/llm-apache-org.md](docs/llm-apache-org.md) gives what we propose to the Foundation's
 gateway, llmao at llm.apache.org, and why, from one trace across the wrapper and the
