@@ -689,8 +689,26 @@ The ledger does not admit a task that depends on an invalidated task. An erasure
 invalidates a task sends the tasks that it blocked back to `proposed`, as each
 invalidation does.
 
-Not built yet: an attempt key for each operation, a block on a new claim while an external
-effect is uncertain, and a `blocked` state for a task that waits on an outside event.
+A claim and a completion can carry an attempt key, which the caller makes. A caller that
+did not get the answer asks again with the same key:
+
+- `claim_next` with the same key gives the same claim, while that claim is in force. It
+  does not give a second task. When that claim is over, the ledger refuses the key.
+- `complete` with the same key and the same handoff gives the done task. The ledger
+  completes the task one time, and nothing else occurs for the second call. With a
+  different handoff, the ledger refuses the key.
+
+The memory tools `claim_next` and `complete` take `attempt`. A key is 1 to 64 ASCII
+letters, digits, dots, hyphens or underscores. A key belongs to one session and one
+domain. A different session with the same key makes its own claim. The same key with a
+different `domain` also makes its own claim. One key can be used for a claim and for a
+completion. The ledger looks for the key in the transaction that makes
+the claim. The key is in the event of the claim or the completion, so the ledger finds it
+again after a rebuild. A command has no session, so `amem task` has no attempt key.
+
+Not built yet: an attempt key for the other operations, a block on a new claim while an
+external effect is uncertain, and a `blocked` state for a task that waits on an outside
+event.
 
 ## Task definitions: `platform task`
 
