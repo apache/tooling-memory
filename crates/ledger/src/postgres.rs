@@ -590,46 +590,41 @@ impl Db {
         let tx = self.client.transaction().await?;
         let rows = tx
             .query(
-                &format!(
-                    "SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE {claimable_now}
-                     ORDER BY priority DESC, created"
-                ),
+                &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE {claimable_now}"),
                 &[],
             )
             .await?;
-        for row in &rows {
-            let seen = task_from_row(row)?;
+        let mut candidates = rows
+            .iter()
+            .map(task_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::in_queue_order(&mut candidates);
+        for seen in candidates {
             if !claimable(&seen, now, manifest, handling) {
                 continue;
             }
-            let Some(locked) = tx
-                .query_opt(
-                    &format!(
-                        "SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $1 AND {claimable_now}
-                         FOR UPDATE SKIP LOCKED"
-                    ),
-                    &[&seen.id],
-                )
-                .await?
-            else {
-                continue;
-            };
-            let task = task_from_row(&locked)?;
-            if !claimable(&task, now, manifest, handling)
-                || !deps_complete(&tx, &task.spec.depends_on).await?
-                || awaits_continuation(&tx, &s, &task.id).await?
-            {
-                continue;
+            let who = (holder, until);
+            if take(&tx, &s, &seen.id, now, who, manifest, handling).await? {
+                tx.commit().await?;
+                return Ok(Some(seen.id));
             }
-            let claimed = Event::Claimed {
-                holder: holder.to_string(),
-                until,
-            };
-            apply(&tx, &s, &task.id, now, &claimed).await?;
-            tx.commit().await?;
-            return Ok(Some(task.id));
         }
         Ok(None)
+    }
+
+    /// [`take`] in a transaction of its own, for a test of what it refuses.
+    #[cfg(test)]
+    pub(crate) async fn take_alone(
+        &mut self,
+        id: &str,
+        now: OffsetDateTime,
+        who: (&str, OffsetDateTime),
+    ) -> Result<bool, Error> {
+        let s = self.schema_of_task(id).await?;
+        let tx = self.client.transaction().await?;
+        let taken = take(&tx, &s, id, now, who, &[], Label::Restricted).await?;
+        tx.commit().await?;
+        Ok(taken)
     }
 
     pub(crate) async fn claim(
@@ -839,6 +834,44 @@ impl Db {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// Lock one candidate's row and claim it for `who`, a holder and the end of its lease, if
+/// the task is still claimable now that the row is held. The candidate was read before
+/// the lock: another connection may have claimed it and committed since, and this check
+/// is then all that stands between the task and a second holder. A row another
+/// connection holds is passed over.
+async fn take<C: GenericClient>(
+    tx: &C,
+    s: &str,
+    id: &str,
+    now: OffsetDateTime,
+    who: (&str, OffsetDateTime),
+    manifest: &[String],
+    handling: Label,
+) -> Result<bool, Error> {
+    let locked = tx
+        .query_opt(
+            &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $1 FOR UPDATE SKIP LOCKED"),
+            &[&id],
+        )
+        .await?;
+    let Some(locked) = locked else {
+        return Ok(false);
+    };
+    let task = task_from_row(&locked)?;
+    if !claimable(&task, now, manifest, handling)
+        || !deps_complete(tx, &task.spec.depends_on).await?
+        || awaits_continuation(tx, s, &task.id).await?
+    {
+        return Ok(false);
+    }
+    let claimed = Event::Claimed {
+        holder: who.0.to_string(),
+        until: who.1,
+    };
+    apply(tx, s, &task.id, now, &claimed).await?;
+    Ok(true)
 }
 
 /// Take a domain's lock until the transaction ends.

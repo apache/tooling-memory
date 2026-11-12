@@ -371,11 +371,12 @@ impl Db {
                 // out is asked of the parsed time below: as text, a time with fewer
                 // digits of a second sorts after a later one with more
                 "SELECT {TASK_COLUMNS} FROM tasks
-                 WHERE domain = ?1 AND status IN ('open', 'blocked', 'claimed')
-                 ORDER BY priority DESC, created"
+                 WHERE domain = ?1 AND status IN ('open', 'blocked', 'claimed')"
             ))?;
             let rows = stmt.query_map(params![domain], |r| Ok(task_from_row(r)))?;
-            rows.map(|r| r?).collect::<Result<_, _>>()?
+            let mut found: Vec<Task> = rows.map(|r| r?).collect::<Result<_, _>>()?;
+            crate::in_queue_order(&mut found);
+            found
         };
         for task in candidates {
             if !claimable(&task, now, manifest, handling)
