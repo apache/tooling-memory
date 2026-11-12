@@ -21,7 +21,7 @@ struct Parsed {
     trust_tier: String,
     classification: String,
     label_rank: u8,
-    source: Vec<String>,
+    cites: Vec<String>,
     supersedes: Option<String>,
     status: Option<String>,
     title: String,
@@ -57,7 +57,7 @@ pub fn parse_entry(text: &str) -> String {
                 trust_tier: e.front.trust_tier.to_string(),
                 classification: e.front.classification.to_string(),
                 label_rank: rank(e.front.classification),
-                source: e.front.source.clone(),
+                cites: e.front.cites.clone(),
                 supersedes: e.front.supersedes.clone(),
                 status: e.front.status.map(|s| format!("{s:?}").to_lowercase()),
                 title: e.title(),
@@ -114,7 +114,7 @@ fn error(msg: &str) -> String {
 mod tests {
     use super::*;
 
-    const ENTRY: &str = "---\nid: mem-me-00000001\ntype: fact\ndomain: dom-me\nauthor: human:test:me\ncreated: 2026-10-01T09:00:00Z\ntrust_tier: curated\nclassification: internal\n---\n# Retry policy\n\nOperation R retries with backoff.\n";
+    const ENTRY: &str = "---\nid: mem-me-00000001\ntype: fact\ndomain: dom-me\nauthor: human:test:me\ncreated: 2026-10-01T09:00:00Z\ncites:\n- https://example.org/a\ntrust_tier: curated\nclassification: internal\n---\n# Retry policy\n\nOperation R retries with backoff.\n";
 
     #[test]
     fn an_entry_parses_to_what_the_index_would_serve() {
@@ -125,6 +125,7 @@ mod tests {
         assert_eq!(v["classification"], "internal");
         assert_eq!(v["label_rank"], 1);
         assert_eq!(v["trust_tier"], "curated");
+        assert_eq!(v["cites"], serde_json::json!(["https://example.org/a"]));
         assert!(v["body"].as_str().unwrap().contains("backoff"));
         let d = v["digest"].as_str().unwrap();
         assert_eq!(d.len(), 64);

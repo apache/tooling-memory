@@ -73,7 +73,7 @@ DRIVEN = {
 # The rest of the surface, listed but not driven here.
 NOT_DRIVEN = ["fan_out", "task_tree", "retry_task"]
 
-BUNDLE_FORMAT = "durable-memory/bundle/0"
+BUNDLE_FORMAT = "durable-memory/bundle/1"
 LABELS = ["public", "internal", "restricted"]
 
 

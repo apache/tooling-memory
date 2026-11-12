@@ -23,7 +23,7 @@ These contracts are built, and real harnesses on real models test them from end 
 - summaries first
 - the hook protocol
 - the egress as the only way out
-- the containment set: canaries, an independent checker, and reversible writes
+- the containment set: canaries, an independent auditor, and reversible writes
 
 The conformance suite in `crates/memory/tests` states these contracts. The paper's other
 commitments, beyond the read path, are also built and tested from end to end, by real
@@ -33,7 +33,7 @@ harnesses on real models:
 - policy as memory, with scoped exceptions
 - the write gates and the quarantine
 - the task fabric's rubric
-- the librarian's curation and its own telemetry
+- the curation of the curators, and their telemetry
 - prefetch and the read metrics
 - vendor-drift probes
 - transcripts kept as sources
@@ -170,7 +170,7 @@ These parts do what the paper says, on one laptop. Each item names what replaces
 - **The logs** are JSONL and SQLite files under `state/`. They hold the reads, the
   writes, the decisions and the metering of the egress. Everything that `amem` computes
   from them reads them whole:
-  - the librarian's retrieval signals and telemetry
+  - the curator's retrieval signals and telemetry
   - taint
   - the read metrics
   - the policy rates
@@ -264,7 +264,7 @@ The design is several parts around one record. No one part is the safety boundar
 
 An agent starts empty. It loads a small index called T0, works a task that it claimed,
 and writes a handoff when it stops. The next agent continues from the handoff, not from a
-transcript. In addition, the **librarian** curates the record on a budget. A person
+transcript. In addition, the **curator** curates the record on a budget. A person
 promotes what the system may rely on.
 
 ```
@@ -277,7 +277,7 @@ promotes what the system may rely on.
                  │ model calls                      │  Rego     ├──▶ ledger   SQLite, or PostgreSQL
                  ▼                                  │           └──▶ logs     the event log; reads, writes, decisions
               egress ──▶ provider or gateway        │
-       metered, spend-limited, contexts recorded    └── librarian: curation, checker, canaries, drift
+       metered, spend-limited, contexts recorded    └── curator: curation, auditor, canaries, drift
 ```
 
 The diagram shows the MCP arrow straight to the memory server. But MCP also goes through
@@ -389,7 +389,7 @@ the platform domain and the Gofannon bridge.
 | The task fabric | Tasks with leases and handoffs. A rubric from the L1 strategy ranks along the ledger's edges, at admission and in the triage cycle. Workers only claim. Subagents go on the board as children, with a continuation | `task create, admit, claim-next, complete, release, tree, retry, rescore, stats`, `work` |
 | Trust tiers | Raw, curated, verified. Only a person who did not propose an entry can make it verified. Review clocks and decay | `promote`, `approve` |
 | The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced after they are verified, with scoped exceptions). Admission, the read filter, the write scan and quarantine, and blast-radius gates. A log of every decision | `policy show, eval, list, lint`, `quarantine`, `taint` |
-| The librarian | A survey of what needs curation, an independent checker, a search for contradictions, canaries, its own telemetry and alarms, and a cycle on a budget | `librarian`, `curate`, `check`, `canary` |
+| The curator | A survey of what needs curation, an independent auditor, a search for contradictions, canaries, its own telemetry and alarms, and a cycle on a budget | `curator`, `curate`, `audit`, `canary` |
 | The egress | It forwards, meters and times model calls, holds spend limits per destination, and records decision contexts. It keeps the wall clock, CPU and peak memory of each session beside the session's tokens | `launch`, `usage`, `cost` |
 | Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned | `transcript`, `replay`, `reenact run, report, tapes, show, pin, unpin` |
 | The event log | Every write of an entry goes through the append-only log of its domain, with ids and digests only. A materializer builds the index from the log and replays the ledger's events | `log show`, `log materialize` |
@@ -456,7 +456,7 @@ It says what is missing and how to fix it. At the end, it shows the command to r
 
 1. **The read path.** The demo seeds a few hundred entries. A harness works a real task
    from T0 and a handoff. The demo measures the savings.
-2. **Curation, and the trust tiers.** A curation cycle. A librarian run whose rewrite goes
+2. **Curation, and the trust tiers.** A curation cycle. A curator run whose rewrite goes
    in at curated. A person approves an entry for verified.
 3. **The perimeter.** The policy holds in quarantine a write that speaks to agents. Then
    taint, policy as memory with a scoped exception, and the read filter. A spend limit
@@ -551,7 +551,7 @@ export CHROME="$(ls -d ~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome |
 | `crates/reader` | The core crate for the browser reader, compiled to WebAssembly |
 | `crates/web` | The web launcher: sessions in pseudo-terminals, a reading pane, the board, and the companion extension that fetches with the browser's logins |
 | `crates/wslc-api` | The WSL containers C API, bound by hand, Windows only |
-| `crates/memory` | The binary, `amem`: the launcher, the librarian, the command line |
+| `crates/memory` | The binary, `amem`: the launcher, the curator, the command line |
 | `taps/` | The taps: GitHub issues and comments, fetch, search and Gofannon |
 | `probes/drift.toml` | The pinned vendor-drift probe set |
 | `images/harness` | The harness image: the harnesses, Node, Python and `amem`, pinned by version, and Muse by its release channel |

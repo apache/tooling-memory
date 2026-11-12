@@ -319,7 +319,7 @@ async fn metrics_of(
             },
         };
         if entry.front.entry_type == dm_core::EntryType::Handoff {
-            let text = format!("{}\n{}", entry.body, entry.front.source.join("\n"));
+            let text = format!("{}\n{}", entry.body, entry.front.cites.join("\n"));
             handoffs.insert(w.id.clone(), text);
         }
     }

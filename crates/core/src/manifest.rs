@@ -74,7 +74,7 @@ pub struct Manifest {
 }
 
 /// The current bundle format identifier. A format change bumps the trailing number.
-pub const FORMAT: &str = "durable-memory/bundle/0";
+pub const FORMAT: &str = "durable-memory/bundle/1";
 
 impl Manifest {
     /// An empty manifest for `domain`, bounded at `max_label`.

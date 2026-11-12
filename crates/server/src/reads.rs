@@ -36,7 +36,7 @@ pub struct Read {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cached: bool,
     /// The entries served: a page's hit ids, or the one a get opened. What the
-    /// librarian's signals are computed from, co-retrieval and opened bodies.
+    /// curator's signals are computed from, co-retrieval and opened bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ids: Vec<String>,
     /// How a recall was served: `brief`, or `pack:sections` and `pack:summaries`.
@@ -321,7 +321,7 @@ pub fn all(root: &Path) -> std::io::Result<Vec<Read>> {
 
 /// How many times each pair of entries came back from one search, over a read log: the
 /// first five hits of every search that `keep` admits, as a pair in id order. The
-/// librarian's merge signal and the prefetch's association are this one count.
+/// curator's merge signal and the prefetch's association are this one count.
 #[must_use]
 pub fn co_retrieved(
     reads: &[Read],

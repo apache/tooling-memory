@@ -114,7 +114,7 @@ pub async fn file_outbox(
                 title: &note.title,
                 body: &note.body,
                 confidence: None,
-                source,
+                cites: source,
                 domain,
             })
             .await?;
@@ -755,7 +755,7 @@ mod tests {
             "nothing to report"
         );
         assert!(
-            !delegated_report(&task(Some("librarian:merge")), 0, "done"),
+            !delegated_report(&task(Some("curator:merge")), 0, "done"),
             "only delegated tasks"
         );
         assert!(!delegated_report(&task(None), 0, "done"));

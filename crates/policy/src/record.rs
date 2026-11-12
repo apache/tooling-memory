@@ -69,7 +69,7 @@ pub struct Meta {
 /// falls under it, the best curation task waiting goes to the head of the queue.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rubric {
-    /// Weight by origin prefix, e.g. `"librarian:" = -1`, `"task:" = 1`.
+    /// Weight by origin prefix, e.g. `"curator:" = -1`, `"task:" = 1`.
     #[serde(default)]
     pub origin_weights: std::collections::BTreeMap<String, i64>,
     /// What a blocker gains above the task it blocks.

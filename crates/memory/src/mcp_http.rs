@@ -252,7 +252,7 @@ mod tests {
         let err = call_tool(&url, "get", json!({ "id": "mem-me-nothere" }))
             .await
             .unwrap_err();
-        assert!(err.contains("not found"), "{err}");
+        assert_eq!(err, "not found: mem-me-nothere");
         let err = call_tool("http://127.0.0.1:1/mcp", "get", json!({ "id": "x" }))
             .await
             .unwrap_err();

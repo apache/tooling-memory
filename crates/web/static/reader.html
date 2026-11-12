@@ -433,7 +433,7 @@ function open(id) {
     if (m) a.addEventListener('click', (ev) => { ev.preventDefault(); open(m[1]); });
   }
   art.replaceChildren(back, el('div', 'am-entry-type', e.type), el('h2', 'am-entry-title', e.title), meta, body);
-  if (e.source && e.source.length) art.append(el('p', 'am-hint', `Source: ${e.source.join(', ')}`));
+  if (e.cites && e.cites.length) art.append(el('p', 'am-hint', `Cites: ${e.cites.join(', ')}`));
   if (matchMedia('(max-width: 720px)').matches) { art.scrollIntoView({ block: 'start' }); art.focus({ preventScroll: true }); }
 }
 

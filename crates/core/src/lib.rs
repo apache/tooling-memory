@@ -62,7 +62,7 @@ pub enum TrustTier {
     /// Written and not yet looked at. Searchable, with the tier visible.
     #[default]
     Raw,
-    /// A librarian has summarised, merged, or verified it.
+    /// A curator has summarised, merged, or verified it.
     Curated,
     /// Passed the review gate; the approver was not the proposer.
     Verified,
@@ -177,9 +177,10 @@ pub struct Frontmatter {
     /// When the entry was written.
     #[serde(with = "time::serde::rfc3339")]
     pub created: OffsetDateTime,
-    /// Links or citations the entry was distilled from.
+    /// What the author says the entry drew on, at the version it read: entry ids, links,
+    /// or a path in a repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source: Vec<String>,
+    pub cites: Vec<String>,
     /// The author's confidence, if stated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<Confidence>,
@@ -273,6 +274,26 @@ pub enum Error {
 
 const FENCE: &str = "---";
 
+/// Whether a frontmatter block has the key `source`, its own or one a merge key brings.
+fn names_source(block: &serde_norway::Value) -> bool {
+    use serde_norway::Value;
+    let name = |key: &Value| match key {
+        Value::Tagged(t) => t.value.as_str().map(str::to_string),
+        other => other.as_str().map(str::to_string),
+    };
+    let Some(map) = block.as_mapping() else {
+        return false;
+    };
+    map.iter().any(|(key, value)| match name(key).as_deref() {
+        Some("source") => true,
+        Some("<<") => match value {
+            Value::Sequence(merged) => merged.iter().any(names_source),
+            one => names_source(one),
+        },
+        _ => false,
+    })
+}
+
 impl Entry {
     /// Parse `---\nyaml\n---\nbody`.
     ///
@@ -280,7 +301,7 @@ impl Entry {
     ///
     /// [`Error::NoFrontmatter`] when the fences are missing, [`Error::Yaml`] when the
     /// block does not fit [`Frontmatter`], and [`Error::Invalid`] when `id` or `domain`
-    /// is empty.
+    /// is empty, or the block has the `source` field of an older format.
     pub fn parse(text: &str) -> Result<Entry, Error> {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut lines = text.split_inclusive('\n');
@@ -304,6 +325,17 @@ impl Entry {
         }
         if in_front {
             return Err(Error::NoFrontmatter);
+        }
+        // an entry of the format that named this field `source`: read as it stands, it
+        // would lose its citations without a word. The key is looked for in the parsed
+        // block, since YAML spells one key many ways and a line of a value is no key. The
+        // block is read a second time for this alone: typed through it, a title of `2026`
+        // would be a number and no title
+        if serde_norway::from_str::<serde_norway::Value>(&yaml).is_ok_and(|b| names_source(&b)) {
+            return Err(Error::Invalid(
+                "the `source` field is `cites` in this format; this entry is of an older one"
+                    .into(),
+            ));
         }
         let front: Frontmatter = serde_norway::from_str(&yaml)?;
         if front.id.is_empty() || front.domain.is_empty() {
@@ -410,7 +442,7 @@ mod tests {
                 domain: "dom-a".into(),
                 author: "agent:worker-3 (model: test-1)".into(),
                 created: datetime!(2026-10-01 10:00 UTC),
-                source: vec!["https://example.org/thread/1".into()],
+                cites: vec!["https://example.org/thread/1".into()],
                 confidence: Some(Confidence::High),
                 trust_tier: TrustTier::Curated,
                 review_by: Some(date!(2027-04-01)),
@@ -464,11 +496,72 @@ mod tests {
         let e = Entry::parse(text).unwrap();
         assert_eq!(e.front.trust_tier, TrustTier::Raw);
         assert_eq!(e.front.classification, Label::Public);
-        assert!(e.front.source.is_empty());
+        assert!(e.front.cites.is_empty());
         assert_eq!(e.body, "Stopped at step 3.\n");
         assert_eq!(e.title(), "mem-x-1");
         assert_eq!(e.summary(), "Stopped at step 3.");
         assert!(e.is_active());
+    }
+
+    #[test]
+    fn an_entry_of_the_format_that_said_source_is_refused() {
+        let head = "---\nid: mem-x-1\ntype: fact\ndomain: dom-x\nauthor: human:local:me\ncreated: 2026-10-01T10:00:00Z\n";
+        let old = format!("{head}source:\n- https://example.org/a\n---\n\nA fact.\n");
+        let refused = Entry::parse(&old).unwrap_err();
+        assert!(
+            matches!(&refused, Error::Invalid(m) if m.contains("cites")),
+            "{refused}"
+        );
+        let new = format!("{head}cites:\n- https://example.org/a\n---\n\nA fact.\n");
+        assert_eq!(
+            Entry::parse(&new).unwrap().front.cites,
+            ["https://example.org/a"]
+        );
+        // however YAML spells the key
+        for spelt in [
+            "\"source\":\n- a\n",
+            "'source':\n- a\n",
+            "source :\n- a\n",
+            "? source\n: - a\n",
+            "!!str source:\n- a\n",
+            "!x source:\n- a\n",
+            "<<: {source: [a]}\n",
+            "<<:\n- {source: [a]}\n",
+            "cites:\n- b\n\"source\":\n- a\n",
+        ] {
+            let refused = Entry::parse(&format!("{head}{spelt}---\n\nA fact.\n"));
+            assert!(
+                matches!(&refused, Err(Error::Invalid(_))),
+                "{spelt:?}: {refused:?}"
+            );
+        }
+        let flow = "---\n{id: mem-x-1, type: fact, domain: dom-x, author: 'human:local:me', created: 2026-10-01T10:00:00Z, source: [a]}\n---\n\nA fact.\n";
+        assert!(matches!(Entry::parse(flow), Err(Error::Invalid(_))));
+        let indented = head.replace("---\n", "").replace('\n', "\n  ");
+        let indented = format!("---\n  {indented}source: [a]\n---\n\nA fact.\n");
+        assert!(
+            matches!(Entry::parse(&indented), Err(Error::Invalid(_))),
+            "{indented}"
+        );
+    }
+
+    #[test]
+    fn text_that_is_not_the_old_key_is_read_as_before() {
+        let head = "---\nid: mem-x-1\ntype: fact\ndomain: dom-x\nauthor: human:local:me\ncreated: 2026-10-01T10:00:00Z\n";
+        // a value that YAML would read as a number is still the text the field holds
+        let number = format!("{head}title: 2026\ncites:\n- 61\n---\n\nA fact.\n");
+        let number = Entry::parse(&number).unwrap();
+        assert_eq!(number.front.title.as_deref(), Some("2026"));
+        assert_eq!(number.front.cites, ["61"]);
+        // the word in a body, or in a value that runs over a line, is text and no field
+        let body = format!("{head}---\n\nsource: a line of the body\n");
+        assert!(Entry::parse(&body).unwrap().front.cites.is_empty());
+        let value =
+            format!("{head}summary: \"first line\nsource: of the river\"\n---\n\nA fact.\n");
+        assert_eq!(
+            Entry::parse(&value).unwrap().front.summary.as_deref(),
+            Some("first line source: of the river")
+        );
     }
 
     #[test]

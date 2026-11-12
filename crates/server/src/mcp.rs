@@ -47,6 +47,55 @@ fn mcp_err(e: Error) -> McpError {
     }
 }
 
+/// The most bytes a reply may take as one line of the transport. The transport drops a
+/// longer line and answers nothing, and the caller waits; under this, with room for the
+/// envelope, a reply that is too long is refused in words.
+pub const MAX_REPLY_BYTES: usize = 12 * 1024 * 1024;
+
+/// A reply as it was, or a refusal that says how long it was. The length is the reply's
+/// own serialised form: its text is a JSON string inside JSON, so a quote costs more
+/// bytes on the line than in the entry.
+fn bounded(reply: Result<CallToolResponse, McpError>) -> Result<CallToolResponse, McpError> {
+    let reply = match reply {
+        Ok(reply) => reply,
+        // a refusal that quotes what the caller sent is as long as what the caller sent
+        Err(e) => return Err(short_refusal(e)),
+    };
+    // only a completed call carries content; the other kinds are a few fields
+    let CallToolResponse::Complete(result) = &reply else {
+        return Ok(reply);
+    };
+    let bytes = serde_json::to_vec(result).map_or(usize::MAX, |v| v.len());
+    if bytes > MAX_REPLY_BYTES {
+        return Err(McpError::invalid_params(
+            format!(
+                "the reply has {bytes} bytes and a reply holds at most {MAX_REPLY_BYTES}: \
+                 ask for less, with a smaller limit or one entry at a time"
+            ),
+            None,
+        ));
+    }
+    Ok(reply)
+}
+
+/// The most bytes a refusal may take: room for a sentence and the names in it.
+const MAX_REFUSAL_BYTES: usize = 64 * 1024;
+
+/// A refusal as it was, or its first words when it is longer than a refusal may be.
+fn short_refusal(e: McpError) -> McpError {
+    let bytes = serde_json::to_vec(&e).map_or(usize::MAX, |v| v.len());
+    if bytes <= MAX_REFUSAL_BYTES {
+        return e;
+    }
+    let began: String = e.message.chars().take(200).collect();
+    McpError::invalid_params(
+        format!(
+            "refused, with a reason of {bytes} bytes, which is too long to send; it began: {began}"
+        ),
+        None,
+    )
+}
+
 fn ok(value: Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::json(value)?]))
 }
@@ -199,8 +248,10 @@ pub struct PromoteParams {
     pub why: String,
 }
 
-/// Parameters of `write`.
+/// Parameters of `write`. A parameter this does not have is refused: dropped without a
+/// word, a caller's `source` of an older format would lose the entry its citations.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WriteParams {
     /// The Markdown body. Required.
     pub body: String,
@@ -215,7 +266,7 @@ pub struct WriteParams {
     pub domain: Option<String>,
     /// Links or citations this was distilled from.
     #[serde(default)]
-    pub source: Vec<String>,
+    pub cites: Vec<String>,
     /// high, medium, or low.
     #[serde(default)]
     pub confidence: Option<String>,
@@ -543,7 +594,7 @@ impl McpServer {
             "created": rfc3339(f.created),
             "trust_tier": f.trust_tier.to_string(),
             "classification": f.classification.to_string(),
-            "source": f.source,
+            "cites": f.cites,
             "supersedes": f.supersedes,
             "review_by": f.review_by.map(|d| d.to_string()),
             "title": e.title(),
@@ -579,7 +630,7 @@ impl McpServer {
             entry_type: parse("entry_type", p.entry_type)?.unwrap_or_default(),
             title: p.title,
             body: p.body,
-            source: p.source,
+            cites: p.cites,
             confidence: confidence(p.confidence.as_deref())?,
             classification: parse("classification", p.classification)?,
             supersedes: p.supersedes,
@@ -646,7 +697,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "One turn of a session's transcript, by citation: an entry's source `transcript:<session>#<turn>`. Served only when an entry you may read cites that turn; reading it raises your label as a get does. Recover from handoffs, not transcripts; this is for checking where an entry came from."
+        description = "One turn of a session's transcript, by citation: an entry's `cites` `transcript:<session>#<turn>`. Served only when an entry you may read cites that turn; reading it raises your label as a get does. Recover from handoffs, not transcripts; this is for checking where an entry came from."
     )]
     async fn transcript_turn(&self, p: Parameters<TurnParams>) -> Result<CallToolResult, McpError> {
         let r = self
@@ -895,11 +946,10 @@ fn t0_uri(domain: &str) -> String {
     format!("memory://t0/{domain}")
 }
 
-#[tool_handler(router = self.tool_router)]
-impl ServerHandler for McpServer {
-    /// Every call goes through the router, as the macro would route it; a harness's call
-    /// is kept on the session's tape, and in a re-run answered from the tape first.
-    async fn call_tool(
+impl McpServer {
+    /// One call through the router; a harness's call is kept on the session's tape, and in
+    /// a re-run answered from the tape first.
+    async fn routed(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
@@ -950,6 +1000,19 @@ impl ServerHandler for McpServer {
             eprintln!("amem: {tool} was not kept on the tape: {e}");
         }
         result
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for McpServer {
+    /// Every call goes through the router, as the macro would route it; a harness's call
+    /// is kept on the session's tape, and in a re-run answered from the tape first.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        bounded(self.routed(request, context).await)
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -1237,6 +1300,16 @@ mod tests {
         id
     }
 
+    #[test]
+    fn write_refuses_a_parameter_it_does_not_have() {
+        let old =
+            serde_json::from_value::<WriteParams>(json!({"body": "A fact.", "source": ["a"]}));
+        let why = old.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(why.contains("source") && why.contains("cites"), "{why}");
+        let new = serde_json::from_value::<WriteParams>(json!({"body": "A fact.", "cites": ["a"]}));
+        assert_eq!(new.unwrap().cites, ["a"]);
+    }
+
     #[tokio::test]
     async fn write_search_list_get_and_t0_round_trip() {
         let (_dir, s) = server().await;
@@ -1244,7 +1317,7 @@ mod tests {
             &s.write(Parameters(WriteParams {
                 body: "# Stopped at step 3\n\nResume with the digests.\n".into(),
                 entry_type: Some("handoff".into()),
-                source: vec!["https://example.org/run/1".into()],
+                cites: vec!["https://example.org/run/1".into()],
                 confidence: Some("high".into()),
                 classification: Some("public".into()),
                 review_by: Some("2027-01-01".into()),
