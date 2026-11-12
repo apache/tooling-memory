@@ -16,8 +16,8 @@ use tokio_postgres::NoTls;
 /// `libxml2.so.2` from the system, and Ubuntu 26.04 has none; 18.6.1 carries its libraries
 /// beside its binaries. 18.6.1's Linux and macOS archives
 /// store zone aliases, `UTC` among them, as tar hard links, which the extractor of
-/// `postgresql_archive` 0.20 skips (theseus-rs/postgresql-embedded#263, fixed in 0.22,
-/// which the reqwest pin in Cargo.toml holds back): see [`create_database`].
+/// `postgresql_archive` 0.20 skipped (theseus-rs/postgresql-embedded#263). An install that
+/// 0.20 made stays in the cache without them: see [`create_database`].
 const EMBEDDED_RELEASE: &str = "=18.6.1";
 
 /// The release installed, once in a process. Installing lists every release through
@@ -118,7 +118,7 @@ impl PgServer {
 
 /// Makes database `name` on the server `admin` names, with tokio-postgres, which sets no
 /// zone on connect. `PostgreSQL::create_database` connects with a client that sets `UTC`,
-/// which the embedded 18.6.1 is installed without, and is refused.
+/// which an 18.6.1 that `postgresql_archive` 0.20 installed is without, and is refused.
 async fn create_database(admin: &str, name: &str) -> Result<(), tokio_postgres::Error> {
     let (client, conn) = tokio_postgres::connect(admin, NoTls).await?;
     tokio::spawn(conn);
