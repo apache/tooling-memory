@@ -430,9 +430,6 @@ pub struct FileExceptionParams {
     pub expiry: String,
     /// Why it is needed.
     pub justification: String,
-    /// The domain to write it in; the only granted domain when omitted.
-    #[serde(default)]
-    pub domain: Option<String>,
 }
 
 /// Parameters of `propose_amendment`.
@@ -1018,7 +1015,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "The rules in force for what you are about to do: each with its id, layer, rule, intent and whether it is enforced or advisory. Call it before an action that cannot be taken back."
+        description = "The rules in force for what you are about to do: each with its id, layer, rule, intent and whether it is enforced or advisory. Call it before an action that cannot be taken back. A rule above what you may read is named, and its text is withheld."
     )]
     async fn check_policy(
         &self,
@@ -1028,12 +1025,13 @@ impl McpServer {
         let rules = self
             .memory
             .check_policy(&p.action, p.domain.as_deref())
+            .await
             .map_err(mcp_err)?;
         ok(json!({ "rules": rules }))
     }
 
     #[tool(
-        description = "Ask for an exception to a rule that refused you: for one task, until an expiry, with a justification. It lets nothing through until a person approves it. A rule of the L0 core takes no exception."
+        description = "Ask for an exception to a rule that refused you: for one task, until an expiry, with a justification. The scope and the justification are plain words. It lets nothing through until a person approves it. A rule of the L0 core takes no exception."
     )]
     async fn file_exception(
         &self,
@@ -1048,7 +1046,6 @@ impl McpServer {
                 scope: p.scope,
                 expires: p.expiry,
                 justification: p.justification,
-                domain: p.domain,
             })
             .await
             .map_err(mcp_err)?;
@@ -1552,7 +1549,6 @@ mod tests {
                 scope: "one test tag".into(),
                 expiry: "2099-01-01T00:00:00Z".into(),
                 justification: "The tag is on a scratch repository.".into(),
-                domain: None,
             }))
             .await
             .unwrap(),

@@ -93,7 +93,7 @@ say "A reset" "Rules are cheapest to add when something has just gone wrong. Whe
 agent agent:a write "{\"title\": \"pol-L3-900 No writes on a Friday\", \"entry_type\": \"policy\", \"body\": \"# No writes on a Friday\n\n\`\`\`policy\nid = \\\"pol-L3-900\\\"\nlayer = 3\nrule = \\\"No entry is written on a Friday.\\\"\nintent = \\\"A write on a Friday went wrong once.\\\"\nstatus = \\\"enforced\\\"\n\`\`\`\n\"}" >/dev/null
 agent agent:curator promote "{\"id\": \"$(a policy list | j "[p['entry'] for p in d['policies'] if p['id'] == 'pol-L3-900'][0]")\", \"to\": \"curated\", \"why\": \"it parses\"}" >/dev/null
 rules
-a policy reset --domain dom-demo | j "'\n'.join([f\"  kept {k['policy_id']}: {k['person']} is in its lineage\" for k in d['kept']] + [f\"  retired {r}\" for r in d['retired']])"
+a policy reset --domain dom-demo | j "'\n'.join([f\"  kept {k['policy_id']}: {k['person']} is in its lineage\" for k in d['kept']] + [f\"  retired {r['policy_id']}\" for r in d['retired']])"
 rules
 
 say "The lint" "Each rule and exception with how often it refused, let through and advised, counted from the decision log, so a rule nobody hits or an exception everybody uses shows up. A rule past its review date, a rule without an owner and an enforced rule that no decision cites are findings for the owner."

@@ -127,8 +127,9 @@ two weeks. It is also the reason that none of it is the production shape.
   domain. It does not select rules by the action. The lint reports a rule after its
   review date and an unused rule, from the full decision log and not from one review
   period. The approver of an exception is a name in the answer. `amem` does not check
-  that this person approves. The order of rules under the ceiling is the order of their
-  ids. While the next version of a rule waits for its review, the rule is in no decision.
+  that this person approves. A new version of a rule is the newest rule under the
+  ceiling. While the next version of a rule waits for its review, the rule is in no
+  decision.
 - **Lineage, in part.** An entry does not record its session. `amem taint` compares the
   time of a read with the time of a later write, and it goes forward only. Reads and
   sends are not in the event log. A write that the scan refuses is a file under `state/`,
