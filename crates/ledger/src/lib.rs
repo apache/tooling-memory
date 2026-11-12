@@ -677,6 +677,19 @@ fn claimable(task: &Task, now: OffsetDateTime, manifest: &[String], handling: La
 }
 
 /// Whether `by` acts under the claim in force: its generation first, since a claim made
+/// The queue's order: the highest priority first, and of equal priorities the task
+/// filed first. The times are compared as times; as text, one with fewer digits of a
+/// second sorts after a later one with more.
+pub(crate) fn in_queue_order(tasks: &mut [Task]) {
+    tasks.sort_by(|a, b| {
+        b.spec
+            .priority
+            .cmp(&a.spec.priority)
+            .then(a.created.cmp(&b.created))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 /// since is the reason to stop whoever the caller is, then its name and the lease.
 pub(crate) fn check_holder(task: &Task, by: Held<'_>, now: OffsetDateTime) -> Result<(), Error> {
     if by.generation != task.generation {
@@ -1731,6 +1744,8 @@ mod tests {
     }
 
     on_both! {
+        of_two_tasks_of_one_priority_the_one_filed_first_is_claimed_first,
+        a_lease_that_ran_out_half_a_second_ago_is_lost_to_claim_next,
         a_dependent_in_another_domain_is_opened_and_retriaged_too,
         a_blocked_task_whose_dependencies_are_done_is_claimable_whatever_its_state_says,
         a_task_closed_by_its_continuation_opens_what_waited_on_it,
@@ -2132,6 +2147,62 @@ mod tests {
         assert_eq!(
             open.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
             [id.as_str()]
+        );
+    }
+
+    /// The lease ends on a whole second and the clock stands a half second after: the two
+    /// times, as text, sort the other way.
+    async fn a_lease_that_ran_out_half_a_second_ago_is_lost_to_claim_next(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Long job")).await;
+        claim(&mut l, &t.id, "s1", mins(5)).await.unwrap();
+        *now.lock().unwrap() = T0 + mins(5) - Duration::milliseconds(500);
+        assert!(next(&mut l, "s2", mins(5)).await.is_none(), "still held");
+        *now.lock().unwrap() = T0 + mins(5) + Duration::milliseconds(500);
+        let c = next(&mut l, "s2", mins(5)).await.unwrap();
+        assert_eq!((c.task.id.as_str(), c.generation), (t.id.as_str(), 2));
+    }
+
+    /// Filed half a second apart: the earlier time has fewer digits of a second, and
+    /// as text sorts after the later one.
+    async fn of_two_tasks_of_one_priority_the_one_filed_first_is_claimed_first(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let early = admitted(&mut l, spec("Early")).await;
+        *now.lock().unwrap() = T0 + Duration::milliseconds(500);
+        let late = admitted(&mut l, spec("Late")).await;
+        assert_eq!(next(&mut l, "s", mins(5)).await.unwrap().task.id, early.id);
+        assert_eq!(next(&mut l, "s", mins(5)).await.unwrap().task.id, late.id);
+    }
+
+    /// The candidate was claimed by another connection, and that committed, between the
+    /// read of the queue and the lock of its row.
+    #[tokio::test]
+    async fn on_postgres_a_candidate_claimed_meanwhile_is_not_taken() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        let t = admitted(&mut l, spec("One holder")).await;
+        let other = admitted(&mut l, spec("Free")).await;
+        let now = l.now();
+        claim(&mut l, &t.id, "first", mins(30)).await.unwrap();
+        let Backend::Postgres(db) = &mut l.backend else {
+            unreachable!("a ledger connected to PostgreSQL");
+        };
+        let until = now + mins(30);
+        assert!(!db.take_alone(&t.id, now, ("second", until)).await.unwrap());
+        assert!(db
+            .take_alone(&other.id, now, ("second", until))
+            .await
+            .unwrap());
+        let held = l.get(&t.id).await.unwrap();
+        assert_eq!(
+            (held.holder.as_deref(), held.generation),
+            (Some("first"), 1)
+        );
+        assert_eq!(
+            l.get(&other.id).await.unwrap().holder.as_deref(),
+            Some("second")
         );
     }
 

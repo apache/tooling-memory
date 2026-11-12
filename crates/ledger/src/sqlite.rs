@@ -367,14 +367,16 @@ impl Db {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let candidates: Vec<Task> = {
             let mut stmt = tx.prepare(&format!(
+                // every task that may be claimable. Whether a claimed one's lease has run
+                // out is asked of the parsed time below: as text, a time with fewer
+                // digits of a second sorts after a later one with more
                 "SELECT {TASK_COLUMNS} FROM tasks
-                 WHERE domain = ?1 AND (status IN ('open', 'blocked') OR (status = 'claimed' AND lease_until < ?2))
-                 ORDER BY priority DESC, created"
+                 WHERE domain = ?1 AND status IN ('open', 'blocked', 'claimed')"
             ))?;
-            let rows = stmt.query_map(params![domain, crate::fmt_time(now)], |r| {
-                Ok(task_from_row(r))
-            })?;
-            rows.map(|r| r?).collect::<Result<_, _>>()?
+            let rows = stmt.query_map(params![domain], |r| Ok(task_from_row(r)))?;
+            let mut found: Vec<Task> = rows.map(|r| r?).collect::<Result<_, _>>()?;
+            crate::in_queue_order(&mut found);
+            found
         };
         for task in candidates {
             if !claimable(&task, now, manifest, handling)
