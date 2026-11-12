@@ -2649,14 +2649,36 @@ impl Memory {
         domain: Option<&str>,
         lease: Duration,
     ) -> Result<Option<Claim>, Error> {
+        self.claim_next_once(domain, lease, None).await
+    }
+
+    /// [`Memory::claim_next`] under an attempt key: a caller that did not hear the answer
+    /// asks again with the same key and gets the same claim, not a second task.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::claim_next`]; a ledger error when the key's claim is over.
+    pub async fn claim_next_once(
+        &self,
+        domain: Option<&str>,
+        lease: Duration,
+        attempt: Option<&str>,
+    ) -> Result<Option<Claim>, Error> {
         let domain = self.resolve_domain(domain)?;
         let handling = self.handling()?;
-        let claim = self
-            .ledger
-            .lock()
-            .await
-            .claim_next(&domain, &self.author, lease, &self.capabilities(), handling)
-            .await?;
+        let can = self.capabilities();
+        let mut l = self.ledger.lock().await;
+        let claim = match attempt {
+            Some(key) => {
+                l.claim_next_once(&domain, &self.author, lease, (&can, handling), key)
+                    .await?
+            }
+            None => {
+                l.claim_next(&domain, &self.author, lease, &can, handling)
+                    .await?
+            }
+        };
+        drop(l);
         if let Some(c) = &claim {
             lock(&self.session).observe(c.task.spec.classification);
             lock(&self.claims).insert(c.task.id.clone(), c.generation);
@@ -2714,14 +2736,42 @@ impl Memory {
         generation: Option<u64>,
         handoff: &str,
     ) -> Result<Task, Error> {
+        self.complete_once(id, generation, handoff, None).await
+    }
+
+    /// [`Memory::complete`] under an attempt key: asked again with the same key, it
+    /// gives the completed task back, and the task is completed once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::complete`]; a ledger error when the key was used for another task.
+    pub async fn complete_once(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        handoff: &str,
+        attempt: Option<&str>,
+    ) -> Result<Task, Error> {
         let task = self.ledger.lock().await.get(id).await?;
         self.check_task(&task)?;
         if self.store.get(&task.spec.domain, handoff).await?.is_none() {
             return Err(Error::NotFound(format!("handoff {handoff}")));
         }
         let mut l = self.ledger.lock().await;
-        let by = self.under(self.claim_of(id, generation)?);
-        let done = l.complete(id, by, handoff).await?;
+        // a completion asked again under its key comes after this session forgot the
+        // claim: the task's own generation then stands in, and the ledger answers by
+        // the key, or refuses a task that is done as it would anyone
+        let again = attempt.is_some() && task.status == dm_ledger::Status::Done;
+        let generation = if again {
+            task.generation
+        } else {
+            self.claim_of(id, generation)?
+        };
+        let by = self.under(generation);
+        let done = match attempt {
+            Some(key) => l.complete_once(id, by, handoff, key).await?,
+            None => l.complete(id, by, handoff).await?,
+        };
         lock(&self.claims).remove(id);
         // a continuation finishes the task it resumed, and that one the task it resumed in
         // turn: up the chain, while each is open and nobody holds it

@@ -1140,6 +1140,9 @@ enum TaskOp {
         domain: Option<String>,
         #[arg(long, default_value_t = 1800)]
         lease_seconds: i64,
+        /// A key for this attempt: the same key asked again gives the same claim.
+        #[arg(long)]
+        attempt: Option<String>,
     },
     /// Renew a lease, under the claim of the generation that `claim-next` printed.
     Heartbeat {
@@ -1157,6 +1160,9 @@ enum TaskOp {
         /// The generation of the claim.
         #[arg(long)]
         generation: u64,
+        /// A key for this attempt: the same key asked again completes nothing twice.
+        #[arg(long)]
+        attempt: Option<String>,
     },
     /// Give a task back, optionally with a handoff for the next claimant.
     Release {
@@ -4884,7 +4890,11 @@ async fn held_task(m: &Memory, op: TaskOp) -> Fallible {
             id,
             handoff,
             generation,
-        } => json(&m.complete(&id, Some(generation), &handoff).await?),
+            attempt,
+        } => json(
+            &m.complete_once(&id, Some(generation), &handoff, attempt.as_deref())
+                .await?,
+        ),
         TaskOp::Release {
             id,
             generation,
@@ -4943,8 +4953,13 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         TaskOp::ClaimNext {
             domain,
             lease_seconds,
+            attempt,
         } => match m
-            .claim_next(domain.as_deref(), Duration::seconds(lease_seconds))
+            .claim_next_once(
+                domain.as_deref(),
+                Duration::seconds(lease_seconds),
+                attempt.as_deref(),
+            )
             .await?
         {
             Some(c) => json(&c.task),

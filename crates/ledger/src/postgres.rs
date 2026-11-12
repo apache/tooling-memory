@@ -17,8 +17,9 @@
 //! connections cannot both win the same task.
 
 use crate::{
-    check_holder, claimable, parse_time, Error, Event, Held, PromotionRecord, PromotionSpec,
-    RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
+    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS,
+    TASK_COLUMNS,
 };
 use dm_core::Label;
 use std::collections::HashMap;
@@ -428,6 +429,56 @@ impl Db {
         })
     }
 
+    /// The first claim or completion in a domain made under an attempt key: its task and
+    /// its event.
+    pub(crate) async fn attempt_in(
+        &self,
+        domain: &str,
+        key: &str,
+    ) -> Result<Option<(String, Event)>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(None);
+        };
+        let row = self
+            .client
+            .query_opt(
+                &format!(
+                    "SELECT task_id, payload FROM {s}.events
+                     WHERE kind IN ('claimed', 'completed')
+                       AND payload::jsonb ->> 'attempt' = $1
+                     ORDER BY seq LIMIT 1"
+                ),
+                &[&key],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let (id, payload): (String, String) = (row.try_get(0)?, row.try_get(1)?);
+        let event = Event::parse(&id, &payload)?;
+        Ok(Some((id, event)))
+    }
+
+    /// As [`Db::attempt_in`], for the domain of a task.
+    pub(crate) async fn attempt_of(
+        &self,
+        task: &str,
+        key: &str,
+    ) -> Result<Option<(String, Event)>, Error> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT domain FROM public.ledger_tasks WHERE id = $1",
+                &[&task],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Err(Error::NotFound(task.to_string()));
+        };
+        let domain: String = row.try_get(0)?;
+        self.attempt_in(&domain, key).await
+    }
+
     /// The payloads of a task's events of one kind, oldest first.
     pub(crate) async fn payloads_of(&self, id: &str, kind: &str) -> Result<Vec<String>, Error> {
         let s = self.schema_of_task(id).await?;
@@ -596,7 +647,7 @@ impl Db {
         &mut self,
         domain: &str,
         now: OffsetDateTime,
-        holder: &str,
+        who: Claimant<'_>,
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
@@ -642,8 +693,10 @@ impl Db {
                 continue;
             }
             let claimed = Event::Claimed {
-                holder: holder.to_string(),
+                holder: who.holder.to_string(),
                 until,
+                generation: task.generation + 1,
+                attempt: who.attempt.map(str::to_string),
             };
             apply(&tx, &s, &task.id, now, &claimed).await?;
             tx.commit().await?;
@@ -656,7 +709,7 @@ impl Db {
         &mut self,
         id: &str,
         now: OffsetDateTime,
-        holder: &str,
+        who: Claimant<'_>,
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
@@ -682,8 +735,10 @@ impl Db {
             });
         }
         let claimed = Event::Claimed {
-            holder: holder.to_string(),
+            holder: who.holder.to_string(),
             until,
+            generation: task.generation + 1,
+            attempt: who.attempt.map(str::to_string),
         };
         apply(&tx, &s, id, now, &claimed).await?;
         tx.commit().await?;
@@ -1285,7 +1340,7 @@ async fn project<C: GenericClient>(
             vec![&id],
         ),
         Event::HandoffLeft { handoff } => ("SET handoff = $2 WHERE id = $1", vec![&id, handoff]),
-        Event::Completed { handoff } => (
+        Event::Completed { handoff, .. } => (
             "SET status = 'done', handoff = $2, lease_until = NULL WHERE id = $1",
             vec![&id, handoff],
         ),

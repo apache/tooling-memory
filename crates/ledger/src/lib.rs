@@ -83,6 +83,15 @@ pub enum Error {
         /// The generation of the claim in force.
         current: u64,
     },
+    /// The attempt key was used before, for another operation or another task, or for
+    /// a claim that is over: the same key cannot claim or complete a second time.
+    #[error("the attempt key {key} was used for {id}, and that attempt is over")]
+    AttemptSpent {
+        /// The key.
+        key: String,
+        /// The task it was used for.
+        id: String,
+    },
     /// Another connection holds the write-ahead log, so text just removed may still be
     /// in it. Run the operation again.
     #[error("ledger: another connection holds the log: {0}")]
@@ -290,6 +299,14 @@ pub struct Claim {
     pub generation: u64,
 }
 
+/// Who claims, and the attempt key it gave: a retry of the same claim carries the same
+/// key, so it is the same claim and not a second one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Claimant<'a> {
+    pub(crate) holder: &'a str,
+    pub(crate) attempt: Option<&'a str>,
+}
+
 /// A holder and the generation of the claim it acts under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Held<'a> {
@@ -381,6 +398,12 @@ enum Event {
         holder: String,
         #[serde(with = "time::serde::rfc3339")]
         until: OffsetDateTime,
+        /// The generation this claim got. Absent from a claim of an older ledger.
+        #[serde(default)]
+        generation: u64,
+        /// The attempt key the caller gave, when it gave one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<String>,
     },
     /// A claim of a named task the ledger refused, and why. Changes nothing; it is the
     /// record that someone tried.
@@ -406,6 +429,9 @@ enum Event {
     },
     Completed {
         handoff: String,
+        /// The attempt key the caller gave, when it gave one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<String>,
     },
     Invalidated {
         reason: String,
@@ -498,8 +524,9 @@ fn redact_event(id: &str, payload: &str, redaction: &Redaction) -> Result<Option
         Event::HandoffLeft { handoff } if handoff != redaction.reason => Event::HandoffLeft {
             handoff: redaction.reason.clone(),
         },
-        Event::Completed { handoff } if handoff != redaction.reason => Event::Completed {
+        Event::Completed { handoff, attempt } if handoff != redaction.reason => Event::Completed {
             handoff: redaction.reason.clone(),
+            attempt,
         },
         Event::LateHandoff {
             holder,
@@ -964,9 +991,88 @@ impl Ledger {
         manifest: &[String],
         handling: Label,
     ) -> Result<Option<Claim>, Error> {
+        let who = Claimant {
+            holder,
+            attempt: None,
+        };
+        self.claim_next_as(domain, who, lease, manifest, handling)
+            .await
+    }
+
+    /// [`Ledger::claim_next`] under an attempt key. A caller that did not hear the answer
+    /// asks again with the same key: while the claim that key made is in force, it gets
+    /// that claim back, and no second task.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AttemptSpent`] when the key's claim is over, or the key was used for
+    /// something else; a database error.
+    pub async fn claim_next_once(
+        &mut self,
+        domain: &str,
+        holder: &str,
+        lease: Duration,
+        (manifest, handling): (&[String], Label),
+        attempt: &str,
+    ) -> Result<Option<Claim>, Error> {
+        let seen = on_backend!(&self.backend, db => db.attempt_in(domain, attempt))?;
+        if let Some((id, event)) = seen {
+            return self
+                .same_claim(&id, holder, attempt, &event)
+                .await
+                .map(Some);
+        }
+        let who = Claimant {
+            holder,
+            attempt: Some(attempt),
+        };
+        self.claim_next_as(domain, who, lease, manifest, handling)
+            .await
+    }
+
+    /// The claim an attempt key made, if it is still in force for this holder.
+    async fn same_claim(
+        &self,
+        id: &str,
+        holder: &str,
+        attempt: &str,
+        event: &Event,
+    ) -> Result<Claim, Error> {
+        let task = self.get(id).await?;
+        let now = self.now();
+        let in_force = match event {
+            Event::Claimed { generation, .. } => {
+                task.status == Status::Claimed
+                    && task.generation == *generation
+                    && task.holder.as_deref() == Some(holder)
+                    && task.lease_until.is_some_and(|t| t >= now)
+            }
+            _ => false,
+        };
+        match (in_force, task.lease_until) {
+            (true, Some(lease_until)) => Ok(Claim {
+                generation: task.generation,
+                task,
+                lease_until,
+            }),
+            _ => Err(Error::AttemptSpent {
+                key: attempt.to_string(),
+                id: id.to_string(),
+            }),
+        }
+    }
+
+    async fn claim_next_as(
+        &mut self,
+        domain: &str,
+        who: Claimant<'_>,
+        lease: Duration,
+        manifest: &[String],
+        handling: Label,
+    ) -> Result<Option<Claim>, Error> {
         let now = self.now();
         let until = now + lease;
-        let claimed = on_backend!(&mut self.backend, db => db.claim_next(domain, now, holder, until, manifest, handling))?;
+        let claimed = on_backend!(&mut self.backend, db => db.claim_next(domain, now, who, until, manifest, handling))?;
         if let Some(id) = &claimed {
             self.trace("claimed", id).await;
         }
@@ -1000,7 +1106,12 @@ impl Ledger {
     ) -> Result<Claim, Error> {
         let now = self.now();
         let until = now + lease;
-        let claimed = on_backend!(&mut self.backend, db => db.claim(id, now, holder, until, manifest, handling));
+        let who = Claimant {
+            holder,
+            attempt: None,
+        };
+        let claimed =
+            on_backend!(&mut self.backend, db => db.claim(id, now, who, until, manifest, handling));
         if matches!(claimed, Err(Error::WrongState { .. })) {
             self.record_refusal(id, holder, now).await?;
         }
@@ -1086,6 +1197,16 @@ impl Ledger {
     ///
     /// [`Error::NotFound`], [`Error::NotHolder`], or [`Error::WrongState`].
     pub async fn complete(&mut self, id: &str, by: Held<'_>, handoff: &str) -> Result<Task, Error> {
+        self.complete_keyed(id, by, handoff, None).await
+    }
+
+    async fn complete_keyed(
+        &mut self,
+        id: &str,
+        by: Held<'_>,
+        handoff: &str,
+        attempt: Option<&str>,
+    ) -> Result<Task, Error> {
         let now = self.now();
         let task = self.get(id).await?;
         if task.status != Status::Claimed {
@@ -1097,10 +1218,41 @@ impl Ledger {
         }
         let completed = Event::Completed {
             handoff: handoff.to_string(),
+            attempt: attempt.map(str::to_string),
         };
         self.append_held(id, now, by, &completed).await?;
         self.unblock_dependents(id).await?;
         self.get(id).await
+    }
+
+    /// [`Ledger::complete`] under an attempt key. A caller that did not hear the answer
+    /// asks again with the same key, and gets the completed task back: the task is
+    /// completed once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Ledger::complete`]; [`Error::AttemptSpent`] when the key was used for
+    /// another task or another operation.
+    pub async fn complete_once(
+        &mut self,
+        id: &str,
+        by: Held<'_>,
+        handoff: &str,
+        attempt: &str,
+    ) -> Result<Task, Error> {
+        let seen = on_backend!(&self.backend, db => db.attempt_of(id, attempt))?;
+        if let Some((task, event)) = seen {
+            let same = task == id && matches!(event, Event::Completed { .. });
+            return if same {
+                self.get(id).await
+            } else {
+                Err(Error::AttemptSpent {
+                    key: attempt.to_string(),
+                    id: task,
+                })
+            };
+        }
+        self.complete_keyed(id, by, handoff, Some(attempt)).await
     }
 
     /// Close a task its continuation finished: the continuation `by` resumed it and is
@@ -1136,6 +1288,7 @@ impl Ledger {
             now,
             &Event::Completed {
                 handoff: handoff.to_string(),
+                attempt: None,
             },
         )
         .await?;
@@ -1769,6 +1922,8 @@ mod tests {
     }
 
     on_both! {
+        a_claim_asked_twice_under_one_key_is_one_claim,
+        a_completion_asked_twice_under_one_key_is_one_completion,
         a_dependent_in_another_domain_is_opened_and_retriaged_too,
         a_blocked_task_whose_dependencies_are_done_is_claimable_whatever_its_state_says,
         a_task_closed_by_its_continuation_opens_what_waited_on_it,
@@ -2200,6 +2355,82 @@ mod tests {
             open.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
             [id.as_str()]
         );
+    }
+
+    fn is_spent<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::AttemptSpent { .. }))
+    }
+
+    async fn next_once(l: &mut Ledger, holder: &str, key: &str) -> Result<Option<Claim>, Error> {
+        l.claim_next_once("dom-a", holder, mins(30), (&[], Label::Restricted), key)
+            .await
+    }
+
+    /// A caller that did not hear the answer asks again with the same key.
+    async fn a_claim_asked_twice_under_one_key_is_one_claim(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let first = admitted(&mut l, spec("First")).await;
+        let second = admitted(&mut l, spec("Second")).await;
+        let c = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
+        let again = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
+        assert_eq!(
+            (again.task.id.as_str(), again.generation),
+            (c.task.id.as_str(), 1)
+        );
+        assert_eq!(c.task.id, first.id);
+        assert_eq!(
+            l.get(&second.id).await.unwrap().status,
+            Status::Open,
+            "no second task"
+        );
+        // the key is this holder's claim, and nobody else's way to it
+        assert!(is_spent(&next_once(&mut l, "s2", "key-1").await));
+        // a new key is a new claim
+        let other = next_once(&mut l, "s1", "key-2").await.unwrap().unwrap();
+        assert_eq!(other.task.id, second.id);
+        a_key_whose_claim_is_over_claims_nothing(&mut l, &now).await;
+    }
+
+    async fn a_key_whose_claim_is_over_claims_nothing(l: &mut Ledger, now: &Mutex<OffsetDateTime>) {
+        // once the claim the key made is over, the key claims nothing more
+        *now.lock().unwrap() = T0 + mins(31);
+        assert!(is_spent(&next_once(l, "s1", "key-1").await));
+        // and a rebuild keeps what the key means
+        l.rebuild().await.unwrap();
+        assert!(is_spent(&next_once(l, "s1", "key-1").await));
+    }
+
+    async fn a_key_completes_no_other_task(l: &mut Ledger, t: &Task, other: &Task) {
+        // the key completed that task: it completes no other
+        let reused = l
+            .complete_once(&other.id, held("s1", 1), "mem-a-h", "done-1")
+            .await;
+        assert!(is_spent(&reused));
+        assert_eq!(l.get(&other.id).await.unwrap().status, Status::Claimed);
+        // without a key, a second completion is refused as it was
+        assert!(is_wrong_state(
+            &l.complete(&t.id, held("s1", 1), "mem-a-h").await
+        ));
+    }
+
+    async fn a_completion_asked_twice_under_one_key_is_one_completion(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Once")).await;
+        let other = admitted(&mut l, spec("Other")).await;
+        claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        claim(&mut l, &other.id, "s1", mins(30)).await.unwrap();
+        let before = l.event_count().await.unwrap();
+        let done = l
+            .complete_once(&t.id, held("s1", 1), "mem-a-h", "done-1")
+            .await
+            .unwrap();
+        let again = l
+            .complete_once(&t.id, held("s1", 1), "mem-a-h", "done-1")
+            .await
+            .unwrap();
+        assert_eq!(again, done);
+        assert_eq!(l.event_count().await.unwrap(), before + 1, "one event");
+        a_key_completes_no_other_task(&mut l, &t, &other).await;
     }
 
     fn is_fenced<T>(r: &Result<T, Error>, given: u64, current: u64) -> bool {

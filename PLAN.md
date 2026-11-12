@@ -68,7 +68,7 @@ Landed so far:
 |---|---|---|
 | 0 | #69 | Nothing |
 | 1 | #71 | Nothing |
-| 2 | #73 | An attempt key on every operation; an uncertain external effect blocking reassignment; waiting on an outside event as a state; the record's remaining fields (`parent`, `scores`, `implements`, `reversibility`, `artifacts_touched`, `policy_context`) |
+| 2 | #73, and attempt keys for a claim and a completion in the pull request after #74 | An attempt key on the other operations; an uncertain external effect blocking reassignment; waiting on an outside event as a state; the record's remaining fields (`parent`, `scores`, `implements`, `reversibility`, `artifacts_touched`, `policy_context`) |
 | 3 | the pull request after #73 | A suite that gates a version of a definition; the data scope enforced; a definition required by default, once the system's own filings name one; tools offered a few at boot and the rest by search |
 
 What stays unbuilt after these, and stays on README's list: federation across domains, authentication of people, logprob-based drift, and accelerator time, which only a gateway can count. So do the items on that list that need another machine or an outside service more than they need code: the limits on re-enactment, harness settings and decomposition templates in the platform domain, bytes stored and resource limits on the sandbox, the authoring of agent definitions, the search tool against its live provider, a harness under Seatbelt on a Mac, and the Gofannon bridge against a live deployment, whose agents make model calls that the egress does not meter.

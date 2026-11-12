@@ -4,8 +4,9 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, Error, Event, Held, PromotionRecord, PromotionSpec,
-    RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
+    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Task, TaskSpec, PROMOTION_COLUMNS,
+    TASK_COLUMNS,
 };
 use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -224,6 +225,37 @@ impl Db {
         })
     }
 
+    /// The first claim or completion made under an attempt key: its task and its event.
+    /// One file holds every domain, so the domain is not asked.
+    pub(crate) fn attempt_in(
+        &self,
+        _domain: &str,
+        key: &str,
+    ) -> Result<Option<(String, Event)>, Error> {
+        let row: Option<(String, String)> = self
+            .conn()
+            .query_row(
+                "SELECT task_id, payload FROM events
+                 WHERE kind IN ('claimed', 'completed')
+                   AND json_extract(payload, '$.attempt') = ?1
+                 ORDER BY seq LIMIT 1",
+                params![key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(id, payload)| Ok((id.clone(), Event::parse(&id, &payload)?)))
+            .transpose()
+    }
+
+    /// As [`Db::attempt_in`], for the domain of a task.
+    pub(crate) fn attempt_of(
+        &self,
+        _task: &str,
+        key: &str,
+    ) -> Result<Option<(String, Event)>, Error> {
+        self.attempt_in("", key)
+    }
+
     /// The payloads of a task's events of one kind, oldest first.
     pub(crate) fn payloads_of(&self, id: &str, kind: &str) -> Result<Vec<String>, Error> {
         let conn = self.conn();
@@ -369,7 +401,7 @@ impl Db {
         &mut self,
         domain: &str,
         now: OffsetDateTime,
-        holder: &str,
+        who: Claimant<'_>,
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
@@ -399,8 +431,10 @@ impl Db {
                 &task.id,
                 now,
                 &Event::Claimed {
-                    holder: holder.to_string(),
+                    holder: who.holder.to_string(),
                     until,
+                    generation: task.generation + 1,
+                    attempt: who.attempt.map(str::to_string),
                 },
             )?;
             tx.commit()?;
@@ -413,7 +447,7 @@ impl Db {
         &mut self,
         id: &str,
         now: OffsetDateTime,
-        holder: &str,
+        who: Claimant<'_>,
         until: OffsetDateTime,
         manifest: &[String],
         handling: Label,
@@ -436,8 +470,10 @@ impl Db {
             id,
             now,
             &Event::Claimed {
-                holder: holder.to_string(),
+                holder: who.holder.to_string(),
                 until,
+                generation: task.generation + 1,
+                attempt: who.attempt.map(str::to_string),
             },
         )?;
         tx.commit()?;
@@ -851,7 +887,7 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         | Event::Retriaged { .. }
         | Event::ClaimRefused { .. }
         | Event::LateHandoff { .. } => project_waiting(conn, id, event)?,
-        Event::Claimed { holder, until } => {
+        Event::Claimed { holder, until, .. } => {
             conn.execute(
                 "UPDATE tasks SET status = 'claimed', holder = ?2, lease_until = ?3,
                     attempts = attempts + 1 WHERE id = ?1",
@@ -877,7 +913,7 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
                 params![id, handoff],
             )?;
         }
-        Event::Completed { handoff } => {
+        Event::Completed { handoff, .. } => {
             conn.execute(
                 "UPDATE tasks SET status = 'done', handoff = ?2, lease_until = NULL
                  WHERE id = ?1",
