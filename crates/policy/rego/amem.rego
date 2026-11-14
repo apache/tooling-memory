@@ -368,12 +368,15 @@ base_decision := erase_decision if input.action == "erase"
 # `deny contains {"policy": <id>, "reason": <why>}` for a request. A denial wins over
 # the decision above unless an exception in force covers it: an exception entry,
 # verified and unexpired, that breaches that policy and is scoped to the task this
-# session holds. An L0 rule takes no exception. Every decision says which policies it
-# cites, the denials or the exceptions used: the paper's citation and override rates.
+# session holds. A rule of the L0 core takes no exception. Every decision says which
+# policies it cites, the denials or the exceptions used: the paper's citation and
+# override rates. Only the modules of enforced rules are loaded here. The module of an
+# advisory rule is evaluated apart, so nothing it says can refuse, whatever rule it
+# names.
 core_policy(pid) if {
 	some p in data.policies
 	p.id == pid
-	p.layer == 0
+	p.core == true
 }
 
 excepted(pid) if {
@@ -392,6 +395,8 @@ rule_denials contains d if {
 	some d in all_denials
 	not excepted(d.policy)
 }
+
+denial_list := [d | some d in rule_denials]
 
 exceptions_used contains x if {
 	some d in all_denials
@@ -418,6 +423,7 @@ decision := {
 	"review": "human",
 	"reason": concat("; ", denied_reasons),
 	"cites": denied_list,
+	"denials": denial_list,
 } if {
 	count(rule_denials) > 0
 }
