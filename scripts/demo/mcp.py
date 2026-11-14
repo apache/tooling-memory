@@ -8,7 +8,9 @@ launcher sets it for a harness working a task.
 Prints the tool's JSON result, or `refused: <message>` and exits 1. A batch is several
 calls in one session, as a harness makes them; it prints the last result. `steps` is a
 batch that goes on past a refusal and prints one JSON line per call, `{"tool", "ok",
-"result"}` or `{"tool", "ok": false, "refused"}`, for an act that shows each."""
+"result"}` or `{"tool", "ok": false, "refused"}`, for an act that shows each. In
+`steps`, an item `{"run": "<shell command>"}` is not a tool call: the command runs here
+between two calls, for an act that changes something under an open session."""
 import json
 import os
 import subprocess
@@ -49,6 +51,9 @@ def outcome(r):
 
 if tool == "steps":
     for n, c in enumerate(calls, start=2):
+        if "run" in c:
+            subprocess.run(c["run"], shell=True, check=True)
+            continue
         send({"jsonrpc": "2.0", "id": n, "method": "tools/call",
               "params": {"name": c["tool"], "arguments": c["arguments"]}})
         ok, text = outcome(recv())

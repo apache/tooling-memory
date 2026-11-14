@@ -44,6 +44,7 @@ pub mod prefetch;
 pub mod projection;
 pub mod reads;
 pub mod recall;
+pub mod rules;
 pub mod sources;
 pub mod t0;
 pub mod tape;
@@ -72,6 +73,23 @@ fn check_write_size(size: usize) -> Result<(), Error> {
 }
 /// The index, relative to the root.
 pub const INDEX_FILE: &str = "state/index.db";
+/// What changes whenever a session changes the policy: every other session compares it
+/// with what it last loaded.
+pub const POLICY_STAMP_FILE: &str = "state/policy.stamp";
+
+/// The policy stamp as the root holds it now: what the last change to a policy entry
+/// left, and the digest of the root's own policy files. A file that cannot be read
+/// gives a stamp no session has seen, so the session loads the policy again and is
+/// refused there.
+fn policy_stamp(root: &Path) -> String {
+    let entries = std::fs::read_to_string(root.join(POLICY_STAMP_FILE)).unwrap_or_default();
+    let own = match Policy::root_text(root) {
+        Ok(Some(text)) => dm_core::digest(&text),
+        Ok(None) => String::new(),
+        Err(e) => format!("unreadable: {e}"),
+    };
+    format!("{entries}|{own}")
+}
 /// The ledger, relative to the root.
 pub const LEDGER_FILE: &str = "state/ledger.db";
 
@@ -111,6 +129,10 @@ pub enum Error {
     /// The grants do not allow it.
     #[error("not allowed: {0}")]
     Denied(String),
+    /// The session's authority is no longer what it started with, or cannot be shown:
+    /// the session stops, and a new one starts under the grants as they are now.
+    #[error("stopped: {0}")]
+    Stale(String),
     /// Not there, or not for this session to see. The two are deliberately the same.
     #[error("not found: {0}")]
     NotFound(String),
@@ -223,7 +245,9 @@ pub struct PromotionView {
 /// where no runtime is at hand. Policy is enforced whatever a session may read, so the
 /// owner's view is used. An entry whose body is not a policy is skipped.
 fn policy_entries(ix: &Index, root: &Path, grants: &Grants) -> Vec<dm_policy::record::Entry> {
-    let Ok(hits) = ix.list(&grants.read_filter(), Some(EntryType::Policy), 1000) else {
+    // every one: a rule left out is a rule not enforced, and the newest entries are
+    // whatever was written last, by anyone
+    let Ok(hits) = ix.list_every(&grants.read_filter(), Some(EntryType::Policy)) else {
         return Vec::new();
     };
     hits.into_iter()
@@ -233,7 +257,11 @@ fn policy_entries(ix: &Index, root: &Path, grants: &Grants) -> Vec<dm_policy::re
                 .join(&h.domain)
                 .join(format!("{}.md", h.id));
             let entry = Entry::parse(&std::fs::read_to_string(path).ok()?).ok()?;
-            dm_policy::record::parse(&h.id, h.trust_tier, &entry.body).ok()
+            let mut rule = dm_policy::record::parse(&h.id, h.trust_tier, &entry.body).ok()?;
+            rule.domain = h.domain;
+            rule.classification = h.classification;
+            rule.created = Some(entry.front.created);
+            Some(rule)
         })
         .collect()
 }
@@ -301,7 +329,15 @@ pub struct Memory {
     claims: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     /// What this session may read, as the policy computed it once and the index applies
     /// inside every query.
-    scope: OnceLock<ReadFilter>,
+    /// It is kept with the version of the policy that computed it, and is computed
+    /// again when the policy in force is another.
+    scope: Mutex<Option<(String, ReadFilter)>>,
+    /// The digest of the grants file this session was opened from. The session is
+    /// valid only while the file reads the same.
+    grants_stamp: String,
+    /// The policy stamp this session last loaded its policy at: what
+    /// `state/policy.stamp` read then. Shared with the session's views.
+    policy_seen: Arc<Mutex<String>>,
     /// How many decision contexts this session has kept.
     contexts_kept: Arc<AtomicUsize>,
     /// The tools this session may call, when the launcher hosts them.
@@ -423,7 +459,9 @@ impl Memory {
     ///
     /// A missing or bad grants file, or a store, index, or ledger that will not open.
     pub fn open(root: &Path) -> Result<Memory, Error> {
-        let grants = Grants::load(&root.join(GRANTS_FILE))?;
+        let grants_text = std::fs::read_to_string(root.join(GRANTS_FILE)).map_err(io(root))?;
+        let grants = Grants::parse(&grants_text)?;
+        let policy_seen = policy_stamp(root);
         std::fs::create_dir_all(root.join("state")).map_err(io(root))?;
         let store = Store::open_dir(root)?;
         let index = Index::open(&root.join(INDEX_FILE))?;
@@ -460,7 +498,9 @@ impl Memory {
             held: Arc::default(),
             superseded: Arc::new(AtomicUsize::new(0)),
             claims: Arc::default(),
-            scope: OnceLock::new(),
+            scope: Mutex::new(None),
+            grants_stamp: dm_core::digest(&grants_text),
+            policy_seen: Arc::new(Mutex::new(policy_seen)),
             contexts_kept: Arc::new(AtomicUsize::new(0)),
             tools: OnceLock::new(),
             playback: OnceLock::new(),
@@ -487,6 +527,7 @@ impl Memory {
     /// When the policy fails to give the read scope.
     pub fn for_request(&self) -> Result<Memory, Error> {
         let scope = self.session_filter()?;
+        let version = self.policy().version().to_string();
         let mut session = self.grants.session();
         session.handling = session.handling.min(scope.handling);
         Ok(Memory {
@@ -509,7 +550,9 @@ impl Memory {
             held: Arc::clone(&self.held),
             superseded: Arc::clone(&self.superseded),
             claims: Arc::clone(&self.claims),
-            scope: OnceLock::from(scope),
+            scope: Mutex::new(Some((version, scope))),
+            grants_stamp: self.grants_stamp.clone(),
+            policy_seen: Arc::clone(&self.policy_seen),
             contexts_kept: Arc::clone(&self.contexts_kept),
             tools: self.tools.clone(),
             playback: self.playback.clone(),
@@ -523,8 +566,12 @@ impl Memory {
     /// away and never add them. The session's handling is capped at it as well. The
     /// decision is logged like any other.
     fn session_filter(&self) -> Result<ReadFilter, Error> {
-        if let Some(f) = self.scope.get() {
-            return Ok(f.clone());
+        self.fresh()?;
+        let policy = self.policy();
+        if let Some((version, f)) = lock(&self.scope).as_ref() {
+            if version == policy.version() {
+                return Ok(f.clone());
+            }
         }
         let input = Input {
             action: Action::Read,
@@ -539,13 +586,14 @@ impl Memory {
             spend: None,
             fetch: None,
         };
-        let f = self
-            .policy()
+        let f = policy
             .read_scope(&input)?
             .narrow(&self.grants.read_filter());
         {
+            // from the grants each time, so a filter that widens again widens the
+            // session's handling with it
             let mut s = lock(&self.session);
-            s.handling = s.handling.min(f.handling);
+            s.handling = self.grants.session().handling.min(f.handling);
         }
         self.log_decision(
             &input,
@@ -559,11 +607,72 @@ impl Memory {
                     f.handling,
                     f.min_tier
                 ),
-                policy: self.policy().version().to_string(),
+                policy: policy.version().to_string(),
                 cites: Vec::new(),
+                denials: Vec::new(),
+                advisories: Vec::new(),
             },
         );
-        Ok(self.scope.get_or_init(|| f).clone())
+        // what a pack pushed under another filter is no note for this one
+        if lock(&self.scope).is_some() {
+            *lock(&self.cache) = recall::Cache::default();
+        }
+        *lock(&self.scope) = Some((policy.version().to_string(), f.clone()));
+        Ok(f)
+    }
+
+    /// Show that this session's authority is current, before anything is released
+    /// under it: the grants file reads as it did when the session opened, and the
+    /// policy is the one in force. A session whose grants changed stops, because a
+    /// request made after a revocation cannot use the old grant; a new session starts
+    /// under the grants as they are. A policy another session changed is loaded here,
+    /// and the read filter follows it. When neither can be shown, the answer is no.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stale`] when the grants changed or cannot be read, or the policy
+    /// cannot be loaded again.
+    pub fn fresh(&self) -> Result<(), Error> {
+        let now = std::fs::read_to_string(self.root.join(GRANTS_FILE)).map_err(|e| {
+            Error::Stale(format!(
+                "the grants cannot be read ({e}), so this session's access cannot be shown"
+            ))
+        })?;
+        if dm_core::digest(&now) != self.grants_stamp {
+            return Err(Error::Stale(
+                "the grants changed after this session started. A session keeps no grant \
+                 that was changed under it: start a new session"
+                    .into(),
+            ));
+        }
+        let stamp = policy_stamp(&self.root);
+        let mut seen = lock(&self.policy_seen);
+        if *seen != stamp {
+            self.load_policy_again().map_err(|e| {
+                Error::Stale(format!(
+                    "the policy changed and cannot be loaded again ({e}), so this \
+                     session's access cannot be shown"
+                ))
+            })?;
+            *seen = stamp;
+        }
+        Ok(())
+    }
+
+    /// Compile the policy from the record as it is now, through an index handle of its
+    /// own: the caller may hold this session's.
+    fn load_policy_again(&self) -> Result<(), Error> {
+        let index = Index::open_reader(&self.root.join(INDEX_FILE))?;
+        // an index that cannot be read shows no rules, which is not the same as none
+        index.list(&self.grants.read_filter(), Some(EntryType::Policy), 1)?;
+        let entries = policy_entries(&index, &self.root, &self.grants);
+        let p = Policy::load(&self.root, &self.grants)?.with_record(
+            &self.grants,
+            entries,
+            OffsetDateTime::now_utc(),
+        )?;
+        *self.policy.write().unwrap_or_else(PoisonError::into_inner) = std::sync::Arc::new(p);
+        Ok(())
     }
 
     /// The task this session runs on: a launcher sets it before the harness starts,
@@ -603,7 +712,16 @@ impl Memory {
             entries,
             OffsetDateTime::now_utc(),
         )?;
+        let version = p.version().to_string();
         *self.policy.write().unwrap_or_else(PoisonError::into_inner) = std::sync::Arc::new(p);
+        // every other session learns from the stamp that the policy is another now
+        let stamp = format!(
+            "{version} {}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        let path = self.root.join(POLICY_STAMP_FILE);
+        std::fs::write(&path, &stamp).map_err(io(&path))?;
+        *lock(&self.policy_seen) = policy_stamp(&self.root);
         Ok(())
     }
 
@@ -618,11 +736,40 @@ impl Memory {
     /// Ask the policy, and log the decision under the record's state: every allow and
     /// deny, with the policy version that produced it, as the paper has decision logs.
     fn decide(&self, input: &Input) -> Result<Decision, Error> {
+        self.fresh()?;
         let mut input = input.clone();
         input.held_task = self.held_task();
-        let d = self.policy().decide(&input)?;
+        let mut d = self.policy().decide(&input)?;
         self.log_decision(&input, &d);
+        self.withhold_rule_text(&mut d)?;
         Ok(d)
+    }
+
+    /// A refusal is read as the rule is: the reason, the code and the remedy are text
+    /// of the rule's module, so for a rule whose entry this session may not read, the
+    /// refusal names the rule and nothing more. The log keeps the decision whole.
+    fn withhold_rule_text(&self, d: &mut Decision) -> Result<(), Error> {
+        if d.denials.is_empty() {
+            return Ok(());
+        }
+        let filter = self.session_filter()?;
+        let p = self.policy();
+        let above = |id: &str| {
+            p.entries().iter().any(|e| {
+                e.meta.id == id
+                    && e.tier == TrustTier::Verified
+                    && !filter.admits(&e.domain, e.classification, e.tier, true)
+            })
+        };
+        for denial in &mut d.denials {
+            if above(&denial.policy) {
+                denial.reason = "its text is above what this session may read".into();
+                denial.code = None;
+                denial.remedy = None;
+            }
+        }
+        d.say_denials();
+        Ok(())
     }
 
     /// Whether a model call may leave for `destination`, given what this session and
@@ -655,10 +802,12 @@ impl Memory {
             }),
             fetch: None,
         };
-        let d = self.policy().decide(&input)?;
+        self.fresh()?;
+        let mut d = self.policy().decide(&input)?;
         if !d.allow {
             self.log_decision(&input, &d);
         }
+        self.withhold_rule_text(&mut d)?;
         Ok(d)
     }
 
@@ -678,6 +827,8 @@ impl Memory {
             "reason": d.reason,
             "policy": d.policy,
             "cites": d.cites,
+            "denials": d.denials,
+            "advisories": d.advisories,
             "held_task": input.held_task,
         });
         reads::append_line(&self.root.join("state/decisions.jsonl"), &line.to_string());
@@ -731,8 +882,16 @@ impl Memory {
         self.author = author.into();
         self.reads.set_author(&self.author);
         // the read scope is the principal's; a new author is asked afresh
-        self.scope = OnceLock::new();
+        self.scope = Mutex::new(None);
         self
+    }
+
+    /// Take over the claims another session of the same holder made: for a session
+    /// opened in the place of one that stopped, so the tasks it held are still its own
+    /// to complete or release.
+    pub fn adopt_claims(&self, from: &Memory) {
+        let theirs = lock(&from.claims).clone();
+        lock(&self.claims).extend(theirs);
     }
 
     /// The capabilities this session's manifest carries, matched against task
@@ -1066,7 +1225,11 @@ impl Memory {
             body: req.body,
         };
         check_write_size(entry.render().len())?;
-        self.gate(&entry).await?;
+        let replaced = self.gate(&entry).await?;
+        // a policy entry written, or one replaced by an entry of any kind, changes what
+        // is in force
+        let policy_changed = entry.front.entry_type == EntryType::Policy
+            || replaced.is_some_and(|old| old.front.entry_type == EntryType::Policy);
         self.put_logged(&entry).await?;
         self.index_put(&entry).await?;
         if let Some(old) = &entry.front.supersedes {
@@ -1084,7 +1247,7 @@ impl Memory {
             entry.front.supersedes.as_deref(),
         );
         self.refresh_projection().await;
-        if entry.front.entry_type == EntryType::Policy {
+        if policy_changed {
             self.reload_policy().await?;
         }
         self.written.0.fetch_add(1, Ordering::Relaxed);
@@ -1798,7 +1961,8 @@ impl Memory {
             }
         }
         let kind = match decision.review {
-            _ if !decision.cites.is_empty() => "policy",
+            // a module's denial that names no rule cites none, and is a rule's still
+            _ if !decision.cites.is_empty() || !decision.denials.is_empty() => "policy",
             dm_policy::decide::Review::Approver => "verified",
             _ if findings.is_empty() => "blast-radius",
             _ => "injection",
@@ -1882,6 +2046,9 @@ impl Memory {
             self.put_logged(&entry).await?;
             self.index_put(&entry).await?;
             self.refresh_projection().await;
+            if entry.front.entry_type == EntryType::Policy || entry.front.supersedes.is_some() {
+                self.reload_policy().await?;
+            }
             Some(Written {
                 id: entry.front.id.clone(),
                 classification: entry.front.classification,
@@ -1980,7 +2147,14 @@ impl Memory {
         self.observe(&decisions);
         self.observe(&conventions);
         let generated_by = format!("memory {}", env!("CARGO_PKG_VERSION"));
-        let digest = self.policy_digest();
+        // a rule is read as an entry is: the digest gives the text of the rules this
+        // session may read, and for the others their ids
+        let readable: Vec<Hit> = {
+            let f = self.session_filter()?;
+            let ix = self.index.lock().await;
+            ix.list_every(&f, Some(EntryType::Policy))?
+        };
+        let digest = self.policy_digest(&readable);
         let text = t0::render(&t0::Inputs {
             domain: &domain,
             generated_by: &generated_by,
@@ -1999,8 +2173,10 @@ impl Memory {
     /// The policy digest T0 carries: the L0 core in full, rule and intent; the other
     /// layers' rules that are verified, by id and rule, marked enforced where a module
     /// checks them; and the exceptions in force, with their scope.
-    fn policy_digest(&self) -> Vec<String> {
+    fn policy_digest(&self, readable: &[Hit]) -> Vec<String> {
         let p = self.policy();
+        let withheld = |e: &dm_policy::record::Entry| !readable.iter().any(|h| h.id == e.entry_id);
+        let mut shown = Vec::new();
         let now = OffsetDateTime::now_utc();
         let mut out = Vec::new();
         let mut entries: Vec<_> = p.entries().iter().collect();
@@ -2017,16 +2193,50 @@ impl Memory {
                         m.expires.as_deref().unwrap_or("?")
                     ));
                 }
-            } else if m.layer == 0 {
-                out.push(format!(
-                    "{} (L0, not overridable): {} Why: {}",
-                    m.id, m.rule, m.intent
-                ));
-            } else if e.tier == TrustTier::Verified {
-                let how = if e.enforced() { ", enforced" } else { "" };
-                out.push(format!("{} (L{}{how}): {}", m.id, m.layer, m.rule));
+            } else if m.is_core() && p.state_of(e) == dm_policy::record::Status::Enforced {
+                if withheld(e) {
+                    out.push(format!(
+                        "{} (L0, not overridable): above what this session may read",
+                        m.id
+                    ));
+                } else {
+                    shown.push(e.entry_id.as_str());
+                    out.push(format!(
+                        "{} (L0, not overridable): {} Why: {}",
+                        m.id, m.rule, m.intent
+                    ));
+                }
+            } else {
+                // a rule a person verified, or one that reports: with what its module
+                // does, when it has one. A rule of the core that only reports is here too
+                let state = p.state_of(e);
+                let how = match (state, e.rego.is_some()) {
+                    (dm_policy::record::Status::Enforced, true) => ", enforced",
+                    (dm_policy::record::Status::Advisory, true) => ", advisory",
+                    _ => "",
+                };
+                let live = matches!(
+                    state,
+                    dm_policy::record::Status::Enforced | dm_policy::record::Status::Advisory
+                );
+                if live && (e.tier == TrustTier::Verified || !how.is_empty()) {
+                    let rule = if withheld(e) {
+                        "above what this session may read"
+                    } else {
+                        shown.push(e.entry_id.as_str());
+                        m.rule.as_str()
+                    };
+                    out.push(format!("{} (L{}{how}): {rule}", m.id, m.layer));
+                }
             }
         }
+        // the session has read the rules whose text it was given
+        let read: Vec<Hit> = readable
+            .iter()
+            .filter(|h| shown.contains(&h.id.as_str()))
+            .cloned()
+            .collect();
+        self.observe(&read);
         out
     }
 
@@ -3384,6 +3594,7 @@ impl Memory {
         src: &Path,
         into_domain: Option<&str>,
     ) -> Result<bundle::Imported, Error> {
+        self.fresh()?;
         let domain = self.resolve_domain(into_domain)?;
         let default = self
             .grants
@@ -3424,6 +3635,8 @@ impl Memory {
             .await?;
         self.restore_promotions(&imported.promotions).await?;
         self.refresh_projection().await;
+        // an import can land a rule or an exception, or replace one
+        self.reload_policy().await?;
         Ok(imported)
     }
 
@@ -3452,6 +3665,9 @@ impl Memory {
         let entries = self.store.all().await?;
         let n = self.index.lock().await.rebuild(entries)?;
         let m = self.ledger.lock().await.rebuild().await?;
+        // the policy is compiled from the index: a rebuilt index can hold rules the old
+        // one had lost, and every open session must decide under them
+        self.reload_policy().await?;
         Ok((n, m))
     }
 }
@@ -3862,6 +4078,245 @@ mod tests {
                 .any(|s| attr(s, "policy.action") == Some(Value::from("file_task"))),
             "the owner's task filing is a decision too"
         );
+    }
+
+    /// The built-in policy with agents narrowed to public entries.
+    fn narrowed_policy() -> String {
+        dm_policy::decide::BUILTIN.replace(
+            "read_filter := base_filter\n",
+            "read_filter := object.union(base_filter, {\"handling\": \"public\"}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n",
+        )
+    }
+
+    fn is_stale<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::Stale(_)))
+    }
+
+    /// A session keeps no grant that was changed under it: after a change to the
+    /// grants file, every read, write and claim of the session is refused, and a new
+    /// session works under the grants as they are.
+    #[tokio::test]
+    async fn a_session_stops_when_its_grants_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        owner.write(req("Backoff is exponential.\n")).await.unwrap();
+        let t = filed(&owner, tspec("Tidy", 0, None, &[], &[])).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 1);
+        let view = agent.for_request().unwrap();
+        let path = dir.path().join(GRANTS_FILE);
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{before}\n[spend.gateway]\nsession_tokens = 400\n"),
+        )
+        .unwrap();
+        assert!(is_stale(&agent.search("backoff", None, 10).await));
+        assert!(is_stale(&agent.t0(None).await));
+        assert!(is_stale(&agent.list(None, None, 10).await));
+        assert!(is_stale(&agent.write(req("A late note.\n")).await));
+        assert!(is_stale(&agent.claim(&t.id, Duration::minutes(5)).await));
+        assert!(is_stale(&agent.check_spend("gateway", 0, 0)));
+        assert!(
+            is_stale(&view.search("backoff", None, 10).await),
+            "a view of it too"
+        );
+        assert!(is_stale(&agent.for_request()));
+        let fresh = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert_eq!(fresh.search("backoff", None, 10).await.unwrap().len(), 1);
+        // a grants file that cannot be read shows nothing, so the answer is no
+        std::fs::remove_file(&path).unwrap();
+        assert!(is_stale(&fresh.search("backoff", None, 10).await));
+        // the file as it was is the authority the first session started with
+        std::fs::write(&path, before).unwrap();
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 1);
+    }
+
+    /// A rule that another session puts in force reaches a session that is already
+    /// open: its next decision is made under the policy as it is now.
+    #[tokio::test]
+    async fn an_open_session_decides_under_a_rule_verified_after_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let supersede = |of: &str| WriteRequest {
+            entry_type: EntryType::Decision,
+            supersedes: Some(of.to_string()),
+            ..req("Use something else on a laptop.\n")
+        };
+        let d2 = agent.write(supersede(&d1)).await.unwrap().id;
+        let rule = policy_entry(&owner, &rule_text("pol-L2-070", 2, "")).await;
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        verify(&owner, &curator, &rule).await;
+        let refused = agent.write(supersede(&d2)).await.unwrap_err().to_string();
+        assert!(refused.contains("pol-L2-070"), "{refused}");
+    }
+
+    /// The policy is compiled from the index. An index that lost its entries gives a
+    /// policy with no rule; the rebuild brings the rules back for the sessions that are
+    /// open, not only for the next one.
+    #[tokio::test]
+    async fn a_rebuilt_index_brings_its_rules_to_the_open_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let rule = policy_entry(&owner, &rule_text("pol-L2-071", 2, "")).await;
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        verify(&owner, &curator, &rule).await;
+        owner.index.lock().await.rebuild(Vec::new()).unwrap();
+        owner.reload_policy().await.unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert!(agent.policy().entries().is_empty());
+        owner.reindex().await.unwrap();
+        let refused = agent
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                supersedes: Some(d1),
+                ..req("Use something else on a laptop.\n")
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("pol-L2-071"), "{refused}");
+    }
+
+    /// A change to the root's own policy reaches an open session's read filter: its
+    /// next search is made under the narrower filter, and under the wider one again
+    /// when the file is gone.
+    #[tokio::test]
+    async fn an_open_session_reads_under_the_root_s_policy_as_it_is_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        owner
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req("Backoff is exponential, public.\n")
+            })
+            .await
+            .unwrap();
+        let internal = owner
+            .write(req("Backoff is exponential, internal.\n"))
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 2);
+        std::fs::create_dir_all(dir.path().join("policy")).unwrap();
+        std::fs::write(dir.path().join("policy/local.rego"), narrowed_policy()).unwrap();
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 1);
+        assert!(agent.get(&internal).await.is_err());
+        // a policy that will not compile shows nothing, so the answer is no
+        std::fs::write(
+            dir.path().join("policy/local.rego"),
+            "package amem\nnot rego {",
+        )
+        .unwrap();
+        assert!(is_stale(&agent.search("backoff", None, 10).await));
+        std::fs::remove_dir_all(dir.path().join("policy")).unwrap();
+        assert_eq!(agent.search("backoff", None, 10).await.unwrap().len(), 2);
+        // the session's handling widened with the filter: the entry is read by id again
+        agent.get(&internal).await.unwrap();
+    }
+
+    /// A root's policy directory that cannot be read is no reason to fall back to the
+    /// built-in policy: the session is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_root_policy_that_cannot_be_read_refuses_the_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        owner.write(req("Backoff is exponential.\n")).await.unwrap();
+        let policy = dir.path().join("policy");
+        std::fs::create_dir_all(&policy).unwrap();
+        std::fs::write(policy.join("local.rego"), narrowed_policy()).unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert!(agent.search("backoff", None, 10).await.unwrap().is_empty());
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // a process that reads every directory whatever its mode cannot show this
+        let blind = std::fs::read_dir(&policy).is_err();
+        let after = agent.search("backoff", None, 10).await;
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if blind {
+            assert!(is_stale(&after), "{:?}", after.map(|h| h.len()));
+        }
+    }
+
+    /// A stopped session imports nothing. An import, and an entry of any kind that
+    /// replaces a rule, change what is in force for the sessions that are open.
+    #[tokio::test]
+    async fn an_import_and_a_replaced_rule_reach_the_open_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        let rule = policy_entry(&owner, &rule_text("pol-L2-071", 2, "")).await;
+        verify(&owner, &curator, &rule).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let supersede = |of: &str| WriteRequest {
+            entry_type: EntryType::Decision,
+            supersedes: Some(of.to_string()),
+            ..req("Use something else on a laptop.\n")
+        };
+        assert!(
+            agent.write(supersede(&d1)).await.is_err(),
+            "the rule refuses"
+        );
+        // the owner replaces the rule with a note, which is no policy entry
+        let stamp = || std::fs::read_to_string(dir.path().join(POLICY_STAMP_FILE)).unwrap();
+        let before = stamp();
+        let owner = Memory::open(dir.path()).unwrap();
+        owner
+            .write(WriteRequest {
+                supersedes: Some(rule.clone()),
+                ..req("The rule is withdrawn.\n")
+            })
+            .await
+            .unwrap();
+        assert_ne!(stamp(), before, "the stamp says the policy changed");
+        agent.write(supersede(&d1)).await.unwrap();
+        // an import stamps too, and a stopped session imports nothing
+        let bundle = dir.path().join("out");
+        owner.export(None, Label::Internal, &bundle).await.unwrap();
+        let before = stamp();
+        owner.import(&bundle, None).await.unwrap();
+        assert_ne!(stamp(), before);
+        let grants = dir.path().join(GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(
+            &grants,
+            format!("{text}\n[spend.gateway]\nsession_tokens = 4\n"),
+        )
+        .unwrap();
+        assert!(is_stale(&owner.import(&bundle, None).await));
     }
 
     #[tokio::test]
@@ -6472,6 +6927,746 @@ mod tests {
             "{t0}"
         );
         an_exception_lets_one_task_through(dir.path(), &owner, &agent, &d2).await;
+    }
+
+    /// A rule whose block says enforced, with a module that gives a code and a remedy.
+    fn rule_text(id: &str, layer: u8, extra: &str) -> String {
+        format!(
+            "# A rule\n\n```policy\nid = \"{id}\"\nlayer = {layer}\nrule = \"Decisions are superseded by a person, not an agent.\"\nintent = \"An agent rewrote a standing decision mid-task.\"\nowner = \"human:test:lead\"\nstatus = \"enforced\"\n{extra}```\n\n```rego\npackage amem.rules\nimport rego.v1\ndeny contains {{\"policy\": \"{id}\", \"reason\": \"an agent superseded a decision\", \"code\": \"decision-by-agent\", \"remedy\": \"propose the change to the owner of the decision\"}} if {{\n\tinput.principal.class == \"agent\"\n\tinput.write.supersedes_type == \"decision\"\n}}\n```\n"
+        )
+    }
+
+    async fn policy_entry(m: &Memory, body: &str) -> String {
+        m.write(WriteRequest {
+            entry_type: EntryType::Policy,
+            ..req(body)
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// An agent supersedes the newest decision of the record's one chain.
+    async fn agent_supersedes(root: &Path, of: &str) -> Result<Written, Error> {
+        let agent = Memory::open(root).unwrap().with_author("agent:a");
+        agent
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                supersedes: Some(of.to_string()),
+                ..req("Use something else on a laptop.\n")
+            })
+            .await
+    }
+
+    /// Where a rule is, to a session opened now.
+    async fn status_of(root: &Path, id: &str) -> Option<dm_policy::record::Status> {
+        let m = Memory::open(root).unwrap();
+        m.check_policy("supersede a decision", None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.policy_id == id)
+            .map(|r| r.status)
+    }
+
+    /// A rule goes up one reviewed step at a time, and is in a decision only once a
+    /// person verified the version that says so. Advisory reports and refuses nothing;
+    /// enforced refuses, and says what would pass.
+    #[tokio::test]
+    async fn a_rule_is_proposed_then_advisory_then_enforced() {
+        use dm_policy::record::Status as Rule;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let advisory = rule_text("pol-L2-050", 2, "").replace("\"enforced\"", "\"advisory\"");
+        let rule = policy_entry(&agent, &advisory).await;
+        // a curator's check puts no module in a decision: the rule is still proposed
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        curator
+            .promote(&rule, TrustTier::Curated, "checked")
+            .await
+            .unwrap();
+        assert_eq!(status_of(dir.path(), "pol-L2-050").await, None);
+        let d2 = agent_supersedes(dir.path(), &d1).await.unwrap().id;
+        let log = || std::fs::read_to_string(dir.path().join("state/decisions.jsonl")).unwrap();
+        assert!(!log().contains("pol-L2-050"), "in no decision yet");
+        // a person verifies it: advisory, which reports and refuses nothing
+        verify(&owner, &curator, &rule).await;
+        assert_eq!(
+            status_of(dir.path(), "pol-L2-050").await,
+            Some(Rule::Advisory)
+        );
+        let d3 = agent_supersedes(dir.path(), &d2).await.unwrap().id;
+        let all = log();
+        let reported = all.lines().last().unwrap_or_default();
+        assert!(
+            reported.contains("\"allow\":true")
+                && reported.contains("\"advisories\":[{")
+                && reported.contains("pol-L2-050"),
+            "{reported}"
+        );
+        // the step up is a new version, which a person verifies: enforced
+        let owner = Memory::open(dir.path()).unwrap();
+        let enforced = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Policy,
+                supersedes: Some(rule.clone()),
+                ..req(&rule_text("pol-L2-050", 2, ""))
+            })
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(
+            status_of(dir.path(), "pol-L2-050").await,
+            None,
+            "under review"
+        );
+        verify(&owner, &curator, &enforced).await;
+        assert_eq!(
+            status_of(dir.path(), "pol-L2-050").await,
+            Some(Rule::Enforced)
+        );
+        let refused = agent_supersedes(dir.path(), &d3)
+            .await
+            .unwrap_err()
+            .to_string();
+        for part in [
+            "pol-L2-050",
+            "(code decision-by-agent)",
+            "To pass: propose the change to the owner of the decision.",
+        ] {
+            assert!(refused.contains(part), "{part}: {refused}");
+        }
+    }
+
+    /// An exception is asked for one task until a time, is nothing until a person
+    /// approves it, and is refused for the L0 core.
+    #[tokio::test]
+    async fn an_exception_is_filed_for_a_task_and_waits_for_its_approver() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let core = "# A value\n\n```policy\nid = \"pol-L0-001\"\nlayer = 0\nrule = \"The record is never rewritten in place.\"\nintent = \"History is what an audit reads.\"\n```\n";
+        for body in [rule_text("pol-L2-051", 2, ""), core.to_string()] {
+            let rule = policy_entry(&owner, &body).await;
+            verify(&owner, &agent, &rule).await;
+        }
+        let held = owner
+            .file_own(tspec("Replace the decision", 0, None, &[], &[]))
+            .await
+            .unwrap()
+            .task;
+        let ask = |breaches: &str, expires: &str| rules::ExceptionRequest {
+            breaches: breaches.into(),
+            task: Some(held.id.clone()),
+            scope: "this one replacement".into(),
+            expires: expires.into(),
+            justification: "The task is to replace the decision.".into(),
+        };
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let core = agent
+            .file_exception(ask("pol-L0-001", "2099-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(&core, Err(Error::Denied(why)) if why.contains("L0 core")));
+        let past = agent
+            .file_exception(ask("pol-L2-051", "2020-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(&past, Err(Error::Denied(why)) if why.contains("time to come")));
+        let unknown = agent
+            .file_exception(ask("pol-L2-999", "2099-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(unknown, Err(Error::NotFound(_))));
+        let filed = agent
+            .file_exception(ask("pol-L2-051", "2099-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(filed.approver, "human:test:lead", "the owner of an L2 rule");
+        assert!(filed.policy_id.starts_with("exc-"));
+        // filed is not approved: the task is still refused
+        let inside = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        inside.set_held_task(&held.id);
+        let supersede = || WriteRequest {
+            entry_type: EntryType::Decision,
+            supersedes: Some(d1.clone()),
+            ..req("Use files on a laptop.\n")
+        };
+        assert!(inside.write(supersede()).await.is_err());
+        // asked again before the approval and after it: one entry, one approval task
+        let again = agent
+            .file_exception(ask("pol-L2-051", "2099-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(&again, Err(Error::Denied(why)) if why.contains(&filed.id)));
+        owner.approve(&filed.task.id).await.unwrap();
+        let again = agent
+            .file_exception(ask("pol-L2-051", "2099-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(&again, Err(Error::Denied(why)) if why.contains(&filed.id)));
+        let inside = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        inside.set_held_task(&held.id);
+        inside.write(supersede()).await.unwrap();
+    }
+
+    /// A refusal is read as the rule is. The reason, the code and the remedy are text
+    /// of the rule's module: a session that may not read the rule gets its id, and so
+    /// does the task the refusal files, which is no higher than the refused write.
+    #[tokio::test]
+    async fn a_refusal_by_a_rule_above_the_handling_names_the_rule_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                classification: Some(Label::Public),
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let rule = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Policy,
+                classification: Some(Label::Restricted),
+                ..req(&rule_text("pol-L2-090", 2, ""))
+            })
+            .await
+            .unwrap()
+            .id;
+        verify(&owner, &agent, &rule).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:a")
+            .with_handling_cap(Label::Public);
+        let err = capped
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                supersedes: Some(d1),
+                ..req("Use something else on a laptop.\n")
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pol-L2-090"), "{err}");
+        let gates = gate_tasks(&owner, "gate:policy").await;
+        assert_eq!(gates.len(), 1);
+        for text in [&err, &gates[0].spec.body] {
+            for of_the_module in [
+                "an agent superseded",
+                "decision-by-agent",
+                "propose the change",
+            ] {
+                assert!(!text.contains(of_the_module), "{text}");
+            }
+        }
+        assert_eq!(capped.label(), Label::Public);
+    }
+
+    /// A module's denial that names no rule refuses still, says that it names none,
+    /// and files the task of a rule's refusal.
+    #[tokio::test]
+    async fn a_denial_that_names_no_rule_is_a_rule_s_refusal_still() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let unnamed = rule_text("pol-L2-091", 2, "").replace("\"policy\": \"pol-L2-091\", ", "");
+        assert!(!unnamed.contains("\"policy\""));
+        let rule = policy_entry(&owner, &unnamed).await;
+        verify(&owner, &agent, &rule).await;
+        let err = agent_supersedes(dir.path(), &d1).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("a rule that names no policy: an agent superseded"),
+            "{err}"
+        );
+        assert_eq!(gate_tasks(&owner, "gate:policy").await.len(), 1);
+        assert!(gate_tasks(&owner, "gate:blast-radius").await.is_empty());
+    }
+
+    /// A rule is in force however many policy entries were written after it: the
+    /// policy is compiled from every one, not from the newest of them.
+    #[tokio::test]
+    async fn a_rule_stays_in_force_however_many_entries_follow_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let rule = policy_entry(&owner, &rule_text("pol-L2-092", 2, "")).await;
+        verify(&owner, &agent, &rule).await;
+        // what an agent's flood of raw entries leaves in the index, without the hour
+        // it takes to write them
+        let mut later = owner.get(&rule).await.unwrap();
+        later.front.trust_tier = TrustTier::Raw;
+        {
+            let mut ix = owner.index.lock().await;
+            for i in 0..1001 {
+                later.front.id = format!("mem-me-flood{i:04}");
+                later.front.created += time::Duration::seconds(1);
+                ix.upsert(&later).unwrap();
+            }
+        }
+        owner.reload_policy().await.unwrap();
+        let grants = owner.grants().clone();
+        let ix = owner.index.lock().await;
+        let loaded = policy_entries(&ix, dir.path(), &grants);
+        assert!(
+            loaded.iter().any(|e| e.entry_id == rule && e.enforced()),
+            "{} entries loaded, the rule not among them",
+            loaded.len()
+        );
+    }
+
+    /// An amendment is a task for a person that names the rule's owner; the same
+    /// evidence twice is one task.
+    #[tokio::test]
+    async fn an_amendment_is_a_task_for_the_rule_s_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let rule = policy_entry(&owner, &rule_text("pol-L2-052", 2, "")).await;
+        verify(&owner, &agent, &rule).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let evidence = "The rule refused a decision that its own owner asked to replace.";
+        let first = agent
+            .propose_amendment("pol-L2-052", evidence)
+            .await
+            .unwrap();
+        assert_eq!(first.task.spec.origin.as_deref(), Some("amend:pol-L2-052"));
+        assert_eq!(first.task.spec.requirements, ["human"]);
+        assert!(first.task.spec.body.contains("human:test:lead"));
+        assert!(first.task.spec.body.contains(evidence));
+        let again = agent
+            .propose_amendment("pol-L2-052", evidence)
+            .await
+            .unwrap();
+        assert!(again.deduplicated);
+        assert_eq!(again.task.id, first.task.id);
+        let none = agent.propose_amendment("pol-L2-052", " ").await;
+        assert!(matches!(none, Err(Error::Denied(_))));
+        let unknown = agent.propose_amendment("pol-L2-999", evidence).await;
+        assert!(matches!(unknown, Err(Error::NotFound(_))));
+    }
+
+    /// Two rules of an agent that a person proposed or closed and nobody approved: one
+    /// whose proposal was declined, and one whose proposal task a person completed
+    /// without approving, so the entry stayed raw.
+    async fn proposals_nobody_approved(root: &Path, owner: &Memory) {
+        let agent = Memory::open(root).unwrap().with_author("agent:a");
+        let curator = Memory::open(root).unwrap().with_author("agent:curator");
+        let declined = policy_entry(&agent, &rule_text("pol-L3-005", 3, "")).await;
+        let other = Memory::open(root).unwrap().with_author("human:test:other");
+        let Promotion::Proposed { task } = other
+            .promote(&declined, TrustTier::Verified, "looks right")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        owner.invalidate(&task.id, "declined", None).await.unwrap();
+        // and one whose proposal a person closed without approving: the entry is raw
+        let closed = policy_entry(&agent, &rule_text("pol-L3-006", 3, "")).await;
+        let Promotion::Proposed { task } = curator
+            .promote(&closed, TrustTier::Verified, "looks right")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        {
+            let mut l = owner.ledger.lock().await;
+            let who = "human:test:other";
+            let lease = Duration::minutes(5);
+            l.claim(
+                &task.id,
+                who,
+                lease,
+                &task.spec.requirements,
+                Label::Restricted,
+            )
+            .await
+            .unwrap();
+            let held = dm_ledger::Held {
+                holder: who,
+                generation: 1,
+            };
+            l.complete(&task.id, held, &closed).await.unwrap();
+        }
+    }
+
+    async fn retired_says_so_and_the_exception_stands(root: &Path, exception: &str) {
+        use dm_policy::record::Status as Rule;
+        let dir = root;
+        // the retired version says retired, and the exception is as it was
+        let fresh = Memory::open(dir).unwrap();
+        let p = fresh.policy();
+        let state = |id: &str| {
+            p.entries()
+                .iter()
+                .find(|e| e.meta.id == id)
+                .map(dm_policy::record::Entry::state)
+        };
+        assert_eq!(state("pol-L3-003"), Some(Rule::Retired));
+        assert_eq!(state("pol-L3-004"), Some(Rule::Retired));
+        assert!(fresh.get(exception).await.unwrap().front.status.is_none());
+    }
+
+    /// A reset keeps each rule that a person wrote, curated or approved and retires the
+    /// rest. Only the owner resets. A proposal that a person made and nobody approved
+    /// puts no person in the lineage, and an exception is not touched.
+    #[tokio::test]
+    async fn a_reset_keeps_the_rules_with_a_person_in_their_lineage() {
+        use dm_policy::record::Status as Rule;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        // written by a person; written by an agent and verified by a person; written by
+        // an agent and curated by an agent; written by an agent and never reviewed;
+        // written by an agent and proposed by a person whose proposal was declined
+        policy_entry(&owner, &rule_text("pol-L3-001", 3, "")).await;
+        let verified = policy_entry(&agent, &rule_text("pol-L3-002", 3, "")).await;
+        verify(&owner, &curator, &verified).await;
+        let curated = policy_entry(&agent, &rule_text("pol-L3-003", 3, "")).await;
+        curator
+            .promote(&curated, TrustTier::Curated, "checked")
+            .await
+            .unwrap();
+        policy_entry(&agent, &rule_text("pol-L3-004", 3, "")).await;
+        proposals_nobody_approved(dir.path(), &owner).await;
+        let exception = "# Exception\n\n```policy\nid = \"exc-2026-030\"\nlayer = 3\nbreaches = \"pol-L3-002\"\nscope_task = \"task-me-x\"\nexpires = \"2099-01-01T00:00:00Z\"\n```\n";
+        let exception = policy_entry(&agent, exception).await;
+        // a value that an agent wrote and nobody reviewed is not in the digest as core
+        let value = "# A value\n\n```policy\nid = \"pol-L0-102\"\nlayer = 0\nrule = \"An agent's value.\"\nintent = \"i\"\n```\n";
+        policy_entry(&agent, value).await;
+        let digest = Memory::open(dir.path()).unwrap().t0(None).await.unwrap();
+        assert!(!digest.contains("pol-L0-102"), "{digest}");
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert!(matches!(
+            agent.reset_rules(None).await,
+            Err(Error::Denied(_))
+        ));
+        let owner = Memory::open(dir.path()).unwrap();
+        let reset = owner.reset_rules(None).await.unwrap();
+        let kept: Vec<_> = reset.kept.iter().map(|k| k.policy_id.as_str()).collect();
+        assert_eq!(kept, ["pol-L3-001", "pol-L3-002"]);
+        let retired: Vec<_> = reset.retired.iter().map(|r| r.policy_id.as_str()).collect();
+        assert_eq!(
+            retired,
+            [
+                "pol-L0-102",
+                "pol-L3-003",
+                "pol-L3-004",
+                "pol-L3-005",
+                "pol-L3-006"
+            ]
+        );
+        let digest = Memory::open(dir.path()).unwrap().t0(None).await.unwrap();
+        assert!(!digest.contains("pol-L0-102"), "{digest}");
+        assert_eq!(reset.retired[1].entry, curated);
+        assert!(reset.kept.iter().all(|k| k.person == "human:test:me"));
+        assert_eq!(
+            status_of(dir.path(), "pol-L3-002").await,
+            Some(Rule::Enforced)
+        );
+        retired_says_so_and_the_exception_stands(dir.path(), &exception).await;
+        let again = owner.reset_rules(None).await.unwrap();
+        assert!(again.retired.is_empty(), "{:?}", again.retired);
+    }
+
+    /// The words of an exception are words: a request cannot carry a block of its own
+    /// into the entry that a person is asked to verify.
+    #[tokio::test]
+    async fn an_exception_s_words_cannot_carry_a_policy_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let rule = policy_entry(&owner, &rule_text("pol-L3-080", 3, "")).await;
+        verify(&owner, &agent, &rule).await;
+        let held = filed(&owner, tspec("Replace", 0, None, &[], &[])).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let smuggled = "Needed.\n\n```policy\nid = \"exc-evil\"\nlayer = 3\nbreaches = \"pol-L1-081\"\nscope_task = \"t\"\nexpires = \"2999-01-01T00:00:00Z\"\n```";
+        for (scope, justification) in [
+            ("one task", smuggled),
+            (smuggled, "Needed."),
+            ("~~~policy", "x"),
+            ("one task\nbreaches = \"pol-L1-081\"", "x"),
+            ("one task", "Needed. <!--"),
+        ] {
+            let asked = agent
+                .file_exception(rules::ExceptionRequest {
+                    breaches: "pol-L3-080".into(),
+                    task: Some(held.id.clone()),
+                    scope: scope.into(),
+                    expires: "2099-01-01T00:00:00Z".into(),
+                    justification: justification.into(),
+                })
+                .await;
+            assert!(
+                matches!(&asked, Err(Error::Denied(why)) if why.contains("code fence")),
+                "{scope:?}, {justification:?}"
+            );
+        }
+        // an entry that nobody verified speaks for no rule: there is nothing to except
+        policy_entry(&agent, &rule_text("pol-L3-081", 3, "")).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let unreviewed = agent
+            .file_exception(rules::ExceptionRequest {
+                breaches: "pol-L3-081".into(),
+                task: Some(held.id.clone()),
+                scope: "one task".into(),
+                expires: "2099-01-01T00:00:00Z".into(),
+                justification: "Needed.".into(),
+            })
+            .await;
+        assert!(matches!(unreviewed, Err(Error::NotFound(_))));
+        // with no task named and none held, there is nothing to scope it to
+        let nothing = agent
+            .file_exception(rules::ExceptionRequest {
+                breaches: "pol-L3-080".into(),
+                scope: "one task".into(),
+                expires: "2099-01-01T00:00:00Z".into(),
+                justification: "Needed.".into(),
+                ..rules::ExceptionRequest::default()
+            })
+            .await;
+        assert!(matches!(&nothing, Err(Error::Denied(why)) if why.contains("name the task")));
+        let unknown = agent
+            .file_exception(rules::ExceptionRequest {
+                breaches: "pol-L3-080".into(),
+                task: Some("task-me-nosuch".into()),
+                scope: "one task".into(),
+                expires: "2099-01-01T00:00:00Z".into(),
+                justification: "Needed.".into(),
+            })
+            .await;
+        assert!(unknown.is_err());
+    }
+
+    async fn one_amendment_while_a_person_works(
+        dir: &Path,
+        owner: &Memory,
+        reader: &Memory,
+        first: &Task,
+    ) {
+        // also while a person works on the first; and another filer has its own
+        {
+            let mut l = owner.ledger.lock().await;
+            if first.status == Status::Proposed {
+                l.admit(&first.id).await.unwrap();
+            }
+            let reqs = &first.spec.requirements;
+            l.claim(
+                &first.id,
+                "human:test:me",
+                Duration::minutes(5),
+                reqs,
+                Label::Restricted,
+            )
+            .await
+            .unwrap();
+        }
+        let third = reader
+            .propose_amendment("pol-L2-090", "A third case.")
+            .await
+            .unwrap();
+        assert_eq!(third.task.id, first.id);
+        let other = Memory::open(dir).unwrap().with_author("agent:c");
+        let theirs = other
+            .propose_amendment("pol-L2-090", "It is wrong.")
+            .await
+            .unwrap();
+        assert_ne!(theirs.task.id, first.id);
+    }
+
+    /// An agent's raw entry with a rule's id does not speak for the rule, and a filer
+    /// has one amendment to a rule that is not done. Gives the session that filed.
+    async fn amendments_use_the_reviewed_entry(
+        root: &Path,
+        owner: &Memory,
+        secret: &str,
+    ) -> Memory {
+        let agent = Memory::open(root).unwrap().with_author("agent:a");
+        let dir = root;
+        // an agent's raw entry with the same id, another owner and another text
+        let fake = secret
+            .replace("human:test:lead", "human:evil:x")
+            .replace("SECRET-INTENT", "FAKE");
+        policy_entry(&agent, &fake).await;
+        let reader = Memory::open(dir).unwrap().with_author("agent:b");
+        let filed = reader
+            .propose_amendment("pol-L2-090", "It is wrong.")
+            .await
+            .unwrap();
+        assert!(filed.task.spec.body.contains("human:test:lead"));
+        assert!(!filed.task.spec.body.contains("human:evil:x"));
+        assert_eq!(filed.task.spec.classification, Label::Restricted);
+        // one open amendment for each rule and filer: other evidence is the same task
+        let again = reader
+            .propose_amendment("pol-L2-090", "It is wrong in another case.")
+            .await
+            .unwrap();
+        assert!(again.deduplicated);
+        assert_eq!(again.task.id, filed.task.id);
+        one_amendment_while_a_person_works(dir, owner, &reader, &filed.task).await;
+        reader
+    }
+
+    /// A rule is read as memory is. A session below the rule's entry gets the rule's
+    /// id, and not its text, and cannot file against it. An entry nobody reviewed that
+    /// reuses a rule's id does not speak for the rule.
+    #[tokio::test]
+    async fn a_rule_s_text_is_the_reviewed_entry_s_and_is_read_within_the_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let secret = rule_text("pol-L2-090", 2, "").replace(
+            "An agent rewrote a standing decision mid-task.",
+            "SECRET-INTENT",
+        );
+        let rule = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Policy,
+                classification: Some(Label::Restricted),
+                ..req(&secret)
+            })
+            .await
+            .unwrap()
+            .id;
+        verify(&owner, &agent, &rule).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:a")
+            .with_handling_cap(Label::Public);
+        let rules = capped.check_policy("anything", None).await.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].withheld && rules[0].intent.is_empty() && rules[0].rule.is_empty());
+        assert_eq!(rules[0].owner, None);
+        assert_eq!(rules[0].policy_id, "pol-L2-090");
+        assert_eq!(capped.label(), Label::Public);
+        // the digest in T0 names the rule and withholds its text, as the tool does
+        let t0 = capped.t0(None).await.unwrap();
+        assert!(t0.contains("pol-L2-090 (L2, enforced)"), "{t0}");
+        assert!(
+            !t0.contains("SECRET-INTENT") && !t0.contains("superseded by a person"),
+            "{t0}"
+        );
+        assert_eq!(capped.label(), Label::Public);
+        let amend = capped.propose_amendment("pol-L2-090", "It is wrong.").await;
+        assert!(matches!(amend, Err(Error::NotFound(_))));
+        let reader = amendments_use_the_reviewed_entry(dir.path(), &owner, &secret).await;
+        let rules = reader.check_policy("anything", None).await.unwrap();
+        assert_eq!(rules[0].intent, "SECRET-INTENT");
+        assert_eq!(rules[0].owner.as_deref(), Some("human:test:lead"));
+    }
+
+    /// The lint: a rule over the ceiling, a rule that refused nothing, a rule with no
+    /// owner and a rule after its review date are findings, and the rates count what
+    /// an advisory rule would have refused.
+    #[tokio::test]
+    async fn the_lint_finds_what_the_lifecycle_asks_of_a_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let grants = dir.path().join(GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        let ceiling = if text.contains("[gates]") {
+            text.replace("[gates]", "[gates]\nmax_enforced_rules = 1")
+        } else {
+            format!("{text}\n[gates]\nmax_enforced_rules = 1\n")
+        };
+        std::fs::write(&grants, ceiling).unwrap();
+        let owner = Memory::open(dir.path()).unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let first = policy_entry(&owner, &rule_text("pol-L2-001", 2, "")).await;
+        verify(&owner, &agent, &first).await;
+        let late = rule_text("pol-L2-002", 2, "review_by = \"2020-01-01\"\n")
+            .replace("owner = \"human:test:lead\"\n", "");
+        let second = policy_entry(&owner, &late).await;
+        verify(&owner, &agent, &second).await;
+        // the first refuses, and the second, over the ceiling, advises
+        assert!(agent_supersedes(dir.path(), &d1).await.is_err());
+        let m = Memory::open(dir.path()).unwrap();
+        let kinds = |id: &str| {
+            let mut kinds: Vec<String> = m
+                .policy_findings()
+                .into_iter()
+                .filter(|f| f.policy == id)
+                .map(|f| f.kind)
+                .collect();
+            kinds.sort();
+            kinds
+        };
+        assert!(kinds("pol-L2-001").is_empty(), "{:?}", kinds("pol-L2-001"));
+        assert_eq!(
+            kinds("pol-L2-002"),
+            ["no-owner", "over-ceiling", "review-due"]
+        );
+        let rates = m.policy_rates();
+        let rate = |id: &str| {
+            rates
+                .iter()
+                .find(|r| r.id == id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            (rate("pol-L2-001").refused, rate("pol-L2-001").advised),
+            (1, 0)
+        );
+        assert_eq!(
+            (rate("pol-L2-002").refused, rate("pol-L2-002").advised),
+            (0, 1)
+        );
+        // without the ceiling the second is enforced, and it has refused nothing yet
+        std::fs::write(&grants, text).unwrap();
+        let m = Memory::open(dir.path()).unwrap();
+        let unused: Vec<String> = m
+            .policy_findings()
+            .into_iter()
+            .filter(|f| f.kind == "unused")
+            .map(|f| f.policy)
+            .collect();
+        assert_eq!(unused, ["pol-L2-002"]);
+        let filed = m.file_policy_findings(&m.policy_findings()).await.unwrap();
+        assert_eq!(filed.len(), 3, "no-owner, review-due and unused");
+        assert!(m
+            .file_policy_findings(&m.policy_findings())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     async fn an_exception_lets_one_task_through(

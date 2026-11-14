@@ -124,9 +124,14 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Approval events.** An approval is the completion of a promotion task. It has no
   scope and no expiry, and the perimeter does not check it when an action runs. There is
   no `declassify` and no guard.
-- **The rule lifecycle.** A rule is enforced when a person verified it and it has a
-  module. A rule has no status, no owner who is a person, and no review date that the
-  policy uses. There is no ceiling on rules, no reset, and no `check_policy` tool.
+- **The rule lifecycle, in part.** `check_policy` gives all the rules in force for a
+  domain. It does not select rules by the action. The lint reports a rule after its
+  review date and an unused rule, from the full decision log and not from one review
+  period. The approver of an exception is a name in the answer. `amem` does not check
+  that this person approves. A new version of a rule is the newest rule under the
+  ceiling. While the next version of a rule waits for its review, the rule is in no
+  decision. When the module of an enforced rule fails in a decision, that decision
+  fails. An imported rule keeps the author and the date of its entry.
 - **Lineage, in part.** An entry does not record its session. `amem taint` compares the
   time of a read with the time of a later write, and it goes forward only. Reads and
   sends are not in the event log. A write that the scan refuses is a file under `state/`,
@@ -137,8 +142,12 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Curation and audit, in part.** No curation task demotes an entry, checks an owner or
   a cross-link, or curates policy. No test on planted faults qualifies the auditor's
   model. The auditor does not read handoffs.
-- **Access freshness.** A session keeps its read filter until it ends. A change to the
-  grants or to a policy does not stop a session.
+- **Access freshness, in part.** Any change to the grants file stops each open session,
+  not only a session that the change affects. The files that a session rendered before
+  the change stay on disk. A harness that a stopped session started continues to run,
+  and each of its memory calls and model calls is refused. A read that waits does not
+  check again before it gives its answer. Some commands of the owner do not do the
+  check. A grant has no expiry of its own.
 - **The improvement loop.** The only gate on a platform artifact is that a person
   verifies it. There is no performance gate, no safety gate, and no check that a change
   adds no permission.

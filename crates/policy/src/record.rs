@@ -27,6 +27,36 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Where a rule is in its life. Each step up is a reviewed promotion: a rule is in a
+/// decision, as advisory or as enforced, only once a person has verified the version
+/// that says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    /// Written, and not yet in any decision.
+    Proposed,
+    /// Evaluated with every decision and reported, refusing nothing: where a rule
+    /// written after something went wrong starts.
+    Advisory,
+    /// Refuses.
+    Enforced,
+    /// No longer in any decision. Kept, as every entry is.
+    Retired,
+}
+
+impl Status {
+    /// The word the block and the data hold.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Proposed => "proposed",
+            Status::Advisory => "advisory",
+            Status::Enforced => "enforced",
+            Status::Retired => "retired",
+        }
+    }
+}
+
 /// What the `policy` block says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
@@ -44,9 +74,33 @@ pub struct Meta {
     /// The policy ids this one implements; an L3 convention names the L2 it serves.
     #[serde(default)]
     pub implements: Vec<String>,
-    /// The domain that owns it.
+    /// Who owns it: the person who answers for the rule, as `human:<system>:<id>`, or
+    /// the domain that does.
     #[serde(default)]
     pub owner: Option<String>,
+    /// Where the rule is in its life. A block that does not say is enforced once its
+    /// entry is verified, as before the lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
+    /// When the rule must be looked at again, a calendar date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_by: Option<String>,
+    /// For an L0 rule: whether it is part of the core, which takes no exception. An L0
+    /// rule that does not say is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<bool>,
+    /// The person who signed this rule off above the domain's ceiling on enforced rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_off_by: Option<String>,
+    /// For an exception: what it covers, in words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// For an exception: who approved it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    /// For an exception: why it is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub justification: Option<String>,
     /// For an exception: the policy id it breaches.
     #[serde(default)]
     pub breaches: Option<String>,
@@ -129,6 +183,12 @@ impl Meta {
     pub fn is_exception(&self) -> bool {
         self.breaches.is_some()
     }
+
+    /// Whether this is an L0 rule of the core, which takes no exception.
+    #[must_use]
+    pub fn is_core(&self) -> bool {
+        self.layer == 0 && self.core.unwrap_or(true)
+    }
 }
 
 /// A policy entry as the record holds it.
@@ -142,26 +202,62 @@ pub struct Entry {
     pub meta: Meta,
     /// Its Rego module, if it carries one.
     pub rego: Option<String>,
+    /// The domain its entry is in; empty for one that came from no record.
+    #[serde(default)]
+    pub domain: String,
+    /// How sensitive its entry is: who may read the rule's text.
+    #[serde(default)]
+    pub classification: dm_core::Label,
+    /// When its entry was written, where the record says.
+    #[serde(skip)]
+    pub created: Option<time::OffsetDateTime>,
 }
 
 impl Entry {
-    /// Whether its module is enforced: verified and carrying one.
+    /// Where the rule is in its life, as its block and its entry's tier say together.
+    /// The block names the step the rule's author means it to be at, and the tier
+    /// holds it back: below verified a rule is proposed, whatever its block says, so no
+    /// module is evaluated that a person has not verified. A module's denial names the
+    /// rule it speaks for, and one evaluated unreviewed could name another rule's. A
+    /// block that names no status is enforced once verified.
     #[must_use]
-    pub fn enforced(&self) -> bool {
-        self.tier == dm_core::TrustTier::Verified
-            && self.rego.is_some()
-            && !self.meta.is_exception()
+    pub fn state(&self) -> Status {
+        use dm_core::TrustTier::Verified;
+        match (self.meta.status, self.tier) {
+            (Some(Status::Retired), _) => Status::Retired,
+            (Some(Status::Enforced) | None, Verified) => Status::Enforced,
+            (Some(Status::Advisory), Verified) => Status::Advisory,
+            _ => Status::Proposed,
+        }
     }
 
-    /// Whether, as an exception, it is in force at `now`: verified, not expired.
+    /// Whether its module refuses: an enforced rule carrying one.
+    #[must_use]
+    pub fn enforced(&self) -> bool {
+        self.state() == Status::Enforced && self.rego.is_some() && !self.meta.is_exception()
+    }
+
+    /// Whether its module is evaluated and reported without refusing.
+    #[must_use]
+    pub fn advisory(&self) -> bool {
+        self.state() == Status::Advisory && self.rego.is_some() && !self.meta.is_exception()
+    }
+
+    /// When, as an exception, it lapses: its expiry, if that is a time.
+    #[must_use]
+    pub fn lapses(&self) -> Option<time::OffsetDateTime> {
+        let expires = self.meta.expires.as_deref()?;
+        time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339).ok()
+    }
+
+    /// Whether, as an exception, it is in force at `now`: verified, not expired, and
+    /// not retired.
     #[must_use]
     pub fn in_force(&self, now: time::OffsetDateTime) -> bool {
         self.meta.is_exception()
+            && self.meta.status != Some(Status::Retired)
             && self.tier == dm_core::TrustTier::Verified
-            && self.meta.expires.as_deref().is_some_and(|e| {
-                time::OffsetDateTime::parse(e, &time::format_description::well_known::Rfc3339)
-                    .is_ok_and(|t| t > now)
-            })
+            && self.lapses().is_some_and(|t| t > now)
     }
 }
 
@@ -189,7 +285,49 @@ pub fn parse(entry_id: &str, tier: dm_core::TrustTier, body: &str) -> Result<Ent
         tier,
         meta,
         rego: fenced(body, "rego").map(str::to_string),
+        domain: String::new(),
+        classification: dm_core::Label::default(),
+        created: None,
     })
+}
+
+/// A body with its `policy` block saying `status`: the text a rule is superseded with
+/// when it moves in its life. Everything outside the block is kept as it was.
+///
+/// # Errors
+///
+/// A body with no `policy` block, or a block that is not TOML.
+pub fn with_status(body: &str, status: Status) -> Result<String, String> {
+    let block = fenced(body, "policy").ok_or("no ```policy block")?;
+    let mut table: toml::Table = toml::from_str(block).map_err(|e| format!("policy block: {e}"))?;
+    table.insert("status".into(), toml::Value::String(status.as_str().into()));
+    let new = toml::to_string(&table).map_err(|e| format!("policy block: {e}"))?;
+    // the block itself, by where it is: the same text can stand earlier in the body
+    let at = block.as_ptr() as usize - body.as_ptr() as usize;
+    let out = format!(
+        "{}{}{}",
+        &body[..at],
+        new.trim_end(),
+        &body[at + block.len()..]
+    );
+    match parse("", dm_core::TrustTier::Raw, &out) {
+        Ok(e) if e.meta.status == Some(status) => Ok(out),
+        _ => Err("the policy block does not read back with the new status".into()),
+    }
+}
+
+/// The body of a policy entry: a heading, what a person reads, and the block.
+///
+/// # Errors
+///
+/// A block that will not be written as TOML.
+pub fn render(title: &str, text: &str, meta: &Meta) -> Result<String, String> {
+    let block = toml::to_string(meta).map_err(|e| format!("policy block: {e}"))?;
+    Ok(format!(
+        "# {title}\n\n{}\n\n```policy\n{}\n```\n",
+        text.trim(),
+        block.trim_end()
+    ))
 }
 
 /// A module may only add denials: it must be in `package amem.rules`, so a record entry
@@ -208,7 +346,9 @@ pub struct Finding {
     /// The policy id the finding is about.
     pub policy: String,
     /// What kind: `implements-unknown`, `higher-layer-conflict`, `exception-on-core`,
-    /// `exception-expired`, `inert`, `module-refused`.
+    /// `exception-expired`, `inert`, `module-refused`, `no-owner`, `review-due`; and
+    /// from the caller, which has the grants and the decision log, `over-ceiling` and
+    /// `unused`.
     pub kind: String,
     /// One sentence.
     pub why: String,
@@ -249,13 +389,14 @@ pub fn lint(entries: &[Entry], now: time::OffsetDateTime) -> Vec<Finding> {
                 Some(_) => {}
             }
         }
+        out.extend(lifecycle_findings(e, now));
         if let Some(b) = &m.breaches {
-            if by_id(b).is_some_and(|t| t.meta.layer == 0) {
+            if by_id(b).is_some_and(|t| t.meta.is_core()) {
                 out.push(Finding {
                     policy: m.id.clone(),
                     kind: "exception-on-core".into(),
                     why: format!(
-                        "{} breaches {b}, an L0 rule, which takes no exception: it is ignored",
+                        "{} breaches {b}, a rule of the L0 core, which takes no exception: it is ignored",
                         m.id
                     ),
                 });
@@ -296,6 +437,47 @@ pub fn lint(entries: &[Entry], now: time::OffsetDateTime) -> Vec<Finding> {
     out
 }
 
+/// What a rule's place in its life asks of it: a rule in a decision has an owner and
+/// has been looked at by its review date, and a rule is where its block says it is.
+fn lifecycle_findings(e: &Entry, now: time::OffsetDateTime) -> Vec<Finding> {
+    let m = &e.meta;
+    let mut out = Vec::new();
+    if m.is_exception() {
+        return out;
+    }
+    let state = e.state();
+    let live = matches!(state, Status::Enforced | Status::Advisory);
+    if live && m.owner.as_deref().is_none_or(|o| o.trim().is_empty()) {
+        out.push(Finding {
+            policy: m.id.clone(),
+            kind: "no-owner".into(),
+            why: format!(
+                "{} is {} and names no owner to answer for it",
+                m.id,
+                state.as_str()
+            ),
+        });
+    }
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    let due = m
+        .review_by
+        .as_deref()
+        .and_then(|d| time::Date::parse(d, format).ok())
+        .is_some_and(|d| d < now.date());
+    if live && due {
+        out.push(Finding {
+            policy: m.id.clone(),
+            kind: "review-due".into(),
+            why: format!(
+                "{} was to be reviewed by {}: its owner confirms it, amends it or retires it",
+                m.id,
+                m.review_by.as_deref().unwrap_or_default()
+            ),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +511,18 @@ mod tests {
         };
         assert!(v.enforced());
         assert!(parse("x", TrustTier::Raw, "no block").is_err());
+        // a new status goes into the block, wherever else its text stands in the body
+        let block = "id = \"pol-L2-031\"\nlayer = 2";
+        let twice = format!("```toml\n{block}\n```\n\n```policy\n{block}\n```\n");
+        let retired = with_status(&twice, Status::Retired).unwrap();
+        assert_eq!(
+            parse("x", TrustTier::Raw, &retired).unwrap().meta.status,
+            Some(Status::Retired)
+        );
+        assert!(
+            retired.starts_with(&format!("```toml\n{block}\n```")),
+            "{retired}"
+        );
         assert!(
             parse("x", TrustTier::Raw, &body("layer = 2", None)).is_err(),
             "no id"

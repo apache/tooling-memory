@@ -243,11 +243,163 @@ pub struct Decision {
     pub reason: String,
     /// The record's policies this decision rests on: those that refused it, or the
     /// exceptions it used.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "as_texts")]
     pub cites: Vec<String>,
     /// The digest of the policy text that decided.
     #[serde(default)]
     pub policy: String,
+    /// Each rule that refused, with what a caller needs to act on the refusal: the
+    /// rule, why, a reason code, and what would pass.
+    #[serde(
+        default,
+        deserialize_with = "as_denials",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub denials: Vec<Denial>,
+    /// What the advisory rules would have refused, had they been enforced. They refuse
+    /// nothing: this is how a rule is watched before it is given teeth.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<Denial>,
+}
+
+/// One rule's refusal, as its module states it. A module is a person's or an agent's
+/// text: a field it leaves out is empty, and one that is not a string is read as its
+/// JSON, so no module's denial can make a decision fail to parse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Denial {
+    /// The rule.
+    #[serde(default, deserialize_with = "as_text")]
+    pub policy: String,
+    /// Why, in a sentence.
+    #[serde(default, deserialize_with = "as_text")]
+    pub reason: String,
+    /// A short code for the reason, the same for every refusal of its kind.
+    #[serde(
+        default,
+        deserialize_with = "as_some_text",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub code: Option<String>,
+    /// What would pass.
+    #[serde(
+        default,
+        deserialize_with = "as_some_text",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remedy: Option<String>,
+}
+
+fn text_of(v: serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// A denial out of whatever a module put in its `deny` set: an object's fields, or
+/// for anything else its JSON as the reason.
+fn denial_of(v: serde_json::Value) -> Denial {
+    match v {
+        serde_json::Value::Object(_) => serde_json::from_value(v).unwrap_or_else(|e| Denial {
+            policy: String::new(),
+            reason: e.to_string(),
+            code: None,
+            remedy: None,
+        }),
+        other => Denial {
+            policy: String::new(),
+            reason: text_of(other),
+            code: None,
+            remedy: None,
+        },
+    }
+}
+
+fn as_denials<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Denial>, D::Error> {
+    let list = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(list.into_iter().map(denial_of).collect())
+}
+
+fn as_texts<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let list = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(list.into_iter().map(text_of).collect())
+}
+
+fn as_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    serde_json::Value::deserialize(d).map(text_of)
+}
+
+fn as_some_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok((!v.is_null()).then(|| text_of(v)))
+}
+
+impl Denial {
+    /// The refusal in a sentence a caller can act on: the rule, why, the code, and what
+    /// would pass.
+    #[must_use]
+    pub fn said(&self) -> String {
+        // a module's denial that names no rule is still a refusal, and says so
+        let policy = if self.policy.is_empty() {
+            "a rule that names no policy"
+        } else {
+            &self.policy
+        };
+        let mut out = format!("{policy}: {}", self.reason);
+        if let Some(code) = &self.code {
+            out.push_str(&format!(" (code {code})"));
+        }
+        if let Some(remedy) = &self.remedy {
+            out.push_str(&format!(". To pass: {}.", remedy.trim_end_matches('.')));
+        }
+        out
+    }
+}
+
+impl Decision {
+    /// Make the reason of a refusal from its denials, each as [`Denial::said`] has it.
+    /// A caller that changes a denial calls this again.
+    pub fn say_denials(&mut self) {
+        if !self.allow && !self.denials.is_empty() {
+            let said: Vec<String> = self.denials.iter().map(Denial::said).collect();
+            self.reason = said.join("; ");
+        }
+    }
+}
+
+/// The entries of the enforced rules over a ceiling, which is a domain's. In each
+/// domain the enforced rules are counted oldest first, and each one past the ceiling is
+/// held back. A rule of the L0 core is never held back and takes no place. Nor does a
+/// rule a person signed off: a signature admits that rule and does not raise the
+/// ceiling. A new rule can thus never push an older one out.
+fn over_ceiling(entries: &[crate::record::Entry], grants: &Grants) -> Vec<String> {
+    let Some(ceiling) = grants.gates.max_enforced_rules else {
+        return Vec::new();
+    };
+    let signed = |e: &crate::record::Entry| {
+        e.meta
+            .signed_off_by
+            .as_deref()
+            .is_some_and(|by| matches!(Class::of(by, &grants.owner), Class::Owner | Class::Human))
+    };
+    let mut by_domain: std::collections::BTreeMap<&str, Vec<&crate::record::Entry>> =
+        std::collections::BTreeMap::new();
+    for e in entries.iter().filter(|e| {
+        e.state() == crate::record::Status::Enforced
+            && !e.meta.is_exception()
+            && !e.meta.is_core()
+            && !signed(e)
+    }) {
+        by_domain.entry(e.domain.as_str()).or_default().push(e);
+    }
+    let mut over = Vec::new();
+    for counted in by_domain.values_mut() {
+        counted.sort_by(|a, b| (a.created, &a.entry_id).cmp(&(b.created, &b.entry_id)));
+        over.extend(counted.iter().skip(ceiling).map(|e| e.entry_id.clone()));
+    }
+    over.sort();
+    over
 }
 
 /// What a session may read, as the policy computes it: the conditions an entry must
@@ -296,6 +448,16 @@ pub struct Policy {
     entries: Vec<crate::record::Entry>,
     /// Modules a verified entry carried that would not load, and why.
     refused: Vec<(String, String)>,
+    /// The entries of the rules the ceiling holds at advisory.
+    held_back: Vec<String>,
+    /// The data the record gave the engine, and when each exception in it lapses: an
+    /// expiry is read against the clock at each decision, never compiled in.
+    data: serde_json::Value,
+    lapses: Vec<(String, time::OffsetDateTime)>,
+    /// One engine for each advisory rule: the base with that rule's module alone. What
+    /// it denies is reported and never joins the decision, and a module that fails
+    /// takes no other rule's report with it.
+    watch: Vec<(String, regorus::Engine)>,
 }
 
 impl std::fmt::Debug for Policy {
@@ -329,16 +491,38 @@ impl Policy {
     /// A policy that will not compile, or a file that cannot be read.
     pub fn load(root: &Path, grants: &Grants) -> Result<Policy, Error> {
         let dir = root.join("policy");
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .map(|d| {
-                d.filter_map(Result::ok)
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|x| x == "rego"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        match Policy::root_text(root)? {
+            Some(text) => Policy::compile(&text, &dir.display().to_string(), grants),
+            None => Policy::builtin(grants),
+        }
+    }
+
+    /// The text of a root's own policy, its `policy/*.rego` in the order of their
+    /// names; none when the root has no such file and the built-in policy stands.
+    ///
+    /// # Errors
+    ///
+    /// A policy file that cannot be read.
+    pub fn root_text(root: &Path) -> Result<Option<String>, Error> {
+        let dir = root.join("policy");
+        // no directory is no policy of the root's own; one that cannot be read is an
+        // error, since the built-in policy may allow what the root's would not
+        let mut files: Vec<_> = match std::fs::read_dir(&dir) {
+            Ok(d) => d
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "rego"))
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(Error::Io {
+                    path: dir.display().to_string(),
+                    source: e,
+                })
+            }
+        };
         if files.is_empty() {
-            return Policy::builtin(grants);
+            return Ok(None);
         }
         files.sort();
         let mut text = String::new();
@@ -349,7 +533,7 @@ impl Policy {
             })?);
             text.push('\n');
         }
-        Policy::compile(&text, &dir.display().to_string(), grants)
+        Ok(Some(text))
     }
 
     /// This policy with the record's policy entries: each verified entry's module is
@@ -367,26 +551,52 @@ impl Policy {
         now: time::OffsetDateTime,
     ) -> Result<Policy, Error> {
         let mut texts = self.text.clone();
-        for e in entries.iter().filter(|e| e.enforced()) {
+        let over = over_ceiling(&entries, grants);
+        let advisory =
+            |e: &crate::record::Entry| e.advisory() || (e.enforced() && over.contains(&e.entry_id));
+        // an advisory rule's module is evaluated with every decision, in an engine of
+        // its own: what it denies is reported, and whatever rule it names it cannot
+        // refuse
+        let base = self.engine.clone();
+        let mut watch = Vec::new();
+        for e in entries.iter().filter(|e| e.enforced() || e.advisory()) {
             let Some(rego) = &e.rego else { continue };
             if !crate::record::module_is_confined(rego) {
                 self.refused
                     .push((e.meta.id.clone(), "not in package amem.rules".into()));
                 continue;
             }
-            let mut trial = self.engine.clone();
-            match trial.add_policy(format!("{}.rego", e.meta.id), rego.clone()) {
+            let name = format!("{}.rego", e.entry_id);
+            let mut trial = if advisory(e) {
+                base.clone()
+            } else {
+                self.engine.clone()
+            };
+            // the version says which modules are loaded and what each one does: the
+            // same module refuses as an enforced rule and reports as an advisory one
+            let how = if advisory(e) { "advisory" } else { "enforced" };
+            match trial.add_policy(name, rego.clone()) {
                 Ok(_) => {
-                    self.engine = trial;
-                    texts.push_str(rego);
+                    texts.push_str(&format!("\n# {} {how}\n{rego}", e.meta.id));
+                    if advisory(e) {
+                        watch.push((e.meta.id.clone(), trial));
+                    } else {
+                        self.engine = trial;
+                    }
                 }
                 Err(err) => self.refused.push((e.meta.id.clone(), err.to_string())),
             }
         }
+        // the rules in force, for what an exception may lift: a rule that is in no
+        // decision says nothing here, so an unreviewed entry cannot mark a rule as core
         let policies: Vec<_> = entries
             .iter()
-            .filter(|e| !e.meta.is_exception())
-            .map(|e| serde_json::json!({"id": e.meta.id, "layer": e.meta.layer}))
+            .filter(|e| !e.meta.is_exception() && e.state() == crate::record::Status::Enforced)
+            .map(|e| {
+                serde_json::json!({
+                    "id": e.meta.id, "layer": e.meta.layer, "core": e.meta.is_core(),
+                })
+            })
             .collect();
         let exceptions: Vec<_> = entries
             .iter()
@@ -401,9 +611,89 @@ impl Policy {
             "grants": grants, "policies": policies, "exceptions": exceptions,
         });
         self.engine = Policy::with_data(self.engine, &data)?;
+        self.watch = watch
+            .into_iter()
+            .map(|(id, engine)| Ok((id, Policy::with_data(engine, &data)?)))
+            .collect::<Result<_, Error>>()?;
         self.version = digest(&texts);
+        self.lapses = entries
+            .iter()
+            .filter(|e| e.in_force(now))
+            .filter_map(|e| Some((e.meta.id.clone(), e.lapses()?)))
+            .collect();
+        self.data = data;
         self.entries = entries;
+        self.held_back = over;
         Ok(self)
+    }
+
+    /// Where a rule is in its life under this policy: as its entry says, or advisory
+    /// when the ceiling on enforced rules holds it back.
+    #[must_use]
+    pub fn state_of(&self, rule: &crate::record::Entry) -> crate::record::Status {
+        if self.held_back.contains(&rule.entry_id) {
+            crate::record::Status::Advisory
+        } else {
+            rule.state()
+        }
+    }
+
+    /// The rules held at advisory because the ceiling on enforced rules is reached and
+    /// no person signed them off, by policy id.
+    #[must_use]
+    pub fn over_ceiling(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| self.held_back.contains(&e.entry_id))
+            .map(|e| e.meta.id.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// What the advisory rules deny for a request, each module asked on its own. A
+    /// module that fails to evaluate reports that under its rule, and changes no
+    /// decision and no other rule's report. A denial that names no rule is its
+    /// module's rule's.
+    fn advisories(&self, input: &Input) -> Vec<Denial> {
+        let Ok(input) = serde_json::to_string(input) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (id, watch) in &self.watch {
+            let mut engine = watch.clone();
+            let said = regorus::Value::from_json_str(&input)
+                .map_err(|e| e.to_string())
+                .and_then(|value| {
+                    engine.set_input(value);
+                    engine
+                        .eval_rule("data.amem.rules.deny".to_string())
+                        .map_err(|e| e.to_string())
+                })
+                .and_then(|v| v.to_json_str().map_err(|e| e.to_string()))
+                .and_then(|j| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(&j).map_err(|e| e.to_string())
+                });
+            match said {
+                Ok(list) => out.extend(list.into_iter().map(|v| {
+                    let mut d = denial_of(v);
+                    if d.policy.is_empty() {
+                        d.policy.clone_from(id);
+                    }
+                    d
+                })),
+                Err(why) => out.push(Denial {
+                    policy: id.clone(),
+                    reason: format!("the advisory module did not evaluate: {why}"),
+                    code: Some("advisory-failed".into()),
+                    remedy: None,
+                }),
+            }
+        }
+        out.sort_by(|a, b| (&a.policy, &a.reason).cmp(&(&b.policy, &b.reason)));
+        out
     }
 
     fn with_data(
@@ -451,6 +741,10 @@ impl Policy {
             source: source.to_string(),
             entries: Vec::new(),
             refused: Vec::new(),
+            held_back: Vec::new(),
+            data: serde_json::Value::Null,
+            lapses: Vec::new(),
+            watch: Vec::new(),
         })
     }
 
@@ -478,12 +772,35 @@ impl Policy {
     ///
     /// When the policy fails to evaluate or its answer is not a scope.
     pub fn read_scope(&self, input: &Input) -> Result<ReadScope, Error> {
-        let json = self.eval("data.amem.read_filter", input)?;
+        let json = self.eval(
+            "data.amem.read_filter",
+            input,
+            time::OffsetDateTime::now_utc(),
+        )?;
         serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))
     }
 
-    fn eval(&self, rule: &str, input: &Input) -> Result<String, Error> {
-        let mut engine = self.engine.clone();
+    /// The engine as it stands at `now`: without the exceptions that have lapsed since
+    /// the policy was compiled.
+    fn engine_at(&self, now: time::OffsetDateTime) -> Result<regorus::Engine, Error> {
+        let lapsed: Vec<&str> = self
+            .lapses
+            .iter()
+            .filter(|(_, at)| *at <= now)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if lapsed.is_empty() {
+            return Ok(self.engine.clone());
+        }
+        let mut data = self.data.clone();
+        if let Some(list) = data["exceptions"].as_array_mut() {
+            list.retain(|e| !lapsed.contains(&e["id"].as_str().unwrap_or_default()));
+        }
+        Policy::with_data(self.engine.clone(), &data)
+    }
+
+    fn eval(&self, rule: &str, input: &Input, now: time::OffsetDateTime) -> Result<String, Error> {
+        let mut engine = self.engine_at(now)?;
         let value = regorus::Value::from_json_str(
             &serde_json::to_string(input).map_err(|e| Error::Policy(e.to_string()))?,
         )
@@ -502,10 +819,22 @@ impl Policy {
     ///
     /// When the policy fails to evaluate or its decision is not the shape expected.
     pub fn decide(&self, input: &Input) -> Result<Decision, Error> {
-        let json = self.eval("data.amem.decision", input)?;
+        self.decide_at(input, time::OffsetDateTime::now_utc())
+    }
+
+    /// Decide one request as the clock reads `now`: an exception that has lapsed by
+    /// then lets nothing through, whenever the policy was compiled.
+    ///
+    /// # Errors
+    ///
+    /// As [`Policy::decide`].
+    pub fn decide_at(&self, input: &Input, now: time::OffsetDateTime) -> Result<Decision, Error> {
+        let json = self.eval("data.amem.decision", input, now)?;
         let mut d: Decision =
             serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))?;
         d.policy = self.version.clone();
+        d.advisories = self.advisories(input);
+        d.say_denials();
         Ok(d)
     }
 }
@@ -813,7 +1142,11 @@ mod tests {
     }
 
     fn supersede_decision(p: &Policy, held: Option<&str>) -> Decision {
-        p.decide(&Input {
+        p.decide(&supersede_input(held)).unwrap()
+    }
+
+    fn supersede_input(held: Option<&str>) -> Input {
+        Input {
             action: Action::Write,
             principal: Principal {
                 id: "agent:x".into(),
@@ -834,8 +1167,375 @@ mod tests {
             held_task: held.map(str::to_string),
             spend: None,
             fetch: None,
-        })
+        }
+    }
+
+    /// An expiry is read against the clock at each decision: a policy compiled while
+    /// an exception was in force refuses once the exception has lapsed.
+    #[test]
+    fn an_exception_lapses_at_its_expiry_whenever_the_policy_was_compiled() {
+        use dm_core::TrustTier::Verified;
+        let g = grants();
+        let rule = rule_entry("pol-L2-031", 2, Verified, "", true);
+        let exception = |id: &str, expires: &str| {
+            rule_entry(
+                id,
+                2,
+                Verified,
+                &format!(
+                    "breaches = \"pol-L2-031\"\nscope_task = \"task-t-1\"\nexpires = \"{expires}\""
+                ),
+                false,
+            )
+        };
+        let compiled = time::macros::datetime!(2026-11-01 00:00 UTC);
+        let short = exception("exc-2026-010", "2026-11-02T00:00:00Z");
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![rule.clone(), short.clone()], compiled)
+            .unwrap();
+        let input = supersede_input(Some("task-t-1"));
+        let before = time::macros::datetime!(2026-11-01 12:00 UTC);
+        let at = time::macros::datetime!(2026-11-02 00:00 UTC);
+        assert!(p.decide_at(&input, before).unwrap().allow);
+        let d = p.decide_at(&input, at).unwrap();
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(d.cites, ["pol-L2-031"]);
+        // an exception that still runs is kept when another lapses
+        let long = exception("exc-2026-011", "2026-12-01T00:00:00Z");
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![rule, short, long], compiled)
+            .unwrap();
+        let d = p.decide_at(&input, at).unwrap();
+        assert!(d.allow, "{d:?}");
+        assert_eq!(d.cites, ["exc-2026-011"]);
+    }
+
+    fn with(g: &Grants, entries: Vec<crate::record::Entry>) -> Policy {
+        Policy::builtin(g)
+            .unwrap()
+            .with_record(g, entries, time::OffsetDateTime::now_utc())
+            .unwrap()
+    }
+
+    /// A rule's life: proposed and retired rules are in no decision, an advisory rule is
+    /// reported and refuses nothing, and an enforced one refuses.
+    #[test]
+    fn a_rule_refuses_only_once_enforced_and_is_watched_while_advisory() {
+        use dm_core::TrustTier::{Curated, Raw, Verified};
+        let g = grants();
+        let rule = |tier, status: &str| {
+            rule_entry(
+                "pol-L2-031",
+                2,
+                tier,
+                &format!("status = \"{status}\""),
+                true,
+            )
+        };
+        // below verified a rule is in no decision: nobody's module is evaluated that a
+        // person has not verified
+        for (tier, status) in [
+            (Raw, "advisory"),
+            (Raw, "enforced"),
+            (Curated, "advisory"),
+            (Curated, "enforced"),
+            (Verified, "proposed"),
+            (Verified, "retired"),
+        ] {
+            let d = supersede_decision(&with(&g, vec![rule(tier, status)]), None);
+            assert!(
+                d.allow && d.advisories.is_empty(),
+                "{status} at {tier}: {d:?}"
+            );
+        }
+        let d = supersede_decision(&with(&g, vec![rule(Verified, "advisory")]), None);
+        assert!(d.allow, "{d:?}");
+        assert_eq!(d.advisories.len(), 1, "{d:?}");
+        assert_eq!(d.advisories[0].policy, "pol-L2-031");
+        assert!(d.cites.is_empty() && d.denials.is_empty(), "{d:?}");
+        let d = supersede_decision(&with(&g, vec![rule(Verified, "enforced")]), None);
+        assert!(!d.allow && d.advisories.is_empty(), "{d:?}");
+    }
+
+    /// A refusal says what would pass: the rule's module gives a code and a remedy, and
+    /// the decision carries them.
+    #[test]
+    fn a_denial_carries_the_rule_s_reason_code_and_remedy() {
+        let g = grants();
+        let body = "```policy\nid = \"pol-L2-040\"\nlayer = 2\n```\n\n```rego\npackage amem.rules\nimport rego.v1\ndeny contains {\"policy\": \"pol-L2-040\", \"reason\": \"an agent superseded a decision\", \"code\": \"decision-by-agent\", \"remedy\": \"propose the change to the decision's owner\"} if {\n\tinput.principal.class == \"agent\"\n\tinput.write.supersedes_type == \"decision\"\n}\n```\n";
+        let rule = crate::record::parse("mem-p-40", dm_core::TrustTier::Verified, body).unwrap();
+        let d = supersede_decision(&with(&g, vec![rule]), None);
+        assert!(!d.allow);
+        assert_eq!(
+            d.denials,
+            vec![Denial {
+                policy: "pol-L2-040".into(),
+                reason: "an agent superseded a decision".into(),
+                code: Some("decision-by-agent".into()),
+                remedy: Some("propose the change to the decision's owner".into()),
+            }]
+        );
+    }
+
+    /// A rule written at `day` of November 2026.
+    fn dated(mut e: crate::record::Entry, day: u8) -> crate::record::Entry {
+        let at = time::macros::datetime!(2026-11-01 00:00 UTC) + time::Duration::days(day.into());
+        e.created = Some(at);
+        e
+    }
+
+    /// The ceiling: the enforced rules of a domain past it, oldest first, are held at
+    /// advisory until a person signs one off, and a signature admits that rule alone.
+    #[test]
+    fn a_rule_over_the_ceiling_is_advisory_until_a_person_signs_it_off() {
+        use crate::record::Status::{Advisory, Enforced};
+        use dm_core::TrustTier::Verified;
+        let mut g = grants();
+        g.gates.max_enforced_rules = Some(1);
+        // the newer rule is the one held back, whatever its id: a new rule pushes no
+        // older one out
+        let old = dated(rule_entry("pol-L2-900", 2, Verified, "", true), 1);
+        let new = dated(rule_entry("a-new-rule", 2, Verified, "", true), 2);
+        let p = with(&g, vec![new.clone(), old.clone()]);
+        assert_eq!(p.over_ceiling(), ["a-new-rule"]);
+        let d = supersede_decision(&p, None);
+        assert_eq!(d.cites, ["pol-L2-900"], "the older refuses: {d:?}");
+        assert_eq!(d.advisories.len(), 1);
+        assert_eq!(d.advisories[0].policy, "a-new-rule");
+        // signed off by a person, the newer is enforced, and takes no place
+        let by = |who: &str| {
+            let extra = format!("signed_off_by = \"{who}\"");
+            dated(rule_entry("a-new-rule", 2, Verified, &extra, true), 2)
+        };
+        let third = dated(rule_entry("pol-L2-903", 2, Verified, "", true), 3);
+        let p = with(&g, vec![old.clone(), by("human:test:lead"), third.clone()]);
+        assert_eq!(
+            p.over_ceiling(),
+            ["pol-L2-903"],
+            "the signature raised nothing"
+        );
+        let mut cites = supersede_decision(&p, None).cites;
+        cites.sort();
+        assert_eq!(cites, ["a-new-rule", "pol-L2-900"]);
+        assert_eq!(p.state_of(&p.entries()[2]), Advisory);
+        assert_eq!(p.state_of(&p.entries()[0]), Enforced);
+        // a sign-off is a person's: an agent's name, or none, admits nothing
+        for who in ["agent:a", ""] {
+            let p = with(&g, vec![old.clone(), by(who)]);
+            assert_eq!(p.over_ceiling(), ["a-new-rule"], "signed by {who:?}");
+        }
+        // the ceiling is a domain's: the same rules in two domains are each under it
+        let mut elsewhere = new.clone();
+        elsewhere.domain = "dom-other".into();
+        assert!(with(&g, vec![old.clone(), elsewhere])
+            .over_ceiling()
+            .is_empty());
+        // a rule with no module is counted as any enforced rule is
+        let plain = dated(rule_entry("pol-L2-800", 2, Verified, "", false), 0);
+        assert_eq!(
+            with(&g, vec![plain, old.clone()]).over_ceiling(),
+            ["pol-L2-900"]
+        );
+        // with no ceiling, nothing is held back
+        g.gates.max_enforced_rules = None;
+        assert!(with(&g, vec![old, new, third]).over_ceiling().is_empty());
+    }
+
+    /// The L0 core is never held back by the ceiling, at any ceiling, and takes no
+    /// place under it.
+    #[test]
+    fn the_ceiling_never_holds_back_the_l0_core() {
+        use dm_core::TrustTier::Verified;
+        let mut g = grants();
+        let core = dated(rule_entry("pol-L0-001", 0, Verified, "", true), 5);
+        let older = dated(rule_entry("a-new-rule", 2, Verified, "", true), 1);
+        for ceiling in [0, 1] {
+            g.gates.max_enforced_rules = Some(ceiling);
+            let p = with(&g, vec![core.clone(), older.clone()]);
+            assert!(!p.over_ceiling().contains(&"pol-L0-001".to_string()));
+            let d = supersede_decision(&p, None);
+            assert!(
+                d.cites.contains(&"pol-L0-001".to_string()),
+                "{ceiling}: {d:?}"
+            );
+        }
+        g.gates.max_enforced_rules = Some(1);
+        assert!(with(&g, vec![core, older]).over_ceiling().is_empty());
+    }
+
+    /// A rule with its own module text, at a status.
+    fn rule_with(id: &str, status: &str, module: &str) -> crate::record::Entry {
+        let body = format!(
+            "```policy\nid = \"{id}\"\nlayer = 2\nstatus = \"{status}\"\n```\n\n```rego\npackage amem.rules\nimport rego.v1\n{module}\n```\n"
+        );
+        crate::record::parse(
+            &format!("mem-p-{id}-{status}"),
+            dm_core::TrustTier::Verified,
+            &body,
+        )
         .unwrap()
+    }
+
+    /// An advisory module refuses nothing, whatever rule its denial names: another
+    /// rule's id, an id nobody has, or none at all.
+    #[test]
+    fn an_advisory_module_refuses_nothing_whatever_it_names() {
+        use dm_core::TrustTier::Verified;
+        let g = grants();
+        let enforced = rule_entry("pol-L2-001", 2, Verified, "", false);
+        for named in [
+            "\"policy\": \"pol-L2-001\", ",
+            "\"policy\": \"nobody\", ",
+            "",
+        ] {
+            let module = format!("deny contains {{{named}\"reason\": \"always\"}} if true");
+            let watch = rule_with("pol-L2-050", "advisory", &module);
+            let p = with(&g, vec![enforced.clone(), watch]);
+            let d = supersede_decision(&p, None);
+            assert!(d.allow, "{named}: {d:?}");
+            assert!(d.cites.is_empty() && d.denials.is_empty(), "{named}: {d:?}");
+            assert_eq!(d.advisories.len(), 1, "{named}: {d:?}");
+        }
+        // a second entry that reuses an enforced rule's id as advisory switches nothing off
+        let real = rule_entry("pol-L2-031", 2, Verified, "", true);
+        let shadow = rule_with(
+            "pol-L2-031",
+            "advisory",
+            "deny contains {\"policy\": \"x\"} if false",
+        );
+        let d = supersede_decision(&with(&g, vec![real, shadow]), None);
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(d.cites, ["pol-L2-031"]);
+    }
+
+    /// A denial is a module's text: a field that is not a string is read as its JSON,
+    /// and a missing one is empty. The decision is made either way.
+    #[test]
+    fn a_malformed_denial_does_not_break_the_decision() {
+        let g = grants();
+        let odd = rule_with(
+            "pol-L2-060",
+            "enforced",
+            "deny contains {\"reason\": \"no id\", \"code\": 7, \"remedy\": [\"a\"]} if true",
+        );
+        let d = supersede_decision(&with(&g, vec![odd.clone()]), None);
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(d.denials[0].code.as_deref(), Some("7"));
+        assert_eq!(d.denials[0].remedy.as_deref(), Some("[\"a\"]"));
+        assert_eq!(d.denials[0].policy, "");
+        // the same module as advisory: reported, and everything goes ahead
+        let watch = rule_with(
+            "pol-L2-060",
+            "advisory",
+            odd.rego
+                .as_deref()
+                .unwrap()
+                .split_once("rego.v1\n")
+                .unwrap()
+                .1,
+        );
+        let d = supersede_decision(&with(&g, vec![watch]), None);
+        assert!(d.allow && d.advisories.len() == 1, "{d:?}");
+        // a denial whose rule is not a string, and one that is no object at all
+        for said in [
+            "{\"policy\": {\"a\": 1}, \"reason\": 3}",
+            "\"x\"",
+            "7",
+            "[1, 2]",
+        ] {
+            let module = format!("deny contains {said} if true");
+            let d = supersede_decision(
+                &with(&g, vec![rule_with("pol-L2-061", "enforced", &module)]),
+                None,
+            );
+            assert!(!d.allow, "{said}: {d:?}");
+            assert_eq!(d.denials.len(), 1, "{said}: {d:?}");
+        }
+    }
+
+    /// Each advisory module is asked on its own: one that fails, or that has no
+    /// `deny`, reports that and takes no other rule's report with it.
+    #[test]
+    fn a_bad_advisory_module_takes_no_other_report_with_it() {
+        let g = grants();
+        let good = rule_with(
+            "pol-L2-070",
+            "advisory",
+            "deny contains {\"policy\": \"pol-L2-070\", \"reason\": \"always\"} if true",
+        );
+        for bad in ["deny contains \"x\" if true", "deny := 5", "allow := true"] {
+            let p = with(
+                &g,
+                vec![good.clone(), rule_with("pol-L2-071", "advisory", bad)],
+            );
+            let d = supersede_decision(&p, None);
+            assert!(d.allow, "{bad}: {d:?}");
+            assert!(
+                d.advisories
+                    .iter()
+                    .any(|a| a.policy == "pol-L2-070" && a.reason == "always"),
+                "{bad}: {d:?}"
+            );
+            assert!(
+                d.advisories.iter().any(|a| a.policy == "pol-L2-071"),
+                "{bad}: {d:?}"
+            );
+        }
+        // the version says what each module does
+        let module = "deny contains {\"reason\": \"always\"} if true";
+        let advisory = with(&g, vec![rule_with("pol-L2-072", "advisory", module)]);
+        let enforced = with(&g, vec![rule_with("pol-L2-072", "enforced", module)]);
+        assert_ne!(advisory.version(), enforced.version());
+        assert_ne!(advisory.version(), Policy::builtin(&g).unwrap().version());
+    }
+
+    /// An exception whose block says retired is in force for nothing.
+    #[test]
+    fn a_retired_exception_lets_nothing_through() {
+        use dm_core::TrustTier::Verified;
+        let g = grants();
+        let rule = rule_entry("pol-L2-031", 2, Verified, "", true);
+        let exc = rule_entry(
+            "exc-2026-020",
+            2,
+            Verified,
+            "breaches = \"pol-L2-031\"\nscope_task = \"task-t-1\"\nexpires = \"2099-01-01T00:00:00Z\"\nstatus = \"retired\"",
+            false,
+        );
+        assert!(!supersede_decision(&with(&g, vec![rule, exc]), Some("task-t-1")).allow);
+    }
+
+    /// The core of L0 takes no exception; an L0 rule marked as outside the core takes one.
+    #[test]
+    fn only_the_marked_core_of_l0_takes_no_exception() {
+        use dm_core::TrustTier::Verified;
+        let g = grants();
+        let exc = rule_entry(
+            "exc-2026-003",
+            0,
+            Verified,
+            "breaches = \"pol-L0-002\"\nscope_task = \"task-t-1\"\nexpires = \"2099-01-01T00:00:00Z\"",
+            false,
+        );
+        let outside = rule_entry("pol-L0-002", 0, Verified, "core = false", true);
+        let p = with(&g, vec![outside, exc.clone()]);
+        assert!(supersede_decision(&p, Some("task-t-1")).allow);
+        // an entry nobody reviewed marks no rule as core, whatever id it takes
+        let squat = rule_entry(
+            "pol-L0-002",
+            0,
+            dm_core::TrustTier::Raw,
+            "core = true",
+            false,
+        );
+        let outside = rule_entry("pol-L0-002", 0, Verified, "core = false", true);
+        let p = with(&g, vec![outside, exc.clone(), squat]);
+        assert!(supersede_decision(&p, Some("task-t-1")).allow);
+        let core = rule_entry("pol-L0-002", 0, Verified, "core = true", true);
+        let p = with(&g, vec![core, exc]);
+        assert!(!supersede_decision(&p, Some("task-t-1")).allow);
     }
 
     #[test]
