@@ -9,8 +9,8 @@ FROM ubuntu:24.04
 
 # The npm harnesses' versions are in package.json, and every package under them in
 # package-lock.json; the rest are here.
-ARG NODE_VERSION=24.22.2
-ARG PI=1.5.0
+ARG NODE_VERSION=24.22.3
+ARG PI=1.5.2
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
