@@ -340,7 +340,13 @@ impl Denial {
     /// would pass.
     #[must_use]
     pub fn said(&self) -> String {
-        let mut out = format!("{}: {}", self.policy, self.reason);
+        // a module's denial that names no rule is still a refusal, and says so
+        let policy = if self.policy.is_empty() {
+            "a rule that names no policy"
+        } else {
+            &self.policy
+        };
+        let mut out = format!("{policy}: {}", self.reason);
         if let Some(code) = &self.code {
             out.push_str(&format!(" (code {code})"));
         }
@@ -348,6 +354,17 @@ impl Denial {
             out.push_str(&format!(". To pass: {}.", remedy.trim_end_matches('.')));
         }
         out
+    }
+}
+
+impl Decision {
+    /// Make the reason of a refusal from its denials, each as [`Denial::said`] has it.
+    /// A caller that changes a denial calls this again.
+    pub fn say_denials(&mut self) {
+        if !self.allow && !self.denials.is_empty() {
+            let said: Vec<String> = self.denials.iter().map(Denial::said).collect();
+            self.reason = said.join("; ");
+        }
     }
 }
 
@@ -817,10 +834,7 @@ impl Policy {
             serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))?;
         d.policy = self.version.clone();
         d.advisories = self.advisories(input);
-        if !d.allow && !d.denials.is_empty() {
-            let said: Vec<String> = d.denials.iter().map(Denial::said).collect();
-            d.reason = said.join("; ");
-        }
+        d.say_denials();
         Ok(d)
     }
 }
@@ -1507,6 +1521,17 @@ mod tests {
         );
         let outside = rule_entry("pol-L0-002", 0, Verified, "core = false", true);
         let p = with(&g, vec![outside, exc.clone()]);
+        assert!(supersede_decision(&p, Some("task-t-1")).allow);
+        // an entry nobody reviewed marks no rule as core, whatever id it takes
+        let squat = rule_entry(
+            "pol-L0-002",
+            0,
+            dm_core::TrustTier::Raw,
+            "core = true",
+            false,
+        );
+        let outside = rule_entry("pol-L0-002", 0, Verified, "core = false", true);
+        let p = with(&g, vec![outside, exc.clone(), squat]);
         assert!(supersede_decision(&p, Some("task-t-1")).allow);
         let core = rule_entry("pol-L0-002", 0, Verified, "core = true", true);
         let p = with(&g, vec![core, exc]);

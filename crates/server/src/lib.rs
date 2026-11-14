@@ -245,7 +245,9 @@ pub struct PromotionView {
 /// where no runtime is at hand. Policy is enforced whatever a session may read, so the
 /// owner's view is used. An entry whose body is not a policy is skipped.
 fn policy_entries(ix: &Index, root: &Path, grants: &Grants) -> Vec<dm_policy::record::Entry> {
-    let Ok(hits) = ix.list(&grants.read_filter(), Some(EntryType::Policy), 1000) else {
+    // every one: a rule left out is a rule not enforced, and the newest entries are
+    // whatever was written last, by anyone
+    let Ok(hits) = ix.list_every(&grants.read_filter(), Some(EntryType::Policy)) else {
         return Vec::new();
     };
     hits.into_iter()
@@ -257,6 +259,7 @@ fn policy_entries(ix: &Index, root: &Path, grants: &Grants) -> Vec<dm_policy::re
             let entry = Entry::parse(&std::fs::read_to_string(path).ok()?).ok()?;
             let mut rule = dm_policy::record::parse(&h.id, h.trust_tier, &entry.body).ok()?;
             rule.domain = h.domain;
+            rule.classification = h.classification;
             rule.created = Some(entry.front.created);
             Some(rule)
         })
@@ -736,9 +739,37 @@ impl Memory {
         self.fresh()?;
         let mut input = input.clone();
         input.held_task = self.held_task();
-        let d = self.policy().decide(&input)?;
+        let mut d = self.policy().decide(&input)?;
         self.log_decision(&input, &d);
+        self.withhold_rule_text(&mut d)?;
         Ok(d)
+    }
+
+    /// A refusal is read as the rule is: the reason, the code and the remedy are text
+    /// of the rule's module, so for a rule whose entry this session may not read, the
+    /// refusal names the rule and nothing more. The log keeps the decision whole.
+    fn withhold_rule_text(&self, d: &mut Decision) -> Result<(), Error> {
+        if d.denials.is_empty() {
+            return Ok(());
+        }
+        let filter = self.session_filter()?;
+        let p = self.policy();
+        let above = |id: &str| {
+            p.entries().iter().any(|e| {
+                e.meta.id == id
+                    && e.tier == TrustTier::Verified
+                    && !filter.admits(&e.domain, e.classification, e.tier, true)
+            })
+        };
+        for denial in &mut d.denials {
+            if above(&denial.policy) {
+                denial.reason = "its text is above what this session may read".into();
+                denial.code = None;
+                denial.remedy = None;
+            }
+        }
+        d.say_denials();
+        Ok(())
     }
 
     /// Whether a model call may leave for `destination`, given what this session and
@@ -772,10 +803,11 @@ impl Memory {
             fetch: None,
         };
         self.fresh()?;
-        let d = self.policy().decide(&input)?;
+        let mut d = self.policy().decide(&input)?;
         if !d.allow {
             self.log_decision(&input, &d);
         }
+        self.withhold_rule_text(&mut d)?;
         Ok(d)
     }
 
@@ -1929,7 +1961,8 @@ impl Memory {
             }
         }
         let kind = match decision.review {
-            _ if !decision.cites.is_empty() => "policy",
+            // a module's denial that names no rule cites none, and is a rule's still
+            _ if !decision.cites.is_empty() || !decision.denials.is_empty() => "policy",
             dm_policy::decide::Review::Approver => "verified",
             _ if findings.is_empty() => "blast-radius",
             _ => "injection",
@@ -2119,7 +2152,7 @@ impl Memory {
         let readable: Vec<Hit> = {
             let f = self.session_filter()?;
             let ix = self.index.lock().await;
-            ix.list(&f, Some(EntryType::Policy), 1000)?
+            ix.list_every(&f, Some(EntryType::Policy))?
         };
         let digest = self.policy_digest(&readable);
         let text = t0::render(&t0::Inputs {
@@ -2173,9 +2206,9 @@ impl Memory {
                         m.id, m.rule, m.intent
                     ));
                 }
-            } else if !m.is_core() {
+            } else {
                 // a rule a person verified, or one that reports: with what its module
-                // does, when it has one
+                // does, when it has one. A rule of the core that only reports is here too
                 let state = p.state_of(e);
                 let how = match (state, e.rego.is_some()) {
                     (dm_policy::record::Status::Enforced, true) => ", enforced",
@@ -7036,10 +7069,135 @@ mod tests {
             ..req("Use files on a laptop.\n")
         };
         assert!(inside.write(supersede()).await.is_err());
+        // asked again before the approval and after it: one entry, one approval task
+        let again = agent
+            .file_exception(ask("pol-L2-051", "2099-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(&again, Err(Error::Denied(why)) if why.contains(&filed.id)));
         owner.approve(&filed.task.id).await.unwrap();
+        let again = agent
+            .file_exception(ask("pol-L2-051", "2099-01-01T00:00:00Z"))
+            .await;
+        assert!(matches!(&again, Err(Error::Denied(why)) if why.contains(&filed.id)));
         let inside = Memory::open(dir.path()).unwrap().with_author("agent:a");
         inside.set_held_task(&held.id);
         inside.write(supersede()).await.unwrap();
+    }
+
+    /// A refusal is read as the rule is. The reason, the code and the remedy are text
+    /// of the rule's module: a session that may not read the rule gets its id, and so
+    /// does the task the refusal files, which is no higher than the refused write.
+    #[tokio::test]
+    async fn a_refusal_by_a_rule_above_the_handling_names_the_rule_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                classification: Some(Label::Public),
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let rule = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Policy,
+                classification: Some(Label::Restricted),
+                ..req(&rule_text("pol-L2-090", 2, ""))
+            })
+            .await
+            .unwrap()
+            .id;
+        verify(&owner, &agent, &rule).await;
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:a")
+            .with_handling_cap(Label::Public);
+        let err = capped
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                supersedes: Some(d1),
+                ..req("Use something else on a laptop.\n")
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pol-L2-090"), "{err}");
+        let gates = gate_tasks(&owner, "gate:policy").await;
+        assert_eq!(gates.len(), 1);
+        for text in [&err, &gates[0].spec.body] {
+            for of_the_module in [
+                "an agent superseded",
+                "decision-by-agent",
+                "propose the change",
+            ] {
+                assert!(!text.contains(of_the_module), "{text}");
+            }
+        }
+        assert_eq!(capped.label(), Label::Public);
+    }
+
+    /// A module's denial that names no rule refuses still, says that it names none,
+    /// and files the task of a rule's refusal.
+    #[tokio::test]
+    async fn a_denial_that_names_no_rule_is_a_rule_s_refusal_still() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let unnamed = rule_text("pol-L2-091", 2, "").replace("\"policy\": \"pol-L2-091\", ", "");
+        assert!(!unnamed.contains("\"policy\""));
+        let rule = policy_entry(&owner, &unnamed).await;
+        verify(&owner, &agent, &rule).await;
+        let err = agent_supersedes(dir.path(), &d1).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("a rule that names no policy: an agent superseded"),
+            "{err}"
+        );
+        assert_eq!(gate_tasks(&owner, "gate:policy").await.len(), 1);
+        assert!(gate_tasks(&owner, "gate:blast-radius").await.is_empty());
+    }
+
+    /// A rule is in force however many policy entries were written after it: the
+    /// policy is compiled from every one, not from the newest of them.
+    #[tokio::test]
+    async fn a_rule_stays_in_force_however_many_entries_follow_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let rule = policy_entry(&owner, &rule_text("pol-L2-092", 2, "")).await;
+        verify(&owner, &agent, &rule).await;
+        // what an agent's flood of raw entries leaves in the index, without the hour
+        // it takes to write them
+        let mut later = owner.get(&rule).await.unwrap();
+        later.front.trust_tier = TrustTier::Raw;
+        {
+            let mut ix = owner.index.lock().await;
+            for i in 0..1001 {
+                later.front.id = format!("mem-me-flood{i:04}");
+                later.front.created += time::Duration::seconds(1);
+                ix.upsert(&later).unwrap();
+            }
+        }
+        owner.reload_policy().await.unwrap();
+        let grants = owner.grants().clone();
+        let ix = owner.index.lock().await;
+        let loaded = policy_entries(&ix, dir.path(), &grants);
+        assert!(
+            loaded.iter().any(|e| e.entry_id == rule && e.enforced()),
+            "{} entries loaded, the rule not among them",
+            loaded.len()
+        );
     }
 
     /// An amendment is a task for a person that names the rule's owner; the same

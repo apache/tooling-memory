@@ -615,6 +615,29 @@ impl Index {
         kind: Option<EntryType>,
         limit: usize,
     ) -> Result<Vec<Hit>, Error> {
+        self.list_up_to(filter, kind, Some(limit))
+    }
+
+    /// Every entry of a kind within the filter, newest first. For a caller whose
+    /// answer is wrong when an entry is left out, as the policy is when a rule is.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the index did not write.
+    pub fn list_every(
+        &self,
+        filter: &ReadFilter,
+        kind: Option<EntryType>,
+    ) -> Result<Vec<Hit>, Error> {
+        self.list_up_to(filter, kind, None)
+    }
+
+    fn list_up_to(
+        &self,
+        filter: &ReadFilter,
+        kind: Option<EntryType>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Hit>, Error> {
         let (where_sql, mut values) = compile_filter(filter, 2);
         let kind_sql = if kind.is_some() {
             " AND e.entry_type = ?1"
@@ -624,8 +647,8 @@ impl Index {
         values.insert(0, kind.map_or_else(String::new, |k| k.to_string()).into());
         let sql = format!(
             "SELECT {HIT_COLUMNS} FROM entries e WHERE 1 = 1{kind_sql}{where_sql}
-             ORDER BY {NEWEST_FIRST} LIMIT {}",
-            limit.max(1)
+             ORDER BY {NEWEST_FIRST}{}",
+            limit.map_or_else(String::new, |n| format!(" LIMIT {}", n.max(1)))
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| Ok(hit_from_row(row, 0.0)))?;
