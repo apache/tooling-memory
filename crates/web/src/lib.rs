@@ -215,6 +215,10 @@ macro_rules! session {
     ($app:expr) => {
         match $app.session() {
             Ok(m) => m,
+            // a session that stopped refuses; that is the client's to know, not a fault
+            Err(e @ dm_server::Error::Stale(_)) => {
+                return (StatusCode::FORBIDDEN, e.to_string()).into_response();
+            }
             Err(e) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
@@ -1153,8 +1157,8 @@ async fn reader_asset(Path(name): Path<String>) -> Response {
 }
 
 /// The domains the record grants, for the reader's picker.
-async fn domains(State(app): State<App>) -> Json<Vec<String>> {
-    Json(app.memory().domains())
+async fn domains(State(app): State<App>) -> Response {
+    Json(session!(app).domains()).into_response()
 }
 
 /// A bundle file name: letters, digits, dot, underscore and hyphen, not starting with a
@@ -1189,6 +1193,9 @@ fn admit_bundle_request(
         return Err((StatusCode::NOT_FOUND, "no such file".into()));
     }
     let memory = app.memory();
+    if let Err(stopped) = memory.fresh() {
+        return Err((StatusCode::FORBIDDEN, stopped.to_string()));
+    }
     if !memory.domains().iter().any(|d| d == domain) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1211,6 +1218,7 @@ fn export_refusal(e: dm_server::Error) -> Refusal {
     let status = match e {
         dm_server::Error::Denied(_)
         | dm_server::Error::NotFound(_)
+        | dm_server::Error::Stale(_)
         | dm_server::Error::Bundle(dm_server::bundle::Error::Invalid(_)) => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -2273,6 +2281,42 @@ mod tests {
         assert_eq!(status, 200, "the board reads under a new session: {tasks}");
         let (status, domains) = get_json(addr, "/api/domains").await;
         assert_eq!((status, domains), (200, serde_json::json!(["dom-me"])));
+    }
+
+    /// When the grants cannot be read, no new session opens, and the stopped one serves
+    /// nothing: each request is refused as the client's, with the reason.
+    #[tokio::test]
+    async fn a_board_whose_session_stays_stopped_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _h) = start(dir.path(), &["true"]).await;
+        let m = Memory::open(&dir.path().join("memory")).unwrap();
+        let w = m
+            .write(dm_server::WriteRequest {
+                body: "Operation R retries with backoff.\n".into(),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        // exported once, so the entry's file is there to serve
+        let entry = format!("/bundle/dom-me/internal/{}.md", w.id);
+        let manifest = "/bundle/dom-me/internal/manifest.yaml";
+        for path in ["/api/domains", manifest, entry.as_str()] {
+            let (status, body) = http(addr, "GET", path, None).await;
+            assert_eq!(status, 200, "{path}: {body}");
+        }
+        let grants = dir.path().join("memory/grants.toml");
+        std::fs::write(&grants, "this is = not [ grants").unwrap();
+        for path in [
+            "/api/tasks",
+            "/api/domains",
+            "/api/entries",
+            manifest,
+            &entry,
+        ] {
+            let (status, body) = http(addr, "GET", path, None).await;
+            assert_eq!(status, 403, "{path}: {body}");
+            assert!(body.contains("stopped"), "{path}: {body}");
+        }
     }
 
     #[tokio::test]

@@ -235,6 +235,8 @@ struct Inner {
     /// How long a tunnel has for the TLS hellos the egress reads, [`hello::HELLO_WAIT`]
     /// outside a test.
     hello_wait: std::time::Duration,
+    /// How often an open tunnel asks whether its session is still valid.
+    stop_check: std::time::Duration,
 }
 
 /// How the egress resolves a tunnel's host and dials it: the system's resolver and TCP,
@@ -377,6 +379,7 @@ impl Egress {
                 telemetry,
                 network: Arc::new(SystemNetwork),
                 hello_wait: hello::HELLO_WAIT,
+                stop_check: std::time::Duration::from_secs(1),
             }),
         })
     }
@@ -1127,7 +1130,24 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
             }
             Err(Stop::Ended) => return,
         };
-        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        // an open tunnel is the session's still: it carries bytes only while the session
+        // is valid, and is closed when the session stops
+        let stopped = async {
+            loop {
+                tokio::time::sleep(inner.stop_check).await;
+                if inner.memory.fresh().is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+            () = stopped => {
+                eprintln!("egress: tunnel to {host}: the session stopped; closed");
+                let _ = inbound.shutdown().await;
+                let _ = outbound.shutdown().await;
+            }
+        }
         let _ = inner.telemetry.record(
             started,
             &session,
@@ -3620,6 +3640,33 @@ mod tests {
         c.read_exact(&mut body).await.unwrap();
         answer.push_str(&String::from_utf8_lossy(&body));
         (answer, c)
+    }
+
+    /// A tunnel that is open when its session stops is closed: a harness that keeps a
+    /// connection alive sends nothing more through it.
+    #[tokio::test]
+    async fn an_open_tunnel_is_closed_when_its_session_stops() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, _) = echo_upstream().await;
+        let entry = format!("127.0.0.1:{}", addr.port());
+        let (d, mut e) = fixture(Some(("github", Destination::tunnel([entry])))).await;
+        Arc::get_mut(&mut e.inner).unwrap().stop_check = std::time::Duration::from_millis(50);
+        let egress = serve(&e).await;
+        let (head, mut c) = connect(egress, &addr.to_string()).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        echoes(&mut c, "127.0.0.1").await;
+        let grants = d.path().join("m").join(dm_server::GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("{text}\n# a change\n")).unwrap();
+        let (rest, closed) = until_closed(&mut c).await;
+        assert!(closed, "the tunnel stayed open after the session stopped");
+        assert_eq!(rest, b"");
+        // and nothing written now comes back
+        let _ = c.write_all(b"sent after the session stopped").await;
+        assert_eq!(until_closed(&mut c).await.0, b"");
+        // nor does a new tunnel open
+        let (head, _) = connect(egress, &addr.to_string()).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
     }
 
     #[tokio::test]

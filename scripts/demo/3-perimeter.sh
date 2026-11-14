@@ -161,9 +161,17 @@ for line in sys.stdin:
 fi
 
 say "A grant withdrawn mid-session" "A session is valid only while its grants read as they did when it started. The owner lowers the handling of the record while an agent's session is open. The session's next read is refused, and so is its next write: a request made after a revocation cannot use the old grant. A new session starts under the grants as they are."
+# the grants go back however the step ends, a signal included; a copy that an
+# interrupted run left is put back first, so it is never overwritten with lowered grants
+restore_grants() {
+  if [ -f "$root/grants.toml.before-revoke" ]; then
+    mv "$root/grants.toml.before-revoke" "$root/grants.toml"
+  fi
+}
+restore_grants
+trap restore_grants EXIT
+trap 'restore_grants; trap - EXIT; exit 130' INT TERM HUP
 cp "$root/grants.toml" "$root/grants.toml.before-revoke"
-# the grants go back however the step ends
-trap 'if [ -f "$root/grants.toml.before-revoke" ]; then mv "$root/grants.toml.before-revoke" "$root/grants.toml"; fi' EXIT
 sed 's/^handling = .*/handling = "public"/' "$root/grants.toml" > "$root/grants.toml.lowered"
 agent agent:a steps "[
   {\"tool\": \"search\", \"arguments\": {\"query\": \"decision\", \"limit\": 50}},

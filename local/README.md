@@ -658,7 +658,7 @@ check, each call of a hosted tool, each import, and each request through the egr
   valid again. If `amem` cannot read the file, it refuses the call.
 - **The policy.** `state/policy.stamp` changes when a session writes, promotes or erases
   a policy entry, replaces a policy entry with an entry of any type, imports a bundle,
-  or resets the rules.
+  resets the rules, or builds the index again (`amem reindex`, `amem materialize`).
   The stamp also includes the digest of the root's `policy/*.rego`. When the stamp is
   not the stamp that the session loaded, the session loads the policy again. The read
   filter of the session has the version of the policy that computed it, and `amem`
@@ -672,8 +672,19 @@ check, each call of a hosted tool, each import, and each request through the egr
 read filter again. If the filter is not the filter that the pack was read under, `amem`
 withholds the brief.
 
+A tunnel that is open when its session stops does not stay open. The egress asks each
+second if the session is valid, and closes the tunnel when it is not.
+
 The board is the owner's session. When its session stops, the board opens a new session
-under the grants as they are.
+under the grants as they are. When the board cannot open one, for example because
+`grants.toml` does not parse, it answers each request with status 403 and the reason.
+It also refuses the files of a bundle that it exported before.
+
+The read filter of a session is computed again only for a new version of the policy.
+The expiry of an exception does not make a new version. Thus a root policy whose read
+filter reads the exceptions keeps its filter after an expiry, until the stamp changes.
+The built-in read filter does not read the exceptions. An advisory rule also reports
+with the exceptions as they were when the policy loaded.
 
 `amem` does not look for which grant changed: any change to `grants.toml` stops each
 open session of that record.

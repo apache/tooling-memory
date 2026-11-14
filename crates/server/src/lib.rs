@@ -3665,6 +3665,9 @@ impl Memory {
         let entries = self.store.all().await?;
         let n = self.index.lock().await.rebuild(entries)?;
         let m = self.ledger.lock().await.rebuild().await?;
+        // the policy is compiled from the index: a rebuilt index can hold rules the old
+        // one had lost, and every open session must decide under them
+        self.reload_policy().await?;
         Ok((n, m))
     }
 }
@@ -4157,6 +4160,43 @@ mod tests {
         verify(&owner, &curator, &rule).await;
         let refused = agent.write(supersede(&d2)).await.unwrap_err().to_string();
         assert!(refused.contains("pol-L2-070"), "{refused}");
+    }
+
+    /// The policy is compiled from the index. An index that lost its entries gives a
+    /// policy with no rule; the rebuild brings the rules back for the sessions that are
+    /// open, not only for the next one.
+    #[tokio::test]
+    async fn a_rebuilt_index_brings_its_rules_to_the_open_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let d1 = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                ..req("Use SQLite on a laptop.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let rule = policy_entry(&owner, &rule_text("pol-L2-071", 2, "")).await;
+        let curator = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:curator");
+        verify(&owner, &curator, &rule).await;
+        owner.index.lock().await.rebuild(Vec::new()).unwrap();
+        owner.reload_policy().await.unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        assert!(agent.policy().entries().is_empty());
+        owner.reindex().await.unwrap();
+        let refused = agent
+            .write(WriteRequest {
+                entry_type: EntryType::Decision,
+                supersedes: Some(d1),
+                ..req("Use something else on a laptop.\n")
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("pol-L2-071"), "{refused}");
     }
 
     /// A change to the root's own policy reaches an open session's read filter: its
