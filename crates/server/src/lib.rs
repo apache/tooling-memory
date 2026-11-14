@@ -37,6 +37,7 @@ use tokio::sync::Mutex as AsyncMutex;
 pub mod bundle;
 pub mod contexts;
 pub mod fabric;
+mod holds;
 pub mod log;
 pub mod mcp;
 pub mod platform;
@@ -2159,6 +2160,11 @@ impl Memory {
         filing: Filing,
         parent: Option<&Task>,
     ) -> Result<Created, Error> {
+        // a parent the filer names is a task it can read; one it cannot is not found.
+        // The task a session holds is its parent without the asking
+        if let (Some(named), None) = (&spec.parent, parent) {
+            self.check_task(&l.get(named).await?)?;
+        }
         let mut spec = self.stamp(spec, filing, parent)?;
         // what a session files while it holds a task is that task's work: it runs under
         // the same definition, and is checked the same way, unless it names its own
@@ -2205,12 +2211,29 @@ impl Memory {
         )?;
         spec.created_by = self.author.clone();
         spec.classification = spec.classification.max(self.label());
+        // the policy in force is the service's to say, not the filer's
+        spec.policy_context = self.policy_context();
         // a session files no higher than the task it holds: work it delegates serves
         // that task, and rank is not something a worker can raise
         if let (Filing::Held, Some(p)) = (filing, parent) {
             spec.priority = spec.priority.min(p.spec.priority);
+            spec.parent = Some(p.id.clone());
         }
         Ok(spec)
+    }
+
+    /// The verified policy entries of the record now, by id: what a task filed now is
+    /// filed under.
+    fn policy_context(&self) -> Vec<String> {
+        let policy = self.policy();
+        let mut ids: Vec<String> = policy
+            .entries()
+            .iter()
+            .filter(|e| e.tier == dm_core::TrustTier::Verified)
+            .map(|e| e.entry_id.clone())
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// Admit a proposed task. On a laptop the owner is the triage.
@@ -2324,6 +2347,8 @@ impl Memory {
             priority: parent.spec.priority,
             definition: parent.spec.definition.clone(),
             acceptance: parent.spec.acceptance.clone(),
+            parent: Some(parent.id.clone()),
+            policy_context: self.policy_context(),
             ..TaskSpec::default()
         }
     }
@@ -2504,6 +2529,8 @@ impl Memory {
             priority: parent.spec.priority,
             definition: parent.spec.definition.clone(),
             acceptance: parent.spec.acceptance.clone(),
+            policy_context: self.policy_context(),
+            ..TaskSpec::default()
         })
         .await?;
         let continuation = self

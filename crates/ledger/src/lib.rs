@@ -198,6 +198,85 @@ pub struct TaskSpec {
     /// The checks that say this task is done, its own or those its definition gave it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance: Vec<String>,
+    /// The task this one was split from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// What triage scored it, beside the one number the queue is ordered by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scores: Option<Scores>,
+    /// The decisions this task carries out: entries of the record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implements: Vec<String>,
+    /// Whether what the task does can be undone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversibility: Option<Reversibility>,
+    /// The owned paths the task changes, as globs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts_touched: Vec<String>,
+    /// The policy in force when the task was filed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_context: Vec<String>,
+}
+
+/// What triage scored a task: the parts its rank is made of.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scores {
+    /// What it is worth done.
+    #[serde(default)]
+    pub value: i64,
+    /// How soon it loses that worth.
+    #[serde(default)]
+    pub urgency: i64,
+    /// What it costs to do.
+    #[serde(default)]
+    pub effort: i64,
+    /// The tasks that wait on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unblocks: Vec<String>,
+}
+
+/// Whether what a task does can be undone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reversibility {
+    /// It can.
+    Reversible,
+    /// It cannot.
+    Irreversible,
+}
+
+impl std::str::FromStr for Reversibility {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Reversibility, String> {
+        match s {
+            "reversible" => Ok(Reversibility::Reversible),
+            "irreversible" => Ok(Reversibility::Irreversible),
+            other => Err(format!("{other:?} is not reversible or irreversible")),
+        }
+    }
+}
+
+impl std::str::FromStr for Outcome {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Outcome, String> {
+        match s {
+            "applied" => Ok(Outcome::Applied),
+            "not_applied" => Ok(Outcome::NotApplied),
+            other => Err(format!("{other:?} is not applied or not_applied")),
+        }
+    }
+}
+
+/// How an external effect turned out, as whoever reconciled it found the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// The destination holds the effect.
+    Applied,
+    /// The destination does not hold it, so the action may be made again.
+    NotApplied,
 }
 
 /// The fields of a task that the ledger keeps and never queries by, as one JSON column.
@@ -207,6 +286,64 @@ struct Extra {
     definition: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     acceptance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scores: Option<Scores>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    implements: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reversibility: Option<Reversibility>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    artifacts_touched: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    policy_context: Vec<String>,
+    /// The outside event the task waits on. Not of the spec: events set and clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    waits_on: Option<String>,
+    /// The external actions begun under a claim and not yet settled, by action id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    effects: Vec<String>,
+}
+
+impl Extra {
+    fn parse(id: &str, text: Option<&str>) -> Result<Extra, Error> {
+        match text {
+            // a row from before the column has none, and reads as a task with nothing more
+            None | Some("") => Ok(Extra::default()),
+            Some(text) => serde_json::from_str(text).map_err(|_| Error::BadRow {
+                id: id.to_string(),
+                what: format!("extra {text:?}"),
+            }),
+        }
+    }
+}
+
+/// The `extra` column of task `id` after `event`, when the event changes it: the event
+/// a task waits on, and the effects not settled. Both backends project through this.
+pub(crate) fn extra_after(
+    id: &str,
+    extra: Option<&str>,
+    event: &Event,
+) -> Result<Option<String>, Error> {
+    let mut e = Extra::parse(id, extra)?;
+    match event {
+        Event::Waiting { on } => e.waits_on = Some(on.clone()),
+        Event::Arrived { .. } => e.waits_on = None,
+        Event::EffectBegun { action } => {
+            if !e.effects.contains(action) {
+                e.effects.push(action.clone());
+            }
+        }
+        Event::EffectSettled { action, .. } => e.effects.retain(|a| a != action),
+        _ => return Ok(None),
+    }
+    serde_json::to_string(&e)
+        .map(Some)
+        .map_err(|err| Error::BadRow {
+            id: id.to_string(),
+            what: format!("extra serialises: {err}"),
+        })
 }
 
 impl TaskSpec {
@@ -215,6 +352,14 @@ impl TaskSpec {
         let extra = Extra {
             definition: self.definition.clone(),
             acceptance: self.acceptance.clone(),
+            parent: self.parent.clone(),
+            scores: self.scores.clone(),
+            implements: self.implements.clone(),
+            reversibility: self.reversibility,
+            artifacts_touched: self.artifacts_touched.clone(),
+            policy_context: self.policy_context.clone(),
+            waits_on: None,
+            effects: Vec::new(),
         };
         serde_json::to_string(&extra).unwrap_or_default()
     }
@@ -251,6 +396,29 @@ pub struct Task {
     /// Where its handoff was posted back upstream, once a tap has done so.
     #[serde(default)]
     pub posted_to: Option<String>,
+    /// The outside event it waits on: a check that runs, a reply, a change that has not
+    /// landed. Nobody may claim it until that event arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+    /// The external actions begun under a claim of it whose outcome nobody has recorded.
+    /// Nobody may claim it while there is one: a lease that ran out does not say whether
+    /// the destination holds the effect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<String>,
+}
+
+impl Task {
+    /// Why nobody may claim this task whatever its lease says, when something holds it
+    /// back: the event it waits on, or an effect nobody has settled.
+    #[must_use]
+    pub fn held_back(&self) -> Option<String> {
+        if let Some(on) = &self.waiting_on {
+            return Some(format!("waits on {on}"));
+        }
+        self.effects
+            .first()
+            .map(|a| format!("effect {a} is not settled"))
+    }
 }
 
 /// What an erasure did to an entry's promotion records and approval tasks.
@@ -385,7 +553,8 @@ type Clock = Box<dyn Fn() -> OffsetDateTime + Send + Sync>;
 enum Event {
     Created {
         id: String,
-        spec: TaskSpec,
+        /// Boxed: a spec is several times the size of any other event.
+        spec: Box<TaskSpec>,
     },
     Admitted,
     /// Admitted with a dependency that is not done: not claimable until each is.
@@ -443,6 +612,26 @@ enum Event {
         reason: String,
         superseded_by: Option<String>,
     },
+    /// The holder gave the task up until an outside event comes: nobody's to claim
+    /// until [`Event::Arrived`].
+    Waiting {
+        on: String,
+    },
+    /// The outside event a task waited on came.
+    Arrived {
+        event: String,
+    },
+    /// The holder is about to make an external action. Until [`Event::EffectSettled`]
+    /// names the same action, nobody else may claim the task.
+    EffectBegun {
+        action: String,
+    },
+    /// Someone looked at the destination and recorded what became of an action.
+    EffectSettled {
+        action: String,
+        outcome: Outcome,
+        by: String,
+    },
     /// The handoff of a completed task was posted back where the task came from.
     Posted {
         to: String,
@@ -480,6 +669,10 @@ impl Event {
             Event::HandoffLeft { .. } => "handoff_left",
             Event::Completed { .. } => "completed",
             Event::Invalidated { .. } => "invalidated",
+            Event::Waiting { .. } => "waiting",
+            Event::Arrived { .. } => "arrived",
+            Event::EffectBegun { .. } => "effect_begun",
+            Event::EffectSettled { .. } => "effect_settled",
             Event::Posted { .. } => "posted",
             Event::Rescored { .. } => "rescored",
             Event::Promoted { .. } => "promoted",
@@ -687,14 +880,7 @@ impl RawTask {
         };
         let requirements = json_list(&self.requirements, "requirements")?;
         let depends_on = json_list(&self.depends_on, "depends_on")?;
-        // a row from before the column has none, and reads as a task with nothing more
-        let extra: Extra = match self.extra.as_deref() {
-            None | Some("") => Extra::default(),
-            Some(text) => serde_json::from_str(text).map_err(|_| Error::BadRow {
-                id: id.clone(),
-                what: format!("extra {text:?}"),
-            })?,
-        };
+        let extra = Extra::parse(&id, self.extra.as_deref())?;
         Ok(Task {
             spec: TaskSpec {
                 domain: self.domain,
@@ -709,6 +895,12 @@ impl RawTask {
                 priority: self.priority,
                 definition: extra.definition,
                 acceptance: extra.acceptance,
+                parent: extra.parent,
+                scores: extra.scores,
+                implements: extra.implements,
+                reversibility: extra.reversibility,
+                artifacts_touched: extra.artifacts_touched,
+                policy_context: extra.policy_context,
             },
             created: parse_time(&id, &self.created)?,
             status: Status::parse(&id, &self.status)?,
@@ -720,6 +912,8 @@ impl RawTask {
             reason: self.reason,
             superseded_by: self.superseded_by,
             posted_to: self.posted_to,
+            waiting_on: extra.waits_on,
+            effects: extra.effects,
             id,
         })
     }
@@ -743,6 +937,7 @@ fn claimable(task: &Task, now: OffsetDateTime, manifest: &[String], handling: La
     let state = matches!(task.status, Status::Open | Status::Blocked)
         || (task.status == Status::Claimed && !lease_live);
     state
+        && task.held_back().is_none()
         && task.spec.classification <= handling
         && task.spec.requirements.iter().all(|r| manifest.contains(r))
 }
@@ -926,7 +1121,7 @@ impl Ledger {
         let now = self.now();
         let event = Event::Created {
             id: id.clone(),
-            spec,
+            spec: Box::new(spec),
         };
         self.append_at(&id, now, &event).await?;
         Ok(Created {
@@ -962,7 +1157,8 @@ impl Ledger {
         }
         self.append(id, &Event::Admitted).await?;
         let waits_on = self.not_done(&task.spec.depends_on).await?;
-        if !waits_on.is_empty() {
+        // a task sent back to triage while it waited on an event waits on it still
+        if !waits_on.is_empty() || task.waiting_on.is_some() {
             self.append(id, &Event::Blocked { on: waits_on }).await?;
         }
         self.get(id).await
@@ -1230,6 +1426,7 @@ impl Ledger {
                 op: "complete",
             });
         }
+        Self::effects_settled(&task)?;
         let completed = Event::Completed {
             handoff: handoff.to_string(),
             attempt: attempt.map(str::to_string),
@@ -1285,6 +1482,7 @@ impl Ledger {
         let held = task.status == Status::Claimed && task.lease_until.is_some_and(|t| t >= now);
         let resumed_it = continuation.spec.origin.as_deref() == Some(continues(id).as_str())
             && continuation.status == Status::Done;
+        Self::effects_settled(&task)?;
         if task.status.is_terminal() || held || !resumed_it {
             return Err(Error::WrongState {
                 id: id.to_string(),
@@ -1333,6 +1531,177 @@ impl Ledger {
         }
         self.append_held(id, now, by, &Event::Released).await?;
         self.get(id).await
+    }
+
+    /// A task with an effect nobody has settled is not done, whoever says so: whether
+    /// the destination holds the effect is part of what done means.
+    fn effects_settled(task: &Task) -> Result<(), Error> {
+        if task.effects.is_empty() {
+            return Ok(());
+        }
+        Err(Error::WrongState {
+            id: task.id.clone(),
+            status: task.status,
+            op: "complete while an effect of it is not settled",
+        })
+    }
+
+    /// Give a task up until an outside event comes: a check that runs, a reply, a change
+    /// that has not landed. The task is blocked and nobody's to claim until
+    /// [`Ledger::arrived`] is told of `on`; the holder's session can end meanwhile. A
+    /// handoff says where the next holder starts.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`], [`Error::NotHolder`], [`Error::Fenced`], or
+    /// [`Error::WrongState`].
+    pub async fn wait_for(
+        &mut self,
+        id: &str,
+        by: Held<'_>,
+        on: &str,
+        handoff: Option<&str>,
+    ) -> Result<Task, Error> {
+        let now = self.now();
+        let task = self.get(id).await?;
+        if task.status != Status::Claimed {
+            return Err(Error::WrongState {
+                id: id.to_string(),
+                status: task.status,
+                op: "wait",
+            });
+        }
+        if let Some(handoff) = handoff {
+            let left = Event::HandoffLeft {
+                handoff: handoff.to_string(),
+            };
+            self.append_held(id, now, by, &left).await?;
+        }
+        let waiting = Event::Waiting { on: on.to_string() };
+        self.append_held(id, now, by, &waiting).await?;
+        self.get(id).await
+    }
+
+    /// An outside event came: every task of the domain that waited on it waits on it no
+    /// more, and is open again once its dependencies are done. The tasks that waited.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn arrived(&mut self, domain: &str, event: &str) -> Result<Vec<Task>, Error> {
+        let mut woken = Vec::new();
+        // whatever its state says: a task sent back to triage while it waited waits still
+        for status in [Status::Blocked, Status::Proposed, Status::Open] {
+            for t in self.list(domain, status).await? {
+                if t.waiting_on.as_deref() != Some(event) {
+                    continue;
+                }
+                let came = Event::Arrived {
+                    event: event.to_string(),
+                };
+                self.append(&t.id, &came).await?;
+                if status == Status::Blocked && self.not_done(&t.spec.depends_on).await?.is_empty()
+                {
+                    let by = event.to_string();
+                    self.append(&t.id, &Event::Unblocked { by }).await?;
+                }
+                woken.push(self.get(&t.id).await?);
+            }
+        }
+        Ok(woken)
+    }
+
+    /// Record that the holder is about to make an external action, before it makes it.
+    /// From here until [`Ledger::effect_settled`] names the action, nobody else may
+    /// claim the task: a lease that runs out does not say whether the destination holds
+    /// the effect. A retry of the action carries the same id, and is the same effect.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`], [`Error::NotHolder`], or [`Error::Fenced`]: the claim is
+    /// checked in the transaction that records the effect.
+    pub async fn effect_begun(
+        &mut self,
+        id: &str,
+        by: Held<'_>,
+        action: &str,
+    ) -> Result<Task, Error> {
+        let now = self.now();
+        let begun = Event::EffectBegun {
+            action: action.to_string(),
+        };
+        self.append_held(id, now, by, &begun).await?;
+        self.get(id).await
+    }
+
+    /// Record what became of an external action, as `by` found the destination. With
+    /// `held`, it is the holder that says so, and the claim is checked in the
+    /// transaction that records it. Without, it is someone who reconciles after the
+    /// claim: whether `by` may is the caller's rule, and the ledger records who did.
+    /// Asked again for an action already settled, it changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]; [`Error::WrongState`] for an action the task never began;
+    /// with `held`, [`Error::NotHolder`] or [`Error::Fenced`].
+    pub async fn effect_settled(
+        &mut self,
+        id: &str,
+        action: &str,
+        outcome: Outcome,
+        (by, held): (&str, Option<Held<'_>>),
+    ) -> Result<Task, Error> {
+        let task = self.get(id).await?;
+        if task.effects.iter().any(|a| a == action) {
+            let settled = Event::EffectSettled {
+                action: action.to_string(),
+                outcome,
+                by: by.to_string(),
+            };
+            match held {
+                Some(held) => {
+                    let now = self.now();
+                    self.append_held(id, now, held, &settled).await?;
+                }
+                None => self.append(id, &settled).await?,
+            }
+            return self.get(id).await;
+        }
+        if self.settlement(id, action).await?.is_some() {
+            return Ok(task);
+        }
+        Err(Error::WrongState {
+            id: id.to_string(),
+            status: task.status,
+            op: "settle an effect the task did not begin",
+        })
+    }
+
+    /// How an action of a task was settled, and by whom, when it was.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn settlement(
+        &self,
+        id: &str,
+        action: &str,
+    ) -> Result<Option<(Outcome, String)>, Error> {
+        let payloads = on_backend!(&self.backend, db => db.payloads_of(id, "effect_settled"))?;
+        let mut last = None;
+        for p in payloads {
+            if let Event::EffectSettled {
+                action: a,
+                outcome,
+                by,
+            } = Event::parse(id, &p)?
+            {
+                if a == action {
+                    last = Some((outcome, by));
+                }
+            }
+        }
+        Ok(last)
     }
 
     /// Leave a handoff on a task after the claim it was written under is over: the
@@ -1967,6 +2336,10 @@ mod tests {
         two_claimers_on_two_connections_get_two_tasks,
         a_domain_claims_only_its_own_queue,
         a_rescore_moves_the_queue_and_keeps_the_filed_priority,
+        a_task_that_waits_on_an_event_is_nobody_s_until_the_event_comes,
+        an_effect_not_settled_holds_the_task_past_its_lease,
+        a_settled_effect_gives_the_task_back_and_fences_who_began_it,
+        a_task_keeps_the_rest_of_its_record,
         a_task_waits_on_its_continuation,
         a_task_closes_with_its_continuation,
         a_continuation_given_up_on_gives_its_task_back,
@@ -3975,10 +4348,10 @@ mod tests {
             let id = dm_core::id::new_task_id(domain);
             let created = Event::Created {
                 id: id.clone(),
-                spec: TaskSpec {
+                spec: Box::new(TaskSpec {
                     domain: domain.into(),
                     ..spec("Old")
-                },
+                }),
             };
             let mut events = vec![created];
             if admit {
@@ -4237,6 +4610,181 @@ mod tests {
         assert_eq!(attr(2, "task.generation"), Some(Value::I64(1)));
         assert_eq!(attr(3, "task.status"), Some(Value::from("done")));
         assert_eq!(attr(3, "memory.domain"), Some(Value::from("dom-a")));
+    }
+
+    async fn a_task_that_waits_on_an_event_is_nobody_s_until_the_event_comes(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Open the change and wait for its check")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        let parked = l
+            .wait_for(&t.id, by, "check:42", Some("mem-a-h1"))
+            .await
+            .unwrap();
+        it_is_parked(&parked);
+        // its dependencies are done and no lease is live, and still nobody gets it
+        assert!(next(&mut l, "s2", mins(30)).await.is_none());
+        *now.lock().unwrap() = T0 + mins(90);
+        nobody_gets_it(&mut l, &t.id).await;
+        it_waits_through_a_replay(&mut l, &t.id, by).await;
+        only_its_event_wakes_it(&mut l, &t).await;
+        the_woken_task_is_claimed_again(&mut l, &t).await;
+    }
+
+    fn it_is_parked(parked: &Task) {
+        assert_eq!(parked.status, Status::Blocked);
+        assert_eq!(parked.waiting_on.as_deref(), Some("check:42"));
+        assert_eq!(parked.holder, None);
+        assert_eq!(parked.handoff.as_deref(), Some("mem-a-h1"));
+        assert_eq!(parked.held_back().as_deref(), Some("waits on check:42"));
+    }
+
+    async fn it_waits_through_a_replay(l: &mut Ledger, id: &str, by: Held<'_>) {
+        // who gave it up holds it no more
+        assert!(is_not_holder(&l.heartbeat(id, by, mins(30)).await));
+        // a replay reads the same from the events
+        l.rebuild().await.unwrap();
+        let replayed = l.get(id).await.unwrap();
+        assert_eq!(replayed.waiting_on.as_deref(), Some("check:42"));
+        assert!(next(l, "s2", mins(30)).await.is_none());
+    }
+
+    /// Neither the next claim nor a claim by name gets the task.
+    async fn nobody_gets_it(l: &mut Ledger, id: &str) {
+        assert!(next(l, "s2", mins(30)).await.is_none());
+        assert!(is_wrong_state(&claim(l, id, "s2", mins(30)).await));
+    }
+
+    async fn only_its_event_wakes_it(l: &mut Ledger, t: &Task) {
+        assert!(l.arrived("dom-a", "check:41").await.unwrap().is_empty());
+        assert!(l.arrived("dom-b", "check:42").await.unwrap().is_empty());
+        assert!(next(l, "s2", mins(30)).await.is_none());
+        let woken = l.arrived("dom-a", "check:42").await.unwrap();
+        assert_eq!(woken.len(), 1);
+        assert_eq!(woken[0].id, t.id);
+        assert_eq!(woken[0].status, Status::Open);
+        assert_eq!(woken[0].waiting_on, None);
+    }
+
+    async fn the_woken_task_is_claimed_again(l: &mut Ledger, t: &Task) {
+        // told twice, the event wakes nothing more
+        assert!(l.arrived("dom-a", "check:42").await.unwrap().is_empty());
+        let c = next(l, "s2", mins(30)).await.unwrap();
+        assert_eq!(c.task.id, t.id);
+        assert_eq!(c.generation, 2);
+        assert_eq!(c.task.handoff.as_deref(), Some("mem-a-h1"));
+        assert!(is_fenced(
+            &l.wait_for(&t.id, held("s1", 1), "check:43", None).await,
+            1,
+            2
+        ));
+    }
+
+    async fn an_effect_not_settled_holds_the_task_past_its_lease(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Post the release note")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        // the retry of the action is the same effect
+        let again = l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        assert_eq!(again.effects, vec!["act-1".to_string()]);
+        // its holder cannot call it done while nobody knows what the destination holds
+        assert!(is_wrong_state(&l.complete(&t.id, by, "mem-a-h").await));
+        // and says what it holds itself while its claim is in force
+        l.effect_begun(&t.id, by, "act-0").await.unwrap();
+        let own = l
+            .effect_settled(&t.id, "act-0", Outcome::Applied, ("s1", Some(by)))
+            .await
+            .unwrap();
+        assert_eq!(own.effects, vec!["act-1".to_string()]);
+        *now.lock().unwrap() = T0 + mins(31);
+        // the lease ran out, and that alone gives the task to nobody
+        nobody_gets_it(&mut l, &t.id).await;
+        the_effect_holds_through_a_replay(&mut l, &t.id, by).await;
+    }
+
+    async fn the_effect_holds_through_a_replay(l: &mut Ledger, id: &str, by: Held<'_>) {
+        let held_back = l.get(id).await.unwrap().held_back();
+        assert_eq!(held_back.as_deref(), Some("effect act-1 is not settled"));
+        // nor may the one who lost the lease begin another
+        assert!(is_not_holder(&l.effect_begun(id, by, "act-2").await));
+        l.rebuild().await.unwrap();
+        assert_eq!(l.get(id).await.unwrap().effects, vec!["act-1"]);
+        assert!(next(l, "s2", mins(30)).await.is_none());
+    }
+
+    async fn a_settled_effect_gives_the_task_back_and_fences_who_began_it(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Post the release note")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        *now.lock().unwrap() = T0 + mins(31);
+        not_settled_by_a_wrong_name_or_a_stale_holder(&mut l, &t.id, by).await;
+        assert_eq!(l.settlement(&t.id, "act-1").await.unwrap(), None);
+        let settled = l
+            .effect_settled(&t.id, "act-1", Outcome::NotApplied, ("human:a:x", None))
+            .await
+            .unwrap();
+        assert!(settled.effects.is_empty());
+        assert_eq!(
+            l.settlement(&t.id, "act-1").await.unwrap(),
+            Some((Outcome::NotApplied, "human:a:x".to_string()))
+        );
+        settled_once_and_claimed_again(&mut l, &t, by).await;
+    }
+
+    async fn not_settled_by_a_wrong_name_or_a_stale_holder(l: &mut Ledger, id: &str, by: Held<'_>) {
+        let unknown = l
+            .effect_settled(id, "act-9", Outcome::Applied, ("human:a:x", None))
+            .await;
+        assert!(is_wrong_state(&unknown));
+        // who lost the lease does not say what became of it
+        let stale = l
+            .effect_settled(id, "act-1", Outcome::Applied, ("s1", Some(by)))
+            .await;
+        assert!(is_not_holder(&stale));
+    }
+
+    async fn settled_once_and_claimed_again(l: &mut Ledger, t: &Task, by: Held<'_>) {
+        // said again, it is the same settlement and no second event
+        let events = l.event_count().await.unwrap();
+        l.effect_settled(&t.id, "act-1", Outcome::Applied, ("human:a:y", None))
+            .await
+            .unwrap();
+        assert_eq!(l.event_count().await.unwrap(), events);
+        let c2 = next(l, "s2", mins(30)).await.unwrap();
+        assert_eq!((c2.task.id.as_str(), c2.generation), (t.id.as_str(), 2));
+        // the delayed request of the first holder is refused where the effect is recorded
+        assert!(is_fenced(&l.effect_begun(&t.id, by, "act-1").await, 1, 2));
+        assert!(l.get(&t.id).await.unwrap().effects.is_empty());
+    }
+
+    async fn a_task_keeps_the_rest_of_its_record(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let mut s = spec("Carry out the decision");
+        s.parent = Some("task-a-1".into());
+        s.scores = Some(Scores {
+            value: 8,
+            urgency: 5,
+            effort: 3,
+            unblocks: vec!["task-a-9".into()],
+        });
+        s.implements = vec!["mem-a-0847".into()];
+        s.reversibility = Some(Reversibility::Irreversible);
+        s.artifacts_touched = vec!["docs/**".into()];
+        s.policy_context = vec!["pol-L1-007".into()];
+        let filed = l.create(s.clone()).await.unwrap().task;
+        assert_eq!(filed.spec, s);
+        drop(l);
+        let l = b.open().await;
+        assert_eq!(l.get(&filed.id).await.unwrap().spec, s);
+        // a task without them says nothing of them
+        let plain = serde_json::to_value(spec("Plain")).unwrap();
+        for absent in ["parent", "scores", "implements", "reversibility"] {
+            assert!(plain.get(absent).is_none(), "{absent}");
+        }
     }
 
     async fn a_rescore_moves_the_queue_and_keeps_the_filed_priority(b: &Site) {

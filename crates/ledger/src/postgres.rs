@@ -1336,6 +1336,41 @@ async fn insert_promotion<C: GenericClient>(
 }
 
 /// Update the projection for one event. Replay calls this and nothing else.
+/// The projection of the events that hold a task back from a claim, or stop doing so:
+/// what it waits on and which effects are not settled live in `extra`.
+async fn project_hold<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    id: &str,
+    event: &Event,
+) -> Result<(), Error> {
+    let row = conn
+        .query_opt(
+            &format!("SELECT extra FROM {s}.tasks WHERE id = $1 FOR UPDATE"),
+            &[&id],
+        )
+        .await?;
+    let extra: Option<String> = row.map(|r| r.try_get(0)).transpose()?.flatten();
+    if let Some(next) = crate::extra_after(id, extra.as_deref(), event)? {
+        conn.execute(
+            &format!("UPDATE {s}.tasks SET extra = $2 WHERE id = $1"),
+            &[&id, &next],
+        )
+        .await?;
+    }
+    if matches!(event, Event::Waiting { .. }) {
+        conn.execute(
+            &format!(
+                "UPDATE {s}.tasks SET status = 'blocked', holder = NULL, lease_until = NULL
+                 WHERE id = $1"
+            ),
+            &[&id],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn project<C: GenericClient>(
     conn: &C,
     s: &str,
@@ -1391,6 +1426,10 @@ async fn project<C: GenericClient>(
                 lease_until = NULL WHERE id = $1",
             vec![&id, reason, superseded_by],
         ),
+        Event::Waiting { .. }
+        | Event::Arrived { .. }
+        | Event::EffectBegun { .. }
+        | Event::EffectSettled { .. } => return project_hold(conn, s, id, event).await,
         Event::Posted { to } => ("SET posted_to = $2 WHERE id = $1", vec![&id, to]),
         Event::Rescored { priority, .. } => {
             ("SET priority = $2 WHERE id = $1", vec![&id, priority])

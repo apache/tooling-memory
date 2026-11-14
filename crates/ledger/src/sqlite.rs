@@ -883,6 +883,31 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
     Ok(())
 }
 
+/// The projection of the events that hold a task back from a claim, or stop doing so:
+/// what it waits on and which effects are not settled live in `extra`.
+fn project_hold(conn: &Connection, id: &str, event: &Event) -> Result<(), Error> {
+    let extra: Option<String> = conn
+        .query_row("SELECT extra FROM tasks WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .flatten();
+    if let Some(next) = crate::extra_after(id, extra.as_deref(), event)? {
+        conn.execute(
+            "UPDATE tasks SET extra = ?2 WHERE id = ?1",
+            params![id, next],
+        )?;
+    }
+    if matches!(event, Event::Waiting { .. }) {
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', holder = NULL, lease_until = NULL
+             WHERE id = ?1",
+            params![id],
+        )?;
+    }
+    Ok(())
+}
+
 /// Update the projection for one event. Replay calls this and nothing else.
 fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Result<(), Error> {
     match event {
@@ -942,6 +967,10 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
                 params![id, reason, superseded_by],
             )?;
         }
+        Event::Waiting { .. }
+        | Event::Arrived { .. }
+        | Event::EffectBegun { .. }
+        | Event::EffectSettled { .. } => project_hold(conn, id, event)?,
         Event::Posted { to } => {
             conn.execute(
                 "UPDATE tasks SET posted_to = ?2 WHERE id = ?1",
