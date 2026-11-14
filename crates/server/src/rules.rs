@@ -146,7 +146,7 @@ impl Memory {
         let readable = {
             let f = self.filter_for(None)?;
             let ix = self.index.lock().await;
-            ix.list(&f, Some(EntryType::Policy), 1000)?
+            ix.list_every(&f, Some(EntryType::Policy))?
         };
         let p = self.policy();
         let mut rules: Vec<(&str, RuleInForce)> = p
@@ -295,6 +295,18 @@ impl Memory {
         let approver = self.approver_of(&rule);
         let key = dm_core::digest(&format!("{}\n{task}\n{}", rule.meta.id, ask.expires));
         let policy_id = format!("exc-{}-{}", now.year(), key.get(..8).unwrap_or(&key));
+        // asked before for this rule, task and expiry: one entry and one approval task
+        if let Some(before) = self
+            .policy()
+            .entries()
+            .iter()
+            .find(|e| e.meta.id == policy_id && e.meta.status != Some(Status::Retired))
+        {
+            return Err(Error::Denied(format!(
+                "this exception was asked for before, as {}: it is not asked for twice",
+                before.entry_id
+            )));
+        }
         let meta = Meta {
             id: policy_id.clone(),
             layer: rule.meta.layer,

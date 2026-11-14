@@ -530,7 +530,14 @@ body of such an entry has a fenced `policy` block in TOML. The block gives:
 
 Where a machine can check the rule, a fenced `rego` block adds denials in
 `package amem.rules`. A denial gives `policy` and `reason`. It can also give `code`, a
-short reason code, and `remedy`, what would pass. A refusal shows all of them.
+short reason code, and `remedy`, what would pass. A refusal shows all of them to a
+session that can read the rule's entry. To a session that cannot, the refusal gives the
+rule's id only. A denial that gives no `policy` still refuses, and the refusal says that
+the rule names no policy.
+
+The policy is compiled from every policy entry of the record. No number of later entries
+puts a rule out of the policy. An exception for one rule, one task and one expiry is
+asked for once; a second request is refused and names the first entry.
 
 A rule has one of four statuses: `proposed`, `advisory`, `enforced` or `retired`. The
 `status` in the block is the highest status that the rule can have. The trust tier of

@@ -205,6 +205,9 @@ pub struct Entry {
     /// The domain its entry is in; empty for one that came from no record.
     #[serde(default)]
     pub domain: String,
+    /// How sensitive its entry is: who may read the rule's text.
+    #[serde(default)]
+    pub classification: dm_core::Label,
     /// When its entry was written, where the record says.
     #[serde(skip)]
     pub created: Option<time::OffsetDateTime>,
@@ -279,6 +282,7 @@ pub fn parse(entry_id: &str, tier: dm_core::TrustTier, body: &str) -> Result<Ent
         meta,
         rego: fenced(body, "rego").map(str::to_string),
         domain: String::new(),
+        classification: dm_core::Label::default(),
         created: None,
     })
 }

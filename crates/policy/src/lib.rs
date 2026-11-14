@@ -86,7 +86,7 @@ pub struct Gates {
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_definition: bool,
     /// The most rules that are enforced on the strength of their verification alone.
-    /// A rule over the ceiling, counted in the order of the rules' ids, is advisory
+    /// A rule over the ceiling, counted oldest entry first in its domain, is advisory
     /// until a person signs that one rule off in its block. None is no ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_enforced_rules: Option<usize>,
