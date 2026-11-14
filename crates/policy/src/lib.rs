@@ -85,6 +85,11 @@ pub struct Gates {
     /// for itself name no definition yet.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_definition: bool,
+    /// The most rules that are enforced on the strength of their verification alone.
+    /// A rule over the ceiling, counted oldest entry first in its domain, is advisory
+    /// until a person signs that one rule off in its block. None is no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_enforced_rules: Option<usize>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
@@ -106,6 +111,7 @@ impl Default for Gates {
             max_supersedes_per_session: default_max_supersedes(),
             verified_needs_approver: default_true(),
             require_definition: false,
+            max_enforced_rules: None,
         }
     }
 }
