@@ -411,6 +411,41 @@ pub struct LateHandoffParams {
     pub handoff: String,
 }
 
+/// Parameters of `check_policy`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct CheckPolicyParams {
+    /// What you are about to do, in a few words.
+    pub action: String,
+    /// The domain; the only granted domain when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters of `file_exception`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct FileExceptionParams {
+    /// The policy id of the rule to breach.
+    pub breaches: String,
+    /// The one task the exception holds for. Optional in a session that runs on a task.
+    #[serde(default)]
+    pub task: Option<String>,
+    /// What the exception covers, in words.
+    pub scope: String,
+    /// When it lapses, RFC 3339.
+    pub expiry: String,
+    /// Why it is needed.
+    pub justification: String,
+}
+
+/// Parameters of `propose_amendment`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct ProposeAmendmentParams {
+    /// The policy id of the rule.
+    pub policy_id: String,
+    /// What happened, and the ids of the entries that show it.
+    pub evidence: String,
+}
+
 /// Parameters of `claim`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct LeaseParams {
@@ -993,6 +1028,60 @@ impl McpServer {
     }
 
     #[tool(
+        description = "The rules in force for what you are about to do: each with its id, layer, rule, intent and whether it is enforced or advisory. Call it before an action that cannot be taken back. A rule above what you may read is named, and its text is withheld."
+    )]
+    async fn check_policy(
+        &self,
+        p: Parameters<CheckPolicyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let rules = self
+            .memory
+            .check_policy(&p.action, p.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "rules": rules }))
+    }
+
+    #[tool(
+        description = "Ask for an exception to a rule that refused you: for one task, until an expiry, with a justification. The scope and the justification are plain words. It lets nothing through until a person approves it. A rule of the L0 core takes no exception."
+    )]
+    async fn file_exception(
+        &self,
+        p: Parameters<FileExceptionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let filed = self
+            .memory
+            .file_exception(crate::rules::ExceptionRequest {
+                breaches: p.breaches,
+                task: p.task,
+                scope: p.scope,
+                expires: p.expiry,
+                justification: p.justification,
+            })
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "exception": filed }))
+    }
+
+    #[tool(
+        description = "Propose an amendment to a rule you find wrong in the case before you. It files a task for the rule's owner with your evidence. The rule stays in force until its owner changes it."
+    )]
+    async fn propose_amendment(
+        &self,
+        p: Parameters<ProposeAmendmentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let created = self
+            .memory
+            .propose_amendment(&p.policy_id, &p.evidence)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": created.task, "deduplicated": created.deduplicated }))
+    }
+
+    #[tool(
         description = "Close a task without doing it: obsolete, invalid, or a duplicate of another."
     )]
     async fn invalidate_task(
@@ -1417,6 +1506,70 @@ mod tests {
         );
         assert_eq!(filed["task"]["status"], "proposed");
         assert_eq!(filed["not_admitted_because"], "it names no task definition");
+    }
+
+    /// The three policy tools of the paper's surface answer over MCP.
+    #[tokio::test]
+    async fn the_policy_tools_give_the_rules_an_exception_and_an_amendment() {
+        let (_dir, s) = server().await;
+        let rule = "# A rule\n\n```policy\nid = \"pol-L2-060\"\nlayer = 2\nrule = \"A release is tagged by a person.\"\nintent = \"A tag cannot be taken back.\"\nowner = \"human:test:lead\"\nstatus = \"advisory\"\n```\n";
+        let written = s
+            .memory
+            .write(crate::WriteRequest {
+                entry_type: dm_core::EntryType::Policy,
+                body: rule.into(),
+                ..crate::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let agent = crate::Memory::open(s.memory.root())
+            .unwrap()
+            .with_author("agent:curator");
+        let crate::Promotion::Proposed { task } = agent
+            .promote(&written.id, dm_core::TrustTier::Verified, "checked")
+            .await
+            .unwrap()
+        else {
+            panic!("proposed")
+        };
+        s.memory.approve(&task.id).await.unwrap();
+        let rules = payload(
+            &s.check_policy(Parameters(CheckPolicyParams {
+                action: "tag a release".into(),
+                domain: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(rules["rules"][0]["policy_id"], "pol-L2-060");
+        assert_eq!(rules["rules"][0]["status"], "advisory");
+        assert_eq!(rules["rules"][0]["intent"], "A tag cannot be taken back.");
+        let amend = |evidence: &str| ProposeAmendmentParams {
+            policy_id: "pol-L2-060".into(),
+            evidence: evidence.into(),
+        };
+        let task = payload(
+            &s.propose_amendment(Parameters(amend("The tag was a test tag.")))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(task["task"]["origin"], "amend:pol-L2-060");
+        let id = task["task"]["id"].as_str().unwrap().to_string();
+        let filed = payload(
+            &s.file_exception(Parameters(FileExceptionParams {
+                breaches: "pol-L2-060".into(),
+                task: Some(id),
+                scope: "one test tag".into(),
+                expiry: "2099-01-01T00:00:00Z".into(),
+                justification: "The tag is on a scratch repository.".into(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(filed["exception"]["approver"], "human:test:lead");
+        assert_eq!(filed["exception"]["task"]["requirements"][0], "human");
+        let none = s.propose_amendment(Parameters(amend(""))).await;
+        assert!(none.is_err());
     }
 
     /// The same call made twice under one key, as after an answer that did not arrive.
