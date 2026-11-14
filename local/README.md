@@ -563,9 +563,10 @@ each advisory module by itself. When an advisory module fails, the decision log 
 for that rule, and the decision does not change. When the module of an enforced rule
 loads and then fails in a decision, that decision fails.
 
-A session loads the policy when it starts, and again when it changes a policy entry
-itself. A change that a different session makes applies to the sessions that start after
-the change.
+A session loads the policy when it starts. Before each read and each decision, the
+session compares the policy stamp with the stamp that it loaded. When a different session
+changed a policy entry, or the root's `policy/*.rego` changed, the session loads the
+policy again and computes its read filter again. See "Access freshness" below.
 
 `[gates] max_enforced_rules` in `grants.toml` is a ceiling on the enforced rules of one
 domain. There is no ceiling by default. `amem` counts the enforced rules of a domain from
@@ -643,6 +644,57 @@ through, and how often the rule advised.
 With `--file`, `amem policy lint` files a task for the owner for each finding, except
 for a module that is not yet verified. Thus an unused rule goes to the owner. `amem` looks
 at the full decision log, not at one review period.
+
+## Access freshness
+
+A session is valid only while its authority is what the session started with. `amem`
+does these checks before each read through the read filter, each decision, each spend
+check, each call of a hosted tool, each import, and each request through the egress:
+
+- **The grants.** `amem` reads `grants.toml` and compares its digest with the digest
+  from the start of the session. If the file changed, the session stops: each call
+  gives `stopped: the grants changed after this session started`. A new session starts
+  under the grants as they are. If the file has its first text again, the session is
+  valid again. If `amem` cannot read the file, it refuses the call.
+- **The policy.** `state/policy.stamp` changes when a session writes, promotes or erases
+  a policy entry, replaces a policy entry with an entry of any type, imports a bundle,
+  resets the rules, or builds the index again (`amem reindex`, `amem materialize`).
+  The stamp also includes the digest of the root's `policy/*.rego`. When the stamp is
+  not the stamp that the session loaded, the session loads the policy again. The read
+  filter of the session has the version of the policy that computed it, and `amem`
+  computes it again for a new version. If the policy does not load, `amem` refuses the
+  call.
+- **Expiry.** `amem` compares the expiry of an exception with the clock at each
+  decision. An exception that was in force when the policy loaded lets nothing through
+  after its expiry.
+
+`recall` with a deputy does one more check. When the brief is ready, `amem` computes the
+read filter again. If the filter is not the filter that the pack was read under, `amem`
+withholds the brief.
+
+A tunnel that is open when its session stops does not stay open. The egress asks each
+second if the session is valid, and closes the tunnel when it is not.
+
+The board is the owner's session. When its session stops, the board opens a new session
+under the grants as they are. When the board cannot open one, for example because
+`grants.toml` does not parse, it answers each request with status 403 and the reason.
+It also refuses the files of a bundle that it exported before.
+
+The read filter of a session is computed again only for a new version of the policy.
+The expiry of an exception does not make a new version. Thus a root policy whose read
+filter reads the exceptions keeps its filter after an expiry, until the stamp changes.
+The built-in read filter does not read the exceptions. An advisory rule also reports
+with the exceptions as they were when the policy loaded.
+
+`amem` does not look for which grant changed: any change to `grants.toml` stops each
+open session of that record.
+
+The check is before the read. A read that waits, for example on the index, does not
+check again before it gives its answer. Only `recall` with a deputy does.
+
+Some commands of the owner and of the launcher do not do the check: for example
+`amem transcript`, `amem tape`, `amem source`, `amem quarantine`, `amem taint`,
+`amem policy lint` and `amem policy reset`. No memory tool is in this group.
 
 ## The states of a task, and its claim: `amem task`
 

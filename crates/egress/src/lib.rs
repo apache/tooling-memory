@@ -235,6 +235,8 @@ struct Inner {
     /// How long a tunnel has for the TLS hellos the egress reads, [`hello::HELLO_WAIT`]
     /// outside a test.
     hello_wait: std::time::Duration,
+    /// How often an open tunnel asks whether its session is still valid.
+    stop_check: std::time::Duration,
 }
 
 /// How the egress resolves a tunnel's host and dials it: the system's resolver and TCP,
@@ -377,6 +379,7 @@ impl Egress {
                 telemetry,
                 network: Arc::new(SystemNetwork),
                 hello_wait: hello::HELLO_WAIT,
+                stop_check: std::time::Duration::from_secs(1),
             }),
         })
     }
@@ -399,6 +402,10 @@ impl Egress {
         body: Bytes,
     ) -> Result<Relayed, Error> {
         let inner = &self.inner;
+        inner
+            .memory
+            .fresh()
+            .map_err(|e| Error::Refused(e.to_string()))?;
         let dest = inner
             .tools
             .get(tool)
@@ -834,13 +841,23 @@ fn over_budget(inner: &Inner, destination: &str) -> Option<String> {
         .telemetry
         .spent(destination, None, Some(day_ago))
         .unwrap_or(0);
+    // a check that cannot be made is a refusal: a session that has stopped, or a
+    // policy that does not evaluate, sends nothing
     match inner.memory.check_spend(destination, session, day) {
         Ok(d) if !d.allow => Some(d.reason),
-        _ => None,
+        Ok(_) => None,
+        Err(e) => Some(e.to_string()),
     }
 }
 
 fn admit(inner: &Inner, destination: &str) -> Result<Destination, Box<Response>> {
+    if let Err(e) = inner.memory.fresh() {
+        return Err(Box::new(error_json(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &e.to_string(),
+        )));
+    }
     let Some(dest) = inner.destinations.get(destination) else {
         return Err(Box::new(error_json(
             StatusCode::NOT_FOUND,
@@ -1033,6 +1050,9 @@ async fn tunnel_for(
             message,
         ))
     };
+    if let Err(e) = inner.memory.fresh() {
+        return Err(refuse(&e.to_string()));
+    }
     let Some((host, port)) = host_and_port(authority) else {
         return Err(Box::new(error_json(
             StatusCode::BAD_REQUEST,
@@ -1110,7 +1130,24 @@ async fn connect_or_not_found(State(egress): State<Egress>, mut req: Request) ->
             }
             Err(Stop::Ended) => return,
         };
-        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        // an open tunnel is the session's still: it carries bytes only while the session
+        // is valid, and is closed when the session stops
+        let stopped = async {
+            loop {
+                tokio::time::sleep(inner.stop_check).await;
+                if inner.memory.fresh().is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+            () = stopped => {
+                eprintln!("egress: tunnel to {host}: the session stopped; closed");
+                let _ = inbound.shutdown().await;
+                let _ = outbound.shutdown().await;
+            }
+        }
         let _ = inner.telemetry.record(
             started,
             &session,
@@ -1881,6 +1918,56 @@ mod tests {
             e.call("nowhere", "v1/x", &serde_json::json!({})).await,
             Err(Error::Refused(_))
         ));
+    }
+
+    /// A session whose grants changed has stopped: no model call of it leaves, by the
+    /// library or by the router.
+    #[tokio::test]
+    async fn a_stopped_session_sends_no_model_call() {
+        let fake = Router::new().route(
+            "/v1/chat/completions",
+            any(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":4,"completion_tokens":2}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("m");
+        Memory::init(&root, "human:test:me", "dom-me").unwrap();
+        let m = Arc::new(Memory::open(&root).unwrap().with_author("agent:a"));
+        let mut d = HashMap::new();
+        d.insert(
+            "openai".to_string(),
+            Destination::forward(format!("http://{addr}"), Auth::PassThrough),
+        );
+        let e = Egress::new(m, d, &dir.path().join("t.db")).unwrap();
+        let ask = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        let grants = root.join("grants.toml");
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("{text}\n# the owner changed the grants\n")).unwrap();
+        assert!(e.call("openai", "v1/chat/completions", &ask).await.is_err());
+        let r = e
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/openai/v1/chat/completions")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(ask.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let said = String::from_utf8_lossy(&body);
+        assert!(said.contains("stopped"), "{said}");
     }
 
     #[tokio::test]
@@ -3553,6 +3640,33 @@ mod tests {
         c.read_exact(&mut body).await.unwrap();
         answer.push_str(&String::from_utf8_lossy(&body));
         (answer, c)
+    }
+
+    /// A tunnel that is open when its session stops is closed: a harness that keeps a
+    /// connection alive sends nothing more through it.
+    #[tokio::test]
+    async fn an_open_tunnel_is_closed_when_its_session_stops() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, _) = echo_upstream().await;
+        let entry = format!("127.0.0.1:{}", addr.port());
+        let (d, mut e) = fixture(Some(("github", Destination::tunnel([entry])))).await;
+        Arc::get_mut(&mut e.inner).unwrap().stop_check = std::time::Duration::from_millis(50);
+        let egress = serve(&e).await;
+        let (head, mut c) = connect(egress, &addr.to_string()).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        echoes(&mut c, "127.0.0.1").await;
+        let grants = d.path().join("m").join(dm_server::GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("{text}\n# a change\n")).unwrap();
+        let (rest, closed) = until_closed(&mut c).await;
+        assert!(closed, "the tunnel stayed open after the session stopped");
+        assert_eq!(rest, b"");
+        // and nothing written now comes back
+        let _ = c.write_all(b"sent after the session stopped").await;
+        assert_eq!(until_closed(&mut c).await.0, b"");
+        // nor does a new tunnel open
+        let (head, _) = connect(egress, &addr.to_string()).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
     }
 
     #[tokio::test]

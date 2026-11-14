@@ -316,6 +316,8 @@ impl Memory {
         entries.extend(unnamed);
         self.index.lock().await.rebuild_domain(&domain, entries)?;
         out.ledger_events = self.ledger.lock().await.rebuild().await?;
+        // the policy is compiled from the index, which this changed
+        self.reload_policy().await?;
         Ok(out)
     }
 }

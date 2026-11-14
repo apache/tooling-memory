@@ -277,6 +277,22 @@ impl Index {
         Index::init(conn)
     }
 
+    /// An index that exists, opened to read: nothing is created or changed, and a
+    /// writer elsewhere is waited for only briefly. For a reader that may be called
+    /// while another handle of the same process is at work.
+    ///
+    /// # Errors
+    ///
+    /// When the file is not there or cannot be opened.
+    pub fn open_reader(path: &Path) -> Result<Index, Error> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        Ok(Index { conn })
+    }
+
     /// An index that lives only in memory.
     ///
     /// # Errors

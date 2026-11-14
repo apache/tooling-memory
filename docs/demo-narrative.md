@@ -220,8 +220,14 @@ example.com. After `agent:reader` has read internal entries, it can reach only t
 hosts, because a URL could leak what it read. The repeated fetch comes from the stored
 copy. Nothing leaves.
 
-**3.12 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
-finds one hit. Your own search reaches the cap of 50 results.
+**3.12 A grant withdrawn.** `agent:a` has an open session and searches. You lower the
+handling of the record to public. The next search of that session is refused, and so is
+its next write: the session stops. A new session of `agent:a` starts under the new
+grants and finds no hit, because the record has no public entry. Then the demo puts the
+grants back.
+
+**3.13 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
+finds no hit. Your own search reaches the cap of 50 results.
 
 ## Act 4 · The task fabric
 

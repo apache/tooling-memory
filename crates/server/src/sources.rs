@@ -218,6 +218,8 @@ impl Memory {
     /// [`Error::Tool`] when the tool fails or a request it needed was refused, with
     /// what it said withheld when the scan finds anything in that.
     pub async fn use_tool(self: &Arc<Self>, tool: &str, args: Value) -> Result<Value, Error> {
+        // a stored source is released under the same check as a search
+        self.fresh()?;
         self.definition_allows(tool).await?;
         let (grant, label) = self.tool_grant(tool)?;
         let id = source_id(tool, &args);
