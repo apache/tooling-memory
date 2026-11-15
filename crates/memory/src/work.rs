@@ -37,6 +37,11 @@ pub struct Options {
     pub prefetch: bool,
     /// Claim this task rather than the next one, and stop after it.
     pub task: Option<String>,
+    /// Fill this position before the first claim.
+    pub position: Option<String>,
+    /// Before each claim, fill the first position that waits for this session, and
+    /// leave it when the task is settled.
+    pub wake: bool,
 }
 
 /// How to mine after a task.
@@ -254,6 +259,10 @@ fn muse_answer(jsonl: &str) -> Option<String> {
 /// When the harness cannot be run or the memory server cannot be reached.
 pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
     let client = Arc::new(client(session.memory()).await?);
+    let memory = session.memory();
+    if let Some(name) = &options.position {
+        crate::positions::fill(&memory, name, options.domain.as_deref()).await?;
+    }
     let mut last = NOTHING_TO_DO;
     loop {
         // counted from before the claim until the task is settled: a launcher told to
@@ -262,17 +271,7 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
         let Ok(in_flight) = crate::stops::InFlight::enter() else {
             return Ok(last);
         };
-        let claimed = match &options.task {
-            Some(id) => client.claim(id, options.lease_seconds).await?,
-            // a worker only claims: rank is the ledger's, moved along dependency edges
-            // at admission and by triage's cycle, never by a worker on its way in
-            None => {
-                client
-                    .claim_next(options.domain.as_deref(), options.lease_seconds)
-                    .await?
-            }
-        };
-        let Some(task) = claimed else {
+        let Some(task) = next_task(&memory, &client, options).await? else {
             drop(in_flight);
             if !options.keep_going {
                 eprintln!("amem: nothing claimable");
@@ -290,28 +289,79 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
             client.release(&task.id, None).await.ok();
             return Ok(last);
         }
-        last = one(session, &client, &task, options).await?;
+        let ran = one(session, &client, &task, options).await;
+        if options.wake {
+            // the task is settled, or the run failed: the next claim wakes a position
+            // afresh, and this session is in none until then
+            memory.vacate();
+        }
+        last = ran?;
         drop(in_flight);
         if options.task.is_some() {
             return Ok(last);
         }
-        if let Some(plan) = options
-            .mine
-            .as_ref()
-            .filter(|_| !dm_sandbox::stop::stopping())
-        {
-            let via = if plan.via_harness {
-                crate::MineVia::Harness
-            } else {
-                crate::MineVia::Api
-            };
-            if let Err(e) = session.mine(plan.model.as_deref(), via).await {
-                eprintln!("amem: mining failed: {e}");
-            }
-        }
+        mine_after(session, options).await;
         if !options.keep_going {
             return Ok(last);
         }
+    }
+}
+
+/// The task to run next: the one named, or the next one the ledger gives this session.
+/// With `wake`, the session fills each position that waits for it, in turn, and claims
+/// in that position's domain, until one gives a task; when none does, it claims nothing
+/// and is in no position.
+async fn next_task(
+    memory: &Memory,
+    client: &MemoryClient,
+    options: &Options,
+) -> Fallible<Option<Task>> {
+    if let Some(id) = &options.task {
+        return Ok(client.claim(id, options.lease_seconds).await?);
+    }
+    if !options.wake {
+        // a worker only claims: rank is the ledger's, moved along dependency edges at
+        // admission and by triage's cycle, never by a worker on its way in
+        return Ok(client
+            .claim_next(options.domain.as_deref(), options.lease_seconds)
+            .await?);
+    }
+    for woken in crate::positions::waiting(memory, options.domain.as_deref()).await? {
+        crate::positions::wake(memory, &woken).await?;
+        let claimed = client
+            .claim_next(Some(&woken.domain), options.lease_seconds)
+            .await;
+        if let Ok(Some(task)) = claimed {
+            return Ok(Some(task));
+        }
+        // nothing of this position is this session's to claim: it leaves the position,
+        // so one such position does not keep it from the next that waits
+        memory.vacate();
+        claimed?;
+        eprintln!(
+            "amem: nothing of {} is claimable by this session",
+            woken.position
+        );
+    }
+    Ok(None)
+}
+
+/// Mine the transcript after a task, when the options say so and no stop came.
+async fn mine_after(session: &Session, options: &Options) {
+    let Some(plan) = options
+        .mine
+        .as_ref()
+        .filter(|_| !dm_sandbox::stop::stopping())
+    else {
+        return;
+    };
+    let via = if plan.via_harness {
+        crate::MineVia::Harness
+    } else {
+        crate::MineVia::Api
+    };
+    if let Err(e) = session.mine(plan.model.as_deref(), via).await {
+        eprintln!("amem: mining failed: {e}");
     }
 }
 

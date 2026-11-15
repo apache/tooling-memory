@@ -269,7 +269,7 @@ pub struct PromoteParams {
 pub struct WriteParams {
     /// The Markdown body. Required.
     pub body: String,
-    /// decision, fact, convention, method, or handoff. Default fact.
+    /// decision, fact, convention, method, handoff, policy, or position. Default fact.
     #[serde(default)]
     pub entry_type: Option<String>,
     /// A title; else the body's first heading.
@@ -304,7 +304,8 @@ pub struct ListParams {
     /// A granted domain. Omit for every granted domain.
     #[serde(default)]
     pub domain: Option<String>,
-    /// decision, fact, convention, method, or handoff. Omit for every kind.
+    /// decision, fact, convention, method, handoff, policy, or position. Omit for every
+    /// kind.
     #[serde(default)]
     pub kind: Option<String>,
     /// How many, 1 to 100. Default 10.
@@ -346,6 +347,43 @@ pub struct CreateTaskParams {
     /// Checks that say this task is done, in place of its definition's.
     #[serde(default)]
     pub acceptance: Vec<String>,
+    /// The position this task is pinned to, `pos-<name>`: only a session that fills
+    /// the position claims the task. Give `pin_reason` with it.
+    #[serde(default)]
+    pub position: Option<String>,
+    /// Why the task is pinned: continuity, relationship, or separation.
+    #[serde(default)]
+    pub pin_reason: Option<String>,
+}
+
+/// Parameters of `position`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct PositionParams {
+    /// The position's name, `pos-<name>`.
+    pub name: String,
+    /// A granted domain; the one that holds the position when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters of `positions`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct PositionsParams {
+    /// A granted domain. Omit for every granted domain.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters of `retire_position`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct RetirePositionParams {
+    /// The position's name, `pos-<name>`.
+    pub name: String,
+    /// Why it is retired: words on one line. The retiring entry keeps them.
+    pub why: String,
+    /// A granted domain; the one that holds the position when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 /// Parameters that name a task.
@@ -578,6 +616,8 @@ const READS: &[&str] = &[
     "task_tree",
     "get_task",
     "list_tasks",
+    "position",
+    "positions",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -870,7 +910,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "File a task on the ledger. It is born proposed and becomes claimable once the owner admits it."
+        description = "File a task on the ledger. It is born proposed and becomes claimable once the owner admits it. With `position` and `pin_reason` the task is pinned: only a session that fills that position claims it."
     )]
     async fn create_task(
         &self,
@@ -890,7 +930,8 @@ impl McpServer {
             priority: p.priority.unwrap_or(0),
             definition: p.definition,
             acceptance: p.acceptance,
-            ..dm_ledger::TaskSpec::default()
+            position: p.position,
+            pin_reason: parse("pin_reason", p.pin_reason)?,
         };
         let c = self.memory.create_task(spec).await.map_err(mcp_err)?;
         // what a task that stays proposed lacks goes back to whoever filed it
@@ -1125,6 +1166,47 @@ impl McpServer {
             .map_err(mcp_err)?;
         ok(json!({ "tasks": tasks }))
     }
+
+    #[tool(
+        description = "One position: its charter and authority envelope, its open commitments (the open tasks pinned to it), its handoff cache, and the sessions that hold a task from it. `seat` is present when this session fills the position, and says whether it is seconded."
+    )]
+    async fn position(&self, p: Parameters<PositionParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let view = self
+            .memory
+            .position(&p.name, p.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!(view))
+    }
+
+    #[tool(
+        description = "The positions of a domain, newest first: for each, whether it is active or retired, how many open tasks are pinned to it, which of them wait, the sessions live in it, and whether it needs a session started. An entry that is not in force says why."
+    )]
+    async fn positions(&self, p: Parameters<PositionsParams>) -> Result<CallToolResult, McpError> {
+        let listed = self
+            .memory
+            .positions(p.0.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "positions": listed }))
+    }
+
+    #[tool(
+        description = "Retire a position, as the owner of the record: its tasks lose their pin and return to matching, and its history stays under its name. `why` is words on one line."
+    )]
+    async fn retire_position(
+        &self,
+        p: Parameters<RetirePositionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let retired = self
+            .memory
+            .retire_position(&p.name, &p.why, p.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!(retired))
+    }
 }
 
 const INSTRUCTIONS: &str = "This is your memory. Start by loading T0 for your domain (the `t0` tool or the memory://t0/<domain> resource). \
@@ -1336,6 +1418,9 @@ mod tests {
             "task_tree",
             "retry_task",
             "promotions",
+            "position",
+            "positions",
+            "retire_position",
         ] {
             assert!(
                 names.contains(&expected),
@@ -2012,5 +2097,226 @@ mod tests {
         );
         assert!(none["task"].is_null(), "{none}");
         assert_eq!(s.memory.label(), dm_core::Label::Public);
+    }
+
+    const RELEASE: &str = "pos-release";
+
+    /// Write the position `pos-release`, which `codex` fills, through the `write` tool,
+    /// and leave it as a person other than its proposer would: verified.
+    async fn release_position(s: &McpServer) -> String {
+        let block = "```position pos-release\n[charter]\norders = \"Each release is cut from main.\"\ncovers = []\nagent = \"codex\"\n\n[envelope]\ntools = []\nhandling = \"restricted\"\n```\n";
+        let written = payload(
+            &s.write(Parameters(WriteParams {
+                body: format!("# The release coordinator\n\n{block}"),
+                entry_type: Some("position".into()),
+                ..WriteParams::default()
+            }))
+            .await
+            .unwrap(),
+        );
+        let id = written["id"].as_str().unwrap().to_string();
+        let mut e = s.memory.store.get("dom-me", &id).await.unwrap().unwrap();
+        e.front.trust_tier = dm_core::TrustTier::Verified;
+        s.memory.store.put(&e).await.unwrap();
+        id
+    }
+
+    fn pinned(title: &str, position: Option<&str>, reason: Option<&str>) -> CreateTaskParams {
+        CreateTaskParams {
+            title: title.into(),
+            body: "Do it.".into(),
+            position: position.map(str::to_string),
+            pin_reason: reason.map(str::to_string),
+            ..CreateTaskParams::default()
+        }
+    }
+
+    /// File a task pinned to `pos-release` for continuity, and admit it.
+    async fn admitted_pinned(s: &McpServer, title: &str) -> String {
+        let filed = s
+            .create_task(Parameters(pinned(title, Some(RELEASE), Some("continuity"))))
+            .await
+            .unwrap();
+        let filed = payload(&filed);
+        assert_eq!(filed["task"]["position"], RELEASE, "{filed}");
+        assert_eq!(filed["task"]["pin_reason"], "continuity", "{filed}");
+        let id = filed["task"]["id"].as_str().unwrap().to_string();
+        s.admit_task(Parameters(TaskIdParams { id: id.clone() }))
+            .await
+            .unwrap();
+        id
+    }
+
+    fn refusal<T>(r: Result<T, McpError>) -> McpError {
+        match r {
+            Err(e) => e,
+            Ok(_) => panic!("it was allowed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_task_refuses_half_a_pin_and_an_unknown_reason_as_invalid_params() {
+        let (_dir, s) = server().await;
+        release_position(&s).await;
+        let invalid = McpError::invalid_params("x", None).code;
+        let no_reason = refusal(
+            s.create_task(Parameters(pinned("Announce", Some(RELEASE), None)))
+                .await,
+        );
+        assert_eq!(no_reason.code, invalid);
+        assert!(
+            no_reason
+                .message
+                .contains("a pin names a position and gives a reason"),
+            "{}",
+            no_reason.message
+        );
+        let unknown = refusal(
+            s.create_task(Parameters(pinned("Announce", Some(RELEASE), Some("habit"))))
+                .await,
+        );
+        assert_eq!(unknown.code, invalid);
+        assert!(
+            unknown.message.starts_with("pin_reason:") && unknown.message.contains("\"habit\""),
+            "{}",
+            unknown.message
+        );
+        let none = payload(
+            &s.list_tasks(Parameters(ListTasksParams {
+                status: Some("proposed".into()),
+                ..ListTasksParams::default()
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(none["tasks"], json!([]), "a refused task is not filed");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_task_is_refused_to_a_claim_from_outside_its_position() {
+        let (_dir, s) = server().await;
+        release_position(&s).await;
+        let id = admitted_pinned(&s, "Announce release 1.4").await;
+        let refused = refusal(
+            s.claim(Parameters(LeaseParams {
+                id: id.clone(),
+                lease_seconds: Some(60),
+            }))
+            .await,
+        );
+        assert_eq!(refused.code, McpError::invalid_params("x", None).code);
+        assert!(
+            refused.message.contains("pinned to position pos-release"),
+            "{}",
+            refused.message
+        );
+        let next = payload(
+            &s.claim_next(Parameters(ClaimNextParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(next["task"].is_null(), "{next}");
+    }
+
+    #[tokio::test]
+    async fn positions_lists_a_verified_position_with_what_waits_on_it() {
+        let (_dir, s) = server().await;
+        let entry = release_position(&s).await;
+        let id = admitted_pinned(&s, "Announce release 1.4").await;
+        let listed = payload(
+            &s.positions(Parameters(PositionsParams::default()))
+                .await
+                .unwrap(),
+        );
+        let row = &listed["positions"][0];
+        assert_eq!(listed["positions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(row["name"], RELEASE, "{listed}");
+        assert_eq!(row["entry"], entry, "{listed}");
+        assert_eq!(row["state"], "active", "{listed}");
+        assert_eq!(row["agent"], "codex", "{listed}");
+        assert_eq!(row["pinned"], 1, "{listed}");
+        assert_eq!(row["waiting"], json!([id]), "{listed}");
+        assert_eq!(row["wake"], true, "{listed}");
+        // both tools only read the record: a re-run that diverged still serves them
+        assert_eq!(kind_of("position"), tape::Kind::Read);
+        assert_eq!(kind_of("positions"), tape::Kind::Read);
+        assert_eq!(kind_of("retire_position"), tape::Kind::Mutation);
+    }
+
+    #[tokio::test]
+    async fn position_shows_a_verified_position_with_its_commitments() {
+        let (_dir, s) = server().await;
+        let entry = release_position(&s).await;
+        let id = admitted_pinned(&s, "Announce release 1.4").await;
+        let view = payload(
+            &s.position(Parameters(PositionParams {
+                name: RELEASE.into(),
+                domain: Some("dom-me".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(view["name"], RELEASE, "{view}");
+        assert_eq!(view["entry"], entry, "{view}");
+        assert_eq!(view["charter"]["agent"], "codex", "{view}");
+        assert_eq!(view["envelope"]["handling"], "restricted", "{view}");
+        assert_eq!(view["commitments"][0]["id"], id, "{view}");
+        assert_eq!(view["handoffs"], json!([]), "{view}");
+        assert!(view.get("seat").is_none(), "{view}");
+        let missing = refusal(
+            s.position(Parameters(PositionParams {
+                name: "pos-none".into(),
+                domain: None,
+            }))
+            .await,
+        );
+        assert!(missing.message.contains("pos-none"), "{}", missing.message);
+    }
+
+    #[tokio::test]
+    async fn retire_position_is_the_owner_s_and_unpins_the_tasks() {
+        let (dir, s) = server().await;
+        release_position(&s).await;
+        let id = admitted_pinned(&s, "Announce release 1.4").await;
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:codex (model: test-1)");
+        let agent = McpServer::new(Arc::new(agent));
+        let retire = || {
+            Parameters(RetirePositionParams {
+                name: RELEASE.into(),
+                why: "the release train ended".into(),
+                domain: None,
+            })
+        };
+        let refused = refusal(agent.retire_position(retire()).await);
+        assert_eq!(refused.code, McpError::invalid_params("x", None).code);
+        assert!(
+            refused.message.contains("only the owner"),
+            "{}",
+            refused.message
+        );
+        let retired = payload(&s.retire_position(retire()).await.unwrap());
+        assert_eq!(retired["position"], RELEASE, "{retired}");
+        assert_eq!(retired["unpinned"], json!([id]), "{retired}");
+        let listed = payload(
+            &s.positions(Parameters(PositionsParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(listed["positions"][0]["state"], "retired", "{listed}");
+        assert_eq!(listed["positions"][0]["entry"], retired["retired_by"]);
+        // the task returned to matching: a session in no position claims it
+        let claimed = payload(
+            &agent
+                .claim(Parameters(LeaseParams {
+                    id: id.clone(),
+                    lease_seconds: Some(60),
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(claimed["task"]["id"], id, "{claimed}");
+        assert!(claimed["task"].get("position").is_none(), "{claimed}");
     }
 }

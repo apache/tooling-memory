@@ -71,6 +71,18 @@ term here in the same commit as the first document that needs it.
 | late handoff | A handoff that a holder leaves on a task after its claim is over | |
 | attempt key | A key that a caller makes for one claim or one completion. The same key asked again gives the same result, and the ledger does the operation one time | idempotency key, request id |
 | task definition | The record in the platform domain for one kind of work: its purpose, its tools, its acceptance checks and its outputs. A task names one as `<name>@<version>` | task type, task template |
+| position | The record for one standing role: an entry of type `position` with a charter and an authority envelope, named `pos-<name>`. It is in force when a person verified its entry | seat, role (for a position), slot, post |
+| charter | The part of a position that gives its standing orders, the task definitions that it covers, and the agent definition that fills it | mandate, job description |
+| authority envelope | The part of a position that gives the most that a session in it may do: the tools and the handling. "The envelope" after the first use | scope (for the envelope), permissions |
+| agent definition | The name of one kind of agent: the name in the author of a session, `codex` for `agent:codex`. An `agent` artifact of the platform domain has the same name. A charter names one | agent type, persona |
+| pin | The field of a task that names a position. Only a session that fills the position claims a pinned task. To pin a task is to file it with a pin | assignment, binding |
+| pin reason | Why a task is pinned: `continuity`, `relationship` or `separation` | pin type |
+| commitment | An open task that is pinned to a position | obligation, duty |
+| handoff cache | The newest handoffs that cite a position, which a session in the position gets first in T0 | handoff history, position memory |
+| seconded session | A session that fills a position under an agent definition that the charter does not name. It reads the position and does its tasks, and it does not write the position's history | substitute (for a seconded session), stand-in |
+| fill (a position) | What a session does when a launcher puts it in a position: it then claims the position's tasks under the authority envelope | occupy, take, assume |
+| wake (a position) | To start a session in a position that has a task that waits and no live session | spawn (for a wake), summon |
+| retire (a position) | What the owner does to end a position: its tasks lose their pin, and its history stays in the record | delete (for retire), close (for retire) |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |

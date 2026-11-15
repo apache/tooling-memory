@@ -698,6 +698,11 @@ fn file_task(root: &Path, title: &str) -> String {
 }
 
 fn work(root: &Path, bins: &Path, workdir: &Path) -> Output {
+    work_with(root, bins, workdir, &[])
+}
+
+/// `amem work` as [`work`] runs it, with more flags.
+fn work_with(root: &Path, bins: &Path, workdir: &Path, flags: &[&str]) -> Output {
     let mut cmd = memory();
     cmd.args([
         "--root",
@@ -715,6 +720,7 @@ fn work(root: &Path, bins: &Path, workdir: &Path) -> Output {
         "--lease-seconds",
         "60",
     ]);
+    cmd.args(flags);
     cmd.env("PATH", path_with(bins));
     cmd.env("ANTHROPIC_API_KEY", "sk-ant-placeholder");
     cmd.stdin(Stdio::null());
@@ -801,6 +807,291 @@ fn work_with_nothing_claimable_says_so() {
     let out = work(&root, &bins, &work_dir);
     assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing claimable"));
+}
+
+/// Write a position that `agent` fills, as the owner, and verify it: an agent proposes
+/// it, and the owner approves the proposal. The fake harness is `claude`, so a session
+/// of `amem work` runs under the agent definition `claude`.
+fn verified_position(root: &Path, name: &str, agent: &str) {
+    let body = format!(
+        "# A coordinator\n\n```position {name}\n[charter]\norders = \"Each release is cut from main, after the mirrors are checked.\"\ncovers = []\nagent = \"{agent}\"\n\n[envelope]\ntools = []\nhandling = \"restricted\"\n```\n"
+    );
+    let written = cli(
+        root,
+        &[
+            "write", "--kind", "position", "--title", name, "--body", &body,
+        ],
+    );
+    let entry = written["id"].as_str().unwrap();
+    let curator = dm_server::Memory::open(root)
+        .unwrap()
+        .with_author("agent:curator");
+    let proposed = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(curator.promote(
+            entry,
+            dm_core::TrustTier::Verified,
+            "read against the charter",
+        ))
+        .unwrap();
+    let dm_server::Promotion::Proposed { task } = proposed else {
+        panic!("the agent's promotion to verified is a proposal");
+    };
+    drop(curator);
+    cli(root, &["approve", &task.id]);
+}
+
+/// File a task pinned to the position `name` for continuity, and admit it.
+fn pinned_task(root: &Path, name: &str, title: &str) -> String {
+    let t = cli(
+        root,
+        &[
+            "task",
+            "create",
+            title,
+            "--body",
+            "Tell the list.",
+            "--position",
+            name,
+            "--pin-reason",
+            "continuity",
+        ],
+    );
+    let id = t["id"].as_str().unwrap().to_string();
+    cli(root, &["task", "admit", &id]);
+    id
+}
+
+/// A root with a fake harness that completes its task and keeps its arguments, and a
+/// working tree: the root, the harness's directory, the working tree.
+fn root_for_positions(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let root = init_root(dir);
+    let bins = fake_harness(
+        dir,
+        &format!("echo \"args=$*\" > ./fake.out\n{COMPLETES_ITS_TASK}"),
+    );
+    let work_dir = dir.join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    (root, bins, work_dir)
+}
+
+/// What `amem work` with `flags` said on standard error, when it ended with `code`.
+fn worked(root: &Path, bins: &Path, work_dir: &Path, flags: &[&str], code: i32) -> String {
+    let out = work_with(root, bins, work_dir, flags);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(code), "{flags:?}: {stderr}");
+    stderr
+}
+
+fn status_of(root: &Path, id: &str) -> String {
+    cli(root, &["task", "get", id])["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn work_wake_fills_the_position_that_waits_and_its_handoff_goes_to_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, bins, work_dir) = root_for_positions(dir.path());
+    verified_position(&root, "pos-release", "claude");
+    let id = pinned_task(&root, "pos-release", "Announce release 1.4");
+
+    // a worker that no one put in the position does not get the pinned task
+    let stderr = worked(&root, &bins, &work_dir, &[], 3);
+    assert!(stderr.contains("nothing claimable"), "{stderr}");
+    assert_eq!(status_of(&root, &id), "open");
+
+    let stderr = worked(&root, &bins, &work_dir, &["--wake"], 0);
+    let woke = format!("amem: woke pos-release for {id}");
+    assert!(stderr.contains(&woke), "{stderr}");
+    assert!(stderr.contains(&format!("claimed {id}")), "{stderr}");
+    let t = cli(&root, &["task", "get", &id]);
+    assert_eq!(t["status"], "done", "{t}");
+    let h = t["handoff"].as_str().unwrap();
+    // the harness's session was in the position: its T0 held the position's slice, and
+    // the handoff it wrote cites the position without the harness saying so
+    let args = std::fs::read_to_string(work_dir.join("fake.out")).unwrap();
+    assert!(args.contains("## Position pos-release"), "{args}");
+    let shown = cli(&root, &["position", "show", "pos-release"]);
+    assert_eq!(shown["handoffs"][0]["id"], h, "{shown}");
+    assert_eq!(shown["commitments"], serde_json::json!([]), "{shown}");
+    let e = cli_text(&root, &["get", h]);
+    assert!(e.contains("pos-release"), "{e}");
+
+    // nothing waits now: a second wake fills nothing and claims nothing
+    let stderr = worked(&root, &bins, &work_dir, &["--wake"], 3);
+    assert!(!stderr.contains("woke"), "{stderr}");
+    assert!(stderr.contains("nothing claimable"), "{stderr}");
+}
+
+#[test]
+fn work_in_a_position_of_another_agent_definition_is_seconded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, bins, work_dir) = root_for_positions(dir.path());
+    verified_position(&root, "pos-release", "codex");
+    let id = pinned_task(&root, "pos-release", "Announce release 1.4");
+
+    // the position waits for a session under codex: a wake of this harness fills nothing
+    let stderr = worked(&root, &bins, &work_dir, &["--wake"], 3);
+    let waits = "amem: pos-release waits for a session under codex";
+    assert!(stderr.contains(waits), "{stderr}");
+    assert!(!stderr.contains("claimed"), "{stderr}");
+    assert_eq!(status_of(&root, &id), "open");
+
+    // the operator names the position: the session is seconded, and does the task
+    let flags = ["--position", "pos-release"];
+    let stderr = worked(&root, &bins, &work_dir, &flags, 0);
+    let seconded = "amem: seconded to pos-release: its charter names codex";
+    assert!(stderr.contains(seconded), "{stderr}");
+    let t = cli(&root, &["task", "get", &id]);
+    assert_eq!(t["status"], "done", "{t}");
+    let args = std::fs::read_to_string(work_dir.join("fake.out")).unwrap();
+    assert!(args.contains("This session is seconded"), "{args}");
+    // its handoff is on its task, and the position's cache stays empty
+    let e = cli_text(&root, &["get", t["handoff"].as_str().unwrap()]);
+    assert!(!e.contains("pos-release"), "{e}");
+    let shown = cli(&root, &["position", "show", "pos-release"]);
+    assert_eq!(shown["handoffs"], serde_json::json!([]), "{shown}");
+}
+
+/// A position that is not in force ends the worker before it claims anything.
+#[test]
+fn work_in_a_position_that_is_not_in_force_claims_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, bins, work_dir) = root_for_positions(dir.path());
+    let id = file_task(&root, "Tidy");
+    let out = work_with(&root, &bins, &work_dir, &["--position", "pos-none"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("no position pos-none is in force"),
+        "{stderr}"
+    );
+    assert_eq!(status_of(&root, &id), "open");
+}
+
+/// A position whose task this session cannot claim does not keep a wake from the next
+/// position that waits: the session leaves the first, and fills the second.
+#[test]
+fn a_wake_goes_on_to_the_next_position_when_one_gives_it_no_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, bins, work_dir) = root_for_positions(dir.path());
+    verified_position(&root, "pos-b", "claude");
+    let ready = pinned_task(&root, "pos-b", "Work of pos-b");
+    // the wake list has the newest entry first: pos-a, which is written last
+    verified_position(&root, "pos-a", "claude");
+    let filed = cli(
+        &root,
+        &[
+            "task",
+            "create",
+            "Work of pos-a",
+            "--body",
+            "Needs a tool.",
+            "--require",
+            "tool:none",
+            "--position",
+            "pos-a",
+            "--pin-reason",
+            "continuity",
+        ],
+    );
+    let stuck = filed["id"].as_str().unwrap().to_string();
+    cli(&root, &["task", "admit", &stuck]);
+
+    let stderr = worked(&root, &bins, &work_dir, &["--wake"], 0);
+    let first = stderr.find(&format!("amem: woke pos-a for {stuck}"));
+    let gave_none = stderr.find("amem: nothing of pos-a is claimable by this session");
+    let second = stderr.find(&format!("amem: woke pos-b for {ready}"));
+    assert!(first.is_some() && first < gave_none, "{stderr}");
+    assert!(gave_none < second, "{stderr}");
+    assert_eq!(status_of(&root, &ready), "done");
+    assert_eq!(status_of(&root, &stuck), "open");
+    // the handoff went to the position the session was in when it wrote it
+    let shown = cli(&root, &["position", "show", "pos-a"]);
+    assert_eq!(shown["handoffs"], serde_json::json!([]), "{shown}");
+}
+
+/// A worker that wakes positions in a loop leaves each position when its task is
+/// settled, so it can fill the next one that waits.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_that_wakes_in_a_loop_leaves_one_position_before_it_fills_the_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, bins, work_dir) = root_for_positions(dir.path());
+    let mut ids = Vec::new();
+    for name in ["pos-a", "pos-b"] {
+        verified_position(&root, name, "claude");
+        ids.push(pinned_task(&root, name, &format!("Work of {name}")));
+    }
+    let err = dir.path().join("worker.err");
+    let mut worker = memory()
+        .args(["--root", root.to_str().unwrap(), "work"])
+        .args(["--harness", "claude", "--auth", "key", "--unconfined"])
+        .args(["--workdir", work_dir.to_str().unwrap()])
+        .args(["--lease-seconds", "60", "--wake", "--loop"])
+        .args(["--idle-seconds", "1"])
+        .env("PATH", path_with(&bins))
+        .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&err).unwrap())
+        .spawn()
+        .unwrap();
+    let said = || std::fs::read_to_string(&err).unwrap_or_default();
+    let done = |id: &String| cli(&root, &["task", "get", id])["status"] == "done";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while !ids.iter().all(done) {
+        if let Some(status) = worker.try_wait().unwrap() {
+            panic!(
+                "the worker ended ({status}) before both tasks were done:\n{}",
+                said()
+            );
+        }
+        if std::time::Instant::now() > deadline {
+            worker.kill().ok();
+            panic!("both tasks were not done in time:\n{}", said());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    signal(&worker, "TERM");
+    let status = exited(&mut worker, 60);
+    let said = said();
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + 15), "{said}");
+    for (name, id) in ["pos-a", "pos-b"].iter().zip(&ids) {
+        assert!(
+            said.contains(&format!("amem: woke {name} for {id}")),
+            "{said}"
+        );
+    }
+}
+
+/// `--position` and `--wake` do not reach the launcher inside the egress container of
+/// the `wslc` backend, so `amem work` refuses them there before anything runs.
+#[test]
+fn work_refuses_a_position_on_the_wslc_backend_in_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    for flags in [&["--wake"][..], &["--position", "pos-release"][..]] {
+        let out = memory()
+            .args(["--root", root.to_str().unwrap(), "work"])
+            .args(["--harness", "claude", "--auth", "key", "--backend", "wslc"])
+            .args(["--workdir", dir.path().to_str().unwrap()])
+            .args(flags)
+            .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+            // a path with no `wslc` on it: a launcher that did not refuse starts nothing
+            .env("PATH", dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("--position and --wake do not reach the `wslc` backend"),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]

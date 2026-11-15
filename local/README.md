@@ -836,6 +836,126 @@ Not built yet: the autonomy level has no effect, no suite gates a version of a
 definition, and the data scope is not enforced. An erasure of the entry of a definition
 does not remove the checks that tasks took from it.
 
+## Positions: `amem position`
+
+A position is the record for one standing role: for example, a release coordinator or
+the reviewer of a subsystem. It is an entry of type `position`. The body of the entry
+holds one fenced block with the info string `position pos-<name>`. The block is TOML:
+
+```toml
+[charter]
+orders = "Announce each release to the list after the mirrors carry it."
+covers = ["release"]
+agent = "codex"
+
+[envelope]
+tools = ["tool:fetch"]
+handling = "internal"
+```
+
+- The name on the fence is the identifier of the position. It starts with `pos-`, then
+  has lower-case letters, digits and hyphens. The id of the entry is the version.
+- `[charter] orders` gives the standing orders.
+- `[charter] covers` gives the names of the task definitions that the position takes.
+- `[charter] agent` gives the agent definition that fills the position: the name in the
+  author of a session, `codex` for `agent:codex`.
+- `[envelope] tools` gives the tools that a session in the position can call.
+- `[envelope] handling` gives the highest label that a session in the position reads.
+- `status = "retired"`, above `[charter]`, is in a version that retires the position.
+
+Write the entry with `amem write --kind position`. A position is in force when its
+entry is active and a person verified it. When two such entries define one name, the
+newer entry is in force. A block with a key that is not in this list defines no
+position. `amem position list` shows each entry and, when the entry is not in force, the
+reason.
+
+Pin a task to a position with `amem task create --position <name> --pin-reason
+<reason>`. The memory tool `create_task` takes `position` and `pin_reason`. The pin
+reason is one of three words:
+
+- `continuity`: the position holds open commitments that the task depends on.
+- `relationship`: the position holds a relationship with an outside project.
+- `separation`: the review must go to a position other than the author's.
+
+The ledger records the pin reason and does the same thing for each one. The memory
+server refuses a pin without a pin reason, and a pin to a position that is not in force.
+Only a session that fills the position claims a pinned task. `claim_next` does not
+give the task to a different session. When a different session asks for the task by its
+id, the ledger refuses, and the refusal names the position. A continuation in the same
+domain takes the pin of its parent. A subagent task and a retry do not.
+
+A session that fills a position gets these, and is held to them:
+
+- It claims the tasks that are pinned to the position, and the tasks without a pin whose
+  task definition the charter covers. It claims no other task.
+- It can call only the tools that the envelope holds. The grants and the task definition
+  can make that set smaller.
+- It reads no entry above the handling of the envelope.
+- Its T0 starts with the slice of the position: the charter, the authority envelope, the
+  open commitments and the handoff cache. A commitment is an open task that is pinned to
+  the position.
+- When it writes a handoff, the memory server adds the name of the position to the
+  citations of the handoff. The handoff cache is the newest five handoffs that cite the
+  position.
+- When the entry of the position is replaced, retired, demoted or erased, the session
+  cannot continue in the position. The memory server refuses its next claim and its next
+  T0. A handoff that it writes then does not get the citation. Start a new session.
+
+A session under an agent definition that the charter does not name is a seconded
+session. It claims the tasks of the position, and it reads what the position holds. It
+cannot write an entry that cites the position, so the handoff cache does not get its
+handoffs. A person has no agent definition, so a session of a person is always seconded.
+
+A session does not select its position. The operator names the position when the
+session starts, or the launcher finds one that waits:
+
+- With `amem serve --position <name>`, the session fills the position before the memory
+  server serves. The variable `MEMORY_POSITION` does the same. If the memory server
+  refuses the position, the command ends with the refusal.
+- With `amem work --position <name>`, the session fills the position before the first
+  claim.
+- `amem work --wake` reads which positions wait: each has a task that waits and no live
+  session. The session fills the first position whose charter names the agent definition
+  of this harness. It does one task and leaves the position. If that position gives it
+  no task, it leaves the position and fills the next one that waits. When no position
+  waits for this harness, the launcher claims nothing. It names each position that waits
+  for a different agent definition.
+
+`--position` and `--wake` do not work on the `wslc` sandbox backend. `amem work` refuses
+them there.
+
+`amem position show <name>` gives one position: the record, its open commitments, its
+handoff cache and the sessions that are live in it. A session is live in a position
+while it holds a lease on a task that it claimed from the position. The memory tools
+`position` and `positions` give the same answers to a session.
+
+The owner retires a position with `amem position retire <name> --why <text>`, or with
+the memory tool `retire_position`. The memory server writes a new version with
+`status = "retired"` and the reason. It takes the pin off each task of the position
+that is not closed, so any session that matches can claim those tasks. The entries that cite the
+position stay in the record. A retired position takes no session and no pin.
+
+Not built yet:
+
+- The platform's standing roles are not positions, and nothing makes a position when a
+  domain is registered.
+- No curator proposes a position, and an unused position does not go to its owner.
+- The memory server does not start a session when a pinned task is admitted. A person
+  or a scheduler runs `amem work --wake`.
+- A session that holds no lease is not seen as live, and two sessions can fill one
+  position at the same time.
+- The position is not in the principal chain, and not in the input of the policy.
+- No tap posts for a position.
+- Nothing checks that a `separation` pin names a position other than the author's.
+- The envelope has no data scope other than its handling.
+- While the next version of a position waits for review, no version is in force.
+- A retirement needs no second person.
+- A subagent that runs inside the harness writes as the session, so its handoffs cite
+  the position.
+- An import lands entries with their citations, so a bundle can bring entries that cite
+  a position.
+- A read of the handoff cache looks at the newest 200 handoffs of the domain only.
+
 ## The task fabric: `amem task rescore` and `stats`
 
 An L1 policy entry can carry the rubric that it compiles into, as a `[rubric]` table in
