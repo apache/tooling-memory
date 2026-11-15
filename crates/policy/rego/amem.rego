@@ -161,6 +161,15 @@ erase_decision := {"allow": false, "admit": false, "review": "human", "reason": 
 # leaves them as they are; a root's own policy narrows, for example agents to public:
 #
 #   read_filter := object.union(base_filter, {"handling": "public"}) if class == "agent"
+#
+# A root's own policy can also set "raw_reach" in `read_filter`, to "chain", "fleet" or
+# "all": which raw entries the session reads. "chain" is the raw entries that name a task
+# of the session's task chain; "fleet" is those and each raw entry that does not have the
+# reach of content from outside the fleet; "all" is every raw entry. This key can narrow
+# the default of the principal's class or widen it. Without the key the class decides: an
+# agent reads "fleet", and the owner, another person, a tap and the system read "all".
+#
+#   read_filter := object.union(base_filter, {"raw_reach": "chain"}) if class == "agent"
 base_filter := {
 	"domains": [d | some d, _ in data.grants.domains],
 	"handling": data.grants.handling,

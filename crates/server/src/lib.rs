@@ -1322,6 +1322,8 @@ impl Memory {
                 cites: req.cites,
                 // the log gives it, with the event that offers the entry
                 session: None,
+                reach: dm_core::Reach::Fleet,
+                task: None,
                 confidence: req.confidence,
                 trust_tier: tier,
                 review_by,

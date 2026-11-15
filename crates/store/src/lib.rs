@@ -683,6 +683,8 @@ mod tests {
                 created: datetime!(2026-10-01 10:00 UTC),
                 cites: vec![],
                 session: None,
+                reach: dm_core::Reach::Fleet,
+                task: None,
                 confidence: None,
                 trust_tier: TrustTier::Raw,
                 review_by: None,

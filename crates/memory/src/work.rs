@@ -824,6 +824,7 @@ mod tests {
             summary: summary.into(),
             score: 0.0,
             review_due: false,
+            reach: dm_core::Reach::Fleet,
         };
         let found = prefetch::Prefetched {
             query: "retry".into(),

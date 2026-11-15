@@ -47,6 +47,19 @@ impl Class {
             Class::System
         }
     }
+
+    /// Which raw entries a principal of this class reads when the policy does not say.
+    /// An agent reads the raw entries of the fleet and of its task chain. The owner,
+    /// another person, a tap and the system read all raw entries: a person looks at
+    /// content from outside the fleet before a session of the fleet reads it, and a tap
+    /// reads what it posts back.
+    #[must_use]
+    pub fn raw_reach(self) -> dm_core::RawReach {
+        match self {
+            Class::Agent => dm_core::RawReach::Fleet,
+            Class::Owner | Class::Human | Class::Tap | Class::System => dm_core::RawReach::All,
+        }
+    }
 }
 
 /// What is being asked.
@@ -412,11 +425,24 @@ pub struct ReadScope {
     pub handling: dm_core::Label,
     /// The lowest trust tier returned.
     pub min_tier: dm_core::TrustTier,
+    /// Which raw entries are readable, when the policy says: it can narrow the default
+    /// of the principal's class or widen it. Absent means that default.
+    #[serde(default)]
+    pub raw_reach: Option<dm_core::RawReach>,
 }
 
 impl ReadScope {
+    /// Which raw entries a principal of `class` reads under this scope: what the policy
+    /// gives, else the default of the class ([`Class::raw_reach`]).
+    #[must_use]
+    pub fn raw_reach_for(&self, class: Class) -> dm_core::RawReach {
+        self.raw_reach.unwrap_or_else(|| class.raw_reach())
+    }
+
     /// The filter the index applies: this scope intersected with what the grants
-    /// allow, so a policy can narrow a session's reads and never widen them.
+    /// allow, so a policy can narrow a session's reads and never widen them. The raw
+    /// reach and the chain of the granted filter stay as they are: the caller sets
+    /// them, from [`ReadScope::raw_reach_for`] and the task that the session holds.
     #[must_use]
     pub fn narrow(&self, granted: &dm_core::ReadFilter) -> dm_core::ReadFilter {
         let mut f = granted.clone();
@@ -1083,6 +1109,96 @@ mod tests {
         assert_eq!(scope.handling, g.handling);
         assert_eq!(scope.min_tier, dm_core::TrustTier::Raw);
         assert_eq!(scope.narrow(&g.read_filter()), g.read_filter());
+        assert_eq!(
+            scope.raw_reach, None,
+            "the built-in policy leaves the default"
+        );
+    }
+
+    const ALL_CLASSES: [Class; 5] = [
+        Class::Owner,
+        Class::Human,
+        Class::Agent,
+        Class::Tap,
+        Class::System,
+    ];
+
+    #[test]
+    fn an_agent_reads_the_raw_entries_of_the_fleet_and_each_other_class_reads_all() {
+        use dm_core::RawReach;
+        for class in ALL_CLASSES {
+            let want = if class == Class::Agent {
+                RawReach::Fleet
+            } else {
+                RawReach::All
+            };
+            assert_eq!(class.raw_reach(), want, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn the_raw_reach_is_the_policy_s_when_it_gives_one_and_else_the_default_of_the_class() {
+        use dm_core::RawReach;
+        let g = grants();
+        let builtin = Policy::builtin(&g).unwrap();
+        for class in ALL_CLASSES {
+            let scope = builtin.read_scope(&read_input(class)).unwrap();
+            assert_eq!(scope.raw_reach_for(class), class.raw_reach(), "{class:?}");
+        }
+        for given in [RawReach::Chain, RawReach::Fleet, RawReach::All] {
+            let scope = ReadScope {
+                domains: Vec::new(),
+                handling: dm_core::Label::Public,
+                min_tier: dm_core::TrustTier::Raw,
+                raw_reach: Some(given),
+            };
+            for class in ALL_CLASSES {
+                assert_eq!(scope.raw_reach_for(class), given, "{class:?}");
+            }
+        }
+    }
+
+    /// The built-in policy with a `read_filter` that sets `raw_reach` for agents.
+    fn with_raw_reach(value: &str) -> String {
+        let text = BUILTIN.replace(
+            "read_filter := base_filter\n",
+            &format!("read_filter := object.union(base_filter, {{\"raw_reach\": \"{value}\"}}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n"),
+        );
+        assert_ne!(text, BUILTIN, "the rule was replaced");
+        text
+    }
+
+    #[test]
+    fn a_policy_sets_the_raw_reach_and_an_unknown_value_is_an_error() {
+        use dm_core::RawReach;
+        let g = grants();
+        for (word, want) in [
+            ("chain", RawReach::Chain),
+            ("fleet", RawReach::Fleet),
+            ("all", RawReach::All),
+        ] {
+            let p = Policy::compile(&with_raw_reach(word), "test", &g).unwrap();
+            let scope = p.read_scope(&read_input(Class::Agent)).unwrap();
+            assert_eq!(scope.raw_reach, Some(want), "{word}");
+            assert_eq!(scope.raw_reach_for(Class::Agent), want, "{word}");
+            // the rule names agents, so the owner keeps the default of its class
+            let owner = p.read_scope(&read_input(Class::Owner)).unwrap();
+            assert_eq!(owner.raw_reach, None);
+            assert_eq!(owner.raw_reach_for(Class::Owner), RawReach::All);
+            // the granted filter keeps its raw reach and its chain through `narrow`
+            let mut granted = g.read_filter();
+            granted.raw_reach = RawReach::Fleet;
+            granted.chain = vec!["task-x".into()];
+            let narrowed = scope.narrow(&granted);
+            assert_eq!(narrowed.raw_reach, RawReach::Fleet);
+            assert_eq!(narrowed.chain, ["task-x"]);
+        }
+        let p = Policy::compile(&with_raw_reach("tap"), "test", &g).unwrap();
+        let refused = p.read_scope(&read_input(Class::Agent)).unwrap_err();
+        assert!(
+            matches!(&refused, Error::Policy(m) if m.contains("raw_reach") && m.contains("tap")),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -1119,6 +1235,7 @@ mod tests {
             domains: Vec::new(),
             handling: dm_core::Label::Restricted,
             min_tier: dm_core::TrustTier::Raw,
+            raw_reach: None,
         };
         let f = none.narrow(&g.read_filter());
         assert_eq!(f.domains, vec![String::new()]);

@@ -13,7 +13,7 @@ pub mod filter;
 pub mod id;
 pub mod manifest;
 
-pub use filter::ReadFilter;
+pub use filter::{RawReach, ReadFilter};
 
 /// How sensitive an entry is. Ordered: public < internal < restricted.
 #[derive(
@@ -86,6 +86,55 @@ impl std::str::FromStr for TrustTier {
             "curated" => Ok(TrustTier::Curated),
             "verified" => Ok(TrustTier::Verified),
             other => Err(Error::Invalid(format!("unknown trust tier {other:?}"))),
+        }
+    }
+}
+
+/// Who reads an entry while it is raw. A curated or a verified entry is read as its
+/// domain, its label and its tier allow, whatever its reach. The reaches have no order:
+/// the read filter names the ones it admits ([`ReadFilter::admits_entry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Reach {
+    /// The sessions that work in the chain of the task that the entry names.
+    Chain,
+    /// The sessions whose policy admits raw entries in the domain. What an entry
+    /// without the field has.
+    #[default]
+    Fleet,
+    /// Content from authors outside the fleet, or written by a session that read such
+    /// content: the chain of the task that the entry names, and the readers of all raw
+    /// entries. Every other session reads it once it is curated.
+    Tap,
+}
+
+impl Reach {
+    /// Whether this is the reach of an entry that names none. The frontmatter leaves
+    /// the field out for it, so an entry from before reads and renders as it did.
+    #[must_use]
+    pub fn is_fleet(&self) -> bool {
+        matches!(self, Reach::Fleet)
+    }
+}
+
+impl fmt::Display for Reach {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Reach::Chain => "chain",
+            Reach::Fleet => "fleet",
+            Reach::Tap => "tap",
+        })
+    }
+}
+
+impl std::str::FromStr for Reach {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Error> {
+        match s {
+            "chain" => Ok(Reach::Chain),
+            "fleet" => Ok(Reach::Fleet),
+            "tap" => Ok(Reach::Tap),
+            other => Err(Error::Invalid(format!("unknown reach {other:?}"))),
         }
     }
 }
@@ -191,6 +240,13 @@ pub struct Frontmatter {
     /// have drawn on. Absent on an entry written before the log kept this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// Who reads the entry while it is raw. Absent means the fleet.
+    #[serde(default, skip_serializing_if = "Reach::is_fleet")]
+    pub reach: Reach,
+    /// The task that the writing session held. A session whose chain holds this task
+    /// reads the entry while it is raw, whatever its reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     /// The author's confidence, if stated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<Confidence>,
@@ -454,6 +510,8 @@ mod tests {
                 created: datetime!(2026-10-01 10:00 UTC),
                 cites: vec!["https://example.org/thread/1".into()],
                 session: None,
+                reach: Reach::Fleet,
+                task: None,
                 confidence: Some(Confidence::High),
                 trust_tier: TrustTier::Curated,
                 review_by: Some(date!(2027-04-01)),
@@ -479,13 +537,82 @@ mod tests {
         // an entry written before the log kept the session has no such field, and is
         // written again without one
         assert!(!text.contains("session"), "{text}");
+        // nor has an entry from before the reach those two fields
+        assert!(
+            !text.contains("reach") && !text.contains("\ntask"),
+            "{text}"
+        );
         let mut written = sample();
         written.front.session = Some("sess-0a1b2c@42".into());
+        written.front.reach = Reach::Tap;
+        written.front.task = Some("task-x".into());
         let text = written.render();
         assert!(text.contains("\nsession: sess-0a1b2c@42\n"), "{text}");
+        assert!(
+            text.contains("\nreach: tap\ntask: task-x\n"),
+            "after the session: {text}"
+        );
         let back = Entry::parse(&text).unwrap();
         assert_eq!(written, back);
         assert_eq!(text, back.render());
+    }
+
+    /// The sample as a binary from before the reach rendered it, byte for byte.
+    const SAMPLE_AS_BEFORE: &str = "---\nid: mem-a-0847\ntype: decision\ndomain: dom-a\nauthor: 'agent:worker-3 (model: test-1)'\ncreated: 2026-10-01T10:00:00Z\ncites:\n- https://example.org/thread/1\nconfidence: high\ntrust_tier: curated\nreview_by: 2027-04-01\nsupersedes: mem-a-0312\npolicy_context:\n- pol-L2-031\nclassification: internal\n---\n\n# Retry with backoff\n\nOperation R retries with exponential backoff.\nState lives in header H.\n\n## Options\n\nTwo were considered.\n";
+
+    #[test]
+    fn an_entry_without_a_reach_renders_as_before_and_one_with_a_reach_round_trips() {
+        let e = sample();
+        let text = e.render();
+        assert_eq!(text, SAMPLE_AS_BEFORE, "no field of the reach is written");
+        let before = Entry::parse(SAMPLE_AS_BEFORE).unwrap();
+        assert_eq!(before.front.reach, Reach::Fleet, "absent reads as fleet");
+        assert_eq!(before.front.task, None);
+        assert_eq!(before, e);
+        assert_eq!(digest(&before.render()), digest(SAMPLE_AS_BEFORE));
+        for (reach, word) in [(Reach::Tap, "tap"), (Reach::Chain, "chain")] {
+            let mut written = sample();
+            written.front.reach = reach;
+            written.front.task = Some("task-x".into());
+            let text = written.render();
+            assert!(text.contains(&format!("\nreach: {word}\n")), "{text}");
+            assert!(text.contains("\ntask: task-x\n"), "{text}");
+            let back = Entry::parse(&text).unwrap();
+            assert_eq!(written, back);
+            assert_eq!(text, back.render());
+        }
+        // each field alone: a task under fleet reach names the task and no reach
+        let mut held = sample();
+        held.front.task = Some("task-x".into());
+        let text = held.render();
+        assert!(!text.contains("reach"), "{text}");
+        assert_eq!(Entry::parse(&text).unwrap(), held);
+        // fleet said in so many words is read, and is written again without the word
+        let said = SAMPLE_AS_BEFORE.replace("\nconfidence:", "\nreach: fleet\nconfidence:");
+        assert_ne!(said, SAMPLE_AS_BEFORE);
+        assert_eq!(Entry::parse(&said).unwrap().render(), SAMPLE_AS_BEFORE);
+    }
+
+    #[test]
+    fn an_unknown_reach_is_refused() {
+        for bad in ["domain", "all", "Tap", "", "[tap]"] {
+            let text =
+                SAMPLE_AS_BEFORE.replace("\nconfidence:", &format!("\nreach: {bad}\nconfidence:"));
+            assert_ne!(text, SAMPLE_AS_BEFORE);
+            assert!(
+                matches!(Entry::parse(&text), Err(Error::Yaml(_))),
+                "{bad:?}"
+            );
+        }
+        assert_eq!("tap".parse::<Reach>().unwrap(), Reach::Tap);
+        assert_eq!("chain".parse::<Reach>().unwrap(), Reach::Chain);
+        assert_eq!("fleet".parse::<Reach>().unwrap(), Reach::Fleet);
+        assert!("all".parse::<Reach>().is_err());
+        for reach in [Reach::Chain, Reach::Fleet, Reach::Tap] {
+            assert_eq!(reach.to_string().parse::<Reach>().unwrap(), reach);
+        }
+        assert_eq!(Reach::default(), Reach::Fleet);
+        assert!(Reach::Fleet.is_fleet() && !Reach::Tap.is_fleet() && !Reach::Chain.is_fleet());
     }
 
     #[test]
