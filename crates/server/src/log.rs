@@ -19,6 +19,19 @@
 //! its `write`, so the reads of that session below that number are what it may have
 //! drawn on.
 //!
+//! A `send` says that something left the record's perimeter: a tap posted a handoff, a
+//! bundle was exported, or the egress saw a model call answered. It names where it went
+//! and the digest of what went, never the text, and it goes into the log of the domain
+//! it is about and of each domain its session has read, so in each of those logs the
+//! reads below it are what it may have carried.
+//!
+//! The ledger keeps its own events as its order of record. The log of a domain takes a
+//! copy of each, a `ledger` event: the task, what happened to it, who did it and under
+//! which attempt key, and no text. The copy is made before each write and each send and
+//! before the log is served, from a cursor the log itself can give again:
+//! `state/log/<domain>.ledger` holds the number of the last ledger event copied, and
+//! when that file is behind, the log's own `ledger` events say where the copy stands.
+//!
 //! Each event carries the classification of what it names, and a line without one reads
 //! as the highest. A quarantined write is at the highest and flagged: the security role
 //! reads it, and nobody else.
@@ -89,6 +102,33 @@ pub enum Change {
         /// The entries.
         ids: Vec<String>,
     },
+    /// Something left the perimeter in a session: a handoff a tap posted, a bundle an
+    /// export wrote, or a model call the egress saw answered.
+    Send {
+        /// Where it went: where a tap posted, `export:<label>` for a bundle, the name of
+        /// the destination for a model call. One line.
+        to: String,
+        /// The digest of what went: the handoff's stored text, the bundle's manifest, or
+        /// the request of the model call.
+        digest: String,
+    },
+    /// A copy of one event of the ledger: what happened to a task, and no text of it.
+    Ledger {
+        /// The task, or the key of a promotion.
+        task: String,
+        /// What happened, as the ledger names it: `created`, `claimed`, `completed`.
+        op: String,
+        /// Who did it, when the ledger's event says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<String>,
+        /// The attempt key a claim or a completion was made under.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<String>,
+        /// The event's place in the ledger's own order.
+        ledger_seq: u64,
+        /// When the ledger appended it.
+        when: String,
+    },
 }
 
 /// One event in a domain's log.
@@ -100,7 +140,7 @@ pub struct Event {
     pub at: String,
     /// Who: the session's author.
     pub by: String,
-    /// The session that acted. Absent on a `put` and an `erased`.
+    /// The session that acted. Absent on a `put`, an `erased` and a `ledger`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// The classification of what the event names: the highest, when it names several.
@@ -162,6 +202,99 @@ fn paths(root: &Path, domain: &str) -> Result<(PathBuf, PathBuf, PathBuf), Error
     ))
 }
 
+/// The file that holds the number of the last ledger event copied into `domain`'s log.
+fn ledger_cursor(root: &Path, domain: &str) -> Result<PathBuf, Error> {
+    let d = valid_domain(domain)?;
+    Ok(root.join(DIR).join(format!("{d}.ledger")))
+}
+
+/// The number a cursor file holds, or zero when there is none.
+fn cursor_at(file: &Path) -> u64 {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether `to` can say where a send went: one line of at most 2048 characters.
+fn one_line(to: &str) -> bool {
+    !to.is_empty() && to.chars().count() <= 2048 && !to.chars().any(char::is_control)
+}
+
+/// The one writer of a domain's log, for as long as it lives: it holds the domain's
+/// lock from the read of the last sequence number, so each event it appends takes the
+/// next one.
+struct Writer {
+    log: PathBuf,
+    seq_file: PathBuf,
+    last: u64,
+    /// The domain's lock, held until this is dropped.
+    _lock: std::fs::File,
+}
+
+impl Writer {
+    /// Take `domain`'s lock and read where its log stands.
+    fn open(root: &Path, domain: &str) -> Result<Writer, Error> {
+        let (log, seq_file, lock_file) = paths(root, domain)?;
+        let dir = root.join(DIR);
+        std::fs::create_dir_all(&dir).map_err(crate::io(&dir))?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_file)
+            .map_err(crate::io(&lock_file))?;
+        lock.lock().map_err(crate::io(&lock_file))?;
+        let last = cursor_at(&seq_file);
+        Ok(Writer {
+            log,
+            seq_file,
+            last,
+            _lock: lock,
+        })
+    }
+
+    /// Append one event, at the next sequence number.
+    fn append(
+        &mut self,
+        by: &str,
+        session: Option<&str>,
+        label: Option<Label>,
+        sync: bool,
+        change: Change,
+    ) -> Result<Event, Error> {
+        let event = Event {
+            seq: self.last + 1,
+            at: now(),
+            by: by.to_string(),
+            session: session.map(str::to_string),
+            label,
+            quarantined: matches!(change, Change::Quarantined { .. }),
+            change,
+        };
+        let line =
+            serde_json::to_string(&event).map_err(|e| Error::Transcript(format!("log: {e}")))?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .map_err(crate::io(&self.log))?;
+        f.write_all(format!("{line}\n").as_bytes())
+            .and_then(|()| if sync { f.sync_data() } else { Ok(()) })
+            .map_err(crate::io(&self.log))?;
+        std::fs::write(&self.seq_file, event.seq.to_string()).map_err(crate::io(&self.seq_file))?;
+        self.last = event.seq;
+        Ok(event)
+    }
+
+    /// Sync what was appended without a sync of its own.
+    fn sync(&self) -> Result<(), Error> {
+        std::fs::File::open(&self.log)
+            .and_then(|f| f.sync_data())
+            .map_err(crate::io(&self.log))
+    }
+}
+
 fn now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -185,6 +318,7 @@ pub fn append(root: &Path, domain: &str, by: &str, change: Change) -> Result<Eve
 /// `sync` says whether the file is synced before this returns. Only a `read` goes
 /// without: a write or a send syncs the file as it is appended, and that covers each
 /// read before it, so a read that is lost with the machine is one nothing was made from.
+/// The copies of the ledger's events are synced together, once ([`Memory::ledger_into_log`]).
 ///
 /// # Errors
 ///
@@ -198,42 +332,9 @@ pub fn append_with(
     sync: bool,
     make: impl FnOnce(u64) -> Result<Change, Error>,
 ) -> Result<Event, Error> {
-    let (log, seq_file, lock_file) = paths(root, domain)?;
-    let dir = root.join(DIR);
-    std::fs::create_dir_all(&dir).map_err(crate::io(&dir))?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_file)
-        .map_err(crate::io(&lock_file))?;
-    lock.lock().map_err(crate::io(&lock_file))?;
-    let last: u64 = std::fs::read_to_string(&seq_file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let change = make(last + 1)?;
-    let event = Event {
-        seq: last + 1,
-        at: now(),
-        by: by.to_string(),
-        session: session.map(str::to_string),
-        label,
-        quarantined: matches!(change, Change::Quarantined { .. }),
-        change,
-    };
-    let line = serde_json::to_string(&event).map_err(|e| Error::Transcript(format!("log: {e}")))?;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .map_err(crate::io(&log))?;
-    f.write_all(format!("{line}\n").as_bytes())
-        .and_then(|()| if sync { f.sync_data() } else { Ok(()) })
-        .map_err(crate::io(&log))?;
-    std::fs::write(&seq_file, event.seq.to_string()).map_err(crate::io(&seq_file))?;
-    drop(lock);
-    Ok(event)
+    let mut writer = Writer::open(root, domain)?;
+    let change = make(writer.last + 1)?;
+    writer.append(by, session, label, sync, change)
 }
 
 /// A domain's log from `from` on, in order. A line that does not parse is skipped: a
@@ -268,8 +369,13 @@ pub fn state(events: &[Event]) -> BTreeMap<String, Option<(String, bool)>> {
             Change::Erased { id } => {
                 out.insert(id.clone(), None);
             }
-            // offered, refused or read: none of these says what the record holds
-            Change::Write { .. } | Change::Quarantined { .. } | Change::Read { .. } => {}
+            // offered, refused, read, sent, or the ledger's: none of these says what the
+            // record holds
+            Change::Write { .. }
+            | Change::Quarantined { .. }
+            | Change::Read { .. }
+            | Change::Send { .. }
+            | Change::Ledger { .. } => {}
         }
     }
     out
@@ -286,6 +392,20 @@ pub fn quarantined_writes(events: &[Event]) -> BTreeSet<u64> {
             _ => None,
         })
         .collect()
+}
+
+/// The number of the last ledger event that `domain`'s log holds a copy of, or zero. It
+/// reads the whole file, which is what the proof of concept has; it is asked only when
+/// the ledger has an event to copy.
+fn last_ledger_seq(root: &Path, domain: &str) -> Result<u64, Error> {
+    Ok(read(root, domain, 0)?
+        .iter()
+        .filter_map(|e| match &e.change {
+            Change::Ledger { ledger_seq, .. } => Some(*ledger_seq),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0))
 }
 
 /// Whether a citation names an entry, in the shape of a name the record holds. A link
@@ -411,7 +531,8 @@ impl Memory {
     }
 
     /// Say in `domain`'s log that this session was served `ids`, at `label`: the highest
-    /// classification among them.
+    /// classification among them. The session keeps the domain as one it has read, so a
+    /// later send of the session goes into this log too.
     pub(crate) fn log_read(
         &self,
         domain: &str,
@@ -427,7 +548,112 @@ impl Memory {
             false,
             |_| Ok(Change::Read { ids }),
         )?;
+        crate::lock(&self.read_domains).insert(domain.to_string());
         Ok(())
+    }
+
+    /// Say that something left the perimeter in this session: `to` is where it went and
+    /// `digest` is of what went. One `send` event, at the session's label, goes into the
+    /// log of each domain the session has read and of `home`, the domain the send is
+    /// about. A session with neither leaves no event.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a `to` that is not one line of at most 2048 characters; a
+    /// domain that is not a name, or the file system.
+    pub(crate) async fn log_send(
+        &self,
+        home: Option<&str>,
+        to: &str,
+        digest: String,
+    ) -> Result<(), Error> {
+        self.log_send_at(home, to, digest, self.label()).await
+    }
+
+    /// [`Memory::log_send`] at `label`, for a send of something the session's label has
+    /// not risen to yet.
+    pub(crate) async fn log_send_at(
+        &self,
+        home: Option<&str>,
+        to: &str,
+        digest: String,
+        label: Label,
+    ) -> Result<(), Error> {
+        if !one_line(to) {
+            return Err(Error::Denied(
+                "where a send went is one line of at most 2048 characters".into(),
+            ));
+        }
+        let mut domains = crate::lock(&self.read_domains).clone();
+        domains.extend(home.map(str::to_string));
+        for domain in domains {
+            // the ledger's events so far come before the send; a copy that fails is late,
+            // not lost, since the next one starts where this one stopped
+            let _ = self.ledger_into_log(&domain).await;
+            let sent = Change::Send {
+                to: to.to_string(),
+                digest: digest.clone(),
+            };
+            append_with(
+                &self.root,
+                &domain,
+                &self.author,
+                Some(&self.session_id),
+                Some(label),
+                true,
+                |_| Ok(sent),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Copy the ledger's events of `domain` that its log does not hold yet into the log,
+    /// in the ledger's order, each as a `ledger` event at the task's classification.
+    /// Returns how many were appended. Run again, it appends nothing: the cursor file
+    /// says where the copy stands, and when that file is behind, the log itself does.
+    ///
+    /// The ledger is asked before the domain's lock is taken, never under it: a caller
+    /// can hold the ledger while it waits for that lock. Then one hold of the lock covers
+    /// the second read of the cursor, every append and the new cursor, so two processes
+    /// that copy at once append each event once.
+    ///
+    /// # Errors
+    ///
+    /// A domain that is not a name, a ledger error, or the file system.
+    pub(crate) async fn ledger_into_log(&self, domain: &str) -> Result<u64, Error> {
+        let cursor = ledger_cursor(&self.root, domain)?;
+        let after = cursor_at(&cursor);
+        let events = self.ledger.lock().await.events_after(domain, after).await?;
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut writer = Writer::open(&self.root, domain)?;
+        // what another process copied meanwhile, or a copy that stopped before it wrote
+        // the cursor: the log's own events say so
+        let mut copied = cursor_at(&cursor).max(last_ledger_seq(&self.root, domain)?);
+        let mut appended = 0;
+        for e in events {
+            if e.seq <= copied {
+                continue;
+            }
+            let by = e.principal.clone().unwrap_or_else(|| "ledger".to_string());
+            let change = Change::Ledger {
+                task: e.task,
+                op: e.op,
+                principal: e.principal,
+                attempt: e.attempt,
+                ledger_seq: e.seq,
+                when: e.at,
+            };
+            writer.append(&by, None, Some(e.classification), false, change)?;
+            copied = e.seq;
+            appended += 1;
+        }
+        // one sync for the copy, and before the cursor: a cursor ahead of the log would
+        // leave events out of it for good
+        writer.sync()?;
+        std::fs::write(&cursor, copied.to_string()).map_err(crate::io(&cursor))?;
+        Ok(appended)
     }
 
     /// Say in its domain's log that an entry was erased; before the record erases it.
@@ -452,13 +678,7 @@ impl Memory {
     /// [`Error::Denied`] for an author outside the security role or an ungranted domain;
     /// the file system.
     pub fn log(&self, domain: Option<&str>, from: u64) -> Result<Vec<Event>, Error> {
-        if !self.grants.is_security(&self.author) {
-            return Err(Error::Denied(
-                "the log is for the owner and the security role".into(),
-            ));
-        }
-        let domain = self.resolve_domain(domain)?;
-        let handling = self.handling()?;
+        let (domain, handling) = self.log_reader(domain)?;
         let mut events = read(&self.root, &domain, from)?;
         let refused = quarantined_writes(&events);
         let reads_quarantine = handling >= Label::Restricted;
@@ -468,6 +688,30 @@ impl Memory {
             e.label_or_highest() <= handling && (reads_quarantine || !held)
         });
         Ok(events)
+    }
+
+    /// Whether this session reads the log of the domain it asks for: the domain as
+    /// granted, and the most the session may handle. Only the security role does.
+    fn log_reader(&self, domain: Option<&str>) -> Result<(String, Label), Error> {
+        if !self.grants.is_security(&self.author) {
+            return Err(Error::Denied(
+                "the log is for the owner and the security role".into(),
+            ));
+        }
+        Ok((self.resolve_domain(domain)?, self.handling()?))
+    }
+
+    /// [`Memory::log`] with the ledger's events up to now: the copy of the ledger is
+    /// brought up to date first, then the log is served as `log` serves it. A session
+    /// the log is not for is refused before anything is copied.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::log`]; a ledger error.
+    pub async fn log_synced(&self, domain: Option<&str>, from: u64) -> Result<Vec<Event>, Error> {
+        let (domain, _) = self.log_reader(domain)?;
+        self.ledger_into_log(&domain).await?;
+        self.log(Some(&domain), from)
     }
 
     /// What the record holds and the log never named, written before the log was kept:
@@ -500,6 +744,7 @@ impl Memory {
             return Err(Error::Denied("materializing is the owner's".into()));
         }
         let domain = self.resolve_domain(domain)?;
+        self.ledger_into_log(&domain).await?;
         let events = read(&self.root, &domain, 0)?;
         let mut out = Materialized {
             domain: domain.clone(),
@@ -1374,5 +1619,405 @@ mod tests {
             .with_handling_cap(Label::Internal);
         let served = capped.log(None, 0).unwrap();
         assert!(served.is_empty(), "{served:?}");
+    }
+    /// The send events of `domain`'s log after sequence number `after`.
+    fn sends_after(root: &Path, domain: &str, after: u64) -> Vec<Event> {
+        let mut events = read(root, domain, after + 1).unwrap();
+        events.retain(|e| matches!(e.change, Change::Send { .. }));
+        events
+    }
+
+    /// Grant `domains` beside `dom-me`, and write one entry in each granted domain as
+    /// the owner. Returns the entries, `dom-me`'s first.
+    async fn entry_in_each(root: &Path, domains: &[&str]) -> Vec<String> {
+        let grants = root.join(crate::GRANTS_FILE);
+        let mut text = std::fs::read_to_string(&grants).unwrap();
+        for d in domains {
+            text.push_str(&format!(
+                "\n[domains.{d}]\ndefault_classification = \"internal\"\n"
+            ));
+        }
+        std::fs::write(&grants, text).unwrap();
+        let owner = Memory::open(root).unwrap();
+        let mut ids = Vec::new();
+        for domain in ["dom-me"].iter().chain(domains) {
+            let w = WriteRequest {
+                domain: Some((*domain).to_string()),
+                ..req("# Import\n\nFive steps.\n")
+            };
+            ids.push(owner.write(w).await.unwrap().id);
+        }
+        ids
+    }
+
+    const REQUEST: &[u8] = br#"{"messages":[{"role":"user","content":"Which port?"}]}"#;
+
+    async fn model_call(m: &Memory) {
+        m.keep_context("anthropic", "/v1/messages", REQUEST, b"{}")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_model_call_leaves_a_send_event_in_the_log_of_each_domain_its_session_read() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Memory::init(dir.path(), "human:test:me", "dom-me").unwrap());
+        let ids = entry_in_each(dir.path(), &["dom-other", "dom-third"]).await;
+        let reader = agent(dir.path(), "agent:reader");
+        reader.get(&ids[0]).await.unwrap();
+        // a later request of the same session reads the second domain
+        let view = reader.for_request().unwrap();
+        view.get(&ids[1]).await.unwrap();
+        model_call(&reader).await;
+        let sent = Change::Send {
+            to: "anthropic".into(),
+            digest: dm_core::digest(std::str::from_utf8(REQUEST).unwrap()),
+        };
+        for domain in ["dom-me", "dom-other"] {
+            let sends = sends_after(dir.path(), domain, 0);
+            assert_eq!(sends.len(), 1, "{domain}: {sends:?}");
+            assert_eq!(sends[0].change, sent, "where it went, and the digest of it");
+            assert_eq!(sends[0].session.as_deref(), Some(reader.session_id()));
+            assert_eq!(sends[0].by, "agent:reader");
+            // the reads it may have carried are below it in this log
+            let below = read(dir.path(), domain, 0).unwrap();
+            let read_at = below
+                .iter()
+                .find(|e| matches!(e.change, Change::Read { .. }))
+                .unwrap();
+            assert!(read_at.seq < sends[0].seq);
+        }
+        assert!(sends_after(dir.path(), "dom-third", 0).is_empty());
+        // a session that read nothing and holds no task of a domain leaves no event
+        model_call(&agent(dir.path(), "agent:idle")).await;
+        for domain in ["dom-me", "dom-other", "dom-third"] {
+            let sends = sends_after(dir.path(), domain, 0);
+            assert!(
+                sends.iter().all(|e| e.by == "agent:reader"),
+                "{domain}: {sends:?}"
+            );
+        }
+        let text = std::fs::read_to_string(dir.path().join(DIR).join("dom-me.jsonl")).unwrap();
+        assert!(!text.contains("Which port"), "no text of what was sent");
+    }
+
+    #[tokio::test]
+    async fn a_send_event_is_at_the_label_of_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let secret = WriteRequest {
+            classification: Some(Label::Restricted),
+            ..req("# Vault\n\nThe steps to open the vault.\n")
+        };
+        let secret = owner.write(secret).await.unwrap().id;
+        // the only granted domain is the session's own: nothing read, and a send still
+        let low = agent(dir.path(), "agent:low");
+        let at = last(dir.path());
+        model_call(&low).await;
+        let sends = sends_after(dir.path(), "dom-me", at);
+        assert_eq!(sends.len(), 1, "{sends:?}");
+        assert_eq!(sends[0].label, Some(Label::Public));
+        let high = agent(dir.path(), "agent:high");
+        high.get(&secret).await.unwrap();
+        let at = last(dir.path());
+        model_call(&high).await;
+        let sends = sends_after(dir.path(), "dom-me", at);
+        assert_eq!(sends.len(), 1, "{sends:?}");
+        assert_eq!(sends[0].label, Some(Label::Restricted));
+    }
+
+    #[tokio::test]
+    async fn a_send_to_a_destination_that_is_not_one_line_is_refused_and_leaves_no_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        for to in ["https://x/1\nhttps://x/2", "", "x\u{7}", &"x".repeat(2049)] {
+            let refused = m.log_send(Some("dom-me"), to, "d".into()).await;
+            assert!(matches!(refused, Err(Error::Denied(_))), "{to:?}");
+        }
+        assert!(read(dir.path(), "dom-me", 0).unwrap().is_empty());
+        m.log_send(Some("dom-me"), &"x".repeat(2048), "d".into())
+            .await
+            .unwrap();
+        assert_eq!(sends_after(dir.path(), "dom-me", 0).len(), 1);
+        // a session with no domain to say it in says nothing, and is not refused
+        m.log_send(None, "https://x/1", "d".into()).await.unwrap();
+        assert_eq!(read(dir.path(), "dom-me", 0).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_export_leaves_a_read_event_that_names_what_it_carries_and_then_a_send_event() {
+        let (dir, _, _) = read_fixture().await;
+        let owner = Memory::open(dir.path()).unwrap();
+        let secret = WriteRequest {
+            classification: Some(Label::Restricted),
+            ..req("# Vault\n\nThe steps to open the vault.\n")
+        };
+        owner.write(secret).await.unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let at = last(dir.path());
+        let ex = owner
+            .export(None, Label::Restricted, out.path())
+            .await
+            .unwrap();
+        let carried: Vec<String> = ex.manifest.entries.iter().map(|e| e.id.clone()).collect();
+        assert!(carried.len() >= 3, "{carried:?}");
+        let events = read(dir.path(), "dom-me", at + 1).unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].change, Change::Read { ids: carried });
+        assert_eq!(events[0].label, Some(Label::Restricted), "the highest");
+        let manifest = std::fs::read_to_string(out.path().join("manifest.yaml")).unwrap();
+        let sent = Change::Send {
+            to: "export:restricted".into(),
+            digest: dm_core::digest(&manifest),
+        };
+        assert_eq!(events[1].change, sent);
+        assert_eq!(events[1].label, Some(Label::Restricted));
+        for e in &events {
+            assert_eq!(e.session.as_deref(), Some(owner.session_id()));
+        }
+        assert_eq!(owner.label(), Label::Public, "an export shows it nothing");
+    }
+
+    fn task(title: &str, label: Label) -> dm_ledger::TaskSpec {
+        dm_ledger::TaskSpec {
+            domain: "dom-me".into(),
+            title: title.into(),
+            body: "Do it, and say how.\n".into(),
+            classification: label,
+            ..dm_ledger::TaskSpec::default()
+        }
+    }
+
+    /// File a task as `m`, admit it and claim it. Returns its id.
+    async fn claimed(m: &Memory, spec: dm_ledger::TaskSpec) -> String {
+        let id = m.create_task(spec).await.unwrap().task.id;
+        // a filing the domain's grant admits at once is admitted already
+        let _ = m.admit(&id).await;
+        m.claim(&id, time::Duration::minutes(5)).await.unwrap();
+        id
+    }
+
+    /// Write a handoff as `m` and complete `task` with it. Returns the handoff's id.
+    async fn completed(m: &Memory, task: &str, label: Label) -> String {
+        let handoff = WriteRequest {
+            entry_type: dm_core::EntryType::Handoff,
+            classification: Some(label),
+            ..req("# Done\n\nThe key moved to the new vault.\n")
+        };
+        let handoff = m.write(handoff).await.unwrap().id;
+        m.complete(task, None, &handoff).await.unwrap();
+        handoff
+    }
+
+    /// The copies of the ledger's events in `events`, each as the ledger's own number,
+    /// the task, what happened and who did it.
+    fn copies(events: &[Event]) -> Vec<(u64, String, String, Option<String>)> {
+        events
+            .iter()
+            .filter_map(|e| match &e.change {
+                Change::Ledger {
+                    task,
+                    op,
+                    principal,
+                    ledger_seq,
+                    ..
+                } => Some((*ledger_seq, task.clone(), op.clone(), principal.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_log_of_a_domain_takes_one_event_for_each_event_of_the_ledger_in_its_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let id = claimed(&m, task("Rotate the signing key", Label::Internal)).await;
+        completed(&m, &id, Label::Internal).await;
+        let ledger = m
+            .ledger
+            .lock()
+            .await
+            .events_after("dom-me", 0)
+            .await
+            .unwrap();
+        let kinds: Vec<&str> = ledger.iter().map(|e| e.op.as_str()).collect();
+        assert_eq!(kinds, ["created", "admitted", "claimed", "completed"]);
+        assert_eq!(m.ledger_into_log("dom-me").await.unwrap(), 1, "the last");
+        let events = read(dir.path(), "dom-me", 0).unwrap();
+        let expected: Vec<_> = ledger
+            .iter()
+            .map(|e| (e.seq, e.task.clone(), e.op.clone(), e.principal.clone()))
+            .collect();
+        assert_eq!(copies(&events), expected);
+        for (e, of) in events
+            .iter()
+            .filter(|e| matches!(e.change, Change::Ledger { .. }))
+            .zip(&ledger)
+        {
+            assert_eq!(e.label, Some(Label::Internal), "the task's");
+            assert_eq!(e.session, None);
+            let who = of.principal.as_deref().unwrap_or("ledger");
+            assert_eq!(e.by, who, "{e:?}");
+            let Change::Ledger { attempt, when, .. } = &e.change else {
+                unreachable!()
+            };
+            assert_eq!((attempt, when), (&of.attempt, &of.at));
+        }
+        assert_eq!(
+            expected[2].3.as_deref(),
+            Some("human:test:me"),
+            "the holder"
+        );
+        // a second run appends nothing, and nor does one whose cursor file is gone
+        assert_eq!(m.ledger_into_log("dom-me").await.unwrap(), 0);
+        std::fs::remove_file(dir.path().join(DIR).join("dom-me.ledger")).unwrap();
+        m.create_task(task("Another", Label::Internal))
+            .await
+            .unwrap();
+        assert!(m.ledger_into_log("dom-me").await.unwrap() >= 1);
+        let again = read(dir.path(), "dom-me", 0).unwrap();
+        let seqs: Vec<u64> = copies(&again).iter().map(|c| c.0).collect();
+        let mut once = seqs.clone();
+        once.dedup();
+        assert_eq!(seqs, once, "each event of the ledger once");
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        // the log holds no text of the task
+        let text = std::fs::read_to_string(dir.path().join(DIR).join("dom-me.jsonl")).unwrap();
+        for held in ["Rotate the signing key", "say how", "new vault"] {
+            assert!(!text.contains(held), "{held:?} in the log");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_and_a_send_come_after_the_ledger_s_events_before_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let id = claimed(&m, task("Rotate the signing key", Label::Internal)).await;
+        // nothing wrote or sent yet: the log has no copy
+        assert!(read(dir.path(), "dom-me", 0).unwrap().is_empty());
+        let handoff = completed(&m, &id, Label::Internal).await;
+        let events = read(dir.path(), "dom-me", 0).unwrap();
+        let place =
+            |wanted: &dyn Fn(&Change) -> bool| events.iter().position(|e| wanted(&e.change));
+        let claim = place(&|c| matches!(c, Change::Ledger { op, .. } if op == "claimed"));
+        let write = place(&|c| matches!(c, Change::Write { id, .. } if *id == handoff));
+        assert!(claim.is_some() && claim < write, "{events:?}");
+        assert!(place(&|c| matches!(c, Change::Ledger { op, .. } if op == "completed")).is_none());
+        // a send brings the copy up to date first
+        model_call(&m).await;
+        let events = read(dir.path(), "dom-me", 0).unwrap();
+        let place =
+            |wanted: &dyn Fn(&Change) -> bool| events.iter().position(|e| wanted(&e.change));
+        let done = place(&|c| matches!(c, Change::Ledger { op, .. } if op == "completed"));
+        let send = place(&|c| matches!(c, Change::Send { .. }));
+        assert!(done.is_some() && done < send, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn the_log_of_another_domain_holds_none_of_a_domain_s_ledger_events() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Memory::init(dir.path(), "human:test:me", "dom-me").unwrap());
+        entry_in_each(dir.path(), &["dom-other"]).await;
+        let m = Memory::open(dir.path()).unwrap();
+        let here = claimed(&m, task("Rotate the signing key", Label::Internal)).await;
+        let there = dm_ledger::TaskSpec {
+            domain: "dom-other".into(),
+            ..task("Elsewhere", Label::Internal)
+        };
+        let there = m.create_task(there).await.unwrap().task.id;
+        for domain in ["dom-me", "dom-other"] {
+            m.ledger_into_log(domain).await.unwrap();
+        }
+        let tasks_in = |domain: &str| -> BTreeSet<String> {
+            copies(&read(dir.path(), domain, 0).unwrap())
+                .into_iter()
+                .map(|c| c.1)
+                .collect()
+        };
+        assert_eq!(tasks_in("dom-me"), BTreeSet::from([here]));
+        assert_eq!(tasks_in("dom-other"), BTreeSet::from([there]));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_handles_internal_is_not_served_the_ledger_events_of_a_restricted_task()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let open = m.create_task(task("Sweep the logs", Label::Internal));
+        let open = open.await.unwrap().task.id;
+        let secret = m.create_task(task("Rotate the signing key", Label::Restricted));
+        let secret = secret.await.unwrap().task.id;
+        // the log as it is served brings the copy up to date first
+        let all = copies(&m.log_synced(None, 0).await.unwrap());
+        let tasks: BTreeSet<&str> = all.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(tasks, BTreeSet::from([open.as_str(), secret.as_str()]));
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Internal);
+        let served = copies(&capped.log_synced(None, 0).await.unwrap());
+        assert!(!served.is_empty());
+        assert!(served.iter().all(|c| c.1 == open), "{served:?}");
+        // and a session the log is not for is refused before anything is copied
+        m.create_task(task("A third", Label::Internal))
+            .await
+            .unwrap();
+        let before = read(dir.path(), "dom-me", 0).unwrap().len();
+        let worker = agent(dir.path(), "agent:worker");
+        assert!(matches!(
+            worker.log_synced(None, 0).await,
+            Err(Error::Denied(_))
+        ));
+        assert_eq!(read(dir.path(), "dom-me", 0).unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn the_materializer_copies_the_ledger_s_events_before_it_reads_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        m.create_task(task("Sweep the logs", Label::Internal))
+            .await
+            .unwrap();
+        assert!(read(dir.path(), "dom-me", 0).unwrap().is_empty());
+        let done = m.materialize(None).await.unwrap();
+        let copied = copies(&read(dir.path(), "dom-me", 0).unwrap()).len() as u64;
+        assert!(copied >= 1);
+        assert_eq!(done.events, copied, "{done:?}");
+    }
+
+    #[test]
+    fn a_send_and_a_ledger_event_are_one_line_each_and_say_nothing_of_what_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let sent = Change::Send {
+            to: "https://x/1".into(),
+            digest: "d1".into(),
+        };
+        let copied = Change::Ledger {
+            task: "task-me-1".into(),
+            op: "claimed".into(),
+            principal: Some("agent:w".into()),
+            attempt: None,
+            ledger_seq: 7,
+            when: "2026-11-01T10:00:00Z".into(),
+        };
+        append(dir.path(), "dom-me", "agent:w", sent.clone()).unwrap();
+        append(dir.path(), "dom-me", "agent:w", copied.clone()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(DIR).join("dom-me.jsonl")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].ends_with(r#""kind":"send","to":"https://x/1","digest":"d1"}"#),
+            "{text}"
+        );
+        assert!(
+            lines[1].ends_with(
+                r#""kind":"ledger","task":"task-me-1","op":"claimed","principal":"agent:w","ledger_seq":7,"when":"2026-11-01T10:00:00Z"}"#
+            ),
+            "{text}"
+        );
+        let events = read(dir.path(), "dom-me", 0).unwrap();
+        assert_eq!(
+            events.iter().map(|e| &e.change).collect::<Vec<_>>(),
+            [&sent, &copied]
+        );
+        assert!(state(&events).is_empty());
     }
 }

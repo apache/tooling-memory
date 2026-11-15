@@ -58,6 +58,9 @@ impl Memory {
     /// Record where a completed task's handoff was posted back, so it is posted once.
     /// Only a task of `domain` at or under `ceiling`, the tap's, since a tap may say
     /// where it posted what it was handed and nothing about the rest; `to` is one line.
+    /// The log of the domain takes a `send` event first: this session, where the handoff
+    /// went, and the digest of its stored text. A post the ledger then refuses, of a
+    /// task posted already, leaves that event: the tap says it sent the handoff again.
     ///
     /// # Errors
     ///
@@ -77,8 +80,7 @@ impl Memory {
                 "where it was posted is one line of at most 2048 characters".into(),
             ));
         }
-        let mut l = self.ledger.lock().await;
-        let task = l.get(id).await?;
+        let task = self.ledger.lock().await.get(id).await?;
         self.check_task(&task)?;
         if task.spec.domain != domain {
             return Err(Error::Denied(format!("{id} is not a task of {domain}")));
@@ -89,9 +91,28 @@ impl Memory {
                 task.spec.classification
             )));
         }
-        let posted = l.post(id, to).await?;
+        // the handoff left before the ledger says where it went: the log of the task's
+        // domain takes the send first, at the task's classification when the session's
+        // label is under it. The ledger is not held here: the send copies its events
+        if let Some(handoff) = task.handoff.as_deref() {
+            let digest = self.stored_digest(handoff).await?.unwrap_or_default();
+            let label = self.label().max(task.spec.classification);
+            self.log_send_at(Some(domain), to, digest, label).await?;
+        }
+        let posted = self.ledger.lock().await.post(id, to).await?;
         self.observe_task(&posted);
         Ok(posted)
+    }
+
+    /// The digest of the stored text of an entry in a granted domain, or none when the
+    /// record does not hold it.
+    async fn stored_digest(&self, id: &str) -> Result<Option<String>, Error> {
+        for domain in self.domains() {
+            if let Some((_, text)) = self.store.get_with_text(&domain, id).await? {
+                return Ok(Some(dm_core::digest(&text)));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -236,6 +257,70 @@ mod tests {
             })
             .collect();
         assert_eq!(read, [vec![handoff]], "the tap's session read the handoff");
+    }
+
+    #[tokio::test]
+    async fn a_post_leaves_a_send_event_that_names_where_the_handoff_went_and_its_digest() {
+        use crate::log::{Change, Event};
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let task = done(
+            &m,
+            Some("github:acme/x#1"),
+            Label::Internal,
+            Some("Done, internally.\n"),
+        )
+        .await;
+        let open = done(&m, Some("github:acme/x#2"), Label::Internal, None).await;
+        let handoff = m.get_task(&task).await.unwrap().handoff.unwrap();
+        // a tap that posts without having read: its label is under the task's
+        let tap = Memory::open(dir.path())
+            .unwrap()
+            .with_author("tap:comments")
+            .without_read_log();
+        assert_eq!(tap.label(), Label::Public);
+        let sends = || -> Vec<Event> {
+            let mut events = crate::log::read(dir.path(), "dom-me", 0).unwrap();
+            events.retain(|e| matches!(e.change, Change::Send { .. }));
+            events
+        };
+        // nothing was sent of a task that has no handoff
+        assert!(tap
+            .post(&open, "https://x/2", "dom-me", Label::Internal)
+            .await
+            .is_err());
+        assert!(sends().is_empty());
+        tap.post(&task, "https://x/1", "dom-me", Label::Internal)
+            .await
+            .unwrap();
+        let sent = sends();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let stored =
+            std::fs::read_to_string(dir.path().join(format!("record/dom-me/{handoff}.md")))
+                .unwrap();
+        let expected = Change::Send {
+            to: "https://x/1".into(),
+            digest: dm_core::digest(&stored),
+        };
+        assert_eq!(sent[0].change, expected);
+        assert_eq!(sent[0].session.as_deref(), Some(tap.session_id()));
+        assert_eq!(sent[0].by, "tap:comments");
+        assert_eq!(sent[0].label, Some(Label::Internal), "the task's");
+        // the ledger's events up to the post are below the send, and the send is before
+        // the ledger's own record of it
+        let events = crate::log::read(dir.path(), "dom-me", 0).unwrap();
+        let ops: Vec<&str> = events
+            .iter()
+            .filter(|e| e.seq < sent[0].seq)
+            .filter_map(|e| match &e.change {
+                Change::Ledger { task: of, op, .. } if *of == task => Some(op.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ops.last(), Some(&"completed"), "{ops:?}");
+        let text =
+            std::fs::read_to_string(dir.path().join(crate::log::DIR).join("dom-me.jsonl")).unwrap();
+        assert!(!text.contains("Done, internally"), "no text of the handoff");
     }
 
     /// A second domain granted, and a task from upstream completed in it by the owner;

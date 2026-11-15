@@ -94,6 +94,24 @@ pub fn body_digest(body: &str) -> String {
     crate::digest(body.trim())
 }
 
+/// The sends of one session to one destination, as the log of one domain holds them:
+/// what lineage gives for content that left the perimeter and cannot be called back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sent {
+    /// The domain whose log holds the send events.
+    pub domain: String,
+    /// Where they went.
+    pub to: String,
+    /// The session that sent.
+    pub session: String,
+    /// How many send events.
+    pub count: u64,
+    /// The sequence number of the first of them in that log.
+    pub first: u64,
+    /// The sequence number of the last.
+    pub last: u64,
+}
+
 /// The erasure record and the receipt, together.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Receipt {

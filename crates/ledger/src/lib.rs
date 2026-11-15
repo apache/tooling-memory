@@ -502,6 +502,152 @@ impl Event {
     }
 }
 
+/// One event of the ledger as the log of its domain takes it: which task, what happened
+/// to it, who did it and under which attempt key. It has no field for a title, a body, a
+/// handoff, a reason or a why, so no text of a task or of a promotion leaves the ledger
+/// in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Logged {
+    /// Its place among the ledger's events: the order the ledger appended them in.
+    pub seq: u64,
+    /// The task, or the key a promotion of an entry is appended under.
+    pub task: String,
+    /// What happened: `created`, `claimed`, `completed` and the rest, as the ledger's
+    /// `kind` column names them.
+    pub op: String,
+    /// When, as the ledger wrote it.
+    pub at: String,
+    /// Who did it: the filer of a `created`, the holder that a `claimed`, a
+    /// `claim_refused` or a `late_handoff` names, the promoter of a `promoted`, and for a
+    /// `heartbeat`, a `released`, a `handoff_left` and a `completed` the holder whose
+    /// lease was live. Absent for the others, and for a `completed` that the task's
+    /// continuation caused, which no holder did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// The attempt key a `claimed` or a `completed` was made under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<String>,
+    /// The classification of the task, or of the promotion.
+    pub classification: Label,
+}
+
+/// The kinds of event that say who holds a task: a backend gives these for a task from
+/// before the number asked for too, so the holder of a later event can be named.
+pub(crate) const LEASE_KINDS: &str = "'claimed', 'heartbeat', 'released'";
+
+/// A row of the events table, with what the task's row says of the task.
+pub(crate) struct RawEvent {
+    pub(crate) seq: i64,
+    pub(crate) task: String,
+    pub(crate) at: String,
+    pub(crate) payload: String,
+    /// The domain of the task's row. None for an event of no task: a promotion.
+    pub(crate) domain: Option<String>,
+    /// The label rank of the task's row.
+    pub(crate) label_rank: Option<i64>,
+}
+
+/// The claim in force on a task, as the events read so far say.
+struct Lease {
+    holder: String,
+    until: OffsetDateTime,
+}
+
+/// Who caused `event`, and the attempt key it was made under. `lease` is the claim in
+/// force on the task before the event, `at` the event's time. An event only the holder
+/// may cause names the holder when the lease was live at that time, which is what the
+/// ledger checked as it appended the event; a time that does not parse names the holder.
+fn who(
+    event: &Event,
+    lease: Option<&Lease>,
+    at: Option<OffsetDateTime>,
+) -> (Option<String>, Option<String>) {
+    let holder = || {
+        lease
+            .filter(|l| at.is_none_or(|at| l.until >= at))
+            .map(|l| l.holder.clone())
+    };
+    match event {
+        Event::Created { spec, .. } => (
+            Some(spec.created_by.clone()).filter(|by| !by.is_empty()),
+            None,
+        ),
+        Event::Claimed {
+            holder, attempt, ..
+        } => (Some(holder.clone()), attempt.clone()),
+        Event::ClaimRefused { holder, .. } | Event::LateHandoff { holder, .. } => {
+            (Some(holder.clone()), None)
+        }
+        Event::Promoted { spec, .. } => (Some(spec.by.clone()), None),
+        Event::Heartbeat { .. } | Event::Released | Event::HandoffLeft { .. } => (holder(), None),
+        Event::Completed { attempt, .. } => (holder(), attempt.clone()),
+        Event::Admitted
+        | Event::Blocked { .. }
+        | Event::Unblocked { .. }
+        | Event::Retriaged { .. }
+        | Event::Invalidated { .. }
+        | Event::Posted { .. }
+        | Event::Rescored { .. } => (None, None),
+    }
+}
+
+/// The events of `domain` after sequence number `after`, from `rows` in the ledger's
+/// order. The rows hold the earlier events of [`LEASE_KINDS`] too: they say who held
+/// each task, and none of them is given back.
+fn logged(rows: Vec<RawEvent>, domain: &str, after: u64) -> Result<Vec<Logged>, Error> {
+    let mut held: std::collections::HashMap<String, Lease> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let event = Event::parse(&row.task, &row.payload)?;
+        let at = OffsetDateTime::parse(&row.at, &Rfc3339).ok();
+        let (principal, attempt) = who(&event, held.get(&row.task), at);
+        let (own_domain, own_label) = match &event {
+            Event::Claimed { holder, until, .. } => {
+                let lease = Lease {
+                    holder: holder.clone(),
+                    until: *until,
+                };
+                held.insert(row.task.clone(), lease);
+                (None, None)
+            }
+            Event::Heartbeat { until } => {
+                if let Some(lease) = held.get_mut(&row.task) {
+                    lease.until = *until;
+                }
+                (None, None)
+            }
+            Event::Released => {
+                held.remove(&row.task);
+                (None, None)
+            }
+            // a created event and a promoted one name their own domain and label
+            Event::Created { spec, .. } => (Some(spec.domain.as_str()), Some(spec.classification)),
+            Event::Promoted { spec, .. } => (Some(spec.domain.as_str()), Some(spec.classification)),
+            _ => (None, None),
+        };
+        let seq = u64::try_from(row.seq).unwrap_or(0);
+        if seq <= after || own_domain.or(row.domain.as_deref()) != Some(domain) {
+            continue;
+        }
+        let classification = match (own_label, row.label_rank) {
+            (Some(label), _) => label,
+            (None, Some(rank)) => label_from_rank(&row.task, rank)?,
+            // a task whose row is gone: nothing says what it is, so it is the highest
+            (None, None) => Label::Restricted,
+        };
+        out.push(Logged {
+            seq,
+            task: row.task,
+            op: event.kind().to_string(),
+            at: row.at,
+            principal,
+            attempt,
+            classification,
+        });
+    }
+    Ok(out)
+}
+
 /// What a PostgreSQL ledger keeps of a why after the rows are rewritten: the server, not
 /// the ledger, decides when old row versions and its log are gone.
 const POSTGRES_RESIDUE: &str = "the ledger's PostgreSQL server: old row versions and its write-ahead log keep removed text until the server vacuums and recycles them";
@@ -1760,6 +1906,19 @@ impl Ledger {
         on_backend!(&self.backend, db => db.event_count())
     }
 
+    /// The events of `domain` after sequence number `after`, each once, in the order the
+    /// ledger appended them: what the log of the domain copies. `after` is the `seq` of
+    /// the last event a caller has, or zero. A domain the ledger has no event of gives
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn events_after(&self, domain: &str, after: u64) -> Result<Vec<Logged>, Error> {
+        let rows = on_backend!(&self.backend, db => db.events_after(domain, after))?;
+        logged(rows, domain, after)
+    }
+
     /// Drop the projection and replay every event into a fresh one. Returns the number
     /// of events replayed.
     ///
@@ -1978,6 +2137,12 @@ mod tests {
         a_restored_record_keeps_its_time_and_its_erased_why,
         an_erasure_rewrites_the_tasks_filed_from_an_origin,
         an_erasure_takes_the_reason_and_the_handoff_of_the_tasks_too,
+        events_after_gives_each_event_of_a_domain_once_in_the_ledger_s_order,
+        events_after_gives_only_the_events_after_the_number_given,
+        each_event_given_names_its_task_its_kind_its_principal_and_its_attempt_key,
+        a_completion_by_a_continuation_names_no_principal,
+        a_completion_after_the_lease_ran_out_names_no_principal,
+        the_events_given_hold_no_text_of_a_task_or_of_a_promotion,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -3741,6 +3906,195 @@ mod tests {
         l.invalidate(&b.id, "obsolete", None).await.unwrap();
         assert_eq!(l.event_count().await.unwrap(), 9);
         (a, b)
+    }
+
+    /// Each event as the task and what happened to it.
+    fn ops(events: &[Logged]) -> Vec<(&str, &str)> {
+        events
+            .iter()
+            .map(|e| (e.task.as_str(), e.op.as_str()))
+            .collect()
+    }
+
+    async fn events_after_gives_each_event_of_a_domain_once_in_the_ledger_s_order(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let (a, second) = nine_events(&mut l, &now).await;
+        let elsewhere = TaskSpec {
+            domain: "dom-b".into(),
+            ..spec("In b")
+        };
+        let other = admitted(&mut l, elsewhere).await;
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let (a, second) = (a.id.as_str(), second.id.as_str());
+        assert_eq!(
+            ops(&got),
+            [
+                (a, "created"),
+                (a, "admitted"),
+                (a, "claimed"),
+                (a, "heartbeat"),
+                (a, "released"),
+                (a, "claimed"),
+                (a, "completed"),
+                (second, "created"),
+                (second, "invalidated"),
+                ("promotion:mem-a-1", "promoted"),
+            ]
+        );
+        assert!(got.windows(2).all(|w| w[0].seq < w[1].seq), "{got:?}");
+        let got = l.events_after("dom-b", 0).await.unwrap();
+        let other = other.id.as_str();
+        assert_eq!(ops(&got), [(other, "created"), (other, "admitted")]);
+        assert!(l.events_after("dom-none", 0).await.unwrap().is_empty());
+    }
+
+    async fn events_after_gives_only_the_events_after_the_number_given(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        nine_events(&mut l, &now).await;
+        let all = l.events_after("dom-a", 0).await.unwrap();
+        assert_eq!(all.len(), 9);
+        // from the heartbeat on: the release after it is by the holder of a claim from
+        // before the number given, and is given as it was
+        assert_eq!(all[4].principal.as_deref(), Some("s1"), "{:?}", all[4]);
+        let rest = l.events_after("dom-a", all[3].seq).await.unwrap();
+        assert_eq!(rest, all[4..]);
+        let last = all[8].seq;
+        assert!(l.events_after("dom-a", last).await.unwrap().is_empty());
+    }
+
+    async fn each_event_given_names_its_task_its_kind_its_principal_and_its_attempt_key(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let internal = TaskSpec {
+            classification: Label::Internal,
+            ..spec("Keyed")
+        };
+        let t = admitted(&mut l, internal).await;
+        let c = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
+        assert_eq!(c.task.id, t.id);
+        assert!(is_wrong_state(&claim(&mut l, &t.id, "s2", mins(5)).await));
+        *now.lock().unwrap() = T0 + mins(2);
+        l.heartbeat_as(&t.id, "s1", mins(30)).await.unwrap();
+        l.complete_once(&t.id, held("s1", 1), "mem-a-h", "done-1")
+            .await
+            .unwrap();
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let named: Vec<(&str, Option<&str>, Option<&str>)> = got
+            .iter()
+            .map(|e| (e.op.as_str(), e.principal.as_deref(), e.attempt.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("created", Some("human:test:me"), None),
+                ("admitted", None, None),
+                ("claimed", Some("s1"), Some("key-1")),
+                ("claim_refused", Some("s2"), None),
+                ("heartbeat", Some("s1"), None),
+                ("completed", Some("s1"), Some("done-1")),
+                ("promoted", Some("agent:curator"), None),
+            ]
+        );
+        assert!(got[..6].iter().all(|e| e.task == t.id), "{got:?}");
+        each_event_given_is_classified_as_its_task_is(&mut l, &got).await;
+    }
+
+    /// `got` is of an internal task and an internal promotion.
+    async fn each_event_given_is_classified_as_its_task_is(l: &mut Ledger, got: &[Logged]) {
+        assert!(
+            got.iter().all(|e| e.classification == Label::Internal),
+            "{got:?}"
+        );
+        let public = admitted(l, spec("Public")).await;
+        let after = got.last().unwrap().seq;
+        let got = l.events_after("dom-a", after).await.unwrap();
+        assert_eq!(ops(&got)[0], (public.id.as_str(), "created"));
+        assert!(got.iter().all(|e| e.classification == Label::Public));
+    }
+
+    async fn a_completion_by_a_continuation_names_no_principal(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let (parent, child, cont) = delegated(&mut l).await;
+        claim(&mut l, &child.id, "s2", mins(5)).await.unwrap();
+        l.complete_as(&child.id, "s2", "mem-a-child").await.unwrap();
+        claim(&mut l, &cont.id, "s3", mins(5)).await.unwrap();
+        l.complete_as(&cont.id, "s3", "mem-a-done").await.unwrap();
+        l.complete_by_continuation(&parent.id, &cont.id, "mem-a-done")
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let of_parent: Vec<(&str, Option<&str>)> = got
+            .iter()
+            .filter(|e| e.task == parent.id)
+            .map(|e| (e.op.as_str(), e.principal.as_deref()))
+            .collect();
+        // s1 held it, left a handoff and released it: the completion after is nobody's
+        assert_eq!(
+            of_parent[2..],
+            [
+                ("claimed", Some("s1")),
+                ("handoff_left", Some("s1")),
+                ("released", Some("s1")),
+                ("completed", None),
+            ]
+        );
+        let by_holder = got
+            .iter()
+            .find(|e| e.task == cont.id && e.op == "completed");
+        assert_eq!(by_holder.unwrap().principal.as_deref(), Some("s3"));
+    }
+
+    async fn a_completion_after_the_lease_ran_out_names_no_principal(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let parent = admitted(&mut l, spec("Compare two decisions")).await;
+        claim(&mut l, &parent.id, "s1", mins(5)).await.unwrap();
+        let cont = admitted(&mut l, resume(&parent, &[])).await;
+        // s1 did not release it: its lease ran out, and the continuation closed the task
+        *now.lock().unwrap() = T0 + mins(10);
+        claim(&mut l, &cont.id, "s3", mins(5)).await.unwrap();
+        l.complete_as(&cont.id, "s3", "mem-a-done").await.unwrap();
+        l.complete_by_continuation(&parent.id, &cont.id, "mem-a-done")
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let closed = got
+            .iter()
+            .find(|e| e.task == parent.id && e.op == "completed");
+        assert_eq!(closed.unwrap().principal, None, "{got:?}");
+    }
+
+    async fn the_events_given_hold_no_text_of_a_task_or_of_a_promotion(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Rotate the signing key")).await;
+        claim(&mut l, &t.id, "s1", mins(5)).await.unwrap();
+        l.release_as(&t.id, "s1", Some("mem-a-left")).await.unwrap();
+        claim(&mut l, &t.id, "s1", mins(5)).await.unwrap();
+        l.complete_as(&t.id, "s1", "mem-a-handoff").await.unwrap();
+        let dropped = admitted(&mut l, spec("Second")).await;
+        l.invalidate(&dropped.id, "the vault moved", None)
+            .await
+            .unwrap();
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        assert_eq!(got.len(), 11, "{got:?}");
+        let json = serde_json::to_string(&got).unwrap();
+        for text in [
+            "Rotate the signing key",
+            "Do it.",
+            "mem-a-left",
+            "mem-a-handoff",
+            "the vault moved",
+            "checked against the tree",
+        ] {
+            assert!(!json.contains(text), "{text:?} in {json}");
+        }
     }
 
     async fn not_found_and_persistence(b: &Site) {

@@ -74,6 +74,8 @@ term here in the same commit as the first document that needs it.
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
 | security role | The owner, and each author that `security` in `grants.toml` lists. Only this role reads the quarantine and the event log of a domain | security team |
+| send event | An event in the event log of a domain for content that left the perimeter in a session: a handoff that a tap posted, an export, or a model call that the egress recorded as answered. It holds the place and a digest, and no text | |
+| lineage | The answer to one question about an entry, from the event log of each domain. Back: the entries that its session read before it wrote the entry, and the entries that it cites. Forward: the entries and the send events that came after a session read it | provenance |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
 
 ## Calls and tools

@@ -18,8 +18,8 @@
 
 use crate::{
     check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
-    PROMOTION_COLUMNS, TASK_COLUMNS,
+    PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
+    LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use std::collections::HashMap;
@@ -856,6 +856,45 @@ impl Db {
             n += u64::try_from(c).unwrap_or(0);
         }
         Ok(n)
+    }
+
+    /// The rows of `domain` after sequence number `after`, in order, and before them the
+    /// rows that say who held the tasks those are of. The events are those of the
+    /// domain's schema; a domain without one has none.
+    pub(crate) async fn events_after(
+        &self,
+        domain: &str,
+        after: u64,
+    ) -> Result<Vec<RawEvent>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT e.seq, e.task_id, e.at, e.payload, t.label_rank
+                     FROM {s}.events e LEFT JOIN {s}.tasks t ON t.id = e.task_id
+                     WHERE e.seq > $1 OR (e.kind IN ({LEASE_KINDS})
+                           AND e.task_id IN (SELECT task_id FROM {s}.events WHERE seq > $1))
+                     ORDER BY e.seq"
+                ),
+                &[&after],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(RawEvent {
+                    seq: r.try_get(0)?,
+                    task: r.try_get(1)?,
+                    at: r.try_get(2)?,
+                    payload: r.try_get(3)?,
+                    domain: Some(domain.to_string()),
+                    label_rank: r.try_get(4)?,
+                })
+            })
+            .collect()
     }
 
     /// Replay every domain's events into a fresh projection, one transaction for all.

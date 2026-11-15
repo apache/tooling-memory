@@ -37,6 +37,7 @@ use tokio::sync::Mutex as AsyncMutex;
 pub mod bundle;
 pub mod contexts;
 pub mod fabric;
+pub mod lineage;
 pub mod log;
 pub mod mcp;
 pub mod platform;
@@ -266,7 +267,8 @@ fn policy_entries(ix: &Index, root: &Path, grants: &Grants) -> Vec<dm_policy::re
         .collect()
 }
 
-/// What an entry may have reached, as [`Memory::taint`] computes it.
+/// What an entry may have reached, as [`Memory::taint`] computes it: one hop of
+/// [`lineage`] forward.
 #[derive(Clone, Debug, Serialize)]
 pub struct Taint {
     /// The entry.
@@ -349,6 +351,9 @@ pub struct Memory {
     /// When this service last stamped a write; see [`next_stamp`]. Shared with the
     /// views [`Memory::for_request`] makes, which write for the same service.
     last_stamp: Arc<Mutex<OffsetDateTime>>,
+    /// The domains this session has read: a send of the session goes into the log of
+    /// each. Shared with the session's views.
+    read_domains: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -506,6 +511,7 @@ impl Memory {
             playback: OnceLock::new(),
             recording: Arc::new(Mutex::new(tape::Recording::default())),
             last_stamp: Arc::new(Mutex::new(OffsetDateTime::UNIX_EPOCH)),
+            read_domains: Arc::default(),
         })
     }
 
@@ -558,6 +564,7 @@ impl Memory {
             playback: self.playback.clone(),
             recording: Arc::clone(&self.recording),
             last_stamp: Arc::clone(&self.last_stamp),
+            read_domains: Arc::clone(&self.read_domains),
         })
     }
 
@@ -1228,6 +1235,9 @@ impl Memory {
     /// gates refuse, or a store or index error.
     pub async fn write(&self, req: WriteRequest) -> Result<Written, Error> {
         let mut entry = self.entry_to_write(req).await?;
+        // the ledger's events so far come before the write in the log of its domain. A
+        // copy that fails is late, not lost: the next one starts where this one stopped
+        let _ = self.ledger_into_log(&entry.front.domain).await;
         let offered = self.log_offered(&mut entry)?;
         let replaced = self.gate(&entry, offered).await?;
         // a policy entry written, or one replaced by an entry of any kind, changes what
@@ -2139,47 +2149,31 @@ impl Memory {
         Ok(written)
     }
 
-    /// What an entry may have reached: the sessions that read it, from the read log,
-    /// and the entries those sessions wrote after reading it, from the write log. The
-    /// paper's lineage for erasure and for a poisoned entry: what was written by a
-    /// session that read it is what to look at next.
+    /// What an entry may have reached: the sessions that read it, and the entries those
+    /// sessions wrote after reading it, from the log of each granted domain. The paper's
+    /// lineage for erasure and for a poisoned entry, one hop forward: what was written
+    /// by a session that read it is what to look at next. [`Memory::lineage`] is the
+    /// whole query.
     #[must_use]
     pub fn taint(&self, id: &str) -> Taint {
-        // times are compared as times: as text, `…00.12Z` sorts after `…00.123Z`, and a
-        // write a thousandth of a second after a read would not follow from it. A read
-        // whose time does not read still names its reader, and counts as the earliest
-        // there is, so nothing that session wrote is left out
-        let when = |at: &str| {
-            OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
-        };
-        let reads = reads::all(&self.root).unwrap_or_default();
-        let mut first_read: std::collections::BTreeMap<String, OffsetDateTime> =
-            std::collections::BTreeMap::new();
-        for r in &reads {
-            let read_at = when(&r.at).unwrap_or(OffsetDateTime::UNIX_EPOCH);
-            if r.ids.iter().any(|i| i == id) {
-                first_read
-                    .entry(r.session.clone())
-                    .and_modify(|at| *at = (*at).min(read_at))
-                    .or_insert(read_at);
-            }
-        }
-        let mut written = Vec::new();
-        for w in reads::all_writes(&self.root).unwrap_or_default() {
-            if w.id == id {
-                continue;
-            }
-            let after = when(&w.at)
-                .zip(first_read.get(&w.session))
-                .is_some_and(|(wrote, read)| wrote > *read);
-            if after {
-                written.push(w.id);
-            }
-        }
+        let logs: std::collections::BTreeMap<String, Vec<log::Event>> = self
+            .domains()
+            .into_iter()
+            .map(|d| {
+                let events = log::read(&self.root, &d, 0).unwrap_or_default();
+                (d, events)
+            })
+            .collect();
+        let forward = lineage::trace(&logs, id, lineage::Direction::Forward, Some(1));
         Taint {
             id: id.to_string(),
-            readers: first_read.into_keys().collect(),
-            written,
+            readers: forward.sessions,
+            written: forward
+                .entries
+                .into_iter()
+                .filter(|e| e.informed)
+                .map(|e| e.id)
+                .collect(),
         }
     }
 
@@ -3298,7 +3292,29 @@ impl Memory {
         .await?;
         self.export_excerpts(&domain, &ex.manifest.entries, max_label, dest)
             .await?;
+        self.log_export(&domain, &ex.manifest).await?;
         Ok(ex)
+    }
+
+    /// Say in the log of `domain` that a bundle left: first a read of the entries it
+    /// carries, at the highest classification among them, then the send, which names the
+    /// bound of the export and the digest of the manifest. The session's label does not
+    /// rise: an export hands the entries out and shows none of them to the session. The
+    /// send is at the highest classification the bundle holds when that is above the
+    /// session's label.
+    async fn log_export(
+        &self,
+        domain: &str,
+        manifest: &dm_core::manifest::Manifest,
+    ) -> Result<(), Error> {
+        let ids: Vec<String> = manifest.entries.iter().map(|e| e.id.clone()).collect();
+        if let Some(carried) = manifest.entries.iter().map(|e| e.classification).max() {
+            self.log_read(domain, ids, carried)?;
+        }
+        let to = format!("export:{}", manifest.max_label);
+        let digest = dm_core::digest(&manifest.to_yaml());
+        let label = self.label().max(manifest.highest_label);
+        self.log_send_at(Some(domain), &to, digest, label).await
     }
 
     /// Erase an entry: the body leaves every version in the record and the index, the
@@ -3586,7 +3602,7 @@ fn cites(text: &str, id: &str) -> bool {
 impl Memory {
     /// Flag every granted entry that names `id`, in its body, its sources or as the
     /// entry it supersedes, and every entry a session wrote after reading it, which is
-    /// the paper's lineage from the read log: its review date becomes today, so curation
+    /// the paper's lineage from the log: its review date becomes today, so curation
     /// re-derives it from what remains or erases it too. Returns the ids flagged.
     async fn flag_citers(&self, id: &str) -> Result<Vec<String>, Error> {
         let today = OffsetDateTime::now_utc().date();
@@ -3821,33 +3837,65 @@ mod tests {
         assert!(matches!(titled, Err(Error::Denied(_))));
     }
 
-    /// A read and a later write whose times, as text, sort the other way: the write's has
-    /// one more digit.
+    /// One line of a domain's log, as the log writes it.
+    fn log_line(seq: u64, at: &str, session: &str, change: &str) -> String {
+        format!(
+            r#"{{"seq":{seq},"at":"{at}","by":"agent:a","session":"{session}","label":"internal",{change}}}"#
+        )
+    }
+
+    /// In one log the sequence numbers decide what came after a read, whatever the times
+    /// say. Across two logs the times decide, compared as times: the time of the read,
+    /// as text, sorts after the time of the later write, which has one more digit.
     #[test]
-    fn a_write_follows_a_read_by_time_whatever_the_times_look_like_as_text() {
+    fn a_write_follows_a_read_by_its_place_in_one_log_and_by_time_across_two() {
         let dir = tempfile::tempdir().unwrap();
-        let m = mem(dir.path());
-        let state = dir.path().join("state");
-        std::fs::create_dir_all(&state).unwrap();
-        let read = r#"{"at":"2026-10-01T10:00:00.12Z","session":"s1","tool":"get","hits":1,"tokens":1,"ids":["mem-me-read"]}"#;
-        std::fs::write(reads::path(dir.path()), format!("{read}\n")).unwrap();
-        let lines = [
-            r#"{"at":"2026-10-01T10:00:00.123Z","session":"s1","id":"mem-me-after","author":"a"}"#,
-            r#"{"at":"2026-10-01T10:00:00.1Z","session":"s1","id":"mem-me-before","author":"a"}"#,
-            r#"{"at":"2026-10-01T10:00:01Z","session":"s2","id":"mem-me-other","author":"a"}"#,
+        drop(mem(dir.path()));
+        grant_domain(dir.path(), "dom-other");
+        let m = Memory::open(dir.path()).unwrap();
+        let logs = dir.path().join(log::DIR);
+        std::fs::create_dir_all(&logs).unwrap();
+        let wrote = |id: &str| format!(r#""kind":"write","id":"{id}","digest":"d""#);
+        let read = r#""kind":"read","ids":["mem-me-read"]"#;
+        let here = [
+            log_line(1, "2026-10-01T11:00:00Z", "s1", &wrote("mem-me-early")),
+            log_line(2, "2026-10-01T10:00:00.12Z", "s1", read),
+            log_line(3, "2026-10-01T09:00:00Z", "s1", &wrote("mem-me-late")),
         ];
-        std::fs::write(state.join("writes.jsonl"), lines.join("\n") + "\n").unwrap();
+        std::fs::write(logs.join("dom-me.jsonl"), here.join("\n") + "\n").unwrap();
+        let there = [
+            log_line(
+                1,
+                "2026-10-01T10:00:00.123Z",
+                "s1",
+                &wrote("mem-other-after"),
+            ),
+            log_line(
+                2,
+                "2026-10-01T10:00:00.1Z",
+                "s1",
+                &wrote("mem-other-before"),
+            ),
+            log_line(3, "2026-10-01T09:00:00Z", "s2", &wrote("mem-other-else")),
+        ];
+        std::fs::write(logs.join("dom-other.jsonl"), there.join("\n") + "\n").unwrap();
         let t = m.taint("mem-me-read");
         assert_eq!(t.readers, ["s1"]);
-        assert_eq!(t.written, ["mem-me-after"]);
-        // a read whose time does not read is still a read: its session is a reader, and
-        // what it wrote is not known to be from before
-        let unread =
-            r#"{"at":"","session":"s2","tool":"get","hits":1,"tokens":1,"ids":["mem-me-read"]}"#;
-        std::fs::write(reads::path(dir.path()), format!("{read}\n{unread}\n")).unwrap();
+        assert_eq!(t.written, ["mem-me-late", "mem-other-after"]);
+        // a read whose time does not parse is still a read: its session is a reader, and
+        // what it wrote in another domain is not known to be from before
+        let unread = log_line(4, "", "s2", read);
+        std::fs::write(
+            logs.join("dom-me.jsonl"),
+            here.join("\n") + "\n" + &unread + "\n",
+        )
+        .unwrap();
         let t = m.taint("mem-me-read");
         assert_eq!(t.readers, ["s1", "s2"]);
-        assert_eq!(t.written, ["mem-me-after", "mem-me-other"]);
+        assert_eq!(
+            t.written,
+            ["mem-me-late", "mem-other-after", "mem-other-else"]
+        );
     }
 
     #[tokio::test]
@@ -8398,16 +8446,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = mem(dir.path());
         let poison = a.write(req("Something.\n")).await.unwrap().id;
-        let reader = Memory::open(dir.path()).unwrap().with_author("agent:r");
+        // from the log of the domain: the read log, which is telemetry, is off
+        let reader = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:r")
+            .without_read_log();
         let before = reader.write(req("Before reading.\n")).await.unwrap().id;
         reader.get(&poison).await.unwrap();
         let after = reader.write(req("After reading.\n")).await.unwrap().id;
+        // one that names the entry and did not read it, and one a step further on: taint
+        // is the entries that the readers wrote, and no more
         let bystander = Memory::open(dir.path()).unwrap().with_author("agent:b");
-        let unrelated = bystander.write(req("Unrelated.\n")).await.unwrap().id;
+        let citing = WriteRequest {
+            cites: vec![poison.clone()],
+            ..req("Unrelated.\n")
+        };
+        let unrelated = bystander.write(citing).await.unwrap().id;
+        bystander.get(&after).await.unwrap();
+        let further = bystander.write(req("A step on.\n")).await.unwrap().id;
         let t = a.taint(&poison);
         assert_eq!(t.readers, vec![reader.session_id().to_string()]);
         assert_eq!(t.written, vec![after.clone()]);
         assert!(!t.written.contains(&before) && !t.written.contains(&unrelated));
+        assert!(!t.written.contains(&further));
     }
 
     fn spec(title: &str) -> TaskSpec {

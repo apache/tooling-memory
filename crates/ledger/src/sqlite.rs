@@ -5,8 +5,8 @@
 
 use crate::{
     check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
-    PROMOTION_COLUMNS, TASK_COLUMNS,
+    PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
+    LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -558,6 +558,34 @@ impl Db {
             .conn()
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
         Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    /// The rows of `domain` after sequence number `after`, in order, and before them the
+    /// rows that say who held the tasks those are of. The events table is one for all
+    /// domains: a task's row names its domain, and a promotion names its own in its
+    /// payload, so every promotion after `after` is given and the caller keeps its own.
+    pub(crate) fn events_after(&self, domain: &str, after: u64) -> Result<Vec<RawEvent>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT e.seq, e.task_id, e.at, e.payload, t.domain, t.label_rank
+             FROM events e LEFT JOIN tasks t ON t.id = e.task_id
+             WHERE (e.seq > ?1 OR (e.kind IN ({LEASE_KINDS})
+                    AND e.task_id IN (SELECT task_id FROM events WHERE seq > ?1)))
+               AND (t.domain = ?2 OR e.kind = 'promoted')
+             ORDER BY e.seq"
+        ))?;
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![after, domain], |r| {
+            Ok(RawEvent {
+                seq: r.get(0)?,
+                task: r.get(1)?,
+                at: r.get(2)?,
+                payload: r.get(3)?,
+                domain: r.get(4)?,
+                label_rank: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub(crate) fn rebuild(&mut self) -> Result<u64, Error> {
