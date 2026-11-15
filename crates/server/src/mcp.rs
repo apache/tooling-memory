@@ -673,6 +673,8 @@ impl McpServer {
     /// session's tape, or answered from the tape the session re-enacts.
     #[must_use]
     pub fn new(memory: Arc<Memory>) -> Self {
+        // what a harness asks through this server, an agent may have asked
+        memory.mark_served();
         Self {
             memory,
             tool_router: Self::tool_router(),
@@ -1627,7 +1629,10 @@ mod tests {
         else {
             panic!("proposed")
         };
-        s.memory.approve(&task.id).await.unwrap();
+        // a served session approves nothing: the owner approves in a session of its own
+        let owner = crate::Memory::open(s.memory.root()).unwrap();
+        owner.approve(&task.id).await.unwrap();
+        s.memory.reload_policy().await.unwrap();
         let rules = payload(
             &s.check_policy(Parameters(CheckPolicyParams {
                 action: "tag a release".into(),
