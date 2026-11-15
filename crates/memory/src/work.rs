@@ -8,6 +8,7 @@ use crate::hooks::{self, Event};
 use crate::Session;
 use dm_client::{MemoryClient, Task};
 use dm_sandbox::Harness;
+use dm_server::arms::TRANSCRIPT_BUDGET_TOKENS;
 use dm_server::{mcp, prefetch, Memory};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -183,9 +184,20 @@ pub async fn prompted(
         })
         .await
         .ok();
+    // the transcript-replay arm: earlier sessions' transcripts in front of the prompt.
+    // The tape keeps the caller's prompt; nothing is added under any other setting
+    let replayed = session
+        .memory()
+        .transcript_context(None, TRANSCRIPT_BUDGET_TOKENS)
+        .await?;
+    let given = if replayed.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{replayed}\n{prompt}")
+    };
     // the harness's own arguments follow its headless form, where every harness takes
     // a flag after the prompt
-    let mut argv = session.harness().headless(prompt);
+    let mut argv = session.harness().headless(&given);
     argv.extend(args.iter().cloned());
     let (code, output) = session.run(&argv, true).await?;
     let output = output.map(|o| answer_of(session, o));
@@ -193,10 +205,11 @@ pub async fn prompted(
         crate::stops::answer(out);
     }
     let mut after = handoff_ids(&client, None).await?;
-    let wrote = after.difference(&before).next().is_some();
+    // a session whose settings leave its own handoff out of what it lists still wrote it
+    let wrote = after.difference(&before).next().is_some() || session.memory().written().1 > 0;
     after.extend(file_outbox(session, &client, wrote, None).await?);
     let new: Vec<&String> = after.difference(&before).collect();
-    if new.is_empty() && !no_handoff {
+    if new.is_empty() && !wrote && !no_handoff {
         eprintln!(
             "amem: the run left no handoff; the next session starts from nothing (pass --no-handoff if that is intended)"
         );

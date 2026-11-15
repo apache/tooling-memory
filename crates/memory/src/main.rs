@@ -19,6 +19,7 @@ mod curator;
 mod deputy;
 mod doctor;
 mod drift;
+mod eval;
 mod eventlog;
 mod gofannon;
 mod golden;
@@ -312,6 +313,15 @@ enum Command {
         /// sets it; a session does not choose its own position.
         #[arg(long, env = "MEMORY_POSITION")]
         position: Option<String>,
+        /// The evaluation arm whose settings this session gets, before it serves:
+        /// no-memory, transcript-replay, t0-only, raw-only or full. A launcher sets it;
+        /// a session does not choose its own settings.
+        #[arg(long, env = "MEMORY_ARM")]
+        arm: Option<String>,
+        /// The snapshot this session reads at, an RFC 3339 time: an entry created
+        /// later is not read.
+        #[arg(long, env = "MEMORY_AS_OF")]
+        as_of: Option<String>,
     },
     /// Run a harness confined: no network except the egress, the memory server attached,
     /// model calls forwarded and metered. Credentials come from this process's
@@ -383,6 +393,15 @@ enum Command {
         /// record's telemetry, not this one's.
         #[arg(long)]
         empty_memory: bool,
+        /// Run as an evaluation arm: no-memory, transcript-replay, t0-only, raw-only or
+        /// full. The arm fixes the session's settings, which narrow what it reads; the
+        /// record, the sandbox, the egress and the tools stay the same.
+        #[arg(long, conflicts_with = "empty_memory")]
+        arm: Option<String>,
+        /// Read the record as of this RFC 3339 time: an entry created later is not
+        /// read. The tasks, the policy and the grants are read as they are now.
+        #[arg(long)]
+        as_of: Option<String>,
         /// After the run, mine the session's transcript for entries with a small model
         /// through the same destination; they land raw, low confidence, with the
         /// transcript as source.
@@ -936,6 +955,12 @@ enum Command {
         #[command(subcommand)]
         op: platform::PlatformOp,
     },
+    /// The evaluation: the arms of the comparison, each one fixed value of a session's
+    /// settings.
+    Eval {
+        #[command(subcommand)]
+        op: eval::EvalOp,
+    },
     /// Positions: the standing roles of a domain, what is pinned to each, and which
     /// wait for a session. A position is in force once a person verified its entry.
     Position {
@@ -1463,14 +1488,23 @@ fn refuse_invocation(cli: &Cli, root: &Path) -> Fallible {
 }
 
 /// `amem serve`: the root over MCP on standard input and output, as an author, holding
-/// the task `MEMORY_TASK` names if a launcher set it, and in the position `position`
-/// names if a launcher gave one. A position that refuses the session ends the command.
-async fn serve_stdio_cmd(
-    root: &Path,
-    author: Option<String>,
-    manifest: Vec<String>,
-    position: Option<String>,
-) -> Fallible {
+/// the task `MEMORY_TASK` names if a launcher set it, in the position `position`
+/// names if a launcher gave one, and under the settings a launcher gave. A position
+/// that refuses the session ends the command.
+async fn serve_stdio_cmd(root: &Path, command: Command) -> Fallible {
+    let Command::Serve {
+        author,
+        manifest,
+        position,
+        arm,
+        as_of,
+    } = command
+    else {
+        unreachable!("routed by run_cli")
+    };
+    let settings = eval::settings(arm.as_deref(), as_of.as_deref())?;
+    // serve gives no prompt, so it has nothing to put transcripts in front of
+    eval::needs_prompt(settings.as_ref(), false)?;
     let mut m = Memory::open(root)?.with_manifest(manifest);
     if let Some(a) = author {
         m = m.with_author(a);
@@ -1478,6 +1512,9 @@ async fn serve_stdio_cmd(
     if let Some(name) = position.filter(|p| !p.is_empty()) {
         positions::fill(&m, &name, None).await?;
     }
+    // after the position is filled, which is the launcher's read, and before anything
+    // is served
+    eval::give(&m, settings.as_ref())?;
     // a harness working a task has it in MEMORY_TASK, as the launcher sets it;
     // what this session files or writes is judged against that task
     if let Some(t) = std::env::var("MEMORY_TASK").ok().filter(|t| !t.is_empty()) {
@@ -1546,11 +1583,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         cmd @ (Command::Init { .. } | Command::Usage | Command::Cost { .. }) => {
             bookkeeping_cmd(&root, cmd).await
         }
-        Command::Serve {
-            author,
-            manifest,
-            position,
-        } => serve_stdio_cmd(&root, author, manifest, position).await,
+        cmd @ Command::Serve { .. } => serve_stdio_cmd(&root, cmd).await,
         cmd @ (Command::Launch { .. } | Command::Work { .. } | Command::Inside { .. }) => {
             launch_cmd(&root, cmd).await
         }
@@ -1591,6 +1624,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Log { op } => eventlog::cmd(&Memory::open(&root)?, op).await,
         Command::Gofannon { op } => gofannon::cmd(&root, op).await,
         Command::Platform { op } => platform::cmd(&Memory::open(&root)?, op).await,
+        Command::Eval { op } => eval::cmd(&op),
         Command::Position { op } => positions::cmd(&Memory::open(&root)?, op).await,
         Command::Tool { name, args } => sources::call(&root, &name, &args).await,
         Command::ToolServer { listen, token_env } => {
@@ -2931,6 +2965,8 @@ fn wslc_for_launch(
         model,
         subagents,
         no_handoff,
+        arm,
+        as_of,
         args,
         ..
     } = command
@@ -2939,6 +2975,9 @@ fn wslc_for_launch(
     };
     if backend_of(*backend, *unconfined, root, (*harness).into()) != Backend::Wslc {
         return Ok(None);
+    }
+    if arm.is_some() || as_of.is_some() {
+        return Err(eval::NOT_ON_WSLC.into());
     }
     let mut inside_args = run_options_args(model.as_deref(), *subagents);
     inside_args.extend(inside_args_for_launch(
@@ -3063,6 +3102,8 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         subagents,
         no_handoff,
         empty_memory,
+        arm,
+        as_of,
         mine: mine_after,
         mine_model,
         mine_via,
@@ -3074,6 +3115,8 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     };
     let workdir = resolve_workdir(root, workdir)?;
     refuse_browser_unconfined(unconfined, backend)?;
+    let settings = eval::settings(arm.as_deref(), as_of.as_deref())?;
+    eval::needs_prompt(settings.as_ref(), prompt.is_some() || prompt_file.is_some())?;
     let prompt = match (prompt, prompt_file) {
         (Some(p), _) => Some(p),
         (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
@@ -3092,7 +3135,9 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         },
         workdir,
         runner_for(backend_of(backend, unconfined, root, harness.into()), root)?,
-        RunOptions::new(model, subagents, program, None).empty_memory(empty_memory),
+        RunOptions::new(model, subagents, program, None)
+            .empty_memory(empty_memory)
+            .settings(settings),
     )
     .await?;
     let code = stops
@@ -3309,6 +3354,8 @@ struct RunOptions {
     /// A private home of the run's own, for a re-run, which must not leave its
     /// transcript among the harness's real sessions.
     home: Option<PathBuf>,
+    /// The session's settings, when the launch names an arm or a snapshot.
+    settings: Option<dm_server::arms::Settings>,
 }
 
 impl RunOptions {
@@ -3325,7 +3372,13 @@ impl RunOptions {
             projection,
             empty_memory: false,
             home: None,
+            settings: None,
         }
+    }
+
+    fn settings(mut self, settings: Option<dm_server::arms::Settings>) -> RunOptions {
+        self.settings = settings;
+        self
     }
 
     fn home(mut self, home: PathBuf) -> RunOptions {
@@ -3674,6 +3727,8 @@ impl Session {
             root
         };
         let mut p = prepare_launch(root, harness, creds, socket, None, projected).await?;
+        // before anything is read: the projection is rendered later, under the settings
+        eval::give(&p.memory, options.settings.as_ref())?;
         let mut options = options;
         if options.model.is_none() {
             options.model = platform_model(&p.memory, harness).await;
@@ -4931,6 +4986,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Log { .. }
         | Command::Gofannon { .. }
         | Command::Platform { .. }
+        | Command::Eval { .. }
         | Command::Position { .. }
         | Command::Tool { .. }
         | Command::ToolServer { .. }

@@ -144,7 +144,7 @@ impl Memory {
         // the policy entries this session may read; its label rises only to the rules
         // whose text it is given
         let readable = {
-            let f = self.filter_for(None)?;
+            let f = self.policy_filter()?;
             let ix = self.index.lock().await;
             ix.list_every(&f, Some(EntryType::Policy))?
         };

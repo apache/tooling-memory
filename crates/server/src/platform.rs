@@ -374,8 +374,9 @@ impl Memory {
         let Some(entry) = self.pinned_entry(&named).await? else {
             return Err(none());
         };
-        // under the filter every read is under, and before anything of the entry is told
-        let filter = self.session_filter()?;
+        // under the filter the grants and the policy give, and before anything of the
+        // entry is told. Filing a task is a write: the session's settings do not narrow it
+        let filter = self.granted_filter()?;
         let seen = self.index.lock().await.meta(&entry.front.id, &filter)?;
         if seen.is_none() {
             return Err(none());

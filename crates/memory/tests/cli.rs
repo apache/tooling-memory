@@ -751,6 +751,124 @@ fn a_position_is_written_verified_pinned_to_and_retired_through_the_commands() {
     step_position_retire(&d.root, &entry, &id);
 }
 
+fn search_call() -> (&'static str, serde_json::Value) {
+    ("search", serde_json::json!({"query": "digests"}))
+}
+
+fn settings_call() -> (&'static str, serde_json::Value) {
+    ("settings", serde_json::json!({}))
+}
+
+/// A session of `amem serve` under the arm a launcher's variable names: what it is
+/// refused, what it still does, and what it reads.
+#[test]
+fn serve_gives_the_session_the_arm_a_launcher_names() {
+    let mut d = step_init();
+    step_write(&mut d);
+    let body = "# Stopped\n\nThe digests are next.\n";
+    let write = serde_json::json!({"body": body, "entry_type": "handoff"});
+
+    // no launcher named an arm: production's settings, and the search finds the handoff
+    let calls = [search_call(), settings_call()];
+    let open = serve(&d.root, "agent:codex", &[], &[], &calls);
+    let found = &open.result(0)["hits"][0]["id"];
+    assert_eq!(*found, d.handoff, "{:?}", open.calls);
+    assert_eq!(open.result(1)["arm"], "full", "{:?}", open.calls);
+    assert_eq!(open.result(1)["settings"]["memory"], true);
+
+    // the variable a launcher sets
+    let env = [("MEMORY_ARM", "no-memory")];
+    let t0 = ("t0", serde_json::json!({}));
+    let calls = [search_call(), settings_call(), ("write", write), t0];
+    let off = serve(&d.root, "agent:codex", &[], &env, &calls);
+    let (allowed, why) = &off.calls[0];
+    assert!(!allowed, "the search is refused: {why}");
+    assert!(why.contains("memory access is off"), "{why}");
+    assert_eq!(off.result(1)["arm"], "no-memory", "{:?}", off.calls);
+    assert_eq!(off.result(1)["settings"]["memory"], false);
+    assert!(off.result(2)["id"].is_string(), "the write is not governed");
+    let (_, t0) = &off.calls[3];
+    assert!(t0.contains("T0 is off"), "{t0}");
+    assert!(!t0.contains(&d.handoff), "{t0}");
+    let said = "amem: arm no-memory (the floor)";
+    assert!(off.stderr.contains(said), "{}", off.stderr);
+}
+
+/// The flags of `amem serve`, and what ends the command before it serves.
+#[test]
+fn serve_takes_an_arm_and_a_snapshot_as_flags_and_refuses_what_is_neither() {
+    let mut d = step_init();
+    step_write(&mut d);
+    // the raw-only arm at a snapshot before the record was written
+    let flags = ["--arm", "raw-only", "--as-of", "2026-01-01T00:00:00Z"];
+    let calls = [search_call(), settings_call()];
+    let early = serve(&d.root, "agent:codex", &flags, &[], &calls);
+    let none = serde_json::json!([]);
+    assert_eq!(early.result(0)["hits"], none, "{:?}", early.calls);
+    let told = early.result(1);
+    assert_eq!(told["arm"], "raw-only", "{told}");
+    assert_eq!(told["settings"]["not_after"], "2026-01-01T00:00:00Z");
+
+    // an empty variable is unset, and a name that is no arm ends the command
+    let unset = [("MEMORY_ARM", ""), ("MEMORY_AS_OF", "")];
+    let same = serve(&d.root, "agent:codex", &[], &unset, &[settings_call()]);
+    assert_eq!(same.result(0)["arm"], "full", "{:?}", same.calls);
+    for (flags, why) in [
+        (["--arm", "everything"], "is not an arm"),
+        (["--as-of", "yesterday"], "RFC 3339"),
+        (["--arm", "transcript-replay"], "in front of a prompt"),
+    ] {
+        let refused = fails(&d.root, &[&["serve"][..], &flags[..]].concat());
+        assert!(refused.contains(why), "{refused}");
+    }
+}
+
+#[test]
+fn eval_arms_lists_the_five_arms_in_the_paper_s_order() {
+    let d = step_init();
+    let arms = json(&ok(&d.root, &["eval", "arms"], None));
+    let names: Vec<&str> = arms
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["arm"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "no-memory",
+            "transcript-replay",
+            "t0-only",
+            "raw-only",
+            "full"
+        ]
+    );
+    assert_eq!(arms[0]["stands_for"], "the floor");
+    assert_eq!(arms[0]["settings"]["memory"], false);
+    assert_eq!(arms[1]["settings"]["transcripts"], true);
+    assert_eq!(arms[2]["settings"]["depth"], "t0");
+    assert_eq!(arms[3]["settings"]["max_tier"], "raw");
+    assert_eq!(arms[3]["settings"]["t0"], "digest");
+    assert_eq!(arms[4]["stands_for"], "the system as built");
+    assert_eq!(arms[4]["settings"]["t0"], "full");
+}
+
+#[test]
+fn launch_refuses_an_arm_over_an_empty_record_and_a_name_that_is_no_arm() {
+    let d = step_init();
+    let launch = ["launch", "--harness", "claude", "--unconfined"];
+    let both = [&launch[..], &["--arm", "full", "--empty-memory"][..]].concat();
+    let refused = fails(&d.root, &both);
+    assert!(refused.contains("--empty-memory"), "{refused}");
+    assert!(refused.contains("cannot be used with"), "{refused}");
+    let unknown = [&launch[..], &["--arm", "everything", "--prompt", "hi"][..]].concat();
+    let refused = fails(&d.root, &unknown);
+    assert!(refused.contains("is not an arm"), "{refused}");
+    let replay = [&launch[..], &["--arm", "transcript-replay"][..]].concat();
+    let refused = fails(&d.root, &replay);
+    assert!(refused.contains("in front of a prompt"), "{refused}");
+}
+
 #[test]
 fn serve_fills_the_position_a_launcher_names_before_it_serves() {
     let d = step_init();

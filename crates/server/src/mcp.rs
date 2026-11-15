@@ -618,6 +618,7 @@ const READS: &[&str] = &[
     "list_tasks",
     "position",
     "positions",
+    "settings",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -1193,6 +1194,14 @@ impl McpServer {
     }
 
     #[tool(
+        description = "The settings of this session, which narrow what it reads: memory access, the disclosure depth, prefetch, the T0 contents, the highest trust tier, the snapshot, and transcript replay. `arm` names the evaluation arm with these settings, or is null. A launcher sets them once; no tool changes them."
+    )]
+    async fn settings(&self) -> Result<CallToolResult, McpError> {
+        let settings = self.memory.settings();
+        ok(json!({ "arm": crate::arms::Arm::of(&settings), "settings": settings }))
+    }
+
+    #[tool(
         description = "Retire a position, as the owner of the record: its tasks lose their pin and return to matching, and its history stays under its name. `why` is words on one line."
     )]
     async fn retire_position(
@@ -1219,7 +1228,9 @@ fn t0_uri(domain: &str) -> String {
 
 impl McpServer {
     /// One call through the router; a harness's call is kept on the session's tape, and in
-    /// a re-run answered from the tape first.
+    /// a re-run answered from the tape first. A harness's call is asked of the session's
+    /// settings before it is served; the launcher's own calls are not, and get the empty
+    /// answers the read filter gives.
     async fn routed(
         &self,
         request: CallToolRequestParams,
@@ -1257,11 +1268,9 @@ impl McpServer {
                 }
                 tape::Answer::Refused(why) => return Err(McpError::invalid_params(why, None)),
             }
-            let tcc = ToolCallContext::new(self, request, context);
-            return self.tool_router.call(tcc).await;
+            return self.admitted(&tool, request, context).await;
         }
-        let tcc = ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tcc).await;
+        let result = self.admitted(&tool, request, context).await;
         let (value, is_error) = to_tape(&result);
         if let Err(e) = self
             .memory
@@ -1271,6 +1280,21 @@ impl McpServer {
             eprintln!("amem: {tool} was not kept on the tape: {e}");
         }
         result
+    }
+}
+
+impl McpServer {
+    /// A harness's call, served when the session's settings admit the tool. A refusal
+    /// names the setting, and is the call's result like any other error.
+    async fn admitted(
+        &self,
+        tool: &str,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.memory.admits_tool(tool).map_err(mcp_err)?;
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 }
 
@@ -1421,6 +1445,7 @@ mod tests {
             "position",
             "positions",
             "retire_position",
+            "settings",
         ] {
             assert!(
                 names.contains(&expected),

@@ -86,6 +86,10 @@ term here in the same commit as the first document that needs it.
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
+| session settings | The values that a launcher gives a session one time, before the session reads. They make what the session reads smaller, and the session cannot change them | session config, switches, flags (for session settings) |
+| arm | One fixed value of the session settings, for an evaluation: `no-memory`, `transcript-replay`, `t0-only`, `raw-only` or `full` | variant, condition, mode (for an arm) |
+| snapshot | The time that a session reads the record at, `--as-of`. The session does not read an entry that was created after it | cutoff, checkpoint (for a snapshot) |
+| disclosure depth | How far below T0 a session reads: `t0` (T0 and nothing below it) or `full` | depth (alone, for the session setting) |
 
 ## Calls and tools
 

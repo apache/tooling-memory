@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
+pub mod arms;
 pub mod bundle;
 pub mod contexts;
 pub mod fabric;
@@ -353,6 +354,10 @@ pub struct Memory {
     /// The position this session fills, when it fills one: a copy of the record taken
     /// then. Shared by the views of a session ([`Memory::for_request`]).
     seat: Arc<Mutex<Option<positions::Seated>>>,
+    /// The settings a launcher gave this session, once: what narrows its reads below
+    /// its grants and its policy. Unset is production. A view of the session
+    /// ([`Memory::for_request`]) carries them.
+    settings: OnceLock<arms::Settings>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -511,6 +516,7 @@ impl Memory {
             recording: Arc::new(Mutex::new(tape::Recording::default())),
             last_stamp: Arc::new(Mutex::new(OffsetDateTime::UNIX_EPOCH)),
             seat: Arc::default(),
+            settings: OnceLock::new(),
         })
     }
 
@@ -525,13 +531,14 @@ impl Memory {
     /// manifest, the tools and the projection carry over. What is kept per session and
     /// keyed by the session id is shared too, so a view counts with its session: the
     /// held task, the supersede count the blast-radius gate reads, the tape and the
-    /// number of kept contexts. What this view wrote starts at zero.
+    /// number of kept contexts. What this view wrote starts at zero. The session's
+    /// settings carry over, and the view's scope is the granted one, before them.
     ///
     /// # Errors
     ///
     /// When the policy fails to give the read scope.
     pub fn for_request(&self) -> Result<Memory, Error> {
-        let scope = self.session_filter()?;
+        let scope = self.granted_filter()?;
         let version = self.scope_key(&self.policy());
         let mut session = self.grants.session();
         session.handling = session.handling.min(scope.handling);
@@ -564,16 +571,26 @@ impl Memory {
             recording: Arc::clone(&self.recording),
             last_stamp: Arc::clone(&self.last_stamp),
             seat: Arc::clone(&self.seat),
+            settings: self.settings.clone(),
         })
     }
 
-    /// The read filter for this session: the policy's read scope for this principal,
+    /// The read filter for this session: the granted filter under the session's
+    /// settings ([`arms::Settings::apply`]). Every read of an entry is under it, so a
+    /// setting that leaves an entry out leaves it out of every read path.
+    fn session_filter(&self) -> Result<ReadFilter, Error> {
+        Ok(self.settings().apply(self.granted_filter()?))
+    }
+
+    /// What the grants and the policy let this session read, before its settings: the
+    /// policy's read scope for this principal,
     /// evaluated once and narrowed against the grants, so the policy can take reads
     /// away and never add them. A session that fills a position reads no higher than
     /// the handling of the position's envelope, and reads nothing once the position
     /// changed. The session's handling is capped at the filter as well. The decision
-    /// is logged like any other.
-    fn session_filter(&self) -> Result<ReadFilter, Error> {
+    /// is logged like any other. The cache holds this filter, not the one under the
+    /// settings: T0 and the writes that read on the session's behalf start from it.
+    fn granted_filter(&self) -> Result<ReadFilter, Error> {
         self.fresh()?;
         // a session in a position reads under the envelope of the version in force,
         // or not at all
@@ -777,7 +794,7 @@ impl Memory {
         if d.denials.is_empty() {
             return Ok(());
         }
-        let filter = self.session_filter()?;
+        let filter = self.policy_filter()?;
         let p = self.policy();
         let above = |id: &str| {
             p.entries().iter().any(|e| {
@@ -1006,7 +1023,12 @@ impl Memory {
     }
 
     fn filter_for(&self, domain: Option<&str>) -> Result<ReadFilter, Error> {
-        let mut f = self.session_filter()?;
+        self.in_domain(self.session_filter()?, domain)
+    }
+
+    /// `f` narrowed to `domain`, when one is named: a domain the grants lack, or one
+    /// outside `f`, is refused.
+    fn in_domain(&self, mut f: ReadFilter, domain: Option<&str>) -> Result<ReadFilter, Error> {
         if let Some(d) = domain {
             let d = self.resolve_domain(Some(d))?;
             if !f.domains.contains(&d) {
@@ -1116,10 +1138,24 @@ impl Memory {
     /// [`Error::NotFound`] when absent or not for this session, or a store error.
     pub async fn get(&self, id: &str) -> Result<Entry, Error> {
         let f = self.session_filter()?;
-        let meta = self.index.lock().await.meta(id, &f)?;
+        self.get_under(id, &f).await
+    }
+
+    /// The handoff a task tool names, read on behalf of that write: under the granted
+    /// filter, so a session whose settings leave retrieval out, or whose snapshot is
+    /// before its own handoff, still releases a task with the handoff it wrote. The
+    /// entry is checked and not returned to the caller.
+    async fn get_for_task(&self, id: &str) -> Result<Entry, Error> {
+        let f = self.granted_filter()?;
+        self.get_under(id, &f).await
+    }
+
+    /// [`Memory::get`] under `f`.
+    async fn get_under(&self, id: &str, f: &ReadFilter) -> Result<Entry, Error> {
+        let meta = self.index.lock().await.meta(id, f)?;
         let Some(meta) = meta else {
             self.forget_pushed(id);
-            return Err(self.not_served(id, None).await);
+            return Err(self.not_served(id, None, f).await);
         };
         self.note_get();
         let entry = self
@@ -1131,7 +1167,7 @@ impl Memory {
         // an entry a curation has since replaced, and the reader is redirected, not lost
         if !entry.is_active() && !f.include_inactive {
             self.forget_pushed(id);
-            return Err(self.not_served(id, entry.front.status).await);
+            return Err(self.not_served(id, entry.front.status, f).await);
         }
         if !lock(&self.session).observe(entry.front.classification) {
             self.forget_pushed(id);
@@ -1142,13 +1178,11 @@ impl Memory {
         Ok(entry)
     }
 
-    /// Why an entry is not served, for an entry this session could read: moved to its
-    /// successor, or gone. Anything the session could not read stays not found, so the
-    /// answer tells nothing a search would not.
-    async fn not_served(&self, id: &str, known: Option<Status>) -> Error {
-        let Ok(mut wide) = self.session_filter() else {
-            return Error::NotFound(id.to_string());
-        };
+    /// Why an entry is not served, for an entry this session could read under `f`:
+    /// moved to its successor, or gone. Anything the session could not read stays not
+    /// found, so the answer tells nothing a search would not.
+    async fn not_served(&self, id: &str, known: Option<Status>, f: &ReadFilter) -> Error {
+        let mut wide = f.clone();
         wide.include_inactive = true;
         let ix = self.index.lock().await;
         let Ok(Some(meta)) = ix.meta(id, &wide) else {
@@ -1335,7 +1369,7 @@ impl Memory {
         }
         let f = self.session_filter()?;
         if self.index.lock().await.meta(id, &f)?.is_none() {
-            return Err(self.not_served(id, None).await);
+            return Err(self.not_served(id, None, &f).await);
         }
         let (_, entry) = self.find(id).await?;
         self.promote_entry(entry, to, why).await
@@ -2137,27 +2171,22 @@ impl Memory {
     }
 
     /// The T0 for a domain: the latest handoffs, standing decisions, conventions, and
-    /// pointers, under the budget. What a session loads first.
+    /// pointers, under the budget. What a session loads first. The session's settings
+    /// decide its contents: all of it, the policy digest and the count of tasks that
+    /// wait, or one line that says T0 is off and reads nothing.
     ///
     /// # Errors
     ///
     /// An ungranted domain, or an index or ledger error.
     pub async fn t0(&self, domain: Option<&str>) -> Result<String, Error> {
         let domain = self.resolve_domain(domain)?;
-        let f = self.filter_for(Some(&domain))?;
-        let (handoffs, decisions, conventions, total, due) = {
-            let ix = self.index.lock().await;
-            let mut conventions = ix.list(&f, Some(EntryType::Convention), 20)?;
-            conventions.extend(ix.list(&f, Some(EntryType::Method), 20)?);
-            (
-                ix.list(&f, Some(EntryType::Handoff), 5)?,
-                ix.list(&f, Some(EntryType::Decision), 30)?,
-                conventions,
-                ix.count(&f)?,
-                ix.due_for_review(&f, OffsetDateTime::now_utc().date(), 1000)?
-                    .len(),
-            )
-        };
+        let contents = self.settings().t0_served();
+        if contents == arms::T0Contents::Off {
+            return Ok(arms::T0_OFF.to_string());
+        }
+        // under the settings' bounds and never closed: T0 is what the depth T0 serves
+        let f = self.t0_filter(&domain)?;
+        let lists = self.t0_lists(&f, contents).await?;
         // a count, so nothing is read and the label stays; what it counts is only what
         // the session may see
         let handling = self.handling()?;
@@ -2170,30 +2199,34 @@ impl Memory {
             .iter()
             .filter(|t| self.sees(t, handling))
             .count();
-        self.observe(&handoffs);
-        self.observe(&decisions);
-        self.observe(&conventions);
+        lists.observed_by(self);
         let generated_by = format!("memory {}", env!("CARGO_PKG_VERSION"));
         // a rule is read as an entry is: the digest gives the text of the rules this
         // session may read, and for the others their ids
         let readable: Vec<Hit> = {
-            let f = self.session_filter()?;
+            let f = self.policy_filter()?;
             let ix = self.index.lock().await;
             ix.list_every(&f, Some(EntryType::Policy))?
         };
         let digest = self.policy_digest(&readable);
-        let position = self.position_slice(&domain).await?;
+        let digest_only = contents == arms::T0Contents::Digest;
+        let position = if digest_only {
+            String::new()
+        } else {
+            self.position_slice(&domain, &f).await?
+        };
         let text = t0::render(&t0::Inputs {
             domain: &domain,
             generated_by: &generated_by,
             position: &position,
-            handoffs: &handoffs,
-            decisions: &decisions,
-            conventions: &conventions,
-            total_active: total,
-            due_for_review: due,
+            handoffs: &lists.handoffs,
+            decisions: &lists.decisions,
+            conventions: &lists.conventions,
+            total_active: lists.total,
+            due_for_review: lists.due,
             tasks_waiting: waiting,
             policy_digest: &digest,
+            digest_only,
         });
         self.reads.text("t0", &text);
         Ok(text)
@@ -3136,7 +3169,7 @@ impl Memory {
         handoff: Option<&str>,
     ) -> Result<Task, Error> {
         if let Some(h) = handoff {
-            self.get(h).await?; // the handoff must exist and be readable here
+            self.get_for_task(h).await?; // the handoff must exist and be readable here
         }
         let mut l = self.ledger.lock().await;
         self.check_task(&l.get(id).await?)?;
@@ -3161,7 +3194,7 @@ impl Memory {
         generation: Option<u64>,
         handoff: &str,
     ) -> Result<Task, Error> {
-        if self.get(handoff).await?.front.entry_type != EntryType::Handoff {
+        if self.get_for_task(handoff).await?.front.entry_type != EntryType::Handoff {
             return Err(Error::Denied(format!("{handoff} is not a handoff entry")));
         }
         let mut l = self.ledger.lock().await;

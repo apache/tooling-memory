@@ -1052,15 +1052,19 @@ impl Memory {
         self.read_tasks(seen)
     }
 
-    /// The handoff cache of a position: the newest handoffs of its domain, within this
-    /// session's filter, whose citations hold its name. Each is read.
-    async fn handoff_cache(&self, domain: &str, name: &str) -> Result<Vec<Hit>, Error> {
-        let f = self.filter_for(Some(domain))?;
+    /// The handoff cache of a position: the newest handoffs of its domain, within `f`,
+    /// the filter of the read that asks, whose citations hold its name. Each is read.
+    async fn handoff_cache(
+        &self,
+        domain: &str,
+        name: &str,
+        f: &ReadFilter,
+    ) -> Result<Vec<Hit>, Error> {
         let newest = self
             .index
             .lock()
             .await
-            .list(&f, Some(EntryType::Handoff), CACHE_WALK)?;
+            .list(f, Some(EntryType::Handoff), CACHE_WALK)?;
         let mut out = Vec::new();
         for h in newest {
             if out.len() == CACHE_SIZE {
@@ -1075,14 +1079,18 @@ impl Memory {
         Ok(out)
     }
 
-    /// The position's section of the T0 of `domain`: empty for a session that fills no
-    /// position there.
+    /// The position's section of the T0 of `domain`, its handoff cache read under `f`,
+    /// the filter of that T0: empty for a session that fills no position there.
     ///
     /// # Errors
     ///
     /// [`Error::Stale`] when the position changed after this session filled it; an
     /// index, store or ledger error.
-    pub(crate) async fn position_slice(&self, domain: &str) -> Result<String, Error> {
+    pub(crate) async fn position_slice(
+        &self,
+        domain: &str,
+        f: &ReadFilter,
+    ) -> Result<String, Error> {
         let here = lock(&self.seat)
             .as_ref()
             .is_some_and(|s| s.position.domain == domain);
@@ -1095,7 +1103,7 @@ impl Memory {
         let name = &seat.position.name;
         lock(&self.session).observe(seat.position.classification);
         let commitments = self.commitments(domain, name).await?;
-        let handoffs = self.handoff_cache(domain, name).await?;
+        let handoffs = self.handoff_cache(domain, name, f).await?;
         Ok(slice(&seat, &commitments, &handoffs))
     }
 
@@ -1114,7 +1122,8 @@ impl Memory {
         };
         lock(&self.session).observe(position.classification);
         let commitments = self.commitments(&position.domain, name).await?;
-        let cache = self.handoff_cache(&position.domain, name).await?;
+        let f = self.filter_for(Some(&position.domain))?;
+        let cache = self.handoff_cache(&position.domain, name, &f).await?;
         self.reads.hits("position", Some(name), &cache);
         let sessions = self.live_in(&position.domain, name).await?;
         let seat = lock(&self.seat)
