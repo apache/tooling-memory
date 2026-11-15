@@ -467,8 +467,11 @@ impl Memory {
     /// What this session can do, as the ledger matches it to a task's requirements: the
     /// manifest it was given, and each tool the grants give it. A session that fills a
     /// position presents no tool outside the position's authority envelope.
-    #[must_use]
-    pub(crate) fn capabilities(&self) -> Vec<String> {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stale`] when the position changed after this session filled it.
+    pub(crate) fn capabilities(&self) -> Result<Vec<String>, Error> {
         let mut all = self.manifest.clone();
         for (name, tap) in &self.grants.taps {
             let tool = format!("tool:{name}");
@@ -476,8 +479,8 @@ impl Memory {
                 all.push(tool);
             }
         }
-        self.narrow_to_envelope(&mut all);
-        all
+        self.narrow_to_envelope(&mut all)?;
+        Ok(all)
     }
 }
 
@@ -910,7 +913,7 @@ mod tests {
         let m = Memory::open(dir.path())
             .unwrap()
             .with_manifest(vec!["human".into()]);
-        assert_eq!(m.capabilities(), ["human", "tool:fetch"]);
+        assert_eq!(m.capabilities().unwrap(), ["human", "tool:fetch"]);
         written(&m, REVIEW, true).await;
         // so a task that requires what its definition declares is one this session claims
         let t = m

@@ -884,6 +884,29 @@ give the task to a different session. When a different session asks for the task
 id, the ledger refuses, and the refusal names the position. A continuation in the same
 domain takes the pin of its parent. A subagent task and a retry do not.
 
+The memory server applies the checks of a pin to a pin that a continuation takes. A
+session can file a task with the origin `continues:<id>`. If the session cannot read
+the position of that parent, the memory server refuses the task. If the session cannot
+read the parent, the memory server refuses the task and names nothing of the parent.
+
+A task that a session pins to a position stays proposed until one of these admits it:
+
+- a person;
+- a session that fills the position under the agent definition that the charter names.
+
+This applies to each session that does not fill the position in that way: a seconded
+session, a session in a different position and a session in no position. The memory
+server does not admit their pinned task when they file it, and it refuses their
+`admit`.
+
+A pinned task waits for its continuation, and no session claims the task during that
+time. Thus only these sessions fan out a pinned task or file its continuation:
+
+- the session that holds the task, which can be a seconded session;
+- a session that can admit a task of the position.
+
+The memory server refuses each other session, and files nothing.
+
 A session that fills a position gets these, and is held to them:
 
 - It claims the tasks that are pinned to the position, and the tasks without a pin whose
@@ -892,14 +915,16 @@ A session that fills a position gets these, and is held to them:
   can make that set smaller.
 - It reads no entry above the handling of the envelope.
 - Its T0 starts with the slice of the position: the charter, the authority envelope, the
-  open commitments and the handoff cache. A commitment is an open task that is pinned to
-  the position.
+  open commitments and the handoff cache. A commitment is a task that is pinned to the
+  position, is admitted and is not closed. A proposed task is not a commitment. The
+  slice shows the first 160 characters of the title of a commitment.
 - When it writes a handoff, the memory server adds the name of the position to the
   citations of the handoff. The handoff cache is the newest five handoffs that cite the
   position.
 - When the entry of the position is replaced, retired, demoted or erased, the session
-  cannot continue in the position. The memory server refuses its next claim and its next
-  T0. A handoff that it writes then does not get the citation. Start a new session.
+  cannot continue in the position. The memory server refuses each claim, each read, each
+  tool call and each T0 of the session from then on. The session can still write a
+  handoff, and that handoff does not get the citation. Start a new session.
 
 A session under an agent definition that the charter does not name is a seconded
 session. It claims the tasks of the position, and it reads what the position holds. It
@@ -917,23 +942,30 @@ session starts, or the launcher finds one that waits:
 - `amem work --wake` reads which positions wait: each has a task that waits and no live
   session. The session fills the first position whose charter names the agent definition
   of this harness. It does one task and leaves the position. If that position gives it
-  no task, it leaves the position and fills the next one that waits. When no position
-  waits for this harness, the launcher claims nothing. It names each position that waits
-  for a different agent definition.
+  no task, it leaves the position and fills the next one that waits. If a position
+  refuses the session, the launcher prints the refusal and goes to the next one. When no
+  position waits for this harness, the launcher claims nothing. It names each position
+  that waits for a different agent definition.
 
 `--position` and `--wake` do not work on the `wslc` sandbox backend. `amem work` refuses
 them there.
 
 `amem position show <name>` gives one position: the record, its open commitments, its
 handoff cache and the sessions that are live in it. A session is live in a position
-while it holds a lease on a task that it claimed from the position. The memory tools
-`position` and `positions` give the same answers to a session.
+while it holds a lease on a task that it claimed from the position. A reader that cannot
+see that task does not get the name of the session. The memory tools `position` and
+`positions` give the same answers to a session.
+
+A position whose envelope has a handling below the classification of its own entry takes
+no session. `amem position list` shows `wake` as false for that position, and the wake
+list does not hold it.
 
 The owner retires a position with `amem position retire <name> --why <text>`, or with
 the memory tool `retire_position`. The memory server writes a new version with
 `status = "retired"` and the reason. It takes the pin off each task of the position
 that is not closed, so any session that matches can claim those tasks. The entries that cite the
-position stay in the record. A retired position takes no session and no pin.
+position stay in the record. A retired position takes no session and no pin. An owner
+that retires the position that its own session fills leaves the position.
 
 Not built yet:
 
@@ -944,7 +976,11 @@ Not built yet:
   or a scheduler runs `amem work --wake`.
 - A session that holds no lease is not seen as live, and two sessions can fill one
   position at the same time.
-- The position is not in the principal chain, and not in the input of the policy.
+- The position is not in the principal chain, and not in the input of the policy. The
+  policy does not decide who admits a pinned task. The memory server holds that rule.
+- A session whose position changed cannot complete the task that it holds. The lease
+  ends, and the task returns to the queue.
+- `amem position list` counts a proposed task in `pinned`.
 - No tap posts for a position.
 - Nothing checks that a `separation` pin names a position other than the author's.
 - The envelope has no data scope other than its handling.

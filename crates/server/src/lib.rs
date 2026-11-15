@@ -570,10 +570,14 @@ impl Memory {
     /// The read filter for this session: the policy's read scope for this principal,
     /// evaluated once and narrowed against the grants, so the policy can take reads
     /// away and never add them. A session that fills a position reads no higher than
-    /// the handling of the position's envelope. The session's handling is capped at
-    /// the filter as well. The decision is logged like any other.
+    /// the handling of the position's envelope, and reads nothing once the position
+    /// changed. The session's handling is capped at the filter as well. The decision
+    /// is logged like any other.
     fn session_filter(&self) -> Result<ReadFilter, Error> {
         self.fresh()?;
+        // a session in a position reads under the envelope of the version in force,
+        // or not at all
+        self.seat_in_force()?;
         let policy = self.policy();
         let key = self.scope_key(&policy);
         if let Some((cached, f)) = lock(&self.scope).as_ref() {
@@ -2404,6 +2408,7 @@ impl Memory {
             }
         }
         self.bind_definition(&mut spec).await?;
+        self.continued_pin(l, &mut spec).await?;
         self.bind_position(&mut spec).await?;
         let created = l.create(spec).await?;
         // a filing that names a task already there is handed that task, and admits it on
@@ -2417,9 +2422,14 @@ impl Memory {
                     .into(),
             ));
         }
-        let task = self
-            .admit_per_policy(l, created.task, filing, parent)
-            .await?;
+        // a pinned task is a commitment of its position once it is admitted, so it is
+        // admitted as filed only on the word of a session that may commit the position
+        let task = if filing == Filing::Own || self.commits(&created.task)? {
+            self.admit_per_policy(l, created.task, filing, parent)
+                .await?
+        } else {
+            created.task
+        };
         Ok(Created {
             task,
             deduplicated: created.deduplicated,
@@ -2449,15 +2459,25 @@ impl Memory {
         Ok(spec)
     }
 
-    /// Admit a proposed task. On a laptop the owner is the triage.
+    /// Admit a proposed task. On a laptop the owner is the triage. A task pinned to a
+    /// position becomes a commitment of that position here, so a session of an agent
+    /// admits one only when it fills the position under the agent definition the
+    /// charter names.
     ///
     /// # Errors
     ///
-    /// A ledger error, or a task outside the grants.
+    /// A ledger error, or a task outside the grants; [`Error::Denied`] for a pinned
+    /// task and a session that may not commit its position.
     pub async fn admit(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
         let task = l.get(id).await?;
         self.check_task(&task)?;
+        if !self.commits(&task)? {
+            let position = task.spec.position.as_deref().unwrap_or_default();
+            return Err(Error::Denied(format!(
+                "{id} is not admitted: it is pinned to position {position}, and only a person or a session that fills the position under the agent definition its charter names admits it"
+            )));
+        }
         // the owner is the triage here, and may admit a task that lacks a definition or
         // its checks: the system's own filings name none. Nobody else passes that gap,
         // and nobody admits a task whose definition is gone
@@ -2581,11 +2601,13 @@ impl Memory {
     /// A parent outside the grants or above the handling, or a ledger error;
     /// [`Error::Denied`] when the parent has an open continuation this session may not
     /// read. That check runs before the items are matched, so the refusal is the same
-    /// whatever the items are.
+    /// whatever the items are. [`Error::Denied`] also for a parent pinned to a position,
+    /// from a session that neither works the parent nor may commit the position.
     pub async fn fan_out(&self, parent: &str, items: &[(String, String)]) -> Result<FanOut, Error> {
         let mut l = self.ledger.lock().await;
         let parent = l.get(parent).await?;
         self.check_task(&parent)?;
+        self.may_continue(&parent)?;
         let handling = self.handling()?;
         // a harness that delegates twice from one run, as Claude Code does with one
         // Agent call per subagent, gets one continuation waiting on all of them: an open
@@ -2946,9 +2968,9 @@ impl Memory {
     ) -> Result<Option<Claim>, Error> {
         let domain = self.resolve_domain(domain)?;
         let handling = self.handling()?;
-        let can = self.capabilities();
+        let can = self.capabilities()?;
         let kept = attempt.map(|k| self.attempt_key(k)).transpose()?;
-        let seat = self.seat_in_force().await?;
+        let seat = self.seat_in_force()?;
         let who = dm_ledger::Claimer {
             holder: &self.author,
             manifest: &can,
@@ -2993,11 +3015,11 @@ impl Memory {
     /// the position this session fills changed; [`Error::Denied`] for a task outside
     /// the domain of that position.
     pub async fn claim(&self, id: &str, lease: Duration) -> Result<Claim, Error> {
-        let seat = self.seat_in_force().await?;
+        let seat = self.seat_in_force()?;
         let mut l = self.ledger.lock().await;
         let task = l.get(id).await?;
         self.check_task(&task)?;
-        let can = self.capabilities();
+        let can = self.capabilities()?;
         let who = dm_ledger::Claimer {
             holder: &self.author,
             manifest: &can,

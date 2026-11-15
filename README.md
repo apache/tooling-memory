@@ -230,7 +230,8 @@ These parts do what the paper says, on one laptop. Each item names what replaces
   entries of a domain. It finds the citations that keep a tool's source past its clock
   in the same way.
 - **Positions**: `amem` reads every entry of type `position` in a domain to find the
-  position in force. It does this on each claim and each T0 of a session in a position.
+  position in force. It does this on each claim, each read, each tool call and each T0
+  of a session in a position.
   A read of the handoff cache looks at the newest 200 handoffs of the domain only.
   Production: a lookup in the index, by the name of the position and by citation.
 - **Tools** fetch and search in one of these ways:

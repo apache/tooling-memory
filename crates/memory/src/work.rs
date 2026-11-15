@@ -310,7 +310,7 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
 /// The task to run next: the one named, or the next one the ledger gives this session.
 /// With `wake`, the session fills each position that waits for it, in turn, and claims
 /// in that position's domain, until one gives a task; when none does, it claims nothing
-/// and is in no position.
+/// and is in no position. A position that refuses the session is passed over.
 async fn next_task(
     memory: &Memory,
     client: &MemoryClient,
@@ -327,7 +327,9 @@ async fn next_task(
             .await?);
     }
     for woken in crate::positions::waiting(memory, options.domain.as_deref()).await? {
-        crate::positions::wake(memory, &woken).await?;
+        if !crate::positions::wake(memory, &woken).await? {
+            continue;
+        }
         let claimed = client
             .claim_next(Some(&woken.domain), options.lease_seconds)
             .await;

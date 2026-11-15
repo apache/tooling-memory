@@ -910,7 +910,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "File a task on the ledger. It is born proposed and becomes claimable once the owner admits it. With `position` and `pin_reason` the task is pinned: only a session that fills that position claims it."
+        description = "File a task on the ledger. It is born proposed and becomes claimable once the owner admits it. With `position` and `pin_reason` the task is pinned: only a session that fills that position claims it, and it stays proposed until a person or a session that fills the position under its charter's agent definition admits it."
     )]
     async fn create_task(
         &self,
@@ -979,7 +979,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Admit a proposed task so it can be claimed. On a laptop the owner is the triage."
+        description = "Admit a proposed task so it can be claimed. On a laptop the owner is the triage. A task pinned to a position is admitted by a person, or by a session that fills the position under the agent definition its charter names."
     )]
     async fn admit_task(&self, p: Parameters<TaskIdParams>) -> Result<CallToolResult, McpError> {
         let t = self.memory.admit(&p.0.id).await.map_err(mcp_err)?;

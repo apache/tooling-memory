@@ -1461,13 +1461,28 @@ impl Ledger {
     ///
     /// A database error, or an event the ledger did not write.
     pub async fn seated(&self, domain: &str, position: &str) -> Result<Vec<String>, Error> {
+        let held = self.held_from(domain, position).await?;
+        let mut out: Vec<String> = held.into_iter().filter_map(|t| t.holder).collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// The tasks of a domain that a session claimed from a position and holds under a
+    /// lease that is live: each names its holder. A caller that shows who is in the
+    /// position shows the holders of the tasks its reader may see.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn held_from(&self, domain: &str, position: &str) -> Result<Vec<Task>, Error> {
         let now = self.now();
         let mut out = Vec::new();
         for task in self.list(domain, Status::Claimed).await? {
             let live = task.lease_until.is_some_and(|t| t >= now);
-            let (true, Some(holder)) = (live, task.holder) else {
+            if !live || task.holder.is_none() {
                 continue;
-            };
+            }
             let claims = on_backend!(&self.backend, db => db.payloads_of(&task.id, "claimed"))?;
             let from = match claims
                 .last()
@@ -1478,11 +1493,9 @@ impl Ledger {
                 _ => None,
             };
             if from.as_deref() == Some(position) {
-                out.push(holder);
+                out.push(task);
             }
         }
-        out.sort();
-        out.dedup();
         Ok(out)
     }
 
@@ -4924,7 +4937,8 @@ mod tests {
     }
 
     /// A subagent task and a retry of a pinned task, a continuation of an unpinned task,
-    /// and a continuation of a task the ledger does not hold: each is unpinned.
+    /// a continuation of a task the ledger does not hold, and a continuation of a pinned
+    /// task that is filed in another domain: each is unpinned.
     async fn no_other_task_takes_a_pin(l: &mut Ledger, pinned_parent: &Task) {
         let plain = admitted(l, spec("Unpinned parent")).await;
         for origin in [
@@ -4941,6 +4955,17 @@ mod tests {
                 "{origin}"
             );
         }
+        // the position is one of the parent's domain: another domain holds none of that name
+        let abroad = TaskSpec {
+            domain: "dom-b".into(),
+            ..filed_from_parent(continues(&pinned_parent.id), "Resume in another domain")
+        };
+        let abroad = l.create(abroad).await.unwrap().task;
+        assert_eq!(
+            (abroad.spec.position, abroad.spec.pin_reason),
+            (None, None),
+            "a continuation in another domain"
+        );
     }
 
     async fn seated(l: &Ledger, position: &str) -> Vec<String> {

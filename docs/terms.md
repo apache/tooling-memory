@@ -77,7 +77,7 @@ term here in the same commit as the first document that needs it.
 | agent definition | The name of one kind of agent: the name in the author of a session, `codex` for `agent:codex`. An `agent` artifact of the platform domain has the same name. A charter names one | agent type, persona |
 | pin | The field of a task that names a position. Only a session that fills the position claims a pinned task. To pin a task is to file it with a pin | assignment, binding |
 | pin reason | Why a task is pinned: `continuity`, `relationship` or `separation` | pin type |
-| commitment | An open task that is pinned to a position | obligation, duty |
+| commitment | A task that is pinned to a position, is admitted and is not closed | obligation, duty |
 | handoff cache | The newest handoffs that cite a position, which a session in the position gets first in T0 | handoff history, position memory |
 | seconded session | A session that fills a position under an agent definition that the charter does not name. It reads the position and does its tasks, and it does not write the position's history | substitute (for a seconded session), stand-in |
 | fill (a position) | What a session does when a launcher puts it in a position: it then claims the position's tasks under the authority envelope | occupy, take, assume |

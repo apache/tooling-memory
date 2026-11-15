@@ -120,20 +120,29 @@ pub async fn waiting(m: &Memory, domain: Option<&str>) -> Result<Vec<Wake>, Erro
 }
 
 /// Wake a position: fill it for this session, and say so on standard error with the
-/// tasks that wait.
+/// tasks that wait. Returns whether the session fills it. A position that refuses the
+/// session is said on standard error with the refusal, and the caller goes to the next
+/// one: a position that cannot be filled does not keep the others from a session.
 ///
 /// # Errors
 ///
-/// As [`Memory::fill_position`].
-pub async fn wake(m: &Memory, woken: &Wake) -> Result<(), Error> {
-    m.fill_position(&woken.position, Some(&woken.domain))
-        .await?;
-    eprintln!(
-        "amem: woke {} for {}",
-        woken.position,
-        woken.tasks.join(", ")
-    );
-    Ok(())
+/// As [`Memory::fill_position`], but for its refusal of the position.
+pub async fn wake(m: &Memory, woken: &Wake) -> Result<bool, Error> {
+    match m.fill_position(&woken.position, Some(&woken.domain)).await {
+        Ok(_) => {
+            eprintln!(
+                "amem: woke {} for {}",
+                woken.position,
+                woken.tasks.join(", ")
+            );
+            Ok(true)
+        }
+        Err(Error::Denied(why)) => {
+            eprintln!("amem: {} is not woken: {why}", woken.position);
+            Ok(false)
+        }
+        Err(other) => Err(other),
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +178,25 @@ mod tests {
         let (mine, others) = for_agent(list(), None);
         assert_eq!(mine, vec![]);
         assert_eq!(others.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_position_that_refuses_the_session_is_passed_over_and_no_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        // no entry defines the position: the library refuses to fill it
+        let refused = m.fill_position("pos-a", Some("dom-me")).await;
+        assert!(matches!(refused, Err(Error::Denied(_))), "{refused:?}");
+        let woke = wake(&m, &waits("pos-a", "codex")).await;
+        assert!(matches!(woke, Ok(false)), "{woke:?}");
+        assert_eq!(m.seat(), None);
+        // an error that is no refusal of the position is the caller's to end on: here
+        // the grants changed under the session
+        let grants = dir.path().join(dm_server::GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("{text}\n# changed\n")).unwrap();
+        let stopped = wake(&m, &waits("pos-a", "codex")).await;
+        assert!(matches!(stopped, Err(Error::Stale(_))), "{stopped:?}");
     }
 
     #[test]
