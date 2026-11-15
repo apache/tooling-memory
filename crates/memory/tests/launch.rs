@@ -1094,6 +1094,36 @@ fn work_refuses_a_position_on_the_wslc_backend_in_words() {
     }
 }
 
+/// `--arm` and `--as-of` give the settings to the memory server on this host, and the
+/// `wslc` backend starts its memory server in a container, so `amem launch` refuses
+/// them there before anything runs.
+#[test]
+fn launch_refuses_an_arm_and_a_snapshot_on_the_wslc_backend_in_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let snapshot = ["--as-of", "2026-10-01T10:00:00Z"];
+    for flags in [&["--arm", "no-memory"][..], &snapshot[..]] {
+        let out = memory()
+            .args(["--root", root.to_str().unwrap(), "launch"])
+            .args(["--harness", "claude", "--auth", "key", "--backend", "wslc"])
+            .args(["--workdir", dir.path().to_str().unwrap()])
+            .args(["--prompt", "hello"])
+            .args(flags)
+            .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+            // a path with no `wslc` on it: a launcher that did not refuse starts nothing
+            .env("PATH", dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("--arm and --as-of do not reach the `wslc` backend"),
+            "{stderr}"
+        );
+    }
+}
+
 #[test]
 fn a_prompted_launch_runs_headless_and_insists_on_a_handoff() {
     let dir = tempfile::tempdir().unwrap();
