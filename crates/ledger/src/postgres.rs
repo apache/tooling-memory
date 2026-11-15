@@ -726,6 +726,7 @@ impl Db {
         if !claimable(&task, now, manifest, handling)
             || !deps_complete(&tx, &task.spec.depends_on).await?
             || awaits_continuation(&tx, &s, &task.id).await?
+            || resumes_unsettled(&tx, &task).await?
         {
             return Err(Error::WrongState {
                 id: id.to_string(),
@@ -942,6 +943,7 @@ async fn take<C: GenericClient>(
     if !claimable(&task, now, manifest, handling)
         || !deps_complete(tx, &task.spec.depends_on).await?
         || awaits_continuation(tx, s, &task.id).await?
+        || resumes_unsettled(tx, &task).await?
     {
         return Ok(false);
     }
@@ -1085,6 +1087,32 @@ async fn awaits_continuation<C: GenericClient>(conn: &C, s: &str, id: &str) -> R
         )
         .await?
         .is_some())
+}
+
+/// Whether the work of `task` is held by an effect that nobody has settled: an effect of
+/// the task it continues or retries, however far up and in whichever domain. Such an
+/// effect holds the work under each of its names, so the task is nobody's to claim.
+async fn resumes_unsettled<C: GenericClient>(conn: &C, task: &Task) -> Result<bool, Error> {
+    let mut seen = std::collections::HashSet::new();
+    let mut up = crate::resumed(task).map(str::to_string);
+    while let Some(id) = up.take() {
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        let Some(s) = schema_of_task_in(conn, &id).await? else {
+            break;
+        };
+        let above = match get_in(conn, &s, &id).await {
+            Ok(t) => t,
+            Err(Error::NotFound(_)) => break,
+            Err(e) => return Err(e),
+        };
+        if !above.effects.is_empty() {
+            return Ok(true);
+        }
+        up = crate::resumed(&above).map(str::to_string);
+    }
+    Ok(false)
 }
 
 /// Drop one domain's projection and replay its events into it.
@@ -1335,7 +1363,6 @@ async fn insert_promotion<C: GenericClient>(
     Ok(())
 }
 
-/// Update the projection for one event. Replay calls this and nothing else.
 /// The projection of the events that hold a task back from a claim, or stop doing so:
 /// what it waits on and which effects are not settled live in `extra`.
 async fn project_hold<C: GenericClient>(
@@ -1371,6 +1398,7 @@ async fn project_hold<C: GenericClient>(
     Ok(())
 }
 
+/// Update the projection for one event. Replay calls this and nothing else.
 async fn project<C: GenericClient>(
     conn: &C,
     s: &str,

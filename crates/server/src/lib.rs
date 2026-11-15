@@ -2451,10 +2451,12 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// A parent outside the grants or above the handling, or a ledger error;
-    /// [`Error::Denied`] when the parent has an open continuation this session may not
-    /// read. That check runs before the items are matched, so the refusal is the same
-    /// whatever the items are.
+    /// A parent outside the grants or above the handling, or a ledger error: the ledger
+    /// files no part and no continuation of a task whose work is held by an effect that
+    /// nobody has settled. [`Error::Denied`] when the parent has an open continuation
+    /// this session may not read, or one with an effect that is not settled. Those
+    /// checks run before the items are matched, so the refusal is the same whatever the
+    /// items are.
     pub async fn fan_out(&self, parent: &str, items: &[(String, String)]) -> Result<FanOut, Error> {
         let mut l = self.ledger.lock().await;
         let parent = l.get(parent).await?;
@@ -2656,6 +2658,13 @@ impl Memory {
                         .into(),
                 ));
             }
+            // a continuation that began an effect is not closed as folded while nobody
+            // knows what the destination holds: its work would go to the new one
+            if let Some(why) = holds::unsettled(&t) {
+                return Err(Error::Denied(format!(
+                    "{why}; settle the effect, then fan out again"
+                )));
+            }
             ids.extend(t.spec.depends_on.iter().cloned());
             folded.push(t.id);
         }
@@ -2727,7 +2736,8 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// A task outside the grants, or a ledger error.
+    /// A task outside the grants, or a ledger error: the ledger files no retry of a
+    /// task whose work is held by an effect that nobody has settled.
     pub async fn retry_task(&self, id: &str) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
         let root = l.get(id).await?;
@@ -2933,19 +2943,9 @@ impl Memory {
         };
         lock(&self.claims).remove(id);
         // a continuation finishes the task it resumed, and that one the task it resumed in
-        // turn: up the chain, while each is open and nobody holds it
-        let mut by = done.clone();
-        while let Some(parent) = by
-            .spec
-            .origin
-            .as_deref()
-            .and_then(|o| o.strip_prefix("continues:"))
-        {
-            let Ok(closed) = l.complete_by_continuation(parent, &by.id, handoff).await else {
-                break;
-            };
-            by = closed;
-        }
+        // turn: up the chain, while each is open, nobody holds it and its effects are
+        // settled. One left open for an effect closes when the effect is settled
+        l.close_resumed(&done).await;
         self.observe_task(&done);
         Ok(done)
     }
@@ -3019,10 +3019,18 @@ impl Memory {
     /// not its to close: the call is refused before anything moves, and the refusal
     /// names nothing of that work.
     ///
+    /// A task with an effect that nobody has settled is not closed, and neither is a
+    /// task with such a task open below it: what the destination holds is not known,
+    /// and a closed task says that the question is over. Whoever looked at the
+    /// destination settles the effect first. The reason is the session's own words on
+    /// the task, so a session that has read above the task's classification is refused.
+    ///
     /// # Errors
     ///
     /// A ledger error, or a task outside the grants; [`Error::Denied`] when an open task
-    /// filed from it, however far down, is above the session's handling.
+    /// filed from it, however far down, is above the session's handling, when the task
+    /// or such an open task has an effect that is not settled, or when the session's
+    /// label is above the task's classification.
     pub async fn invalidate(
         &self,
         id: &str,
@@ -3030,9 +3038,12 @@ impl Memory {
         superseded_by: Option<&str>,
     ) -> Result<Task, Error> {
         let mut l = self.ledger.lock().await;
-        self.check_task(&l.get(id).await?)?;
+        let named = l.get(id).await?;
+        self.check_task(&named)?;
+        self.writes_within(&named, "a reason")?;
         let handling = self.handling()?;
         let mut open = Vec::new();
+        let mut unsettled = holds::unsettled(&named);
         let mut pending = l.filed_from(id).await?;
         while let Some(t) = pending.pop() {
             pending.extend(l.filed_from(&t.id).await?);
@@ -3045,7 +3056,15 @@ impl Memory {
                         .into(),
                 ));
             }
+            unsettled = unsettled.or_else(|| holds::unsettled(&t));
             open.push(t.id);
+        }
+        // after the walk: the refusal for work this session may not read comes first,
+        // and is the same whatever that work holds
+        if let Some(why) = unsettled {
+            return Err(Error::Denied(format!(
+                "{why}; settle the effect, then invalidate"
+            )));
         }
         let task = l.invalidate(id, reason, superseded_by).await?;
         for t in open {
@@ -6600,6 +6619,34 @@ mod tests {
         .await
         .unwrap()
         .id
+    }
+
+    /// A task is filed under the verified policy entries of the record, whatever its
+    /// filer says, and so are the part and the continuation that a fan-out files.
+    #[tokio::test]
+    async fn a_filing_names_the_verified_policy_of_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let rule = policy_entry(&owner, RULE).await;
+        // a rule that nobody verified is not in force, and no filing names it
+        policy_entry(&owner, &rule_text("pol-L2-091", 2, "")).await;
+        verify(&owner, &agent, &rule).await;
+        let fresh = Memory::open(dir.path()).unwrap();
+        let filed = fresh
+            .create_task(TaskSpec {
+                policy_context: vec!["pol-made-up".into()],
+                ..tspec("Carry out the decision", 0, None, &[], &[])
+            })
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(filed.spec.policy_context, vec![rule.clone()]);
+        let part = [("A part".to_string(), "Do the part.\n".to_string())];
+        let out = fresh.fan_out(&filed.id, &part).await.unwrap();
+        assert_eq!(out.children[0].spec.policy_context, vec![rule.clone()]);
+        let resumes = out.continuation.unwrap();
+        assert_eq!(resumes.spec.policy_context, vec![rule]);
     }
 
     /// An agent supersedes the newest decision of the record's one chain.

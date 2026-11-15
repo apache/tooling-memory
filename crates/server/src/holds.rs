@@ -21,7 +21,28 @@ fn token(what: &str, name: &str, most: usize) -> Result<(), Error> {
     }
 }
 
+/// Why a task is not closed, folded or handed on: an effect of it that nobody has settled.
+pub(crate) fn unsettled(task: &Task) -> Option<String> {
+    task.effects
+        .first()
+        .map(|a| format!("effect {a} of {} is not settled", task.id))
+}
+
 impl Memory {
+    /// What a session writes on a task in its own words, every session that may read
+    /// the task reads. A session whose label is above the task's classification has
+    /// read what those sessions may not, so it writes no such words there. A filing
+    /// rises to the session's label instead; a task that is filed stays where it is.
+    pub(crate) fn writes_within(&self, task: &Task, what: &str) -> Result<(), Error> {
+        if self.label() <= task.spec.classification {
+            return Ok(());
+        }
+        Err(Error::Denied(format!(
+            "this session has read above the classification of {}: it does not write {what} on that task",
+            task.id
+        )))
+    }
+
     /// Give a held task up until an outside event comes: a check that runs, a reply, a
     /// change that has not landed. Nobody may claim it until a tap or a person reports
     /// the event with [`Memory::event_arrived`]. The handoff, when given, must exist
@@ -29,8 +50,9 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for an event name that is not one token; a ledger error,
-    /// including a lease already lost; a task outside the grants.
+    /// [`Error::Denied`] for an event name that is not one token, or from a session
+    /// whose label is above the task's classification; a ledger error, including a
+    /// lease already lost; a task outside the grants.
     pub async fn wait_for(
         &self,
         id: &str,
@@ -43,7 +65,9 @@ impl Memory {
             self.get(h).await?;
         }
         let mut l = self.ledger.lock().await;
-        self.check_task(&l.get(id).await?)?;
+        let task = l.get(id).await?;
+        self.check_task(&task)?;
+        self.writes_within(&task, "an event name")?;
         let by = self.under(self.claim_of(id, generation)?);
         let t = l.wait_for(id, by, on, handoff).await?;
         lock(&self.claims).remove(id);
@@ -82,8 +106,9 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for an action id that is not one token; a ledger error,
-    /// including a lease already lost or a claim made since; a task outside the grants.
+    /// [`Error::Denied`] for an action id that is not one token, or from a session
+    /// whose label is above the task's classification; a ledger error, including a
+    /// lease already lost or a claim made since; a task outside the grants.
     pub async fn effect_begun(
         &self,
         id: &str,
@@ -92,7 +117,9 @@ impl Memory {
     ) -> Result<Task, Error> {
         token("an action id", action, 64)?;
         let mut l = self.ledger.lock().await;
-        self.check_task(&l.get(id).await?)?;
+        let task = l.get(id).await?;
+        self.check_task(&task)?;
+        self.writes_within(&task, "an action id")?;
         let by = self.under(self.claim_of(id, generation)?);
         let t = l.effect_begun(id, by, action).await?;
         self.observe_task(&t);
@@ -139,6 +166,7 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dm_core::Label;
     use dm_ledger::{Status, TaskSpec};
     use std::path::Path;
 
@@ -250,6 +278,214 @@ mod tests {
             .await
             .unwrap();
         assert!(reconciled.effects.is_empty());
+    }
+
+    fn not_handed_on<T: std::fmt::Debug>(r: &Result<T, Error>, id: &str) -> bool {
+        matches!(
+            r,
+            Err(Error::Ledger(dm_ledger::Error::WrongState { id: held, op, .. }))
+                if held == id && op.contains("hand its work on")
+        )
+    }
+
+    fn part() -> Vec<(String, String)> {
+        vec![("A part".to_string(), "Do the part.\n".to_string())]
+    }
+
+    #[tokio::test]
+    async fn a_task_with_an_unsettled_effect_is_not_retried_fanned_out_or_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (agent, id) = held(&owner, dir.path(), "Push the release").await;
+        agent.effect_begun(&id, None, "push-1").await.unwrap();
+        agent.release(&id, None, None).await.unwrap();
+        // another agent does not get the work under the task's name, or under another
+        let other = as_author(dir.path(), "agent:b");
+        assert!(other.claim(&id, time::Duration::minutes(5)).await.is_err());
+        let retried = other.retry_task(&id).await;
+        assert!(not_handed_on(&retried, &id), "{retried:?}");
+        let fanned = other.fan_out(&id, &part()).await;
+        assert!(not_handed_on(&fanned, &id), "{fanned:?}");
+        // and nobody closes it while nobody knows what the destination holds
+        for who in [&other, &owner] {
+            let closed = who.invalidate(&id, "obsolete", None).await;
+            assert!(denied(&closed, "effect push-1"), "{closed:?}");
+        }
+        let tree = owner.task_tree(&id).await.unwrap();
+        assert_eq!(tree.task.status, Status::Open);
+        assert_eq!(tree.task.effects, vec!["push-1".to_string()]);
+        assert!(tree.children.is_empty());
+        // a person looked at the destination: the work is on offer again
+        owner
+            .effect_settled(&id, None, "push-1", Outcome::NotApplied)
+            .await
+            .unwrap();
+        the_retry_holds_its_task_open_in_turn(&owner, &other, &id).await;
+    }
+
+    /// The retry of `id` begins an effect and gives up: `id` is not closed over it.
+    async fn the_retry_holds_its_task_open_in_turn(owner: &Memory, other: &Memory, id: &str) {
+        let retry = retried_with_an_effect(other, id).await;
+        let closed = owner.invalidate(id, "obsolete", None).await;
+        assert!(denied(&closed, "effect push-2"), "{closed:?}");
+        assert_eq!(owner.get_task(id).await.unwrap().status, Status::Open);
+        owner
+            .effect_settled(&retry, None, "push-2", Outcome::Applied)
+            .await
+            .unwrap();
+        let closed = owner.invalidate(id, "obsolete", None).await.unwrap();
+        assert_eq!(closed.status, Status::Invalidated);
+        let below = owner.get_task(&retry).await.unwrap();
+        assert_eq!(below.status, Status::Invalidated);
+    }
+
+    /// A retry of `id` that `other` filed, claimed and gave up with `push-2` begun.
+    async fn retried_with_an_effect(other: &Memory, id: &str) -> String {
+        let retry = other.retry_task(id).await.unwrap();
+        assert_eq!(retry.status, Status::Open);
+        other
+            .claim(&retry.id, time::Duration::minutes(5))
+            .await
+            .unwrap();
+        other.effect_begun(&retry.id, None, "push-2").await.unwrap();
+        other.release(&retry.id, None, None).await.unwrap();
+        retry.id
+    }
+
+    #[tokio::test]
+    async fn a_continuation_with_an_unsettled_effect_is_not_folded_into_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (agent, id) = held(&owner, dir.path(), "Push the release").await;
+        let resumes = owner
+            .create_task(TaskSpec {
+                title: "Resume: Push the release".into(),
+                body: "Do it.\n".into(),
+                origin: Some(dm_ledger::continues(&id)),
+                ..TaskSpec::default()
+            })
+            .await
+            .unwrap()
+            .task;
+        owner.admit(&resumes.id).await.unwrap();
+        let other = as_author(dir.path(), "agent:b");
+        other
+            .claim(&resumes.id, time::Duration::minutes(5))
+            .await
+            .unwrap();
+        other
+            .effect_begun(&resumes.id, None, "push-1")
+            .await
+            .unwrap();
+        other.release(&resumes.id, None, None).await.unwrap();
+        // a new fan-out would close the continuation and give its work to another
+        let fanned = agent.fan_out(&id, &part()).await;
+        assert!(denied(&fanned, "effect push-1"), "{fanned:?}");
+        let tree = owner.task_tree(&id).await.unwrap();
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].task.status, Status::Open);
+        owner
+            .effect_settled(&resumes.id, None, "push-1", Outcome::Applied)
+            .await
+            .unwrap();
+        let fanned = agent.fan_out(&id, &part()).await.unwrap();
+        assert_eq!(fanned.children.len(), 1);
+        let folded = owner.get_task(&resumes.id).await.unwrap();
+        assert_eq!(folded.status, Status::Invalidated);
+    }
+
+    /// A session writes its own words on a task only at or below the task's
+    /// classification: a session that reads the task later reads those words.
+    #[tokio::test]
+    async fn a_session_that_read_above_a_task_writes_no_words_of_its_own_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (agent, id) = held(&owner, dir.path(), "Announce the launch").await;
+        let secret = owner
+            .write(crate::WriteRequest {
+                body: "The launch is CODENAME-BLUEFIN, in May.\n".into(),
+                classification: Some(Label::Restricted),
+                ..crate::WriteRequest::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        agent.get(&secret).await.unwrap();
+        assert_eq!(agent.label(), Label::Restricted);
+        let begun = agent.effect_begun(&id, None, "bluefin-may").await;
+        assert!(denied(&begun, "read above"), "{begun:?}");
+        let waits = agent
+            .wait_for(&id, None, "launch:CODENAME-BLUEFIN", None)
+            .await;
+        assert!(denied(&waits, "read above"), "{waits:?}");
+        let closed = agent.invalidate(&id, "BLUEFIN moved", None).await;
+        assert!(denied(&closed, "read above"), "{closed:?}");
+        // a session below reads the task, and none of those words
+        let reader = as_author(dir.path(), "agent:c").with_handling_cap(Label::Internal);
+        let seen = reader.get_task(&id).await.unwrap();
+        assert_eq!(seen.spec.classification, Label::Public);
+        assert_eq!((seen.status, seen.reason), (Status::Claimed, None));
+        assert_eq!((seen.waiting_on, seen.effects), (None, Vec::new()));
+        // on a task at its label, the session writes them
+        let high = owner
+            .create_task(TaskSpec {
+                title: "Brief the launch team".into(),
+                body: "Do it.\n".into(),
+                classification: Label::Restricted,
+                ..TaskSpec::default()
+            })
+            .await
+            .unwrap()
+            .task;
+        owner.admit(&high.id).await.unwrap();
+        agent
+            .claim(&high.id, time::Duration::minutes(5))
+            .await
+            .unwrap();
+        let begun = agent.effect_begun(&high.id, None, "bluefin-may").await;
+        assert_eq!(begun.unwrap().effects, vec!["bluefin-may".to_string()]);
+    }
+
+    /// A parent that the session may not read is refused as one that does not exist.
+    #[tokio::test]
+    async fn a_filing_names_no_parent_that_the_session_may_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let hidden = owner
+            .create_task(TaskSpec {
+                title: "Brief the launch team".into(),
+                body: "Do it.\n".into(),
+                classification: Label::Restricted,
+                ..TaskSpec::default()
+            })
+            .await
+            .unwrap()
+            .task;
+        let capped = as_author(dir.path(), "agent:c").with_handling_cap(Label::Internal);
+        let mut answers = Vec::new();
+        for parent in [hidden.id.as_str(), "task-me-nowhere"] {
+            let filed = capped
+                .create_task(TaskSpec {
+                    title: "A part".into(),
+                    body: "Do it.\n".into(),
+                    parent: Some(parent.to_string()),
+                    ..TaskSpec::default()
+                })
+                .await;
+            match filed {
+                Err(Error::Ledger(dm_ledger::Error::NotFound(named))) => {
+                    assert_eq!(named, parent);
+                    answers.push("not found");
+                }
+                other => panic!("{parent}: {other:?}"),
+            }
+        }
+        assert_eq!(answers.len(), 2);
+        assert_eq!(capped.label(), Label::Public);
+        for st in [Status::Proposed, Status::Open] {
+            let listed = owner.tasks(None, st).await.unwrap();
+            assert!(listed.iter().all(|t| t.spec.parent.is_none()), "{listed:?}");
+        }
     }
 
     #[tokio::test]

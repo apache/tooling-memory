@@ -729,12 +729,36 @@ The task's `effects` field lists the actions that are not settled. While the lis
 empty:
 
 - no session can claim the task, also after the lease expires;
-- the holder cannot complete the task.
+- the holder cannot complete the task;
+- the ledger files no retry, no continuation and no subagent task of the task, so
+  `retry_task` and `fan_out` fail;
+- no session can claim a task that continues or retries the task, however far down;
+- `amem` does not invalidate the task, or a task that has such a task open below it;
+- `fan_out` does not close an open continuation that has such an action.
+
+The work of the task thus goes to no other session, under the name of the task or under
+a different name. A refused claim goes on the record of the task with its reason. The
+reason names the event that the task waited on, or the action that was not settled.
 
 `effect_settled` (`amem task effect-settle <id> <action> applied|not_applied`) records
 what the destination holds. The holder can settle its action while its claim is in force.
 After that, only a person or a tap can settle it. An agent that lost its claim cannot,
-because it cannot know if the destination got the action.
+because it cannot know if the destination got the action. The same outcome for a settled
+action changes nothing. The ledger refuses a different outcome for a settled action, and
+the record keeps the first outcome.
+
+A continuation can be done while its task has an action that is not settled. The task
+then stays open, and no session can claim it. When the last action is settled, the ledger
+closes the task with the handoff of that continuation.
+
+An event name, an action id and the reason of an invalidation are words of the session.
+Each session that can read the task reads them. Thus `amem` refuses `wait_for`,
+`effect_begun` and `invalidate_task` from a session whose session label is above the
+classification of the task.
+
+`amem work` and `amem gofannon work` do not complete a task that has an action that is
+not settled. They release the task with a handoff. With `amem work`, the handoff names
+the action.
 
 A task also has these fields: `parent`, `scores`, `implements`, `reversibility`,
 `artifacts_touched` and `policy_context`. `amem task create` and `create_task` take them,
@@ -748,6 +772,16 @@ Not built yet: an attempt key for the other operations, and a connector that put
 external actions in sequence and settles them. `amem` does not make the external action,
 so the holder must record it. The taps do not report events yet: a person does, or a
 script that runs `amem task arrived`.
+
+These limits are open:
+
+- The ledger knows the work of a task only from the `origin` of a task filed from it. A
+  new task with the same text and no such `origin` is not held.
+- `amem` does not raise the classification of a task. A session that read above the
+  classification of its task cannot record an action or a wait on that task.
+- A continuation can be done while a holder has its task under a lease in force. The
+  ledger does not close that task, because the holder completes it. If the lease expires
+  first, the task is on offer again.
 
 ## Task definitions: `platform task`
 

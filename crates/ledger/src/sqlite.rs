@@ -435,6 +435,7 @@ impl Db {
             if !claimable(&task, now, manifest, handling)
                 || !deps_complete(&tx, &task.spec.depends_on)?
                 || awaits_continuation(&tx, &task)?
+                || resumes_unsettled(&tx, &task)?
             {
                 continue;
             }
@@ -470,6 +471,7 @@ impl Db {
         if !claimable(&task, now, manifest, handling)
             || !deps_complete(&tx, &task.spec.depends_on)?
             || awaits_continuation(&tx, &task)?
+            || resumes_unsettled(&tx, &task)?
         {
             return Err(Error::WrongState {
                 id: id.to_string(),
@@ -792,6 +794,29 @@ fn awaits_continuation(conn: &Connection, task: &Task) -> Result<bool, Error> {
         )
         .optional()?
         .is_some())
+}
+
+/// Whether the work of `task` is held by an effect that nobody has settled: an effect of
+/// the task it continues or retries, however far up. Such an effect holds the work
+/// under each of its names, so the task is nobody's to claim.
+fn resumes_unsettled(conn: &Connection, task: &Task) -> Result<bool, Error> {
+    let mut seen = std::collections::HashSet::new();
+    let mut up = crate::resumed(task).map(str::to_string);
+    while let Some(id) = up.take() {
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        let above = match get_in(conn, &id) {
+            Ok(t) => t,
+            Err(Error::NotFound(_)) => break,
+            Err(e) => return Err(e),
+        };
+        if !above.effects.is_empty() {
+            return Ok(true);
+        }
+        up = crate::resumed(&above).map(str::to_string);
+    }
+    Ok(false)
 }
 
 /// Append the event and project it, in the caller's transaction.
