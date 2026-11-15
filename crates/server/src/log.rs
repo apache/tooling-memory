@@ -771,7 +771,9 @@ impl Memory {
     /// It is filtered as any other read is. An event classified above what this session
     /// may handle is left out, and one that names no classification counts as the
     /// highest. A quarantined write, the event that offered it and the one that refused
-    /// it, is served only to a session that handles the highest classification.
+    /// it, is served only to a session that handles the highest classification. An
+    /// event served is read: the session's label rises to the highest classification
+    /// among the events served, as it does for an entry or a task.
     ///
     /// # Errors
     ///
@@ -787,6 +789,10 @@ impl Memory {
                 || (matches!(e.change, Change::Write { .. }) && refused.contains(&e.seq));
             e.label_or_highest() <= handling && (reads_quarantine || !held)
         });
+        let mut session = crate::lock(&self.session);
+        for e in &events {
+            session.observe(e.label_or_highest());
+        }
         Ok(events)
     }
 
@@ -1465,6 +1471,45 @@ mod tests {
         assert_eq!(gate.len(), 1, "{tasks:?}");
         assert!(gate[0].spec.body.contains("What the scan found"));
         assert_eq!(gate[0].spec.classification, Label::Restricted);
+        // and it names the command that says what the session had read before the write
+        let held = owner.quarantined().unwrap()[0].front.id.clone();
+        let command = format!("`amem lineage {held} --back`");
+        assert!(
+            gate[0].spec.body.contains(&command),
+            "{}",
+            gate[0].spec.body
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_served_from_the_log_raises_the_session_label_to_its_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        owner
+            .write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap();
+        let secret = WriteRequest {
+            classification: Some(Label::Restricted),
+            ..req("# Vault\n\nThe vault listens on 8443.\n")
+        };
+        owner.write(secret).await.unwrap();
+        // a session that handles less is served the events within its handling, and its
+        // label rises to the highest of them
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Internal);
+        assert_eq!(capped.label(), Label::Public);
+        let served = capped.log(None, 0).unwrap();
+        assert!(!served.is_empty());
+        assert_eq!(capped.label(), Label::Internal);
+        // a log with nothing in it shows a session nothing
+        let from = last(dir.path()) + 1;
+        let full = Memory::open(dir.path()).unwrap();
+        assert!(full.log(None, from).unwrap().is_empty());
+        assert_eq!(full.label(), Label::Public);
+        full.log(None, 0).unwrap();
+        assert_eq!(full.label(), Label::Restricted);
     }
 
     /// The kinds of the events, and for a write or a refusal the entry.

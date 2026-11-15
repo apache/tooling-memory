@@ -73,9 +73,13 @@ term here in the same commit as the first document that needs it.
 | task definition | The record in the platform domain for one kind of work: its purpose, its tools, its acceptance checks and its outputs. A task names one as `<name>@<version>` | task type, task template |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
-| security role | The owner, and each author that `security` in `grants.toml` lists. Only this role reads the quarantine and the event log of a domain | security team |
+| event log | The log of a domain, `state/log/<domain>.jsonl`, to which `amem` only appends: each write, version, refusal, erasure, read and send, and a copy of each event of the ledger, in order. An event holds ids and digests, and no text. The paper names it the historian | historian, audit log, journal |
+| security role | The owner, and each author that `security` in `grants.toml` lists. Only this role reads the quarantine, the event log of a domain, lineage and the list of withheld entries | security team |
 | send event | An event in the event log of a domain for content that left the perimeter in a session: a handoff that a tap posted, an export, or a model call that the egress recorded as answered. It holds the place and a digest, and no text | |
 | lineage | The answer to one question about an entry, from the event log of each domain. Back: the entries that its session read before it wrote the entry, and the entries that it cites. Forward: the entries and the send events that came after a session read it | provenance |
+| informed-by edge | A step of lineage between two entries: a session read the first entry before it wrote the second. Each read of the session before the write counts | derived-from edge |
+| cited edge | A step of lineage between two entries: the second entry names the first in `cites` or in `supersedes` | reference (for a cited edge) |
+| read set | The entries that a session read before one of its events: the `read` events of that session that are before the event in the log | context (for a read set) |
 | withheld entry | An entry with `status: withheld`: an erasure reached it by lineage. Its body stays in the record, and no search, list, T0, recall, get or bundle gives it. It stays withheld until a new entry replaces it, or the owner releases it or erases it | flagged entry, quarantined entry (for a withheld entry) |
 | feed | The step that brings the index up to the event log of a domain: it takes each version that the log names above a cursor from the record, and moves the cursor. A writer does it before its write returns | sync (for the feed) |
 | freshness bound | The longest time that a version in the event log of a domain can wait for the feed: 60 seconds. `freshness` measures a domain against it | index lag |

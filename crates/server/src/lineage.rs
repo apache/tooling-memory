@@ -382,9 +382,10 @@ impl Memory {
     /// The lineage of an entry, or back from a send event named `<domain>@<seq>`, over
     /// the log of every granted domain. For the security role, and read as the log is
     /// read: an event above what this session may handle is left out, so the answer
-    /// holds only what the session may be told. The ledger's events are copied into
-    /// each log first, as before every serving of a log. `depth` bounds the steps;
-    /// without one the query runs until it reaches nothing new.
+    /// holds only what the session may be told, and the session's label rises as it
+    /// does for the log. The ledger's events are copied into each log first, as before
+    /// every serving of a log. `depth` bounds the steps; without one the query runs
+    /// until it reaches nothing new.
     ///
     /// # Errors
     ///

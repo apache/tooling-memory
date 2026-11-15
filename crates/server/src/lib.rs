@@ -268,18 +268,6 @@ fn policy_entries(ix: &Index, root: &Path, grants: &Grants) -> Vec<dm_policy::re
         .collect()
 }
 
-/// What an entry may have reached, as [`Memory::taint`] computes it: one hop of
-/// [`lineage`] forward.
-#[derive(Clone, Debug, Serialize)]
-pub struct Taint {
-    /// The entry.
-    pub id: String,
-    /// Sessions that read it.
-    pub readers: Vec<String>,
-    /// Entries those sessions wrote after reading it.
-    pub written: Vec<String>,
-}
-
 /// What a write produced.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Written {
@@ -2047,7 +2035,7 @@ impl Memory {
             };
         }
         let mut body = format!(
-            "{}\n\nThe entry is held as `state/quarantine/{id}.md`, written by `{}` in session `{}`, not in the record and not served. `amem quarantine show {id}` prints it; `amem quarantine release {id}` writes it into the record as it was; `amem quarantine drop {id}` discards it. `amem taint {id}` names the sessions that read an entry and what they wrote after.",
+            "{}\n\nThe entry is held as `state/quarantine/{id}.md`, written by `{}` in session `{}`, not in the record and not served. `amem quarantine show {id}` prints it; `amem quarantine release {id}` writes it into the record as it was; `amem quarantine drop {id}` discards it. `amem lineage {id} --back` names the entries its session had read before it wrote this.",
             decision.reason, entry.front.author, self.session_id
         );
         if !findings.is_empty() {
@@ -2172,27 +2160,6 @@ impl Memory {
                 (d, events)
             })
             .collect()
-    }
-
-    /// What an entry may have reached: the sessions that read it, and the entries those
-    /// sessions wrote after reading it, from the log of each granted domain. The paper's
-    /// lineage for erasure and for a poisoned entry, one hop forward: what was written
-    /// by a session that read it is what to look at next. [`Memory::lineage`] is the
-    /// whole query.
-    #[must_use]
-    pub fn taint(&self, id: &str) -> Taint {
-        let logs = self.logs_whole();
-        let forward = lineage::trace(&logs, id, lineage::Direction::Forward, Some(1));
-        Taint {
-            id: id.to_string(),
-            readers: forward.sessions,
-            written: forward
-                .entries
-                .into_iter()
-                .filter(|e| e.informed)
-                .map(|e| e.id)
-                .collect(),
-        }
     }
 
     /// The T0 for a domain: the latest handoffs, standing decisions, conventions, and
@@ -3859,6 +3826,17 @@ mod tests {
         assert!(matches!(titled, Err(Error::Denied(_))));
     }
 
+    /// One step of lineage forward from `id`, as its owner reads it: the sessions that
+    /// read the entry, and the entries those sessions wrote after the read.
+    async fn readers_and_written(m: &Memory, id: &str) -> (Vec<String>, Vec<String>) {
+        let forward = m
+            .lineage(id, lineage::Direction::Forward, Some(1))
+            .await
+            .unwrap();
+        let written = forward.entries.into_iter().filter(|e| e.informed);
+        (forward.sessions, written.map(|e| e.id).collect())
+    }
+
     /// One line of a domain's log, as the log writes it.
     fn log_line(seq: u64, at: &str, session: &str, change: &str) -> String {
         format!(
@@ -3869,8 +3847,8 @@ mod tests {
     /// In one log the sequence numbers decide what came after a read, whatever the times
     /// say. Across two logs the times decide, compared as times: the time of the read,
     /// as text, sorts after the time of the later write, which has one more digit.
-    #[test]
-    fn a_write_follows_a_read_by_its_place_in_one_log_and_by_time_across_two() {
+    #[tokio::test]
+    async fn a_write_follows_a_read_by_its_place_in_one_log_and_by_time_across_two() {
         let dir = tempfile::tempdir().unwrap();
         drop(mem(dir.path()));
         grant_domain(dir.path(), "dom-other");
@@ -3901,9 +3879,9 @@ mod tests {
             log_line(3, "2026-10-01T09:00:00Z", "s2", &wrote("mem-other-else")),
         ];
         std::fs::write(logs.join("dom-other.jsonl"), there.join("\n") + "\n").unwrap();
-        let t = m.taint("mem-me-read");
-        assert_eq!(t.readers, ["s1"]);
-        assert_eq!(t.written, ["mem-me-late", "mem-other-after"]);
+        let (readers, written) = readers_and_written(&m, "mem-me-read").await;
+        assert_eq!(readers, ["s1"]);
+        assert_eq!(written, ["mem-me-late", "mem-other-after"]);
         // a read whose time does not parse is still a read: its session is a reader, and
         // what it wrote in another domain is not known to be from before
         let unread = log_line(4, "", "s2", read);
@@ -3912,10 +3890,10 @@ mod tests {
             here.join("\n") + "\n" + &unread + "\n",
         )
         .unwrap();
-        let t = m.taint("mem-me-read");
-        assert_eq!(t.readers, ["s1", "s2"]);
+        let (readers, written) = readers_and_written(&m, "mem-me-read").await;
+        assert_eq!(readers, ["s1", "s2"]);
         assert_eq!(
-            t.written,
+            written,
             ["mem-me-late", "mem-other-after", "mem-other-else"]
         );
     }
@@ -4855,12 +4833,12 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let t = owner.taint(&theirs);
+        let (readers, written) = readers_and_written(&owner, &theirs).await;
         assert!(
-            t.readers.contains(&reader.session_id().to_string()),
-            "{t:?}"
+            readers.contains(&reader.session_id().to_string()),
+            "{readers:?}"
         );
-        assert!(t.written.contains(&after), "{t:?}");
+        assert!(written.contains(&after), "{written:?}");
     }
 
     #[tokio::test]
@@ -8448,7 +8426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn taint_follows_reads_to_what_was_written_after() {
+    async fn one_step_of_lineage_follows_reads_to_what_was_written_after() {
         let dir = tempfile::tempdir().unwrap();
         let a = mem(dir.path());
         let poison = a.write(req("Something.\n")).await.unwrap().id;
@@ -8460,8 +8438,8 @@ mod tests {
         let before = reader.write(req("Before reading.\n")).await.unwrap().id;
         reader.get(&poison).await.unwrap();
         let after = reader.write(req("After reading.\n")).await.unwrap().id;
-        // one that names the entry and did not read it, and one a step further on: taint
-        // is the entries that the readers wrote, and no more
+        // one that names the entry and did not read it, and one a step further on: what
+        // a read informed in one step is the entries that the readers wrote, and no more
         let bystander = Memory::open(dir.path()).unwrap().with_author("agent:b");
         let citing = WriteRequest {
             cites: vec![poison.clone()],
@@ -8470,11 +8448,11 @@ mod tests {
         let unrelated = bystander.write(citing).await.unwrap().id;
         bystander.get(&after).await.unwrap();
         let further = bystander.write(req("A step on.\n")).await.unwrap().id;
-        let t = a.taint(&poison);
-        assert_eq!(t.readers, vec![reader.session_id().to_string()]);
-        assert_eq!(t.written, vec![after.clone()]);
-        assert!(!t.written.contains(&before) && !t.written.contains(&unrelated));
-        assert!(!t.written.contains(&further));
+        let (readers, written) = readers_and_written(&a, &poison).await;
+        assert_eq!(readers, vec![reader.session_id().to_string()]);
+        assert_eq!(written, vec![after.clone()]);
+        assert!(!written.contains(&before) && !written.contains(&unrelated));
+        assert!(!written.contains(&further));
     }
 
     fn spec(title: &str) -> TaskSpec {

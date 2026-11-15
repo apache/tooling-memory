@@ -5,6 +5,7 @@
 //! ledger operations, and a `memory://t0/<domain>` resource per granted domain. What it
 //! never gets is a path on disk, a credential, or an entry its grants do not admit.
 
+use crate::lineage::Direction;
 use crate::recall::{self, Budget, Depth};
 use crate::{tape, Error, Memory, WriteRequest};
 use dm_core::TrustTier;
@@ -195,6 +196,31 @@ pub struct RecallParams {
 pub struct GetParams {
     /// The entry id, as a hit or T0 names it.
     pub id: String,
+}
+
+/// Parameters of `lineage`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct LineageParams {
+    /// An entry id. With `back`, also `<domain>@<seq>`: a send event of that domain's log.
+    pub of: String,
+    /// true for what it may have been made from. Default false: what may have been made
+    /// from it, and where that went.
+    #[serde(default)]
+    pub back: Option<bool>,
+    /// The most steps to follow. Default: until a step reaches nothing new.
+    #[serde(default)]
+    pub depth: Option<u32>,
+}
+
+/// Parameters of `log`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct LogParams {
+    /// A granted domain; the only one when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// The first sequence number wanted. Default 0: the whole log.
+    #[serde(default)]
+    pub from: Option<u64>,
 }
 
 /// Parameters of `fetch`.
@@ -576,6 +602,8 @@ const READS: &[&str] = &[
     "task_tree",
     "get_task",
     "list_tasks",
+    "lineage",
+    "log",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -824,6 +852,39 @@ impl McpServer {
     async fn promotions(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
         let r = self.memory.promotions(&p.0.id).await.map_err(mcp_err)?;
         ok(json!({ "promotions": r }))
+    }
+
+    #[tool(
+        description = "For the owner and the security role; refused to any other author. The lineage of an entry, from the event log of each granted domain. Forward, the default: the entries and the sends that came after a session read it, and the entries that cite it. With `back`: the entries its session had read before it wrote the entry, and the entries it cites; `of` may then be `<domain>@<seq>`, a send event. Each entry comes with its `hops` and whether it was `informed` (a read came before the write), `cited`, or both. `complete` is false when the log could not say. Reading it raises your label as reading the log does."
+    )]
+    async fn lineage(&self, p: Parameters<LineageParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let direction = if p.back.unwrap_or(false) {
+            Direction::Back
+        } else {
+            Direction::Forward
+        };
+        let found = self
+            .memory
+            .lineage(&p.of, direction, p.depth)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!(found))
+    }
+
+    #[tool(
+        description = "For the owner and the security role; refused to any other author. The event log of a domain from sequence number `from`: each write offered, each version put, each write refused, each erasure, each read, each send and each event of the ledger, by id and digest and never a body, within what you may handle. `freshness` says how far the index is behind the log, against the published bound of 60 seconds. Reading it raises your label to the highest classification among the events served."
+    )]
+    async fn log(&self, p: Parameters<LogParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let domain = p.domain.as_deref();
+        let events = self
+            .memory
+            .log_synced(domain, p.from.unwrap_or(0))
+            .await
+            .map_err(mcp_err)?;
+        let freshness = self.memory.freshness(domain).map_err(mcp_err)?;
+        ok(json!({ "events": events, "freshness": freshness }))
     }
 
     #[tool(
@@ -1333,6 +1394,8 @@ mod tests {
             "task_tree",
             "retry_task",
             "promotions",
+            "lineage",
+            "log",
         ] {
             assert!(
                 names.contains(&expected),
@@ -2000,5 +2063,153 @@ mod tests {
         );
         assert!(none["task"].is_null(), "{none}");
         assert_eq!(s.memory.label(), dm_core::Label::Public);
+    }
+
+    /// A server over the record at `dir`, for a session of `author`.
+    fn server_of(dir: &std::path::Path, author: &str) -> McpServer {
+        let memory = Memory::open(dir).unwrap().with_author(author);
+        McpServer::new(Arc::new(memory))
+    }
+
+    /// Write `body` through the `write` tool of `s`: the id of the entry.
+    async fn write_note(s: &McpServer, body: &str) -> String {
+        let params = WriteParams {
+            body: body.into(),
+            ..WriteParams::default()
+        };
+        let w = payload(&s.write(Parameters(params)).await.unwrap());
+        w["id"].as_str().unwrap().to_string()
+    }
+
+    /// Read `id` through the `get` tool of a new session of `author`, and write `body`
+    /// in that session: the id of the entry it wrote.
+    async fn read_then_write(dir: &std::path::Path, author: &str, id: &str, body: &str) -> String {
+        let s = server_of(dir, author);
+        s.get(Parameters(GetParams { id: id.into() }))
+            .await
+            .unwrap();
+        write_note(&s, body).await
+    }
+
+    /// The ids of the entries in a lineage answer, in its order.
+    fn reached(answer: &Value) -> Vec<&str> {
+        let entries = answer["entries"].as_array().unwrap();
+        entries.iter().map(|e| e["id"].as_str().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_lineage_tool_gives_the_owner_s_server_the_same_answer_as_the_library() {
+        let (dir, s) = server().await;
+        let x = write_note(&s, "# Port\n\nIt listens on 8080.\n").await;
+        let y = read_then_write(dir.path(), "agent:r", &x, "# Proxy\n\nIt forwards.\n").await;
+        let z = read_then_write(dir.path(), "agent:q", &y, "# Runbook\n\nRestart it.\n").await;
+        let ask = |of: &str, back, depth| {
+            let params = LineageParams {
+                of: of.into(),
+                back,
+                depth,
+            };
+            s.lineage(Parameters(params))
+        };
+        let library = |l: crate::lineage::Lineage| serde_json::to_value(l).unwrap();
+        // forward is the default, and with no depth it runs to the end
+        let forward = payload(&ask(&x, None, None).await.unwrap());
+        assert_eq!(reached(&forward), [y.as_str(), z.as_str()]);
+        assert_eq!(forward["direction"], "forward");
+        let same = s.memory.lineage(&x, Direction::Forward, None).await;
+        assert_eq!(forward, library(same.unwrap()));
+        assert_eq!(forward, payload(&ask(&x, Some(false), None).await.unwrap()));
+        // a depth bounds the steps
+        let near = payload(&ask(&x, None, Some(1)).await.unwrap());
+        assert_eq!(reached(&near), [y.as_str()]);
+        // and back gives what the entry was made from
+        let back = payload(&ask(&z, Some(true), None).await.unwrap());
+        assert_eq!(reached(&back), [y.as_str(), x.as_str()]);
+        assert_eq!(back["direction"], "back");
+        let same = s.memory.lineage(&z, Direction::Back, None).await;
+        assert_eq!(back, library(same.unwrap()));
+        assert_eq!(back["entries"][0]["informed"], true);
+        assert_eq!(back["entries"][0]["hops"], 1);
+    }
+
+    /// The `lineage` tool of `s`, forward from `of`.
+    async fn forward_of(s: &McpServer, of: &str) -> Result<CallToolResult, McpError> {
+        let params = LineageParams {
+            of: of.into(),
+            ..LineageParams::default()
+        };
+        s.lineage(Parameters(params)).await
+    }
+
+    #[tokio::test]
+    async fn lineage_and_log_are_refused_outside_the_security_role_and_served_inside_it() {
+        let (dir, owner) = server().await;
+        let grants = dir.path().join(crate::GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("security = [\"agent:security\"]\n{text}")).unwrap();
+        // the owner's session started under the grants as they were: a new one
+        drop(owner);
+        let owner = server_of(dir.path(), "human:test:me");
+        let x = write_note(&owner, "# Port\n\nIt listens on 8080.\n").await;
+        let worker = server_of(dir.path(), "agent:worker");
+        let refused = forward_of(&worker, &x).await.unwrap_err();
+        assert_eq!(refused.code, McpError::invalid_params("", None).code);
+        let why = "lineage is for the owner and the security role";
+        assert!(refused.message.contains(why), "{refused:?}");
+        let refused = worker
+            .log(Parameters(LogParams::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, McpError::invalid_params("", None).code);
+        let why = "the log is for the owner and the security role";
+        assert!(refused.message.contains(why), "{refused:?}");
+        assert_eq!(worker.memory.label(), dm_core::Label::Public);
+
+        let security = server_of(dir.path(), "agent:security");
+        let answer = payload(&forward_of(&security, &x).await.unwrap());
+        assert_eq!(
+            (&answer["of"], &answer["complete"]),
+            (&json!(x), &json!(true))
+        );
+        // a task filed after the last write: the tool serves the log with the ledger's
+        // events up to now
+        admitted_task(&owner, "Move the port", None).await;
+        let log = payload(
+            &security
+                .log(Parameters(LogParams::default()))
+                .await
+                .unwrap(),
+        );
+        let events = log["events"].as_array().unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds[..2], ["write", "put"], "{kinds:?}");
+        assert!(kinds.contains(&"ledger"), "{kinds:?}");
+        assert_eq!(events[0]["id"], x);
+        let fresh = &log["freshness"];
+        assert_eq!(fresh["domain"], "dom-me");
+        assert_eq!(
+            (&fresh["within_bound"], &fresh["unfed"]),
+            (&json!(true), &json!(0))
+        );
+        assert_eq!(fresh["bound_seconds"], 60);
+        assert_eq!(fresh["log_seq"], events[events.len() - 1]["seq"]);
+        // an event served is a read: the label of the session rose, and to the highest,
+        // since a `put` names no label
+        assert_eq!(security.memory.label(), dm_core::Label::Restricted);
+        // `from` is the first sequence number served
+        let from = LogParams {
+            domain: Some("dom-me".into()),
+            from: Some(2),
+        };
+        let tail = payload(&security.log(Parameters(from)).await.unwrap());
+        assert_eq!(tail["events"][0]["seq"], 2);
+        assert_eq!(tail["events"].as_array().unwrap().len(), events.len() - 1);
+    }
+
+    #[test]
+    fn lineage_and_log_only_read() {
+        assert_eq!(kind_of("lineage"), tape::Kind::Read);
+        assert_eq!(kind_of("log"), tape::Kind::Read);
+        assert_eq!(kind_of("write"), tape::Kind::Mutation);
     }
 }

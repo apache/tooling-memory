@@ -594,9 +594,25 @@ enum Command {
         #[command(subcommand)]
         op: QuarantineOp,
     },
-    /// What an entry may have reached: the sessions that read it and the entries they
-    /// wrote after; where to look when an entry turns out to be poison.
-    Taint { id: String },
+    /// The lineage of an entry, from the event logs: what was written and sent after a
+    /// session read it, and what cites it; with --back, what it was made from. Where to
+    /// look when an entry turns out to be poison. For the owner and the security role.
+    Lineage {
+        /// An entry id, or with --back `<domain>@<seq>` for a send event.
+        of: String,
+        /// Follow the edges back: what the entry or the send may have been made from.
+        #[arg(long)]
+        back: bool,
+        /// The most steps to follow. Without it, until a step reaches nothing new.
+        #[arg(long)]
+        depth: Option<u32>,
+    },
+    /// The entries an erasure withheld, which no read serves until each is derived
+    /// again, released or erased: list them, or release one.
+    Withheld {
+        #[command(subcommand)]
+        op: eventlog::WithheldOp,
+    },
     /// Promote an entry's trust tier. To curated at once, by anyone but its author; to
     /// verified by proposal only, a task a person who did not propose it approves.
     Promote {
@@ -925,8 +941,9 @@ enum Command {
         #[command(subcommand)]
         op: gofannon::GofannonOp,
     },
-    /// The event log of a domain, the order of record of its entries, and the
-    /// materializer that builds the index from it.
+    /// The event log of a domain, the order of record of its entries; the feed of the
+    /// index from it, measured against the published bound; and the materializer that
+    /// builds the index from it.
     Log {
         #[command(subcommand)]
         op: eventlog::LogOp,
@@ -1546,6 +1563,10 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Transcript { op } => transcripts::cmd(&Memory::open(&root)?, op).await,
         Command::Reenact { op } => reenact::cmd(&root, op).await,
         Command::Log { op } => eventlog::cmd(&Memory::open(&root)?, op).await,
+        Command::Lineage { of, back, depth } => {
+            eventlog::lineage(&Memory::open(&root)?, &of, back, depth).await
+        }
+        Command::Withheld { op } => eventlog::withheld(&Memory::open(&root)?, op).await,
         Command::Gofannon { op } => gofannon::cmd(&root, op).await,
         Command::Platform { op } => platform::cmd(&Memory::open(&root)?, op).await,
         Command::Tool { name, args } => sources::call(&root, &name, &args).await,
@@ -4598,7 +4619,7 @@ async fn check_cmd(
     }))
 }
 
-/// `amem policy`, `amem quarantine`, `amem taint`, `amem canary`, `amem erase` and
+/// `amem policy`, `amem quarantine`, `amem canary`, `amem erase` and
 /// `amem reindex`: the perimeter's commands and the record's repair.
 async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
     match command {
@@ -4662,7 +4683,6 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         Command::Quarantine {
             op: QuarantineOp::Drop { id },
         } => json(&m.release_quarantined(&id, false).await?),
-        Command::Taint { id } => json(&m.taint(&id)),
         Command::Promote { id, to, why } => json(&m.promote(&id, to.parse()?, &why).await?),
         Command::Approve { task } => json(&m.approve(&task).await?),
         Command::Promotions { id } => json(&m.promotions(&id).await?),
@@ -4846,8 +4866,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Promotions { .. }
         | Command::Reindex
         | Command::Policy { .. }
-        | Command::Quarantine { .. }
-        | Command::Taint { .. }) => perimeter_cmd(m, cmd).await,
+        | Command::Quarantine { .. }) => perimeter_cmd(m, cmd).await,
         Command::Init { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
@@ -4874,6 +4893,8 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Transcript { .. }
         | Command::Reenact { .. }
         | Command::Log { .. }
+        | Command::Lineage { .. }
+        | Command::Withheld { .. }
         | Command::Gofannon { .. }
         | Command::Platform { .. }
         | Command::Tool { .. }
