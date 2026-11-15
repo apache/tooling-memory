@@ -546,6 +546,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         };
         let f = self
             .policy()
@@ -692,6 +693,7 @@ impl Memory {
                 day_tokens,
             }),
             fetch: None,
+            approval: None,
         };
         let mut d = self.policy().decide(&input)?;
         if !d.allow {
@@ -1735,6 +1737,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })
     }
 
@@ -1802,6 +1805,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })?;
         if !decision.allow {
             return Err(self.quarantine(entry.clone(), &decision, &findings).await);
@@ -2407,6 +2411,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })?;
         if d.admit {
             let admitted = l.admit(&task.id).await?;
@@ -3183,6 +3188,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })?;
         if !d.allow || self.author != self.grants.owner {
             return Err(Error::Denied(format!(

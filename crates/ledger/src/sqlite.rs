@@ -4,9 +4,9 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
-    PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, ApprovalRecord, Claimant, Error, Event, Held,
+    PromotionRecord, PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task,
+    TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -294,6 +294,29 @@ impl Db {
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Append an approval's event, in one transaction. It projects nothing.
+    pub(crate) fn record_approval(&mut self, record: &ApprovalRecord) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let key = crate::approval_key(&record.spec.target);
+        let event = Event::Approved(Box::new(record.clone()));
+        apply(&tx, &key, record.at, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The payloads of the approval events, oldest first: those under `key` when it is
+    /// given, else all of them, whatever their domain.
+    pub(crate) fn approval_payloads(&self, key: Option<&str>) -> Result<Vec<String>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events
+             WHERE kind = 'approved' AND (?1 IS NULL OR task_id = ?1) ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![key], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Remove the why from an entry's promotion events and rows in one transaction, with
@@ -889,7 +912,7 @@ fn insert_promotion(
 }
 
 /// The projection of the events that move a task between waiting and claimable, and of
-/// the two that only record something.
+/// those that only record something.
 fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Error> {
     let sql = match event {
         Event::Blocked { .. } => {
@@ -901,7 +924,8 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
         Event::Retriaged { .. } => {
             "UPDATE tasks SET status = 'proposed' WHERE id = ?1 AND status IN ('open', 'blocked')"
         }
-        // the record that someone tried, or spoke after its claim: nothing of the task moves
+        // the record that someone tried, or spoke after its claim, or approved an action:
+        // no task moves
         _ => return Ok(()),
     };
     conn.execute(sql, params![id])?;
@@ -948,7 +972,8 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         | Event::Unblocked { .. }
         | Event::Retriaged { .. }
         | Event::ClaimRefused { .. }
-        | Event::LateHandoff { .. } => project_waiting(conn, id, event)?,
+        | Event::LateHandoff { .. }
+        | Event::Approved(_) => project_waiting(conn, id, event)?,
         Event::Claimed { holder, until, .. } => {
             conn.execute(
                 "UPDATE tasks SET status = 'claimed', holder = ?2, lease_until = ?3,

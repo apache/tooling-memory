@@ -28,6 +28,12 @@
 //! claims it, lists it, or reads it as delivered work. It is kept once per version of the
 //! entry, and a rebuild replays it with the rest.
 //!
+//! An approval is recorded on the same log too, as one event under the key
+//! `approval:<target>`, and projected nowhere: the events are the store, and
+//! [`Ledger::approvals`] reads them. It is no task either. It names one action, one
+//! entry, one version of that entry, who approved, who may act under it and when it
+//! expires. The ledger keeps it and judges nothing: the policy decides what it permits.
+//!
 //! Time comes from a clock the ledger owns, so tests can move it.
 
 mod postgres;
@@ -545,6 +551,53 @@ pub struct PromotionRecord {
     pub at: OffsetDateTime,
 }
 
+/// What an approval records: a person approved one action on one version of one entry,
+/// for one principal, until a time. It holds no free text, so an erasure of the entry
+/// has nothing to remove from it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalSpec {
+    /// The domain the entry lives in, whose ledger keeps the approval.
+    pub domain: String,
+    /// The person who approved, system-qualified.
+    pub principal: String,
+    /// The action approved, as one token: `erase`, `declassify:internal`. The ledger
+    /// does not interpret it.
+    pub action: String,
+    /// The entry the action is on.
+    pub target: String,
+    /// The digest of the entry text that was approved: the approval is of that version
+    /// and of no other.
+    pub version: String,
+    /// The principal that may run the action under this approval.
+    pub scope: String,
+    /// When the approval stops permitting anything.
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires: OffsetDateTime,
+}
+
+/// An approval as the ledger holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    /// The approval's id, `apr-<domain>-<suffix>`.
+    pub id: String,
+    /// What was approved.
+    #[serde(flatten)]
+    pub spec: ApprovalSpec,
+    /// When it was recorded, on the ledger's clock.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
+impl ApprovalRecord {
+    /// Whether the approval permits nothing any more at `now`: at its expiry and after
+    /// it. The two are compared as times, since the text of a time does not order as the
+    /// time does.
+    #[must_use]
+    pub fn expired(&self, now: OffsetDateTime) -> bool {
+        now >= self.spec.expires
+    }
+}
+
 type Clock = Box<dyn Fn() -> OffsetDateTime + Send + Sync>;
 
 /// One appended event, as replay reads it.
@@ -650,6 +703,10 @@ enum Event {
         #[serde(default, skip_serializing_if = "is_false")]
         why_erased: bool,
     },
+    /// A person approved one action on one version of one entry. Appended under
+    /// [`approval_key`], never a task id, and projected nowhere: the event is the record.
+    /// Boxed: a record is larger than every other event but a boxed one.
+    Approved(Box<ApprovalRecord>),
 }
 
 impl Event {
@@ -676,6 +733,7 @@ impl Event {
             Event::Posted { .. } => "posted",
             Event::Rescored { .. } => "rescored",
             Event::Promoted { .. } => "promoted",
+            Event::Approved(_) => "approved",
         }
     }
 
@@ -792,6 +850,12 @@ fn label_from_rank(id: &str, rank: i64) -> Result<Label, Error> {
 /// never meet.
 fn promotion_key(entry: &str) -> String {
     format!("promotion:{entry}")
+}
+
+/// The key an approval's event is appended under. A task id starts `task-`, so the two
+/// never meet.
+fn approval_key(target: &str) -> String {
+    format!("approval:{target}")
 }
 
 /// The columns of a promotion row, in the order both backends read them.
@@ -1114,7 +1178,10 @@ impl Ledger {
         self.clock = Box::new(clock);
     }
 
-    fn now(&self) -> OffsetDateTime {
+    /// The ledger's clock. A lease and the expiry of an approval are measured against
+    /// it, so whoever judges one asks the ledger for the time.
+    #[must_use]
+    pub fn now(&self) -> OffsetDateTime {
         (self.clock)()
     }
 
@@ -2172,6 +2239,53 @@ impl Ledger {
         on_backend!(&self.backend, db => db.promotions(domain, entry))
     }
 
+    /// Record an approval: one event, projected nowhere. The ledger gives it an id and
+    /// the time of its clock. Nothing is checked and nothing is deduplicated: the same
+    /// spec recorded twice is two approvals, each with its own id.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn record_approval(&mut self, spec: &ApprovalSpec) -> Result<ApprovalRecord, Error> {
+        let record = ApprovalRecord {
+            id: dm_core::id::new_task_id(&spec.domain).replacen("task-", "apr-", 1),
+            spec: spec.clone(),
+            at: self.now(),
+        };
+        on_backend!(&mut self.backend, db => db.record_approval(&record))?;
+        Ok(record)
+    }
+
+    /// The approvals of a domain, oldest first: those of one entry when `target` names
+    /// it, else all of them. Expired ones are returned too; [`ApprovalRecord::expired`]
+    /// says which.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn approvals(
+        &self,
+        domain: &str,
+        target: Option<&str>,
+    ) -> Result<Vec<ApprovalRecord>, Error> {
+        let key = target.map(approval_key);
+        let payloads = match &self.backend {
+            Backend::Sqlite(db) => db.approval_payloads(key.as_deref())?,
+            Backend::Postgres(db) => db.approval_payloads(domain, key.as_deref()).await?,
+        };
+        let mut out = Vec::new();
+        for p in payloads {
+            if let Event::Approved(record) = Event::parse(key.as_deref().unwrap_or("approval"), &p)?
+            {
+                // SQLite keeps every domain's events in one table
+                if record.spec.domain == domain {
+                    out.push(*record);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Remove the why from every promotion record of an entry, for its erasure: the
     /// events that hold it are rewritten and the projection with them, so no replay
     /// brings it back. Who promoted which version to which tier, and when, is kept.
@@ -2498,6 +2612,9 @@ mod tests {
         a_restored_record_keeps_its_time_and_its_erased_why,
         an_erasure_rewrites_the_tasks_filed_from_an_origin,
         an_erasure_takes_the_reason_and_the_handoff_of_the_tasks_too,
+        an_approval_is_one_event_and_is_read_back_whole,
+        approvals_are_of_one_target_and_one_domain,
+        an_approval_is_no_task_and_a_replay_keeps_it,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -4124,6 +4241,179 @@ mod tests {
             "replay keeps what makes a record new"
         );
         assert_eq!(l.list("dom-a", Status::Open).await.unwrap().len(), 1);
+    }
+
+    fn approval(domain: &str, target: &str) -> ApprovalSpec {
+        ApprovalSpec {
+            domain: domain.into(),
+            principal: "human:test:me".into(),
+            action: "erase".into(),
+            target: target.into(),
+            version: "d1".into(),
+            scope: "agent:test:asker".into(),
+            expires: T0 + Duration::hours(24),
+        }
+    }
+
+    async fn an_approval_is_one_event_and_is_read_back_whole(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        // a time with a fraction, which the text of the event must keep
+        let at = T0 + Duration::milliseconds(90_500);
+        *now.lock().unwrap() = at;
+        let events = l.event_count().await.unwrap();
+        let spec = approval("dom-a", "mem-a-1");
+        let first = l.record_approval(&spec).await.unwrap();
+        assert!(first.id.starts_with("apr-"), "{}", first.id);
+        assert_eq!((&first.spec, first.at), (&spec, at));
+        assert_eq!(l.event_count().await.unwrap(), events + 1, "one event");
+        assert_eq!(
+            l.approvals("dom-a", Some("mem-a-1")).await.unwrap(),
+            vec![first.clone()]
+        );
+        the_event_holds_the_approval_and_nothing_else(b, &first).await;
+        the_same_spec_again_is_another_approval(&mut l, first, events).await;
+    }
+
+    async fn the_same_spec_again_is_another_approval(
+        l: &mut Ledger,
+        first: ApprovalRecord,
+        events: u64,
+    ) {
+        let second = l.record_approval(&first.spec).await.unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(l.event_count().await.unwrap(), events + 2);
+        assert_eq!(
+            l.approvals("dom-a", Some("mem-a-1")).await.unwrap(),
+            vec![first, second],
+            "oldest first"
+        );
+    }
+
+    async fn the_event_holds_the_approval_and_nothing_else(b: &Site, record: &ApprovalRecord) {
+        let payloads = b.payloads().await;
+        assert_eq!(payloads.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "action",
+                "at",
+                "domain",
+                "expires",
+                "id",
+                "kind",
+                "principal",
+                "scope",
+                "target",
+                "version"
+            ]
+        );
+        assert_eq!(v["kind"], "approved");
+        assert_eq!(v["id"], record.id.as_str());
+        assert_eq!(v["at"], "2026-10-01T10:01:30.5Z");
+    }
+
+    async fn approvals_are_of_one_target_and_one_domain(b: &Site) {
+        let mut l = b.open().await;
+        // neither domain has filed a task: an approval is the first thing each records
+        let one = l
+            .record_approval(&approval("dom-a", "mem-a-1"))
+            .await
+            .unwrap();
+        let two = l
+            .record_approval(&approval("dom-a", "mem-a-2"))
+            .await
+            .unwrap();
+        // the same entry id, in another domain
+        let elsewhere = l
+            .record_approval(&approval("dom-b", "mem-a-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            l.approvals("dom-a", Some("mem-a-1")).await.unwrap(),
+            vec![one.clone()],
+            "not another target's, and not another domain's"
+        );
+        assert_eq!(
+            l.approvals("dom-a", Some("mem-a-2")).await.unwrap(),
+            vec![two.clone()]
+        );
+        assert_eq!(l.approvals("dom-a", None).await.unwrap(), vec![one, two]);
+        the_other_domain_lists_its_own(&l, elsewhere).await;
+    }
+
+    async fn the_other_domain_lists_its_own(l: &Ledger, elsewhere: ApprovalRecord) {
+        assert_eq!(
+            l.approvals("dom-b", None).await.unwrap(),
+            vec![elsewhere.clone()]
+        );
+        assert_eq!(
+            l.approvals("dom-b", Some("mem-a-1")).await.unwrap(),
+            vec![elsewhere]
+        );
+        assert!(l
+            .approvals("dom-b", Some("mem-a-2"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(l.approvals("dom-c", None).await.unwrap().is_empty());
+    }
+
+    async fn an_approval_is_no_task_and_a_replay_keeps_it(b: &Site) {
+        let mut l = b.open().await;
+        let parent = admitted(&mut l, spec("A task beside it")).await;
+        let record = l
+            .record_approval(&approval("dom-a", "mem-a-1"))
+            .await
+            .unwrap();
+        no_task_query_finds_the_approval(&l, &parent, &record).await;
+        let before = l.approvals("dom-a", None).await.unwrap();
+        assert_eq!(before, vec![record.clone()]);
+        assert_eq!(l.rebuild().await.unwrap(), 3, "created, admitted, approved");
+        assert_eq!(l.approvals("dom-a", None).await.unwrap(), before);
+        assert_eq!(l.get(&parent.id).await.unwrap(), parent);
+        no_task_query_finds_the_approval(&l, &parent, &record).await;
+    }
+
+    async fn no_task_query_finds_the_approval(l: &Ledger, parent: &Task, record: &ApprovalRecord) {
+        only_the_task_is_listed(l, parent).await;
+        for name in [record.id.as_str(), "approval:mem-a-1", "mem-a-1"] {
+            assert!(
+                l.with_origin("dom-a", name).await.unwrap().is_empty(),
+                "{name}"
+            );
+            assert!(l.filed_from(name).await.unwrap().is_empty(), "{name}");
+            assert!(l.dependents(name).await.unwrap().is_empty(), "{name}");
+        }
+        assert!(l.unposted("dom-a").await.unwrap().is_empty());
+        for id in [record.id.as_str(), "approval:mem-a-1"] {
+            assert!(matches!(l.get(id).await, Err(Error::NotFound(_))), "{id}");
+        }
+    }
+
+    /// The text of a time does not order as the time does: `10:00:00Z` sorts after
+    /// `10:00:00.5Z`, and `10:00:00.5Z` after `10:00:00.50001Z`.
+    #[test]
+    fn an_approval_is_expired_at_its_expiry_and_after_it_and_not_before() {
+        let at = |s: &str| OffsetDateTime::parse(s, &Rfc3339).unwrap();
+        let until = |expires: &str| ApprovalRecord {
+            id: "apr-a-1".into(),
+            spec: ApprovalSpec {
+                expires: at(expires),
+                ..approval("dom-a", "mem-a-1")
+            },
+            at: T0,
+        };
+        let half = until("2026-10-01T10:00:00.5Z");
+        assert!(!half.expired(at("2026-10-01T10:00:00.123Z")), "before");
+        assert!(!half.expired(at("2026-10-01T10:00:00Z")), "before");
+        assert!(half.expired(at("2026-10-01T10:00:00.5Z")), "at its expiry");
+        assert!(half.expired(at("2026-10-01T10:00:00.50001Z")), "after");
+        let whole = until("2026-10-01T10:00:00Z");
+        assert!(whole.expired(at("2026-10-01T10:00:00.5Z")), "after");
+        assert!(!whole.expired(at("2026-10-01T09:59:59.999Z")), "before");
     }
 
     async fn invalidate_is_terminal(l: &mut Ledger, t: &Task) {

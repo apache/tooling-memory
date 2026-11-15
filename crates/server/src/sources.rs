@@ -203,6 +203,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: Some(fetch),
+            approval: None,
         })
     }
 

@@ -48,7 +48,7 @@ term here in the same commit as the first document that needs it.
 | ledger | The tasks of each domain, with their leases and origins, on SQLite under `state/` or on PostgreSQL | queue, task list |
 | grants | The file `grants.toml`: the owner, handling, the domains, destinations, taps, gates, spend limits and the ledger | permissions (for the grants), config (for the grants) |
 | grant | One table in the grants: `[domains.<name>]`, `[destinations.<name>]` or `[taps.<name>]` | permission |
-| policy | The Rego rules that decide each action: write, read, erase, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
+| policy | The Rego rules that decide each action: write, read, erase, approve, declassify, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
 | perimeter | The policy, the grants and the parts that enforce them, as one part of the design | |
 | rule | One policy entry in the record: an id, a layer, the rule, its intent, an owner and, where a machine can check it, a module | |
 | status (of a rule) | Where a rule is in its life: `proposed` (in no decision), `advisory` (reports, refuses nothing), `enforced` (refuses) or `retired` | state (of a rule) |
@@ -56,6 +56,8 @@ term here in the same commit as the first document that needs it.
 | reset | `amem policy reset`: the owner retires each rule of a domain that no person wrote, promoted or approved | purge |
 | amendment | A task for the owner of a rule, with evidence, that asks for a change to the rule | |
 | gates | The `[gates]` rules on a write: how many entries one session may supersede, and whether a verified entry needs an approver | |
+| approval | An event on the ledger: a person approved one action on one version of one entry, for one principal, until a time. The policy checks it when the action runs | permission (for an approval) |
+| guard | The person who approves a copy of an entry at a lower label: `guard` in the grant of the domain, or the owner | |
 | scan | The check of a write and of a tool's answer for instructions, secrets, hidden text and the like. The scan finds; the policy decides | |
 | label | `public`, `internal` or `restricted`, in that order | level, tier (for a label), sensitivity |
 | classification | The label of an entry | |
@@ -108,6 +110,7 @@ a different thing. Name that thing in full where it could be read as the term.
 
 | Word | The other sense | Write |
 |---|---|---|
+| guard | The hook `.claude/hooks/guard-bash.sh`, which refuses some commands of a Claude Code session | the guard hook |
 | budget | The tasks or tokens that one curation cycle may use (`--budget-tasks`, `--budget-tokens`), or LiteLLM's budget for each project | curation budget, LiteLLM budget |
 | projection | The ledger built from the event log | the ledger's projection of the log |
 | root | The root user, or the `/` directory, or the top of a URL | root user, root directory |

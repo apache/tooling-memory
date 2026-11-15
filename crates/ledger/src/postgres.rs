@@ -17,9 +17,9 @@
 //! connections cannot both win the same task.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
-    PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, ApprovalRecord, Claimant, Error, Event, Held,
+    PromotionRecord, PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task,
+    TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use std::collections::HashMap;
@@ -511,6 +511,42 @@ impl Db {
         tx.commit().await?;
         self.remember(&spec.domain, &s);
         Ok(true)
+    }
+
+    /// Append an approval's event, in one transaction. It projects nothing. The domain's
+    /// schema is made if this is the first thing the domain records.
+    pub(crate) async fn record_approval(&mut self, record: &ApprovalRecord) -> Result<(), Error> {
+        let tx = self.client.transaction().await?;
+        let s = ensure_domain(&tx, &record.spec.domain).await?;
+        let key = crate::approval_key(&record.spec.target);
+        let event = Event::Approved(Box::new(record.clone()));
+        apply(&tx, &s, &key, record.at, &event).await?;
+        tx.commit().await?;
+        self.remember(&record.spec.domain, &s);
+        Ok(())
+    }
+
+    /// The payloads of a domain's approval events, oldest first: those under `key` when
+    /// it is given, else all of them. A domain that has recorded nothing has none.
+    pub(crate) async fn approval_payloads(
+        &self,
+        domain: &str,
+        key: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT payload FROM {s}.events
+                     WHERE kind = 'approved' AND ($1::text IS NULL OR task_id = $1) ORDER BY seq"
+                ),
+                &[&key],
+            )
+            .await?;
+        rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
     }
 
     /// Remove the why from an entry's promotion events and rows, in one transaction under
@@ -1429,8 +1465,11 @@ async fn project<C: GenericClient>(
             "SET status = 'proposed' WHERE id = $1 AND status IN ('open', 'blocked')",
             vec![&id],
         ),
-        // the record that someone tried, or spoke after its claim: nothing of the task moves
-        Event::ClaimRefused { .. } | Event::LateHandoff { .. } => return Ok(()),
+        // the record that someone tried, or spoke after its claim, or approved an action:
+        // no task moves
+        Event::ClaimRefused { .. } | Event::LateHandoff { .. } | Event::Approved(_) => {
+            return Ok(())
+        }
         Event::Claimed { holder, .. } => (
             "SET status = 'claimed', holder = $2, lease_until = $3,
                 attempts = attempts + 1 WHERE id = $1",
