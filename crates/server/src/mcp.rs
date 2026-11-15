@@ -44,7 +44,9 @@ fn mcp_err(e: Error) -> McpError {
             | dm_ledger::Error::WrongState { .. }
             | dm_ledger::Error::NotHolder { .. }
             | dm_ledger::Error::Fenced { .. }
-            | dm_ledger::Error::AttemptSpent { .. },
+            | dm_ledger::Error::AttemptSpent { .. }
+            | dm_ledger::Error::BadPin(_)
+            | dm_ledger::Error::Pinned { .. },
         ) => McpError::invalid_params(e.to_string(), None),
         other => McpError::internal_error(other.to_string(), None),
     }
@@ -888,6 +890,7 @@ impl McpServer {
             priority: p.priority.unwrap_or(0),
             definition: p.definition,
             acceptance: p.acceptance,
+            ..dm_ledger::TaskSpec::default()
         };
         let c = self.memory.create_task(spec).await.map_err(mcp_err)?;
         // what a task that stays proposed lacks goes back to whoever filed it
@@ -1857,6 +1860,15 @@ mod tests {
         });
         assert_eq!(invalid.code, also.code);
         assert_eq!(invalid.code, ledger.code);
+        // a pin the caller got wrong, or does not fill, is the caller's to act on
+        let pinned = mcp_err(Error::Ledger(dm_ledger::Error::Pinned {
+            id: "t".into(),
+            position: "pos-a-qa".into(),
+        }));
+        assert_eq!(pinned.code, invalid.code);
+        assert!(pinned.message.contains("pinned to position pos-a-qa"));
+        let bad_pin = mcp_err(Error::Ledger(dm_ledger::Error::BadPin("no reason".into())));
+        assert_eq!(bad_pin.code, invalid.code);
         assert_ne!(invalid.code, internal.code);
         // a stopped session is told so in words it can act on, as a refusal is
         let stopped = mcp_err(Error::Stale("the grants changed".into()));

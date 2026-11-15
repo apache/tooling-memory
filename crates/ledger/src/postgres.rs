@@ -17,11 +17,10 @@
 //! connections cannot both win the same task.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
+    check_holder, claimable, parse_time, Claimer, Error, Event, Held, PromotionRecord,
     PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
     PROMOTION_COLUMNS, TASK_COLUMNS,
 };
-use dm_core::Label;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use time::OffsetDateTime;
@@ -623,10 +622,8 @@ impl Db {
         &mut self,
         domain: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<Option<Taken>, Error> {
         let Some(s) = self.schema(domain).await? else {
             return Ok(None);
@@ -671,10 +668,10 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()?;
         crate::in_queue_order(&mut candidates);
         for seen in candidates {
-            if !claimable(&seen, now, manifest, handling) {
+            if !claimable(&seen, now, who) {
                 continue;
             }
-            if take(&tx, &s, &seen.id, now, (who, until), manifest, handling).await? {
+            if take(&tx, &s, &seen.id, now, (who, until)).await? {
                 tx.commit().await?;
                 return Ok(Some(Taken::New(seen.id)));
             }
@@ -691,15 +688,18 @@ impl Db {
         who: (&str, OffsetDateTime),
     ) -> Result<bool, Error> {
         let who = (
-            Claimant {
+            Claimer {
                 holder: who.0,
+                manifest: &[],
+                handling: dm_core::Label::Restricted,
+                seat: None,
                 attempt: None,
             },
             who.1,
         );
         let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
-        let taken = take(&tx, &s, id, now, who, &[], Label::Restricted).await?;
+        let taken = take(&tx, &s, id, now, who).await?;
         tx.commit().await?;
         Ok(taken)
     }
@@ -708,10 +708,8 @@ impl Db {
         &mut self,
         id: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<(), Error> {
         let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
@@ -723,7 +721,7 @@ impl Db {
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         let task = task_from_row(&row)?;
-        if !claimable(&task, now, manifest, handling)
+        if !claimable(&task, now, who)
             || !deps_complete(&tx, &task.spec.depends_on).await?
             || awaits_continuation(&tx, &s, &task.id).await?
         {
@@ -733,12 +731,7 @@ impl Db {
                 op: "claim",
             });
         }
-        let claimed = Event::Claimed {
-            holder: who.holder.to_string(),
-            until,
-            generation: task.generation + 1,
-            attempt: who.attempt.map(str::to_string),
-        };
+        let claimed = who.claimed(until, task.generation + 1);
         apply(&tx, &s, id, now, &claimed).await?;
         tx.commit().await?;
         Ok(())
@@ -925,9 +918,7 @@ async fn take<C: GenericClient>(
     s: &str,
     id: &str,
     now: OffsetDateTime,
-    who: (Claimant<'_>, OffsetDateTime),
-    manifest: &[String],
-    handling: Label,
+    who: (Claimer<'_>, OffsetDateTime),
 ) -> Result<bool, Error> {
     let locked = tx
         .query_opt(
@@ -939,18 +930,13 @@ async fn take<C: GenericClient>(
         return Ok(false);
     };
     let task = task_from_row(&locked)?;
-    if !claimable(&task, now, manifest, handling)
+    if !claimable(&task, now, who.0)
         || !deps_complete(tx, &task.spec.depends_on).await?
         || awaits_continuation(tx, s, &task.id).await?
     {
         return Ok(false);
     }
-    let claimed = Event::Claimed {
-        holder: who.0.holder.to_string(),
-        until: who.1,
-        generation: task.generation + 1,
-        attempt: who.0.attempt.map(str::to_string),
-    };
+    let claimed = who.0.claimed(who.1, task.generation + 1);
     apply(tx, s, &task.id, now, &claimed).await?;
     Ok(true)
 }
@@ -1364,6 +1350,13 @@ async fn project<C: GenericClient>(
         ),
         Event::Retriaged { .. } => (
             "SET status = 'proposed' WHERE id = $1 AND status IN ('open', 'blocked')",
+            vec![&id],
+        ),
+        // the pin leaves the row, so a replay leaves the task unpinned too. The column is
+        // text, and a row with no `extra` holds no pin
+        Event::Unpinned { .. } => (
+            "SET extra = ((extra::jsonb) - 'position' - 'pin_reason')::text
+             WHERE id = $1 AND extra IS NOT NULL AND extra <> ''",
             vec![&id],
         ),
         // the record that someone tried, or spoke after its claim: nothing of the task moves

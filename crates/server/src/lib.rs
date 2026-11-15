@@ -2714,6 +2714,8 @@ impl Memory {
             priority: parent.spec.priority,
             definition: parent.spec.definition.clone(),
             acceptance: parent.spec.acceptance.clone(),
+            // the ledger gives a continuation its parent's pin
+            ..TaskSpec::default()
         })
         .await?;
         let continuation = self

@@ -4954,6 +4954,7 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
                     priority,
                     definition,
                     acceptance,
+                    ..TaskSpec::default()
                 })
                 .await?;
             json(&c.task)

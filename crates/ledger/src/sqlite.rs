@@ -4,11 +4,10 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
+    check_holder, claimable, parse_time, Claimer, Error, Event, Held, PromotionRecord,
     PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
     PROMOTION_COLUMNS, TASK_COLUMNS,
 };
-use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -389,10 +388,8 @@ impl Db {
         &mut self,
         domain: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<Option<Taken>, Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -432,23 +429,14 @@ impl Db {
             found
         };
         for task in candidates {
-            if !claimable(&task, now, manifest, handling)
+            if !claimable(&task, now, who)
                 || !deps_complete(&tx, &task.spec.depends_on)?
                 || awaits_continuation(&tx, &task)?
             {
                 continue;
             }
-            apply(
-                &tx,
-                &task.id,
-                now,
-                &Event::Claimed {
-                    holder: who.holder.to_string(),
-                    until,
-                    generation: task.generation + 1,
-                    attempt: who.attempt.map(str::to_string),
-                },
-            )?;
+            let claimed = who.claimed(until, task.generation + 1);
+            apply(&tx, &task.id, now, &claimed)?;
             tx.commit()?;
             return Ok(Some(Taken::New(task.id)));
         }
@@ -459,15 +447,13 @@ impl Db {
         &mut self,
         id: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<(), Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let task = get_in(&tx, id)?;
-        if !claimable(&task, now, manifest, handling)
+        if !claimable(&task, now, who)
             || !deps_complete(&tx, &task.spec.depends_on)?
             || awaits_continuation(&tx, &task)?
         {
@@ -477,17 +463,7 @@ impl Db {
                 op: "claim",
             });
         }
-        apply(
-            &tx,
-            id,
-            now,
-            &Event::Claimed {
-                holder: who.holder.to_string(),
-                until,
-                generation: task.generation + 1,
-                attempt: who.attempt.map(str::to_string),
-            },
-        )?;
+        apply(&tx, id, now, &who.claimed(until, task.generation + 1))?;
         tx.commit()?;
         Ok(())
     }
@@ -863,8 +839,8 @@ fn insert_promotion(
     Ok(())
 }
 
-/// The projection of the events that move a task between waiting and claimable, and of
-/// the two that only record something.
+/// The projection of the events that move a task between waiting and claimable, of the
+/// one that takes its pin off, and of the two that only record something.
 fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Error> {
     let sql = match event {
         Event::Blocked { .. } => {
@@ -875,6 +851,12 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
         }
         Event::Retriaged { .. } => {
             "UPDATE tasks SET status = 'proposed' WHERE id = ?1 AND status IN ('open', 'blocked')"
+        }
+        // the pin leaves the row, so a replay leaves the task unpinned too. A row with
+        // no `extra` holds no pin
+        Event::Unpinned { .. } => {
+            "UPDATE tasks SET extra = json_remove(extra, '$.position', '$.pin_reason')
+             WHERE id = ?1 AND extra IS NOT NULL AND extra != ''"
         }
         // the record that someone tried, or spoke after its claim: nothing of the task moves
         _ => return Ok(()),
@@ -897,6 +879,7 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         Event::Blocked { .. }
         | Event::Unblocked { .. }
         | Event::Retriaged { .. }
+        | Event::Unpinned { .. }
         | Event::ClaimRefused { .. }
         | Event::LateHandoff { .. } => project_waiting(conn, id, event)?,
         Event::Claimed { holder, until, .. } => {
