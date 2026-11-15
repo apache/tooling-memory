@@ -262,12 +262,21 @@ ledger refuses it, and gives the two generations. The holder's name does not hel
 two holders have the same name. The first holder leaves what it learned as a late
 handoff, which the next holder reads.
 
-**4.4 The rescore.** Each move shows its reason. A task with a higher priority runs
+**4.4 Waiting, and an effect that nobody has settled.** The holder of a task gives the
+task up until a check completes. The task shows as blocked, and it names the event that
+it waits on. The next claim gets a different task, although this task has the highest
+priority. Then the event comes, and the task is open again. The next holder records an
+external action, a push, before it makes the push. Its lease of one second expires. The
+ledger still gives the task to nobody, because nobody knows if the push arrived. A person
+looks at the destination and settles the action as not applied. Only then does the next
+claim get the task.
+
+**4.5 The rescore.** Each move shows its reason. A task with a higher priority runs
 first. One curation task moved from 0 to 10. The reason: curation had done 17% of the
 completed work, less than its guaranteed 20%. The curation tasks filed at -1 went down
 to -2, because this period's strategy gives curation a lower weight.
 
-**4.5 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
+**4.6 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
 Claude Code calls its Agent tool twice, once for each subagent. The system stops each
 call before it runs. It files the subagent's prompt on the ledger as a task. With that
 task, it files a follow-up task that continues the comparison after the subagent's task
@@ -278,14 +287,14 @@ back on the board. The system files what Claude Code wrote as a handoff. The tas
 there. Nobody may claim it while its follow-up task is open. Thus nobody does the work
 twice.
 
-**4.6 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
+**4.7 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
 
-**4.7 Results come back.** A new Claude Code session claims the follow-up task, works on
+**4.8 Results come back.** A new Claude Code session claims the follow-up task, works on
 it with both reports, and completes it. When the follow-up task completes, the original
 task "Compare two decisions" also closes, with the same handoff. The reason: the
 follow-up task was the rest of its work. The last line shows it done.
 
-**4.8 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
+**4.9 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
 you. "promote" means the approvals to verified.
 
 ## Act 5 · Watching it

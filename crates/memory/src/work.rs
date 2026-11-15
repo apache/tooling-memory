@@ -430,7 +430,7 @@ async fn settle(
             );
             Ok(0)
         }
-        "claimed" if delegated_report(task, code, &output) => {
+        "claimed" if completes_with_report(task, &now, code, &output) => {
             let handoff = client
                 .write_handoff(
                     &format!("Report: {}", task.title),
@@ -453,10 +453,19 @@ async fn settle(
         }
         "claimed" => {
             let tail = tail_of(&output, 6000);
+            let held = unsettled(&now)
+                .map(|action| {
+                    format!(
+                        " External action `{action}` of the task is not settled: nobody can \
+                         claim the task until a person or a tap settles it \
+                         (`amem task effect-settle`)."
+                    )
+                })
+                .unwrap_or_default();
             let body = format!(
                 "# {title}\n\n`{harness}` stopped without completing task {id} (exit {code}). \
                  The task is back in the pool; what follows is what it printed, so the next \
-                 claimant can start from here.\n\n## Output\n\n{tail}\n",
+                 claimant can start from here.{held}\n\n## Output\n\n{tail}\n",
                 title = task.title,
                 harness = harness.binary(),
                 id = task.id,
@@ -494,6 +503,20 @@ fn delegated_report(task: &Task, code: i32, output: &str) -> bool {
             .get("origin")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|o| o.starts_with("task:"))
+}
+
+/// Whether a run's report completes its task: the report of a delegated task, `task` as
+/// it was claimed, when `now`, the task as it is, has no external action that nobody
+/// has settled.
+fn completes_with_report(task: &Task, now: &Task, code: i32, output: &str) -> bool {
+    delegated_report(task, code, output) && unsettled(now).is_none()
+}
+
+/// The first external action of a task that nobody has settled, when there is one. The
+/// ledger refuses to complete such a task, whatever its run reported: the task goes
+/// back with a handoff, and waits for whoever settles the action.
+pub(crate) fn unsettled(task: &Task) -> Option<&str> {
+    task.raw.get("effects")?.as_array()?.first()?.as_str()
 }
 
 fn tail_of(s: &str, chars: usize) -> String {
@@ -807,6 +830,30 @@ mod tests {
             "only delegated tasks"
         );
         assert!(!delegated_report(&task(None), 0, "done"));
+    }
+
+    #[test]
+    fn a_report_does_not_complete_a_task_with_an_action_that_nobody_settled() {
+        let task = |effects: serde_json::Value| Task {
+            id: "task-a-1".into(),
+            title: "t".into(),
+            body: "b".into(),
+            domain: "dom-a".into(),
+            status: "claimed".into(),
+            depends_on: Vec::new(),
+            requirements: Vec::new(),
+            handoff: None,
+            raw: serde_json::json!({ "origin": "task:task-a-0", "effects": effects }),
+        };
+        let claimed = task(serde_json::Value::Null);
+        let report = "DR-19 is proposed.";
+        let settled = task(serde_json::json!([]));
+        assert!(completes_with_report(&claimed, &claimed, 0, report));
+        assert!(completes_with_report(&claimed, &settled, 0, report));
+        // the ledger would refuse the completion: the task goes back with a handoff
+        let begun = task(serde_json::json!(["push-1", "push-2"]));
+        assert_eq!(unsettled(&begun), Some("push-1"));
+        assert!(!completes_with_report(&claimed, &begun, 0, report));
     }
 
     use super::*;
