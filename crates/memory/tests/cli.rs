@@ -301,8 +301,20 @@ fn the_seven_m0_steps() {
     step_reindex(&d);
 }
 
+/// `id` is withheld: a get says why, and its body, with `text` in it, is still in the
+/// record.
+fn is_withheld(root: &Path, id: &str, text: &str) {
+    let err = fails(root, &["get", id]);
+    assert!(err.contains("gone") && err.contains("withheld"), "{err}");
+    let kept = std::fs::read_to_string(root.join(format!("record/dom-me/{id}.md"))).unwrap();
+    assert!(
+        kept.contains("status: withheld") && kept.contains(text),
+        "{kept}"
+    );
+}
+
 #[test]
-fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
+fn erasure_leaves_a_stub_a_receipt_and_the_citing_entry_withheld() {
     let mut d = step_init();
     step_write(&mut d);
     let marker = "passphrase-Qz7xx";
@@ -343,9 +355,10 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
     assert_eq!(receipt["id"], secret);
     assert_eq!(receipt["reason"], "sensitive");
     assert_eq!(receipt["removed"][0]["version"], "current");
-    assert_eq!(receipt["flagged"], serde_json::json!([citing]));
+    assert_eq!(receipt["withheld"], serde_json::json!([citing]));
     assert_eq!(receipt["promotion_whys_removed"], 1);
     assert!(!ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
+    is_withheld(&d.root, &citing, &format!("See {secret}."));
     let err = fails(&d.root, &["get", &secret]);
     assert!(err.contains("gone") && err.contains("erased"), "{err}");
     let err = fails(&d.root, &["erase", &secret, "--reason", "legal"]);

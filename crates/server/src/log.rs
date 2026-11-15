@@ -32,6 +32,14 @@
 //! `state/log/<domain>.ledger` holds the number of the last ledger event copied, and
 //! when that file is behind, the log's own `ledger` events say where the copy stands.
 //!
+//! The index is fed from the log. After each write that the log holds, the writer
+//! brings the index up to the log: [`Memory::feed`] reads the events above a cursor
+//! that the index keeps for the domain, takes each entry that a `put` or an `erased`
+//! names from the record, and moves the cursor. No reader feeds and no task runs on a
+//! clock, so a version is searchable when its write returns. [`FRESHNESS_BOUND`] is the
+//! published bound on how long a version the log holds may wait, and
+//! [`Memory::freshness`] measures a domain against it.
+//!
 //! Each event carries the classification of what it names, and a line without one reads
 //! as the highest. A quarantined write is at the highest and flagged: the security role
 //! reads it, and nobody else.
@@ -178,6 +186,96 @@ pub struct Materialized {
     pub behind: Vec<String>,
     /// Ledger events replayed into its projection.
     pub ledger_events: u64,
+}
+
+/// The published bound on the fast lane: a version that the log of a domain holds is in
+/// the index within this time. The writer feeds the index before its write returns, so
+/// a version waits only when a writer stopped between the log and the index, or wrote
+/// around this library. [`Memory::freshness`] measures against it.
+pub const FRESHNESS_BOUND: time::Duration = time::Duration::seconds(60);
+
+/// What one feed of the index from the log of a domain did.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct Fed {
+    /// The domain.
+    pub domain: String,
+    /// The sequence number the log was read from.
+    pub from: u64,
+    /// The sequence number of the last event read: where the cursor stands now.
+    pub to: u64,
+    /// How many entries the index took from the record, or dropped because the record
+    /// does not hold them.
+    pub applied: usize,
+}
+
+/// How far the index of a domain is behind its log, against the published bound.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct Freshness {
+    /// The domain.
+    pub domain: String,
+    /// The sequence number of the last event in the log.
+    pub log_seq: u64,
+    /// The sequence number the index was fed up to.
+    pub fed_seq: u64,
+    /// How many `put` and `erased` events are above the cursor: versions that the log
+    /// holds and the index was not fed.
+    pub unfed: u64,
+    /// The age of the oldest of them in seconds, when there is one whose time reads.
+    pub oldest_unfed_seconds: Option<i64>,
+    /// The published bound, in seconds.
+    pub bound_seconds: i64,
+    /// Whether no version waits longer than the bound. An unfed event whose time does
+    /// not read counts as one that does.
+    pub within_bound: bool,
+}
+
+/// The entries that the `put` and `erased` events among `events` name, each once, in
+/// the order of the first event that names it.
+fn versions_named(events: &[Event]) -> Vec<&str> {
+    let mut seen = BTreeSet::new();
+    events
+        .iter()
+        .filter_map(|e| match &e.change {
+            Change::Put { id, .. } | Change::Erased { id } => Some(id.as_str()),
+            _ => None,
+        })
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
+/// How far an index fed up to `fed_seq` is behind a log whose events above that number
+/// are `unread`, as of `now`.
+#[must_use]
+pub fn measure(
+    domain: &str,
+    fed_seq: u64,
+    unread: &[Event],
+    now: time::OffsetDateTime,
+) -> Freshness {
+    let rfc3339 = &time::format_description::well_known::Rfc3339;
+    let waiting: Vec<&Event> = unread
+        .iter()
+        .filter(|e| matches!(e.change, Change::Put { .. } | Change::Erased { .. }))
+        .collect();
+    let ages: Vec<Option<i64>> = waiting
+        .iter()
+        .map(|e| {
+            time::OffsetDateTime::parse(&e.at, rfc3339)
+                .ok()
+                .map(|at| (now - at).whole_seconds().max(0))
+        })
+        .collect();
+    let oldest = ages.iter().flatten().max().copied();
+    let bound = FRESHNESS_BOUND.whole_seconds();
+    Freshness {
+        domain: domain.to_string(),
+        log_seq: unread.last().map_or(fed_seq, |e| e.seq).max(fed_seq),
+        fed_seq,
+        unfed: waiting.len() as u64,
+        oldest_unfed_seconds: oldest,
+        bound_seconds: bound,
+        within_bound: ages.iter().all(|age| age.is_some_and(|a| a <= bound)),
+    }
 }
 
 fn valid_domain(domain: &str) -> Result<&str, Error> {
@@ -422,9 +520,10 @@ impl Memory {
     /// Write a version of an entry through its domain's log: the change is appended
     /// first, then the record takes it. Every record write of an entry comes here. A
     /// version the record refuses over an erased stub is followed in the log by the
-    /// erasure again.
-    pub(crate) async fn put_logged(&self, entry: &Entry) -> Result<(), Error> {
-        append(
+    /// erasure again. Returns the sequence number of the first event appended: where a
+    /// feed of the index starts to take this version ([`Memory::feed_from`]).
+    pub(crate) async fn put_logged(&self, entry: &Entry) -> Result<u64, Error> {
+        let first = append(
             &self.root,
             &entry.front.domain,
             &self.author,
@@ -433,7 +532,8 @@ impl Memory {
                 digest: dm_core::digest(&entry.render()),
                 active: entry.is_active(),
             },
-        )?;
+        )?
+        .seq;
         if let Err(e) = self.store.put(entry).await {
             // the record keeps the stub of an erased entry: the log says so again, after
             // the version just appended, so it does not name a version the record refused
@@ -460,7 +560,7 @@ impl Memory {
                 )?;
             }
         }
-        Ok(())
+        Ok(first)
     }
 
     /// Say in its domain's log that an entry is offered, before anything screens it.
@@ -714,6 +814,115 @@ impl Memory {
         self.log(Some(&domain), from)
     }
 
+    /// Feed the index from the log of a domain: every version the log holds above the
+    /// cursor of the index goes into the index as the record has it. For the security
+    /// role; a writer feeds as part of its write, without asking. Run twice, the second
+    /// run applies nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for an author outside the security role or an ungranted domain;
+    /// a store or index error.
+    pub async fn feed(&self, domain: Option<&str>) -> Result<Fed, Error> {
+        let (domain, _) = self.log_reader(domain)?;
+        self.feed_from(&domain, u64::MAX).await
+    }
+
+    /// Feed the index from `domain`'s log, from the event after the cursor or from
+    /// `from`, whichever is lower. Each entry that a `put` or an `erased` in that span
+    /// names is read from the record once: an entry the record holds is indexed as it
+    /// stands there, which after an `erased` is its stub, and an entry the record does
+    /// not hold leaves the index. Then the cursor moves to the last event read, of any
+    /// kind, and never back.
+    ///
+    /// A writer passes the sequence number of its own `put`. Another feed can pass that
+    /// event before the record takes the version, and index the version before it; the
+    /// writer's feed then reads its event again, with the record as it is now.
+    ///
+    /// The index is held for the whole feed, so two feeds of one process do not mix. Two
+    /// processes can feed at once: each indexes what the record holds, and the cursor
+    /// keeps the higher number.
+    ///
+    /// # Errors
+    ///
+    /// A domain that is not a name, or a store or index error. The cursor does not move
+    /// then, so the next feed reads the same events again.
+    pub(crate) async fn feed_from(&self, domain: &str, from: u64) -> Result<Fed, Error> {
+        let mut ix = self.index.lock().await;
+        let cursor = ix.fed(domain)?;
+        let from = cursor.saturating_add(1).min(from);
+        let events = read(&self.root, domain, from)?;
+        let mut applied = 0;
+        for id in versions_named(&events) {
+            // the index takes the entry as the record has it now, whatever the event
+            // said: after an erasure that is the stub, which replaces the row and the
+            // text the index held
+            match self.record_holds(domain, id).await? {
+                Some(entry) => ix.upsert(&entry)?,
+                None => {
+                    ix.remove(id)?;
+                }
+            }
+            applied += 1;
+        }
+        let to = events.last().map_or(cursor, |e| e.seq).max(cursor);
+        ix.set_fed(domain, to)?;
+        Ok(Fed {
+            domain: domain.to_string(),
+            from,
+            to,
+            applied,
+        })
+    }
+
+    /// The entry the record holds under `id`, for the feed. A name that cannot be a
+    /// path, or text that is not an entry, is no entry the index can serve: it reads as
+    /// absent, so one bad line of the log does not stop every later feed.
+    async fn record_holds(&self, domain: &str, id: &str) -> Result<Option<Entry>, Error> {
+        match self.store.get(domain, id).await {
+            Ok(held) => Ok(held),
+            Err(dm_store::Error::BadName(_) | dm_store::Error::Entry { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// How far the index of a domain is behind its log, against [`FRESHNESS_BOUND`]. For
+    /// the security role. It gives counts and an age and names no entry, so it counts
+    /// every `put` and `erased` above the cursor, whatever the classification. The
+    /// cursor is read through a connection of its own, so this waits for no writer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for an author outside the security role or an ungranted domain;
+    /// the index or the file system.
+    pub fn freshness(&self, domain: Option<&str>) -> Result<Freshness, Error> {
+        let (domain, _) = self.log_reader(domain)?;
+        let index = dm_index::Index::open_reader(&self.root.join(crate::INDEX_FILE))?;
+        let fed_seq = index.fed(&domain)?;
+        let unread = read(&self.root, &domain, fed_seq.saturating_add(1))?;
+        Ok(measure(
+            &domain,
+            fed_seq,
+            &unread,
+            time::OffsetDateTime::now_utc(),
+        ))
+    }
+
+    /// The sequence number of the last `erased` event that names `id` in `domain`'s log,
+    /// when there is one: where the feed of an erasure starts.
+    pub(crate) fn last_erased(&self, domain: &str, id: &str) -> Result<Option<u64>, Error> {
+        Ok(read(&self.root, domain, 0)?
+            .iter()
+            .rev()
+            .find(|e| matches!(&e.change, Change::Erased { id: erased } if erased == id))
+            .map(|e| e.seq))
+    }
+
+    /// The sequence number of the last event in `domain`'s log, or zero.
+    pub(crate) fn last_logged(&self, domain: &str) -> Result<u64, Error> {
+        Ok(read(&self.root, domain, 0)?.last().map_or(0, |e| e.seq))
+    }
+
     /// What the record holds and the log never named, written before the log was kept:
     /// it is indexed as the record has it, since the log starts where it starts.
     async fn unnamed(
@@ -776,7 +985,14 @@ impl Memory {
         let unnamed = self.unnamed(&domain, |id| named.contains_key(id)).await?;
         out.live += unnamed.iter().filter(|e| e.is_active()).count();
         entries.extend(unnamed);
-        self.index.lock().await.rebuild_domain(&domain, entries)?;
+        {
+            // the whole domain was built from the log as read here, so the cursor of the
+            // feed is at the last event read; a version logged after it is fed by its
+            // writer
+            let mut ix = self.index.lock().await;
+            ix.rebuild_domain(&domain, entries)?;
+            ix.set_fed(&domain, events.last().map_or(0, |e| e.seq))?;
+        }
         out.ledger_events = self.ledger.lock().await.rebuild().await?;
         // the policy is compiled from the index, which this changed
         self.reload_policy().await?;
@@ -2019,5 +2235,460 @@ mod tests {
             [&sent, &copied]
         );
         assert!(state(&events).is_empty());
+    }
+
+    /// An entry as a text editor would write it into the record.
+    fn by_hand(id: &str, body: &str) -> Entry {
+        Entry::parse(&format!(
+            "---\nid: {id}\ntype: fact\ndomain: dom-me\nauthor: human:test:me\n\
+             created: 2026-10-01T09:00:00Z\ntrust_tier: raw\nclassification: internal\n---\n{body}"
+        ))
+        .unwrap()
+    }
+
+    /// What a writer leaves that stopped between the log and the index: the `put` of a
+    /// version in the log of `dom-me`, and the version in the record. Returns the
+    /// sequence number of the event.
+    async fn put_without_feed(m: &Memory, id: &str, body: &str) -> u64 {
+        let e = by_hand(id, body);
+        let put = Change::Put {
+            id: id.into(),
+            digest: dm_core::digest(&e.render()),
+            active: true,
+        };
+        let seq = append(m.root(), "dom-me", "human:test:me", put)
+            .unwrap()
+            .seq;
+        m.store.put(&e).await.unwrap();
+        seq
+    }
+
+    /// Where the cursor of the feed stands for `dom-me`.
+    async fn cursor(m: &Memory) -> u64 {
+        m.index.lock().await.fed("dom-me").unwrap()
+    }
+
+    /// The entries a search for `word` gives the owner.
+    async fn found(m: &Memory, word: &str) -> Vec<String> {
+        let hits = m.search(word, None, 10).await.unwrap();
+        hits.into_iter().map(|h| h.id).collect()
+    }
+
+    #[tokio::test]
+    async fn a_write_is_searchable_when_it_returns_and_the_cursor_is_at_its_last_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let a = m
+            .write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(cursor(&m).await, last(dir.path()));
+        assert_eq!(found(&m, "8080").await, std::slice::from_ref(&a));
+        // a write that replaces an entry: the feed takes both versions from the record
+        let b = m
+            .write(WriteRequest {
+                supersedes: Some(a.clone()),
+                ..req("# Port\n\nIt listens on 8081.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        let at = last(dir.path());
+        assert_eq!(cursor(&m).await, at);
+        let fresh = m.freshness(None).unwrap();
+        assert_eq!(
+            (
+                fresh.unfed,
+                fresh.fed_seq,
+                fresh.log_seq,
+                fresh.within_bound
+            ),
+            (0, at, at, true)
+        );
+        assert_eq!(found(&m, "8081").await, [b]);
+        assert!(found(&m, "8080").await.is_empty(), "the replaced one");
+    }
+
+    #[tokio::test]
+    async fn a_put_the_index_does_not_hold_is_indexed_by_the_next_feed_and_by_the_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        m.write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap();
+        let at = cursor(&m).await;
+        let seq = put_without_feed(&m, "mem-me-early001", "Left before the feed.\n").await;
+        assert_eq!(seq, at + 1);
+        assert!(found(&m, "Left").await.is_empty(), "the index is behind");
+        let fed = m.feed(None).await.unwrap();
+        assert_eq!(
+            fed,
+            Fed {
+                domain: "dom-me".into(),
+                from: at + 1,
+                to: seq,
+                applied: 1
+            }
+        );
+        assert_eq!(cursor(&m).await, seq);
+        assert_eq!(found(&m, "Left").await, ["mem-me-early001"]);
+        // a feed run twice applies nothing the second time
+        let to = last(dir.path());
+        m.feed(None).await.unwrap();
+        let again = m.feed(None).await.unwrap();
+        assert_eq!((again.applied, again.from, again.to), (0, to + 1, to));
+        assert_eq!(cursor(&m).await, to);
+        // and the next write of another entry takes what waits
+        put_without_feed(&m, "mem-me-early002", "Stranded before the write.\n").await;
+        m.write(req("# Other\n\nAnother entry.\n")).await.unwrap();
+        assert_eq!(found(&m, "Stranded").await, ["mem-me-early002"]);
+        // the feed is for the security role
+        let stranger = agent(dir.path(), "agent:x");
+        assert!(matches!(stranger.feed(None).await, Err(Error::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn a_feed_applies_an_erasure_the_body_leaves_search_and_the_stub_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let id = m
+            .write(req("# Key\n\nThe deploy key is on the wiki page.\n"))
+            .await
+            .unwrap()
+            .id;
+        // put again and then erased, in the log and in the record, by a writer that
+        // stopped before the index: the span names the entry twice
+        let entry = m.store.get("dom-me", &id).await.unwrap().unwrap();
+        let stub = dm_core::erasure::stub(&entry, dm_core::erasure::Reason::Mistaken);
+        let again = Change::Put {
+            id: id.clone(),
+            digest: dm_core::digest(&entry.render()),
+            active: true,
+        };
+        append(dir.path(), "dom-me", "human:test:me", again).unwrap();
+        m.log_erased("dom-me", &id).unwrap();
+        m.store.erase("dom-me", &id, &stub).await.unwrap();
+        assert_eq!(
+            found(&m, "wiki").await,
+            std::slice::from_ref(&id),
+            "the index is behind"
+        );
+        let fed = m.feed(None).await.unwrap();
+        assert_eq!(fed.applied, 1, "each entry once");
+        assert!(found(&m, "wiki").await.is_empty(), "the body left search");
+        let mut wide = dm_core::ReadFilter::any_domain(Label::Restricted);
+        wide.include_inactive = true;
+        let row = m.index.lock().await.meta(&id, &wide).unwrap().unwrap();
+        assert_eq!(row.status, Some(dm_core::Status::Erased), "the stub stays");
+        assert_eq!(
+            (row.hit.title.as_str(), row.hit.summary.as_str()),
+            (id.as_str(), "")
+        );
+        assert!(matches!(m.get(&id).await, Err(Error::Gone(why)) if why.contains("erased")));
+    }
+
+    #[tokio::test]
+    async fn an_entry_the_log_names_and_the_record_does_not_hold_leaves_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let ghost = by_hand("mem-me-ghost001", "Nowhere in the record.\n");
+        m.index.lock().await.upsert(&ghost).unwrap();
+        let put = Change::Put {
+            id: ghost.front.id.clone(),
+            digest: "d".into(),
+            active: true,
+        };
+        append(dir.path(), "dom-me", "human:test:me", put).unwrap();
+        // a line that names no entry the record can hold does not stop the feed
+        let bad = Change::Put {
+            id: "../outside".into(),
+            digest: "d".into(),
+            active: true,
+        };
+        append(dir.path(), "dom-me", "human:test:me", bad).unwrap();
+        // nor does a file of the record that is not an entry
+        let torn = Change::Put {
+            id: "mem-me-torn0001".into(),
+            digest: "d".into(),
+            active: true,
+        };
+        append(dir.path(), "dom-me", "human:test:me", torn).unwrap();
+        let file = dir.path().join("record/dom-me/mem-me-torn0001.md");
+        std::fs::write(file, "not an entry\n").unwrap();
+        let seq = put_without_feed(&m, "mem-me-early001", "Held by the record.\n").await;
+        let fed = m.feed(None).await.unwrap();
+        assert_eq!((fed.applied, fed.to), (4, seq));
+        assert!(found(&m, "Nowhere").await.is_empty());
+        assert_eq!(found(&m, "Held").await, ["mem-me-early001"]);
+    }
+
+    #[tokio::test]
+    async fn a_writer_whose_event_another_feed_passed_still_indexes_its_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        // the writer's put is in the log, and the record has not taken the version
+        let e = by_hand("mem-me-slow0001", "Taken late by the record.\n");
+        let put = Change::Put {
+            id: e.front.id.clone(),
+            digest: dm_core::digest(&e.render()),
+            active: true,
+        };
+        let seq = append(dir.path(), "dom-me", "human:test:me", put)
+            .unwrap()
+            .seq;
+        // another feed passes the event
+        assert_eq!(m.feed(None).await.unwrap().to, seq);
+        assert_eq!(cursor(&m).await, seq);
+        // the record takes the version, and the writer feeds from its own event
+        m.store.put(&e).await.unwrap();
+        let fed = m.feed_from("dom-me", seq).await.unwrap();
+        assert_eq!((fed.from, fed.to, fed.applied), (seq, seq, 1));
+        assert_eq!(found(&m, "late").await, ["mem-me-slow0001"]);
+    }
+
+    /// An event of `kind` at sequence number `seq`, `age` seconds before `now`.
+    fn aged(seq: u64, kind: &str, age: i64, now: time::OffsetDateTime) -> Event {
+        let at = (now - time::Duration::seconds(age))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let change = match kind {
+            "put" => Change::Put {
+                id: format!("mem-me-{seq}"),
+                digest: "d".into(),
+                active: true,
+            },
+            "erased" => Change::Erased {
+                id: format!("mem-me-{seq}"),
+            },
+            _ => Change::Read {
+                ids: vec![format!("mem-me-{seq}")],
+            },
+        };
+        Event {
+            seq,
+            at,
+            by: "human:test:me".into(),
+            session: None,
+            label: None,
+            quarantined: false,
+            change,
+        }
+    }
+
+    #[test]
+    fn freshness_counts_the_unfed_versions_and_gives_the_age_of_the_oldest() {
+        let now = time::macros::datetime!(2026-11-15 12:00 UTC);
+        let nothing = measure("dom-me", 4, &[], now);
+        assert_eq!(
+            nothing,
+            Freshness {
+                domain: "dom-me".into(),
+                log_seq: 4,
+                fed_seq: 4,
+                unfed: 0,
+                oldest_unfed_seconds: None,
+                bound_seconds: 60,
+                within_bound: true,
+            }
+        );
+        // a read does not count, however old; a put and an erasure do
+        let mut unread = vec![
+            aged(5, "put", 10, now),
+            aged(6, "read", 5000, now),
+            aged(7, "erased", 60, now),
+        ];
+        let at_the_bound = measure("dom-me", 4, &unread, now);
+        assert_eq!(
+            (
+                at_the_bound.unfed,
+                at_the_bound.oldest_unfed_seconds,
+                at_the_bound.log_seq,
+                at_the_bound.within_bound
+            ),
+            (2, Some(60), 7, true)
+        );
+        // a put older than the bound is out of bound
+        unread.push(aged(8, "put", 61, now));
+        let over = measure("dom-me", 4, &unread, now);
+        assert_eq!(
+            (over.unfed, over.oldest_unfed_seconds, over.within_bound),
+            (3, Some(61), false)
+        );
+        // an unfed version whose time does not read is not within the bound
+        let mut unreadable = aged(5, "put", 0, now);
+        unreadable.at = "not a time".into();
+        let unknown = measure("dom-me", 4, &[unreadable, aged(6, "put", 3, now)], now);
+        assert_eq!(
+            (
+                unknown.unfed,
+                unknown.oldest_unfed_seconds,
+                unknown.within_bound
+            ),
+            (2, Some(3), false)
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_of_a_domain_is_out_of_bound_while_an_old_put_waits_for_the_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        m.write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap();
+        let at = cursor(&m).await;
+        // two lines as a writer left them two weeks ago: a read, and a put not fed
+        let read = format!(
+            r#"{{"seq":{},"at":"2026-11-01T10:00:00Z","by":"agent:r","session":"sess-old","label":"internal","kind":"read","ids":["mem-me-early001"]}}"#,
+            at + 1
+        );
+        let put = format!(
+            r#"{{"seq":{},"at":"2026-11-01T10:00:01Z","by":"human:test:me","kind":"put","id":"mem-me-early001","digest":"d1","active":true}}"#,
+            at + 2
+        );
+        let log = dir.path().join(DIR).join("dom-me.jsonl");
+        let mut text = std::fs::read_to_string(&log).unwrap();
+        text.push_str(&format!("{read}\n{put}\n"));
+        std::fs::write(&log, text).unwrap();
+        std::fs::write(
+            dir.path().join(DIR).join("dom-me.seq"),
+            (at + 2).to_string(),
+        )
+        .unwrap();
+        let behind = m.freshness(None).unwrap();
+        assert_eq!(
+            (behind.fed_seq, behind.log_seq, behind.unfed),
+            (at, at + 2, 1),
+            "the read does not count"
+        );
+        assert!(!behind.within_bound, "{behind:?}");
+        assert!(
+            behind.oldest_unfed_seconds > Some(FRESHNESS_BOUND.whole_seconds()),
+            "{behind:?}"
+        );
+        m.feed(None).await.unwrap();
+        let fed = m.freshness(None).unwrap();
+        assert_eq!(
+            (
+                fed.fed_seq,
+                fed.unfed,
+                fed.oldest_unfed_seconds,
+                fed.within_bound
+            ),
+            (at + 2, 0, None, true)
+        );
+        let stranger = agent(dir.path(), "agent:x");
+        assert!(matches!(stranger.freshness(None), Err(Error::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_leaves_the_cursor_at_the_last_event_of_the_log() {
+        // the materializer
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        put_without_feed(&m, "mem-me-early001", "First by hand.\n").await;
+        let seq = put_without_feed(&m, "mem-me-early002", "Second by hand.\n").await;
+        assert_eq!((cursor(&m).await, m.freshness(None).unwrap().unfed), (0, 2));
+        m.materialize(None).await.unwrap();
+        assert_eq!(
+            (cursor(&m).await, m.freshness(None).unwrap().unfed),
+            (seq, 0)
+        );
+        assert_eq!(found(&m, "Second").await, ["mem-me-early002"]);
+        // and a reindex from the record
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let seq = put_without_feed(&m, "mem-me-early001", "First by hand.\n").await;
+        m.reindex().await.unwrap();
+        assert_eq!(
+            (cursor(&m).await, m.freshness(None).unwrap().unfed),
+            (seq, 0)
+        );
+        assert_eq!(found(&m, "First").await, ["mem-me-early001"]);
+    }
+
+    #[tokio::test]
+    async fn each_logged_change_of_an_entry_reaches_the_index_through_the_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let mut wide = dm_core::ReadFilter::any_domain(Label::Restricted);
+        wide.include_inactive = true;
+        // a promotion
+        let id = owner
+            .write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap()
+            .id;
+        owner
+            .promote(&id, dm_core::TrustTier::Curated, "checked")
+            .await
+            .unwrap();
+        assert_eq!(cursor(&owner).await, last(dir.path()));
+        let row = owner.index.lock().await.meta(&id, &wide).unwrap().unwrap();
+        assert_eq!(row.hit.trust_tier, dm_core::TrustTier::Curated);
+        // a release from quarantine
+        let rogue = agent(dir.path(), "agent:rogue");
+        rogue.write(req(POISON)).await.unwrap_err();
+        let held = owner.quarantined().unwrap().remove(0).front.id;
+        owner.release_quarantined(&held, true).await.unwrap();
+        assert_eq!(cursor(&owner).await, last(dir.path()));
+        assert!(owner
+            .index
+            .lock()
+            .await
+            .meta(&held, &wide)
+            .unwrap()
+            .is_some());
+        // an erasure: the stub, and the cursor at the last event
+        owner
+            .erase(&id, dm_core::erasure::Reason::Mistaken)
+            .await
+            .unwrap();
+        assert_eq!(cursor(&owner).await, last(dir.path()));
+        let row = owner.index.lock().await.meta(&id, &wide).unwrap().unwrap();
+        assert_eq!(row.status, Some(dm_core::Status::Erased));
+    }
+
+    #[tokio::test]
+    async fn an_erasure_of_a_stub_the_log_does_not_name_leaves_the_stub_in_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        // from before the log was kept: the index holds the text, the record the stub
+        let live = by_hand("mem-me-early001", "Left before the log.\n");
+        m.index.lock().await.upsert(&live).unwrap();
+        let stub = dm_core::erasure::stub(&live, dm_core::erasure::Reason::Mistaken);
+        m.store.put(&stub).await.unwrap();
+        assert_eq!(found(&m, "Left").await, ["mem-me-early001"]);
+        m.erase("mem-me-early001", dm_core::erasure::Reason::Mistaken)
+            .await
+            .unwrap();
+        assert!(found(&m, "Left").await.is_empty());
+        let mut wide = dm_core::ReadFilter::any_domain(Label::Restricted);
+        wide.include_inactive = true;
+        let row = m.index.lock().await.meta("mem-me-early001", &wide).unwrap();
+        assert_eq!(row.unwrap().status, Some(dm_core::Status::Erased));
+    }
+
+    #[tokio::test]
+    async fn an_import_leaves_the_cursor_at_its_last_event() {
+        let here = tempfile::tempdir().unwrap();
+        let owner = Memory::init(here.path(), "human:test:me", "dom-me").unwrap();
+        owner
+            .write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        owner
+            .export(None, Label::Internal, bundle.path())
+            .await
+            .unwrap();
+        let there = tempfile::tempdir().unwrap();
+        let other = Memory::init(there.path(), "human:test:me", "dom-me").unwrap();
+        let landed = other.import(bundle.path(), None).await.unwrap();
+        assert_eq!(landed.written.len(), 1, "{landed:?}");
+        // what the import logged is behind the cursor when it returns
+        assert_eq!(cursor(&other).await, last(there.path()));
+        assert_eq!(other.freshness(None).unwrap().unfed, 0);
+        assert_eq!(found(&other, "8080").await.len(), 1);
     }
 }

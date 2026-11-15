@@ -7,4 +7,4 @@ when = r["erased_at"][:19]
 print(f"  the receipt: {r['id']} erased by {r['erased_by']}, reason {r['reason']}, at {when}Z")
 for v in r["removed"]:
     print(f"    removed {v['version']}: digest {v['digest'][:16]}..., kept so a copy coming back is known")
-print(f"    entries flagged for review: {', '.join(r['flagged']) or 'none'}")
+print(f"    entries withheld until they are derived again: {', '.join(r.get('withheld', [])) or 'none'}")

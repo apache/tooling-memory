@@ -996,8 +996,8 @@ enum Command {
     /// Rebuild the index from the record and the ledger from its events.
     Reindex,
     /// Erase an entry: the body leaves every version and the index, a stub and a receipt
-    /// remain, and entries that cite it are flagged for review. Irreversible; the owner
-    /// only.
+    /// remain, and entries downstream of it are withheld from retrieval. Irreversible;
+    /// the owner only.
     Erase {
         id: String,
         /// Why, as a class: the receipt keeps it.

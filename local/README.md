@@ -901,7 +901,8 @@ They apply the same checks as to any read. `redirected_from` names what the read
 for, so the reader cites what it read. They follow again only if the current version was
 itself replaced in between, at most eight times.
 
-A demoted or erased entry answers `gone`, as a 410 would. An entry replaced by nothing
+A demoted or erased entry answers `gone`, as a 410 would. A withheld entry answers `gone`
+until a new entry replaces it, and then it redirects. An entry replaced by nothing
 that the reader may read also answers `gone`. The memory server gives either answer only
 about an entry that the reader could read. For any other entry, the answer stays "not
 found". Thus a redirect tells nothing that a search would not tell.
@@ -973,8 +974,8 @@ cycle runs it.
 Demotion, erasure and export of an entry also apply to its excerpts.
 
 `amem transcript erase <session> --reason ...` erases a transcript early. This is the
-owner's act. A stub and a receipt remain, and the command flags the entries that cite the
-transcript.
+owner's act. A stub and a receipt remain, and the command withholds the entries that cite
+the transcript. A withheld entry keeps its body in the record, and no read gives it.
 
 The handoff of a live Codex session cited `#1-3`. With the clock at zero, the sweep kept
 the cited turns as excerpts, and dropped the rest and the raw lines. The erasure of the

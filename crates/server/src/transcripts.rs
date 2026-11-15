@@ -842,7 +842,7 @@ impl Memory {
 
     /// Erase a transcript before its clock: its turns, the harness's lines and every
     /// excerpt of it leave the record; a stub, the header with no turns, and a receipt
-    /// remain; and the entries that cite it are flagged for review, as an erased
+    /// remain; and the entries that cite it are withheld from retrieval, as an erased
     /// entry's citers are. The owner's act, and only once.
     ///
     /// # Errors
@@ -880,7 +880,10 @@ impl Memory {
         t.excerpts.clear();
         self.put_transcript(&t, None).await?;
         self.remove_session_excerpts(session).await?;
-        receipt.flagged = self.flag_citers(session).await?;
+        let downstream = self.downstream(session).await?;
+        let near = crate::withhold::onto_receipt(&mut receipt, downstream);
+        self.put_transcript_receipt(&receipt).await?;
+        self.withhold(&near).await?;
         receipt.unresolved = vec![
             "the harness's own copy in its private home under the root's state".into(),
             "exports issued before the erasure".into(),
@@ -889,7 +892,7 @@ impl Memory {
         self.log_transcript(serde_json::json!({
             "at": rfc3339(receipt.erased_at), "action": "erase", "session": session,
             "domain": t.domain, "kept": "", "dropped": ranges(&(1..=t.turn_count).collect::<Vec<_>>()),
-            "flagged": receipt.flagged,
+            "withheld": receipt.withheld,
         }));
         Ok(receipt)
     }
@@ -936,6 +939,9 @@ impl Memory {
             reason,
             removed,
             flagged: Vec::new(),
+            withheld: Vec::new(),
+            further: Vec::new(),
+            sends: Vec::new(),
             unresolved: vec![erasure::UNFINISHED.into()],
             promotion_whys_removed: 0,
             promotion_tasks_cleared: 0,
@@ -1811,7 +1817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_erasure_leaves_a_stub_and_a_receipt_and_flags_the_citers() {
+    async fn early_erasure_leaves_a_stub_and_a_receipt_and_withholds_the_citers() {
         let dir = tempfile::tempdir().unwrap();
         let m = mem(dir.path());
         let k = m.keep_transcript(keep("a.jsonl")).await.unwrap();
@@ -1827,7 +1833,7 @@ mod tests {
             .unwrap();
         assert!(r.is_finished());
         assert_eq!(r.id, k.session);
-        assert_eq!(r.flagged, vec![h.clone()]);
+        assert_eq!(r.withheld, vec![h.clone()]);
         let versions: Vec<&str> = r.removed.iter().map(|v| v.version.as_str()).collect();
         assert_eq!(versions, vec!["transcript", "turns"]);
         assert_eq!(m.transcript_erasure(&k.session).await.unwrap(), Some(r));
@@ -1842,15 +1848,26 @@ mod tests {
             m.transcript_turn(&k.session, 2).await,
             Err(Error::NotFound(_))
         ));
-        let flagged = m.get(&h).await.unwrap();
-        assert_eq!(
-            flagged.front.review_by,
-            Some(OffsetDateTime::now_utc().date())
+        assert!(
+            matches!(m.get(&h).await, Err(Error::Gone(ref why)) if why.contains("withheld")),
+            "the entry that cites it is withheld"
         );
-        assert_ne!(
-            flagged.front.status,
-            Some(Status::Erased),
-            "flagged, not erased"
+        assert!(
+            m.search("cache", None, 10).await.unwrap().is_empty(),
+            "and no search gives it"
+        );
+        let kept = m.store.get("dom-me", &h).await.unwrap().unwrap();
+        assert_eq!(kept.front.status, Some(Status::Withheld));
+        assert!(
+            kept.body.contains("the cache helps"),
+            "withheld, not erased"
+        );
+        assert_eq!(
+            m.withheld(None).await.unwrap(),
+            [crate::withhold::Withheld {
+                id: h.clone(),
+                because: Some(k.session.clone()),
+            }]
         );
         assert!(matches!(
             m.erase_transcript(&k.session, Reason::Sensitive).await,

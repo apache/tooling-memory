@@ -160,6 +160,10 @@ pub enum Status {
     Superseded,
     /// Erased: the body is gone everywhere, only this stub remains.
     Erased,
+    /// Withheld: an entry it may have been made from was erased. The body stays in the
+    /// record and retrieval does not serve it, until the entry is derived again as a new
+    /// one that names it in `supersedes`, released by the owner, or erased in turn.
+    Withheld,
 }
 
 /// The frontmatter every entry carries. Field names are the contract.
@@ -407,7 +411,7 @@ impl Entry {
         clip(&para, 200)
     }
 
-    /// Whether the entry is live, as opposed to demoted, superseded, or erased.
+    /// Whether the entry is live, as opposed to demoted, superseded, erased, or withheld.
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.front.status.is_none()
@@ -656,6 +660,18 @@ mod tests {
         e.front.status = Some(Status::Demoted);
         let back = Entry::parse(&e.render()).unwrap();
         assert_eq!(back.front.status, Some(Status::Demoted));
+        assert!(!back.is_active());
+    }
+
+    #[test]
+    fn a_withheld_entry_says_so_on_disk_keeps_its_body_and_is_not_active() {
+        let mut e = sample();
+        e.front.status = Some(Status::Withheld);
+        let text = e.render();
+        assert!(text.contains("\nstatus: withheld\n"), "{text}");
+        let back = Entry::parse(&text).unwrap();
+        assert_eq!(back, e, "the body and every field stay");
+        assert!(back.body.contains("exponential backoff"));
         assert!(!back.is_active());
     }
 
