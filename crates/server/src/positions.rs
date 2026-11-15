@@ -761,6 +761,18 @@ impl Memory {
         Ok(found.pop())
     }
 
+    /// The session has read the entry of `position`: its label rises to the entry's
+    /// classification, and the log of the position's domain takes a read event that
+    /// names the entry, so lineage follows what the session writes after.
+    ///
+    /// # Errors
+    ///
+    /// The event could not be appended.
+    fn read_position(&self, position: &Position) -> Result<(), Error> {
+        self.observe_entry(&position.domain, &position.entry, position.classification)?;
+        Ok(())
+    }
+
     /// The position named `name` that takes a session or a pin: in force, active, and
     /// one this session may read. A position the session may not read is refused in
     /// the same words as one that does not exist.
@@ -797,7 +809,7 @@ impl Memory {
             return Err(Error::Denied(why));
         }
         let seconded = agent_definition(&self.author) != Some(position.charter.agent.as_str());
-        lock(&self.session).observe(position.classification);
+        self.read_position(&position)?;
         let seated = Seated { position, seconded };
         let filled = seated.filled();
         *lock(&self.seat) = Some(seated);
@@ -900,7 +912,7 @@ impl Memory {
             )),
         };
         let position = self.position_in_force(&name, Some(&spec.domain)).await?;
-        lock(&self.session).observe(position.classification);
+        self.read_position(&position)?;
         spec.classification = spec.classification.max(position.classification);
         Ok(())
     }
@@ -1071,7 +1083,7 @@ impl Memory {
                 out.push(h);
             }
         }
-        self.observe(&out);
+        self.observe(&out)?;
         Ok(out)
     }
 
@@ -1093,7 +1105,7 @@ impl Memory {
             return Ok(String::new());
         };
         let name = &seat.position.name;
-        lock(&self.session).observe(seat.position.classification);
+        self.read_position(&seat.position)?;
         let commitments = self.commitments(domain, name).await?;
         let handoffs = self.handoff_cache(domain, name).await?;
         Ok(slice(&seat, &commitments, &handoffs))
@@ -1112,7 +1124,7 @@ impl Memory {
         let Some(position) = self.readable_position(name, domain).await? else {
             return Err(Error::NotFound(format!("position {name}")));
         };
-        lock(&self.session).observe(position.classification);
+        self.read_position(&position)?;
         let commitments = self.commitments(&position.domain, name).await?;
         let cache = self.handoff_cache(&position.domain, name).await?;
         self.reads.hits("position", Some(name), &cache);
@@ -1403,7 +1415,7 @@ impl Memory {
         }
         rows.sort_by_key(|(created, _, _)| Reverse(*created));
         let hits: Vec<Hit> = rows.iter().map(|(_, hit, _)| hit.clone()).collect();
-        self.observe(&hits);
+        self.observe(&hits)?;
         self.reads.hits("positions", None, &hits);
         Ok(rows.into_iter().map(|(_, _, row)| row).collect())
     }
@@ -3142,5 +3154,62 @@ mod tests {
         assert_eq!(owner.seat(), None, "no position is there to fill");
         let rows = owner.positions(None).await.unwrap();
         assert_eq!(rows[0].state, Standing::Retired);
+    }
+
+    /// The sequence number of the last event in the log of `dom-me`.
+    fn log_end(m: &Memory) -> u64 {
+        let events = crate::log::read(m.root(), ME, 0).unwrap();
+        events.last().map_or(0, |e| e.seq)
+    }
+
+    /// The entries that the read events of `m`'s session name in the log of `dom-me`,
+    /// after sequence number `after`, in the log's order.
+    fn read_in_log(m: &Memory, after: u64) -> Vec<String> {
+        let events = crate::log::read(m.root(), ME, after + 1).unwrap();
+        let own = events
+            .into_iter()
+            .filter(|e| e.session.as_deref() == Some(m.session_id.as_str()));
+        own.filter_map(|e| match e.change {
+            crate::log::Change::Read { ids } => Some(ids),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn each_read_of_a_position_is_a_read_event_in_the_log_of_its_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let entry = in_force(&owner, &release()).await;
+        // a session that fills the position has read its entry
+        let seated = session(dir.path(), "codex");
+        let before = log_end(&seated);
+        seated.fill_position(RELEASE, Some(ME)).await.unwrap();
+        assert_eq!(read_in_log(&seated, before), [entry.as_str()], "fill");
+        let said = write(&seated, handoff("The tag is not cut yet.\n")).await;
+        assert_eq!(cites_of(&owner, &said).await, [RELEASE]);
+        // its T0 gives the position first: the entry and the handoff cache
+        let before = log_end(&seated);
+        seated.t0(Some(ME)).await.unwrap();
+        let read = read_in_log(&seated, before);
+        assert!(read.contains(&entry), "T0 gives the position: {read:?}");
+        assert!(read.contains(&said), "T0 gives the cache: {read:?}");
+        // a session in no position that looks at it: the entry, then the cache
+        let reader = session(dir.path(), "claude");
+        let before = log_end(&reader);
+        reader.position(RELEASE, Some(ME)).await.unwrap();
+        assert_eq!(
+            read_in_log(&reader, before),
+            [entry.as_str(), said.as_str()]
+        );
+        // a listing reads each entry listed
+        let before = log_end(&reader);
+        reader.positions(Some(ME)).await.unwrap();
+        assert_eq!(read_in_log(&reader, before), [entry.as_str()], "list");
+        // a pin reads the entry of the position it names
+        let before = log_end(&owner);
+        owner.create_task(pinned("Cut 1.2")).await.unwrap();
+        assert_eq!(read_in_log(&owner, before), [entry.as_str()], "pin");
     }
 }

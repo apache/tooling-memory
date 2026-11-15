@@ -2180,16 +2180,25 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let t = owner.taint(&poison);
+        let forward = owner
+            .lineage(&poison, dm_server::lineage::Direction::Forward, Some(1))
+            .await
+            .unwrap();
         assert_eq!(
-            t.readers.len(),
+            forward.sessions.len(),
             1,
             "the board reads as one session: {:?}",
-            t.readers
+            forward.sessions
         );
+        let written: Vec<&str> = forward
+            .entries
+            .iter()
+            .filter(|e| e.informed)
+            .map(|e| e.id.as_str())
+            .collect();
         assert_eq!(
-            t.written,
-            vec![handoff],
+            written,
+            [handoff.as_str()],
             "the handoff the board wrote after reading the entry follows from the read"
         );
     }

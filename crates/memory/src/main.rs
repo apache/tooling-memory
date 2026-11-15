@@ -611,9 +611,25 @@ enum Command {
         #[command(subcommand)]
         op: QuarantineOp,
     },
-    /// What an entry may have reached: the sessions that read it and the entries they
-    /// wrote after; where to look when an entry turns out to be poison.
-    Taint { id: String },
+    /// The lineage of an entry, from the event logs: what was written and sent after a
+    /// session read it, and what cites it; with --back, what it was made from. Where to
+    /// look when an entry turns out to be poison. For the owner and the security role.
+    Lineage {
+        /// An entry id, or with --back `<domain>@<seq>` for a send event.
+        of: String,
+        /// Follow the edges back: what the entry or the send may have been made from.
+        #[arg(long)]
+        back: bool,
+        /// The most steps to follow. Without it, until a step reaches nothing new.
+        #[arg(long)]
+        depth: Option<u32>,
+    },
+    /// The entries an erasure withheld, which no read serves until each is derived
+    /// again, released or erased: list them, or release one.
+    Withheld {
+        #[command(subcommand)]
+        op: eventlog::WithheldOp,
+    },
     /// Promote an entry's trust tier. To curated at once, by anyone but its author; to
     /// verified by proposal only, a task a person who did not propose it approves.
     Promote {
@@ -948,8 +964,9 @@ enum Command {
         #[command(subcommand)]
         op: gofannon::GofannonOp,
     },
-    /// The event log of a domain, the order of record of its entries, and the
-    /// materializer that builds the index from it.
+    /// The event log of a domain, the order of record of its entries; the feed of the
+    /// index from it, measured against the published bound; and the materializer that
+    /// builds the index from it.
     Log {
         #[command(subcommand)]
         op: eventlog::LogOp,
@@ -1019,8 +1036,8 @@ enum Command {
     /// Rebuild the index from the record and the ledger from its events.
     Reindex,
     /// Erase an entry: the body leaves every version and the index, a stub and a receipt
-    /// remain, and entries that cite it are flagged for review. Irreversible; the owner
-    /// only.
+    /// remain, and entries downstream of it are withheld from retrieval. Irreversible;
+    /// the owner only.
     Erase {
         id: String,
         /// Why, as a class: the receipt keeps it.
@@ -1164,36 +1181,56 @@ enum CanaryOp {
     },
 }
 
+// What `task create` takes. Boxed in `TaskOp`: it is several times the size of any other
+// task command.
+#[derive(clap::Args)]
+struct NewTask {
+    title: String,
+    #[arg(long, default_value = "")]
+    body: String,
+    #[arg(long)]
+    domain: Option<String>,
+    #[arg(long = "require")]
+    requirements: Vec<String>,
+    #[arg(long = "after")]
+    depends_on: Vec<String>,
+    #[arg(long, default_value_t = 0)]
+    priority: i64,
+    /// The task definition this kind of work runs under, by name.
+    #[arg(long)]
+    definition: Option<String>,
+    /// A check that says this task is done; repeat for more. Without one, the task
+    /// takes those of its definition.
+    #[arg(long = "accept")]
+    acceptance: Vec<String>,
+    /// The task this one is split from.
+    #[arg(long)]
+    parent: Option<String>,
+    /// A decision this task carries out, as an entry id; repeat for more.
+    #[arg(long = "implements")]
+    implements: Vec<String>,
+    /// Whether what the task does can be undone: `reversible` or `irreversible`.
+    #[arg(long)]
+    reversibility: Option<dm_ledger::Reversibility>,
+    /// An owned path the task changes, as a glob; repeat for more.
+    #[arg(long = "touches")]
+    artifacts_touched: Vec<String>,
+    /// What triage scored it: `value,urgency,effort`, three whole numbers.
+    #[arg(long)]
+    scores: Option<String>,
+    /// Pin the task to this position, `pos-<name>`: only a session that fills the
+    /// position claims it. Give --pin-reason with it.
+    #[arg(long)]
+    position: Option<String>,
+    /// Why the task is pinned: continuity, relationship or separation.
+    #[arg(long)]
+    pin_reason: Option<dm_ledger::PinReason>,
+}
+
 #[derive(Subcommand)]
 enum TaskOp {
     /// File a task. It is born proposed.
-    Create {
-        title: String,
-        #[arg(long, default_value = "")]
-        body: String,
-        #[arg(long)]
-        domain: Option<String>,
-        #[arg(long = "require")]
-        requirements: Vec<String>,
-        #[arg(long = "after")]
-        depends_on: Vec<String>,
-        #[arg(long, default_value_t = 0)]
-        priority: i64,
-        /// The task definition this kind of work runs under, by name.
-        #[arg(long)]
-        definition: Option<String>,
-        /// A check that says this task is done; repeat for more. Without one, the task
-        /// takes those of its definition.
-        #[arg(long = "accept")]
-        acceptance: Vec<String>,
-        /// Pin the task to this position, `pos-<name>`: only a session that fills the
-        /// position claims it. Give --pin-reason with it.
-        #[arg(long)]
-        position: Option<String>,
-        /// Why the task is pinned: continuity, relationship or separation.
-        #[arg(long)]
-        pin_reason: Option<dm_ledger::PinReason>,
-    },
+    Create(Box<NewTask>),
     /// Admit a proposed task.
     Admit { id: String },
     /// Tasks with a status.
@@ -1235,6 +1272,44 @@ enum TaskOp {
         generation: u64,
         #[arg(long)]
         handoff: Option<String>,
+    },
+    /// Give a held task up until an outside event comes. Nobody may claim it until
+    /// `task arrived` names the event.
+    Wait {
+        id: String,
+        /// The name of the event, one token.
+        on: String,
+        /// The generation of the claim.
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        handoff: Option<String>,
+    },
+    /// Report that an outside event came: the tasks that waited on it are open again.
+    /// A tap or a person reports it, not an agent.
+    Arrived {
+        event: String,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Record an external action before it is made. Until it is settled, the task
+    /// goes to nobody else, whatever its lease says.
+    EffectBegin {
+        id: String,
+        /// A stable id for the action, one token; a retry names the same id.
+        action: String,
+        /// The generation of the claim.
+        #[arg(long)]
+        generation: u64,
+    },
+    /// Record what became of an external action: `applied` or `not_applied`. The
+    /// holder names the generation of its claim; a person who reconciles names none.
+    EffectSettle {
+        id: String,
+        action: String,
+        outcome: dm_ledger::Outcome,
+        #[arg(long)]
+        generation: Option<u64>,
     },
     /// Leave a handoff on a task after the claim of that generation is over.
     LateHandoff {
@@ -1589,6 +1664,10 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Transcript { op } => transcripts::cmd(&Memory::open(&root)?, op).await,
         Command::Reenact { op } => reenact::cmd(&root, op).await,
         Command::Log { op } => eventlog::cmd(&Memory::open(&root)?, op).await,
+        Command::Lineage { of, back, depth } => {
+            eventlog::lineage(&Memory::open(&root)?, &of, back, depth).await
+        }
+        Command::Withheld { op } => eventlog::withheld(&Memory::open(&root)?, op).await,
         Command::Gofannon { op } => gofannon::cmd(&root, op).await,
         Command::Platform { op } => platform::cmd(&Memory::open(&root)?, op).await,
         Command::Position { op } => positions::cmd(&Memory::open(&root)?, op).await,
@@ -4653,7 +4732,7 @@ async fn check_cmd(
     }))
 }
 
-/// `amem policy`, `amem quarantine`, `amem taint`, `amem canary`, `amem erase` and
+/// `amem policy`, `amem quarantine`, `amem canary`, `amem erase` and
 /// `amem reindex`: the perimeter's commands and the record's repair.
 async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
     match command {
@@ -4717,7 +4796,6 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         Command::Quarantine {
             op: QuarantineOp::Drop { id },
         } => json(&m.release_quarantined(&id, false).await?),
-        Command::Taint { id } => json(&m.taint(&id)),
         Command::Promote { id, to, why } => json(&m.promote(&id, to.parse()?, &why).await?),
         Command::Approve { task } => json(&m.approve(&task).await?),
         Command::Promotions { id } => json(&m.promotions(&id).await?),
@@ -4901,8 +4979,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Promotions { .. }
         | Command::Reindex
         | Command::Policy { .. }
-        | Command::Quarantine { .. }
-        | Command::Taint { .. }) => perimeter_cmd(m, cmd).await,
+        | Command::Quarantine { .. }) => perimeter_cmd(m, cmd).await,
         Command::Init { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
@@ -4929,6 +5006,8 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Transcript { .. }
         | Command::Reenact { .. }
         | Command::Log { .. }
+        | Command::Lineage { .. }
+        | Command::Withheld { .. }
         | Command::Gofannon { .. }
         | Command::Platform { .. }
         | Command::Position { .. }
@@ -4975,6 +5054,53 @@ async fn held_task(m: &Memory, op: TaskOp) -> Fallible {
     }
 }
 
+/// What holds a task back from a claim though nobody holds it, and what ends that.
+async fn holds_cmd(m: &Memory, op: TaskOp) -> Fallible {
+    match op {
+        TaskOp::Wait {
+            id,
+            on,
+            generation,
+            handoff,
+        } => json(
+            &m.wait_for(&id, Some(generation), &on, handoff.as_deref())
+                .await?,
+        ),
+        TaskOp::Arrived { event, domain } => {
+            json(&m.event_arrived(domain.as_deref(), &event).await?)
+        }
+        TaskOp::EffectBegin {
+            id,
+            action,
+            generation,
+        } => json(&m.effect_begun(&id, Some(generation), &action).await?),
+        TaskOp::EffectSettle {
+            id,
+            action,
+            outcome,
+            generation,
+        } => json(&m.effect_settled(&id, generation, &action, outcome).await?),
+        _ => Ok(()),
+    }
+}
+
+/// The `--scores value,urgency,effort` of `task create`.
+fn scores_of(text: &str) -> Result<dm_ledger::Scores, Box<dyn std::error::Error>> {
+    let parts: Vec<i64> = text
+        .split(',')
+        .map(|n| n.trim().parse::<i64>())
+        .collect::<Result<_, _>>()?;
+    let [value, urgency, effort] = parts[..] else {
+        return Err("scores are value,urgency,effort: three whole numbers".into());
+    };
+    Ok(dm_ledger::Scores {
+        value,
+        urgency,
+        effort,
+        unblocks: Vec::new(),
+    })
+}
+
 /// `amem task rescore` and `amem task stats`: the fabric's ranking and its telemetry.
 async fn fabric_cmd(m: &Memory, op: TaskOp) -> Fallible {
     match op {
@@ -4986,18 +5112,25 @@ async fn fabric_cmd(m: &Memory, op: TaskOp) -> Fallible {
 
 async fn task(m: &Memory, op: TaskOp) -> Fallible {
     match op {
-        TaskOp::Create {
-            title,
-            body,
-            domain,
-            requirements,
-            depends_on,
-            priority,
-            definition,
-            acceptance,
-            position,
-            pin_reason,
-        } => {
+        TaskOp::Create(new) => {
+            let NewTask {
+                title,
+                body,
+                domain,
+                requirements,
+                depends_on,
+                priority,
+                definition,
+                acceptance,
+                parent,
+                implements,
+                reversibility,
+                artifacts_touched,
+                scores,
+                position,
+                pin_reason,
+            } = *new;
+            let scores = scores.as_deref().map(scores_of).transpose()?;
             let c = m
                 .create_task(TaskSpec {
                     domain: domain.unwrap_or_default(),
@@ -5012,8 +5145,14 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
                     priority,
                     definition,
                     acceptance,
+                    parent,
+                    scores,
+                    implements,
+                    reversibility,
+                    artifacts_touched,
                     position,
                     pin_reason,
+                    ..TaskSpec::default()
                 })
                 .await?;
             json(&c.task)
@@ -5037,6 +5176,10 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         | TaskOp::Complete { .. }
         | TaskOp::Release { .. }
         | TaskOp::LateHandoff { .. }) => held_task(m, op).await,
+        op @ (TaskOp::Wait { .. }
+        | TaskOp::Arrived { .. }
+        | TaskOp::EffectBegin { .. }
+        | TaskOp::EffectSettle { .. }) => holds_cmd(m, op).await,
         TaskOp::Invalidate { id, reason } => json(&m.invalidate(&id, &reason, None).await?),
         TaskOp::Tree { id } => json(&m.task_tree(&id).await?),
         TaskOp::Retry { id } => json(&m.retry_task(&id).await?),

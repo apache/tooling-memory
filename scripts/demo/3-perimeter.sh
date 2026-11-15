@@ -1,7 +1,8 @@
 #!/bin/sh
 # Act 3: the perimeter. Shared memory is a channel to every later session, so a write
-# that speaks to agents is held for the owner; the auditor gives its verdict; taint follows
-# an entry's reach; policy is memory, enforced once a person verifies it, with an
+# that speaks to agents is held for the owner; the auditor gives its verdict; lineage,
+# read from the event log, goes back from a bad entry to what its session read and forward
+# to what was written after; policy is memory, enforced once a person verifies it, with an
 # exception scoped to one task; and the policy narrows what an agent reads, inside the
 # query.
 . "$(dirname "$0")/lib.sh"
@@ -22,10 +23,18 @@ fi
 echo "  the owner's queue, each held write with who wrote it and the auditor's verdict:"
 a quarantine list | j "'\n'.join(f\"  {e['id']}  {e['author']:<14} {(e['review'] or {}).get('verdict','unreviewed'):<10} {e['title']}\" for e in d)"
 
-say "Taint" "If an entry turns out to be bad: which sessions read it, and what they wrote afterwards that may carry it on. Erasure flags the same entries for review."
+say "Lineage" "The event log of the domain holds each write as it was offered, each read and each send. The write refused in 3.1 is in the log too: the owner and the security role read it, in a session that handles the highest label. When an entry is bad, the log says what its session read before the write, and what was written after a session read it."
+rogue=$(a quarantine list | j "max((e for e in d if e['author'].startswith('agent:rogue')), key=lambda e: e['created'])['id']")
+echo "  the write that the scan refused in 3.1, as the owner reads it in the log:"
+a log show --domain dom-demo | j "'\n'.join('  %6d  %-11s %-10s %s' % (e['seq'], e['kind'], e.get('label', ''), 'the write as it was offered, digest ' + e['digest'][:16] if e['kind'] == 'write' else 'refused by ' + e['gate'] + '; found: ' + ', '.join(e.get('findings', []))) for e in d if e.get('id') == '$rogue' and e['kind'] in ('write', 'quarantined'))"
+echo "  an agent outside the security role asks for the log:"
+agent agent:reader log '{"domain": "dom-demo"}' | cut -c1-160 | sed 's/^/  /' || true
 read_one=$(a list --kind decision --limit 3 | j "d[-1]['id']")
-agent agent:reader batch "[{\"tool\": \"get\", \"arguments\": {\"id\": \"$read_one\"}}, {\"tool\": \"write\", \"arguments\": {\"title\": \"Drawn from what I read\", \"body\": \"A conclusion drawn from the decision just read.\"}}]" >/dev/null
-a taint "$read_one" | j "f\"  {d['id']}: read by {len(d['readers'])} session(s), who wrote {d['written']} after reading it\""
+note=$(agent agent:reader batch "[{\"tool\": \"get\", \"arguments\": {\"id\": \"$read_one\"}}, {\"tool\": \"write\", \"arguments\": {\"title\": \"Drawn from what I read\", \"body\": \"A conclusion drawn from the decision just read.\"}}]" | j "d['id']")
+echo "  agent:reader read $read_one and wrote $note in one session. Suppose the note is bad:"
+a lineage "$note" --back | python3 "$here/scripts/demo/lineage.py"
+echo "  and suppose the entry that it read is bad. One step forward:"
+a lineage "$read_one" --depth 1 | python3 "$here/scripts/demo/lineage.py" "$note"
 
 say "Policy is memory" "A rule is an entry, with an owner, a review date and a Rego module. A rule written after an incident enters as advisory. It is in a decision only once a person verified it, and each step up is a version that a person verifies."
 rule_text() { cat <<POL

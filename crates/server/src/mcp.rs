@@ -5,6 +5,7 @@
 //! ledger operations, and a `memory://t0/<domain>` resource per granted domain. What it
 //! never gets is a path on disk, a credential, or an entry its grants do not admit.
 
+use crate::lineage::Direction;
 use crate::recall::{self, Budget, Depth};
 use crate::{tape, Error, Memory, WriteRequest};
 use dm_core::TrustTier;
@@ -199,6 +200,31 @@ pub struct GetParams {
     pub id: String,
 }
 
+/// Parameters of `lineage`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct LineageParams {
+    /// An entry id. With `back`, also `<domain>@<seq>`: a send event of that domain's log.
+    pub of: String,
+    /// true for what it may have been made from. Default false: what may have been made
+    /// from it, and where that went.
+    #[serde(default)]
+    pub back: Option<bool>,
+    /// The most steps to follow. Default: until a step reaches nothing new.
+    #[serde(default)]
+    pub depth: Option<u32>,
+}
+
+/// Parameters of `log`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct LogParams {
+    /// A granted domain; the only one when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// The first sequence number wanted. Default 0: the whole log.
+    #[serde(default)]
+    pub from: Option<u64>,
+}
+
 /// Parameters of `fetch`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct FetchParams {
@@ -347,6 +373,18 @@ pub struct CreateTaskParams {
     /// Checks that say this task is done, in place of its definition's.
     #[serde(default)]
     pub acceptance: Vec<String>,
+    /// The task this one is split from, when it is not the task you hold.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// The decisions this task carries out, as entry ids.
+    #[serde(default)]
+    pub implements: Vec<String>,
+    /// Whether what the task does can be undone: `reversible` or `irreversible`.
+    #[serde(default)]
+    pub reversibility: Option<String>,
+    /// The owned paths the task changes, as globs.
+    #[serde(default)]
+    pub artifacts_touched: Vec<String>,
     /// The position this task is pinned to, `pos-<name>`: only a session that fills
     /// the position claims the task. Give `pin_reason` with it.
     #[serde(default)]
@@ -354,6 +392,40 @@ pub struct CreateTaskParams {
     /// Why the task is pinned: continuity, relationship, or separation.
     #[serde(default)]
     pub pin_reason: Option<String>,
+}
+
+/// Parameters of `wait_for`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct WaitParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// The name of the outside event the task waits on, one token, as the tap that
+    /// reports it will name it.
+    pub on: String,
+    /// A handoff entry you wrote about what you did before waiting; the next claimant
+    /// starts from it. Optional.
+    #[serde(default)]
+    pub handoff: Option<String>,
+}
+
+/// Parameters of `effect_begun` and `effect_settled`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct EffectParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// A stable id for the external action, one token of at most 64 characters. A retry
+    /// of the action names the same id.
+    pub action: String,
+    /// For `effect_settled`: `applied` when the destination holds the effect,
+    /// `not_applied` when it does not.
+    #[serde(default)]
+    pub outcome: Option<String>,
 }
 
 /// Parameters of `position`.
@@ -618,6 +690,8 @@ const READS: &[&str] = &[
     "list_tasks",
     "position",
     "positions",
+    "lineage",
+    "log",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -751,7 +825,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Write an entry. It lands at raw trust under this session's author. Write a `handoff` when you stop so the next session continues from it, not from your transcript; write a `decision` with context, options, choice and rationale; write a `fact` with a review_by date."
+        description = "Write an entry. It lands at raw trust under this session's author. Write a `handoff` when you stop so the next session continues from it, not from your transcript; write a `decision` with context, options, choice and rationale; write a `fact` with a review_by date. An answer with `withheld` names something this session read that was erased since: the entry is kept, and no read gives it until the owner releases it."
     )]
     async fn write(&self, p: Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -775,11 +849,16 @@ impl McpServer {
             summary: p.summary,
         };
         let w = self.memory.write(req).await.map_err(mcp_err)?;
-        ok(json!({
+        let mut v = json!({
             "id": w.id,
             "domain": w.domain,
             "classification": w.classification.to_string(),
-        }))
+        });
+        // the entry landed withheld: this session read something that is erased now
+        if let Some(erased) = w.withheld {
+            v["withheld"] = json!(erased);
+        }
+        ok(v)
     }
 
     #[tool(
@@ -869,6 +948,39 @@ impl McpServer {
     }
 
     #[tool(
+        description = "For the owner and the security role; refused to any other author. The lineage of an entry, from the event log of each granted domain. Forward, the default: the entries and the sends that came after a session read it, and the entries that cite it. With `back`: the entries its session had read before it wrote the entry, and the entries it cites; `of` may then be `<domain>@<seq>`, a send event. Each entry comes with its `hops` and whether it was `informed` (a read came before the write), `cited`, or both. `complete` is false when the log could not say. Reading it raises your label as reading the log does."
+    )]
+    async fn lineage(&self, p: Parameters<LineageParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let direction = if p.back.unwrap_or(false) {
+            Direction::Back
+        } else {
+            Direction::Forward
+        };
+        let found = self
+            .memory
+            .lineage(&p.of, direction, p.depth)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!(found))
+    }
+
+    #[tool(
+        description = "For the owner and the security role; refused to any other author. The event log of a domain from sequence number `from`: each write offered, each version put, each write refused, each erasure, each read, each send and each event of the ledger, by id and digest and never a body, within what you may handle. `freshness` says how far the index is behind the log, against the published bound of 60 seconds. Reading it raises your label to the highest classification among the events served."
+    )]
+    async fn log(&self, p: Parameters<LogParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let domain = p.domain.as_deref();
+        let events = self
+            .memory
+            .log_synced(domain, p.from.unwrap_or(0))
+            .await
+            .map_err(mcp_err)?;
+        let freshness = self.memory.freshness(domain).map_err(mcp_err)?;
+        ok(json!({ "events": events, "freshness": freshness }))
+    }
+
+    #[tool(
         description = "Entries of one kind, newest first: the latest handoffs, the standing decisions. A keyed lookup, not a search."
     )]
     async fn list(&self, p: Parameters<ListParams>) -> Result<CallToolResult, McpError> {
@@ -930,8 +1042,13 @@ impl McpServer {
             priority: p.priority.unwrap_or(0),
             definition: p.definition,
             acceptance: p.acceptance,
+            parent: p.parent,
+            implements: p.implements,
+            reversibility: parse("reversibility", p.reversibility)?,
+            artifacts_touched: p.artifacts_touched,
             position: p.position,
             pin_reason: parse("pin_reason", p.pin_reason)?,
+            ..dm_ledger::TaskSpec::default()
         };
         let c = self.memory.create_task(spec).await.map_err(mcp_err)?;
         // what a task that stays proposed lacks goes back to whoever filed it
@@ -1051,6 +1168,50 @@ impl McpServer {
         let t = self
             .memory
             .release(&p.id, p.generation, p.handoff.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Give a held task up until an outside event comes: a check that runs, a reply, a change that has not landed. Do not wait in the session. The task is blocked, and nobody may claim it, until a tap or a person reports the event; then it is offered again. Pass the id of a handoff you wrote so the next claimant starts where you stopped."
+    )]
+    async fn wait_for(&self, p: Parameters<WaitParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .wait_for(&p.id, p.generation, &p.on, p.handoff.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Record that you are about to make an external action under your claim, before you make it. Until the action is settled, the task goes to nobody else, even when your lease runs out. A retry of the action names the same action id."
+    )]
+    async fn effect_begun(&self, p: Parameters<EffectParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .effect_begun(&p.id, p.generation, &p.action)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Record what became of an external action you began: `applied` when the destination holds the effect, `not_applied` when it does not. Only while your claim is in force. After that a person reconciles it: you cannot tell a lost answer from an action that was not made."
+    )]
+    async fn effect_settled(
+        &self,
+        p: Parameters<EffectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let outcome = parse::<dm_ledger::Outcome>("outcome", p.outcome)?
+            .ok_or_else(|| McpError::invalid_params("outcome: applied or not_applied", None))?;
+        let t = self
+            .memory
+            .effect_settled(&p.id, p.generation, &p.action, outcome)
             .await
             .map_err(mcp_err)?;
         ok(json!({ "task": t }))
@@ -1421,6 +1582,8 @@ mod tests {
             "position",
             "positions",
             "retire_position",
+            "lineage",
+            "log",
         ] {
             assert!(
                 names.contains(&expected),
@@ -1722,6 +1885,27 @@ mod tests {
             why,
             "the attempt key try-1 was used before, and that attempt is over"
         );
+    }
+
+    #[tokio::test]
+    async fn a_write_says_when_it_landed_withheld() {
+        let (dir, s) = server().await;
+        let owner = Memory::open(dir.path()).unwrap();
+        let note = crate::WriteRequest {
+            body: "Written in error.\n".into(),
+            ..crate::WriteRequest::default()
+        };
+        let gone = owner.write(note).await.unwrap().id;
+        let read = GetParams { id: gone.clone() };
+        s.get(Parameters(read)).await.unwrap();
+        let before = payload(&s.write(handoff("Stopped at step 1.\n")).await.unwrap());
+        assert!(before.get("withheld").is_none(), "{before}");
+        owner
+            .erase(&gone, dm_core::erasure::Reason::Mistaken)
+            .await
+            .unwrap();
+        let after = payload(&s.write(handoff("Stopped at step 2.\n")).await.unwrap());
+        assert_eq!(after["withheld"], json!(gone), "{after}");
     }
 
     #[test]
@@ -2318,5 +2502,153 @@ mod tests {
         );
         assert_eq!(claimed["task"]["id"], id, "{claimed}");
         assert!(claimed["task"].get("position").is_none(), "{claimed}");
+    }
+
+    /// A server over the record at `dir`, for a session of `author`.
+    fn server_of(dir: &std::path::Path, author: &str) -> McpServer {
+        let memory = Memory::open(dir).unwrap().with_author(author);
+        McpServer::new(Arc::new(memory))
+    }
+
+    /// Write `body` through the `write` tool of `s`: the id of the entry.
+    async fn write_note(s: &McpServer, body: &str) -> String {
+        let params = WriteParams {
+            body: body.into(),
+            ..WriteParams::default()
+        };
+        let w = payload(&s.write(Parameters(params)).await.unwrap());
+        w["id"].as_str().unwrap().to_string()
+    }
+
+    /// Read `id` through the `get` tool of a new session of `author`, and write `body`
+    /// in that session: the id of the entry it wrote.
+    async fn read_then_write(dir: &std::path::Path, author: &str, id: &str, body: &str) -> String {
+        let s = server_of(dir, author);
+        s.get(Parameters(GetParams { id: id.into() }))
+            .await
+            .unwrap();
+        write_note(&s, body).await
+    }
+
+    /// The ids of the entries in a lineage answer, in its order.
+    fn reached(answer: &Value) -> Vec<&str> {
+        let entries = answer["entries"].as_array().unwrap();
+        entries.iter().map(|e| e["id"].as_str().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_lineage_tool_gives_the_owner_s_server_the_same_answer_as_the_library() {
+        let (dir, s) = server().await;
+        let x = write_note(&s, "# Port\n\nIt listens on 8080.\n").await;
+        let y = read_then_write(dir.path(), "agent:r", &x, "# Proxy\n\nIt forwards.\n").await;
+        let z = read_then_write(dir.path(), "agent:q", &y, "# Runbook\n\nRestart it.\n").await;
+        let ask = |of: &str, back, depth| {
+            let params = LineageParams {
+                of: of.into(),
+                back,
+                depth,
+            };
+            s.lineage(Parameters(params))
+        };
+        let library = |l: crate::lineage::Lineage| serde_json::to_value(l).unwrap();
+        // forward is the default, and with no depth it runs to the end
+        let forward = payload(&ask(&x, None, None).await.unwrap());
+        assert_eq!(reached(&forward), [y.as_str(), z.as_str()]);
+        assert_eq!(forward["direction"], "forward");
+        let same = s.memory.lineage(&x, Direction::Forward, None).await;
+        assert_eq!(forward, library(same.unwrap()));
+        assert_eq!(forward, payload(&ask(&x, Some(false), None).await.unwrap()));
+        // a depth bounds the steps
+        let near = payload(&ask(&x, None, Some(1)).await.unwrap());
+        assert_eq!(reached(&near), [y.as_str()]);
+        // and back gives what the entry was made from
+        let back = payload(&ask(&z, Some(true), None).await.unwrap());
+        assert_eq!(reached(&back), [y.as_str(), x.as_str()]);
+        assert_eq!(back["direction"], "back");
+        let same = s.memory.lineage(&z, Direction::Back, None).await;
+        assert_eq!(back, library(same.unwrap()));
+        assert_eq!(back["entries"][0]["informed"], true);
+        assert_eq!(back["entries"][0]["hops"], 1);
+    }
+
+    /// The `lineage` tool of `s`, forward from `of`.
+    async fn forward_of(s: &McpServer, of: &str) -> Result<CallToolResult, McpError> {
+        let params = LineageParams {
+            of: of.into(),
+            ..LineageParams::default()
+        };
+        s.lineage(Parameters(params)).await
+    }
+
+    #[tokio::test]
+    async fn lineage_and_log_are_refused_outside_the_security_role_and_served_inside_it() {
+        let (dir, owner) = server().await;
+        let grants = dir.path().join(crate::GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("security = [\"agent:security\"]\n{text}")).unwrap();
+        // the owner's session started under the grants as they were: a new one
+        drop(owner);
+        let owner = server_of(dir.path(), "human:test:me");
+        let x = write_note(&owner, "# Port\n\nIt listens on 8080.\n").await;
+        let worker = server_of(dir.path(), "agent:worker");
+        let refused = forward_of(&worker, &x).await.unwrap_err();
+        assert_eq!(refused.code, McpError::invalid_params("", None).code);
+        let why = "lineage is for the owner and the security role";
+        assert!(refused.message.contains(why), "{refused:?}");
+        let refused = worker
+            .log(Parameters(LogParams::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, McpError::invalid_params("", None).code);
+        let why = "the log is for the owner and the security role";
+        assert!(refused.message.contains(why), "{refused:?}");
+        assert_eq!(worker.memory.label(), dm_core::Label::Public);
+
+        let security = server_of(dir.path(), "agent:security");
+        let answer = payload(&forward_of(&security, &x).await.unwrap());
+        assert_eq!(
+            (&answer["of"], &answer["complete"]),
+            (&json!(x), &json!(true))
+        );
+        // a task filed after the last write: the tool serves the log with the ledger's
+        // events up to now
+        admitted_task(&owner, "Move the port", None).await;
+        let log = payload(
+            &security
+                .log(Parameters(LogParams::default()))
+                .await
+                .unwrap(),
+        );
+        let events = log["events"].as_array().unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds[..2], ["write", "put"], "{kinds:?}");
+        assert!(kinds.contains(&"ledger"), "{kinds:?}");
+        assert_eq!(events[0]["id"], x);
+        let fresh = &log["freshness"];
+        assert_eq!(fresh["domain"], "dom-me");
+        assert_eq!(
+            (&fresh["within_bound"], &fresh["unfed"]),
+            (&json!(true), &json!(0))
+        );
+        assert_eq!(fresh["bound_seconds"], 60);
+        assert_eq!(fresh["log_seq"], events[events.len() - 1]["seq"]);
+        // an event served is a read: the label of the session rose, and to the highest,
+        // since a `put` names no label
+        assert_eq!(security.memory.label(), dm_core::Label::Restricted);
+        // `from` is the first sequence number served
+        let from = LogParams {
+            domain: Some("dom-me".into()),
+            from: Some(2),
+        };
+        let tail = payload(&security.log(Parameters(from)).await.unwrap());
+        assert_eq!(tail["events"][0]["seq"], 2);
+        assert_eq!(tail["events"].as_array().unwrap().len(), events.len() - 1);
+    }
+
+    #[test]
+    fn lineage_and_log_only_read() {
+        assert_eq!(kind_of("lineage"), tape::Kind::Read);
+        assert_eq!(kind_of("log"), tape::Kind::Read);
+        assert_eq!(kind_of("write"), tape::Kind::Mutation);
     }
 }
