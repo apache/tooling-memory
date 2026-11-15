@@ -73,6 +73,7 @@ term here in the same commit as the first document that needs it.
 | task definition | The record in the platform domain for one kind of work: its purpose, its tools, its acceptance checks and its outputs. A task names one as `<name>@<version>` | task type, task template |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
+| security role | The owner, and each author that `security` in `grants.toml` lists. Only this role reads the quarantine and the event log of a domain | security team |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
 
 ## Calls and tools

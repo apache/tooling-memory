@@ -181,6 +181,12 @@ pub struct Frontmatter {
     /// or a path in a repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cites: Vec<String>,
+    /// The session that wrote the entry and its place in the log of the domain, as
+    /// `<session id>@<offset>`: the offset is the sequence number of the event that
+    /// offered this entry. Reads of that session below the offset are what the entry may
+    /// have drawn on. Absent on an entry written before the log kept this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// The author's confidence, if stated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<Confidence>,
@@ -443,6 +449,7 @@ mod tests {
                 author: "agent:worker-3 (model: test-1)".into(),
                 created: datetime!(2026-10-01 10:00 UTC),
                 cites: vec!["https://example.org/thread/1".into()],
+                session: None,
                 confidence: Some(Confidence::High),
                 trust_tier: TrustTier::Curated,
                 review_by: Some(date!(2027-04-01)),
@@ -464,6 +471,16 @@ mod tests {
         let text = e.render();
         let back = Entry::parse(&text).unwrap();
         assert_eq!(e, back);
+        assert_eq!(text, back.render());
+        // an entry written before the log kept the session has no such field, and is
+        // written again without one
+        assert!(!text.contains("session"), "{text}");
+        let mut written = sample();
+        written.front.session = Some("sess-0a1b2c@42".into());
+        let text = written.render();
+        assert!(text.contains("\nsession: sess-0a1b2c@42\n"), "{text}");
+        let back = Entry::parse(&text).unwrap();
+        assert_eq!(written, back);
         assert_eq!(text, back.render());
     }
 

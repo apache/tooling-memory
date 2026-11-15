@@ -8,8 +8,10 @@ use dm_server::Memory;
 /// What `amem log` does.
 #[derive(Subcommand)]
 pub enum LogOp {
-    /// The domain's log, from a sequence number on: each version put and each erasure,
-    /// by id and digest; never a body.
+    /// The domain's log, from a sequence number on: each write offered, each version
+    /// put, each write refused, each erasure and each read, by id and digest; never a
+    /// body. For the owner and the security role; a quarantined write is shown only to a
+    /// session that handles restricted.
     Show {
         /// The domain; the only granted one when omitted.
         #[arg(long)]
@@ -32,7 +34,8 @@ pub enum LogOp {
 ///
 /// # Errors
 ///
-/// Anyone but the owner, an ungranted domain, or a store, index or ledger error.
+/// An author outside the security role for the log, anyone but the owner for the
+/// materializer, an ungranted domain, or a store, index or ledger error.
 pub async fn cmd(m: &Memory, op: LogOp) -> Fallible {
     match op {
         LogOp::Show { domain, from } => crate::json(&m.log(domain.as_deref(), from)?),

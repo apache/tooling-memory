@@ -811,6 +811,7 @@ mod tests {
                 author: "human:test:me".into(),
                 created: datetime!(2026-10-01 10:00 UTC),
                 cites: vec![],
+                session: None,
                 confidence: None,
                 trust_tier: TrustTier::Raw,
                 review_by: None,

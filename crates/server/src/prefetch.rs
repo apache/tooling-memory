@@ -139,7 +139,7 @@ impl Memory {
             }
         }
         if !out.is_empty() {
-            self.observe(&out);
+            self.observe(&out)?;
             self.reads.hits("read_with", Some(id), &out);
         }
         Ok(out)
@@ -186,7 +186,7 @@ impl Memory {
                 }
             }
         }
-        self.observe(&out.hits);
+        self.observe(&out.hits)?;
         let ids = out.ids();
         self.reads.served_ids(
             "prefetch",

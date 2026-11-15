@@ -543,7 +543,7 @@ impl Memory {
             }
             interleave(lists, budget.hits.max(1))
         };
-        self.observe(&hits);
+        self.observe(&hits)?;
         let mut pack = Pack::empty(queries, depth);
         pack.pieces = hits
             .iter()
@@ -571,7 +571,7 @@ impl Memory {
                 gone.push(p.id.clone());
                 continue;
             };
-            if !lock(&self.session).observe(entry.front.classification) {
+            if !self.observe_entry(&p.domain, &p.id, entry.front.classification)? {
                 gone.push(p.id.clone());
                 continue;
             }
@@ -607,8 +607,11 @@ impl Memory {
                 continue;
             }
             if let Some(meta) = ix.meta(&id, f)? {
-                lock(&self.session).observe(meta.hit.classification);
-                pack.pieces.push(Piece::from_hit(&meta.hit, Via::Linked));
+                // a linked entry is read as a hit is; one the session may not handle,
+                // which the filter never gives, is not served
+                if self.observe_entry(&meta.hit.domain, &id, meta.hit.classification)? {
+                    pack.pieces.push(Piece::from_hit(&meta.hit, Via::Linked));
+                }
             }
         }
         Ok(())

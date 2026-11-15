@@ -208,6 +208,36 @@ mod tests {
         assert_eq!(m.get_task(&local).await.unwrap().posted_to, None);
     }
 
+    #[tokio::test]
+    async fn unposted_leaves_a_read_event_for_each_handoff_it_hands_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let task = done(
+            &m,
+            Some("github:acme/x#1"),
+            Label::Internal,
+            Some("Done, internally.\n"),
+        )
+        .await;
+        let handoff = m.get_task(&task).await.unwrap().handoff.unwrap();
+        let tap = Memory::open(dir.path())
+            .unwrap()
+            .with_author("tap:comments")
+            .without_read_log();
+        let due = tap.unposted("dom-me", Label::Internal).await.unwrap();
+        assert_eq!(due.len(), 1);
+        let read: Vec<Vec<String>> = crate::log::read(dir.path(), "dom-me", 0)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.session.as_deref() == Some(tap.session_id()))
+            .filter_map(|e| match e.change {
+                crate::log::Change::Read { ids } => Some(ids),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(read, [vec![handoff]], "the tap's session read the handoff");
+    }
+
     /// A second domain granted, and a task from upstream completed in it by the owner;
     /// the owner's session and the task's id.
     async fn done_elsewhere(root: &Path) -> (Memory, String) {

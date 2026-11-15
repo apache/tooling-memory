@@ -994,11 +994,48 @@ impl Memory {
         Ok(f)
     }
 
-    fn observe(&self, hits: &[Hit]) {
-        let mut s = lock(&self.session);
-        for h in hits {
-            s.observe(h.classification);
+    /// The session has read `hits`: its label rises to the classification of each, and
+    /// the log of each domain among them takes one read event, which names that domain's
+    /// entries at the highest classification among them. A read is in the log whether
+    /// the read log is kept or not: the read log is telemetry, and this is lineage.
+    ///
+    /// # Errors
+    ///
+    /// The event could not be appended. The read then fails, since a read the log does
+    /// not hold is one that lineage cannot follow.
+    fn observe(&self, hits: &[Hit]) -> Result<(), Error> {
+        let mut served: std::collections::BTreeMap<&str, (Vec<String>, Label)> =
+            std::collections::BTreeMap::new();
+        {
+            let mut s = lock(&self.session);
+            for h in hits {
+                s.observe(h.classification);
+                let (ids, label) = served.entry(h.domain.as_str()).or_default();
+                if !ids.contains(&h.id) {
+                    ids.push(h.id.clone());
+                }
+                *label = (*label).max(h.classification);
+            }
         }
+        for (domain, (ids, label)) in served {
+            self.log_read(domain, ids, label)?;
+        }
+        Ok(())
+    }
+
+    /// The session reads one entry, at `label`: its label rises, and the log of the
+    /// entry's domain takes a read event. Returns whether the session may handle the
+    /// label; when it may not, nothing was served and no event is appended.
+    ///
+    /// # Errors
+    ///
+    /// The event could not be appended.
+    fn observe_entry(&self, domain: &str, id: &str, label: Label) -> Result<bool, Error> {
+        if !lock(&self.session).observe(label) {
+            return Ok(false);
+        }
+        self.log_read(domain, vec![id.to_string()], label)?;
+        Ok(true)
     }
 
     /// Ranked search, summaries only, within the session's filter.
@@ -1014,7 +1051,7 @@ impl Memory {
     ) -> Result<Vec<Hit>, Error> {
         let f = self.filter_for(domain)?;
         let hits = self.index.lock().await.search(query, &f, limit)?;
-        self.observe(&hits);
+        self.observe(&hits)?;
         self.reads.hits("search", Some(query), &hits);
         Ok(hits)
     }
@@ -1032,7 +1069,7 @@ impl Memory {
     ) -> Result<Vec<Hit>, Error> {
         let f = self.filter_for(domain)?;
         let hits = self.index.lock().await.list(&f, kind, limit)?;
-        self.observe(&hits);
+        self.observe(&hits)?;
         self.reads.hits("list", None, &hits);
         Ok(hits)
     }
@@ -1057,7 +1094,7 @@ impl Memory {
             .get(&meta.hit.domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        if !lock(&self.session).observe(entry.front.classification) {
+        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification)? {
             return Err(Error::NotFound(id.to_string()));
         }
         Ok(entry)
@@ -1108,7 +1145,7 @@ impl Memory {
             self.forget_pushed(id);
             return Err(self.not_served(id, entry.front.status).await);
         }
-        if !lock(&self.session).observe(entry.front.classification) {
+        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification)? {
             self.forget_pushed(id);
             return Err(Error::NotFound(id.to_string()));
         }
@@ -1179,13 +1216,38 @@ impl Memory {
     }
 
     /// Write an entry at raw trust, attributed to this session's author, classified at
-    /// least as high as what the session has read. An entry it replaces has its open
-    /// proposals to verify closed, since its successor is what is reviewed now.
+    /// least as high as what the session has read. The log of the domain takes the write
+    /// before anything screens it; the record and the index take it only once the gates
+    /// passed it, and a write they refuse stays in the log, quarantined. An entry it
+    /// replaces has its open proposals to verify closed, since its successor is what is
+    /// reviewed now.
     ///
     /// # Errors
     ///
-    /// An ungranted domain, an empty body, or a store or index error.
+    /// An ungranted domain, an empty body, an entry over the size bound, a write the
+    /// gates refuse, or a store or index error.
     pub async fn write(&self, req: WriteRequest) -> Result<Written, Error> {
+        let mut entry = self.entry_to_write(req).await?;
+        let offered = self.log_offered(&mut entry)?;
+        let replaced = self.gate(&entry, offered).await?;
+        // a policy entry written, or one replaced by an entry of any kind, changes what
+        // is in force
+        let policy_changed = entry.front.entry_type == EntryType::Policy
+            || replaced.is_some_and(|old| old.front.entry_type == EntryType::Policy);
+        self.put_logged(&entry).await?;
+        self.index_put(&entry).await?;
+        self.after_write(&entry, policy_changed).await?;
+        Ok(Written {
+            classification: entry.front.classification,
+            domain: entry.front.domain,
+            id: entry.front.id,
+        })
+    }
+
+    /// The entry a request asks for, as this session writes it: a new id, this author,
+    /// a time after the last write, the tier and the classification the session gives.
+    /// Nothing is logged or stored yet.
+    async fn entry_to_write(&self, req: WriteRequest) -> Result<Entry, Error> {
         let domain = self.resolve_domain(req.domain.as_deref())?;
         if req.body.trim().is_empty() {
             return Err(Error::Denied("an entry needs a body".into()));
@@ -1203,14 +1265,16 @@ impl Memory {
         let review_by = req.review_by.or_else(|| {
             (req.entry_type == EntryType::Fact).then(|| now.date() + Duration::days(90))
         });
-        let entry = Entry {
+        Ok(Entry {
             front: Frontmatter {
                 id: dm_core::id::new_entry_id(&domain),
                 entry_type: req.entry_type,
-                domain: domain.clone(),
+                domain,
                 author: self.author.clone(),
                 created: now,
                 cites: req.cites,
+                // the log gives it, with the event that offers the entry
+                session: None,
                 confidence: req.confidence,
                 trust_tier: tier,
                 review_by,
@@ -1223,21 +1287,19 @@ impl Memory {
                 title: req.title,
             },
             body: req.body,
-        };
-        check_write_size(entry.render().len())?;
-        let replaced = self.gate(&entry).await?;
-        // a policy entry written, or one replaced by an entry of any kind, changes what
-        // is in force
-        let policy_changed = entry.front.entry_type == EntryType::Policy
-            || replaced.is_some_and(|old| old.front.entry_type == EntryType::Policy);
-        self.put_logged(&entry).await?;
-        self.index_put(&entry).await?;
+        })
+    }
+
+    /// What follows a write the record and the index took: the proposals of the entry it
+    /// replaced are closed, the write log and the projection take it, the policy is
+    /// loaded again when it changed, and the session counts it.
+    async fn after_write(&self, entry: &Entry, policy_changed: bool) -> Result<(), Error> {
         if let Some(old) = &entry.front.supersedes {
             self.superseded.fetch_add(1, Ordering::Relaxed);
             // approve refuses a replaced entry anyway: a ledger another connection holds
             // leaves the proposal on the board rather than failing a write already made
             let why = format!("{old} was replaced by {}; propose that one", entry.front.id);
-            let _ = self.close_proposals(&domain, old, &why).await;
+            let _ = self.close_proposals(&entry.front.domain, old, &why).await;
         }
         reads::wrote(
             &self.root,
@@ -1254,11 +1316,7 @@ impl Memory {
         if entry.front.entry_type == EntryType::Handoff {
             self.written.1.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(Written {
-            id: entry.front.id,
-            classification,
-            domain,
-        })
+        Ok(())
     }
 
     /// The tier a write lands at: curated when it replaces an entry in a session working
@@ -1760,7 +1818,7 @@ impl Memory {
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         if entry.front.status == Some(Status::Erased)
-            || !lock(&self.session).observe(entry.front.classification)
+            || !self.observe_entry(&domain, id, entry.front.classification)?
         {
             return Err(Error::NotFound(id.to_string()));
         }
@@ -1891,9 +1949,10 @@ impl Memory {
         })
     }
 
-    /// The gates on a write: the scan, then the policy. Returns the entry this one
-    /// replaces, read once for the policy and for the index.
-    async fn gate(&self, entry: &Entry) -> Result<Option<Entry>, Error> {
+    /// The gates on the write that the log holds as event `offered`: the scan, then the
+    /// policy. Returns the entry this one replaces, read once for the policy and for the
+    /// index.
+    async fn gate(&self, entry: &Entry, offered: u64) -> Result<Option<Entry>, Error> {
         let old = match &entry.front.supersedes {
             Some(o) => self.store.get(&entry.front.domain, o).await?,
             None => None,
@@ -1926,20 +1985,35 @@ impl Memory {
             fetch: None,
         })?;
         if !decision.allow {
-            return Err(self.quarantine(entry.clone(), &decision, &findings).await);
+            return Err(self
+                .quarantine(entry.clone(), offered, &decision, &findings)
+                .await);
         }
         Ok(old)
     }
 
     /// A write the gates refused goes to quarantine under the record's state, never
     /// into the record, and the owner gets a task naming why; the error returned to the
-    /// writer says where it went. Nothing is lost and nothing is served.
+    /// writer says where it went. Nothing is lost and nothing is served. The log says
+    /// first that the write event `offered` was refused, and by which gate. The task
+    /// quotes what the scan found, so it is at the highest classification.
     async fn quarantine(
         &self,
         entry: Entry,
+        offered: u64,
         decision: &Decision,
         findings: &[scan::Finding],
     ) -> Error {
+        let kind = match decision.review {
+            // a module's denial that names no rule cites none, and is a rule's still
+            _ if !decision.cites.is_empty() || !decision.denials.is_empty() => "policy",
+            dm_policy::decide::Review::Approver => "verified",
+            _ if findings.is_empty() => "blast-radius",
+            _ => "injection",
+        };
+        if let Err(e) = self.log_quarantined(&entry, offered, kind, scan::kinds(findings)) {
+            return e;
+        }
         let dir = self.root.join("state/quarantine");
         let id = entry.front.id.clone();
         if let Err(e) = std::fs::create_dir_all(&dir)
@@ -1960,13 +2034,6 @@ impl Memory {
                 body.push_str(&format!("- {:?}: `{}`\n", f.kind, f.excerpt));
             }
         }
-        let kind = match decision.review {
-            // a module's denial that names no rule cites none, and is a rule's still
-            _ if !decision.cites.is_empty() || !decision.denials.is_empty() => "policy",
-            dm_policy::decide::Review::Approver => "verified",
-            _ if findings.is_empty() => "blast-radius",
-            _ => "injection",
-        };
         let filed = self
             .file_own(TaskSpec {
                 domain: entry.front.domain.clone(),
@@ -1980,7 +2047,7 @@ impl Memory {
                 origin: Some(format!("gate:{kind}")),
                 upstream_event: Some(id.clone()),
                 created_by: String::new(),
-                classification: entry.front.classification,
+                classification: Label::Restricted,
                 priority: 5,
                 ..TaskSpec::default()
             })
@@ -1994,12 +2061,19 @@ impl Memory {
         }
     }
 
-    /// The entries in quarantine.
+    /// The entries in quarantine, for the security role: the owner, and each author the
+    /// grants list under `security`.
     ///
     /// # Errors
     ///
-    /// A quarantined file that does not parse.
+    /// [`Error::Denied`] for an author outside the security role; a quarantined file
+    /// that does not parse.
     pub fn quarantined(&self) -> Result<Vec<Entry>, Error> {
+        if !self.grants.is_security(&self.author) {
+            return Err(Error::Denied(
+                "the quarantine is for the owner and the security role".into(),
+            ));
+        }
         let dir = self.root.join("state/quarantine");
         let mut out = Vec::new();
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -2143,9 +2217,8 @@ impl Memory {
             .iter()
             .filter(|t| self.sees(t, handling))
             .count();
-        self.observe(&handoffs);
-        self.observe(&decisions);
-        self.observe(&conventions);
+        // one read for what T0 lists
+        self.observe(&[&handoffs[..], &decisions[..], &conventions[..]].concat())?;
         let generated_by = format!("memory {}", env!("CARGO_PKG_VERSION"));
         // a rule is read as an entry is: the digest gives the text of the rules this
         // session may read, and for the others their ids
@@ -2154,7 +2227,7 @@ impl Memory {
             let ix = self.index.lock().await;
             ix.list_every(&f, Some(EntryType::Policy))?
         };
-        let digest = self.policy_digest(&readable);
+        let digest = self.policy_digest(&readable)?;
         let text = t0::render(&t0::Inputs {
             domain: &domain,
             generated_by: &generated_by,
@@ -2173,7 +2246,7 @@ impl Memory {
     /// The policy digest T0 carries: the L0 core in full, rule and intent; the other
     /// layers' rules that are verified, by id and rule, marked enforced where a module
     /// checks them; and the exceptions in force, with their scope.
-    fn policy_digest(&self, readable: &[Hit]) -> Vec<String> {
+    fn policy_digest(&self, readable: &[Hit]) -> Result<Vec<String>, Error> {
         let p = self.policy();
         let withheld = |e: &dm_policy::record::Entry| !readable.iter().any(|h| h.id == e.entry_id);
         let mut shown = Vec::new();
@@ -2236,8 +2309,8 @@ impl Memory {
             .filter(|h| shown.contains(&h.id.as_str()))
             .cloned()
             .collect();
-        self.observe(&read);
-        out
+        self.observe(&read)?;
+        Ok(out)
     }
 
     // ---- tasks ----
@@ -3836,7 +3909,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(held.to_string().contains("quarantined"), "{held}");
-        let id = agent.quarantined().unwrap()[0].front.id.clone();
+        let id = owner.quarantined().unwrap()[0].front.id.clone();
         owner.release_quarantined(&id, true).await.unwrap();
         let listed: Vec<String> = owner
             .list(None, None, 50)
@@ -3869,7 +3942,8 @@ mod tests {
             agent.search("tracker", None, 10).await.unwrap().is_empty(),
             "never served"
         );
-        let held = agent.quarantined().unwrap();
+        assert!(agent.quarantined().is_err(), "the security role reads it");
+        let held = Memory::open(dir.path()).unwrap().quarantined().unwrap();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].front.author, "agent:test");
         let tasks = gate_tasks(&agent, "gate:injection").await;
@@ -3955,7 +4029,8 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("blast radius"), "{err}");
         assert_eq!(gate_tasks(&agent, "gate:blast-radius").await.len(), 1);
-        assert_eq!(agent.quarantined().unwrap().len(), 1);
+        let owner = Memory::open(dir.path()).unwrap();
+        assert_eq!(owner.quarantined().unwrap().len(), 1);
         agent
             .write(req("A plain write still goes in.\n"))
             .await

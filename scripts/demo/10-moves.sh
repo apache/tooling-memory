@@ -7,8 +7,8 @@
 act 10 "The record moves" "The event log every write goes through, by id and digest and never a body; the index rebuilt from it; the record exported at a label and imported into another, under another owner; and an erasure that holds when the same bundle is imported again." "the event log and its materializer; you, exporting the record; and a second record, another owner's, importing it."
 work=$(mktemp -d)
 
-say "The event log" "Every version an entry is written at, and every erasure, in order, one writer per domain. It holds ids and digests, never bodies, so erasing a body leaves the log as it was."
-a log show --domain dom-demo | j "f\"  {len(d)} events: \" + ', '.join(f'{n} {k}' for k, n in sorted(__import__('collections').Counter(e['kind'] for e in d).items())) + '\n' + '\n'.join(f\"  {e['seq']:>5}  {e['kind']:<7} {e['id']}  {(e.get('digest') or '')[:16]}\" for e in [x for x in d if x['kind'] != 'put'][:1] + d[-3:])"
+say "The event log" "Every write as it was offered, every version the record took, every write the screen refused, every erasure and every read, in order, one writer per domain. It holds ids and digests, never bodies, so erasing a body leaves the log as it was."
+a log show --domain dom-demo | j "f\"  {len(d)} events: \" + ', '.join(f'{n} {k}' for k, n in sorted(__import__('collections').Counter(e['kind'] for e in d).items())) + '\n' + '\n'.join('  %5d  %-11s %s  %s' % (e['seq'], e['kind'], e.get('id') or ', '.join(e.get('ids', [])[:2]) + (' and %d more' % (len(e['ids']) - 2) if len(e.get('ids', [])) > 2 else ''), (e.get('digest') or '')[:16]) for e in [x for x in d if x['kind'] != 'put'][:1] + d[-3:])"
 
 say "The index, rebuilt" "The materializer reads the log and the record and builds the index from them, and replays the ledger's own events; it says what the record holds at another version than the log names."
 a log materialize --domain dom-demo | j "f\"  {d['events']} events read, {d['live']} entries live in the index, {d['ledger_events']} ledger events replayed, {len(d['behind'])} behind the log\""
