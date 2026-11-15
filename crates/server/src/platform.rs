@@ -83,6 +83,15 @@ fn definition_in(e: &Entry, name: &str) -> Option<Result<TaskDefinition, ()>> {
     if !e.is_active() || e.front.trust_tier != TrustTier::Verified {
         return None;
     }
+    definition_block(e, name)
+}
+
+/// The definition that the `platform task <name>` block of an entry gives, whatever the
+/// tier and the state of the entry: none when the entry has no such block, and an error
+/// when the block does not read as a definition. A definition is in force only from an
+/// active entry that a person verified ([`Memory::task_definition`]). A version that is
+/// not verified yet is read here to be graded, and for nothing else.
+pub(crate) fn definition_block(e: &Entry, name: &str) -> Option<Result<TaskDefinition, ()>> {
     let block = artifacts_in(e)
         .into_iter()
         .find(|a| a.kind == "task" && a.name == name)?;
@@ -483,15 +492,16 @@ impl Memory {
 }
 
 /// The refusal for a block that is no task definition: its name, and nothing of its text.
-fn unreadable(name: &str) -> Error {
+pub(crate) fn unreadable(name: &str) -> Error {
     Error::Denied(format!(
         "the task definition {name} does not read as one: it has a key this code does not know, or a tool that is not `tool:<name>`"
     ))
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::testing::{root, verify, written};
     use crate::WriteRequest;
 
     const BODY: &str = "# Claude here\n\nHow Claude works in this repository.\n\n\
@@ -499,39 +509,6 @@ pub(crate) mod tests {
 ```toml\nnot = \"an artifact\"\n```\n\n\
 ```platform harness claude\n{\"model\": \"claude-opus-5-5\"}\n```\n\n\
 ```platform eval unterminated\nnever closed\n";
-
-    /// A root whose platform is `dom-plat`, beside the owner's `dom-me`.
-    pub(crate) fn root(dir: &std::path::Path) -> Memory {
-        Memory::init(dir, "human:test:me", "dom-me").unwrap();
-        let path = dir.join(crate::GRANTS_FILE);
-        let mut g = dm_policy::Grants::load(&path).unwrap();
-        let d = g.domains["dom-me"].clone();
-        g.domains.insert("dom-plat".into(), d);
-        g.platform = Some("dom-plat".into());
-        std::fs::write(&path, g.render().unwrap()).unwrap();
-        Memory::open(dir).unwrap()
-    }
-
-    /// An entry of `dom-plat` with `body`, verified or raw; its id.
-    pub(crate) async fn written(m: &Memory, body: &str, verified: bool) -> String {
-        let id = m
-            .write(WriteRequest {
-                body: body.into(),
-                domain: Some("dom-plat".into()),
-                entry_type: dm_core::EntryType::Convention,
-                ..WriteRequest::default()
-            })
-            .await
-            .unwrap()
-            .id;
-        if verified {
-            // as a person other than its proposer would leave it
-            let mut e = m.store.get("dom-plat", &id).await.unwrap().unwrap();
-            e.front.trust_tier = TrustTier::Verified;
-            m.store.put(&e).await.unwrap();
-        }
-        id
-    }
 
     #[test]
     fn artifacts_are_the_platform_blocks_closed_in_the_body() {
@@ -620,12 +597,6 @@ pub(crate) mod tests {
             definition: definition.map(str::to_string),
             ..dm_ledger::TaskSpec::default()
         }
-    }
-
-    async fn verify(m: &Memory, id: &str) {
-        let mut e = m.store.get("dom-plat", id).await.unwrap().unwrap();
-        e.front.trust_tier = TrustTier::Verified;
-        m.store.put(&e).await.unwrap();
     }
 
     /// A session of this root that holds `id`.

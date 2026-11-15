@@ -80,7 +80,7 @@ pub struct AutonomyView {
 
 /// The level that a version's records leave it at: where the last raise or outcome put
 /// it, and the lowest level when there is none. A graded run alone moves nothing.
-fn level_after(records: &[DefinitionRecord]) -> Autonomy {
+pub(crate) fn level_after(records: &[DefinitionRecord]) -> Autonomy {
     records
         .iter()
         .rev()
@@ -206,7 +206,7 @@ impl Memory {
     /// Whether this session is a person in person: the owner or another person, in a
     /// session that the memory server does not serve. A harness reaches a served
     /// session, so an agent may have asked, whatever the session's name.
-    fn in_person(&self, what: &str) -> Result<(), Error> {
+    pub(crate) fn in_person(&self, what: &str) -> Result<(), Error> {
         let person = matches!(
             Class::of(&self.author, &self.grants.owner),
             Class::Owner | Class::Human
@@ -424,7 +424,7 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::tests::{root, written};
+    use crate::testing::{root, written};
     use crate::WriteRequest;
     use dm_core::{EntryType, Label};
     use dm_ledger::TaskSpec;

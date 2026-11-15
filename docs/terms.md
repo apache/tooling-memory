@@ -80,6 +80,9 @@ term here in the same commit as the first document that needs it.
 | autonomy level | `person`, `review` or `checks`: what a completion of a task under a task definition needs before the task is `done`. The ledger holds the level of each version of a definition, and each version starts at `person` | autonomy tier, trust level |
 | verdict | The decision on work that a holder handed in under a task definition: accept or reject. At the level `person` a person gives it. At the level `review` a principal other than that holder gives it | approval (for a verdict), sign-off (for a verdict) |
 | work outcome | `reverted` or `rejected`: what became of the work of a task that did not stand. A record of it lowers the autonomy level of the definition one step | outcome (alone, for a work outcome) |
+| held-out suite | The scenarios that grade one task definition, in a verified entry of the held-out domain. Each scenario gives the strings that a handoff must hold. The grants name the held-out domain (`held_out`), and only the evaluator and the owner in person read it | test suite (for a held-out suite), golden suite (for a held-out suite) |
+| evaluator | The principal that the grants name (`evaluator`) to grade work on the held-out suites. It reads the held-out domain, and it claims no task | grader, judge |
+| pass mark | The number of scenarios of a held-out suite that must pass for one autonomy level | threshold (for a pass mark) |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |

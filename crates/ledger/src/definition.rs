@@ -104,7 +104,7 @@ impl std::str::FromStr for WorkOutcome {
 pub enum DefinitionChange {
     /// A run of a held-out suite was graded for a level.
     Graded {
-        /// The suite, by its entry.
+        /// The version of the suite: its entry, and the digest of that entry's text.
         suite: String,
         /// The level the run was graded for.
         level: Autonomy,

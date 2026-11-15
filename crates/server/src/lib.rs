@@ -38,6 +38,7 @@ pub mod approvals;
 pub mod autonomy;
 pub mod bundle;
 pub mod contexts;
+pub mod evaluation;
 pub mod fabric;
 mod holds;
 pub mod log;
@@ -52,6 +53,8 @@ pub mod sources;
 pub mod t0;
 pub mod tape;
 mod taps;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod transcripts;
 
 /// The grants file, relative to the root.
@@ -537,10 +540,14 @@ impl Memory {
     /// The read filter for this session: the policy's read scope for this principal,
     /// evaluated once and narrowed against the grants, so the policy can take reads
     /// away and never add them. The session's handling is capped at it as well. The
-    /// decision is logged like any other.
+    /// decision is logged like any other. The held-out domain is taken away here from
+    /// every session that does not read it ([`Memory::reads_held_out`]): every read
+    /// goes through this filter, so this is the one place that withholds the suites.
     fn session_filter(&self) -> Result<ReadFilter, Error> {
         if let Some(f) = self.scope.get() {
-            return Ok(f.clone());
+            // again on the kept scope: a session that the memory server serves from now
+            // on reads the held-out domain no longer
+            return Ok(self.without_held_out(f.clone()));
         }
         let input = Input {
             action: Action::Read,
@@ -560,6 +567,7 @@ impl Memory {
             .policy()
             .read_scope(&input)?
             .narrow(&self.grants.read_filter());
+        let f = self.without_held_out(f);
         {
             let mut s = lock(&self.session);
             s.handling = s.handling.min(f.handling);
@@ -1093,9 +1101,11 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// An ungranted domain, an empty body, or a store or index error.
+    /// An ungranted domain, the held-out domain for a session that does not read it, an
+    /// empty body, or a store or index error.
     pub async fn write(&self, req: WriteRequest) -> Result<Written, Error> {
         let domain = self.resolve_domain(req.domain.as_deref())?;
+        self.may_write_into(&domain)?;
         if req.body.trim().is_empty() {
             return Err(Error::Denied("an entry needs a body".into()));
         }
@@ -2849,7 +2859,7 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// An ungranted domain, or a ledger error.
+    /// An ungranted domain, [`Error::Denied`] for the evaluator, or a ledger error.
     pub async fn claim_next(
         &self,
         domain: Option<&str>,
@@ -2870,6 +2880,7 @@ impl Memory {
         lease: Duration,
         attempt: Option<&str>,
     ) -> Result<Option<Claim>, Error> {
+        self.claims_work()?;
         let domain = self.resolve_domain(domain)?;
         let handling = self.handling()?;
         let can = self.capabilities();
@@ -2899,8 +2910,10 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// A ledger error, including a task outside the grants or above the handling.
+    /// A ledger error, including a task outside the grants or above the handling;
+    /// [`Error::Denied`] for the evaluator, which grades work and claims none.
     pub async fn claim(&self, id: &str, lease: Duration) -> Result<Claim, Error> {
+        self.claims_work()?;
         let mut l = self.ledger.lock().await;
         self.check_task(&l.get(id).await?)?;
         let handling = self.handling()?;
