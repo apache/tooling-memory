@@ -393,7 +393,9 @@ The policy still decides what it reads and writes over MCP. But the harness keep
 network and credentials. Nothing meters its model calls. No model's ceiling applies to
 what it may read. `amem launch --unconfined` is the middle case. At this time it is only
 for Claude Code and Codex. It gives no sandbox, but the model calls still go through the
-egress.
+egress. A harness with no sandbox has a shell on the host. From that shell, an agent can
+run `amem approve` as the owner, because nobody authenticates at the command line. Thus
+an approval stops an agent only when the harness is confined.
 
 ## The parts, and their commands
 

@@ -228,6 +228,25 @@ impl Memory {
         Ok(())
     }
 
+    /// Write an entry that the record holds once, through its domain's log: the change
+    /// is appended first, then the record takes the entry only when it holds none with
+    /// this id. Gives whether this call wrote it. The text of such an entry follows from
+    /// its id alone, so the version that the log names is the version that the record
+    /// holds, whichever call wrote it.
+    pub(crate) async fn create_logged(&self, entry: &Entry) -> Result<bool, Error> {
+        append(
+            &self.root,
+            &entry.front.domain,
+            &self.author,
+            Change::Put {
+                id: entry.front.id.clone(),
+                digest: dm_core::digest(&entry.render()),
+                active: entry.is_active(),
+            },
+        )?;
+        Ok(self.store.create(entry).await?)
+    }
+
     /// Say in its domain's log that an entry was erased; before the record erases it.
     pub(crate) fn log_erased(&self, domain: &str, id: &str) -> Result<(), Error> {
         append(

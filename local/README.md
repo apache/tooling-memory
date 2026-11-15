@@ -554,7 +554,9 @@ The steps are the same for the two actions:
    action. The approval expires after 24 hours, or at the time that
    `--expires <RFC 3339 time>` gives. A time that is not after now is refused. To
    decline, the approver invalidates the task (`amem task invalidate <task>`). The
-   request is then not made again until the entry changes.
+   request is then not made again until the entry changes. Only the approver can
+   invalidate a sign-off task, and only at the command line. `amem` refuses each other
+   session, because `amem` tells the requester that the approver declined.
 4. The session makes the same call again. The policy finds the approval, and the action
    runs.
 
@@ -577,6 +579,12 @@ An agent cannot approve. Three rules hold this:
   request can come from an agent.
 - The memory server has no memory tool that approves.
 
+These rules hold only for a harness that is confined. Nobody authenticates at the command
+line. A harness without a sandbox has a shell on the host: a harness under
+`amem launch --unconfined`, or a harness that you point at `amem serve` yourself. From
+that shell, an agent can run `amem approve`, `amem erase` or `amem declassify` as the
+owner. That call is a call at the command line, so the agent approves its own request.
+
 `amem approvals [<id>] [--domain <domain>]` lists the approvals of one entry, or of a
 domain, as JSON, oldest first. Each has `id`, `domain`, `principal`, `action`, `target`,
 `version`, `scope`, `expires`, `at` and `in_force`. `in_force` says that the approval is
@@ -590,13 +598,20 @@ erasure names who erased, and it does not name the approval.
 of one version of an entry at a lower label. The label must be lower than the label of
 the entry. The reason is words on one line, and the sign-off task holds it for the guard.
 
-The copy is a new raw entry at the lower label. It has the author, the type, the title,
-the summary and the text of the entry. It cites the version that it was made from, as
-`<id>@<digest>`. It does not cite what the entry cites, because those citations can be
-above the label of the copy. Its `origin` names the label, the version and the guard:
+The copy is a new raw entry at the lower label. It has the author, the date (`created`),
+the type, the title, the summary and the text of the entry. It cites the version that it
+was made from, as `<id>@<digest>`. It does not cite what the entry cites, because those
+citations can be above the label of the copy. Its `origin` names the label, the version
+and the guard:
 `declassify:<label>:<id>@<digest>:<guard>`. The entry itself does not change. The same
 call again gives the id of the copy that is there, and writes nothing. Each version and
 each label gets its own copy.
+
+`amem` makes the id of the copy from its `origin`, and the record takes an entry with
+that id only one time. Thus two calls at the same time land one copy, and two requesters
+of the same version get the same copy. If the copy was erased, `amem` refuses the call
+and files no sign-off task. No copy of that version lands at that label again. A new
+version of the entry gets a new copy.
 
 A session that asks for a copy reads the entry, so its session label goes up to the label
 of the entry. The copy is the only write that lands below the session label.

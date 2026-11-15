@@ -3067,12 +3067,16 @@ impl Memory {
     /// destination settles the effect first. The reason is the session's own words on
     /// the task, so a session that has read above the task's classification is refused.
     ///
+    /// A sign-off task is its approver's to close, in person: to invalidate it is to
+    /// decline the request ([`Memory::may_decline`]).
+    ///
     /// # Errors
     ///
     /// A ledger error, or a task outside the grants; [`Error::Denied`] when an open task
     /// filed from it, however far down, is above the session's handling, when the task
-    /// or such an open task has an effect that is not settled, or when the session's
-    /// label is above the task's classification.
+    /// or such an open task has an effect that is not settled, when the session's label
+    /// is above the task's classification, or when the task is a sign-off task and the
+    /// session is not its approver in person.
     pub async fn invalidate(
         &self,
         id: &str,
@@ -3082,6 +3086,8 @@ impl Memory {
         let mut l = self.ledger.lock().await;
         let named = l.get(id).await?;
         self.check_task(&named)?;
+        // to invalidate a sign-off task is to decline it, which is its approver's
+        self.may_decline(&named)?;
         self.writes_within(&named, "a reason")?;
         let handling = self.handling()?;
         let mut open = Vec::new();

@@ -16,7 +16,7 @@
 //! write that lands below the label of the session that makes it.
 
 use crate::rules::words_on_one_line;
-use crate::{lock, next_stamp, reads, Error, Memory, Promotion, PROPOSAL_ORIGIN};
+use crate::{lock, reads, Error, Memory, Promotion, PROPOSAL_ORIGIN};
 use dm_core::{Entry, EntryType, Frontmatter, Label, TrustTier};
 use dm_ledger::{ApprovalRecord, ApprovalSpec, Redaction, Task, TaskSpec};
 use dm_policy::decide::{Action, ApprovalEvent, ApprovalInput, Class, Filing, Input, Review};
@@ -226,9 +226,28 @@ struct Landing<'a> {
     /// The label of the copy.
     to: Label,
     /// The source and its version: `<id>@<digest>`.
-    cites: &'a str,
+    cites: String,
     /// The origin of the copy: the label, the source, its version and the guard.
     origin: String,
+    /// The id of the copy. It follows from the origin, so each call for one version,
+    /// one label and one guard names the same entry, and the record holds one copy.
+    id: String,
+}
+
+impl<'a> Landing<'a> {
+    /// The landing of the copy at `to` of the `version` of `source` that `guard`
+    /// approves.
+    fn of(domain: &'a str, source: &str, version: &str, to: Label, guard: &str) -> Self {
+        let cites = format!("{source}@{version}");
+        let origin = format!("declassify:{to}:{cites}:{guard}");
+        Landing {
+            domain,
+            to,
+            id: dm_core::id::entry_id_for(domain, &origin),
+            cites,
+            origin,
+        }
+    }
 }
 
 /// The upstream event of a sign-off task: the action, the version, how many approvals
@@ -533,7 +552,10 @@ impl Memory {
     /// caller that may read the entry, a sign-off task asks the guard, and the answer is
     /// [`Declassification::Proposed`]. The task is classified as the entry and holds the
     /// justification. After the guard signs it off, the same call lands the copy. A call
-    /// made again for a copy that landed gives that copy and writes nothing.
+    /// made again for a copy that landed gives that copy and writes nothing. Two calls at
+    /// the same time land one copy, since the id of a copy follows from its origin. A
+    /// copy that was erased does not land again, and its request is refused before the
+    /// guard is asked.
     ///
     /// To ask is to read the entry: the session's label rises to the entry's label. The
     /// copy is the one write that lands below the label of its session. The body is text
@@ -543,7 +565,8 @@ impl Memory {
     ///
     /// [`Error::Denied`] for a justification that is empty or is not words on one line,
     /// a label that is not lower than the entry's, an entry that is not live in the
-    /// record, a request that the guard declined, or a refusal of the policy;
+    /// record, a copy of this version at this label that was erased, a request that the
+    /// guard declined, or a refusal of the policy;
     /// [`Error::NotFound`] for an entry that this session cannot read; [`Error::Moved`]
     /// or [`Error::Gone`], as from [`Memory::get`], for one it could read that is no
     /// longer served; a store, index or ledger error.
@@ -581,6 +604,12 @@ impl Memory {
             return Err(Error::NotFound(id.to_string()));
         }
         let action = Gated::Declassify { to };
+        let version = dm_core::digest(&entry.render());
+        let guard = action.approver(&self.grants, &domain);
+        let landing = Landing::of(&domain, &entry.front.id, &version, to, &guard);
+        // before the approval, as the label is: a copy that cannot land asks the guard
+        // for nothing, and the guard's own call leaves no approval
+        self.copy_was_not_erased(id, &landing).await?;
         match self
             .approval_for(action, &domain, &entry, Some(why))
             .await?
@@ -588,60 +617,67 @@ impl Memory {
             Gate::Asked { task, reason } => Ok(Declassification::Proposed { task, reason }),
             Gate::Open(approval) => {
                 self.ran_under(&approval);
-                self.land_copy(&domain, &entry, to, approval).await
+                self.land_copy(&entry, landing, approval).await
             }
         }
     }
 
-    /// The copy of `source` that `approval` permits: the one that landed under an
-    /// approval of this guard for this version and this label, or a new one. The origin
-    /// of a copy names all of them, so a call made again finds the copy by its origin.
+    /// Refuse a copy that was erased, or whose erasure began: the receipt of an erasure
+    /// is written first. The copy of one version at one label has one id, and an erased
+    /// entry is not written again, so nothing can land.
+    async fn copy_was_not_erased(&self, source: &str, at: &Landing<'_>) -> Result<(), Error> {
+        if self.store.receipt(at.domain, &at.id).await?.is_none() {
+            return Ok(());
+        }
+        Err(Error::Denied(format!(
+            "{} is the copy of this version of {source} at {}, and it was erased. An erased entry is not written again: a copy lands at {} again when {source} has a new version",
+            at.id, at.to, at.to
+        )))
+    }
+
+    /// The copy of `source` that `approval` permits: the one that is in the record, or a
+    /// new one. The copy of one version at one label under one guard has one id, so a
+    /// call made again finds it in the record, whatever became of it since, and writes
+    /// nothing. The record says whether the id is taken, and no text is read: a copy
+    /// that another call is writing now is there too.
     async fn land_copy(
         &self,
-        domain: &str,
         source: &Entry,
-        to: Label,
+        at: Landing<'_>,
         approval: ApprovalRecord,
     ) -> Result<Declassification, Error> {
-        let cites = format!("{}@{}", source.front.id, approval.spec.version);
-        let origin = format!("declassify:{to}:{cites}:{}", approval.spec.principal);
-        let landed = self.index.lock().await.by_origin(domain, &origin)?;
-        let id = match landed {
-            Some(id) => id,
-            None => {
-                let landing = Landing {
-                    domain,
-                    to,
-                    cites: &cites,
-                    origin,
-                };
-                self.write_copy(source, landing).await?
-            }
-        };
+        if !self.store.exists(at.domain, &at.id).await? {
+            self.write_copy(source, &at).await?;
+        }
         Ok(Declassification::Declassified {
-            id,
-            classification: to,
-            cites,
+            id: at.id,
+            classification: at.to,
+            cites: at.cites,
             approval: Box::new(approval),
         })
     }
 
-    /// Write the copy of `source`, as [`Memory::write`] writes an entry, with two
+    /// Write the copy of `source`, as [`Memory::write`] writes an entry, with three
     /// differences. The classification is the label asked for and is not raised to the
-    /// session's label. The author, the type, the text and the review date are the
-    /// source's. The copy cites the source's version and nothing else: what the source
-    /// cites can be above the copy's label.
-    async fn write_copy(&self, source: &Entry, at: Landing<'_>) -> Result<String, Error> {
+    /// session's label. The author, the date, the type, the text and the review date are
+    /// the source's. The copy cites the source's version and nothing else: what the
+    /// source cites can be above the copy's label.
+    ///
+    /// The third difference: the record takes the copy only when it holds no entry with
+    /// this id. Every part of the copy follows from the source's version, the label and
+    /// the guard, so two calls at the same time write the same text under the same id.
+    /// One of them writes it, and the other one stops here: the copy is the first one's
+    /// to index.
+    async fn write_copy(&self, source: &Entry, at: &Landing<'_>) -> Result<(), Error> {
         let from = &source.front;
-        let created = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
         let copy = Entry {
             front: Frontmatter {
-                id: dm_core::id::new_entry_id(at.domain),
+                id: at.id.clone(),
                 entry_type: from.entry_type,
                 domain: at.domain.to_string(),
                 author: from.author.clone(),
-                created,
-                cites: vec![at.cites.to_string()],
+                created: from.created,
+                cites: vec![at.cites.clone()],
                 confidence: from.confidence,
                 trust_tier: TrustTier::Raw,
                 review_by: from.review_by,
@@ -649,13 +685,15 @@ impl Memory {
                 policy_context: Vec::new(),
                 classification: at.to,
                 status: None,
-                origin: Some(at.origin),
+                origin: Some(at.origin.clone()),
                 summary: from.summary.clone(),
                 title: from.title.clone(),
             },
             body: source.body.clone(),
         };
-        self.put_logged(&copy).await?;
+        if !self.create_logged(&copy).await? {
+            return Ok(());
+        }
         self.index_put(&copy).await?;
         // the log of writes names who made the write: this session, not the author
         reads::wrote(
@@ -670,7 +708,7 @@ impl Memory {
             self.reload_policy().await?;
         }
         self.written.0.fetch_add(1, Ordering::Relaxed);
-        Ok(copy.front.id)
+        Ok(())
     }
 
     /// For an erasure of `id`: rewrite the sign-off tasks of the entry so that they keep
@@ -703,6 +741,56 @@ impl Memory {
             ));
         }
         Ok(())
+    }
+
+    /// Whether this session may invalidate `task`. To invalidate a sign-off task is to
+    /// decline its request: the requester is told that the approver declined, and the
+    /// request is not made again for that version. So only who may approve the request
+    /// closes its task: the policy's approver, in a session that the memory server does
+    /// not serve. Every other task passes, and so does a sign-off task that is closed,
+    /// which the ledger refuses for all alike.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a session that the memory server serves, and for a caller
+    /// that the policy refuses as the approver of the request; a policy error.
+    pub(crate) fn may_decline(&self, task: &Task) -> Result<(), Error> {
+        let origin = task.spec.origin.as_deref().unwrap_or_default();
+        let Some(target) = origin.strip_prefix(SIGN_OFF_ORIGIN) else {
+            return Ok(());
+        };
+        if task.status.is_terminal() {
+            return Ok(());
+        }
+        if self.served() {
+            return Err(Error::Denied(
+                "a session of the memory server declines nothing: the approver invalidates a sign-off task at the command line"
+                    .into(),
+            ));
+        }
+        let asked = task.spec.upstream_event.as_deref().and_then(asked_in);
+        let Some((action, version)) = asked else {
+            return Err(Error::Denied(format!(
+                "{} names no action and version to decline",
+                task.id
+            )));
+        };
+        let input = ApprovalInput {
+            of: action.of().to_string(),
+            target: target.to_string(),
+            version: version.to_string(),
+            to: action.to(),
+            ..ApprovalInput::default()
+        };
+        let question = self.approval_question(Action::Approve, &task.spec.domain, input);
+        let d = self.decide(&question)?;
+        if d.allow {
+            return Ok(());
+        }
+        Err(Error::Denied(format!(
+            "{} is a sign-off task, and only its approver declines it: {}",
+            task.id, d.reason
+        )))
     }
 
     /// Record the approval that a promotion to verified is: the approver approved this
@@ -1457,6 +1545,7 @@ mod tests {
             (TrustTier::Raw, TrustTier::Curated)
         );
         assert_eq!((c.author.as_str(), &c.title), ("agent:writer", &s.title));
+        assert_eq!(c.created, s.created, "the date of the text");
         assert_eq!((c.status, &c.supersedes), (None, &None));
         assert_eq!(copy.body, source.body);
     }
@@ -1765,5 +1854,120 @@ mod tests {
         m.ledger.lock().await.create(late).await.unwrap();
         denied(m.erase(&id, Reason::Mistaken).await, "already erased");
         assert_eq!(closed_with_the_id_alone(&m, &id).await, 2);
+    }
+
+    /// Two sessions of the requester make the same call at the same time. Gives the
+    /// copy that each call answers.
+    async fn both_at_once(dir: &Path, id: &str) -> (String, String) {
+        let (a, b) = (session(dir, AGENT), session(dir, AGENT));
+        let (first, second) = tokio::join!(
+            a.declassify(id, Label::Internal, WHY),
+            b.declassify(id, Label::Internal, WHY)
+        );
+        (landed(first).0, landed(second).0)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_calls_at_the_same_time_land_one_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, agent) = (owner(dir.path()), session(dir.path(), AGENT));
+        for round in 1..=6usize {
+            let body = format!("The door code of floor {round} is 4417.");
+            let id = restricted(&m, &body).await;
+            let (task, _) = waits(agent.declassify(&id, Label::Internal, WHY).await);
+            approved(&m, &task, None).await;
+            let (first, second) = both_at_once(dir.path(), &id).await;
+            assert_eq!(first, second, "one copy of one version");
+            let copies = entries(&m).await - round;
+            assert_eq!(copies, round, "one copy for each source");
+        }
+        // the log names each copy at the version that the record holds
+        let built = m.materialize(None).await.unwrap();
+        assert!(built.behind.is_empty(), "{built:?}");
+    }
+
+    /// A call that found no copy can reach the write after another call landed the copy,
+    /// and after the copy changed. The record takes nothing from it.
+    #[tokio::test]
+    async fn a_copy_that_is_there_is_not_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = owner(dir.path());
+        let id = restricted(&m, DOOR).await;
+        let (copy, approval) = landed(m.declassify(&id, Label::Internal, WHY).await);
+        changed(dir.path(), &copy).await;
+        let promoted = stored(&m, &copy).await;
+        assert_eq!(promoted.front.trust_tier, TrustTier::Curated);
+        let source = stored(&m, &id).await;
+        let version = &approval.spec.version;
+        let at = Landing::of(DOMAIN, &id, version, Label::Internal, OWNER);
+        assert_eq!(at.id, copy, "the same landing");
+        m.write_copy(&source, &at).await.unwrap();
+        assert_eq!(stored(&m, &copy).await, promoted, "the copy is as it was");
+        let history = m.store.history(DOMAIN, &copy).await.unwrap();
+        assert_eq!(history.len(), 1, "the raw version, from the promotion");
+    }
+
+    #[tokio::test]
+    async fn the_answer_names_the_approval_that_was_given_to_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = owner(dir.path());
+        let (x, y) = (session(dir.path(), AGENT), session(dir.path(), "agent:y"));
+        let id = restricted(&m, DOOR).await;
+        let (for_x, _) = waits(x.declassify(&id, Label::Internal, WHY).await);
+        let (for_y, _) = waits(y.declassify(&id, Label::Internal, WHY).await);
+        assert_ne!(for_x.id, for_y.id, "each requester has its own request");
+        // the approval for agent:y is the newer one of the two
+        let given_x = approved(&m, &for_x, None).await;
+        let given_y = approved(&m, &for_y, None).await;
+        let (copy, under) = landed(x.declassify(&id, Label::Internal, WHY).await);
+        assert_eq!(under, given_x, "agent:x ran under its own approval");
+        let (same, under) = landed(y.declassify(&id, Label::Internal, WHY).await);
+        assert_eq!(under, given_y, "agent:y ran under its own approval");
+        assert_eq!(same, copy, "one copy for the two requesters");
+        assert_eq!(entries(&m).await, 2, "the source and one copy");
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_was_erased_is_not_answered_and_does_not_land_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, agent) = (owner(dir.path()), session(dir.path(), AGENT));
+        let id = restricted(&m, DOOR).await;
+        let (copy, _) = landed(m.declassify(&id, Label::Internal, WHY).await);
+        m.erase(&copy, Reason::Mistaken).await.unwrap();
+        let before = held(&m).await;
+        // the guard in person, and a requester that has no approval
+        for asker in [&m, &agent] {
+            let answer = asker.declassify(&id, Label::Internal, WHY).await;
+            let why = denied(answer, "was erased");
+            assert!(why.contains(&copy), "{why}");
+        }
+        let after = held(&m).await;
+        assert_eq!(after, before, "no entry, no approval and no task");
+        // a copy at another label is another copy
+        let (public, _) = landed(m.declassify(&id, Label::Public, WHY).await);
+        assert_ne!(public, copy);
+    }
+
+    #[tokio::test]
+    async fn only_the_approver_in_person_declines_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, agent) = (owner(dir.path()), session(dir.path(), AGENT));
+        let id = entry(&m, DOOR).await;
+        let task = asked(&agent, &id, "an approval").await;
+        let other = session(dir.path(), "agent:y");
+        let person = session(dir.path(), "human:test:other");
+        for no_approver in [&other, &agent, &person] {
+            let answer = no_approver.invalidate(&task.id, "invalid: no", None).await;
+            denied(answer, "only its approver declines it");
+        }
+        let named = served(Memory::open(dir.path()).unwrap());
+        let answer = named.invalidate(&task.id, "invalid: no", None).await;
+        denied(answer, "declines nothing");
+        // nobody declined: the request is open, and the owner can approve it
+        let again = asked(&agent, &id, "an approval of human:test:me").await;
+        assert_eq!(again.id, task.id);
+        assert!(!again.status.is_terminal(), "{again:?}");
+        approved(&m, &task, None).await;
+        agent.erase(&id, Reason::Mistaken).await.unwrap();
     }
 }
