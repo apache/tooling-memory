@@ -40,6 +40,7 @@ pub mod fabric;
 pub mod log;
 pub mod mcp;
 pub mod platform;
+pub mod positions;
 pub mod prefetch;
 pub mod projection;
 pub mod reads;
@@ -349,6 +350,9 @@ pub struct Memory {
     /// When this service last stamped a write; see [`next_stamp`]. Shared with the
     /// views [`Memory::for_request`] makes, which write for the same service.
     last_stamp: Arc<Mutex<OffsetDateTime>>,
+    /// The position this session fills, when it fills one: a copy of the record taken
+    /// then. Shared by the views of a session ([`Memory::for_request`]).
+    seat: Arc<Mutex<Option<positions::Seated>>>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -506,6 +510,7 @@ impl Memory {
             playback: OnceLock::new(),
             recording: Arc::new(Mutex::new(tape::Recording::default())),
             last_stamp: Arc::new(Mutex::new(OffsetDateTime::UNIX_EPOCH)),
+            seat: Arc::default(),
         })
     }
 
@@ -527,7 +532,7 @@ impl Memory {
     /// When the policy fails to give the read scope.
     pub fn for_request(&self) -> Result<Memory, Error> {
         let scope = self.session_filter()?;
-        let version = self.policy().version().to_string();
+        let version = self.scope_key(&self.policy());
         let mut session = self.grants.session();
         session.handling = session.handling.min(scope.handling);
         Ok(Memory {
@@ -558,18 +563,21 @@ impl Memory {
             playback: self.playback.clone(),
             recording: Arc::clone(&self.recording),
             last_stamp: Arc::clone(&self.last_stamp),
+            seat: Arc::clone(&self.seat),
         })
     }
 
     /// The read filter for this session: the policy's read scope for this principal,
     /// evaluated once and narrowed against the grants, so the policy can take reads
-    /// away and never add them. The session's handling is capped at it as well. The
-    /// decision is logged like any other.
+    /// away and never add them. A session that fills a position reads no higher than
+    /// the handling of the position's envelope. The session's handling is capped at
+    /// the filter as well. The decision is logged like any other.
     fn session_filter(&self) -> Result<ReadFilter, Error> {
         self.fresh()?;
         let policy = self.policy();
-        if let Some((version, f)) = lock(&self.scope).as_ref() {
-            if version == policy.version() {
+        let key = self.scope_key(&policy);
+        if let Some((cached, f)) = lock(&self.scope).as_ref() {
+            if *cached == key {
                 return Ok(f.clone());
             }
         }
@@ -586,9 +594,12 @@ impl Memory {
             spend: None,
             fetch: None,
         };
-        let f = policy
+        let mut f = policy
             .read_scope(&input)?
             .narrow(&self.grants.read_filter());
+        if let Some((_, envelope)) = self.seat_scope() {
+            f.handling = f.handling.min(envelope);
+        }
         {
             // from the grants each time, so a filter that widens again widens the
             // session's handling with it
@@ -617,8 +628,18 @@ impl Memory {
         if lock(&self.scope).is_some() {
             *lock(&self.cache) = recall::Cache::default();
         }
-        *lock(&self.scope) = Some((policy.version().to_string(), f.clone()));
+        *lock(&self.scope) = Some((key, f.clone()));
         Ok(f)
+    }
+
+    /// What a cached read scope was computed under: the version of the policy, and the
+    /// position the session fills. A scope computed under another policy, or before
+    /// the session filled or left a position, is computed again.
+    fn scope_key(&self, policy: &Policy) -> String {
+        match self.seat_scope() {
+            Some((entry, _)) => format!("{} in {entry}", policy.version()),
+            None => policy.version().to_string(),
+        }
     }
 
     /// Show that this session's authority is current, before anything is released
@@ -1197,6 +1218,8 @@ impl Memory {
                 .classification_for_write(&domain, req.classification, &s)
                 .ok_or_else(|| Error::Denied(format!("domain {domain} is not granted")))?
         };
+        let cites = self.cites_for_write(&domain, req.entry_type, req.cites);
+        let cites = cites.await?;
         let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
         // facts decay fast and carry mandatory review dates (the paper, §4): one written
         // without a date gets one ninety days out, which the curator enforces
@@ -1210,7 +1233,7 @@ impl Memory {
                 domain: domain.clone(),
                 author: self.author.clone(),
                 created: now,
-                cites: req.cites,
+                cites,
                 confidence: req.confidence,
                 trust_tier: tier,
                 review_by,
@@ -2155,9 +2178,11 @@ impl Memory {
             ix.list_every(&f, Some(EntryType::Policy))?
         };
         let digest = self.policy_digest(&readable);
+        let position = self.position_slice(&domain).await?;
         let text = t0::render(&t0::Inputs {
             domain: &domain,
             generated_by: &generated_by,
+            position: &position,
             handoffs: &handoffs,
             decisions: &decisions,
             conventions: &conventions,
@@ -2379,6 +2404,7 @@ impl Memory {
             }
         }
         self.bind_definition(&mut spec).await?;
+        self.bind_position(&mut spec).await?;
         let created = l.create(spec).await?;
         // a filing that names a task already there is handed that task, and admits it on
         // its say, only when this session may see it; the answer names nothing of it.
@@ -2922,18 +2948,16 @@ impl Memory {
         let handling = self.handling()?;
         let can = self.capabilities();
         let kept = attempt.map(|k| self.attempt_key(k)).transpose()?;
-        let mut l = self.ledger.lock().await;
-        let claim = match &kept {
-            Some(key) => Self::in_own_words(
-                l.claim_next_once(&domain, &self.author, lease, (&can, handling), key)
-                    .await,
-                attempt,
-            )?,
-            None => {
-                l.claim_next(&domain, &self.author, lease, &can, handling)
-                    .await?
-            }
+        let seat = self.seat_in_force().await?;
+        let who = dm_ledger::Claimer {
+            holder: &self.author,
+            manifest: &can,
+            handling,
+            seat: Self::seat_in(seat.as_ref(), &domain)?,
+            attempt: kept.as_deref(),
         };
+        let mut l = self.ledger.lock().await;
+        let claim = Self::in_own_words(l.claim_next_by(&domain, who, lease).await, attempt)?;
         drop(l);
         if let Some(c) = &claim {
             lock(&self.session).observe(c.task.spec.classification);
@@ -2942,19 +2966,46 @@ impl Memory {
         Ok(claim)
     }
 
+    /// The seat a claim in `domain` is made from: the position this session fills, when
+    /// it fills one. A session in a position claims in the position's domain only.
+    fn seat_in<'a>(
+        seat: Option<&'a positions::Seated>,
+        domain: &str,
+    ) -> Result<Option<dm_ledger::Seat<'a>>, Error> {
+        match seat {
+            Some(s) if s.position.domain != domain => Err(Error::Denied(format!(
+                "this session fills position {} of {}: it claims no task of {domain}",
+                s.position.name, s.position.domain
+            ))),
+            other => Ok(other.map(positions::Seated::seat)),
+        }
+    }
+
     /// Claim one named task. A task above the session's handling is not found, as it is
-    /// to every other read, and the ledger refuses it too.
+    /// to every other read, and the ledger refuses it too. A session that fills a
+    /// position claims as the position: the tasks pinned to it, and the unpinned ones
+    /// its charter covers.
     ///
     /// # Errors
     ///
-    /// A ledger error, including a task outside the grants or above the handling.
+    /// A ledger error, including a task outside the grants or above the handling, and
+    /// a task pinned to a position this session does not fill; [`Error::Stale`] when
+    /// the position this session fills changed; [`Error::Denied`] for a task outside
+    /// the domain of that position.
     pub async fn claim(&self, id: &str, lease: Duration) -> Result<Claim, Error> {
+        let seat = self.seat_in_force().await?;
         let mut l = self.ledger.lock().await;
-        self.check_task(&l.get(id).await?)?;
-        let handling = self.handling()?;
-        let c = l
-            .claim(id, &self.author, lease, &self.capabilities(), handling)
-            .await?;
+        let task = l.get(id).await?;
+        self.check_task(&task)?;
+        let can = self.capabilities();
+        let who = dm_ledger::Claimer {
+            holder: &self.author,
+            manifest: &can,
+            handling: self.handling()?,
+            seat: Self::seat_in(seat.as_ref(), &task.spec.domain)?,
+            attempt: None,
+        };
+        let c = l.claim_by(id, who, lease).await?;
         lock(&self.session).observe(c.task.spec.classification);
         lock(&self.claims).insert(c.task.id.clone(), c.generation);
         Ok(c)

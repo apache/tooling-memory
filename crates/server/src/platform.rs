@@ -465,7 +465,8 @@ impl Memory {
     }
 
     /// What this session can do, as the ledger matches it to a task's requirements: the
-    /// manifest it was given, and each tool the grants give it.
+    /// manifest it was given, and each tool the grants give it. A session that fills a
+    /// position presents no tool outside the position's authority envelope.
     #[must_use]
     pub(crate) fn capabilities(&self) -> Vec<String> {
         let mut all = self.manifest.clone();
@@ -475,6 +476,7 @@ impl Memory {
                 all.push(tool);
             }
         }
+        self.narrow_to_envelope(&mut all);
         all
     }
 }
