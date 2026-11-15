@@ -58,6 +58,7 @@ term here in the same commit as the first document that needs it.
 | gates | The `[gates]` rules on a write: how many entries one session may supersede, and whether a verified entry needs an approver | |
 | approval | An event on the ledger: a person approved one action on one version of one entry, for one principal, until a time. The policy checks it when the action runs | permission (for an approval) |
 | guard | The person who approves a copy of an entry at a lower label: `guard` in the grant of the domain, or the owner | |
+| declassification | A copy of one version of an entry at a lower label, written under an approval of the guard. The copy cites that version, and its origin names the guard. The source does not change | downgrade, lowering (of an entry) |
 | sign-off task | A task that the service files when an action has no approval: it asks the approver for one approval, of one action on one version of one entry, for the principal that asked | approval request |
 | scan | The check of a write and of a tool's answer for instructions, secrets, hidden text and the like. The scan finds; the policy decides | |
 | label | `public`, `internal` or `restricted`, in that order | level, tier (for a label), sensitivity |

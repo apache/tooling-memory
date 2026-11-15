@@ -3208,7 +3208,9 @@ impl Memory {
     /// leaves the ledger, its log and its projection alike, and the receipt counts them;
     /// who promoted which version to which tier, and when, stays. Its approval tasks
     /// keep nothing of it but its id, and an open one is invalidated: nothing is left to
-    /// approve. Run again once finished, it scrubs the ledger again, for a why recorded
+    /// approve. Its sign-off tasks are rewritten the same way, since a request for a copy
+    /// at a lower label says why in the requester's words; the receipt does not count
+    /// them. Run again once finished, it scrubs the ledger again, for a why recorded
     /// after the first run's scrub, and is refused when nothing was left there. Exports
     /// already handed out, the transcripts of sessions that read the entry, and the
     /// queries in the read log are beyond reach and the receipt says so.
@@ -3266,7 +3268,8 @@ impl Memory {
 
     /// An erasure run again once it finished: the ledger's scrub alone. A promotion can
     /// record a why after the first run's scrub, and take it out itself only when the
-    /// ledger lets it; this takes out what it left. The scrub counts every record without
+    /// ledger lets it; this takes out what it left, and what a sign-off task filed since
+    /// then says. The scrub counts every record without
     /// a why and every task it holds redacted, so counts that grew mean it found more, and
     /// the receipt takes them; counts that did not mean the entry was erased already.
     async fn erase_again(
@@ -3281,6 +3284,7 @@ impl Memory {
             .await
             .scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
             .await?;
+        self.scrub_sign_offs(domain, id).await?;
         if scrubbed.records == receipt.promotion_whys_removed
             && scrubbed.tasks == receipt.promotion_tasks_cleared
         {
@@ -3330,6 +3334,9 @@ impl Memory {
             .await
             .scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
             .await?;
+        // a request for an approval can say why in the requester's words, which can be
+        // the entry's words: the sign-off tasks keep the id and nothing else
+        self.scrub_sign_offs(domain, id).await?;
         receipt.promotion_tasks_cleared = scrubbed.tasks;
         receipt.promotion_whys_removed = scrubbed.records;
         close_receipt(&mut receipt, missed);

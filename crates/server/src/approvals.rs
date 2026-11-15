@@ -9,14 +9,21 @@
 //! the approval is recorded first and checked as any other. In person means in a session
 //! that the memory server does not serve. What a served session asks, an agent may have
 //! asked, so such a session signs nothing off, whatever name it carries.
+//!
+//! Two actions are gated here. An erasure is approved by the owner. A declassification
+//! is approved by the guard of the domain: it writes a copy of one version of an entry
+//! at a lower label, and the copy cites that version and names the guard. It is the one
+//! write that lands below the label of the session that makes it.
 
-use crate::{Error, Memory, Promotion, PROPOSAL_ORIGIN};
-use dm_core::{Entry, Label, TrustTier};
-use dm_ledger::{ApprovalRecord, ApprovalSpec, Task, TaskSpec};
+use crate::rules::words_on_one_line;
+use crate::{lock, next_stamp, reads, Error, Memory, Promotion, PROPOSAL_ORIGIN};
+use dm_core::{Entry, EntryType, Frontmatter, Label, TrustTier};
+use dm_ledger::{ApprovalRecord, ApprovalSpec, Redaction, Task, TaskSpec};
 use dm_policy::decide::{Action, ApprovalEvent, ApprovalInput, Class, Filing, Input, Review};
 use dm_policy::Grants;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use time::{Duration, OffsetDateTime};
 
 /// The prefix of the origin of sign-off tasks: `signoff:` and the entry's id.
@@ -136,6 +143,31 @@ pub enum SignOff {
     },
 }
 
+/// What asking for a copy of an entry at a lower label did.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "lowercase")]
+pub enum Declassification {
+    /// The copy is in the record, under an approval of the guard.
+    Declassified {
+        /// The copy.
+        id: String,
+        /// The label of the copy.
+        classification: Label,
+        /// The entry and the version that the copy cites: `<id>@<digest>`.
+        cites: String,
+        /// The approval that the copy landed under.
+        approval: Box<ApprovalRecord>,
+    },
+    /// No approval is in force. A sign-off task asks the guard, and nothing exists at the
+    /// lower label.
+    Proposed {
+        /// The sign-off task. It is classified as the entry.
+        task: Box<Task>,
+        /// Why the copy did not land.
+        reason: String,
+    },
+}
+
 /// An approval, and whether it still permits anything.
 #[derive(Clone, Debug, Serialize)]
 pub struct ApprovalView {
@@ -187,10 +219,49 @@ impl Request<'_> {
     }
 }
 
+/// Where a copy at a lower label lands, and what it says of where it came from.
+struct Landing<'a> {
+    /// The domain of the source, and of the copy.
+    domain: &'a str,
+    /// The label of the copy.
+    to: Label,
+    /// The source and its version: `<id>@<digest>`.
+    cites: &'a str,
+    /// The origin of the copy: the label, the source, its version and the guard.
+    origin: String,
+}
+
 /// The upstream event of a sign-off task: the action, the version, how many approvals
 /// of them the requester had when it asked, and the requester.
 fn sign_off_event(action: Gated, version: &str, given: usize, requester: &str) -> String {
     format!("{}@{version}/{given}/{requester}", action.token())
+}
+
+/// What an erasure of `id` rewrites the sign-off tasks of the entry to: the id that a
+/// stub keeps, and nothing of the reason that a requester gave, which can say what the
+/// entry said.
+fn sign_off_redaction(id: &str) -> Redaction {
+    Redaction {
+        title: format!("Approve: {id}"),
+        body: format!(
+            "`{id}` was erased, and this request is closed with it. Nothing of the entry, nor of why the approval was asked for, is kept here."
+        ),
+        reason: format!("{id} was erased"),
+    }
+}
+
+/// Why an entry that is not live gets no copy at a lower label.
+fn no_copy_of(id: &str, status: dm_core::Status) -> Error {
+    use dm_core::Status;
+    Error::Denied(match status {
+        Status::Erased => format!("{id} is erased; nothing is left to copy"),
+        Status::Superseded => {
+            format!("{id} was replaced; ask for a copy of its current version instead")
+        }
+        Status::Demoted => {
+            format!("{id} was demoted by curation and gets no copy at a lower label")
+        }
+    })
 }
 
 /// The action and the version that the upstream event of a sign-off task names.
@@ -346,8 +417,9 @@ impl Memory {
         Ok(task)
     }
 
-    /// The sign-off task of a request. Its title and its body name the entry by id, so
-    /// an erasure of the entry has nothing to take from the task.
+    /// The sign-off task of a request. Its title and its body name the entry by id. The
+    /// task of a copy also holds the requester's reason, which an erasure of the entry
+    /// takes out again ([`Memory::scrub_sign_offs`]).
     fn sign_off_task(
         &self,
         request: &Request<'_>,
@@ -449,6 +521,172 @@ impl Memory {
                 ],
             );
         }
+    }
+
+    /// Copy an entry to a lower label: a declassification. The copy is a new raw entry
+    /// with the text and the author of the source. It cites the version it was made
+    /// from, and its origin names the guard who approved it. The source stays as it is.
+    ///
+    /// The copy lands only under an approval of the guard of the domain for this version
+    /// and this label, given to the caller and not expired. The guard's own call, in a
+    /// session that the memory server does not serve, is that approval. For any other
+    /// caller that may read the entry, a sign-off task asks the guard, and the answer is
+    /// [`Declassification::Proposed`]. The task is classified as the entry and holds the
+    /// justification. After the guard signs it off, the same call lands the copy. A call
+    /// made again for a copy that landed gives that copy and writes nothing.
+    ///
+    /// To ask is to read the entry: the session's label rises to the entry's label. The
+    /// copy is the one write that lands below the label of its session. The body is text
+    /// that the record holds already, so the scan does not run again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a justification that is empty or is not words on one line,
+    /// a label that is not lower than the entry's, an entry that is not live in the
+    /// record, a request that the guard declined, or a refusal of the policy;
+    /// [`Error::NotFound`] for an entry that this session cannot read; [`Error::Moved`]
+    /// or [`Error::Gone`], as from [`Memory::get`], for one it could read that is no
+    /// longer served; a store, index or ledger error.
+    pub async fn declassify(
+        &self,
+        id: &str,
+        to: Label,
+        justification: &str,
+    ) -> Result<Declassification, Error> {
+        let why = justification.trim();
+        if why.is_empty() || !words_on_one_line(why) {
+            return Err(Error::Denied(
+                "a declassification says why, in words on one line, with no code fence and no markup"
+                    .into(),
+            ));
+        }
+        let filter = self.session_filter()?;
+        if self.index.lock().await.meta(id, &filter)?.is_none() {
+            return Err(self.not_served(id, None).await);
+        }
+        let (domain, entry) = self.find(id).await?;
+        // the index can lag the record: the record says whether the entry is live
+        if let Some(status) = entry.front.status {
+            return Err(no_copy_of(id, status));
+        }
+        let from = entry.front.classification;
+        // before the approval: the guard's own call records one, and a copy that cannot
+        // be must leave none
+        if to >= from {
+            return Err(Error::Denied(format!(
+                "{id} is {from}, and {to} is not lower; a declassification copies an entry to a lower label"
+            )));
+        }
+        if !lock(&self.session).observe(from) {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        let action = Gated::Declassify { to };
+        match self
+            .approval_for(action, &domain, &entry, Some(why))
+            .await?
+        {
+            Gate::Asked { task, reason } => Ok(Declassification::Proposed { task, reason }),
+            Gate::Open(approval) => {
+                self.ran_under(&approval);
+                self.land_copy(&domain, &entry, to, approval).await
+            }
+        }
+    }
+
+    /// The copy of `source` that `approval` permits: the one that landed under an
+    /// approval of this guard for this version and this label, or a new one. The origin
+    /// of a copy names all of them, so a call made again finds the copy by its origin.
+    async fn land_copy(
+        &self,
+        domain: &str,
+        source: &Entry,
+        to: Label,
+        approval: ApprovalRecord,
+    ) -> Result<Declassification, Error> {
+        let cites = format!("{}@{}", source.front.id, approval.spec.version);
+        let origin = format!("declassify:{to}:{cites}:{}", approval.spec.principal);
+        let landed = self.index.lock().await.by_origin(domain, &origin)?;
+        let id = match landed {
+            Some(id) => id,
+            None => {
+                let landing = Landing {
+                    domain,
+                    to,
+                    cites: &cites,
+                    origin,
+                };
+                self.write_copy(source, landing).await?
+            }
+        };
+        Ok(Declassification::Declassified {
+            id,
+            classification: to,
+            cites,
+            approval: Box::new(approval),
+        })
+    }
+
+    /// Write the copy of `source`, as [`Memory::write`] writes an entry, with two
+    /// differences. The classification is the label asked for and is not raised to the
+    /// session's label. The author, the type, the text and the review date are the
+    /// source's. The copy cites the source's version and nothing else: what the source
+    /// cites can be above the copy's label.
+    async fn write_copy(&self, source: &Entry, at: Landing<'_>) -> Result<String, Error> {
+        let from = &source.front;
+        let created = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
+        let copy = Entry {
+            front: Frontmatter {
+                id: dm_core::id::new_entry_id(at.domain),
+                entry_type: from.entry_type,
+                domain: at.domain.to_string(),
+                author: from.author.clone(),
+                created,
+                cites: vec![at.cites.to_string()],
+                confidence: from.confidence,
+                trust_tier: TrustTier::Raw,
+                review_by: from.review_by,
+                supersedes: None,
+                policy_context: Vec::new(),
+                classification: at.to,
+                status: None,
+                origin: Some(at.origin),
+                summary: from.summary.clone(),
+                title: from.title.clone(),
+            },
+            body: source.body.clone(),
+        };
+        self.put_logged(&copy).await?;
+        self.index_put(&copy).await?;
+        // the log of writes names who made the write: this session, not the author
+        reads::wrote(
+            &self.root,
+            &self.session_id,
+            &copy.front.id,
+            &self.author,
+            None,
+        );
+        self.refresh_projection().await;
+        if copy.front.entry_type == EntryType::Policy {
+            self.reload_policy().await?;
+        }
+        self.written.0.fetch_add(1, Ordering::Relaxed);
+        Ok(copy.front.id)
+    }
+
+    /// For an erasure of `id`: rewrite the sign-off tasks of the entry so that they keep
+    /// its id and nothing a requester wrote, in their events too, and invalidate a
+    /// request that is still open.
+    ///
+    /// # Errors
+    ///
+    /// A ledger error; [`dm_ledger::Error::Held`] when another connection holds the log
+    /// that the old text is in.
+    pub(crate) async fn scrub_sign_offs(&self, domain: &str, id: &str) -> Result<(), Error> {
+        let origin = format!("{SIGN_OFF_ORIGIN}{id}");
+        let mut l = self.ledger.lock().await;
+        l.scrub_tasks(domain, &origin, &sign_off_redaction(id))
+            .await?;
+        Ok(())
     }
 
     /// A session that the memory server serves signs nothing off: a harness reaches it,
@@ -1159,5 +1397,373 @@ mod tests {
             assert_eq!(listed[0].record.spec.target, id);
             assert_eq!(reader.label(), Label::Public, "an approval is no read");
         }
+    }
+
+    const GUARD: &str = "human:test:guard";
+    const WHY: &str = "Every visitor gets the code at the door.";
+    const DOOR: &str = "The door code is 4417.";
+
+    /// A restricted entry by the session `m`, with a source of its own.
+    async fn restricted(m: &Memory, body: &str) -> String {
+        let req = WriteRequest {
+            title: Some(TITLE.into()),
+            body: body.into(),
+            cites: vec!["https://example.org/doors".into()],
+            classification: Some(Label::Restricted),
+            ..WriteRequest::default()
+        };
+        m.write(req).await.unwrap().id
+    }
+
+    /// A copy that landed: its id, and the approval it landed under.
+    fn landed(answer: Result<Declassification, Error>) -> (String, ApprovalRecord) {
+        match answer {
+            Ok(Declassification::Declassified { id, approval, .. }) => (id, *approval),
+            other => panic!("expected a copy: {other:?}"),
+        }
+    }
+
+    /// A request that waits for the guard: its sign-off task, and why it waits.
+    fn waits(answer: Result<Declassification, Error>) -> (Task, String) {
+        match answer {
+            Ok(Declassification::Proposed { task, reason }) => (*task, reason),
+            other => panic!("expected a request: {other:?}"),
+        }
+    }
+
+    /// How many entries the record holds, and how many events the ledger holds.
+    async fn held(m: &Memory) -> (usize, u64) {
+        let entries = m.store.list(DOMAIN).await.unwrap().len();
+        let events = m.ledger.lock().await.event_count().await.unwrap();
+        (entries, events)
+    }
+
+    async fn entries(m: &Memory) -> usize {
+        held(m).await.0
+    }
+
+    /// The copy is a raw entry at internal with the source's author and text. It cites
+    /// the version of the source and nothing that the source cites, and its origin names
+    /// the label, the version and the guard.
+    fn is_the_copy_of(copy: &Entry, source: &Entry) {
+        let (c, s) = (&copy.front, &source.front);
+        let version = format!("{}@{}", s.id, dm_core::digest(&source.render()));
+        assert_eq!(c.classification, Label::Internal);
+        let origin = format!("declassify:internal:{version}:{OWNER}");
+        assert_eq!(c.origin.as_deref(), Some(origin.as_str()));
+        assert_eq!(c.cites, [version]);
+        assert_eq!(
+            (c.trust_tier, s.trust_tier),
+            (TrustTier::Raw, TrustTier::Curated)
+        );
+        assert_eq!((c.author.as_str(), &c.title), ("agent:writer", &s.title));
+        assert_eq!((c.status, &c.supersedes), (None, &None));
+        assert_eq!(copy.body, source.body);
+    }
+
+    /// A session that handles internal entries reads the copy, by id and by search, and
+    /// the source stays not found for it.
+    async fn a_session_at_internal_reads_the_copy_alone(dir: &Path, source: &str, copy: &str) {
+        let low = session(dir, "agent:low").with_handling_cap(Label::Internal);
+        assert!(low.get(copy).await.unwrap().body.contains("4417"));
+        let hits = low.search("door code", None, 10).await.unwrap();
+        let found: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(found, [copy]);
+        let answer = low.get(source).await;
+        assert!(matches!(answer, Err(Error::NotFound(_))), "{answer:?}");
+    }
+
+    #[tokio::test]
+    async fn the_guard_s_own_declassification_lands_a_lower_copy_that_cites_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = owner(dir.path());
+        let id = restricted(&session(dir.path(), "agent:writer"), DOOR).await;
+        changed(dir.path(), &id).await;
+        let source = stored(&m, &id).await;
+        let answer = m.declassify(&id, Label::Internal, WHY).await.unwrap();
+        let Declassification::Declassified {
+            id: copy,
+            classification,
+            cites,
+            approval,
+        } = answer
+        else {
+            panic!("expected a copy: {answer:?}")
+        };
+        assert_eq!(classification, Label::Internal);
+        assert_eq!(cites, format!("{id}@{}", dm_core::digest(&source.render())));
+        is_the_copy_of(&stored(&m, &copy).await, &source);
+        assert_eq!(stored(&m, &id).await, source, "the source is as it was");
+        a_session_at_internal_reads_the_copy_alone(dir.path(), &id, &copy).await;
+        let listed = m.approvals(None, Some(&id)).await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].record, *approval);
+        let a = &listed[0].record.spec;
+        assert_eq!(a.action, "declassify:internal");
+        assert_eq!((a.principal.as_str(), a.scope.as_str()), (OWNER, OWNER));
+        // the same call again gives the copy that landed, and writes nothing
+        let (again, _) = landed(m.declassify(&id, Label::Internal, WHY).await);
+        assert_eq!(again, copy);
+        assert_eq!(entries(&m).await, 2, "the source and one copy");
+    }
+
+    /// A session that does not handle the label of a task does not get the task.
+    async fn a_session_below_the_task_does_not_see_it(dir: &Path, task: &Task) {
+        let low = session(dir, "agent:low").with_handling_cap(Label::Internal);
+        let hidden = low.get_task(&task.id).await;
+        assert!(matches!(hidden, Err(Error::Ledger(_))), "{hidden:?}");
+    }
+
+    /// What the session writes next is classified restricted: it read a restricted entry.
+    async fn writes_at_restricted(m: &Memory) {
+        assert_eq!(m.label(), Label::Restricted);
+        let note = WriteRequest {
+            body: "A note.".into(),
+            ..WriteRequest::default()
+        };
+        let written = m.write(note).await.unwrap();
+        assert_eq!(written.classification, Label::Restricted);
+    }
+
+    #[tokio::test]
+    async fn a_declassification_asked_by_another_principal_waits_for_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, agent) = (owner(dir.path()), session(dir.path(), AGENT));
+        let id = restricted(&m, DOOR).await;
+        let (task, reason) = waits(agent.declassify(&id, Label::Internal, WHY).await);
+        assert!(
+            reason.contains("an approval of human:test:me, the guard of dom-me"),
+            "{reason}"
+        );
+        assert_eq!(task.spec.classification, Label::Restricted);
+        assert_eq!(task.spec.created_by, AGENT);
+        assert!(task.spec.body.contains(WHY), "{:?}", task.spec);
+        a_session_below_the_task_does_not_see_it(dir.path(), &task).await;
+        assert_eq!(entries(&m).await, 1, "nothing exists at the lower label");
+        // to ask for a lower copy of an entry is to read the entry
+        writes_at_restricted(&agent).await;
+        approved(&m, &task, None).await;
+        // the requester runs the same call again, here in a new session
+        let later = session(dir.path(), AGENT);
+        let (copy, approval) = landed(later.declassify(&id, Label::Internal, WHY).await);
+        assert_eq!(approval.spec.scope, AGENT);
+        let copy = stored(&m, &copy).await.front;
+        assert_eq!(copy.classification, Label::Internal);
+        writes_at_restricted(&later).await;
+        only_the_guard_that_the_grants_name_signs_a_copy_off().await;
+    }
+
+    /// A root whose domain names a guard that is not the owner.
+    fn guarded(dir: &Path) -> Memory {
+        drop(owner(dir));
+        let path = dir.join(crate::GRANTS_FILE);
+        let mut grants = Grants::load(&path).unwrap();
+        grants.domains.get_mut(DOMAIN).unwrap().guard = Some(GUARD.into());
+        std::fs::write(&path, grants.render().unwrap()).unwrap();
+        Memory::open(dir).unwrap()
+    }
+
+    /// With a guard in the grants, the owner approves no copy, and the owner's own call
+    /// is a request as any other. The guard approves, and the copy names the guard.
+    async fn only_the_guard_that_the_grants_name_signs_a_copy_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = guarded(dir.path());
+        let id = restricted(&m, "The gate code is 2290.").await;
+        let (task, reason) = waits(m.declassify(&id, Label::Internal, WHY).await);
+        assert!(
+            reason.contains("an approval of human:test:guard"),
+            "{reason}"
+        );
+        denied(
+            m.sign_off(&task.id, None).await,
+            "human:test:guard approves declassify in dom-me; human:test:me does not",
+        );
+        let guard = session(dir.path(), GUARD);
+        let approval = approved(&guard, &task, None).await;
+        let spec = &approval.spec;
+        assert_eq!(
+            (spec.principal.as_str(), spec.scope.as_str()),
+            (GUARD, OWNER)
+        );
+        let (copy, _) = landed(m.declassify(&id, Label::Internal, WHY).await);
+        let origin = stored(&m, &copy).await.front.origin.unwrap_or_default();
+        assert!(origin.ends_with(":human:test:guard"), "{origin}");
+    }
+
+    #[tokio::test]
+    async fn a_declassification_is_for_one_version_and_one_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, agent) = (owner(dir.path()), session(dir.path(), AGENT));
+        let id = restricted(&m, DOOR).await;
+        let (first, _) = waits(agent.declassify(&id, Label::Internal, WHY).await);
+        approved(&m, &first, None).await;
+        let (copy, _) = landed(agent.declassify(&id, Label::Internal, WHY).await);
+        // the source has a new version: the approval and the copy are of the old one
+        changed(dir.path(), &id).await;
+        let (second, reason) = waits(agent.declassify(&id, Label::Internal, WHY).await);
+        assert_ne!(second.id, first.id);
+        assert!(reason.contains("another version"), "{reason}");
+        assert_eq!(entries(&m).await, 2, "no copy of the new version yet");
+        // an approval of a copy at internal is no approval of a copy at public
+        approved(&m, &second, None).await;
+        let (third, _) = waits(agent.declassify(&id, Label::Public, WHY).await);
+        let event = third.spec.upstream_event.clone().unwrap_or_default();
+        assert!(event.starts_with("declassify:public@"), "{event}");
+        assert_eq!(entries(&m).await, 2, "no copy at public");
+        // each version and each label has its own copy
+        let (newer, _) = landed(agent.declassify(&id, Label::Internal, WHY).await);
+        approved(&m, &third, None).await;
+        let (public, _) = landed(agent.declassify(&id, Label::Public, WHY).await);
+        assert!(copy != newer && newer != public && public != copy);
+        let public = stored(&m, &public).await.front;
+        assert_eq!(public.classification, Label::Public);
+        assert_eq!(entries(&m).await, 4);
+    }
+
+    /// An entry that the record holds as replaced while the index still serves it.
+    async fn replaced_in_the_record_alone(m: &Memory) -> String {
+        let id = entry(m, "The side door has no code.").await;
+        let mut successor = stored(m, &id).await;
+        successor.front.id = dm_core::id::new_entry_id(DOMAIN);
+        successor.front.supersedes = Some(id.clone());
+        m.store.put(&successor).await.unwrap();
+        assert_eq!(
+            stored(m, &id).await.front.status,
+            Some(dm_core::Status::Superseded),
+            "the record marks it"
+        );
+        id
+    }
+
+    /// No label that is not lower than the entry's, and no justification that is not
+    /// words on one line.
+    async fn refuses_what_is_no_declassification(m: &Memory, restricted: &str, internal: &str) {
+        let before = held(m).await;
+        let mut whys = Vec::new();
+        for (id, to) in [
+            (restricted, Label::Restricted),
+            (internal, Label::Restricted),
+            (internal, Label::Internal),
+        ] {
+            let why = denied(m.declassify(id, to, WHY).await, "is not lower");
+            whys.push((id, why));
+        }
+        // the guard's own call is refused before its approval is recorded
+        assert_eq!(held(m).await, before, "a refused label records nothing");
+        assert!(whys.iter().all(|(id, why)| why.starts_with(id)), "{whys:?}");
+        for no_words in ["", " \n", "Two\nlines.", "See <b>this</b>.", "```"] {
+            let answer = m.declassify(restricted, Label::Internal, no_words).await;
+            denied(answer, "words on one line");
+        }
+    }
+
+    /// Three entries that are not live: one replaced, one erased, and one that the
+    /// record holds as replaced while the index still serves it.
+    async fn not_live(m: &Memory) -> [String; 3] {
+        let old = entry(m, "The gate code was 1180.").await;
+        let new = WriteRequest {
+            body: "The gate code is 2290.".into(),
+            supersedes: Some(old.clone()),
+            ..WriteRequest::default()
+        };
+        m.write(new).await.unwrap();
+        let erased = entry(m, "The key is under the mat.").await;
+        m.erase(&erased, Reason::Mistaken).await.unwrap();
+        [old, erased, replaced_in_the_record_alone(m).await]
+    }
+
+    /// The kind of an answer that is no refusal of the policy and no copy.
+    fn kind(answer: Result<Declassification, Error>) -> &'static str {
+        match answer {
+            Err(Error::NotFound(_)) => "not found",
+            Err(Error::Moved { .. }) => "moved",
+            Err(Error::Gone(_)) => "gone",
+            other => panic!("expected an entry that is not served: {other:?}"),
+        }
+    }
+
+    /// An entry that the session may not read is not found. One that it could read and
+    /// that is not live is refused: as a read of it is, or by the record when the index
+    /// still serves it.
+    async fn refuses_what_is_not_there(m: &Memory, restricted: &str) {
+        let low = session(m.root(), "agent:low").with_handling_cap(Label::Internal);
+        let answer = low.declassify(restricted, Label::Public, WHY).await;
+        assert_eq!(kind(answer), "not found");
+        let [old, erased, lagging] = not_live(m).await;
+        let before = held(m).await;
+        assert_eq!(kind(m.declassify(&old, Label::Public, WHY).await), "moved");
+        let answer = m.declassify(&erased, Label::Public, WHY).await;
+        assert_eq!(kind(answer), "gone");
+        let answer = m.declassify(&lagging, Label::Public, WHY).await;
+        denied(
+            answer,
+            "was replaced; ask for a copy of its current version",
+        );
+        assert_eq!(held(m).await, before, "a refusal records nothing");
+    }
+
+    #[tokio::test]
+    async fn a_declassification_that_cannot_be_is_refused_before_anything_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = owner(dir.path());
+        let id = restricted(&m, DOOR).await;
+        let internal = entry(&m, "The gate code is 2290.").await;
+        let before = held(&m).await;
+        refuses_what_is_no_declassification(&m, &id, &internal).await;
+        assert_eq!(held(&m).await, before, "a refusal records nothing");
+        assert_eq!(m.label(), Label::Public, "and reads nothing");
+        refuses_what_is_not_there(&m, &id).await;
+        // a session of the owner's name that the memory server serves lands no copy: its
+        // call is a request
+        let before = entries(&m).await;
+        let named = served(Memory::open(dir.path()).unwrap());
+        let (task, _) = waits(named.declassify(&id, Label::Internal, WHY).await);
+        assert_eq!(task.spec.created_by, OWNER);
+        assert!(on_ledger(&m).await.iter().all(|a| a.spec.action == "erase"));
+        assert_eq!(entries(&m).await, before, "no copy");
+    }
+
+    /// Every sign-off task of the entry is closed, and holds the id of the entry and
+    /// nothing that a requester wrote. Gives how many there are.
+    async fn closed_with_the_id_alone(m: &Memory, id: &str) -> usize {
+        let tasks = sign_offs(m, id).await;
+        for task in &tasks {
+            let all = format!("{task:?}");
+            assert!(!all.contains("4417") && !all.contains("visitor"), "{all}");
+            assert_eq!(task.spec.title, format!("Approve: {id}"));
+            assert_eq!(task.status, Status::Invalidated, "{all}");
+        }
+        tasks.len()
+    }
+
+    #[tokio::test]
+    async fn an_erasure_of_the_source_takes_the_request_and_flags_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, agent) = (owner(dir.path()), session(dir.path(), AGENT));
+        let id = restricted(&m, DOOR).await;
+        let (copy, _) = landed(m.declassify(&id, Label::Internal, WHY).await);
+        let said = "The door code 4417 is for every visitor.";
+        let (task, _) = waits(agent.declassify(&id, Label::Internal, said).await);
+        assert!(task.spec.body.contains(said), "{:?}", task.spec);
+        let receipt = m.erase(&id, Reason::Mistaken).await.unwrap();
+        assert!(receipt.is_finished(), "{receipt:?}");
+        assert_eq!(receipt.flagged, [copy], "the copy is for review");
+        assert_eq!(closed_with_the_id_alone(&m, &id).await, 1);
+        // the events hold nothing of it either: a replay brings nothing back
+        m.ledger.lock().await.rebuild().await.unwrap();
+        assert_eq!(closed_with_the_id_alone(&m, &id).await, 1);
+        // a request that reaches the ledger after the erasure goes with the next run
+        let late = TaskSpec {
+            domain: DOMAIN.into(),
+            title: format!("Approve: copy of {id} at internal"),
+            body: format!("Why: {said}"),
+            origin: Some(format!("{SIGN_OFF_ORIGIN}{id}")),
+            upstream_event: Some(format!("declassify:internal@late/0/{AGENT}")),
+            classification: Label::Restricted,
+            ..TaskSpec::default()
+        };
+        m.ledger.lock().await.create(late).await.unwrap();
+        denied(m.erase(&id, Reason::Mistaken).await, "already erased");
+        assert_eq!(closed_with_the_id_alone(&m, &id).await, 2);
     }
 }
