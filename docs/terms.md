@@ -56,6 +56,7 @@ term here in the same commit as the first document that needs it.
 | reset | `amem policy reset`: the owner retires each rule of a domain that no person wrote, promoted or approved | purge |
 | amendment | A task for the owner of a rule, with evidence, that asks for a change to the rule | |
 | gates | The `[gates]` rules on a write: how many entries one session may supersede, and whether a verified entry needs an approver | |
+| version (of an entry) | The text of an entry at one time. Each write and each promotion makes a new version. The digest of the text names the version: `<id>@<digest>` cites one version, and an approval names one | revision |
 | approval | An event on the ledger: a person approved one action on one version of one entry, for one principal, until a time. The policy checks it when the action runs | permission (for an approval) |
 | guard | The person who approves a copy of an entry at a lower label: `guard` in the grant of the domain, or the owner | |
 | declassification | A copy of one version of an entry at a lower label, written under an approval of the guard. The copy cites that version, and its origin names the guard. The source does not change | downgrade, lowering (of an entry) |

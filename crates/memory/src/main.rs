@@ -608,9 +608,38 @@ enum Command {
         #[arg(long)]
         why: String,
     },
-    /// Approve a proposal to promote an entry to verified. The approver did not
-    /// propose it, and is a person.
-    Approve { task: String },
+    /// Approve what a task asks a person for. A proposal to promote an entry to verified
+    /// is promoted: the approver did not propose it, and is a person. A sign-off task
+    /// gets an approval of the action and the version that it names, for the principal
+    /// that asked. The action does not run here: the requester runs it again.
+    Approve {
+        task: String,
+        /// When the approval of a sign-off task expires, RFC 3339. 24 hours from now
+        /// when omitted. A proposal to verify takes no expiry.
+        #[arg(long, value_parser = rfc3339_time)]
+        expires: Option<time::OffsetDateTime>,
+    },
+    /// The approvals on the ledger, as JSON, oldest first: who approved which action on
+    /// which version of which entry, for which principal, until when, and whether the
+    /// approval is still in force.
+    Approvals {
+        /// One entry; every entry of the domain when omitted.
+        id: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Copy an entry to a lower label: a declassification. The copy cites the version
+    /// it was made from and names the guard who approved it. The call of the guard is
+    /// the approval. For any other caller, a sign-off task asks the guard.
+    Declassify {
+        id: String,
+        /// The label of the copy: lower than the label of the entry.
+        #[arg(long, value_enum)]
+        to: LabelArg,
+        /// Why the text may be read at the lower label, in words on one line.
+        #[arg(long)]
+        why: String,
+    },
     /// Why each promotion of an entry was made, as JSON, oldest first. A proposal to
     /// verified is listed, not landed until a person approves it. An auditor reads it
     /// after judging the change, not before.
@@ -996,14 +1025,21 @@ enum Command {
     /// Rebuild the index from the record and the ledger from its events.
     Reindex,
     /// Erase an entry: the body leaves every version and the index, a stub and a receipt
-    /// remain, and entries that cite it are flagged for review. Irreversible; the owner
-    /// only.
+    /// remain, and entries that cite it are flagged for review. Irreversible. It runs
+    /// only under an approval of the owner for this version of the entry, and the
+    /// owner's own call here is that approval.
     Erase {
         id: String,
         /// Why, as a class: the receipt keeps it.
         #[arg(long, value_enum)]
         reason: ReasonArg,
     },
+}
+
+/// A time on the command line, as RFC 3339.
+fn rfc3339_time(text: &str) -> Result<time::OffsetDateTime, String> {
+    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .map_err(|e| format!("{e}: give the time as RFC 3339, for example 2027-01-31T17:00:00Z"))
 }
 
 /// Why an entry is erased, on the command line.
@@ -4651,6 +4687,19 @@ async fn check_cmd(
     }))
 }
 
+/// `amem approve`, `amem approvals` and `amem declassify`: the approvals a person
+/// gives, and the copy at a lower label that runs under one.
+async fn approval_cmd(m: &Memory, command: Command) -> Fallible {
+    match command {
+        Command::Approve { task, expires } => json(&m.sign_off(&task, expires).await?),
+        Command::Approvals { id, domain } => {
+            json(&m.approvals(domain.as_deref(), id.as_deref()).await?)
+        }
+        Command::Declassify { id, to, why } => json(&m.declassify(&id, to.into(), &why).await?),
+        _ => unreachable!("routed by maintain"),
+    }
+}
+
 /// `amem policy`, `amem quarantine`, `amem taint`, `amem canary`, `amem erase` and
 /// `amem reindex`: the perimeter's commands and the record's repair.
 async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
@@ -4717,7 +4766,6 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         } => json(&m.release_quarantined(&id, false).await?),
         Command::Taint { id } => json(&m.taint(&id)),
         Command::Promote { id, to, why } => json(&m.promote(&id, to.parse()?, &why).await?),
-        Command::Approve { task } => json(&m.approve(&task).await?),
         Command::Promotions { id } => json(&m.promotions(&id).await?),
         Command::Canary { op } => canary_cmd(m, op).await,
         Command::Erase { id, reason } => json(&m.erase(&id, reason.into()).await?),
@@ -4892,10 +4940,13 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
             let workdir = workdir.or_else(|| std::env::current_dir().ok());
             curator_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
         }
+        cmd
+        @ (Command::Approve { .. } | Command::Approvals { .. } | Command::Declassify { .. }) => {
+            approval_cmd(m, cmd).await
+        }
         cmd @ (Command::Canary { .. }
         | Command::Erase { .. }
         | Command::Promote { .. }
-        | Command::Approve { .. }
         | Command::Promotions { .. }
         | Command::Reindex
         | Command::Policy { .. }
