@@ -277,6 +277,11 @@ pub struct Written {
     pub classification: Label,
     /// Its domain.
     pub domain: String,
+    /// When the entry landed withheld: the erased entry, or the erased transcript, that
+    /// this session had read before the erasure. Retrieval does not serve the entry
+    /// until the owner releases it ([`Memory::release_withheld`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 /// One root, opened.
@@ -1254,19 +1259,36 @@ impl Memory {
         // copy that fails is late, not lost: the next one starts where this one stopped
         let _ = self.ledger_into_log(&entry.front.domain).await;
         let offered = self.log_offered(&mut entry)?;
-        let replaced = self.gate(&entry, offered).await?;
-        // a policy entry written, or one replaced by an entry of any kind, changes what
-        // is in force
-        let policy_changed = entry.front.entry_type == EntryType::Policy
-            || replaced.is_some_and(|old| old.front.entry_type == EntryType::Policy);
-        let put = self.put_logged(&entry).await?;
+        let (policy_changed, put) = match self.screen_and_put(&entry, offered).await {
+            Ok(taken) => taken,
+            Err(e) => {
+                // the log holds the `write` event: it says too that the record did not
+                // take the entry, or lineage would name an entry that does not exist
+                self.log_not_taken(&entry, offered);
+                return Err(e);
+            }
+        };
         self.feed_from(&entry.front.domain, put).await?;
+        let withheld = self.withhold_after_erased_read(&entry).await?;
         self.after_write(&entry, policy_changed).await?;
         Ok(Written {
             classification: entry.front.classification,
             domain: entry.front.domain,
             id: entry.front.id,
+            withheld,
         })
+    }
+
+    /// The gates on the write that the log holds as event `offered`, and then the
+    /// record. Returns whether the write changes the policy in force, and the sequence
+    /// number of its `put` event: where the feed of the index starts.
+    async fn screen_and_put(&self, entry: &Entry, offered: u64) -> Result<(bool, u64), Error> {
+        let replaced = self.gate(entry, offered).await?;
+        // a policy entry written, or one replaced by an entry of any kind, changes what
+        // is in force
+        let policy_changed = entry.front.entry_type == EntryType::Policy
+            || replaced.is_some_and(|old| old.front.entry_type == EntryType::Policy);
+        Ok((policy_changed, self.put_logged(entry).await?))
     }
 
     /// The entry a request asks for, as this session writes it: a new id, this author,
@@ -2072,20 +2094,26 @@ impl Memory {
     }
 
     /// The entries in quarantine, for the security role: the owner, and each author the
-    /// grants list under `security`.
+    /// grants list under `security`. A held entry is read as its events in the log are:
+    /// only a session that handles the highest classification is given any, and the
+    /// label of a session that is given one rises to the highest.
     ///
     /// # Errors
     ///
     /// [`Error::Denied`] for an author outside the security role; a quarantined file
-    /// that does not parse.
+    /// that does not parse; a policy that fails to give the read scope.
     pub fn quarantined(&self) -> Result<Vec<Entry>, Error> {
         if !self.grants.is_security(&self.author) {
             return Err(Error::Denied(
                 "the quarantine is for the owner and the security role".into(),
             ));
         }
-        let dir = self.root.join("state/quarantine");
         let mut out = Vec::new();
+        // a held entry is at the highest classification, as its events in the log are
+        if self.handling()? < Label::Restricted {
+            return Ok(out);
+        }
+        let dir = self.root.join("state/quarantine");
         let Ok(rd) = std::fs::read_dir(&dir) else {
             return Ok(out);
         };
@@ -2102,6 +2130,9 @@ impl Memory {
                 source: e,
             })?;
             out.push(Entry::parse(&text)?);
+        }
+        if !out.is_empty() {
+            lock(&self.session).observe(Label::Restricted);
         }
         Ok(out)
     }
@@ -2137,6 +2168,7 @@ impl Memory {
                 id: entry.front.id.clone(),
                 classification: entry.front.classification,
                 domain: entry.front.domain.clone(),
+                withheld: None,
             })
         } else {
             None
@@ -3726,27 +3758,41 @@ impl Memory {
     ///
     /// A store, index, or ledger error.
     pub async fn reindex(&self) -> Result<(usize, u64), Error> {
-        // where each log stands before the record is read: the index is built from the
-        // record as it is after that, so the feed has nothing to take below it. A version
-        // logged later is fed by its writer
-        let mut logged = Vec::new();
-        for domain in self.domains() {
-            logged.push((self.last_logged(&domain)?, domain));
-        }
         let entries = self.store.all().await?;
-        let n = {
-            let mut ix = self.index.lock().await;
-            let n = ix.rebuild(entries)?;
-            for (seq, domain) in &logged {
-                ix.set_fed(domain, *seq)?;
-            }
-            n
-        };
+        let n = self.rebuild_index(None, entries).await?;
         let m = self.ledger.lock().await.rebuild().await?;
         // the policy is compiled from the index: a rebuilt index can hold rules the old
         // one had lost, and every open session must decide under them
         self.reload_policy().await?;
         Ok((n, m))
+    }
+
+    /// Replace the index, or the part of it that is `domain`'s, with `entries`, a read
+    /// of the record, and then feed it the whole log of each domain replaced. Returns
+    /// how many entries the read held.
+    ///
+    /// Another process can write while the record is read. Its version is then not
+    /// among `entries`, and its feed can come before the rebuild, which removes the row.
+    /// So the rebuild puts the cursor back at zero in its own transaction, and the feed
+    /// after it takes every entry that the log names from the record as it is by then.
+    /// A rebuild that stops before that feed leaves a cursor at zero: `freshness` says
+    /// that versions wait, and the next feed or the next write takes them.
+    pub(crate) async fn rebuild_index(
+        &self,
+        domain: Option<&str>,
+        entries: Vec<Entry>,
+    ) -> Result<usize, Error> {
+        let (n, domains) = {
+            let mut ix = self.index.lock().await;
+            match domain {
+                Some(d) => (ix.rebuild_domain(d, entries)?, vec![d.to_string()]),
+                None => (ix.rebuild(entries)?, self.domains()),
+            }
+        };
+        for d in &domains {
+            self.feed_from(d, u64::MAX).await?;
+        }
+        Ok(n)
     }
 }
 
@@ -7847,6 +7893,59 @@ mod tests {
                 .is_err(),
             "outside the task the rule holds"
         );
+    }
+
+    /// The planted entry is one that the owner must erase. The person who wrote the
+    /// rule and the exception read it in that session, so both are downstream of it.
+    #[tokio::test]
+    async fn an_erasure_takes_an_exception_out_of_force_and_leaves_a_verified_rule_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let decision = |b: &str| WriteRequest {
+            entry_type: EntryType::Decision,
+            ..req(b)
+        };
+        let d1 = owner.write(decision("Use SQLite.\n")).await.unwrap().id;
+        let held = filed(&owner, tspec("Replace the decision", 0, None, &[], &[])).await;
+        let planter = Memory::open(dir.path()).unwrap().with_author("agent:p");
+        let planted = planter.write(req("Planted.\n")).await.unwrap().id;
+        let lead = Memory::open(dir.path()).unwrap();
+        lead.get(&planted).await.unwrap();
+        let rule = policy_entry(&lead, RULE).await;
+        let exception = format!(
+            "# Exception\n\n```policy\nid = \"exc-2026-001\"\nlayer = 2\nbreaches = \"pol-L2-031\"\nscope_task = \"{}\"\nexpires = \"2099-01-01T00:00:00Z\"\nintent = \"The task is to replace it.\"\n```\n",
+            held.id
+        );
+        let exc = policy_entry(&lead, &exception).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        verify(&owner, &agent, &rule).await;
+        verify(&owner, &agent, &exc).await;
+        // in force: the rule refuses, and the exception lets the one task through
+        let supersede = |of: &str| WriteRequest {
+            supersedes: Some(of.to_string()),
+            ..decision("Use files.\n")
+        };
+        let outside = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let refused = outside.write(supersede(&d1)).await.unwrap_err();
+        assert!(refused.to_string().contains("pol-L2-031"), "{refused}");
+        let inside = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        inside.set_held_task(&held.id);
+        let d2 = inside.write(supersede(&d1)).await.unwrap().id;
+
+        let receipt = owner.erase(&planted, Reason::Requested).await.unwrap();
+        assert_eq!(receipt.withheld, std::slice::from_ref(&exc));
+        assert_eq!(receipt.further, std::slice::from_ref(&rule));
+        let status = |e: Option<Entry>| e.and_then(|e| e.front.status);
+        let kept = owner.store.get("dom-me", &rule).await.unwrap();
+        assert_eq!(status(kept), None);
+        let kept = owner.store.get("dom-me", &exc).await.unwrap();
+        assert_eq!(status(kept), Some(dm_core::Status::Withheld));
+        // the sessions that were open at the erasure decide under the policy as it is
+        // now: the exception permits nothing, and the rule refuses as before
+        for session in [&inside, &outside] {
+            let refused = session.write(supersede(&d2)).await.unwrap_err();
+            assert!(refused.to_string().contains("pol-L2-031"), "{refused}");
+        }
     }
 
     fn tspec(

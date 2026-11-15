@@ -618,7 +618,9 @@ impl Memory {
 
     /// One turn of a transcript, by citation: served only when an entry this session
     /// may read cites it, under the session's filter, and the session's label rises to
-    /// the transcript's classification as a `get` raises it to an entry's. Once the
+    /// the transcript's classification as a `get` raises it to an entry's. A turn served
+    /// leaves a `read` event in the log of the domain, which names the transcript by its
+    /// session, and for an excerpt the entry that keeps it too. Once the
     /// transcript has expired, the turn is served from the excerpt of a citing entry the
     /// session may read, which is how an excerpt is demoted and erased with its entry.
     ///
@@ -661,6 +663,9 @@ impl Memory {
         if cited_by.is_empty() || !lock(&self.session).observe(t.classification) {
             return Ok(None);
         }
+        // a turn served is read: the log names the transcript, so lineage follows what
+        // this session writes after it, and an erasure of the transcript reaches that
+        self.log_read(&t.domain, vec![t.session.clone()], t.classification)?;
         Ok(Some(TurnRead {
             session: t.session.clone(),
             turn,
@@ -705,6 +710,10 @@ impl Memory {
             {
                 continue;
             }
+            // the excerpt is text of the transcript, kept with the entry and erased with
+            // either: the read names both
+            let read = vec![x.entry.clone(), x.session.clone()];
+            self.log_read(&meta.hit.domain, read, x.classification)?;
             return Ok(Some(TurnRead {
                 session: x.session,
                 turn,
@@ -950,7 +959,7 @@ impl Memory {
         Ok(pending)
     }
 
-    async fn put_transcript_receipt(&self, r: &Receipt) -> Result<(), Error> {
+    pub(crate) async fn put_transcript_receipt(&self, r: &Receipt) -> Result<(), Error> {
         self.store
             .put_object(
                 &r.domain,
@@ -1879,5 +1888,55 @@ mod tests {
         let again = m.keep_transcript(keep("a.jsonl")).await.unwrap();
         assert_eq!(again.session, k.session);
         assert!(holding(&rec, "zanzibar").is_empty());
+    }
+    #[tokio::test]
+    async fn an_erased_transcript_withholds_what_a_reader_of_its_turns_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let k = m.keep_transcript(keep("a.jsonl")).await.unwrap();
+        let h = citing(&m, &k.session, &[2, 4], "Handoff: the cache helps.\n").await;
+        // another session reads a cited turn, and writes from it without a citation
+        let reader = Memory::open(dir.path()).unwrap().with_author("agent:r");
+        let body = |text: &str| WriteRequest {
+            body: text.into(),
+            ..WriteRequest::default()
+        };
+        let before = reader.write(body("Before the turn.\n")).await.unwrap().id;
+        reader.transcript_turn(&k.session, 2).await.unwrap();
+        let drawn = reader.write(body("The cache is warm.\n")).await.unwrap();
+        assert_eq!(drawn.withheld, None);
+        let status = |id: String| {
+            let m = &m;
+            async move {
+                m.store
+                    .get("dom-me", &id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .front
+                    .status
+            }
+        };
+        let r = m
+            .erase_transcript(&k.session, Reason::Sensitive)
+            .await
+            .unwrap();
+        let mut withheld = r.withheld.clone();
+        withheld.sort();
+        let mut want = vec![h, drawn.id.clone()];
+        want.sort();
+        assert_eq!(withheld, want);
+        assert_eq!(status(drawn.id).await, Some(Status::Withheld));
+        assert_eq!(status(before).await, None, "written before the read");
+        // what the reader writes after the erasure lands withheld, on the same receipt
+        let late = reader.write(body("Still warm.\n")).await.unwrap();
+        assert_eq!(late.withheld.as_deref(), Some(k.session.as_str()));
+        assert_eq!(status(late.id.clone()).await, Some(Status::Withheld));
+        let receipt = m.transcript_erasure(&k.session).await.unwrap().unwrap();
+        assert!(
+            receipt.withheld.contains(&late.id),
+            "{:?}",
+            receipt.withheld
+        );
     }
 }

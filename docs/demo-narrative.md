@@ -475,10 +475,12 @@ and writes a second note, which does not name the first note. Then you export th
 You erase the first note. The receipt lists the second note as withheld. It also lists
 the export as a send: a copy that the erasure cannot reach. The stub in the record keeps
 the id, the type, the domain, the date, the session, the label and the erased status. Its
-author is now the word `erased`. It keeps no text. A search for the second note finds
-nothing. `amem withheld list` names the second note, and the erased note as the cause.
-You read the second note, you decide that it is correct, and you release it. The search
-finds it again.
+author is now the word `erased`. It keeps no text. The session of `agent:reader` is still
+open, and the first note is in its context. It writes a third note. The answer to that
+write says that the note is withheld, and names the erased note. A search for the second
+note finds nothing. `amem withheld list` names the second note and the third note, each
+with the erased note as the cause. You read the second note, you decide that it is
+correct, and you release it. The search finds it again.
 
 ## Act 11 · What this is not, yet
 

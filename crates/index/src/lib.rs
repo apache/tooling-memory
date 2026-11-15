@@ -499,7 +499,9 @@ impl Index {
     }
 
     /// Replace the whole index with what the record holds. One transaction: a reader
-    /// sees the old index or the new one, never half.
+    /// sees the old index or the new one, never half. The cursor of every domain goes
+    /// back to zero in that transaction: the rows a feed wrote are gone, so nothing
+    /// says they are there. The caller feeds each log again ([`Index::set_fed`]).
     ///
     /// # Errors
     ///
@@ -509,7 +511,7 @@ impl Index {
         I: IntoIterator<Item = Entry>,
     {
         let tx = self.conn.transaction()?;
-        tx.execute_batch("DELETE FROM entries; DELETE FROM entries_fts;")?;
+        tx.execute_batch("DELETE FROM entries; DELETE FROM entries_fts; DELETE FROM fed;")?;
         let mut n = 0;
         for e in entries {
             Index::upsert_in(&tx, &e)?;
@@ -520,7 +522,8 @@ impl Index {
     }
 
     /// Replace one domain's part of the index with `entries`, in one transaction: what a
-    /// domain's materializer builds, leaving every other domain as it was.
+    /// domain's materializer builds, leaving every other domain as it was. The cursor of
+    /// the domain goes back to zero in that transaction, as in [`Index::rebuild`].
     ///
     /// # Errors
     ///
@@ -530,6 +533,7 @@ impl Index {
         I: IntoIterator<Item = Entry>,
     {
         let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM fed WHERE domain = ?1", params![domain])?;
         tx.execute(
             "DELETE FROM entries_fts WHERE id IN (SELECT id FROM entries WHERE domain = ?1)",
             params![domain],
@@ -1321,13 +1325,24 @@ mod tests {
             assert_eq!(ix.fed("dom-a").unwrap(), 7, "a lower number is not taken");
             ix.set_fed("dom-a", 9).unwrap();
             assert_eq!((ix.fed("dom-a").unwrap(), ix.fed("dom-b").unwrap()), (9, 2));
-            // a rebuild replaces the entries and keeps how far the log was read
-            ix.rebuild(Vec::new()).unwrap();
-            ix.rebuild_domain("dom-a", Vec::new()).unwrap();
-            assert_eq!(ix.fed("dom-a").unwrap(), 9);
         }
         assert_eq!(Index::open(&path).unwrap().fed("dom-a").unwrap(), 9);
         assert_eq!(Index::open_reader(&path).unwrap().fed("dom-b").unwrap(), 2);
+    }
+
+    #[test]
+    fn a_rebuild_puts_the_cursor_back_at_zero_with_the_rows_it_replaces() {
+        let mut ix = Index::in_memory().unwrap();
+        ix.set_fed("dom-a", 9).unwrap();
+        ix.set_fed("dom-b", 2).unwrap();
+        // one domain's rebuild moves that domain's cursor and no other
+        ix.rebuild_domain("dom-a", Vec::new()).unwrap();
+        assert_eq!((ix.fed("dom-a").unwrap(), ix.fed("dom-b").unwrap()), (0, 2));
+        ix.set_fed("dom-a", 4).unwrap();
+        assert_eq!(ix.fed("dom-a").unwrap(), 4, "the next feed sets it again");
+        // a rebuild of the whole index moves every cursor
+        ix.rebuild(Vec::new()).unwrap();
+        assert_eq!((ix.fed("dom-a").unwrap(), ix.fed("dom-b").unwrap()), (0, 0));
     }
 
     #[test]

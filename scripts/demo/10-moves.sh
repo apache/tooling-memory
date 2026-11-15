@@ -36,12 +36,18 @@ victim=$("$memory" --root "$work/elsewhere" search "DR-19 MoinMoin" | j "d[0]['i
 echo "  erased $victim there"
 "$memory" --root "$work/elsewhere" import "$work/internal" --domain dom-elsewhere 2>&1 | sed 's/^/  /'
 
-say "An erasure follows lineage" "You write a note in error. An agent reads it and writes a second note, and the domain is exported. You erase the first note. The erasure follows the log: the second note is withheld from every read until it is derived again or you release it, and the receipt names the export, a copy that no erasure can reach."
+say "An erasure follows lineage" "You write a note in error. An agent reads it and writes a second note, and the domain is exported. You erase the first note. The erasure follows the log: the second note is withheld from every read until it is derived again or you release it, and the receipt names the export, a copy that no erasure can reach. The agent's session is still open, with the first note in its context. It writes a third note, and that note is withheld as it lands."
 wrong=$(a write --domain dom-demo --kind fact --title "The walkthrough moved" --body "Written in error: the walkthrough moved to room 4.12." | j "d['id']")
-derived=$(agent agent:reader batch "[{\"tool\": \"get\", \"arguments\": {\"id\": \"$wrong\"}}, {\"tool\": \"write\", \"arguments\": {\"title\": \"Where visitors go\", \"body\": \"The visitors of the walkthrough go to the new room this week.\"}}]" | j "d['id']")
+# what you do while the agent's session is open: the export, and then the erasure
+printf '%s\n' \
+  "\"$memory\" --root \"$root\" export \"$work/after\" --domain dom-demo --max-label internal > \"$work/export.out\" 2>&1" \
+  "\"$memory\" --root \"$root\" erase \"$wrong\" --reason mistaken > \"$work/receipt.json\"" > "$work/erase.sh"
+agent agent:reader steps "[{\"tool\": \"get\", \"arguments\": {\"id\": \"$wrong\"}}, {\"tool\": \"write\", \"arguments\": {\"title\": \"Where visitors go\", \"body\": \"The visitors of the walkthrough go to the new room this week.\"}}, {\"run\": \"sh $work/erase.sh\"}, {\"tool\": \"write\", \"arguments\": {\"title\": \"Where visitors wait\", \"body\": \"The visitors of the walkthrough wait outside the new room.\"}}]" > "$work/steps.jsonl"
+derived=$(sed -n 2p "$work/steps.jsonl" | j "d['result']['id']")
 echo "  you wrote $wrong; agent:reader read it and wrote $derived, which does not name it"
-a export "$work/after" --domain dom-demo --max-label internal 2>&1 | sed 's/ to .*, highest/, highest/; s/^/  /'
-a erase "$wrong" --reason mistaken | python3 "$here/scripts/demo/receipt.py" "$root/record/dom-demo/$wrong.md"
+sed 's/ to .*, highest/, highest/; s/^/  /' "$work/export.out"
+python3 "$here/scripts/demo/receipt.py" "$root/record/dom-demo/$wrong.md" < "$work/receipt.json"
+sed -n 3p "$work/steps.jsonl" | j "f\"  the same session wrote {d['result']['id']} after the erasure: \" + (f\"withheld, because it read {d['result']['withheld']}\" if d['result'].get('withheld') else 'served')"
 echo "  a search for the second note: $(a search 'visitors walkthrough' | j 'len(d)') hits"
 a withheld list --domain dom-demo | j "'\n'.join(f\"  withheld: {w['id']}, because {w.get('because', 'an erasure')} was erased\" for w in d) or '  nothing is withheld'"
 a withheld release "$derived" | j "f\"  you looked at it and it stands: released {d['released']}\""

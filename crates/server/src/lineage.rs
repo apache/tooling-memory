@@ -16,7 +16,9 @@
 //! decides nothing, and the read then counts.
 //!
 //! A write the screen refused is no entry, so nothing follows forward into it; back from
-//! it, what its session had read is what the poison may have come from. An entry with no
+//! it, what its session had read is what the poison may have come from. A write that
+//! failed before the record took it is no entry either: the log says so with a
+//! `quarantined` event whose gate is `error`. An entry with no
 //! `write` event, one from before the log or one an import brought, has edges the log
 //! cannot give: the answer says it is not complete.
 
@@ -98,7 +100,8 @@ struct Wrote<'a> {
     at: At<'a>,
     /// The entries it cites and the one it replaces.
     names: Vec<&'a str>,
-    /// Whether the record took it: the screen passed it, or the owner released it.
+    /// Whether the record took it: no `quarantined` event names it, or the owner
+    /// released it after one did.
     kept: bool,
 }
 
@@ -154,7 +157,7 @@ impl<'a> Logs<'a> {
         out
     }
 
-    fn take(&mut self, e: &'a Event, at: At<'a>, log: &'a [Event], refused: &BTreeSet<u64>) {
+    fn take(&mut self, e: &'a Event, at: At<'a>, log: &'a [Event], refused: &BTreeMap<u64, u64>) {
         let session = e.session.as_deref();
         match (&e.change, session) {
             (Change::Read { ids }, Some(session)) => self.reads.push((session, at, ids)),
@@ -174,7 +177,11 @@ impl<'a> Logs<'a> {
                 session,
                 at,
                 names: cites.iter().chain(supersedes).map(String::as_str).collect(),
-                kept: !refused.contains(&e.seq) || put_after(log, id, e.seq),
+                // not refused, or released since: a `put` from before the refusal is a
+                // version the record did not take
+                kept: refused
+                    .get(&e.seq)
+                    .is_none_or(|refusal| put_after(log, id, *refusal)),
             }),
             _ => {}
         }
@@ -573,6 +580,31 @@ mod tests {
             edges(&forward(&one(events), "mem-x")),
             [("mem-held", 1, true, false)]
         );
+    }
+
+    #[test]
+    fn a_write_the_record_refused_after_its_put_event_is_no_forward_edge() {
+        // the log takes the `put` before the record does: the record then refused the
+        // version, and the log says that the write failed
+        let put = Change::Put {
+            id: "mem-lost".into(),
+            digest: "d".into(),
+            active: true,
+        };
+        let failed = Change::Quarantined {
+            id: "mem-lost".into(),
+            of: 2,
+            gate: crate::log::GATE_ERROR.into(),
+            findings: vec![],
+        };
+        let logs = one(vec![
+            ev(1, "s1", read(&["mem-x"])),
+            ev(2, "s1", citing("mem-lost", &["mem-x"], None)),
+            ev(3, "s1", put),
+            ev(4, "s1", failed),
+        ]);
+        assert!(edges(&forward(&logs, "mem-x")).is_empty());
+        assert_eq!(edges(&back(&logs, "mem-lost")), [("mem-x", 1, true, true)]);
     }
 
     #[test]

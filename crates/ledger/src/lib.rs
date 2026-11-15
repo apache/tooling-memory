@@ -4309,6 +4309,53 @@ mod tests {
         );
     }
 
+    /// PostgreSQL gives an event its number at the insert, and not at the commit. Without
+    /// the lock, the second append here commits number 4 while number 3 is in flight, a
+    /// copy that reads then moves its cursor to 4, and number 3 is never copied.
+    #[tokio::test]
+    async fn on_postgres_an_append_waits_for_the_append_in_flight_in_its_domain() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        let a = l.create(spec("A")).await.unwrap().task;
+        let b = l.create(spec("B")).await.unwrap().task;
+        // an append in flight, as the ledger makes one: it holds the lock of the domain,
+        // its row has its number, and it has not committed
+        let mut c = pg_client(&server).await;
+        let tx = c.transaction().await.unwrap();
+        crate::postgres::lock_domain(&tx, "dom-a").await.unwrap();
+        let s = crate::postgres::schema_for("dom-a");
+        let admitted = Event::Admitted;
+        tx.execute(
+            &format!("INSERT INTO {s}.events (task_id, kind, at, payload) VALUES ($1, $2, $3, $4)"),
+            &[
+                &a.id,
+                &admitted.kind(),
+                &fmt_time(T0),
+                &admitted.payload(&a.id).unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        // another connection appends an event of another task of the domain
+        let mut other = Ledger::connect(server.url()).await.unwrap();
+        let second = other.admit(&b.id);
+        tokio::pin!(second);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut second).await;
+        assert!(early.is_err(), "the second append waits for the first");
+        let seqs = |events: Vec<Logged>| events.into_iter().map(|e| e.seq).collect::<Vec<_>>();
+        let seen = seqs(l.events_after("dom-a", 0).await.unwrap());
+        tx.commit().await.unwrap();
+        second.await.unwrap();
+        // a copy that read while the first was in flight goes on from its last number
+        let cursor = seen.last().copied().unwrap_or(0);
+        let rest = seqs(l.events_after("dom-a", cursor).await.unwrap());
+        let all = seqs(l.events_after("dom-a", 0).await.unwrap());
+        assert_eq!(all.len(), 4, "{all:?}");
+        assert_eq!([seen, rest].concat(), all, "and misses no event");
+    }
+
     #[tokio::test]
     async fn on_postgres_a_ledger_from_before_domain_schemas_moves_into_them() {
         let Some(server) = PgServer::start().await.unwrap() else {

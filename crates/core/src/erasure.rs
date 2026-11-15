@@ -139,11 +139,13 @@ pub struct Receipt {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flagged: Vec<String>,
     /// The entries this erasure withheld from retrieval: each names the erased one, or
-    /// was written by a session after that session read it.
+    /// was written by a session after that session read it. A write that such a session
+    /// makes after the erasure is added here when it lands.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub withheld: Vec<String>,
-    /// The entries further downstream, two steps of lineage or more from the erased
-    /// one: listed for whoever follows up, and not withheld.
+    /// The entries downstream that the erasure did not withhold, listed for whoever
+    /// follows up: those two steps of lineage or more from the erased one, and a
+    /// verified rule of the policy one step away, which stays in force.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub further: Vec<String>,
     /// The sends in the lineage forward of the erased entry, at any depth: copies that

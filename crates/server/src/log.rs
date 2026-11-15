@@ -13,7 +13,9 @@
 //! A write is two events. `write` says an entry was offered, before its screen: the
 //! session, the digest, the entries it cites and the one it replaces. Then the screen
 //! answers: `put` when it passed, and the record takes that version, or `quarantined`
-//! when it was refused. Only a `put` says what is live, so nothing downstream of the
+//! when it was refused. A write that fails before the record took it, because no gate
+//! could answer or the record refused the version, gets a `quarantined` event too, with
+//! the gate `error`. Only a `put` says what is live, so nothing downstream of the
 //! log takes a write the screen has not passed. A `read` names the entries a session
 //! was served. An entry's `session` field is its session and the sequence number of
 //! its `write`, so the reads of that session below that number are what it may have
@@ -93,13 +95,15 @@ pub enum Change {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         supersedes: Option<String>,
     },
-    /// The screen refused a write: the record never took it.
+    /// The screen refused a write, or the write failed: the record never took it.
     Quarantined {
         /// The entry.
         id: String,
         /// The sequence number of the `write` event refused.
         of: u64,
         /// Which gate refused it: `policy`, `verified`, `blast-radius` or `injection`.
+        /// [`GATE_ERROR`] when no gate answered or the record did not take the version:
+        /// nothing is held in quarantine then.
         gate: String,
         /// The kinds of thing the scan found, never the text around them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -479,14 +483,20 @@ pub fn state(events: &[Event]) -> BTreeMap<String, Option<(String, bool)>> {
     out
 }
 
-/// The `write` events the screen refused, by sequence number: what each `quarantined`
-/// event names.
+/// What a `quarantined` event names as its gate when the write failed and no gate
+/// refused it.
+pub const GATE_ERROR: &str = "error";
+
+/// The `write` events the record did not take, by sequence number: what each
+/// `quarantined` event names, with the sequence number of the last `quarantined` event
+/// that names it. A `put` of the entry above that number says that the owner released
+/// the write.
 #[must_use]
-pub fn quarantined_writes(events: &[Event]) -> BTreeSet<u64> {
+pub fn quarantined_writes(events: &[Event]) -> BTreeMap<u64, u64> {
     events
         .iter()
         .filter_map(|e| match &e.change {
-            Change::Quarantined { of, .. } => Some(*of),
+            Change::Quarantined { of, .. } => Some((*of, e.seq)),
             _ => None,
         })
         .collect()
@@ -628,6 +638,20 @@ impl Memory {
             |_| Ok(refused),
         )?;
         Ok(())
+    }
+
+    /// Say in its domain's log that the write event `of` failed before the record took
+    /// it, unless the log says already that a gate refused it. The event is a
+    /// `quarantined` one with the gate [`GATE_ERROR`], so lineage and a reader of the log
+    /// treat the write as every write the record did not take. The write failed already
+    /// and its error is what the caller returns, so a failure here is not reported: the
+    /// file system that failed the write can fail this too.
+    pub(crate) fn log_not_taken(&self, entry: &Entry, of: u64) {
+        let refused = read(&self.root, &entry.front.domain, of)
+            .is_ok_and(|after| quarantined_writes(&after).contains_key(&of));
+        if !refused {
+            let _ = self.log_quarantined(entry, of, GATE_ERROR, Vec::new());
+        }
     }
 
     /// Say in `domain`'s log that this session was served `ids`, at `label`: the highest
@@ -786,7 +810,7 @@ impl Memory {
         let reads_quarantine = handling >= Label::Restricted;
         events.retain(|e| {
             let held = e.quarantined
-                || (matches!(e.change, Change::Write { .. }) && refused.contains(&e.seq));
+                || (matches!(e.change, Change::Write { .. }) && refused.contains_key(&e.seq));
             e.label_or_highest() <= handling && (reads_quarantine || !held)
         });
         let mut session = crate::lock(&self.session);
@@ -924,11 +948,6 @@ impl Memory {
             .map(|e| e.seq))
     }
 
-    /// The sequence number of the last event in `domain`'s log, or zero.
-    pub(crate) fn last_logged(&self, domain: &str) -> Result<u64, Error> {
-        Ok(read(&self.root, domain, 0)?.last().map_or(0, |e| e.seq))
-    }
-
     /// What the record holds and the log never named, written before the log was kept:
     /// it is indexed as the record has it, since the log starts where it starts.
     async fn unnamed(
@@ -991,14 +1010,9 @@ impl Memory {
         let unnamed = self.unnamed(&domain, |id| named.contains_key(id)).await?;
         out.live += unnamed.iter().filter(|e| e.is_active()).count();
         entries.extend(unnamed);
-        {
-            // the whole domain was built from the log as read here, so the cursor of the
-            // feed is at the last event read; a version logged after it is fed by its
-            // writer
-            let mut ix = self.index.lock().await;
-            ix.rebuild_domain(&domain, entries)?;
-            ix.set_fed(&domain, events.last().map_or(0, |e| e.seq))?;
-        }
+        // the rebuild, and then a feed of the whole log: a version that another process
+        // wrote while the record was read here is taken by that feed
+        self.rebuild_index(Some(&domain), entries).await?;
         out.ledger_events = self.ledger.lock().await.rebuild().await?;
         // the policy is compiled from the index, which this changed
         self.reload_policy().await?;
@@ -1207,9 +1221,12 @@ mod tests {
             indexed_next || done.behind.contains(&id),
             "the index holds a version the log does not name, and nothing says so: {done:?}"
         );
-        // One read of the entry: two would let a write land between them, and none would
-        // mean the hook never saw the read, so this test could not fail.
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // One read of the entry for the comparison and the rebuild: two would let a write
+        // land between them, and none would mean the hook never saw the read, so this
+        // test could not fail. Then one more, by the feed after the rebuild, which takes
+        // the entry as the record has it by then.
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(indexed_next, "the feed after the rebuild took the version");
     }
 
     /// Rewrite `id`'s stored text with `review_by` as the year and the day of the year, as
@@ -1424,7 +1441,10 @@ mod tests {
         assert!(events[1].quarantined && !events[0].quarantined);
         assert_eq!(events[1].label, Some(Label::Restricted));
         assert_eq!(events[1].session.as_deref(), Some(rogue.session_id()));
-        assert_eq!(quarantined_writes(&events), BTreeSet::from([events[0].seq]));
+        assert_eq!(
+            quarantined_writes(&events),
+            BTreeMap::from([(events[0].seq, events[1].seq)])
+        );
         // nothing downstream of the log takes it
         assert!(!state(&events).contains_key(id), "no put: {events:?}");
         assert!(owner.search("tracker", None, 10).await.unwrap().is_empty());
@@ -1563,6 +1583,87 @@ mod tests {
         let other = agent(dir.path(), "agent:worker");
         assert!(matches!(other.log(None, 0), Err(Error::Denied(_))));
         assert!(matches!(other.quarantined(), Err(Error::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn the_quarantine_is_read_within_the_handling_and_raises_the_label() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Memory::init(dir.path(), "human:test:me", "dom-me").unwrap());
+        let grants = dir.path().join(crate::GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("security = [\"agent:security\"]\n{text}")).unwrap();
+        agent(dir.path(), "agent:rogue")
+            .write(req(POISON))
+            .await
+            .unwrap_err();
+        // a session of the security role that handles less is given no held entry
+        let capped = agent(dir.path(), "agent:security").with_handling_cap(Label::Internal);
+        assert!(capped.quarantined().unwrap().is_empty());
+        assert_eq!(capped.label(), Label::Public);
+        // one that handles the highest is given it, and its label says so
+        let security = agent(dir.path(), "agent:security");
+        assert_eq!(security.label(), Label::Public);
+        assert_eq!(security.quarantined().unwrap().len(), 1);
+        assert_eq!(security.label(), Label::Restricted);
+    }
+
+    #[tokio::test]
+    async fn a_write_that_fails_after_its_event_is_marked_in_the_log_and_is_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let kept = owner
+            .write(req("# Port\n\nIt listens on 8080.\n"))
+            .await
+            .unwrap()
+            .id;
+        let writer = agent(dir.path(), "agent:w");
+        writer.get(&kept).await.unwrap();
+        // the grants change under the session: the log takes its write, and then no
+        // gate answers
+        let grants = dir.path().join(crate::GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(
+            &grants,
+            format!("{text}\n[spend.gateway]\nsession_tokens = 400\n"),
+        )
+        .unwrap();
+        let before = last(dir.path());
+        let failed = writer.write(req("A late note.\n")).await;
+        assert!(matches!(failed, Err(Error::Stale(_))), "{failed:?}");
+        let events = read(dir.path(), "dom-me", before + 1).unwrap();
+        let offered: Vec<(u64, &str)> = events
+            .iter()
+            .filter_map(|e| match &e.change {
+                Change::Write { id, .. } => Some((e.seq, id.as_str())),
+                _ => None,
+            })
+            .collect();
+        let [(offer, lost)] = offered[..] else {
+            panic!("one write event: {events:?}")
+        };
+        let marked = |e: &Event| {
+            matches!(&e.change, Change::Quarantined { of, gate, .. }
+                if *of == offer && gate == GATE_ERROR)
+        };
+        assert_eq!(events.iter().filter(|e| marked(e)).count(), 1, "{events:?}");
+        // nothing is held in quarantine, and the record holds no such entry
+        let owner = Memory::open(dir.path()).unwrap();
+        assert!(owner.quarantined().unwrap().is_empty());
+        assert!(owner.store.get("dom-me", lost).await.unwrap().is_none());
+        // so lineage forward of what the session read names no entry
+        let forward = owner
+            .lineage(&kept, crate::lineage::Direction::Forward, None)
+            .await
+            .unwrap();
+        assert!(forward.entries.is_empty(), "{:?}", forward.entries);
+        // and a session that handles less than the highest is not served the event
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_handling_cap(Label::Internal);
+        assert_eq!(
+            offered_and_refused(&capped.log(None, 0).unwrap()),
+            [("write", kept)]
+        );
     }
 
     /// A record of three entries, `old` replaced by `new`, and `other`; and a session
@@ -2650,6 +2751,30 @@ mod tests {
             (seq, 0)
         );
         assert_eq!(found(&m, "First").await, ["mem-me-early001"]);
+    }
+
+    #[tokio::test]
+    async fn a_version_written_while_a_rebuild_read_the_record_is_in_the_index_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        m.write(req("The yak is shaved.\n")).await.unwrap();
+        // a reindex read the record, and then another process wrote and fed its version
+        let read = m.store.all().await.unwrap();
+        let other = Memory::open(dir.path()).unwrap();
+        let late = other.write(req("The zebra moved north.\n")).await.unwrap();
+        m.rebuild_index(None, read).await.unwrap();
+        // the cursor first: the search below is a read, which the log takes
+        let fresh = m.freshness(None).unwrap();
+        assert_eq!((fresh.unfed, fresh.fed_seq), (0, fresh.log_seq));
+        assert_eq!(found(&m, "zebra").await, [late.id]);
+        // the same for the materializer, which rebuilds one domain
+        let read = m.store.all().await.unwrap();
+        let late = other.write(req("The okapi moved south.\n")).await.unwrap();
+        m.rebuild_index(Some("dom-me"), read).await.unwrap();
+        let fresh = m.freshness(None).unwrap();
+        assert_eq!((fresh.unfed, fresh.fed_seq), (0, fresh.log_seq));
+        assert_eq!(found(&m, "okapi").await, [late.id]);
+        assert_eq!(found(&m, "zebra").await.len(), 1, "and the rest is there");
     }
 
     #[tokio::test]

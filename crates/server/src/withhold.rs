@@ -8,6 +8,18 @@
 //! goes: its body stays, and search, list, T0, recall, `get` and a bundle do not serve
 //! it. The security role reads it from the archive.
 //!
+//! The erasure withholds what the log holds when it runs. A session that read the erased
+//! entry can write after that, from the same context. So each write looks at the log
+//! once the record took it: when its session read an entry before the entry's erasure,
+//! or a turn of a transcript erased since, the new entry is withheld too, and the
+//! receipt of that erasure names it.
+//!
+//! One kind of entry is listed and not withheld: a verified rule of the policy. A rule
+//! refuses, so to withhold it would allow what it refused, and an agent could cause that
+//! with an entry that the owner must erase. The rule stays in force and on the receipt,
+//! for the owner to erase or to replace. An exception permits, so it is withheld as
+//! every other entry is, and it leaves force.
+//!
 //! A withheld entry ends in one of three ways. It is derived again: a new entry names
 //! it in `supersedes`, the record keeps the withheld one as it is, and readers go to
 //! the new one. The owner releases it ([`Memory::release_withheld`]). Or it is erased
@@ -19,11 +31,12 @@
 //! is every send in the lineage, at any depth.
 
 use crate::lineage::{self, Direction};
+use crate::log::{self, Change};
 use crate::{cites, transcripts, Error, Memory};
 use dm_core::erasure::{Receipt, Sent};
-use dm_core::{Entry, EntryType, Status};
+use dm_core::{Entry, EntryType, Status, TrustTier};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One withheld entry that no entry replaced yet.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,7 +56,8 @@ pub(crate) struct Downstream {
     /// erasure withholds.
     pub near: Vec<(String, String)>,
     /// The entries downstream that the erasure does not withhold: two steps or more
-    /// away, or one step away and out of the active set already.
+    /// away, or one step away and out of the active set already, or one step away and a
+    /// verified rule of the policy.
     pub further: Vec<String>,
     /// Every send in the lineage, at any depth.
     pub sends: Vec<Sent>,
@@ -80,6 +94,67 @@ fn names(entry: &Entry, id: &str) -> bool {
     cites(&entry.body, id)
         || entry.front.cites.iter().any(|c| cites(c, id))
         || entry.front.supersedes.as_deref() == Some(id)
+}
+
+/// What a session read that is erased now.
+enum ErasedRead {
+    /// An entry, read before its erasure: its domain and its id.
+    Entry {
+        /// The domain of the entry and of its receipt.
+        domain: String,
+        /// The entry.
+        id: String,
+    },
+    /// A transcript that the session read a turn of, by its session.
+    Transcript(String),
+}
+
+/// Whether `entry` is a verified rule of the policy: one that a decision can take, and
+/// that refuses and never permits. An exception is not one. Neither is a policy entry
+/// below verified, which is in no decision.
+fn verified_rule(entry: &Entry) -> bool {
+    entry.front.entry_type == EntryType::Policy
+        && entry.front.trust_tier == TrustTier::Verified
+        && dm_policy::record::parse(&entry.front.id, entry.front.trust_tier, &entry.body)
+            .is_ok_and(|rule| !rule.meta.is_exception())
+}
+
+/// The first of `events`, the log of one domain, in which `session` read an entry
+/// before the `erased` event of that entry: the id of the entry. A read after the
+/// erasure was of the stub, which holds nothing of the entry.
+fn read_before_erasure<'a>(events: &'a [log::Event], session: &str) -> Option<&'a str> {
+    let mut erased: BTreeMap<&str, u64> = BTreeMap::new();
+    for e in events {
+        if let Change::Erased { id } = &e.change {
+            erased.entry(id.as_str()).or_insert(e.seq);
+        }
+    }
+    events
+        .iter()
+        .filter(|e| e.session.as_deref() == Some(session))
+        .find_map(|e| match &e.change {
+            Change::Read { ids } => ids
+                .iter()
+                .map(String::as_str)
+                .find(|id| erased.get(id).is_some_and(|at| e.seq < *at)),
+            _ => None,
+        })
+}
+
+/// The transcripts that `session` read a turn of, by the `read` events of `events`: a
+/// transcript is named by its session, which is no entry id.
+fn transcripts_read<'a>(events: &'a [log::Event], session: &str) -> BTreeSet<&'a str> {
+    events
+        .iter()
+        .filter(|e| e.session.as_deref() == Some(session))
+        .filter_map(|e| match &e.change {
+            Change::Read { ids } => Some(ids),
+            _ => None,
+        })
+        .flatten()
+        .map(String::as_str)
+        .filter(|id| !dm_core::id::is_entry_id(id))
+        .collect()
 }
 
 impl Memory {
@@ -125,7 +200,8 @@ impl Memory {
                 {
                     continue;
                 }
-                if near && e.is_active() {
+                // a verified rule stays in force: it is listed, and not withheld
+                if near && e.is_active() && !verified_rule(&e) {
                     found.near.push((domain.clone(), other));
                 } else {
                     found.further.push(other);
@@ -157,6 +233,88 @@ impl Memory {
         // a withheld policy entry takes its rule or its exception out of force, as an
         // erased one does
         self.reload_policy().await
+    }
+
+    /// What this session read that is erased now: an entry that it read before the
+    /// erasure, or a transcript that it read a turn of. The logs are read whole, and a
+    /// log that does not read is an error: a write must not land as served because the
+    /// check could not be made.
+    async fn erased_read(&self) -> Result<Option<ErasedRead>, Error> {
+        let session = self.session_id();
+        let mut turns_of = BTreeSet::new();
+        for domain in self.domains() {
+            let events = log::read(self.root(), &domain, 0)?;
+            if let Some(id) = read_before_erasure(&events, session) {
+                let id = id.to_string();
+                return Ok(Some(ErasedRead::Entry { domain, id }));
+            }
+            turns_of.extend(
+                transcripts_read(&events, session)
+                    .into_iter()
+                    .map(str::to_string),
+            );
+        }
+        if turns_of.is_empty() {
+            return Ok(None);
+        }
+        let erased = self
+            .transcripts()
+            .await?
+            .into_iter()
+            .find(|t| t.state == transcripts::State::Erased && turns_of.contains(&t.session));
+        Ok(erased.map(|t| ErasedRead::Transcript(t.session)))
+    }
+
+    /// Withhold `entry`, which this session just wrote, when the session read something
+    /// that is erased now ([`Memory::erased_read`]): the entry is downstream of that
+    /// erasure, as an entry written before the erasure is. The receipt of the erasure
+    /// takes the entry in its withheld list. Returns the erased entry or transcript.
+    ///
+    /// The check comes after the record took the entry, so an erasure that runs at the
+    /// same time finds the entry in the record, or this check finds the erasure in the
+    /// log. A verified rule is never new, so the exception of [`Memory::downstream`]
+    /// does not apply here.
+    ///
+    /// # Errors
+    ///
+    /// A log that does not read, or a store or index error.
+    pub(crate) async fn withhold_after_erased_read(
+        &self,
+        entry: &Entry,
+    ) -> Result<Option<String>, Error> {
+        let Some(erased) = self.erased_read().await? else {
+            return Ok(None);
+        };
+        let id = &entry.front.id;
+        self.withhold(&[(entry.front.domain.clone(), id.clone())])
+            .await?;
+        let listed = |receipt: &mut Receipt| {
+            let new = !receipt.withheld.contains(id);
+            if new {
+                receipt.withheld.push(id.clone());
+            }
+            new
+        };
+        match &erased {
+            ErasedRead::Entry { domain, id: gone } => {
+                if let Some(mut receipt) = self.store.receipt(domain, gone).await? {
+                    if listed(&mut receipt) {
+                        self.store.put_receipt(&receipt).await?;
+                    }
+                }
+            }
+            ErasedRead::Transcript(session) => {
+                if let Some(mut receipt) = self.transcript_erasure(session).await? {
+                    if listed(&mut receipt) {
+                        self.put_transcript_receipt(&receipt).await?;
+                    }
+                }
+            }
+        }
+        Ok(Some(match erased {
+            ErasedRead::Entry { id, .. } => id,
+            ErasedRead::Transcript(session) => session,
+        }))
     }
 
     /// The entries that replaced an entry of `domain`, as the record holds them: each
@@ -380,6 +538,66 @@ mod tests {
         let kept = owner.store.get("dom-me", &after).await.unwrap().unwrap();
         assert_eq!(kept.front.review_by, review);
         assert_eq!(kept.body, "Drawn from what it read.\n");
+    }
+
+    #[tokio::test]
+    async fn a_write_after_the_erasure_by_a_session_that_read_the_entry_lands_withheld() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let gone = wrote(&owner, "Written in error.\n").await;
+        let reader = agent(dir.path(), "agent:r");
+        reader.get(&gone).await.unwrap();
+        let before = wrote(&reader, "The yak is shaved.\n").await;
+        let receipt = owner.erase(&gone, Reason::Mistaken).await.unwrap();
+        assert_eq!(receipt.withheld, std::slice::from_ref(&before));
+
+        // the same session writes again, from the same context
+        let after = reader.write(req("The yak is shorn.\n")).await.unwrap();
+        assert_eq!(after.withheld.as_deref(), Some(gone.as_str()));
+        assert_eq!(status(&owner, &after.id).await, Some(Status::Withheld));
+        assert!(matches!(owner.get(&after.id).await, Err(Error::Gone(_))));
+        assert!(owner.search("shorn", None, 10).await.unwrap().is_empty());
+        // and it cannot derive the withheld entry again: a reader of the old id is not
+        // sent to an entry from the same context
+        let again = WriteRequest {
+            supersedes: Some(before.clone()),
+            ..req("The yak is shaved, again.\n")
+        };
+        let again = reader.write(again).await.unwrap();
+        assert_eq!(status(&owner, &again.id).await, Some(Status::Withheld));
+        let refused = owner.get_following(&before).await;
+        assert!(
+            matches!(&refused, Err(Error::Gone(why)) if why.contains("withheld")),
+            "{refused:?}"
+        );
+        // the receipt names each, and the owner still finds all three to follow up
+        let receipt = owner.receipt(&gone).await.unwrap().unwrap();
+        let all = [before.clone(), after.id.clone(), again.id.clone()];
+        assert_eq!(set(&receipt.withheld), set(&all));
+        let listed: Vec<String> = owner
+            .withheld(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|w| {
+                assert_eq!(w.because.as_deref(), Some(gone.as_str()), "{}", w.id);
+                w.id
+            })
+            .collect();
+        assert_eq!(set(&listed), set(&all));
+
+        // a session that read only the stub, after the erasure, read nothing of the entry
+        let late = agent(dir.path(), "agent:late");
+        late.archived(&gone).await.unwrap();
+        let free = late.write(req("Unrelated, and served.\n")).await.unwrap();
+        assert_eq!(free.withheld, None);
+        assert_eq!(status(&owner, &free.id).await, None);
+        // and so did a session that read nothing
+        let other = agent(dir.path(), "agent:o")
+            .write(req("Also served.\n"))
+            .await
+            .unwrap();
+        assert_eq!(other.withheld, None);
     }
 
     #[tokio::test]

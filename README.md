@@ -145,7 +145,11 @@ two weeks. It is also the reason that none of it is the production shape.
   Back from an entry, they give the entries that its session read before the write.
   Forward, they give the entries and the sends that came after a session read it. An
   erasure withholds the entries that are one step forward, and its receipt lists the
-  sends. These parts are not built:
+  sends. A session that read the erased entry can write after the erasure. Each such
+  write is withheld too, and the receipt names it. These parts are not built:
+  - An erasure does not withhold a verified rule of the policy. A rule refuses, so the
+    rule stays in force, and the receipt lists it for the owner.
+  - A release from quarantine does not look at what the session of the held write read.
   - A model call that fails, or that goes through a tunnel, is not a send event.
   - A request from a tool to an outside host is not a send event.
   - An erasure lists the entries that are two steps or more forward. It does not
@@ -195,8 +199,9 @@ These parts do what the paper says, on one laptop. Each item names what replaces
 - **The index** is one SQLite FTS5 file, with BM25 in process. Production: a search
   engine sharded by domain. In production, OPA compiles the read filter into its query.
 - **The ledger** is on SQLite by default, with one writer under a mutex per process. On
-  PostgreSQL, it has a schema per domain and a `SKIP LOCKED` claim. But it has one
-  connection per process, and no pool. Production: the PostgreSQL shape, with a pool, as
+  PostgreSQL, it has a schema per domain and a `SKIP LOCKED` claim. Each append takes
+  the lock of its domain first, so the appends of one domain run one at a time. It has
+  one connection per process, and no pool. Production: the PostgreSQL shape, with a pool, as
   a projection of the log.
 - **The logs** are JSONL and SQLite files under `state/`. They hold the reads, the
   writes, the decisions and the metering of the egress. Everything that `amem` computes

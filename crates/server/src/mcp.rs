@@ -737,7 +737,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Write an entry. It lands at raw trust under this session's author. Write a `handoff` when you stop so the next session continues from it, not from your transcript; write a `decision` with context, options, choice and rationale; write a `fact` with a review_by date."
+        description = "Write an entry. It lands at raw trust under this session's author. Write a `handoff` when you stop so the next session continues from it, not from your transcript; write a `decision` with context, options, choice and rationale; write a `fact` with a review_by date. An answer with `withheld` names something this session read that was erased since: the entry is kept, and no read gives it until the owner releases it."
     )]
     async fn write(&self, p: Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -761,11 +761,16 @@ impl McpServer {
             summary: p.summary,
         };
         let w = self.memory.write(req).await.map_err(mcp_err)?;
-        ok(json!({
+        let mut v = json!({
             "id": w.id,
             "domain": w.domain,
             "classification": w.classification.to_string(),
-        }))
+        });
+        // the entry landed withheld: this session read something that is erased now
+        if let Some(erased) = w.withheld {
+            v["withheld"] = json!(erased);
+        }
+        ok(v)
     }
 
     #[tool(
@@ -1697,6 +1702,27 @@ mod tests {
             why,
             "the attempt key try-1 was used before, and that attempt is over"
         );
+    }
+
+    #[tokio::test]
+    async fn a_write_says_when_it_landed_withheld() {
+        let (dir, s) = server().await;
+        let owner = Memory::open(dir.path()).unwrap();
+        let note = crate::WriteRequest {
+            body: "Written in error.\n".into(),
+            ..crate::WriteRequest::default()
+        };
+        let gone = owner.write(note).await.unwrap().id;
+        let read = GetParams { id: gone.clone() };
+        s.get(Parameters(read)).await.unwrap();
+        let before = payload(&s.write(handoff("Stopped at step 1.\n")).await.unwrap());
+        assert!(before.get("withheld").is_none(), "{before}");
+        owner
+            .erase(&gone, dm_core::erasure::Reason::Mistaken)
+            .await
+            .unwrap();
+        let after = payload(&s.write(handoff("Stopped at step 2.\n")).await.unwrap());
+        assert_eq!(after["withheld"], json!(gone), "{after}");
     }
 
     #[test]
