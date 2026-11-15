@@ -38,6 +38,7 @@ pub mod bundle;
 pub mod contexts;
 pub mod fabric;
 mod holds;
+pub mod lineage;
 pub mod log;
 pub mod mcp;
 pub mod platform;
@@ -51,6 +52,7 @@ pub mod t0;
 pub mod tape;
 mod taps;
 pub mod transcripts;
+pub mod withhold;
 
 /// The grants file, relative to the root.
 pub const GRANTS_FILE: &str = "grants.toml";
@@ -59,7 +61,7 @@ pub const GRANTS_FILE: &str = "grants.toml";
 /// reply can carry; [`mcp::MAX_REPLY_BYTES`] bounds the reply itself.
 pub const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 /// The most bytes a new entry may hold: under [`MAX_ENTRY_BYTES`] by the room its
-/// frontmatter may grow into later, when it is promoted, replaced or flagged, so an
+/// frontmatter may grow into later, when it is promoted, replaced or withheld, so an
 /// entry `write` kept is still one a bundle carries.
 pub const MAX_WRITE_BYTES: usize = MAX_ENTRY_BYTES - 4 * 1024;
 
@@ -267,17 +269,6 @@ fn policy_entries(ix: &Index, root: &Path, grants: &Grants) -> Vec<dm_policy::re
         .collect()
 }
 
-/// What an entry may have reached, as [`Memory::taint`] computes it.
-#[derive(Clone, Debug, Serialize)]
-pub struct Taint {
-    /// The entry.
-    pub id: String,
-    /// Sessions that read it.
-    pub readers: Vec<String>,
-    /// Entries those sessions wrote after reading it.
-    pub written: Vec<String>,
-}
-
 /// What a write produced.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Written {
@@ -287,6 +278,11 @@ pub struct Written {
     pub classification: Label,
     /// Its domain.
     pub domain: String,
+    /// When the entry landed withheld: the erased entry, or the erased transcript, that
+    /// this session had read before the erasure. Retrieval does not serve the entry
+    /// until the owner releases it ([`Memory::release_withheld`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 /// One root, opened.
@@ -350,6 +346,9 @@ pub struct Memory {
     /// When this service last stamped a write; see [`next_stamp`]. Shared with the
     /// views [`Memory::for_request`] makes, which write for the same service.
     last_stamp: Arc<Mutex<OffsetDateTime>>,
+    /// The domains this session has read: a send of the session goes into the log of
+    /// each. Shared with the session's views.
+    read_domains: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -507,6 +506,7 @@ impl Memory {
             playback: OnceLock::new(),
             recording: Arc::new(Mutex::new(tape::Recording::default())),
             last_stamp: Arc::new(Mutex::new(OffsetDateTime::UNIX_EPOCH)),
+            read_domains: Arc::default(),
         })
     }
 
@@ -559,6 +559,7 @@ impl Memory {
             playback: self.playback.clone(),
             recording: Arc::clone(&self.recording),
             last_stamp: Arc::clone(&self.last_stamp),
+            read_domains: Arc::clone(&self.read_domains),
         })
     }
 
@@ -995,11 +996,48 @@ impl Memory {
         Ok(f)
     }
 
-    fn observe(&self, hits: &[Hit]) {
-        let mut s = lock(&self.session);
-        for h in hits {
-            s.observe(h.classification);
+    /// The session has read `hits`: its label rises to the classification of each, and
+    /// the log of each domain among them takes one read event, which names that domain's
+    /// entries at the highest classification among them. A read is in the log whether
+    /// the read log is kept or not: the read log is telemetry, and this is lineage.
+    ///
+    /// # Errors
+    ///
+    /// The event could not be appended. The read then fails, since a read the log does
+    /// not hold is one that lineage cannot follow.
+    fn observe(&self, hits: &[Hit]) -> Result<(), Error> {
+        let mut served: std::collections::BTreeMap<&str, (Vec<String>, Label)> =
+            std::collections::BTreeMap::new();
+        {
+            let mut s = lock(&self.session);
+            for h in hits {
+                s.observe(h.classification);
+                let (ids, label) = served.entry(h.domain.as_str()).or_default();
+                if !ids.contains(&h.id) {
+                    ids.push(h.id.clone());
+                }
+                *label = (*label).max(h.classification);
+            }
         }
+        for (domain, (ids, label)) in served {
+            self.log_read(domain, ids, label)?;
+        }
+        Ok(())
+    }
+
+    /// The session reads one entry, at `label`: its label rises, and the log of the
+    /// entry's domain takes a read event. Returns whether the session may handle the
+    /// label; when it may not, nothing was served and no event is appended.
+    ///
+    /// # Errors
+    ///
+    /// The event could not be appended.
+    fn observe_entry(&self, domain: &str, id: &str, label: Label) -> Result<bool, Error> {
+        if !lock(&self.session).observe(label) {
+            return Ok(false);
+        }
+        self.log_read(domain, vec![id.to_string()], label)?;
+        Ok(true)
     }
 
     /// Ranked search, summaries only, within the session's filter.
@@ -1015,7 +1053,7 @@ impl Memory {
     ) -> Result<Vec<Hit>, Error> {
         let f = self.filter_for(domain)?;
         let hits = self.index.lock().await.search(query, &f, limit)?;
-        self.observe(&hits);
+        self.observe(&hits)?;
         self.reads.hits("search", Some(query), &hits);
         Ok(hits)
     }
@@ -1033,7 +1071,7 @@ impl Memory {
     ) -> Result<Vec<Hit>, Error> {
         let f = self.filter_for(domain)?;
         let hits = self.index.lock().await.list(&f, kind, limit)?;
-        self.observe(&hits);
+        self.observe(&hits)?;
         self.reads.hits("list", None, &hits);
         Ok(hits)
     }
@@ -1041,11 +1079,12 @@ impl Memory {
     /// An entry from the archive, for audit: a superseded, demoted or erased version the
     /// active set no longer serves, with its stub if erased. The session's handling still
     /// applies and the label still rises; what the archive holds is read, never served
-    /// into retrieval.
+    /// into retrieval. A withheld entry is read from here by the security role alone.
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] when absent or above the session's handling, or a store error.
+    /// [`Error::NotFound`] when absent or above the session's handling, [`Error::Gone`]
+    /// for a withheld entry and an author outside the security role, or a store error.
     pub async fn archived(&self, id: &str) -> Result<Entry, Error> {
         let mut f = self.session_filter()?;
         f.include_inactive = true;
@@ -1058,14 +1097,18 @@ impl Memory {
             .get(&meta.hit.domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        if !lock(&self.session).observe(entry.front.classification) {
+        if self.withheld_from_author(&entry) {
+            return Err(withhold::gone(id));
+        }
+        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification)? {
             return Err(Error::NotFound(id.to_string()));
         }
         Ok(entry)
     }
 
     /// Every entry of a domain the archive holds, active or not, newest first: the
-    /// audit's view, for the curator's own telemetry.
+    /// audit's view, for the curator's own telemetry. A withheld entry is listed for the
+    /// security role alone: its title and its summary are what retrieval does not serve.
     ///
     /// # Errors
     ///
@@ -1077,7 +1120,19 @@ impl Memory {
     ) -> Result<Vec<Hit>, Error> {
         let mut f = self.filter_for(domain)?;
         f.include_inactive = true;
-        Ok(self.index.lock().await.list(&f, None, limit)?)
+        let ix = self.index.lock().await;
+        let mut hits = ix.list(&f, None, limit)?;
+        if !self.grants.is_security(&self.author) {
+            let mut kept = Vec::with_capacity(hits.len());
+            for h in hits {
+                let status = ix.meta(&h.id, &f)?.and_then(|m| m.status);
+                if status != Some(Status::Withheld) {
+                    kept.push(h);
+                }
+            }
+            hits = kept;
+        }
+        Ok(hits)
     }
 
     /// One entry, body included, if the filter admits it. Raises the session label.
@@ -1109,7 +1164,7 @@ impl Memory {
             self.forget_pushed(id);
             return Err(self.not_served(id, entry.front.status).await);
         }
-        if !lock(&self.session).observe(entry.front.classification) {
+        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification)? {
             self.forget_pushed(id);
             return Err(Error::NotFound(id.to_string()));
         }
@@ -1144,6 +1199,15 @@ impl Memory {
             Some(Status::Erased) => {
                 Error::Gone(format!("{id} was erased; a stub and a receipt remain"))
             }
+            // derived again, it has a successor, and the reader goes there as for any
+            // replaced entry
+            Some(Status::Withheld) => match ix.replaced_by(id, &wide) {
+                Ok(Some(to)) => Error::Moved {
+                    id: id.to_string(),
+                    to,
+                },
+                _ => withhold::gone(id),
+            },
             None => Error::NotFound(id.to_string()),
         }
     }
@@ -1180,13 +1244,58 @@ impl Memory {
     }
 
     /// Write an entry at raw trust, attributed to this session's author, classified at
-    /// least as high as what the session has read. An entry it replaces has its open
-    /// proposals to verify closed, since its successor is what is reviewed now.
+    /// least as high as what the session has read. The log of the domain takes the write
+    /// before anything screens it; the record and the index take it only once the gates
+    /// passed it, and a write they refuse stays in the log, quarantined. An entry it
+    /// replaces has its open proposals to verify closed, since its successor is what is
+    /// reviewed now.
     ///
     /// # Errors
     ///
-    /// An ungranted domain, an empty body, or a store or index error.
+    /// An ungranted domain, an empty body, an entry over the size bound, a write the
+    /// gates refuse, or a store or index error.
     pub async fn write(&self, req: WriteRequest) -> Result<Written, Error> {
+        let mut entry = self.entry_to_write(req).await?;
+        // the ledger's events so far come before the write in the log of its domain. A
+        // copy that fails is late, not lost: the next one starts where this one stopped
+        let _ = self.ledger_into_log(&entry.front.domain).await;
+        let offered = self.log_offered(&mut entry)?;
+        let (policy_changed, put) = match self.screen_and_put(&entry, offered).await {
+            Ok(taken) => taken,
+            Err(e) => {
+                // the log holds the `write` event: it says too that the record did not
+                // take the entry, or lineage would name an entry that does not exist
+                self.log_not_taken(&entry, offered);
+                return Err(e);
+            }
+        };
+        self.feed_from(&entry.front.domain, put).await?;
+        let withheld = self.withhold_after_erased_read(&entry).await?;
+        self.after_write(&entry, policy_changed).await?;
+        Ok(Written {
+            classification: entry.front.classification,
+            domain: entry.front.domain,
+            id: entry.front.id,
+            withheld,
+        })
+    }
+
+    /// The gates on the write that the log holds as event `offered`, and then the
+    /// record. Returns whether the write changes the policy in force, and the sequence
+    /// number of its `put` event: where the feed of the index starts.
+    async fn screen_and_put(&self, entry: &Entry, offered: u64) -> Result<(bool, u64), Error> {
+        let replaced = self.gate(entry, offered).await?;
+        // a policy entry written, or one replaced by an entry of any kind, changes what
+        // is in force
+        let policy_changed = entry.front.entry_type == EntryType::Policy
+            || replaced.is_some_and(|old| old.front.entry_type == EntryType::Policy);
+        Ok((policy_changed, self.put_logged(entry).await?))
+    }
+
+    /// The entry a request asks for, as this session writes it: a new id, this author,
+    /// a time after the last write, the tier and the classification the session gives.
+    /// Nothing is logged or stored yet.
+    async fn entry_to_write(&self, req: WriteRequest) -> Result<Entry, Error> {
         let domain = self.resolve_domain(req.domain.as_deref())?;
         if req.body.trim().is_empty() {
             return Err(Error::Denied("an entry needs a body".into()));
@@ -1204,14 +1313,16 @@ impl Memory {
         let review_by = req.review_by.or_else(|| {
             (req.entry_type == EntryType::Fact).then(|| now.date() + Duration::days(90))
         });
-        let entry = Entry {
+        Ok(Entry {
             front: Frontmatter {
                 id: dm_core::id::new_entry_id(&domain),
                 entry_type: req.entry_type,
-                domain: domain.clone(),
+                domain,
                 author: self.author.clone(),
                 created: now,
                 cites: req.cites,
+                // the log gives it, with the event that offers the entry
+                session: None,
                 confidence: req.confidence,
                 trust_tier: tier,
                 review_by,
@@ -1224,21 +1335,19 @@ impl Memory {
                 title: req.title,
             },
             body: req.body,
-        };
-        check_write_size(entry.render().len())?;
-        let replaced = self.gate(&entry).await?;
-        // a policy entry written, or one replaced by an entry of any kind, changes what
-        // is in force
-        let policy_changed = entry.front.entry_type == EntryType::Policy
-            || replaced.is_some_and(|old| old.front.entry_type == EntryType::Policy);
-        self.put_logged(&entry).await?;
-        self.index_put(&entry).await?;
+        })
+    }
+
+    /// What follows a write the record and the index took: the proposals of the entry it
+    /// replaced are closed, the write log and the projection take it, the policy is
+    /// loaded again when it changed, and the session counts it.
+    async fn after_write(&self, entry: &Entry, policy_changed: bool) -> Result<(), Error> {
         if let Some(old) = &entry.front.supersedes {
             self.superseded.fetch_add(1, Ordering::Relaxed);
             // approve refuses a replaced entry anyway: a ledger another connection holds
             // leaves the proposal on the board rather than failing a write already made
             let why = format!("{old} was replaced by {}; propose that one", entry.front.id);
-            let _ = self.close_proposals(&domain, old, &why).await;
+            let _ = self.close_proposals(&entry.front.domain, old, &why).await;
         }
         reads::wrote(
             &self.root,
@@ -1255,11 +1364,7 @@ impl Memory {
         if entry.front.entry_type == EntryType::Handoff {
             self.written.1.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(Written {
-            id: entry.front.id,
-            classification,
-            domain,
-        })
+        Ok(())
     }
 
     /// The tier a write lands at: curated when it replaces an entry in a session working
@@ -1761,7 +1866,8 @@ impl Memory {
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         if entry.front.status == Some(Status::Erased)
-            || !lock(&self.session).observe(entry.front.classification)
+            || self.withheld_from_author(&entry)
+            || !self.observe_entry(&domain, id, entry.front.classification)?
         {
             return Err(Error::NotFound(id.to_string()));
         }
@@ -1861,27 +1967,11 @@ impl Memory {
         })
     }
 
-    /// Index an entry just put, and the entry it replaced. The store marks that one
-    /// superseded as it writes the new one, so the index takes it from the store: a copy
-    /// read before the write would leave list and search serving an entry `get` refuses.
-    async fn index_put(&self, entry: &Entry) -> Result<(), Error> {
-        let old = match &entry.front.supersedes {
-            Some(id) => self.store.get(&entry.front.domain, id).await?,
-            None => None,
-        };
-        let mut ix = self.index.lock().await;
-        ix.upsert(entry)?;
-        if let Some(o) = &old {
-            ix.upsert(o)?;
-        }
-        Ok(())
-    }
-
     /// A new version of the entry at the tier.
     async fn set_tier(&self, mut entry: Entry, tier: TrustTier) -> Result<Promotion, Error> {
         entry.front.trust_tier = tier;
-        self.put_logged(&entry).await?;
-        self.index.lock().await.upsert(&entry)?;
+        let put = self.put_logged(&entry).await?;
+        self.feed_from(&entry.front.domain, put).await?;
         self.refresh_projection().await;
         if entry.front.entry_type == EntryType::Policy {
             self.reload_policy().await?;
@@ -1892,9 +1982,10 @@ impl Memory {
         })
     }
 
-    /// The gates on a write: the scan, then the policy. Returns the entry this one
-    /// replaces, read once for the policy and for the index.
-    async fn gate(&self, entry: &Entry) -> Result<Option<Entry>, Error> {
+    /// The gates on the write that the log holds as event `offered`: the scan, then the
+    /// policy. Returns the entry this one replaces, read once for the policy and for the
+    /// index.
+    async fn gate(&self, entry: &Entry, offered: u64) -> Result<Option<Entry>, Error> {
         let old = match &entry.front.supersedes {
             Some(o) => self.store.get(&entry.front.domain, o).await?,
             None => None,
@@ -1927,20 +2018,35 @@ impl Memory {
             fetch: None,
         })?;
         if !decision.allow {
-            return Err(self.quarantine(entry.clone(), &decision, &findings).await);
+            return Err(self
+                .quarantine(entry.clone(), offered, &decision, &findings)
+                .await);
         }
         Ok(old)
     }
 
     /// A write the gates refused goes to quarantine under the record's state, never
     /// into the record, and the owner gets a task naming why; the error returned to the
-    /// writer says where it went. Nothing is lost and nothing is served.
+    /// writer says where it went. Nothing is lost and nothing is served. The log says
+    /// first that the write event `offered` was refused, and by which gate. The task
+    /// quotes what the scan found, so it is at the highest classification.
     async fn quarantine(
         &self,
         entry: Entry,
+        offered: u64,
         decision: &Decision,
         findings: &[scan::Finding],
     ) -> Error {
+        let kind = match decision.review {
+            // a module's denial that names no rule cites none, and is a rule's still
+            _ if !decision.cites.is_empty() || !decision.denials.is_empty() => "policy",
+            dm_policy::decide::Review::Approver => "verified",
+            _ if findings.is_empty() => "blast-radius",
+            _ => "injection",
+        };
+        if let Err(e) = self.log_quarantined(&entry, offered, kind, scan::kinds(findings)) {
+            return e;
+        }
         let dir = self.root.join("state/quarantine");
         let id = entry.front.id.clone();
         if let Err(e) = std::fs::create_dir_all(&dir)
@@ -1952,7 +2058,7 @@ impl Memory {
             };
         }
         let mut body = format!(
-            "{}\n\nThe entry is held as `state/quarantine/{id}.md`, written by `{}` in session `{}`, not in the record and not served. `amem quarantine show {id}` prints it; `amem quarantine release {id}` writes it into the record as it was; `amem quarantine drop {id}` discards it. `amem taint {id}` names the sessions that read an entry and what they wrote after.",
+            "{}\n\nThe entry is held as `state/quarantine/{id}.md`, written by `{}` in session `{}`, not in the record and not served. `amem quarantine show {id}` prints it; `amem quarantine release {id}` writes it into the record as it was; `amem quarantine drop {id}` discards it. `amem lineage {id} --back` names the entries its session had read before it wrote this.",
             decision.reason, entry.front.author, self.session_id
         );
         if !findings.is_empty() {
@@ -1961,13 +2067,6 @@ impl Memory {
                 body.push_str(&format!("- {:?}: `{}`\n", f.kind, f.excerpt));
             }
         }
-        let kind = match decision.review {
-            // a module's denial that names no rule cites none, and is a rule's still
-            _ if !decision.cites.is_empty() || !decision.denials.is_empty() => "policy",
-            dm_policy::decide::Review::Approver => "verified",
-            _ if findings.is_empty() => "blast-radius",
-            _ => "injection",
-        };
         let filed = self
             .file_own(TaskSpec {
                 domain: entry.front.domain.clone(),
@@ -1981,7 +2080,7 @@ impl Memory {
                 origin: Some(format!("gate:{kind}")),
                 upstream_event: Some(id.clone()),
                 created_by: String::new(),
-                classification: entry.front.classification,
+                classification: Label::Restricted,
                 priority: 5,
                 ..TaskSpec::default()
             })
@@ -1995,14 +2094,27 @@ impl Memory {
         }
     }
 
-    /// The entries in quarantine.
+    /// The entries in quarantine, for the security role: the owner, and each author the
+    /// grants list under `security`. A held entry is read as its events in the log are:
+    /// only a session that handles the highest classification is given any, and the
+    /// label of a session that is given one rises to the highest.
     ///
     /// # Errors
     ///
-    /// A quarantined file that does not parse.
+    /// [`Error::Denied`] for an author outside the security role; a quarantined file
+    /// that does not parse; a policy that fails to give the read scope.
     pub fn quarantined(&self) -> Result<Vec<Entry>, Error> {
-        let dir = self.root.join("state/quarantine");
+        if !self.grants.is_security(&self.author) {
+            return Err(Error::Denied(
+                "the quarantine is for the owner and the security role".into(),
+            ));
+        }
         let mut out = Vec::new();
+        // a held entry is at the highest classification, as its events in the log are
+        if self.handling()? < Label::Restricted {
+            return Ok(out);
+        }
+        let dir = self.root.join("state/quarantine");
         let Ok(rd) = std::fs::read_dir(&dir) else {
             return Ok(out);
         };
@@ -2019,6 +2131,9 @@ impl Memory {
                 source: e,
             })?;
             out.push(Entry::parse(&text)?);
+        }
+        if !out.is_empty() {
+            lock(&self.session).observe(Label::Restricted);
         }
         Ok(out)
     }
@@ -2044,8 +2159,8 @@ impl Memory {
         let text = std::fs::read_to_string(&path).map_err(|_| Error::NotFound(id.to_string()))?;
         let entry = Entry::parse(&text)?;
         let written = if keep {
-            self.put_logged(&entry).await?;
-            self.index_put(&entry).await?;
+            let put = self.put_logged(&entry).await?;
+            self.feed_from(&entry.front.domain, put).await?;
             self.refresh_projection().await;
             if entry.front.entry_type == EntryType::Policy || entry.front.supersedes.is_some() {
                 self.reload_policy().await?;
@@ -2054,6 +2169,7 @@ impl Memory {
                 id: entry.front.id.clone(),
                 classification: entry.front.classification,
                 domain: entry.front.domain.clone(),
+                withheld: None,
             })
         } else {
             None
@@ -2066,48 +2182,17 @@ impl Memory {
         Ok(written)
     }
 
-    /// What an entry may have reached: the sessions that read it, from the read log,
-    /// and the entries those sessions wrote after reading it, from the write log. The
-    /// paper's lineage for erasure and for a poisoned entry: what was written by a
-    /// session that read it is what to look at next.
-    #[must_use]
-    pub fn taint(&self, id: &str) -> Taint {
-        // times are compared as times: as text, `…00.12Z` sorts after `…00.123Z`, and a
-        // write a thousandth of a second after a read would not follow from it. A read
-        // whose time does not read still names its reader, and counts as the earliest
-        // there is, so nothing that session wrote is left out
-        let when = |at: &str| {
-            OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
-        };
-        let reads = reads::all(&self.root).unwrap_or_default();
-        let mut first_read: std::collections::BTreeMap<String, OffsetDateTime> =
-            std::collections::BTreeMap::new();
-        for r in &reads {
-            let read_at = when(&r.at).unwrap_or(OffsetDateTime::UNIX_EPOCH);
-            if r.ids.iter().any(|i| i == id) {
-                first_read
-                    .entry(r.session.clone())
-                    .and_modify(|at| *at = (*at).min(read_at))
-                    .or_insert(read_at);
-            }
-        }
-        let mut written = Vec::new();
-        for w in reads::all_writes(&self.root).unwrap_or_default() {
-            if w.id == id {
-                continue;
-            }
-            let after = when(&w.at)
-                .zip(first_read.get(&w.session))
-                .is_some_and(|(wrote, read)| wrote > *read);
-            if after {
-                written.push(w.id);
-            }
-        }
-        Taint {
-            id: id.to_string(),
-            readers: first_read.into_keys().collect(),
-            written,
-        }
+    /// The log of each granted domain, whole and not filtered by classification: what
+    /// the library itself follows lineage over, for an answer that must miss nothing.
+    /// A log that does not read counts as empty.
+    pub(crate) fn logs_whole(&self) -> std::collections::BTreeMap<String, Vec<log::Event>> {
+        self.domains()
+            .into_iter()
+            .map(|d| {
+                let events = log::read(&self.root, &d, 0).unwrap_or_default();
+                (d, events)
+            })
+            .collect()
     }
 
     /// The T0 for a domain: the latest handoffs, standing decisions, conventions, and
@@ -2144,9 +2229,8 @@ impl Memory {
             .iter()
             .filter(|t| self.sees(t, handling))
             .count();
-        self.observe(&handoffs);
-        self.observe(&decisions);
-        self.observe(&conventions);
+        // one read for what T0 lists
+        self.observe(&[&handoffs[..], &decisions[..], &conventions[..]].concat())?;
         let generated_by = format!("memory {}", env!("CARGO_PKG_VERSION"));
         // a rule is read as an entry is: the digest gives the text of the rules this
         // session may read, and for the others their ids
@@ -2155,7 +2239,7 @@ impl Memory {
             let ix = self.index.lock().await;
             ix.list_every(&f, Some(EntryType::Policy))?
         };
-        let digest = self.policy_digest(&readable);
+        let digest = self.policy_digest(&readable)?;
         let text = t0::render(&t0::Inputs {
             domain: &domain,
             generated_by: &generated_by,
@@ -2174,7 +2258,7 @@ impl Memory {
     /// The policy digest T0 carries: the L0 core in full, rule and intent; the other
     /// layers' rules that are verified, by id and rule, marked enforced where a module
     /// checks them; and the exceptions in force, with their scope.
-    fn policy_digest(&self, readable: &[Hit]) -> Vec<String> {
+    fn policy_digest(&self, readable: &[Hit]) -> Result<Vec<String>, Error> {
         let p = self.policy();
         let withheld = |e: &dm_policy::record::Entry| !readable.iter().any(|h| h.id == e.entry_id);
         let mut shown = Vec::new();
@@ -2237,8 +2321,8 @@ impl Memory {
             .filter(|h| shown.contains(&h.id.as_str()))
             .cloned()
             .collect();
-        self.observe(&read);
-        out
+        self.observe(&read)?;
+        Ok(out)
     }
 
     // ---- tasks ----
@@ -3271,17 +3355,42 @@ impl Memory {
         .await?;
         self.export_excerpts(&domain, &ex.manifest.entries, max_label, dest)
             .await?;
+        self.log_export(&domain, &ex.manifest).await?;
         Ok(ex)
+    }
+
+    /// Say in the log of `domain` that a bundle left: first a read of the entries it
+    /// carries, at the highest classification among them, then the send, which names the
+    /// bound of the export and the digest of the manifest. The session's label does not
+    /// rise: an export hands the entries out and shows none of them to the session. The
+    /// send is at the highest classification the bundle holds when that is above the
+    /// session's label.
+    async fn log_export(
+        &self,
+        domain: &str,
+        manifest: &dm_core::manifest::Manifest,
+    ) -> Result<(), Error> {
+        let ids: Vec<String> = manifest.entries.iter().map(|e| e.id.clone()).collect();
+        if let Some(carried) = manifest.entries.iter().map(|e| e.classification).max() {
+            self.log_read(domain, ids, carried)?;
+        }
+        let to = format!("export:{}", manifest.max_label);
+        let digest = dm_core::digest(&manifest.to_yaml());
+        let label = self.label().max(manifest.highest_label);
+        self.log_send_at(Some(domain), &to, digest, label).await
     }
 
     /// Erase an entry: the body leaves every version in the record and the index, the
     /// stub, the erasure record and the receipt remain. Only the owner may, and only
     /// once. The receipt is written first, with the versions about to be removed and a
-    /// line saying the erasure has not finished; then the record, the citing entries,
+    /// line saying the erasure has not finished; then the record, the entries downstream,
     /// the index, the served bundles; then the receipt again without that line. A run
     /// that stops short leaves that receipt, and the next run picks up where it stopped,
-    /// keeping the first run's reason. Entries that cite the erased one are flagged for
-    /// review today rather than re-derived here. The why of each promotion of the entry
+    /// keeping the first run's reason and what it withheld. The erasure follows lineage
+    /// ([`withhold`]): an entry that names the erased one, or that a
+    /// session wrote after it read the erased one, is withheld from retrieval until it
+    /// is derived again; entries further downstream and every send in the lineage are
+    /// listed on the receipt. The why of each promotion of the entry
     /// leaves the ledger, its log and its projection alike, and the receipt counts them;
     /// who promoted which version to which tier, and when, stays. Its approval tasks
     /// keep nothing of it but its id, and an open one is invalidated: nothing is left to
@@ -3336,6 +3445,9 @@ impl Memory {
                     reason,
                     removed,
                     flagged: Vec::new(),
+                    withheld: Vec::new(),
+                    further: Vec::new(),
+                    sends: Vec::new(),
                     unresolved: vec![erasure::UNFINISHED.into()],
                     promotion_whys_removed: 0,
                     promotion_tasks_cleared: 0,
@@ -3385,9 +3497,10 @@ impl Memory {
         Ok(receipt)
     }
 
-    /// The steps of an erasure after the record's: the citing entries, the index, the
-    /// served bundles, every render, and the ledger's whys and approval tasks; then the
-    /// receipt, closed.
+    /// The steps of an erasure after the record's: the entries downstream, the index,
+    /// the served bundles, every render, and the ledger's whys and approval tasks; then
+    /// the receipt, closed. The index takes the stub through the feed, from the `erased`
+    /// event of the entry in the log.
     async fn finish_erasure(
         &self,
         domain: &str,
@@ -3399,13 +3512,24 @@ impl Memory {
             .get(domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        receipt.flagged = self.flag_citers(id).await?;
-        {
-            let mut ix = self.index.lock().await;
-            ix.remove(id)?;
-            ix.upsert(&stub)?;
-            ix.vacuum()?;
+        // what is downstream goes on the receipt before an entry changes: a run that
+        // stops in the middle leaves the list, and the next run withholds the rest
+        let downstream = self.downstream(id).await?;
+        let near = withhold::onto_receipt(&mut receipt, downstream);
+        self.store.put_receipt(&receipt).await?;
+        self.withhold(&near).await?;
+        match self.last_erased(domain, id)? {
+            Some(erased) => {
+                self.feed_from(domain, erased).await?;
+            }
+            // a stub the log does not name, from before the log was kept
+            None => {
+                let mut ix = self.index.lock().await;
+                ix.remove(id)?;
+                ix.upsert(&stub)?;
+            }
         }
+        self.index.lock().await.vacuum()?;
         self.forget_pushed(id);
         self.drop_bundles(domain)?;
         // every session's render, before the receipt says the erasure is done; what it
@@ -3514,6 +3638,9 @@ fn not_live(id: &str, status: Status) -> Error {
             format!("{id} was replaced; review and promote its current version instead")
         }
         Status::Demoted => format!("{id} was demoted by curation and is not promoted"),
+        Status::Withheld => format!(
+            "{id} is withheld after an erasure and is not promoted; derive it again as a new entry"
+        ),
     })
 }
 
@@ -3539,6 +3666,7 @@ const UNRESOLVED: &[&str] = &[
     "transcripts of sessions that read it",
     "search queries and recall questions in the read log",
     "the history of entries that cite it, and the ledger's handoffs, which are not scanned",
+    "the author and the session of its events in the event log, which is not rewritten",
     "copies the digests do not recognise: a reworded one is a new text to an import",
 ];
 
@@ -3557,40 +3685,6 @@ fn cites(text: &str, id: &str) -> bool {
 }
 
 impl Memory {
-    /// Flag every granted entry that names `id`, in its body, its sources or as the
-    /// entry it supersedes, and every entry a session wrote after reading it, which is
-    /// the paper's lineage from the read log: its review date becomes today, so curation
-    /// re-derives it from what remains or erases it too. Returns the ids flagged.
-    async fn flag_citers(&self, id: &str) -> Result<Vec<String>, Error> {
-        let today = OffsetDateTime::now_utc().date();
-        let read_then_wrote: HashSet<String> = self.taint(id).written.into_iter().collect();
-        let mut flagged = Vec::new();
-        for domain in self.domains() {
-            for other in self.store.list(&domain).await? {
-                if other == id {
-                    continue;
-                }
-                let Some(mut e) = self.store.get(&domain, &other).await? else {
-                    continue;
-                };
-                let names_it = cites(&e.body, id)
-                    || e.front.cites.iter().any(|s| cites(s, id))
-                    || e.front.supersedes.as_deref() == Some(id)
-                    || read_then_wrote.contains(&other);
-                if !names_it || e.front.status == Some(Status::Erased) {
-                    continue;
-                }
-                e.front.review_by = Some(today);
-                self.put_logged(&e).await?;
-                self.index.lock().await.upsert(&e)?;
-                flagged.push(other);
-            }
-        }
-        // an erased policy entry takes its rule or exception with it
-        self.reload_policy().await?;
-        Ok(flagged)
-    }
-
     /// Remove the bundles served from this root for a domain, at every label, and the
     /// working copies an export in progress leaves beside them.
     fn drop_bundles(&self, domain: &str) -> Result<(), Error> {
@@ -3676,6 +3770,8 @@ impl Memory {
         )
         .await?;
         drop(ix);
+        // what the import logged and indexed is behind the cursor of the feed now
+        self.feed_from(&domain, u64::MAX).await?;
         imported.excerpts = self
             .restore_excerpts(&domain, carried, &imported, default, &erased)
             .await?;
@@ -3709,12 +3805,40 @@ impl Memory {
     /// A store, index, or ledger error.
     pub async fn reindex(&self) -> Result<(usize, u64), Error> {
         let entries = self.store.all().await?;
-        let n = self.index.lock().await.rebuild(entries)?;
+        let n = self.rebuild_index(None, entries).await?;
         let m = self.ledger.lock().await.rebuild().await?;
         // the policy is compiled from the index: a rebuilt index can hold rules the old
         // one had lost, and every open session must decide under them
         self.reload_policy().await?;
         Ok((n, m))
+    }
+
+    /// Replace the index, or the part of it that is `domain`'s, with `entries`, a read
+    /// of the record, and then feed it the whole log of each domain replaced. Returns
+    /// how many entries the read held.
+    ///
+    /// Another process can write while the record is read. Its version is then not
+    /// among `entries`, and its feed can come before the rebuild, which removes the row.
+    /// So the rebuild puts the cursor back at zero in its own transaction, and the feed
+    /// after it takes every entry that the log names from the record as it is by then.
+    /// A rebuild that stops before that feed leaves a cursor at zero: `freshness` says
+    /// that versions wait, and the next feed or the next write takes them.
+    pub(crate) async fn rebuild_index(
+        &self,
+        domain: Option<&str>,
+        entries: Vec<Entry>,
+    ) -> Result<usize, Error> {
+        let (n, domains) = {
+            let mut ix = self.index.lock().await;
+            match domain {
+                Some(d) => (ix.rebuild_domain(d, entries)?, vec![d.to_string()]),
+                None => (ix.rebuild(entries)?, self.domains()),
+            }
+        };
+        for d in &domains {
+            self.feed_from(d, u64::MAX).await?;
+        }
+        Ok(n)
     }
 }
 
@@ -3794,33 +3918,76 @@ mod tests {
         assert!(matches!(titled, Err(Error::Denied(_))));
     }
 
-    /// A read and a later write whose times, as text, sort the other way: the write's has
-    /// one more digit.
-    #[test]
-    fn a_write_follows_a_read_by_time_whatever_the_times_look_like_as_text() {
+    /// One step of lineage forward from `id`, as its owner reads it: the sessions that
+    /// read the entry, and the entries those sessions wrote after the read.
+    async fn readers_and_written(m: &Memory, id: &str) -> (Vec<String>, Vec<String>) {
+        let forward = m
+            .lineage(id, lineage::Direction::Forward, Some(1))
+            .await
+            .unwrap();
+        let written = forward.entries.into_iter().filter(|e| e.informed);
+        (forward.sessions, written.map(|e| e.id).collect())
+    }
+
+    /// One line of a domain's log, as the log writes it.
+    fn log_line(seq: u64, at: &str, session: &str, change: &str) -> String {
+        format!(
+            r#"{{"seq":{seq},"at":"{at}","by":"agent:a","session":"{session}","label":"internal",{change}}}"#
+        )
+    }
+
+    /// In one log the sequence numbers decide what came after a read, whatever the times
+    /// say. Across two logs the times decide, compared as times: the time of the read,
+    /// as text, sorts after the time of the later write, which has one more digit.
+    #[tokio::test]
+    async fn a_write_follows_a_read_by_its_place_in_one_log_and_by_time_across_two() {
         let dir = tempfile::tempdir().unwrap();
-        let m = mem(dir.path());
-        let state = dir.path().join("state");
-        std::fs::create_dir_all(&state).unwrap();
-        let read = r#"{"at":"2026-10-01T10:00:00.12Z","session":"s1","tool":"get","hits":1,"tokens":1,"ids":["mem-me-read"]}"#;
-        std::fs::write(reads::path(dir.path()), format!("{read}\n")).unwrap();
-        let lines = [
-            r#"{"at":"2026-10-01T10:00:00.123Z","session":"s1","id":"mem-me-after","author":"a"}"#,
-            r#"{"at":"2026-10-01T10:00:00.1Z","session":"s1","id":"mem-me-before","author":"a"}"#,
-            r#"{"at":"2026-10-01T10:00:01Z","session":"s2","id":"mem-me-other","author":"a"}"#,
+        drop(mem(dir.path()));
+        grant_domain(dir.path(), "dom-other");
+        let m = Memory::open(dir.path()).unwrap();
+        let logs = dir.path().join(log::DIR);
+        std::fs::create_dir_all(&logs).unwrap();
+        let wrote = |id: &str| format!(r#""kind":"write","id":"{id}","digest":"d""#);
+        let read = r#""kind":"read","ids":["mem-me-read"]"#;
+        let here = [
+            log_line(1, "2026-10-01T11:00:00Z", "s1", &wrote("mem-me-early")),
+            log_line(2, "2026-10-01T10:00:00.12Z", "s1", read),
+            log_line(3, "2026-10-01T09:00:00Z", "s1", &wrote("mem-me-late")),
         ];
-        std::fs::write(state.join("writes.jsonl"), lines.join("\n") + "\n").unwrap();
-        let t = m.taint("mem-me-read");
-        assert_eq!(t.readers, ["s1"]);
-        assert_eq!(t.written, ["mem-me-after"]);
-        // a read whose time does not read is still a read: its session is a reader, and
-        // what it wrote is not known to be from before
-        let unread =
-            r#"{"at":"","session":"s2","tool":"get","hits":1,"tokens":1,"ids":["mem-me-read"]}"#;
-        std::fs::write(reads::path(dir.path()), format!("{read}\n{unread}\n")).unwrap();
-        let t = m.taint("mem-me-read");
-        assert_eq!(t.readers, ["s1", "s2"]);
-        assert_eq!(t.written, ["mem-me-after", "mem-me-other"]);
+        std::fs::write(logs.join("dom-me.jsonl"), here.join("\n") + "\n").unwrap();
+        let there = [
+            log_line(
+                1,
+                "2026-10-01T10:00:00.123Z",
+                "s1",
+                &wrote("mem-other-after"),
+            ),
+            log_line(
+                2,
+                "2026-10-01T10:00:00.1Z",
+                "s1",
+                &wrote("mem-other-before"),
+            ),
+            log_line(3, "2026-10-01T09:00:00Z", "s2", &wrote("mem-other-else")),
+        ];
+        std::fs::write(logs.join("dom-other.jsonl"), there.join("\n") + "\n").unwrap();
+        let (readers, written) = readers_and_written(&m, "mem-me-read").await;
+        assert_eq!(readers, ["s1"]);
+        assert_eq!(written, ["mem-me-late", "mem-other-after"]);
+        // a read whose time does not parse is still a read: its session is a reader, and
+        // what it wrote in another domain is not known to be from before
+        let unread = log_line(4, "", "s2", read);
+        std::fs::write(
+            logs.join("dom-me.jsonl"),
+            here.join("\n") + "\n" + &unread + "\n",
+        )
+        .unwrap();
+        let (readers, written) = readers_and_written(&m, "mem-me-read").await;
+        assert_eq!(readers, ["s1", "s2"]);
+        assert_eq!(
+            written,
+            ["mem-me-late", "mem-other-after", "mem-other-else"]
+        );
     }
 
     #[tokio::test]
@@ -3848,6 +4015,15 @@ mod tests {
             body: body.into(),
             ..WriteRequest::default()
         }
+    }
+
+    /// A new version of an active entry that changes nothing a reader is served: its
+    /// review date moves to today, through the log and the feed as every version goes.
+    async fn reviewed_today(m: &Memory, id: &str) {
+        let (domain, mut entry) = m.find(id).await.unwrap();
+        entry.front.review_by = Some(OffsetDateTime::now_utc().date());
+        let put = m.put_logged(&entry).await.unwrap();
+        m.feed_from(&domain, put).await.unwrap();
     }
 
     async fn gate_tasks(m: &Memory, kind: &str) -> Vec<Task> {
@@ -3882,7 +4058,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(held.to_string().contains("quarantined"), "{held}");
-        let id = agent.quarantined().unwrap()[0].front.id.clone();
+        let id = owner.quarantined().unwrap()[0].front.id.clone();
         owner.release_quarantined(&id, true).await.unwrap();
         let listed: Vec<String> = owner
             .list(None, None, 50)
@@ -3915,7 +4091,8 @@ mod tests {
             agent.search("tracker", None, 10).await.unwrap().is_empty(),
             "never served"
         );
-        let held = agent.quarantined().unwrap();
+        assert!(agent.quarantined().is_err(), "the security role reads it");
+        let held = Memory::open(dir.path()).unwrap().quarantined().unwrap();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].front.author, "agent:test");
         let tasks = gate_tasks(&agent, "gate:injection").await;
@@ -4001,7 +4178,8 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("blast radius"), "{err}");
         assert_eq!(gate_tasks(&agent, "gate:blast-radius").await.len(), 1);
-        assert_eq!(agent.quarantined().unwrap().len(), 1);
+        let owner = Memory::open(dir.path()).unwrap();
+        assert_eq!(owner.quarantined().unwrap().len(), 1);
         agent
             .write(req("A plain write still goes in.\n"))
             .await
@@ -4747,12 +4925,12 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let t = owner.taint(&theirs);
+        let (readers, written) = readers_and_written(&owner, &theirs).await;
         assert!(
-            t.readers.contains(&reader.session_id().to_string()),
-            "{t:?}"
+            readers.contains(&reader.session_id().to_string()),
+            "{readers:?}"
         );
-        assert!(t.written.contains(&after), "{t:?}");
+        assert!(written.contains(&after), "{written:?}");
     }
 
     #[tokio::test]
@@ -4960,7 +5138,7 @@ mod tests {
         else {
             panic!("verified is proposed")
         };
-        owner.erase(&cited, Reason::Requested).await.unwrap();
+        reviewed_today(&owner, &x).await;
         assert!(
             owner.approve(&task.id).await.is_err(),
             "the first proposal is stale"
@@ -5229,8 +5407,7 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(capped.label(), Label::Public);
-        // the erasure of what it cites flags it for review: a new version of it
-        owner.erase(&cited, Reason::Requested).await.unwrap();
+        reviewed_today(&owner, &x).await;
         let Promotion::Proposed { task: newer } =
             capped.promote(&x, TrustTier::Verified, WHY).await.unwrap()
         else {
@@ -5259,8 +5436,7 @@ mod tests {
             panic!("verified is proposed")
         };
         let proposed = owner.get(&x).await.unwrap();
-        // the erasure of what it cites flags it for review: a new version of it
-        owner.erase(&cited, Reason::Requested).await.unwrap();
+        reviewed_today(&owner, &x).await;
         let now = owner.get(&x).await.unwrap();
         assert_ne!(now.render(), proposed.render(), "the entry changed");
         let refused = owner.approve(&task.id).await;
@@ -5276,7 +5452,7 @@ mod tests {
         assert!(!owner.promotions(&x).await.unwrap()[0].landed);
         // proposed again as it stands, then approved
         let Promotion::Proposed { task: again } = lib
-            .promote(&x, TrustTier::Verified, "read it again after the flag")
+            .promote(&x, TrustTier::Verified, "read it again as it stands now")
             .await
             .unwrap()
         else {
@@ -6888,29 +7064,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn erasure_flags_what_its_readers_wrote_after_reading_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let owner = mem(dir.path());
-        let gone = owner.write(req("Written in error.\n")).await.unwrap().id;
-        let reader = Memory::open(dir.path()).unwrap().with_author("agent:r");
-        let before = reader.write(req("Before reading.\n")).await.unwrap().id;
-        reader.get(&gone).await.unwrap();
-        let after = reader
-            .write(req("Drawn from what it read.\n"))
-            .await
-            .unwrap()
-            .id;
-        let receipt = owner.erase(&gone, Reason::Mistaken).await.unwrap();
-        assert!(receipt.flagged.contains(&after), "{:?}", receipt.flagged);
-        assert!(!receipt.flagged.contains(&before), "{:?}", receipt.flagged);
-        let today = OffsetDateTime::now_utc().date();
-        assert_eq!(
-            owner.get(&after).await.unwrap().front.review_by,
-            Some(today)
-        );
-    }
-
     const RULE: &str = "# Decisions are superseded by a person\n\n```policy\nid = \"pol-L2-031\"\nlayer = 2\nrule = \"Decisions are superseded by a person, not an agent.\"\nintent = \"An agent rewrote a standing decision mid-task.\"\n```\n\n```rego\npackage amem.rules\nimport rego.v1\ndeny contains {\"policy\": \"pol-L2-031\", \"reason\": \"an agent superseded a decision\"} if {\n\tinput.principal.class == \"agent\"\n\tinput.write.supersedes_type == \"decision\"\n}\n```\n";
 
     async fn verify(owner: &Memory, proposer: &Memory, id: &str) {
@@ -7816,6 +7969,59 @@ mod tests {
         );
     }
 
+    /// The planted entry is one that the owner must erase. The person who wrote the
+    /// rule and the exception read it in that session, so both are downstream of it.
+    #[tokio::test]
+    async fn an_erasure_takes_an_exception_out_of_force_and_leaves_a_verified_rule_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let decision = |b: &str| WriteRequest {
+            entry_type: EntryType::Decision,
+            ..req(b)
+        };
+        let d1 = owner.write(decision("Use SQLite.\n")).await.unwrap().id;
+        let held = filed(&owner, tspec("Replace the decision", 0, None, &[], &[])).await;
+        let planter = Memory::open(dir.path()).unwrap().with_author("agent:p");
+        let planted = planter.write(req("Planted.\n")).await.unwrap().id;
+        let lead = Memory::open(dir.path()).unwrap();
+        lead.get(&planted).await.unwrap();
+        let rule = policy_entry(&lead, RULE).await;
+        let exception = format!(
+            "# Exception\n\n```policy\nid = \"exc-2026-001\"\nlayer = 2\nbreaches = \"pol-L2-031\"\nscope_task = \"{}\"\nexpires = \"2099-01-01T00:00:00Z\"\nintent = \"The task is to replace it.\"\n```\n",
+            held.id
+        );
+        let exc = policy_entry(&lead, &exception).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        verify(&owner, &agent, &rule).await;
+        verify(&owner, &agent, &exc).await;
+        // in force: the rule refuses, and the exception lets the one task through
+        let supersede = |of: &str| WriteRequest {
+            supersedes: Some(of.to_string()),
+            ..decision("Use files.\n")
+        };
+        let outside = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let refused = outside.write(supersede(&d1)).await.unwrap_err();
+        assert!(refused.to_string().contains("pol-L2-031"), "{refused}");
+        let inside = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        inside.set_held_task(&held.id);
+        let d2 = inside.write(supersede(&d1)).await.unwrap().id;
+
+        let receipt = owner.erase(&planted, Reason::Requested).await.unwrap();
+        assert_eq!(receipt.withheld, std::slice::from_ref(&exc));
+        assert_eq!(receipt.further, std::slice::from_ref(&rule));
+        let status = |e: Option<Entry>| e.and_then(|e| e.front.status);
+        let kept = owner.store.get("dom-me", &rule).await.unwrap();
+        assert_eq!(status(kept), None);
+        let kept = owner.store.get("dom-me", &exc).await.unwrap();
+        assert_eq!(status(kept), Some(dm_core::Status::Withheld));
+        // the sessions that were open at the erasure decide under the policy as it is
+        // now: the exception permits nothing, and the rule refuses as before
+        for session in [&inside, &outside] {
+            let refused = session.write(supersede(&d2)).await.unwrap_err();
+            assert!(refused.to_string().contains("pol-L2-031"), "{refused}");
+        }
+    }
+
     fn tspec(
         title: &str,
         priority: i64,
@@ -8393,20 +8599,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn taint_follows_reads_to_what_was_written_after() {
+    async fn one_step_of_lineage_follows_reads_to_what_was_written_after() {
         let dir = tempfile::tempdir().unwrap();
         let a = mem(dir.path());
         let poison = a.write(req("Something.\n")).await.unwrap().id;
-        let reader = Memory::open(dir.path()).unwrap().with_author("agent:r");
+        // from the log of the domain: the read log, which is telemetry, is off
+        let reader = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:r")
+            .without_read_log();
         let before = reader.write(req("Before reading.\n")).await.unwrap().id;
         reader.get(&poison).await.unwrap();
         let after = reader.write(req("After reading.\n")).await.unwrap().id;
+        // one that names the entry and did not read it, and one a step further on: what
+        // a read informed in one step is the entries that the readers wrote, and no more
         let bystander = Memory::open(dir.path()).unwrap().with_author("agent:b");
-        let unrelated = bystander.write(req("Unrelated.\n")).await.unwrap().id;
-        let t = a.taint(&poison);
-        assert_eq!(t.readers, vec![reader.session_id().to_string()]);
-        assert_eq!(t.written, vec![after.clone()]);
-        assert!(!t.written.contains(&before) && !t.written.contains(&unrelated));
+        let citing = WriteRequest {
+            cites: vec![poison.clone()],
+            ..req("Unrelated.\n")
+        };
+        let unrelated = bystander.write(citing).await.unwrap().id;
+        bystander.get(&after).await.unwrap();
+        let further = bystander.write(req("A step on.\n")).await.unwrap().id;
+        let (readers, written) = readers_and_written(&a, &poison).await;
+        assert_eq!(readers, vec![reader.session_id().to_string()]);
+        assert_eq!(written, vec![after.clone()]);
+        assert!(!written.contains(&before) && !written.contains(&unrelated));
+        assert!(!written.contains(&further));
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -10568,11 +10787,12 @@ mod tests {
             "the current version and the one superseding archived"
         );
         assert_eq!(r.removed[0].version, "current");
-        let mut flagged = r.flagged.clone();
-        flagged.sort();
+        let mut withheld = r.withheld.clone();
+        withheld.sort();
         let mut citing = vec![b.clone(), d.clone(), e.clone()];
         citing.sort();
-        assert_eq!(flagged, citing, "body, source and supersedes all cite");
+        assert_eq!(withheld, citing, "body, source and supersedes all cite");
+        assert!(r.flagged.is_empty(), "no erasure writes this field now");
         assert!(r.unresolved.iter().any(|u| u.contains("exports")));
 
         assert!(
@@ -10591,19 +10811,12 @@ mod tests {
             .unwrap()
             .iter()
             .all(|h| h.id != a));
-        let flagged = m.get(&b).await.unwrap();
-        assert_eq!(
-            flagged.front.review_by,
-            Some(OffsetDateTime::now_utc().date()),
-            "review today"
+        assert!(
+            matches!(m.get(&b).await, Err(Error::Gone(ref why)) if why.contains("withheld")),
+            "an entry that cites it is withheld"
         );
-        // c read nothing erased, so it was not flagged for review today; as a fact it
-        // carries its own review date ninety days out
-        assert_ne!(
-            m.get(&c).await.unwrap().front.review_by,
-            Some(OffsetDateTime::now_utc().date()),
-            "not flagged"
-        );
+        // c names nothing erased, and it was written before the export read the entry
+        assert_eq!(m.get(&c).await.unwrap().front.status, None, "not withheld");
         assert!(!bundle.exists(), "the served bundle held a copy");
         let kept = m.receipt(&a).await.unwrap().unwrap();
         assert_eq!(

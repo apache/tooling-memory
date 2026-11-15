@@ -15,11 +15,17 @@
 //! exactly as it was written and a replay produces the same projection on either side.
 //! A claim takes its candidates `FOR UPDATE SKIP LOCKED`, so two claimers on two
 //! connections cannot both win the same task.
+//!
+//! A row of `events` gets its sequence number when it is inserted, and not when its
+//! transaction commits. So every transaction that appends an event takes the lock of
+//! its domain first, before it locks a row ([`lock_domain`]). The appends of one domain
+//! then commit in the order of their numbers: no event commits below a number that a
+//! reader has seen, and a reader that asks for the events after a number misses none.
 
 use crate::{
     check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
-    PROMOTION_COLUMNS, TASK_COLUMNS,
+    PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
+    LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use std::collections::HashMap;
@@ -365,9 +371,7 @@ impl Db {
         let tx = self.client.transaction().await?;
         let s = match event {
             Event::Created { spec, .. } => ensure_domain(&tx, &spec.domain).await?,
-            _ => schema_of_task_in(&tx, id)
-                .await?
-                .ok_or_else(|| Error::NotFound(id.to_string()))?,
+            _ => lock_task_domain(&tx, id).await?,
         };
         apply(&tx, &s, id, at, event).await?;
         tx.commit().await?;
@@ -386,8 +390,8 @@ impl Db {
         by: Held<'_>,
         event: &Event,
     ) -> Result<(), Error> {
-        let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
+        let s = lock_task_domain(&tx, id).await?;
         let row = tx
             .query_opt(
                 &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $1 FOR UPDATE"),
@@ -636,10 +640,10 @@ impl Db {
         // after a later one with more
         let claimable_now = "status IN ('open', 'blocked', 'claimed')";
         let tx = self.client.transaction().await?;
-        // the claim this key made in this domain, looked for under the domain's lock, so
-        // two connections with one key make one claim
+        // the claim this key made in this domain is looked for under the domain's lock,
+        // so two connections with one key make one claim; and a claim appends an event
+        lock_domain(&tx, domain).await?;
         if let Some(key) = who.attempt {
-            lock_domain(&tx, domain).await?;
             let before = tx
                 .query_opt(
                     &format!(
@@ -697,8 +701,8 @@ impl Db {
             },
             who.1,
         );
-        let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
+        let s = lock_task_domain(&tx, id).await?;
         let taken = take(&tx, &s, id, now, who, &[], Label::Restricted).await?;
         tx.commit().await?;
         Ok(taken)
@@ -713,8 +717,8 @@ impl Db {
         manifest: &[String],
         handling: Label,
     ) -> Result<(), Error> {
-        let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
+        let s = lock_task_domain(&tx, id).await?;
         let row = tx
             .query_opt(
                 &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $1 FOR UPDATE"),
@@ -859,6 +863,45 @@ impl Db {
         Ok(n)
     }
 
+    /// The rows of `domain` after sequence number `after`, in order, and before them the
+    /// rows that say who held the tasks those are of. The events are those of the
+    /// domain's schema; a domain without one has none.
+    pub(crate) async fn events_after(
+        &self,
+        domain: &str,
+        after: u64,
+    ) -> Result<Vec<RawEvent>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT e.seq, e.task_id, e.at, e.payload, t.label_rank
+                     FROM {s}.events e LEFT JOIN {s}.tasks t ON t.id = e.task_id
+                     WHERE e.seq > $1 OR (e.kind IN ({LEASE_KINDS})
+                           AND e.task_id IN (SELECT task_id FROM {s}.events WHERE seq > $1))
+                     ORDER BY e.seq"
+                ),
+                &[&after],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(RawEvent {
+                    seq: r.try_get(0)?,
+                    task: r.try_get(1)?,
+                    at: r.try_get(2)?,
+                    payload: r.try_get(3)?,
+                    domain: Some(domain.to_string()),
+                    label_rank: r.try_get(4)?,
+                })
+            })
+            .collect()
+    }
+
     /// Replay every domain's events into a fresh projection, one transaction for all.
     pub(crate) async fn rebuild(&mut self) -> Result<u64, Error> {
         let schemas = self.schemas().await?;
@@ -957,14 +1000,34 @@ async fn take<C: GenericClient>(
     Ok(true)
 }
 
-/// Take a domain's lock until the transaction ends.
-async fn lock_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<(), Error> {
+/// Take a domain's lock until the transaction ends. A transaction that appends an event
+/// takes it before the event's row gets its sequence number, and before it locks a row
+/// of `tasks`: two that took a row and the lock in different orders would wait for each
+/// other.
+pub(crate) async fn lock_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<(), Error> {
     conn.execute(
         "SELECT pg_advisory_xact_lock(hashtext('ledger_domain:' || $1))",
         &[&domain],
     )
     .await?;
     Ok(())
+}
+
+/// Take the lock of the domain that task `id` is in, until the transaction ends, and
+/// give the schema of that domain: the first step of a transaction that appends an
+/// event of the task.
+async fn lock_task_domain<C: GenericClient>(conn: &C, id: &str) -> Result<String, Error> {
+    let row = conn
+        .query_opt(
+            "SELECT d.domain, d.schema FROM public.ledger_tasks t
+             JOIN public.ledger_domains d ON d.domain = t.domain WHERE t.id = $1",
+            &[&id],
+        )
+        .await?
+        .ok_or_else(|| Error::NotFound(id.to_string()))?;
+    let (domain, schema): (String, String) = (row.try_get(0)?, row.try_get(1)?);
+    lock_domain(conn, &domain).await?;
+    Ok(schema)
 }
 
 /// Give a domain's schema its promotions table if it has none, under the domain's lock,

@@ -5,6 +5,7 @@
 // #[cfg(test)] modules; here a panic is the failure being reported.
 #![allow(clippy::unwrap_used)]
 
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -301,8 +302,20 @@ fn the_seven_m0_steps() {
     step_reindex(&d);
 }
 
+/// `id` is withheld: a get says why, and its body, with `text` in it, is still in the
+/// record.
+fn is_withheld(root: &Path, id: &str, text: &str) {
+    let err = fails(root, &["get", id]);
+    assert!(err.contains("gone") && err.contains("withheld"), "{err}");
+    let kept = std::fs::read_to_string(root.join(format!("record/dom-me/{id}.md"))).unwrap();
+    assert!(
+        kept.contains("status: withheld") && kept.contains(text),
+        "{kept}"
+    );
+}
+
 #[test]
-fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
+fn erasure_leaves_a_stub_a_receipt_and_the_citing_entry_withheld() {
     let mut d = step_init();
     step_write(&mut d);
     let marker = "passphrase-Qz7xx";
@@ -343,9 +356,10 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
     assert_eq!(receipt["id"], secret);
     assert_eq!(receipt["reason"], "sensitive");
     assert_eq!(receipt["removed"][0]["version"], "current");
-    assert_eq!(receipt["flagged"], serde_json::json!([citing]));
+    assert_eq!(receipt["withheld"], serde_json::json!([citing]));
     assert_eq!(receipt["promotion_whys_removed"], 1);
     assert!(!ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
+    is_withheld(&d.root, &citing, &format!("See {secret}."));
     let err = fails(&d.root, &["get", &secret]);
     assert!(err.contains("gone") && err.contains("erased"), "{err}");
     let err = fails(&d.root, &["erase", &secret, "--reason", "legal"]);
@@ -462,6 +476,259 @@ fn a_declined_proposal_is_not_printed_as_proposed_again() {
 }
 
 /// The first file under `root` whose bytes contain `needle`.
+/// Tool calls as `author` in one session, through `amem serve` over stdio, as a harness
+/// makes them: the JSON result of each.
+fn session(root: &Path, author: &str, calls: &[(&str, serde_json::Value)]) -> Vec<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amem"))
+        .arg("--root")
+        .arg(root)
+        .args(["serve", "--author", author])
+        .env_remove("MEMORY_ROOT")
+        .env_remove("MEMORY_TASK")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    let hello = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "0"}}});
+    writeln!(stdin, "{hello}").unwrap();
+    stdout.read_line(&mut line).unwrap();
+    let ready = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    writeln!(stdin, "{ready}").unwrap();
+    let mut results = Vec::new();
+    for (n, (tool, arguments)) in calls.iter().enumerate() {
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": n + 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}});
+        writeln!(stdin, "{call}").unwrap();
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        let answer = json(&line);
+        let text = answer["result"]["content"][0]["text"].as_str();
+        let text = text.unwrap_or_else(|| panic!("{tool} as {author}: {answer}"));
+        assert_ne!(answer["result"]["isError"], true, "{tool}: {text}");
+        results.push(json(text));
+    }
+    drop(stdin);
+    child.wait().unwrap();
+    results
+}
+
+/// A session of `author` that reads `id` and then writes a note: the id of the note.
+fn reads_then_writes(root: &Path, author: &str, id: &str, body: &str) -> String {
+    let calls = [
+        ("get", serde_json::json!({ "id": id })),
+        ("write", serde_json::json!({ "body": body })),
+    ];
+    let results = session(root, author, &calls);
+    results[1]["id"].as_str().unwrap().to_string()
+}
+
+/// The entries of a lineage answer, each as its id, its hops, and whether a read
+/// informed it.
+fn edges(lineage: &Value) -> Vec<(String, u64, bool)> {
+    let entries = lineage["entries"].as_array().unwrap();
+    let edge = |e: &Value| {
+        let id = e["id"].as_str().unwrap().to_string();
+        (id, e["hops"].as_u64().unwrap(), e["informed"] == true)
+    };
+    entries.iter().map(edge).collect()
+}
+
+#[test]
+fn lineage_gives_forward_and_with_back_backward_edges_of_a_session_that_read_then_wrote() {
+    let d = step_init();
+    let x = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Port"],
+        Some("The service listens on 8080.\n"),
+    ));
+    let y = reads_then_writes(&d.root, "agent:reader", &x, "The proxy forwards to it.\n");
+    let forward = json(&ok(&d.root, &["lineage", &x], None));
+    assert_eq!(forward["direction"], "forward");
+    assert_eq!(edges(&forward), [(y.clone(), 1, true)]);
+    let back = json(&ok(&d.root, &["lineage", &y, "--back"], None));
+    assert_eq!(back["direction"], "back");
+    assert_eq!(edges(&back), [(x.clone(), 1, true)]);
+    // one session read the entry and wrote the note
+    assert_eq!(forward["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(forward["sessions"], back["sessions"]);
+    assert_eq!(back["complete"], true);
+
+    // a step further on, and a depth that leaves it out
+    let z = reads_then_writes(&d.root, "agent:other", &y, "Restart the proxy first.\n");
+    let all = json(&ok(&d.root, &["lineage", &x], None));
+    assert_eq!(edges(&all), [(y.clone(), 1, true), (z.clone(), 2, true)]);
+    let near = json(&ok(&d.root, &["lineage", &x, "--depth", "1"], None));
+    assert_eq!(edges(&near), [(y.clone(), 1, true)]);
+    let far = json(&ok(&d.root, &["lineage", &z, "--back"], None));
+    assert_eq!(edges(&far), [(y, 1, true), (x.clone(), 2, true)]);
+
+    // an export is a send: forward names where it went, and back from the send event
+    // gives what the export read
+    let bundle = d.dir.path().join("bundle");
+    let bundle = bundle.to_str().unwrap();
+    ok(
+        &d.root,
+        &["export", bundle, "--max-label", "internal"],
+        None,
+    );
+    let sent = json(&ok(&d.root, &["lineage", &x], None));
+    let sends = sent["sends"].as_array().unwrap();
+    assert_eq!(sends.len(), 1, "{sent}");
+    assert!(sends[0]["to"].as_str().unwrap().starts_with("export:"));
+    let of = format!("dom-me@{}", sends[0]["first"]);
+    let from = json(&ok(
+        &d.root,
+        &["lineage", &of, "--back", "--depth", "1"],
+        None,
+    ));
+    let read: Vec<String> = edges(&from).into_iter().map(|e| e.0).collect();
+    assert!(read.contains(&x) && read.contains(&z), "{from}");
+    let why = fails(&d.root, &["lineage", &of]);
+    assert!(why.contains("no lineage forward"), "{why}");
+}
+
+#[test]
+fn withheld_list_names_an_entry_that_an_erasure_withheld_and_release_serves_it_again() {
+    let d = step_init();
+    let secret = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Vault"],
+        Some("The vault opens with a passphrase.\n"),
+    ));
+    let citing = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Where the vault is explained"],
+        Some(&format!("See {secret}.\n")),
+    ));
+    let none = json(&ok(&d.root, &["withheld", "list"], None));
+    assert_eq!(none, serde_json::json!([]));
+    let receipt = json(&ok(
+        &d.root,
+        &["erase", &secret, "--reason", "mistaken"],
+        None,
+    ));
+    assert_eq!(receipt["withheld"], serde_json::json!([citing]));
+    let listed = json(&ok(
+        &d.root,
+        &["withheld", "list", "--domain", "dom-me"],
+        None,
+    ));
+    assert_eq!(
+        listed,
+        serde_json::json!([{ "id": citing, "because": secret }])
+    );
+    let why = fails(&d.root, &["withheld", "list", "--domain", "dom-other"]);
+    assert!(why.contains("not granted"), "{why}");
+    is_withheld(&d.root, &citing, &format!("See {secret}."));
+    let released = json(&ok(&d.root, &["withheld", "release", &citing], None));
+    assert_eq!(released, serde_json::json!({ "released": citing }));
+    let served = ok(&d.root, &["get", &citing], None);
+    assert!(
+        served.contains(&format!("See {secret}.")) && !served.contains("status: withheld"),
+        "{served}"
+    );
+    let none = json(&ok(&d.root, &["withheld", "list"], None));
+    assert_eq!(none, serde_json::json!([]));
+    let why = fails(&d.root, &["withheld", "release", &citing]);
+    assert!(why.contains("is not withheld"), "{why}");
+}
+
+/// `amem log freshness`: whether it succeeded is asserted; its answer, and what it
+/// said on standard error.
+fn freshness(root: &Path) -> (Value, String) {
+    let out = memory(root, &["log", "freshness"], None);
+    assert!(out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    (json(&String::from_utf8_lossy(&out.stdout)), said)
+}
+
+#[test]
+fn log_freshness_reports_a_domain_within_the_bound_after_a_write() {
+    let d = step_init();
+    ok(
+        &d.root,
+        &["write", "--title", "Port"],
+        Some("It is 8080.\n"),
+    );
+    let (fresh, said) = freshness(&d.root);
+    assert_eq!(fresh["domain"], "dom-me");
+    assert_eq!(fresh["within_bound"], true);
+    assert_eq!(fresh["unfed"], 0);
+    assert_eq!(fresh["bound_seconds"], 60);
+    assert_eq!(fresh["fed_seq"], fresh["log_seq"]);
+    assert!(fresh["log_seq"].as_u64().unwrap() >= 2, "{fresh}");
+    assert_eq!(said, "", "nothing waits, so nothing is said");
+}
+
+#[test]
+fn log_show_serves_the_ledger_s_events_up_to_now_and_from_a_sequence_number() {
+    let d = step_init();
+    ok(
+        &d.root,
+        &["write", "--title", "Port"],
+        Some("It is 8080.\n"),
+    );
+    // filed after the last write: nothing copied the ledger into the log since
+    ok(&d.root, &["task", "create", "Move the port"], None);
+    let events = json(&ok(&d.root, &["log", "show"], None));
+    let events = events.as_array().unwrap();
+    assert_eq!(events[0]["kind"], "write");
+    let last = &events[events.len() - 1];
+    assert_eq!(last["kind"], "ledger", "{last}");
+    let from = last["seq"].to_string();
+    let tail = json(&ok(&d.root, &["log", "show", "--from", &from], None));
+    assert_eq!(tail, serde_json::json!([last]));
+}
+
+#[test]
+fn log_freshness_says_when_a_version_waits_past_the_bound_and_log_feed_takes_it() {
+    let d = step_init();
+    ok(
+        &d.root,
+        &["write", "--title", "Port"],
+        Some("It is 8080.\n"),
+    );
+    // a version that a stopped writer left in the log an hour ago
+    let seq = freshness(&d.root).0["log_seq"].as_u64().unwrap() + 1;
+    let old = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let old = old
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let line = serde_json::json!({"seq": seq, "at": old, "by": "human:test:me",
+        "kind": "put", "id": "mem-me-left", "digest": "d", "active": true});
+    let log = d.root.join("state/log/dom-me.jsonl");
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    text.push_str(&format!("{line}\n"));
+    std::fs::write(&log, text).unwrap();
+    // the answer says so, and so does a line on standard error
+    let (stale, said) = freshness(&d.root);
+    assert_eq!(stale["within_bound"], false);
+    assert_eq!(stale["unfed"], 1);
+    let waited = stale["oldest_unfed_seconds"].as_i64().unwrap();
+    assert!(waited >= 3600, "{stale}");
+    assert!(
+        said.contains("behind its log") && said.contains("dom-me"),
+        "{said}"
+    );
+    // the feed takes it, once, and the domain is within the bound again
+    let fed = json(&ok(&d.root, &["log", "feed"], None));
+    assert_eq!(fed["to"], seq);
+    assert_eq!(fed["applied"], 1);
+    let again = json(&ok(&d.root, &["log", "feed", "--domain", "dom-me"], None));
+    assert_eq!(again["applied"], 0);
+    let (fresh, said) = freshness(&d.root);
+    assert_eq!(fresh["within_bound"], true);
+    assert_eq!(fresh["fed_seq"], seq);
+    assert_eq!(said, "");
+}
+
 fn holds(root: &Path, needle: &[u8]) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {

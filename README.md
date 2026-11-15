@@ -84,14 +84,22 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Federation.** There are no cross-domain request tasks, no interface summaries between
   domains, and no portfolio orchestration. A cross-domain dependency is visible, and that
   is all.
-- **The event log, in part.** Every write of an entry goes first through the append-only
-  log of its domain. The log holds ids and digests, and never bodies. Each domain has one
-  writer. One materializer per domain builds the index from the log and the record. It
-  also replays the ledger's own events (`amem log`). These are not built:
-  - The ledger keeps its events in its own table, not in the log of the domain.
-  - `amem` does not yet feed the index from the log as the log grows. It only rebuilds
-    the index from the log.
-  - There is no freshness fast lane with a published bound.
+- **The event log, in part.** Each write, read and send of a session goes into the
+  append-only log of its domain, with a label. A write goes into the log before the
+  scan. Thus the log also holds a write that the scan refused. The log holds ids and
+  digests, and never bodies. Each domain has one writer. A writer feeds the index from
+  the log before its write returns. `amem log freshness` measures the index against a
+  bound of 60 seconds. One materializer per domain builds the index again from the log
+  and the record (`amem log materialize`). These parts are not built:
+  - The ledger writes each event to its own table first. The log of the domain gets a
+    copy of the event, and the copy can be late.
+  - No reader feeds the index. A version that a stopped writer left in the log waits for
+    the next write, or for `amem log feed`.
+  - A read event names the entries, and not their versions. The version of an entry is
+    the last version that the log holds before the read.
+  - Curation events are not in the log.
+  - An erasure does not rewrite the log. The events of an erased entry keep its id, its
+    author and its session.
 - **Drift over many runs.** The detectors read answers and also metadata: fingerprint
   digests, flip rate, formats and refusals. Logprob divergence and change-point detection
   over many runs are missing. The probes run in each curation cycle with `--drift`,
@@ -133,10 +141,24 @@ two weeks. It is also the reason that none of it is the production shape.
   ceiling. While the next version of a rule waits for its review, the rule is in no
   decision. When the module of an enforced rule fails in a decision, that decision
   fails. An imported rule keeps the author and the date of its entry.
-- **Lineage, in part.** An entry does not record its session. `amem taint` compares the
-  time of a read with the time of a later write, and it goes forward only. Reads and
-  sends are not in the event log. A write that the scan refuses is a file under `state/`,
-  not an event in the log.
+- **Lineage, in part.** Each entry names the session that wrote it. `amem lineage` and
+  the `lineage` memory tool read the event logs, for the owner and the security role.
+  Back from an entry, they give the entries that its session read before the write.
+  Forward, they give the entries and the sends that came after a session read it. An
+  erasure withholds the entries that are one step forward, and its receipt lists the
+  sends. A session that read the erased entry can write after the erasure. Each such
+  write is withheld too, and the receipt names it. These parts are not built:
+  - An erasure does not withhold a verified rule of the policy. A rule refuses, so the
+    rule stays in force, and the receipt lists it for the owner.
+  - A release from quarantine does not look at what the session of the held write read.
+  - A model call that fails, or that goes through a tunnel, is not a send event.
+  - A request from a tool to an outside host is not a send event.
+  - An erasure lists the entries that are two steps or more forward. It does not
+    withhold them.
+  - No task is filed for a withheld entry.
+  - The reads of a helper session count for its parent only through the entries that
+    the helper wrote.
+  - An erasure does not go through an approval.
 - **Raw reach.** Each session that reads a domain reads its raw entries, and the content
   that a tap brought in is among them. A session does not record that it read outside
   content.
@@ -178,14 +200,14 @@ These parts do what the paper says, on one laptop. Each item names what replaces
 - **The index** is one SQLite FTS5 file, with BM25 in process. Production: a search
   engine sharded by domain. In production, OPA compiles the read filter into its query.
 - **The ledger** is on SQLite by default, with one writer under a mutex per process. On
-  PostgreSQL, it has a schema per domain and a `SKIP LOCKED` claim. But it has one
-  connection per process, and no pool. Production: the PostgreSQL shape, with a pool, as
+  PostgreSQL, it has a schema per domain and a `SKIP LOCKED` claim. Each append takes
+  the lock of its domain first, so the appends of one domain run one at a time. It has
+  one connection per process, and no pool. Production: the PostgreSQL shape, with a pool, as
   a projection of the log.
 - **The logs** are JSONL and SQLite files under `state/`. They hold the reads, the
   writes, the decisions and the metering of the egress. Everything that `amem` computes
   from them reads them whole:
   - the curator's retrieval signals and telemetry
-  - taint
   - the read metrics
   - the policy rates
   - the relay and write-rate alarms
@@ -194,8 +216,10 @@ These parts do what the paper says, on one laptop. Each item names what replaces
   Production: the same events as OpenTelemetry spans, into a collector and analytics
   tables. `amem` already emits these spans.
 - **The event log** is a JSONL file per domain under `state/log`, behind a file lock.
-  Production: a partitioned log, with a partition per domain. The reference stack uses
-  Kafka. In production, the materializer is a consumer of the log.
+  The feed, lineage and an erasure read the file whole. Only a writer feeds the index.
+  No reader feeds it, and no task feeds it on a schedule. Production: a partitioned log,
+  with a partition per domain. The reference stack uses Kafka. In production, the feed
+  and the materializer are consumers of the log.
 - **Curation** surveys a domain: it reads every entry. It looks for contradictions pair
   by pair through search. It runs as a cycle that someone starts. Production:
   event-driven, for each write, on a schedule with a budget per domain.
@@ -205,8 +229,9 @@ These parts do what the paper says, on one laptop. Each item names what replaces
 - **The policy** is Rego in process, through regorus. `amem` compiles it again when a
   policy entry changes. It reads the record rules from files at open. Production: OPA as
   a sidecar, partial evaluation for the read filter, and decision logs to telemetry.
-- **The quarantine** is files under `state/`. A model reviews them on request. The owner
-  releases them by hand.
+- **The quarantine** keeps the body of each held write as a file under `state/`. The
+  event log holds the event, and not the body. A model reviews the held writes on
+  request. The owner releases them by hand.
 - **Transcripts' citations**: `amem` finds them on every lookup, with a read of all the
   entries of a domain. It finds the citations that keep a tool's source past its clock
   in the same way.
@@ -302,7 +327,7 @@ names another. The process touches nothing outside the root:
 
 | Path | What |
 |---|---|
-| `grants.toml` | The perimeter's data: domains and their labels, destinations and their ceilings, `[gates]`, `[spend.<destination>]`, `[taps.<name>]` for taps and tools (`hosted` for a tool that a tool server serves), `platform = "<domain>"`, and `[ledger]` for PostgreSQL |
+| `grants.toml` | The perimeter's data: `security` for the authors in the security role, domains and their labels, destinations and their ceilings, `[gates]`, `[spend.<destination>]`, `[taps.<name>]` for taps and tools (`hosted` for a tool that a tool server serves), `platform = "<domain>"`, and `[ledger]` for PostgreSQL |
 | `credentials.env` | API keys, `LLMAO_KEY`, `GH_TOKEN`, as `NAME=value`, mode 600. The environment overrides this file |
 | `profiles.toml` | Named launches: harness, auth, model, subagents |
 | `prices.toml` | USD per million tokens per model, and per CPU-hour and GiB-hour under `[resources]`, for `amem cost` |
@@ -394,19 +419,18 @@ egress.
 
 [local/README.md](local/README.md) describes most parts, each under its own heading. At
 this time, only the register in [spikes/plan-2026-10](spikes/plan-2026-10/README.md)
-describes re-enactment, the event log,
-the platform domain and the Gofannon bridge.
+describes re-enactment, the platform domain and the Gofannon bridge.
 
 | Part | What it does | Commands |
 |---|---|---|
 | The read path | T0, BM25 search with summaries first, one body on `get`, recall as a cited brief or a pack, prefetch on claim and at fetch | `t0`, `search`, `get`, `list`, `recall`, `write` |
 | The task fabric | Tasks with leases and handoffs. A rubric from the L1 strategy ranks along the ledger's edges, at admission and in the triage cycle. Workers only claim. Subagents go on the board as children, with a continuation | `task create, admit, claim-next, complete, release, tree, retry, rescore, stats`, `work` |
 | Trust tiers | Raw, curated, verified. Only a person who did not propose an entry can make it verified. Review clocks and decay | `promote`, `approve` |
-| The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced after they are verified, with scoped exceptions). Admission, the read filter, the write scan and quarantine, and blast-radius gates. A log of every decision | `policy show, eval, list, lint`, `quarantine`, `taint` |
+| The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced after they are verified, with scoped exceptions). Admission, the read filter, the write scan and quarantine, and blast-radius gates. A log of every decision | `policy show, eval, list, lint`, `quarantine` |
 | The curator | A survey of what needs curation, an independent auditor, a search for contradictions, canaries, its own telemetry and alarms, and a cycle on a budget | `curator`, `curate`, `audit`, `canary` |
 | The egress | It forwards, meters and times model calls, holds spend limits per destination, and records decision contexts. It keeps the wall clock, CPU and peak memory of each session beside the session's tokens | `launch`, `usage`, `cost` |
 | Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned | `transcript`, `replay`, `reenact run, report, tapes, show, pin, unpin` |
-| The event log | Every write of an entry goes through the append-only log of its domain, with ids and digests only. A materializer builds the index from the log and replays the ledger's events | `log show`, `log materialize` |
+| The event log | Each write, read and send goes into the append-only log of its domain, with a label, and with ids and digests only. The log feeds the index, against a bound of 60 seconds. A materializer builds the index again from the log and replays the ledger's events. Lineage reads the log back and forward. An erasure withholds the entries that are one step forward | `log show, feed, freshness, materialize`, `lineage`, `withheld list, release`; MCP `log`, `lineage` |
 | The platform | Agent definitions, templates, eval suites and harness defaults as artifacts in a platform domain. They load only after a person verifies them | `platform list, show`, `golden --platform` |
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory | `savings`, `golden`, `scripts/eval.py` |
@@ -427,7 +451,8 @@ amem work --harness claude                 # claim the top task, run the harness
 amem recall "how does the import retry?" --provider anthropic
 amem curate --auth gateway --contradictions  # one curation cycle
 amem quarantine list
-amem taint mem-me-xxxxxxxx                 # where a bad entry may have reached
+amem lineage mem-me-xxxxxxxx               # what was written and sent after a read of a bad entry
+amem lineage mem-me-xxxxxxxx --back        # what the session read before it wrote the entry
 amem replay <session> --model gemma4-26b   # the same decisions, another model
 amem reenact run <session> --auth gateway --model qwen3.8-27b --runs 3   # the same task again
 amem reenact report <session>              # each harness and model against the tape
@@ -473,8 +498,8 @@ It says what is missing and how to fix it. At the end, it shows the command to r
 2. **Curation, and the trust tiers.** A curation cycle. A curator run whose rewrite goes
    in at curated. A person approves an entry for verified.
 3. **The perimeter.** The policy holds in quarantine a write that speaks to agents. Then
-   taint, policy as memory with a scoped exception, and the read filter. A spend limit
-   refuses a call.
+   lineage from the event log, policy as memory with a scoped exception, and the read
+   filter. A spend limit refuses a call.
 4. **The task fabric.** The rubric, compiled from a strategy. A rescore along the edges.
    Subagents go on the board. A follow-up task brings back their reports, and its
    completion closes the task that delegated.
@@ -492,9 +517,10 @@ It says what is missing and how to fix it. At the end, it shows the command to r
 9. **From outside.** The GitHub tap files the open issues of a real Apache repository as
    proposed tasks. Its grant reaches one host. The tap files each issue once, and a person
    admits it.
-10. **The record moves.** The event log, and the index rebuilt from it. An export at a
-    label. An import under another owner. An erasure that refuses the text when the bundle
-    comes again.
+10. **The record moves.** The event log, and the index fed and rebuilt from it. An export
+    at a label. An import under another owner. An erasure that refuses the text when the
+    bundle comes again. An erasure that follows lineage: it withholds the entry written
+    after a read, and its receipt names the send.
 11. **What this is not, yet.** The demo reads the two lists from the top of this page.
 
 ## Checks

@@ -383,7 +383,8 @@ impl Memory {
         let Some(Ok(def)) = definition_in(&entry, name) else {
             return Err(unreadable(name));
         };
-        crate::lock(&self.session).observe(def.classification);
+        // binding reads the entry that holds the definition
+        self.observe_entry(&entry.front.domain, &entry.front.id, def.classification)?;
         spec.definition = Some(def.reference());
         spec.classification = spec.classification.max(def.classification);
         if spec.acceptance.is_empty() {

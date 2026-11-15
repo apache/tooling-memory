@@ -160,6 +160,10 @@ pub enum Status {
     Superseded,
     /// Erased: the body is gone everywhere, only this stub remains.
     Erased,
+    /// Withheld: an entry it may have been made from was erased. The body stays in the
+    /// record and retrieval does not serve it, until the entry is derived again as a new
+    /// one that names it in `supersedes`, released by the owner, or erased in turn.
+    Withheld,
 }
 
 /// The frontmatter every entry carries. Field names are the contract.
@@ -181,6 +185,12 @@ pub struct Frontmatter {
     /// or a path in a repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cites: Vec<String>,
+    /// The session that wrote the entry and its place in the log of the domain, as
+    /// `<session id>@<offset>`: the offset is the sequence number of the event that
+    /// offered this entry. Reads of that session below the offset are what the entry may
+    /// have drawn on. Absent on an entry written before the log kept this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// The author's confidence, if stated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<Confidence>,
@@ -401,7 +411,7 @@ impl Entry {
         clip(&para, 200)
     }
 
-    /// Whether the entry is live, as opposed to demoted, superseded, or erased.
+    /// Whether the entry is live, as opposed to demoted, superseded, erased, or withheld.
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.front.status.is_none()
@@ -443,6 +453,7 @@ mod tests {
                 author: "agent:worker-3 (model: test-1)".into(),
                 created: datetime!(2026-10-01 10:00 UTC),
                 cites: vec!["https://example.org/thread/1".into()],
+                session: None,
                 confidence: Some(Confidence::High),
                 trust_tier: TrustTier::Curated,
                 review_by: Some(date!(2027-04-01)),
@@ -464,6 +475,16 @@ mod tests {
         let text = e.render();
         let back = Entry::parse(&text).unwrap();
         assert_eq!(e, back);
+        assert_eq!(text, back.render());
+        // an entry written before the log kept the session has no such field, and is
+        // written again without one
+        assert!(!text.contains("session"), "{text}");
+        let mut written = sample();
+        written.front.session = Some("sess-0a1b2c@42".into());
+        let text = written.render();
+        assert!(text.contains("\nsession: sess-0a1b2c@42\n"), "{text}");
+        let back = Entry::parse(&text).unwrap();
+        assert_eq!(written, back);
         assert_eq!(text, back.render());
     }
 
@@ -639,6 +660,18 @@ mod tests {
         e.front.status = Some(Status::Demoted);
         let back = Entry::parse(&e.render()).unwrap();
         assert_eq!(back.front.status, Some(Status::Demoted));
+        assert!(!back.is_active());
+    }
+
+    #[test]
+    fn a_withheld_entry_says_so_on_disk_keeps_its_body_and_is_not_active() {
+        let mut e = sample();
+        e.front.status = Some(Status::Withheld);
+        let text = e.render();
+        assert!(text.contains("\nstatus: withheld\n"), "{text}");
+        let back = Entry::parse(&text).unwrap();
+        assert_eq!(back, e, "the body and every field stay");
+        assert!(back.body.contains("exponential backoff"));
         assert!(!back.is_active());
     }
 

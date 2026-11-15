@@ -383,12 +383,13 @@ There are two more gates:
 Only the owner can erase. Each decision, allow or deny, goes to `state/decisions.jsonl`,
 with the policy version that made it.
 
-Detection. The write log, `state/writes.jsonl`, records which session wrote which entry.
-It is beside the read log, which now names the entries that each read served. `amem taint
-<id>` follows the reach of an entry: the sessions that read it, and the entries that those
-sessions wrote after they read it. This is the paper's lineage for erasure. It is also the
-first place to look when you find that an entry is poisoned. The curator's telemetry
-adds two alarms, from the logs only:
+Detection. The event log of each domain records each write, each read and each send, with
+the session that did it. `amem lineage <id>` follows an entry through the log: the
+entries and the sends that came after a session read it, and with `--back` the entries
+that its session read before the write. This is the paper's lineage for erasure. It is
+also the first place to look when you find that an entry is poisoned. See "The event log
+and lineage" below. The write log, `state/writes.jsonl`, and the read log beside it are
+telemetry. The curator's telemetry adds two alarms, from those two logs only:
 
 - `write-rate`: an author writes thirty or more entries in an hour.
 - `relay`: three or more other sessions read an agent's entry within an hour after it was
@@ -454,6 +455,142 @@ writes:
   it from the user. The verdict was `malicious`.
 - A release signature in base64, held as an encoded payload: `benign`.
 - Codex's handoff that quoted the injection it had refused: `report`.
+
+## The event log and lineage: `amem log`, `amem lineage` and `amem withheld`
+
+Each domain has an event log, `state/log/<domain>.jsonl`. The paper names it the
+historian. `amem` only appends to it, and each domain has one writer at a time. An event
+holds ids and digests, and never a body. Each event has a sequence number, a time and
+an author. These are the kinds of event:
+
+| Kind | What occurred |
+|---|---|
+| `write` | A session offered an entry. `amem` appends this event before the scan and the gates |
+| `put` | The record took a version of an entry |
+| `quarantined` | The scan or a gate refused a write. The event names the `write` event, the gate, and the kinds of thing that the scan found. A write that failed before the record took it gets this event too, with the gate `error`. Nothing is held in `state/quarantine` for such a write |
+| `erased` | The owner erased an entry |
+| `read` | A read gave entries to a session. An export is also a read. A read of a turn of a transcript names the transcript by its session. A turn that comes from an excerpt also names the entry that keeps the excerpt |
+| `send` | Content left the perimeter in a session: a tap posted a handoff, an export wrote a bundle, or the egress recorded a model call with its answer. The event holds the place and a digest |
+| `ledger` | A copy of one event of the ledger: the task, what occurred, the principal and the attempt key, with no text |
+
+A `write`, a `read` and a `send` name their session. Each entry names its session too:
+its frontmatter has `session: <session id>@<offset>`, and the offset is the sequence
+number of its `write` event.
+
+A `write`, a `read`, a `send` and a `ledger` event have a label: the classification of
+the entries or the task that the event names. A `put` and an `erased` event have no
+label, and an event with no label counts as `restricted`. A `quarantined` event has the
+label `restricted`. The body of the refused write stays in `state/quarantine`.
+
+**Who reads the log.** Only the security role reads the log, lineage and the
+quarantine. The security role is the owner, and each author that the `security` key of
+`grants.toml` lists. Put the key before the first table of the file, and give each
+author exactly as its session gives it:
+
+```toml
+security = ["agent:security"]
+```
+
+`amem` filters the log as it filters each read. A session gets no event above its
+handling. Only a session that handles `restricted` gets the two events of a refused
+write, `write` and `quarantined`, whatever the label of the `write` event. An event that
+a session gets is a read: the session label goes up to the label of the event. The same
+rule applies to the quarantine. `amem quarantine list` and `show` give a held write only
+to a session that handles `restricted`, and the session label goes up to `restricted`.
+
+- `amem log show [--domain <domain>] [--from <seq>]` prints the log from a sequence
+  number. First it copies the new events of the ledger into the log.
+- The `log` memory tool gives the same events, and the freshness of the domain.
+- `amem log materialize` builds the index of a domain again from its log and the
+  record. Only the owner can run it.
+
+**The feed, and the freshness bound.** The index has a cursor for each domain: the
+sequence number of the last event that the index took. After a writer appends a version
+to the log, it feeds the index from the log before its write returns. The feed reads
+each entry that the log names above the cursor from the record, and moves the cursor.
+The freshness bound is 60 seconds: a version in the log is in the index not later than
+60 seconds after its event.
+
+- `amem log freshness [--domain <domain>]` measures a domain against the bound. It gives
+  the last sequence number of the log (`log_seq`) and the cursor (`fed_seq`). It gives
+  the number of versions above the cursor (`unfed`), and the age of the oldest of them
+  (`oldest_unfed_seconds`). `within_bound` says if each version is within the bound.
+  When `within_bound` is false, the command also prints a line on standard error.
+- `amem log feed [--domain <domain>]` feeds the index now. Use it when a writer stopped
+  between the log and the index. No reader feeds the index, and no task feeds it on a
+  schedule.
+
+`amem reindex` and `amem log materialize` replace the rows of the index from the record.
+In the same transaction, they put the cursor back at zero. Then they feed the whole log.
+Another process can write while the record is read. The feed after the rebuild reads
+each entry that the log names from the record again, so the index gets that version too.
+
+**Lineage.** `amem lineage <id>` and the `lineage` memory tool read the log of each
+granted domain. The answer has two kinds of edge:
+
+- An informed-by edge (`informed`): a session read one entry before it wrote the other.
+  The read set of an entry is all that its session read before the write. Each entry in
+  the read set counts, so this edge is coarse.
+- A cited edge (`cited`): one entry names the other in `cites` or in `supersedes`.
+
+Forward is the default. `amem lineage <id>` gives the sessions that read the entry, and
+the entries that those sessions wrote after the read. It also gives the sends of those
+sessions after the read, and the entries that cite the entry. `amem lineage <id> --back`
+gives the entries that the session of the entry read before the write, and the entries
+that the entry cites. With `--back`, `<id>` can also be `<domain>@<seq>`, which names a
+send event. `--depth <n>` stops after `n` steps. Each entry in the answer has its number
+of steps (`hops`). A write that the record did not take is no entry: the answer forward
+does not name it. A session that read a turn of a transcript read the transcript. Thus an
+answer back can name a transcript, by its session, among the entries.
+
+In one log, the sequence numbers give the order. Between two domains, the times of the
+events give the order. `complete` is false when the log cannot give the full answer: for
+example, for an entry that has no `write` event, because it is older than the log or an
+import brought it.
+
+**An erasure follows lineage.** `amem erase` reads the lineage forward from the erased
+entry. An entry that is one step forward gets `status: withheld`: an entry that names
+the erased entry, or an entry that a session wrote after it read the erased entry. A
+withheld entry keeps its body in the record. No search, list, T0, recall, get or bundle
+gives it. The receipt of the erasure lists:
+
+- `withheld`: the entries that this erasure withheld.
+- `further`: the entries that are two steps or more forward, and each verified rule of
+  the policy that is one step forward. The erasure does not withhold them.
+- `sends`: each send after a read of the erased entry, with its destination and the
+  sequence numbers of its events. These are copies that the erasure cannot remove.
+
+The stub of the erased entry keeps its id, type, domain, time of creation,
+classification, `supersedes`, session and the status `erased`. Its author becomes
+`erased`. The title, the citations and each other field go with the body.
+
+A session that read the entry before the erasure can write after the erasure. `amem`
+looks at the log after each write. If the session read an entry before the erasure of
+that entry, the new entry gets `status: withheld`. The receipt of the erasure then names
+the new entry in `withheld`. The answer to the write names the erased entry
+(`withheld`). The same session cannot derive a withheld entry again. Its new entry is
+withheld too, and a reader of the old id does not get it. A session that read only the
+stub, after the erasure, is not affected. If `amem` cannot read a log for this check, the
+write fails and the new entry is withheld.
+
+An erasure does not withhold a verified rule of the policy. A rule refuses. Suppose that
+an erasure could withhold a rule. Then an agent could plant an entry that the owner must
+erase, and what the rule refused would pass. The rule stays in force, and the receipt
+lists it in `further`. Erase the rule or replace it if its text came from the erased entry. An
+exception permits, so the erasure withholds it as each other entry, and it is in no
+decision after that.
+
+A withheld entry stays withheld until one of these occurs:
+
+- It is derived again: a new entry names it in `supersedes`. Then a reader of the old
+  id gets the new entry.
+- The owner releases it: `amem withheld release <id>`. Use this when you read the entry
+  and it is correct.
+- The owner erases it.
+
+`amem withheld list [--domain <domain>]` gives the withheld entries that no entry
+replaced, each with the erased entry that caused it (`because`). `amem` files no task
+for a withheld entry.
 
 ## The trust tiers: `amem promote` and `amem approve`
 
@@ -693,7 +830,7 @@ The check is before the read. A read that waits, for example on the index, does 
 check again before it gives its answer. Only `recall` with a deputy does.
 
 Some commands of the owner and of the launcher do not do the check: for example
-`amem transcript`, `amem tape`, `amem source`, `amem quarantine`, `amem taint`,
+`amem transcript`, `amem tape`, `amem source`, `amem quarantine`,
 `amem policy lint` and `amem policy reset`. No memory tool is in this group.
 
 ## The states of a task, and its claim: `amem task`
@@ -967,7 +1104,8 @@ They apply the same checks as to any read. `redirected_from` names what the read
 for, so the reader cites what it read. They follow again only if the current version was
 itself replaced in between, at most eight times.
 
-A demoted or erased entry answers `gone`, as a 410 would. An entry replaced by nothing
+A demoted or erased entry answers `gone`, as a 410 would. A withheld entry answers `gone`
+until a new entry replaces it, and then it redirects. An entry replaced by nothing
 that the reader may read also answers `gone`. The memory server gives either answer only
 about an entry that the reader could read. For any other entry, the answer stays "not
 found". Thus a redirect tells nothing that a search would not tell.
@@ -1039,8 +1177,10 @@ cycle runs it.
 Demotion, erasure and export of an entry also apply to its excerpts.
 
 `amem transcript erase <session> --reason ...` erases a transcript early. This is the
-owner's act. A stub and a receipt remain, and the command flags the entries that cite the
-transcript.
+owner's act. A stub and a receipt remain, and the command withholds the entries that cite
+the transcript. It also withholds each entry that a session wrote after that session read
+a turn of the transcript, before the erasure or after it. A withheld entry keeps its body
+in the record, and no read gives it.
 
 The handoff of a live Codex session cited `#1-3`. With the clock at zero, the sweep kept
 the cited turns as excerpts, and dropped the rest and the raw lines. The erasure of the
@@ -1345,8 +1485,12 @@ way:
 - Each operation appends one event and updates the projection in one transaction.
 - `amem reindex` replays the events.
 - On PostgreSQL, a claim takes its row with `SELECT ... FOR UPDATE SKIP LOCKED`. Thus many
-  claimers on many connections each get a different task, and no claimer waits on the lock
-  of another claimer.
+  claimers on many connections each get a different task.
+- On PostgreSQL, a row of `events` gets its sequence number at the insert, and not at the
+  commit. So each transaction that appends an event takes the lock of its domain first.
+  The appends of one domain then commit in the order of their numbers, and the copy into
+  the event log misses none. The appends of one domain wait for each other. The appends
+  of two domains do not.
 - On both backends, the clock of the ledger itself decides when a lease expires.
 
 With each backend, the record, the index and the read log stay under the root. The tests
