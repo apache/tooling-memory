@@ -27,18 +27,7 @@ use serde::Serialize;
 /// The kinds of artifact the launcher reads.
 pub const KINDS: &[&str] = &["agent", "template", "eval", "harness", "task"];
 
-/// What a completion of a task needs before it counts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Autonomy {
-    /// A person's verdict. Where every definition starts.
-    #[default]
-    Person,
-    /// A review by a session on another model than the author's.
-    Review,
-    /// The acceptance checks alone.
-    Checks,
-}
+pub use dm_ledger::Autonomy;
 
 /// A task definition: the record for one kind of work. A task names one, and what a
 /// session that claims the task may use comes from it.
@@ -73,7 +62,9 @@ pub struct TaskDefinition {
     /// What the work leaves behind.
     #[serde(default)]
     pub outputs: Vec<String>,
-    /// What a completion needs before it counts.
+    /// The highest autonomy level that the person who verified this text lets the
+    /// definition earn. The level that a version has earned is state on the ledger
+    /// ([`Memory::autonomy`]), and every version starts at the lowest.
     #[serde(default)]
     pub autonomy: Autonomy,
 }
@@ -365,13 +356,35 @@ impl Memory {
         let Some(named) = spec.definition.clone() else {
             return Ok(());
         };
-        let name = definition_name(&named);
+        let def = self.readable_definition(&named).await?;
+        spec.definition = Some(def.reference());
+        spec.classification = spec.classification.max(def.classification);
+        if spec.acceptance.is_empty() {
+            spec.acceptance.clone_from(&def.acceptance);
+        }
+        for tool in &def.tools {
+            if !spec.requirements.contains(tool) {
+                spec.requirements.push(tool.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// The definition that `named` names, as a bare name or as `<name>@<entry>`, for
+    /// this session: it must be in force, and the session must be one that may read its
+    /// entry. The session has then read the entry, and its label is no lower.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`], as [`Memory::bind_definition`] gives it.
+    pub(crate) async fn readable_definition(&self, named: &str) -> Result<TaskDefinition, Error> {
+        let name = definition_name(named);
         let none = || {
             Error::Denied(format!(
                 "no task definition {name} is in force: a verified entry of the platform's domain defines one"
             ))
         };
-        let Some(entry) = self.pinned_entry(&named).await? else {
+        let Some(entry) = self.pinned_entry(named).await? else {
             return Err(none());
         };
         // under the filter every read is under, and before anything of the entry is told
@@ -384,17 +397,7 @@ impl Memory {
             return Err(unreadable(name));
         };
         crate::lock(&self.session).observe(def.classification);
-        spec.definition = Some(def.reference());
-        spec.classification = spec.classification.max(def.classification);
-        if spec.acceptance.is_empty() {
-            spec.acceptance.clone_from(&def.acceptance);
-        }
-        for tool in &def.tools {
-            if !spec.requirements.contains(tool) {
-                spec.requirements.push(tool.clone());
-            }
-        }
-        Ok(())
+        Ok(def)
     }
 
     /// Why triage does not admit a task on its own, when what it lacks is a definition
@@ -487,7 +490,7 @@ fn unreadable(name: &str) -> Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::WriteRequest;
 
@@ -498,7 +501,7 @@ mod tests {
 ```platform eval unterminated\nnever closed\n";
 
     /// A root whose platform is `dom-plat`, beside the owner's `dom-me`.
-    fn root(dir: &std::path::Path) -> Memory {
+    pub(crate) fn root(dir: &std::path::Path) -> Memory {
         Memory::init(dir, "human:test:me", "dom-me").unwrap();
         let path = dir.join(crate::GRANTS_FILE);
         let mut g = dm_policy::Grants::load(&path).unwrap();
@@ -509,7 +512,8 @@ mod tests {
         Memory::open(dir).unwrap()
     }
 
-    async fn written(m: &Memory, body: &str, verified: bool) -> String {
+    /// An entry of `dom-plat` with `body`, verified or raw; its id.
+    pub(crate) async fn written(m: &Memory, body: &str, verified: bool) -> String {
         let id = m
             .write(WriteRequest {
                 body: body.into(),

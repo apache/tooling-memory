@@ -21,6 +21,19 @@ fn token(what: &str, name: &str, most: usize) -> Result<(), Error> {
     }
 }
 
+/// The event that a task under a task definition waits on is the verdict on its work. A
+/// session does not wait on that name, and no session reports it: [`Memory::verdict`]
+/// gives the verdict, and checks who gives it.
+fn not_a_verdict(event: &str) -> Result<(), Error> {
+    if event.starts_with(crate::autonomy::VERDICT_EVENT) {
+        return Err(Error::Denied(format!(
+            "an event named {}<task> is the verdict on the work of a task: no session waits on that name or reports it",
+            crate::autonomy::VERDICT_EVENT
+        )));
+    }
+    Ok(())
+}
+
 /// Why a task is not closed, folded or handed on: an effect of it that nobody has settled.
 pub(crate) fn unsettled(task: &Task) -> Option<String> {
     task.effects
@@ -50,9 +63,9 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for an event name that is not one token, or from a session
-    /// whose label is above the task's classification; a ledger error, including a
-    /// lease already lost; a task outside the grants.
+    /// [`Error::Denied`] for an event name that is not one token or that names a
+    /// verdict, or from a session whose label is above the task's classification; a
+    /// ledger error, including a lease already lost; a task outside the grants.
     pub async fn wait_for(
         &self,
         id: &str,
@@ -61,6 +74,7 @@ impl Memory {
         handoff: Option<&str>,
     ) -> Result<Task, Error> {
         token("an event name", on, 200)?;
+        not_a_verdict(on)?;
         if let Some(h) = handoff {
             self.get(h).await?;
         }
@@ -82,14 +96,15 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for an agent, or an event name that is not one token; an
-    /// ungranted domain; a ledger error.
+    /// [`Error::Denied`] for an agent, or an event name that is not one token or that
+    /// names a verdict; an ungranted domain; a ledger error.
     pub async fn event_arrived(
         &self,
         domain: Option<&str>,
         event: &str,
     ) -> Result<Vec<Task>, Error> {
         token("an event name", event, 200)?;
+        not_a_verdict(event)?;
         if Class::of(&self.author, &self.grants.owner) == Class::Agent {
             return Err(Error::Denied(
                 "an agent does not report the event a task waits on: a tap or a person does".into(),
@@ -278,6 +293,31 @@ mod tests {
             .await
             .unwrap();
         assert!(reconciled.effects.is_empty());
+    }
+
+    /// Rule 14 of the autonomy levels: the event of a verdict is the service's name.
+    #[tokio::test]
+    async fn no_session_waits_on_the_event_of_a_verdict_or_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let (agent, id) = held(&owner, dir.path(), "Tidy the importer").await;
+        let event = format!("verdict:{id}");
+        let waits = agent.wait_for(&id, None, &event, None).await;
+        assert!(denied(&waits, "verdict on the work"), "{waits:?}");
+        let held = owner.get_task(&id).await.unwrap();
+        assert_eq!((held.status, held.waiting_on), (Status::Claimed, None));
+        let tap = as_author(dir.path(), "tap:checks");
+        for session in [&tap, &owner] {
+            for name in [event.as_str(), "verdict:task-me-other", "verdict:"] {
+                let reported = session.event_arrived(None, name).await;
+                assert!(denied(&reported, "verdict on the work"), "{reported:?}");
+            }
+        }
+        // a name that only holds the word is an event like any other
+        let other = "check:verdict:1";
+        agent.wait_for(&id, None, other, None).await.unwrap();
+        let woken = tap.event_arrived(None, other).await.unwrap();
+        assert_eq!(woken.len(), 1);
     }
 
     fn not_handed_on<T: std::fmt::Debug>(r: &Result<T, Error>, id: &str) -> bool {

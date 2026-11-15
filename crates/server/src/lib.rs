@@ -35,6 +35,7 @@ use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
 pub mod approvals;
+pub mod autonomy;
 pub mod bundle;
 pub mod contexts;
 pub mod fabric;
@@ -2933,6 +2934,11 @@ impl Memory {
     /// Complete a task with the handoff entry that records what happened. The handoff
     /// must exist in the task's domain.
     ///
+    /// A task that names a task definition is done only when its completion has what
+    /// the autonomy level of that definition asks ([`autonomy`]). Below the highest
+    /// level the task is not closed here: it comes back `blocked`, with the handoff on
+    /// it, and waits for its verdict ([`Memory::verdict`]).
+    ///
     /// # Errors
     ///
     /// [`Error::NotFound`] for a missing handoff, a ledger error, or a task outside the
@@ -2978,7 +2984,15 @@ impl Memory {
             self.observe_task(&same);
             return Ok(same);
         }
+        // the same completion asked again while the task waits for its verdict
+        if self.handed_in_before(&l, &task, handoff).await? {
+            self.observe_task(&task);
+            return Ok(task);
+        }
         let by = self.under(self.claim_of(id, generation)?);
+        if self.needs_verdict(&l, &task).await? {
+            return self.park_for_verdict(&mut l, &task, by, handoff).await;
+        }
         let done = match &kept {
             Some(key) => Self::in_own_words(l.complete_once(id, by, handoff, key).await, attempt)?,
             None => l.complete(id, by, handoff).await?,

@@ -77,6 +77,9 @@ term here in the same commit as the first document that needs it.
 | external action | A change that a holder makes outside the record under its claim. The holder records it on the task before it makes it | side effect |
 | settle | To record what became of an external action: the destination holds it, or does not | reconcile, resolve |
 | task definition | The record in the platform domain for one kind of work: its purpose, its tools, its acceptance checks and its outputs. A task names one as `<name>@<version>` | task type, task template |
+| autonomy level | `person`, `review` or `checks`: what a completion of a task under a task definition needs before the task is `done`. The ledger holds the level of each version of a definition, and each version starts at `person` | autonomy tier, trust level |
+| verdict | The decision on work that a holder handed in under a task definition: accept or reject. At the level `person` a person gives it. At the level `review` a principal other than that holder gives it | approval (for a verdict), sign-off (for a verdict) |
+| work outcome | `reverted` or `rejected`: what became of the work of a task that did not stand. A record of it lowers the autonomy level of the definition one step | outcome (alone, for a work outcome) |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |

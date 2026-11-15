@@ -1062,7 +1062,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Complete a task with the handoff entry you wrote describing what happened. Write the handoff first with `write`, entry_type handoff."
+        description = "Complete a task with the handoff entry you wrote describing what happened. Write the handoff first with `write`, entry_type handoff. A task under a task definition can come back `blocked`, waiting on `verdict:<task>`: your work is handed in, and the task is done when a person or a reviewer accepts it. Do not complete it again."
     )]
     async fn complete(&self, p: Parameters<CompleteParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
