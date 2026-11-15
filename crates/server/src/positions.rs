@@ -23,6 +23,11 @@
 //! in the position may use and the most it reads. A retiring version says
 //! `status = "retired"` above `[charter]`.
 //!
+//! The owner retires a position through [`Memory::retire_position`]: the tasks pinned
+//! to it then return to matching, and its history stays under its name.
+//! [`Memory::positions`] lists the positions with what waits on each, and
+//! [`Memory::wake_list`] names the ones that need a session started.
+//!
 //! A position is in force only from an active entry a person verified, the newest one,
 //! as a task definition is. A session fills a position through
 //! [`Memory::fill_position`]: it then claims the tasks pinned to the position and the
@@ -36,11 +41,13 @@
 //! their citations, so it can bring entries that cite a position; and the handoff
 //! cache walks the newest [`CACHE_WALK`] handoffs of the domain at each read.
 
-use crate::{lock, Error, Memory};
+use crate::{lock, Error, Memory, WriteRequest};
 use dm_core::{Entry, EntryType, Label, ReadFilter, TrustTier};
 use dm_index::Hit;
-use dm_ledger::{Task, TaskSpec};
+use dm_ledger::{Status, Task, TaskSpec};
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
+use time::OffsetDateTime;
 
 /// What the name of every position starts with. A cite that starts with it names a
 /// position.
@@ -168,13 +175,36 @@ pub fn agent_definition(author: &str) -> Option<&str> {
         .and_then(|rest| rest.split_whitespace().next())
 }
 
-/// The `position <name>` blocks of a body, each with its text. A fence inside a longer
-/// fence is text of that one, and opens nothing.
-fn blocks_in(body: &str) -> Vec<(String, String)> {
+/// A `position <name>` block of a body.
+struct Fenced {
+    /// The name on its fence.
+    name: String,
+    /// Its text: its lines, as [`str::lines`] gives them.
+    text: String,
+    /// Where its lines are in the body: from its first line to its closing fence.
+    at: std::ops::Range<usize>,
+}
+
+/// A line of a body without its line ending, as [`str::lines`] gives it.
+fn without_ending(raw: &str) -> &str {
+    match raw.strip_suffix('\n') {
+        Some(line) => line.strip_suffix('\r').unwrap_or(line),
+        None => raw,
+    }
+}
+
+/// The `position <name>` blocks of a body. A fence inside a longer fence is text of
+/// that one, and opens nothing.
+fn blocks_in(body: &str) -> Vec<Fenced> {
     let mut out = Vec::new();
-    // the fence that is open: its length, the name when it is a position's, its lines
-    let mut open: Option<(usize, Option<String>, Vec<&str>)> = None;
-    for line in body.lines() {
+    // the fence that is open: its length, the name when it is a position's, where its
+    // first line starts, its lines
+    let mut open: Option<(usize, Option<String>, usize, Vec<&str>)> = None;
+    let mut next = 0;
+    for raw in body.split_inclusive('\n') {
+        let start = next;
+        next += raw.len();
+        let line = without_ending(raw);
         let trimmed = line.trim_start();
         let ticks = trimmed.chars().take_while(|c| *c == '`').count();
         let rest = &trimmed[ticks..];
@@ -185,13 +215,17 @@ fn blocks_in(body: &str) -> Vec<(String, String)> {
                     (Some("position"), Some(name), None) => Some(name.to_string()),
                     _ => None,
                 };
-                open = Some((ticks, name, Vec::new()));
+                open = Some((ticks, name, next, Vec::new()));
             }
             None => {}
-            Some((fence, name, lines)) => {
+            Some((fence, name, first, lines)) => {
                 if ticks >= *fence && rest.trim().is_empty() {
                     if let Some(name) = name.take() {
-                        out.push((name, lines.join("\n")));
+                        out.push(Fenced {
+                            name,
+                            text: lines.join("\n"),
+                            at: *first..start,
+                        });
                     }
                     open = None;
                 } else {
@@ -203,20 +237,15 @@ fn blocks_in(body: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The position an entry defines: an entry of type `position` with one `position`
-/// block that reads. The block reads when its name is a position's, it has no key this
-/// code does not know, its agent is one word, and every tool is `tool:<name>`. Whether
-/// the entry is in force is the caller's to ask.
-#[must_use]
-pub fn position_in(e: &Entry) -> Option<Position> {
-    if e.front.entry_type != EntryType::Position {
-        return None;
-    }
-    let mut blocks = blocks_in(&e.body);
-    let (name, text) = blocks.pop().filter(|_| blocks.is_empty())?;
-    let block: Block = toml::from_str(&text).ok()?;
+/// The one `position` block of a body, when it reads. The block reads when its name is
+/// a position's, it has no key this code does not know, its agent is one word, and
+/// every tool is `tool:<name>`.
+fn block_in(body: &str) -> Option<(Fenced, Block)> {
+    let mut blocks = blocks_in(body);
+    let fenced = blocks.pop().filter(|_| blocks.is_empty())?;
+    let block: Block = toml::from_str(&fenced.text).ok()?;
     let agent = &block.charter.agent;
-    let reads = is_name(&name)
+    let reads = is_name(&fenced.name)
         && !agent.is_empty()
         && !agent.contains(char::is_whitespace)
         && block
@@ -224,8 +253,19 @@ pub fn position_in(e: &Entry) -> Option<Position> {
             .tools
             .iter()
             .all(|t| t.starts_with("tool:") && t.len() > 5);
-    reads.then(|| Position {
-        name,
+    reads.then_some((fenced, block))
+}
+
+/// The position an entry defines: an entry of type `position` with one `position`
+/// block that reads. Whether the entry is in force is the caller's to ask.
+#[must_use]
+pub fn position_in(e: &Entry) -> Option<Position> {
+    if e.front.entry_type != EntryType::Position {
+        return None;
+    }
+    let (fenced, block) = block_in(&e.body)?;
+    Some(Position {
+        name: fenced.name,
         entry: e.front.id.clone(),
         domain: e.front.domain.clone(),
         classification: e.front.classification,
@@ -235,20 +275,79 @@ pub fn position_in(e: &Entry) -> Option<Position> {
     })
 }
 
+/// The body of a position's entry with the `status` of its block set, and everything
+/// else of the body byte for byte. The status is a line above the block's first table:
+/// a retiring version gets `status = "retired"` as the block's first line, and an
+/// active one has no such line.
+///
+/// # Errors
+///
+/// A body with no one position block that reads; and a result that does not read back
+/// as the same record with the new status, which is how a block whose status is not
+/// one line of its own is refused.
+pub fn with_status(body: &str, status: State) -> Result<String, String> {
+    let (fenced, old) = block_in(body).ok_or("the body holds no one position block that reads")?;
+    if old.status == status {
+        return Ok(body.to_string());
+    }
+    let mut kept = String::new();
+    let mut above_tables = true;
+    for line in body[fenced.at.clone()].split_inclusive('\n') {
+        let key = line.trim_start();
+        above_tables = above_tables && !key.starts_with('[');
+        let sets_status = key
+            .strip_prefix("status")
+            .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if !(above_tables && sets_status) {
+            kept.push_str(line);
+        }
+    }
+    let set = match status {
+        State::Active => "",
+        State::Retired => "status = \"retired\"\n",
+    };
+    let (before, after) = (&body[..fenced.at.start], &body[fenced.at.end..]);
+    let out = format!("{before}{set}{kept}{after}");
+    match block_in(&out) {
+        Some((now, block))
+            if now.name == fenced.name
+                && block.status == status
+                && block.charter == old.charter
+                && block.envelope == old.envelope =>
+        {
+            Ok(out)
+        }
+        _ => Err(
+            "the position block does not read back as the same record with the new status".into(),
+        ),
+    }
+}
+
 /// The record among the active entries that define one name, newest first: the newest
 /// verified one, active or retired as its block says; when none is verified, the
 /// newest retiring one the owner wrote, since only the owner replaces a verified entry.
-fn in_force(candidates: Vec<(Entry, Position)>, owner: &str) -> Option<Position> {
+fn in_force<'a>(candidates: &[(&'a Entry, &'a Position)], owner: &str) -> Option<&'a Position> {
     let verified = candidates
         .iter()
         .find(|(e, _)| e.front.trust_tier == TrustTier::Verified);
     if let Some((_, p)) = verified {
-        return Some(p.clone());
+        return Some(p);
     }
     candidates
-        .into_iter()
+        .iter()
         .find(|(e, p)| p.state == State::Retired && e.front.author == owner)
-        .map(|(_, p)| p)
+        .map(|(_, p)| *p)
+}
+
+/// The entries of `entries` that define the position `name`, in the order given.
+fn versions_of<'a>(
+    entries: &'a [(Entry, Option<Position>)],
+    name: &str,
+) -> Vec<(&'a Entry, &'a Position)> {
+    entries
+        .iter()
+        .filter_map(|(e, p)| Some((e, p.as_ref().filter(|p| p.name == name)?)))
+        .collect()
 }
 
 /// The position a session fills: a copy, taken when the session filled it.
@@ -335,6 +434,108 @@ pub struct PositionView {
     /// This session's seat, when it fills the position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seat: Option<SeatView>,
+}
+
+/// What a retirement did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Retired {
+    /// The position's name.
+    pub position: String,
+    /// Its domain.
+    pub domain: String,
+    /// The version that was retired: the entry the retiring version replaced, or the
+    /// retiring version itself when it replaced none.
+    pub entry: String,
+    /// The retiring version: the entry the name resolves to now.
+    pub retired_by: String,
+    /// The tasks this call took the pin off, in queue order.
+    pub unpinned: Vec<String>,
+}
+
+/// What a listed entry is to the position it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Standing {
+    /// It is the record in force of its name, and the position takes sessions and pins.
+    Active,
+    /// It is the record in force of its name, and the position is retired.
+    Retired,
+    /// It is not the record in force of its name.
+    #[serde(rename = "none")]
+    NotInForce,
+}
+
+/// An entry of type `position`, as [`Memory::positions`] lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ListedPosition {
+    /// The position's name; empty when the entry's block does not read.
+    pub name: String,
+    /// The entry.
+    pub entry: String,
+    /// Its domain.
+    pub domain: String,
+    /// What the entry is to its name.
+    pub state: Standing,
+    /// The agent definition its charter names; empty when the block does not read.
+    pub agent: String,
+    /// How many open tasks are pinned to the position, of those this session may see.
+    pub pinned: usize,
+    /// Those of them a session could claim now, in queue order: an open one, and a
+    /// claimed one whose holder has no live lease on a task from the position.
+    pub waiting: Vec<String>,
+    /// The sessions that hold a task they claimed from the position, under a live lease.
+    pub sessions: Vec<String>,
+    /// Whether the position needs a session started: it is active, a task waits, and
+    /// no session is live in it.
+    pub wake: bool,
+    /// Why the entry is not the record in force of its name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why_not: Option<String>,
+}
+
+impl ListedPosition {
+    /// The row of an entry that is not the record in force of a name.
+    fn not_in_force(e: &Entry, p: Option<&Position>, why: String) -> ListedPosition {
+        ListedPosition {
+            name: p.map(|p| p.name.clone()).unwrap_or_default(),
+            entry: e.front.id.clone(),
+            domain: e.front.domain.clone(),
+            state: Standing::NotInForce,
+            agent: p.map(|p| p.charter.agent.clone()).unwrap_or_default(),
+            pinned: 0,
+            waiting: Vec::new(),
+            sessions: Vec::new(),
+            wake: false,
+            why_not: Some(why),
+        }
+    }
+}
+
+/// A position that needs a session started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Wake {
+    /// The position's name.
+    pub position: String,
+    /// Its domain.
+    pub domain: String,
+    /// The entry that defines it.
+    pub entry: String,
+    /// The agent definition its charter names: what to start the session under.
+    pub agent: String,
+    /// The tasks that wait for the session, in queue order.
+    pub tasks: Vec<String>,
+}
+
+/// Whether a session could claim a task pinned to a position now, when `sessions` hold
+/// a live lease on a task from that position: the task is open, or it is claimed and
+/// its holder is none of them. Only a session in the position claims a pinned task, so
+/// the holder of a live lease on it is one of `sessions`.
+fn waits(task: &Task, sessions: &[String]) -> bool {
+    match task.status {
+        Status::Open => true,
+        Status::Claimed => !task.holder.as_ref().is_some_and(|h| sessions.contains(h)),
+        _ => false,
+    }
 }
 
 fn none_in_force(name: &str) -> Error {
@@ -429,25 +630,36 @@ impl Memory {
         if !self.grants.may_write(domain) || !is_name(name) {
             return Ok(None);
         }
-        // the whole record of the domain, whoever asks: which version is in force is
-        // one answer, and what a session may read of it is asked after
+        let entries = self.position_entries(domain).await?;
+        Ok(in_force(&versions_of(&entries, name), &self.grants.owner).cloned())
+    }
+
+    /// The active entries of type `position` in a domain, newest first, each with the
+    /// position it defines when its block reads. This is the whole record of the
+    /// domain, whoever asks: which version is in force is one answer, and what a
+    /// session may read of it is asked after.
+    async fn position_entries(
+        &self,
+        domain: &str,
+    ) -> Result<Vec<(Entry, Option<Position>)>, Error> {
         let all = ReadFilter::for_domains([domain], Label::Restricted);
         let hits = self
             .index
             .lock()
             .await
             .list_every(&all, Some(EntryType::Position))?;
-        let mut candidates = Vec::new();
+        let mut out = Vec::new();
         for h in hits {
             let Some(e) = self.store.get(domain, &h.id).await? else {
                 continue;
             };
-            if let Some(p) = position_in(&e).filter(|p| e.is_active() && p.name == name) {
-                candidates.push((e, p));
+            if e.is_active() {
+                let position = position_in(&e);
+                out.push((e, position));
             }
         }
-        candidates.sort_by_key(|(e, _)| std::cmp::Reverse(e.front.created));
-        Ok(in_force(candidates, &self.grants.owner))
+        out.sort_by_key(|(e, _)| Reverse(e.front.created));
+        Ok(out)
     }
 
     /// The position named `name` that this session may read: in the domain named, or in
@@ -766,13 +978,287 @@ impl Memory {
             seat,
         })
     }
+
+    /// Whether this session may retire a position for the reason `why`. The reason
+    /// goes into an entry, so it is words only.
+    fn may_retire(&self, why: &str) -> Result<(), Error> {
+        if self.author != self.grants.owner {
+            return Err(Error::Denied(format!(
+                "only the owner {} retires a position",
+                self.grants.owner
+            )));
+        }
+        let marked = ["```", "~~~", "\n", "\r", "<"]
+            .iter()
+            .any(|mark| why.contains(mark));
+        if marked || why.trim().is_empty() {
+            return Err(Error::Denied(
+                "the reason to retire a position is words on one line, with no code fence and \
+                 no markup"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Replace each verified version that defines `name` as active by a retiring
+    /// version: the same body with the block's status set, and the reason as its last
+    /// paragraph. The oldest goes first, so the newest retiring version is the one
+    /// that replaces the version in force, and no older verified version comes back
+    /// into force.
+    async fn write_retiring(&self, domain: &str, name: &str, why: &str) -> Result<(), Error> {
+        let entries = self.position_entries(domain).await?;
+        let in_force_once = versions_of(&entries, name)
+            .into_iter()
+            .rev()
+            .filter(|(e, p)| e.front.trust_tier == TrustTier::Verified && p.state == State::Active);
+        for (old, _) in in_force_once {
+            let body = with_status(&old.body, State::Retired).map_err(Error::Denied)?;
+            self.write(WriteRequest {
+                domain: Some(domain.to_string()),
+                entry_type: EntryType::Position,
+                title: old.front.title.clone(),
+                body: format!("{}\n\nRetired: {why}\n", body.trim_end()),
+                supersedes: Some(old.front.id.clone()),
+                classification: Some(old.front.classification),
+                ..WriteRequest::default()
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The tasks pinned to a position, when this session may see each of them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] when one is above this session's handling: a retirement takes
+    /// the pin off every task, and this session would change a task it may not read.
+    async fn pins_in_reach(&self, domain: &str, name: &str) -> Result<(), Error> {
+        let pinned = self.ledger.lock().await.pinned_to(domain, name).await?;
+        let handling = self.handling()?;
+        if pinned.iter().all(|t| self.sees(t, handling)) {
+            Ok(())
+        } else {
+            Err(Error::Denied(format!(
+                "position {name} has pinned tasks this session may not read; it is not retired here"
+            )))
+        }
+    }
+
+    /// Take the pin off every open task of a position, so each returns to matching.
+    /// The reason the ledger keeps is a fixed sentence. Gives the tasks, read.
+    async fn unpin_all(&self, domain: &str, name: &str) -> Result<Vec<String>, Error> {
+        let why = format!("position {name} was retired");
+        let mut unpinned = Vec::new();
+        {
+            let mut l = self.ledger.lock().await;
+            for task in l.pinned_to(domain, name).await? {
+                unpinned.push(l.unpin(&task.id, &why).await?);
+            }
+        }
+        let read = self.read_tasks(unpinned)?;
+        Ok(read.into_iter().map(|t| t.id).collect())
+    }
+
+    /// Retire a position: the owner's step down, as the retirement of a rule is. The
+    /// version in force is replaced by one whose block says `status = "retired"`, with
+    /// the reason as its last paragraph. That version counts at once, since only the
+    /// owner replaces a verified entry. Each task pinned to the position then loses
+    /// its pin and returns to matching. The position's history stays under its name.
+    ///
+    /// Asked again for a retired position, it finds no verified version that says
+    /// active, so it writes no second version. It takes the pin off what is still
+    /// pinned, so a second call finishes a retirement that failed half way.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for anyone but the owner of the record, for a reason that is
+    /// empty or is not words on one line, and when a task pinned to the position is
+    /// above this session's handling; [`Error::NotFound`] when no such position is
+    /// there for this session; and as [`Memory::write`].
+    pub async fn retire_position(
+        &self,
+        name: &str,
+        why: &str,
+        domain: Option<&str>,
+    ) -> Result<Retired, Error> {
+        self.may_retire(why)?;
+        let Some(found) = self.readable_position(name, domain).await? else {
+            return Err(Error::NotFound(format!("position {name}")));
+        };
+        let domain = found.domain;
+        self.pins_in_reach(&domain, name).await?;
+        self.write_retiring(&domain, name, why).await?;
+        let now = self.position_record(&domain, name).await?;
+        let Some(now) = now.filter(|p| p.state == State::Retired) else {
+            return Err(Error::Denied(format!(
+                "position {name} does not resolve as retired: ask again"
+            )));
+        };
+        let retiring = self.store.get(&domain, &now.entry).await?;
+        let replaced = retiring.and_then(|e| e.front.supersedes);
+        let unpinned = self.unpin_all(&domain, name).await?;
+        Ok(Retired {
+            position: name.to_string(),
+            entry: replaced.unwrap_or_else(|| now.entry.clone()),
+            retired_by: now.entry,
+            domain,
+            unpinned,
+        })
+    }
+
+    /// The row of the record in force of a name: what is pinned to the position, what
+    /// of it waits, and who is live in it.
+    async fn in_force_row(&self, p: &Position) -> Result<ListedPosition, Error> {
+        let (pinned, sessions) = {
+            let l = self.ledger.lock().await;
+            let pinned = l.pinned_to(&p.domain, &p.name).await?;
+            (pinned, l.seated(&p.domain, &p.name).await?)
+        };
+        let pinned = self.read_tasks(pinned)?;
+        let waiting: Vec<String> = pinned
+            .iter()
+            .filter(|t| waits(t, &sessions))
+            .map(|t| t.id.clone())
+            .collect();
+        let active = p.state == State::Active;
+        Ok(ListedPosition {
+            name: p.name.clone(),
+            entry: p.entry.clone(),
+            domain: p.domain.clone(),
+            state: if active {
+                Standing::Active
+            } else {
+                Standing::Retired
+            },
+            agent: p.charter.agent.clone(),
+            pinned: pinned.len(),
+            wake: active && !waiting.is_empty() && sessions.is_empty(),
+            waiting,
+            sessions,
+            why_not: None,
+        })
+    }
+
+    /// The row of an entry that defines `p`: the record in force of its name, or why
+    /// the entry is not that record. A verified entry that a version this session may
+    /// not read replaced has no row: to this session that position does not exist.
+    async fn listed(
+        &self,
+        e: &Entry,
+        p: &Position,
+        entries: &[(Entry, Option<Position>)],
+        readable: &[Hit],
+    ) -> Result<Option<ListedPosition>, Error> {
+        let record = in_force(&versions_of(entries, &p.name), &self.grants.owner);
+        if record.is_some_and(|r| r.entry == p.entry) {
+            return Ok(Some(self.in_force_row(p).await?));
+        }
+        let why = if e.front.trust_tier != TrustTier::Verified {
+            format!(
+                "its entry is {}; a position is in force once a person verifies it",
+                e.front.trust_tier
+            )
+        } else if record.is_some_and(|r| readable.iter().any(|h| h.id == r.entry)) {
+            format!("a newer verified entry defines {}", p.name)
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(ListedPosition::not_in_force(e, Some(p), why)))
+    }
+
+    /// The rows of one domain within `filter`, each with its entry's index row and the
+    /// time of the entry.
+    async fn listed_in(
+        &self,
+        domain: &str,
+        filter: &ReadFilter,
+    ) -> Result<Vec<(OffsetDateTime, Hit, ListedPosition)>, Error> {
+        let mut f = filter.clone();
+        f.domains = vec![domain.to_string()];
+        let readable = self
+            .index
+            .lock()
+            .await
+            .list_every(&f, Some(EntryType::Position))?;
+        let entries = self.position_entries(domain).await?;
+        let mut rows = Vec::new();
+        for (e, p) in &entries {
+            let Some(hit) = readable.iter().find(|h| h.id == e.front.id) else {
+                continue;
+            };
+            let row = match p {
+                Some(p) => self.listed(e, p, &entries, &readable).await?,
+                None => Some(ListedPosition::not_in_force(
+                    e,
+                    None,
+                    "its block does not read as a position".into(),
+                )),
+            };
+            if let Some(row) = row {
+                rows.push((e.front.created, hit.clone(), row));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The positions of one granted domain, or of all when none is named: every active
+    /// entry of type `position` this session may read, newest first. An entry that is
+    /// the record in force of its name says whether the position is active or
+    /// retired, how many open tasks are pinned to it, which of them wait, which
+    /// sessions are live in it, and whether it needs a session started. Any other
+    /// entry says why it is not in force. Each entry listed is read, and so is each
+    /// task counted.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a domain outside the grants or outside what this session
+    /// reads; an index, store or ledger error.
+    pub async fn positions(&self, domain: Option<&str>) -> Result<Vec<ListedPosition>, Error> {
+        let f = self.filter_for(domain)?;
+        let mut rows = Vec::new();
+        for d in self.domains() {
+            if f.domains.contains(&d) {
+                rows.extend(self.listed_in(&d, &f).await?);
+            }
+        }
+        rows.sort_by_key(|(created, _, _)| Reverse(*created));
+        let hits: Vec<Hit> = rows.iter().map(|(_, hit, _)| hit.clone()).collect();
+        self.observe(&hits);
+        self.reads.hits("positions", None, &hits);
+        Ok(rows.into_iter().map(|(_, _, row)| row).collect())
+    }
+
+    /// The positions that need a session started, of one granted domain or of all:
+    /// each is active, has a task that waits, and has no live session. Each names the
+    /// agent definition of its charter and the tasks that wait, in queue order. A
+    /// launcher reads this list and starts the sessions; the service starts none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::positions`].
+    pub async fn wake_list(&self, domain: Option<&str>) -> Result<Vec<Wake>, Error> {
+        let listed = self.positions(domain).await?;
+        Ok(listed
+            .into_iter()
+            .filter(|p| p.wake)
+            .map(|p| Wake {
+                position: p.name,
+                domain: p.domain,
+                entry: p.entry,
+                agent: p.agent,
+                tasks: p.waiting,
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Promotion, WriteRequest};
-    use dm_ledger::{PinReason, Status};
+    use dm_ledger::PinReason;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -1560,5 +2046,569 @@ mod tests {
         // and it stays retired once a person verified that version
         verify(&owner, ME, &last).await;
         assert_eq!(denied(later.fill_position(RELEASE, None).await), fill);
+    }
+
+    const WHY: &str = "The release work moved to the build service.";
+
+    /// The ids of every version of a position entry that `dom-me` holds, in force or
+    /// replaced.
+    async fn versions(m: &Memory) -> Vec<String> {
+        let all = m.list_archive(Some(ME), 100).await.unwrap();
+        all.into_iter()
+            .filter(|h| h.entry_type == EntryType::Position)
+            .map(|h| h.id)
+            .collect()
+    }
+
+    /// The position a task is pinned to, as the ledger holds the task now.
+    async fn pin_of(m: &Memory, id: &str) -> Option<String> {
+        let task = m.ledger.lock().await.get(id).await.unwrap();
+        assert_eq!(task.spec.position.is_some(), task.spec.pin_reason.is_some());
+        task.spec.position
+    }
+
+    async fn state_of(m: &Memory) -> State {
+        m.position(RELEASE, None).await.unwrap().position.state
+    }
+
+    #[test]
+    fn a_new_status_changes_only_the_status_line_of_the_block() {
+        let mut p = release();
+        p.charter.orders = "Cut it.\nstatus = \"as the orders say\"\n[then] rest.".into();
+        let block = p.block().unwrap();
+        assert!(
+            block.contains("\nstatus = \"as the orders say\"\n"),
+            "{block}"
+        );
+        let fence = "```position pos-release\n";
+        let commented = with(
+            &block,
+            fence,
+            "```position pos-release\n# who cuts a release\n",
+        );
+        let body = format!("# The coordinator\r\n\n```toml\nstatus = \"x\"\n```\n\n{commented}\nLast words, no line end");
+        let retired = with_status(&body, State::Retired).unwrap();
+        let expected = with(
+            &body,
+            fence,
+            "```position pos-release\nstatus = \"retired\"\n",
+        );
+        assert_eq!(retired, expected, "one line more, and nothing else");
+        let read = |text: &str| position_in(&entry_of("position", text)).unwrap();
+        assert_eq!(read(&retired).state, State::Retired);
+        assert_eq!(read(&retired).charter, p.charter);
+        // asked for the status it has, the body is the same; and the line goes again
+        assert_eq!(with_status(&retired, State::Retired).unwrap(), retired);
+        let comment = "# who cuts a release\n";
+        let below = with(
+            &body,
+            comment,
+            "# who cuts a release\nstatus = \"retired\"\n",
+        );
+        assert_eq!(with_status(&below, State::Retired).unwrap(), below);
+        assert_eq!(with_status(&retired, State::Active).unwrap(), body);
+        assert_eq!(with_status(&below, State::Active).unwrap(), body);
+        // an active status that is written out is replaced
+        let written = with(
+            &body,
+            fence,
+            "```position pos-release\nstatus = \"active\"\n",
+        );
+        assert_eq!(with_status(&written, State::Retired).unwrap(), expected);
+        // no block, two blocks, a block that does not read, and a status this cannot
+        // set as one line of its own
+        let quoted = with(
+            &body,
+            fence,
+            "```position pos-release\n\"status\" = \"active\"\n",
+        );
+        assert_eq!(read(&quoted).state, State::Active, "it reads as a position");
+        let dotted = "```position pos-release\ncharter.agent = \"codex\"\ncharter.orders = \"\"\"\nCut it.\nstatus = \"as the orders say\"\n\"\"\"\n\n[envelope]\nhandling = \"restricted\"\n```\n";
+        assert!(
+            read(dotted).charter.orders.contains("status = "),
+            "it reads too"
+        );
+        let none = [
+            "# The coordinator\n\nNo block.\n".to_string(),
+            format!("{body}\n{block}"),
+            with(&body, "agent = \"codex\"", "agent = \"\""),
+            quoted,
+            dotted.to_string(),
+        ];
+        for text in none {
+            let refused = with_status(&text, State::Retired);
+            assert!(refused.is_err(), "{refused:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_retires_a_position_and_gives_a_reason_in_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let first = in_force(&owner, &release()).await;
+        let commitment = admitted(&owner, pinned("Cut 1.2")).await;
+        let codex = session(dir.path(), "codex");
+        let why = denied(codex.retire_position(RELEASE, WHY, None).await);
+        assert_eq!(why, "only the owner human:test:me retires a position");
+        for words in [
+            "",
+            "  ",
+            "Done.\nstatus",
+            "```",
+            "~~~",
+            "<b>Done</b>",
+            "a\rb",
+        ] {
+            let why = denied(owner.retire_position(RELEASE, words, None).await);
+            assert!(
+                why.starts_with("the reason to retire a position is words"),
+                "{why}"
+            );
+        }
+        // every task it takes the pin off is one the session may read
+        let high = TaskSpec {
+            classification: Label::Restricted,
+            ..pinned("Cut 2.0")
+        };
+        let high = admitted(&owner, high).await;
+        let capped = Memory::open(dir.path()).unwrap();
+        let capped = capped.with_handling_cap(Label::Internal);
+        let why = denied(capped.retire_position(RELEASE, WHY, None).await);
+        assert_eq!(
+            why,
+            "position pos-release has pinned tasks this session may not read; it is not retired here"
+        );
+        // nothing was written and nothing was unpinned
+        assert_eq!(versions(&owner).await, [first]);
+        assert_eq!(state_of(&owner).await, State::Active);
+        for id in [&commitment.id, &high.id] {
+            assert_eq!(pin_of(&owner, id).await.as_deref(), Some(RELEASE));
+        }
+        // a name with no record in force is not there to retire
+        let unverified = Position {
+            name: "pos-qa".into(),
+            ..release()
+        };
+        write(&owner, entry(&unverified)).await;
+        for name in ["pos-qa", "pos-nothere"] {
+            let missing = owner.retire_position(name, WHY, None).await;
+            assert!(matches!(missing, Err(Error::NotFound(_))), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retired_position_takes_nothing_new_and_its_history_stays_under_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let mut req = entry(&release());
+        req.classification = Some(Label::Restricted);
+        req.title = Some("The release coordinator, as chartered".into());
+        let first = write(&owner, req).await;
+        verify(&owner, ME, &first).await;
+        let seated = session(dir.path(), "codex");
+        seated.fill_position(RELEASE, None).await.unwrap();
+        let report = write(&seated, handoff("The mirrors are checked.\n")).await;
+        let old = owner.store.get(ME, &first).await.unwrap().unwrap();
+
+        let fresh = Memory::open(dir.path()).unwrap();
+        let retired = fresh.retire_position(RELEASE, WHY, None).await.unwrap();
+        assert_eq!(
+            (retired.position.as_str(), retired.domain.as_str()),
+            (RELEASE, ME)
+        );
+        assert_eq!(retired.entry, first);
+        assert!(retired.unpinned.is_empty());
+        // the retiring version: the same entry with the status set and the reason
+        let last = owner.store.get(ME, &retired.retired_by).await.unwrap();
+        let last = last.unwrap();
+        let body = with_status(&old.body, State::Retired).unwrap();
+        assert_eq!(
+            last.body,
+            format!("{}\n\nRetired: {WHY}\n", body.trim_end())
+        );
+        assert_eq!(last.front.supersedes.as_deref(), Some(first.as_str()));
+        assert_eq!(last.front.entry_type, EntryType::Position);
+        assert_eq!(last.front.title, old.front.title);
+        assert_eq!(last.front.classification, Label::Restricted);
+        assert_eq!(versions(&owner).await.len(), 2);
+        // it takes no session and no pin, and the session in it stops
+        let later = session(dir.path(), "codex");
+        let fill = denied(later.fill_position(RELEASE, None).await);
+        assert!(fill.contains("position pos-release is retired"), "{fill}");
+        assert_eq!(denied(owner.file_own(pinned("Cut 1.3")).await), fill);
+        stale(seated.claim_next(Some(ME), lease()).await);
+        // and what it was stays under its name
+        let view = later.position(RELEASE, None).await.unwrap();
+        assert_eq!(view.position.state, State::Retired);
+        assert_eq!(view.position.entry, retired.retired_by);
+        assert_eq!(view.position.charter.orders, ORDERS);
+        let cached: Vec<&str> = view.handoffs.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(cached, [report.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn the_open_tasks_of_a_retired_position_return_to_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        in_force(&owner, &release()).await;
+        let seated = session(dir.path(), "codex");
+        seated.fill_position(RELEASE, None).await.unwrap();
+        let done = admitted(&owner, pinned("Cut 1.0")).await;
+        let claim = seated.claim(&done.id, lease()).await.unwrap();
+        let report = write(&seated, handoff("The tag is cut.\n")).await;
+        let closed = seated.complete(&done.id, Some(claim.generation), &report);
+        closed.await.unwrap();
+        let held = admitted(&owner, pinned("Cut 1.1")).await;
+        seated.claim(&held.id, lease()).await.unwrap();
+        let open = admitted(&owner, pinned("Cut 1.2")).await;
+        let waits_on_open = TaskSpec {
+            depends_on: vec![open.id.clone()],
+            ..pinned("Announce 1.2")
+        };
+        let blocked = owner.file_own(waits_on_open).await.unwrap().task;
+        let plain = session(dir.path(), "claude");
+        let proposed = plain.create_task(pinned("Cut 1.3")).await.unwrap().task;
+        let before = [
+            (&held, Status::Claimed),
+            (&open, Status::Open),
+            (&blocked, Status::Blocked),
+            (&proposed, Status::Proposed),
+        ];
+        for (task, status) in before {
+            let now = owner.ledger.lock().await.get(&task.id).await.unwrap();
+            assert_eq!(now.status, status, "{}", task.spec.title);
+        }
+        assert!(
+            plain.claim(&open.id, lease()).await.is_err(),
+            "it is pinned"
+        );
+
+        let retired = owner.retire_position(RELEASE, WHY, None).await.unwrap();
+        // in queue order: the task that another one waits on ranks first
+        let expected = [&open.id, &held.id, &blocked.id, &proposed.id];
+        assert_eq!(retired.unpinned.iter().collect::<Vec<_>>(), expected);
+        for (task, status) in before {
+            let now = owner.ledger.lock().await.get(&task.id).await.unwrap();
+            assert_eq!(now.status, status, "{}", task.spec.title);
+            assert_eq!(pin_of(&owner, &task.id).await, None, "{}", task.spec.title);
+        }
+        // the ledger keeps one fixed sentence for each, and none of the owner's words
+        let log = rusqlite::Connection::open(dir.path().join(crate::LEDGER_FILE)).unwrap();
+        let mut unpinned = log
+            .prepare("SELECT payload FROM events WHERE kind = 'unpinned'")
+            .unwrap();
+        let whys: Vec<String> = unpinned
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(whys.len(), 4, "{whys:?}");
+        for payload in &whys {
+            assert!(
+                payload.contains("\"position pos-release was retired\"") && !payload.contains(WHY),
+                "{payload}"
+            );
+        }
+        // what the position finished is its history: that pin stays on the record
+        assert_eq!(pin_of(&owner, &done.id).await.as_deref(), Some(RELEASE));
+        let taken = plain.claim(&open.id, lease()).await.unwrap();
+        assert_eq!(taken.task.id, open.id);
+        let view = owner.position(RELEASE, None).await.unwrap();
+        assert!(view.commitments.is_empty(), "{:?}", view.commitments);
+    }
+
+    #[tokio::test]
+    async fn a_retirement_asked_again_writes_no_second_version_and_finishes_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        // two verified versions, neither of which replaced the other
+        let older = in_force(&owner, &release()).await;
+        let mut wider = release();
+        wider.charter.covers.push("triage".into());
+        let newer = in_force(&owner, &wider).await;
+        // and a version that no person verified, which a retirement leaves as it is
+        let draft = write(&owner, entry(&release())).await;
+        let first = owner.retire_position(RELEASE, WHY, None).await.unwrap();
+        assert_eq!(
+            first.entry, newer,
+            "the version in force is the one retired"
+        );
+        assert_eq!(state_of(&owner).await, State::Retired);
+        let written = versions(&owner).await;
+        assert_eq!(written.len(), 5, "a retiring version for each: {written:?}");
+        let replaced_older = owner.store.get(ME, &older).await.unwrap().unwrap();
+        assert!(!replaced_older.is_active(), "no older version comes back");
+        let draft = owner.store.get(ME, &draft).await.unwrap().unwrap();
+        assert!(draft.is_active(), "nobody replaced the draft");
+        // a task that is still pinned, as after a retirement that stopped half way
+        let left = owner.ledger.lock().await.create(pinned("Cut 1.4")).await;
+        let left = left.unwrap().task;
+        let again = owner.retire_position(RELEASE, "Asked again.", None).await;
+        let again = again.unwrap();
+        assert_eq!(again.unpinned, [left.id.as_str()]);
+        assert_eq!(pin_of(&owner, &left.id).await, None);
+        assert_eq!(
+            (&again.entry, &again.retired_by),
+            (&first.entry, &first.retired_by)
+        );
+        assert_eq!(versions(&owner).await, written);
+        // nor once a person verified the retiring version
+        verify(&owner, ME, &first.retired_by).await;
+        let third = owner.retire_position(RELEASE, "And again.", None).await;
+        let third = third.unwrap();
+        assert_eq!(third.retired_by, first.retired_by);
+        assert!(third.unpinned.is_empty());
+        assert_eq!(versions(&owner).await, written);
+    }
+
+    #[tokio::test]
+    async fn a_retiring_entry_an_agent_writes_for_a_verified_position_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let first = in_force(&owner, &release()).await;
+        let commitment = admitted(&owner, pinned("Cut 1.2")).await;
+        let mut retiring = release();
+        retiring.state = State::Retired;
+        retiring.charter.orders = "The release work has ended.".into();
+        let codex = session(dir.path(), "codex");
+        let stray = write(&codex, entry(&retiring)).await;
+        assert_eq!(state_of(&owner).await, State::Active);
+        let rows = owner.positions(Some(ME)).await.unwrap();
+        let states: Vec<(&str, Standing, usize)> = rows
+            .iter()
+            .map(|r| (r.entry.as_str(), r.state, r.pinned))
+            .collect();
+        let expected = [
+            (stray.as_str(), Standing::NotInForce, 0),
+            (first.as_str(), Standing::Active, 1),
+        ];
+        assert_eq!(states, expected);
+        assert_eq!(
+            pin_of(&owner, &commitment.id).await.as_deref(),
+            Some(RELEASE)
+        );
+        let filled = codex.fill_position(RELEASE, None).await.unwrap();
+        assert_eq!(filled.entry, first);
+        assert_eq!(next(&codex).await, Some(commitment.id));
+    }
+
+    fn wake(entry: &str, tasks: &[&Task]) -> Wake {
+        Wake {
+            position: RELEASE.into(),
+            domain: ME.into(),
+            entry: entry.into(),
+            agent: "codex".into(),
+            tasks: tasks.iter().map(|t| t.id.clone()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_wake_list_names_a_position_with_an_admitted_task_and_no_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let entry = in_force(&owner, &release()).await;
+        assert!(owner.wake_list(None).await.unwrap().is_empty());
+        // a task that is only proposed, and one that waits for another, wake nobody
+        let plain = session(dir.path(), "claude");
+        let proposed = plain.create_task(pinned("Cut 1.3")).await.unwrap().task;
+        assert_eq!(proposed.status, Status::Proposed);
+        let other = admitted(&owner, task("Tidy")).await;
+        let waits_on_other = TaskSpec {
+            depends_on: vec![other.id.clone()],
+            ..pinned("Announce 1.2")
+        };
+        let blocked = owner.file_own(waits_on_other).await.unwrap().task;
+        assert_eq!(blocked.status, Status::Blocked);
+        assert!(owner.wake_list(None).await.unwrap().is_empty());
+        let rows = owner.positions(None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!((row.pinned, row.wake), (2, false));
+        assert!(row.waiting.is_empty(), "{:?}", row.waiting);
+        // an admitted one does, and the list says under which agent definition
+        let second = TaskSpec {
+            priority: -1,
+            ..pinned("Cut 1.2, the notes")
+        };
+        let second = admitted(&owner, second).await;
+        let cut = admitted(&owner, pinned("Cut 1.2")).await;
+        let list = owner.wake_list(None).await.unwrap();
+        assert_eq!(list, [wake(&entry, &[&cut, &second])], "in queue order");
+        assert_eq!(owner.wake_list(Some(ME)).await.unwrap(), list);
+        assert!(owner.wake_list(Some(PLAT)).await.unwrap().is_empty());
+        // a retired position is not woken for a task that is still pinned to it
+        owner.retire_position(RELEASE, WHY, None).await.unwrap();
+        let left = {
+            let mut l = owner.ledger.lock().await;
+            let left = l.create(pinned("Cut 1.4")).await.unwrap().task;
+            l.admit(&left.id).await.unwrap()
+        };
+        let rows = owner.positions(None).await.unwrap();
+        let row = &rows[0];
+        assert_eq!((row.state, row.pinned), (Standing::Retired, 1));
+        assert_eq!(row.waiting, [left.id]);
+        assert!(!row.wake);
+        assert!(owner.wake_list(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_entries_a_listing_shows_and_the_tasks_it_counts_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let mut public = entry(&release());
+        public.classification = Some(Label::Public);
+        let id = write(&owner, public).await;
+        verify(&owner, ME, &id).await;
+        let reader = || session(dir.path(), "claude");
+        let (first, second, third) = (reader(), reader(), reader());
+        assert_eq!(first.positions(None).await.unwrap().len(), 1);
+        assert_eq!(first.label(), Label::Public);
+        // a task that is counted is read
+        let internal = TaskSpec {
+            classification: Label::Internal,
+            ..pinned("Cut 1.2")
+        };
+        admitted(&owner, internal).await;
+        assert_eq!(second.positions(None).await.unwrap()[0].pinned, 1);
+        assert_eq!(second.label(), Label::Internal);
+        // and so is an entry that is listed, in force or not
+        let elsewhere = Position {
+            domain: PLAT.into(),
+            ..release()
+        };
+        write(&owner, entry(&elsewhere)).await;
+        assert_eq!(third.positions(Some(PLAT)).await.unwrap().len(), 1);
+        assert_eq!(third.label(), Label::Internal);
+    }
+
+    #[tokio::test]
+    async fn the_wake_list_leaves_out_a_position_while_a_session_in_it_holds_a_live_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let entry = in_force(&owner, &release()).await;
+        let first = admitted(&owner, pinned("Cut 1.2")).await;
+        let second = admitted(&owner, pinned("Cut 1.3")).await;
+        let seated = session(dir.path(), "codex");
+        seated.fill_position(RELEASE, None).await.unwrap();
+        assert_eq!(next(&seated).await, Some(first.id.clone()));
+        // a task waits, and the session that is live in the position takes it next
+        let rows = owner.positions(None).await.unwrap();
+        let row = &rows[0];
+        assert_eq!(row.sessions, [seated.author()]);
+        assert_eq!(row.waiting, [second.id.as_str()]);
+        assert_eq!((row.pinned, row.wake), (2, false));
+        assert!(owner.wake_list(None).await.unwrap().is_empty());
+        // the lease runs out: nobody is live in the position, and both tasks wait
+        let later = OffsetDateTime::now_utc() + lease() + time::Duration::minutes(1);
+        owner.ledger.lock().await.set_clock(move || later);
+        let rows = owner.positions(None).await.unwrap();
+        let row = &rows[0];
+        assert!(row.sessions.is_empty(), "{:?}", row.sessions);
+        assert_eq!(row.waiting, [first.id.as_str(), second.id.as_str()]);
+        assert!(row.wake);
+        let list = owner.wake_list(None).await.unwrap();
+        assert_eq!(list, [wake(&entry, &[&first, &second])]);
+    }
+
+    #[tokio::test]
+    async fn the_listing_says_why_an_entry_is_not_in_force_and_shows_what_the_session_may_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let first = in_force(&owner, &release()).await;
+        let second = in_force(&owner, &release()).await;
+        let qa = Position {
+            name: "pos-qa".into(),
+            ..release()
+        };
+        let unverified = write(&owner, entry(&qa)).await;
+        let mut broken = entry(&release());
+        broken.body = with(&broken.body, "agent = \"codex\"", "agent = \"\"");
+        let broken = write(&owner, broken).await;
+        let seen = admitted(&owner, pinned("Cut 1.2")).await;
+        let high = TaskSpec {
+            classification: Label::Restricted,
+            ..pinned("Cut 2.0")
+        };
+        let high = admitted(&owner, high).await;
+
+        let low = session(dir.path(), "claude").with_handling_cap(Label::Internal);
+        let rows = low.positions(None).await.unwrap();
+        let none = |entry: &str, name: &str, agent: &str, why: &str| ListedPosition {
+            name: name.into(),
+            entry: entry.into(),
+            domain: ME.into(),
+            state: Standing::NotInForce,
+            agent: agent.into(),
+            pinned: 0,
+            waiting: Vec::new(),
+            sessions: Vec::new(),
+            wake: false,
+            why_not: Some(why.into()),
+        };
+        let active = |tasks: &[&Task]| ListedPosition {
+            name: RELEASE.into(),
+            entry: second.clone(),
+            domain: ME.into(),
+            state: Standing::Active,
+            agent: "codex".into(),
+            pinned: tasks.len(),
+            waiting: tasks.iter().map(|t| t.id.clone()).collect(),
+            sessions: Vec::new(),
+            wake: true,
+            why_not: None,
+        };
+        let raw = "its entry is raw; a position is in force once a person verifies it";
+        let expected = [
+            none(&broken, "", "", "its block does not read as a position"),
+            none(&unverified, "pos-qa", "codex", raw),
+            active(&[&seen]),
+            none(
+                &first,
+                RELEASE,
+                "codex",
+                "a newer verified entry defines pos-release",
+            ),
+        ];
+        assert_eq!(rows, expected, "newest first, and one task is out of sight");
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["state"], "none");
+        assert_eq!(json[2]["state"], "active");
+        assert!(json[2].get("why_not").is_none(), "{}", json[2]);
+        assert_eq!(
+            owner.positions(Some(ME)).await.unwrap()[2],
+            active(&[&seen, &high])
+        );
+        assert!(low.positions(Some(PLAT)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_listing_leaves_out_a_position_whose_version_in_force_is_above_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let first = in_force(&owner, &release()).await;
+        let qa = Position {
+            name: "pos-qa".into(),
+            ..release()
+        };
+        let unverified = write(&owner, entry(&qa)).await;
+        let mut hidden = entry(&release());
+        hidden.classification = Some(Label::Restricted);
+        let hidden = write(&owner, hidden).await;
+        verify(&owner, ME, &hidden).await;
+        // the version in force is no row, and the verified version it replaced is none
+        // either: to this session the position is not there
+        let low = session(dir.path(), "claude").with_handling_cap(Label::Internal);
+        let rows = low.positions(None).await.unwrap();
+        let listed: Vec<&str> = rows.iter().map(|r| r.entry.as_str()).collect();
+        assert_eq!(listed, [unverified.as_str()]);
+        let rows = owner.positions(None).await.unwrap();
+        let listed: Vec<(&str, Standing)> =
+            rows.iter().map(|r| (r.entry.as_str(), r.state)).collect();
+        let expected = [
+            (hidden.as_str(), Standing::Active),
+            (unverified.as_str(), Standing::NotInForce),
+            (first.as_str(), Standing::NotInForce),
+        ];
+        assert_eq!(listed, expected);
     }
 }
