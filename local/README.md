@@ -570,7 +570,8 @@ that entry, the new entry gets `status: withheld`. The receipt of the erasure th
 the new entry in `withheld`. The answer to the write names the erased entry
 (`withheld`). The same session cannot derive a withheld entry again. Its new entry is
 withheld too, and a reader of the old id does not get it. A session that read only the
-stub, after the erasure, is not affected.
+stub, after the erasure, is not affected. If `amem` cannot read a log for this check, the
+write fails and the new entry is withheld.
 
 An erasure does not withhold a verified rule of the policy. A rule refuses. Suppose that
 an erasure could withhold a rule. Then an agent could plant an entry that the owner must

@@ -237,8 +237,7 @@ impl Memory {
 
     /// What this session read that is erased now: an entry that it read before the
     /// erasure, or a transcript that it read a turn of. The logs are read whole, and a
-    /// log that does not read is an error: a write must not land as served because the
-    /// check could not be made.
+    /// log that does not read is an error, which the caller does not take as "nothing".
     async fn erased_read(&self) -> Result<Option<ErasedRead>, Error> {
         let session = self.session_id();
         let mut turns_of = BTreeSet::new();
@@ -275,6 +274,9 @@ impl Memory {
     /// log. A verified rule is never new, so the exception of [`Memory::downstream`]
     /// does not apply here.
     ///
+    /// When the check cannot be made, the entry is withheld and the error is returned:
+    /// the record holds the entry by then, and it must not be served unchecked.
+    ///
     /// # Errors
     ///
     /// A log that does not read, or a store or index error.
@@ -282,12 +284,16 @@ impl Memory {
         &self,
         entry: &Entry,
     ) -> Result<Option<String>, Error> {
-        let Some(erased) = self.erased_read().await? else {
-            return Ok(None);
+        let erased = match self.erased_read().await {
+            Ok(None) => return Ok(None),
+            found => found,
         };
         let id = &entry.front.id;
         self.withhold(&[(entry.front.domain.clone(), id.clone())])
             .await?;
+        let Some(erased) = erased? else {
+            return Ok(None);
+        };
         let listed = |receipt: &mut Receipt| {
             let new = !receipt.withheld.contains(id);
             if new {
@@ -598,6 +604,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.withheld, None);
+    }
+
+    #[tokio::test]
+    async fn a_write_is_withheld_when_a_log_does_not_read_for_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(mem(dir.path()));
+        // a second granted domain, with a directory where its log would be
+        let grants = dir.path().join(crate::GRANTS_FILE);
+        let mut text = std::fs::read_to_string(&grants).unwrap();
+        text.push_str("\n[domains.dom-b]\ndefault_classification = \"internal\"\n");
+        std::fs::write(&grants, text).unwrap();
+        std::fs::create_dir_all(dir.path().join(log::DIR).join("dom-b.jsonl")).unwrap();
+        let m = Memory::open(dir.path()).unwrap();
+        let note = WriteRequest {
+            domain: Some("dom-me".into()),
+            ..req("The yak is shaved.\n")
+        };
+        let failed = m.write(note).await;
+        assert!(matches!(failed, Err(Error::Io { .. })), "{failed:?}");
+        // the record took the entry before the check: no read gives it
+        let ids = m.store.list("dom-me").await.unwrap();
+        let [id] = &ids[..] else {
+            panic!("one entry: {ids:?}")
+        };
+        assert_eq!(status(&m, id).await, Some(Status::Withheld));
+        let hits = m.search("yak", Some("dom-me"), 10).await.unwrap();
+        assert!(hits.is_empty(), "{hits:?}");
     }
 
     #[tokio::test]
