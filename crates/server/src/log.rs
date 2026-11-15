@@ -391,7 +391,10 @@ impl Writer {
 
     /// Sync what was appended without a sync of its own.
     fn sync(&self) -> Result<(), Error> {
-        std::fs::File::open(&self.log)
+        // opened for writing: Windows refuses to flush a handle that can only read
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.log)
             .and_then(|f| f.sync_data())
             .map_err(crate::io(&self.log))
     }
