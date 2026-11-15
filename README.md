@@ -110,10 +110,11 @@ two weeks. It is also the reason that none of it is the production shape.
   - CPU or memory limits on the sandbox
 - **The task record, in part.** A claim has a generation, and the ledger refuses a
   holder that gives an earlier one. A task can be `blocked` on a task that it depends on.
-  A claim and a completion can carry an attempt key. These parts are not built: an
-  attempt key for the other operations, a block on a new claim
-  while an external effect is uncertain, and a `blocked` state for a task that waits on an
-  outside event. The generation does not prove who the caller is.
+  A claim and a completion can carry an attempt key. A holder can give a task up until an
+  outside event comes, and a task with an external action that is not settled goes to no
+  other session. These parts are not built: an attempt key for the other operations, a
+  connector that makes external actions in sequence and settles them, and taps that
+  report the events. The generation does not prove who the caller is.
 - **Task definitions, in part, and autonomy levels.** A task can name a task definition.
   It then takes the checks of the definition, and its holder can call only the tools that
   the definition declares. Triage requires a definition only when the grants say so,

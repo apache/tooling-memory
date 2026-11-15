@@ -344,6 +344,52 @@ pub struct CreateTaskParams {
     /// Checks that say this task is done, in place of its definition's.
     #[serde(default)]
     pub acceptance: Vec<String>,
+    /// The task this one is split from, when it is not the task you hold.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// The decisions this task carries out, as entry ids.
+    #[serde(default)]
+    pub implements: Vec<String>,
+    /// Whether what the task does can be undone: `reversible` or `irreversible`.
+    #[serde(default)]
+    pub reversibility: Option<String>,
+    /// The owned paths the task changes, as globs.
+    #[serde(default)]
+    pub artifacts_touched: Vec<String>,
+}
+
+/// Parameters of `wait_for`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct WaitParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// The name of the outside event the task waits on, one token, as the tap that
+    /// reports it will name it.
+    pub on: String,
+    /// A handoff entry you wrote about what you did before waiting; the next claimant
+    /// starts from it. Optional.
+    #[serde(default)]
+    pub handoff: Option<String>,
+}
+
+/// Parameters of `effect_begun` and `effect_settled`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct EffectParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// A stable id for the external action, one token of at most 64 characters. A retry
+    /// of the action names the same id.
+    pub action: String,
+    /// For `effect_settled`: `applied` when the destination holds the effect,
+    /// `not_applied` when it does not.
+    #[serde(default)]
+    pub outcome: Option<String>,
 }
 
 /// Parameters that name a task.
@@ -888,6 +934,11 @@ impl McpServer {
             priority: p.priority.unwrap_or(0),
             definition: p.definition,
             acceptance: p.acceptance,
+            parent: p.parent,
+            implements: p.implements,
+            reversibility: parse("reversibility", p.reversibility)?,
+            artifacts_touched: p.artifacts_touched,
+            ..dm_ledger::TaskSpec::default()
         };
         let c = self.memory.create_task(spec).await.map_err(mcp_err)?;
         // what a task that stays proposed lacks goes back to whoever filed it
@@ -1007,6 +1058,50 @@ impl McpServer {
         let t = self
             .memory
             .release(&p.id, p.generation, p.handoff.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Give a held task up until an outside event comes: a check that runs, a reply, a change that has not landed. Do not wait in the session. The task is blocked, and nobody may claim it, until a tap or a person reports the event; then it is offered again. Pass the id of a handoff you wrote so the next claimant starts where you stopped."
+    )]
+    async fn wait_for(&self, p: Parameters<WaitParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .wait_for(&p.id, p.generation, &p.on, p.handoff.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Record that you are about to make an external action under your claim, before you make it. Until the action is settled, the task goes to nobody else, even when your lease runs out. A retry of the action names the same action id."
+    )]
+    async fn effect_begun(&self, p: Parameters<EffectParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .effect_begun(&p.id, p.generation, &p.action)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Record what became of an external action you began: `applied` when the destination holds the effect, `not_applied` when it does not. Only while your claim is in force. After that a person reconciles it: you cannot tell a lost answer from an action that was not made."
+    )]
+    async fn effect_settled(
+        &self,
+        p: Parameters<EffectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let outcome = parse::<dm_ledger::Outcome>("outcome", p.outcome)?
+            .ok_or_else(|| McpError::invalid_params("outcome: applied or not_applied", None))?;
+        let t = self
+            .memory
+            .effect_settled(&p.id, p.generation, &p.action, outcome)
             .await
             .map_err(mcp_err)?;
         ok(json!({ "task": t }))

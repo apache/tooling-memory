@@ -1163,6 +1163,21 @@ enum TaskOp {
         /// takes those of its definition.
         #[arg(long = "accept")]
         acceptance: Vec<String>,
+        /// The task this one is split from.
+        #[arg(long)]
+        parent: Option<String>,
+        /// A decision this task carries out, as an entry id; repeat for more.
+        #[arg(long = "implements")]
+        implements: Vec<String>,
+        /// Whether what the task does can be undone: `reversible` or `irreversible`.
+        #[arg(long)]
+        reversibility: Option<dm_ledger::Reversibility>,
+        /// An owned path the task changes, as a glob; repeat for more.
+        #[arg(long = "touches")]
+        artifacts_touched: Vec<String>,
+        /// What triage scored it: `value,urgency,effort`, three whole numbers.
+        #[arg(long)]
+        scores: Option<String>,
     },
     /// Admit a proposed task.
     Admit { id: String },
@@ -1205,6 +1220,44 @@ enum TaskOp {
         generation: u64,
         #[arg(long)]
         handoff: Option<String>,
+    },
+    /// Give a held task up until an outside event comes. Nobody may claim it until
+    /// `task arrived` names the event.
+    Wait {
+        id: String,
+        /// The name of the event, one token.
+        on: String,
+        /// The generation of the claim.
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        handoff: Option<String>,
+    },
+    /// Report that an outside event came: the tasks that waited on it are open again.
+    /// A tap or a person reports it, not an agent.
+    Arrived {
+        event: String,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Record an external action before it is made. Until it is settled, the task
+    /// goes to nobody else, whatever its lease says.
+    EffectBegin {
+        id: String,
+        /// A stable id for the action, one token; a retry names the same id.
+        action: String,
+        /// The generation of the claim.
+        #[arg(long)]
+        generation: u64,
+    },
+    /// Record what became of an external action: `applied` or `not_applied`. The
+    /// holder names the generation of its claim; a person who reconciles names none.
+    EffectSettle {
+        id: String,
+        action: String,
+        outcome: dm_ledger::Outcome,
+        #[arg(long)]
+        generation: Option<u64>,
     },
     /// Leave a handoff on a task after the claim of that generation is over.
     LateHandoff {
@@ -4919,6 +4972,53 @@ async fn held_task(m: &Memory, op: TaskOp) -> Fallible {
     }
 }
 
+/// What holds a task back from a claim though nobody holds it, and what ends that.
+async fn holds_cmd(m: &Memory, op: TaskOp) -> Fallible {
+    match op {
+        TaskOp::Wait {
+            id,
+            on,
+            generation,
+            handoff,
+        } => json(
+            &m.wait_for(&id, Some(generation), &on, handoff.as_deref())
+                .await?,
+        ),
+        TaskOp::Arrived { event, domain } => {
+            json(&m.event_arrived(domain.as_deref(), &event).await?)
+        }
+        TaskOp::EffectBegin {
+            id,
+            action,
+            generation,
+        } => json(&m.effect_begun(&id, Some(generation), &action).await?),
+        TaskOp::EffectSettle {
+            id,
+            action,
+            outcome,
+            generation,
+        } => json(&m.effect_settled(&id, generation, &action, outcome).await?),
+        _ => Ok(()),
+    }
+}
+
+/// The `--scores value,urgency,effort` of `task create`.
+fn scores_of(text: &str) -> Result<dm_ledger::Scores, Box<dyn std::error::Error>> {
+    let parts: Vec<i64> = text
+        .split(',')
+        .map(|n| n.trim().parse::<i64>())
+        .collect::<Result<_, _>>()?;
+    let [value, urgency, effort] = parts[..] else {
+        return Err("scores are value,urgency,effort: three whole numbers".into());
+    };
+    Ok(dm_ledger::Scores {
+        value,
+        urgency,
+        effort,
+        unblocks: Vec::new(),
+    })
+}
+
 /// `amem task rescore` and `amem task stats`: the fabric's ranking and its telemetry.
 async fn fabric_cmd(m: &Memory, op: TaskOp) -> Fallible {
     match op {
@@ -4939,7 +5039,13 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
             priority,
             definition,
             acceptance,
+            parent,
+            implements,
+            reversibility,
+            artifacts_touched,
+            scores,
         } => {
+            let scores = scores.as_deref().map(scores_of).transpose()?;
             let c = m
                 .create_task(TaskSpec {
                     domain: domain.unwrap_or_default(),
@@ -4954,6 +5060,12 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
                     priority,
                     definition,
                     acceptance,
+                    parent,
+                    scores,
+                    implements,
+                    reversibility,
+                    artifacts_touched,
+                    ..TaskSpec::default()
                 })
                 .await?;
             json(&c.task)
@@ -4977,6 +5089,10 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         | TaskOp::Complete { .. }
         | TaskOp::Release { .. }
         | TaskOp::LateHandoff { .. }) => held_task(m, op).await,
+        op @ (TaskOp::Wait { .. }
+        | TaskOp::Arrived { .. }
+        | TaskOp::EffectBegin { .. }
+        | TaskOp::EffectSettle { .. }) => holds_cmd(m, op).await,
         TaskOp::Invalidate { id, reason } => json(&m.invalidate(&id, &reason, None).await?),
         TaskOp::Tree { id } => json(&m.task_tree(&id).await?),
         TaskOp::Retry { id } => json(&m.retry_task(&id).await?),

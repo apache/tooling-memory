@@ -54,6 +54,36 @@ a task late-handoff "$fenced" "$note" --generation "$first" >/dev/null
 echo "  refused. Its handoff is left on the task for the holder now: late-handoff, generation $first"
 a task release "$fenced" --generation "$second" >/dev/null
 a task invalidate "$fenced" --reason "obsolete: shown" >/dev/null
+say "Waiting, and an effect nobody has settled" "A session does not wait for an outside event. It gives the task up until the event comes, and the tap's event puts the task back on offer. A holder records an external action before it makes it. When its lease then runs out, nobody knows if the destination holds the effect, so the ledger gives the task to nobody until a person settles it."
+# claim the next task and say whether it is $1; anything else goes back to the queue
+offer() {
+  got=$(a task claim-next --domain dom-demo --lease-seconds "${2:-600}")
+  gid=$(printf '%s' "$got" | j "d['id'] if d else ''")
+  ggen=$(printf '%s' "$got" | j "d['generation'] if d else ''")
+  if [ "$gid" = "$1" ]; then
+    echo "  claim-next gave the task, at generation $ggen"
+  elif [ -n "$gid" ]; then
+    a task release "$gid" --generation "$ggen" >/dev/null
+    echo "  claim-next gave another task, not this one, though it ranks first"
+  else
+    echo "  claim-next gave nothing"
+  fi
+}
+waits=$(a task create "Land the fixture change" --domain dom-demo --priority 60 --reversibility irreversible --touches "fixtures/**" --body "Open the change, then wait for its check." | j "d['id']")
+a task admit "$waits" >/dev/null
+offer "$waits"
+a task wait "$waits" check:fixtures-42 --generation "$ggen" | j "f\"  given up by its holder: {d['status']}, waiting on {d['waiting_on']}\""
+offer "$waits"
+a task arrived check:fixtures-42 --domain dom-demo | j "f\"  the event check:fixtures-42 came: {len(d)} task is {d[0]['status']} again\""
+offer "$waits" 1
+a task effect-begin "$waits" push-fixtures-1 --generation "$ggen" | j "f\"  the holder records the action before it makes it: effects {d['effects']}\""
+sleep 2
+echo "  the lease of one second ran out, and the holder never said what became of the push"
+offer "$waits"
+a task effect-settle "$waits" push-fixtures-1 not_applied | j "f\"  a person looked at the destination and settled it as not applied: effects {d.get('effects', [])}\""
+offer "$waits"
+a task release "$waits" --generation "$ggen" >/dev/null
+a task invalidate "$waits" --reason "obsolete: shown" >/dev/null
 say "The rescore" "Each cycle the queue is ranked again; every move is a ledger event with its reason, and curation's share of the work is held to its floor."
 a task rescore | j "f\"  rubric {d['rubric']}; curation's share of the completed work {d['maintenance_share']:.0%} against a floor of {d['floor']:.0%}\n\" + '\n'.join(f\"  {c['from']:>3} -> {c['to']:<3} {c['title']:<40} {c['why']}\" for c in d['changed'])"
 
