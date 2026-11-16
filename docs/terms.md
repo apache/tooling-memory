@@ -48,7 +48,7 @@ term here in the same commit as the first document that needs it.
 | ledger | The tasks of each domain, with their leases and origins, on SQLite under `state/` or on PostgreSQL | queue, task list |
 | grants | The file `grants.toml`: the owner, handling, the domains, destinations, taps, gates, spend limits and the ledger | permissions (for the grants), config (for the grants) |
 | grant | One table in the grants: `[domains.<name>]`, `[destinations.<name>]` or `[taps.<name>]` | permission |
-| policy | The Rego rules that decide each action: write, read, erase, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
+| policy | The Rego rules that decide each action: write, read, erase, approve, declassify, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
 | perimeter | The policy, the grants and the parts that enforce them, as one part of the design | |
 | stopped (session) | A session whose grants changed after it started. Each read, decision, tool call and model call of the session is refused, and a new session starts under the grants as they are | revoked session, stale session |
 | policy stamp | `state/policy.stamp` and the digest of the root's `policy/*.rego`: what a session compares to know that the policy changed | |
@@ -58,6 +58,11 @@ term here in the same commit as the first document that needs it.
 | reset | `amem policy reset`: the owner retires each rule of a domain that no person wrote, promoted or approved | purge |
 | amendment | A task for the owner of a rule, with evidence, that asks for a change to the rule | |
 | gates | The `[gates]` rules on a write: how many entries one session may supersede, and whether a verified entry needs an approver | |
+| version (of an entry) | The text of an entry at one time. Each write and each promotion makes a new version. The digest of the text names the version: `<id>@<digest>` cites one version, and an approval names one | revision |
+| approval | An event on the ledger: a person approved one action on one version of one entry, for one principal, until a time. The policy checks it when the action runs | permission (for an approval) |
+| guard | The person who approves a copy of an entry at a lower label: `guard` in the grant of the domain, or the owner | |
+| declassification | A copy of one version of an entry at a lower label, written under an approval of the guard. The copy cites that version, and its origin names the guard. The source does not change | downgrade, lowering (of an entry) |
+| sign-off task | A task that the service files when an action has no approval: it asks the approver for one approval, of one action on one version of one entry, for the principal that asked | approval request |
 | scan | The check of a write and of a tool's answer for instructions, secrets, hidden text and the like. The scan finds; the policy decides | |
 | label | `public`, `internal` or `restricted`, in that order | level, tier (for a label), sensitivity |
 | classification | The label of an entry | |
@@ -132,6 +137,7 @@ a different thing. Name that thing in full where it could be read as the term.
 
 | Word | The other sense | Write |
 |---|---|---|
+| guard | The hook `.claude/hooks/guard-bash.sh`, which refuses some commands of a Claude Code session | the guard hook |
 | budget | The tasks or tokens that one curation cycle may use (`--budget-tasks`, `--budget-tokens`), or LiteLLM's budget for each project | curation budget, LiteLLM budget |
 | projection | The ledger built from the event log | the ledger's projection of the log |
 | root | The root user, or the `/` directory, or the top of a URL | root user, root directory |

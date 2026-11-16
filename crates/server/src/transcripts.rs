@@ -872,6 +872,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })?;
         if !d.allow || self.author != self.grants.owner {
             return Err(Error::Denied(format!(

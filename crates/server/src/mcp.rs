@@ -559,6 +559,29 @@ pub struct ProposeAmendmentParams {
     pub evidence: String,
 }
 
+/// Parameters of `erase`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct EraseParams {
+    /// The entry id.
+    pub id: String,
+    /// Why, as a class: `requested`, `mistaken`, `sensitive` or `legal`. The receipt
+    /// keeps it.
+    pub reason: String,
+}
+
+/// Parameters of `declassify`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct DeclassifyParams {
+    /// The entry id.
+    pub id: String,
+    /// The label of the copy, lower than the label of the entry: `public` or
+    /// `internal`.
+    pub target_label: String,
+    /// Why the text may be read at the lower label, in words on one line. The guard
+    /// reads it.
+    pub justification: String,
+}
+
 /// Parameters of `claim`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct LeaseParams {
@@ -744,6 +767,8 @@ impl McpServer {
     /// session's tape, or answered from the tape the session re-enacts.
     #[must_use]
     pub fn new(memory: Arc<Memory>) -> Self {
+        // what a harness asks through this server, an agent may have asked
+        memory.mark_served();
         Self {
             memory,
             tool_router: Self::tool_router(),
@@ -1288,6 +1313,35 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Erase an entry. It cannot be taken back: the text leaves every version and the index, and a stub and a receipt remain. It runs only under an approval of the owner for this version of the entry. Without one, the call is refused, and the refusal names the task that asks the owner for the approval. Call again after the approval. If the entry changed since, the approval is of another version, and a new task asks again."
+    )]
+    async fn erase(&self, p: Parameters<EraseParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let reason: dm_core::erasure::Reason = parse("reason", Some(p.reason))?
+            .ok_or_else(|| McpError::invalid_params("reason: a class of reason", None))?;
+        let receipt = self.memory.erase(&p.id, reason).await.map_err(mcp_err)?;
+        ok(serde_json::to_value(receipt).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Ask the guard of the domain for a copy of an entry at a lower label, with your reason in words on one line. `proposed` means that the guard has a task and that nothing exists at the lower label. Call again after the approval to land the copy: `declassified`, with the id of the copy. The copy cites the entry and the version it was made from. If the entry changed since, the approval is of another version, and a new task asks again."
+    )]
+    async fn declassify(
+        &self,
+        p: Parameters<DeclassifyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let to: dm_core::Label = parse("target_label", Some(p.target_label))?
+            .ok_or_else(|| McpError::invalid_params("target_label: a label", None))?;
+        let answer = self
+            .memory
+            .declassify(&p.id, to, &p.justification)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(answer).unwrap_or_default())
+    }
+
+    #[tool(
         description = "Close a task without doing it: obsolete, invalid, or a duplicate of another."
     )]
     async fn invalidate_task(
@@ -1579,6 +1633,8 @@ mod tests {
             "task_tree",
             "retry_task",
             "promotions",
+            "erase",
+            "declassify",
             "position",
             "positions",
             "retire_position",
@@ -1602,6 +1658,25 @@ mod tests {
                 t.name
             );
         }
+    }
+
+    /// An agent reaches every tool of the memory server, so the server has no tool that
+    /// approves: a person approves at the command line. The two gated actions are tools,
+    /// and a re-run captures them as it captures a write.
+    #[test]
+    fn the_gated_actions_are_tools_and_no_tool_approves() {
+        let router = McpServer::tool_router();
+        let tools = router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        for gated in ["erase", "declassify"] {
+            assert!(names.contains(&gated), "missing tool {gated}: {names:?}");
+            assert_eq!(kind_of(gated), tape::Kind::Mutation, "{gated}");
+        }
+        let approving: Vec<&&str> = names
+            .iter()
+            .filter(|n| n.contains("approv") || n.contains("sign_off"))
+            .collect();
+        assert!(approving.is_empty(), "a tool that approves: {approving:?}");
     }
 
     #[test]
@@ -1784,7 +1859,10 @@ mod tests {
         else {
             panic!("proposed")
         };
-        s.memory.approve(&task.id).await.unwrap();
+        // a served session approves nothing: the owner approves in a session of its own
+        let owner = crate::Memory::open(s.memory.root()).unwrap();
+        owner.approve(&task.id).await.unwrap();
+        s.memory.reload_policy().await.unwrap();
         let rules = payload(
             &s.check_policy(Parameters(CheckPolicyParams {
                 action: "tag a release".into(),
@@ -1822,6 +1900,113 @@ mod tests {
         assert_eq!(filed["exception"]["task"]["requirements"][0], "human");
         let none = s.propose_amendment(Parameters(amend(""))).await;
         assert!(none.is_err());
+    }
+
+    const AGENT: &str = "agent:x";
+
+    /// A server over the session of an agent, and the owner in person on the same root.
+    fn agent_and_owner() -> (tempfile::TempDir, McpServer, Memory) {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author(AGENT);
+        (dir, McpServer::new(Arc::new(agent)), owner)
+    }
+
+    /// An entry of the owner at a label.
+    async fn entry_at(owner: &Memory, label: dm_core::Label, body: &str) -> String {
+        let req = WriteRequest {
+            title: Some("Door code".into()),
+            body: body.into(),
+            classification: Some(label),
+            ..WriteRequest::default()
+        };
+        owner.write(req).await.unwrap().id
+    }
+
+    /// A refusal of a tool: its message, which is in the class of a bad request.
+    fn refusal_text(answer: Result<CallToolResult, McpError>) -> String {
+        let invalid = McpError::invalid_params("", None).code;
+        match answer {
+            Err(e) if e.code == invalid => e.message.to_string(),
+            other => panic!("expected a refusal: {other:?}"),
+        }
+    }
+
+    /// An erasure that an agent asks for over the memory server is refused, and the
+    /// refusal names the task that asks the owner. After the owner signed that task off
+    /// in person, the same call erases.
+    #[tokio::test]
+    async fn erase_over_mcp_waits_for_the_owner_s_approval_and_then_gives_the_receipt() {
+        let (_dir, s, owner) = agent_and_owner();
+        let id = entry_at(&owner, dm_core::Label::Internal, "The door code is 4417.").await;
+        let erase = |reason: &str| {
+            s.erase(Parameters(EraseParams {
+                id: id.clone(),
+                reason: reason.into(),
+            }))
+        };
+        let bad = refusal_text(erase("because").await);
+        assert!(bad.contains("reason: reason \"because\" is not"), "{bad}");
+        let why = refusal_text(erase("mistaken").await);
+        let named = why
+            .split_once("Task ")
+            .and_then(|(_, rest)| rest.split_once(" asks human:test:me for it."));
+        let Some((task, _)) = named else {
+            panic!("the refusal names no task: {why}")
+        };
+        // the reason that did not parse asked nobody: this is the one request
+        let asked = owner.tasks(None, dm_ledger::Status::Open).await.unwrap();
+        let asked: Vec<&str> = asked.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(asked, [task]);
+        assert!(
+            owner.get(&id).await.is_ok(),
+            "a refused erasure erases nothing"
+        );
+        owner.sign_off(task, None).await.unwrap();
+        let receipt = payload(&erase("mistaken").await.unwrap());
+        assert_eq!(receipt["id"], id.as_str());
+        assert_eq!(receipt["erased_by"], AGENT);
+        assert_eq!(receipt["reason"], "mistaken");
+        assert!(matches!(owner.get(&id).await, Err(Error::Gone(_))));
+    }
+
+    fn copy_at(id: &str, label: &str) -> Parameters<DeclassifyParams> {
+        Parameters(DeclassifyParams {
+            id: id.into(),
+            target_label: label.into(),
+            justification: "Every visitor gets the code at the door.".into(),
+        })
+    }
+
+    /// A declassification that an agent asks for over the memory server is `proposed`,
+    /// with the task for the guard. After the guard signed that task off in person, the
+    /// same call lands the copy at the label that the call named.
+    #[tokio::test]
+    async fn declassify_over_mcp_is_proposed_and_lands_after_the_guard_s_approval() {
+        let (_dir, s, owner) = agent_and_owner();
+        let id = entry_at(&owner, dm_core::Label::Restricted, "The door code is 4417.").await;
+        let bad = refusal_text(s.declassify(copy_at(&id, "secret")).await);
+        assert!(bad.contains("target_label: "), "{bad}");
+        let asked = payload(&s.declassify(copy_at(&id, "internal")).await.unwrap());
+        assert_eq!(asked["outcome"], "proposed", "{asked}");
+        let title = format!("Approve: copy of {id} at internal");
+        assert_eq!(asked["task"]["title"], title.as_str());
+        assert_eq!(asked["task"]["created_by"], AGENT);
+        let task = asked["task"]["id"].as_str().unwrap();
+        owner.sign_off(task, None).await.unwrap();
+        let landed = payload(&s.declassify(copy_at(&id, "internal")).await.unwrap());
+        assert_eq!(landed["outcome"], "declassified", "{landed}");
+        assert_eq!(landed["classification"], "internal");
+        let cites = landed["cites"].as_str().unwrap();
+        assert!(cites.starts_with(&format!("{id}@")), "{cites}");
+        let copy = owner.get(landed["id"].as_str().unwrap()).await.unwrap();
+        assert_eq!(copy.front.classification, dm_core::Label::Internal);
+        assert_eq!(copy.front.cites, [cites]);
+        // the approval was of a copy at internal: a copy at public is another request
+        let lower = payload(&s.declassify(copy_at(&id, "public")).await.unwrap());
+        assert_eq!(lower["outcome"], "proposed", "{lower}");
+        let title = format!("Approve: copy of {id} at public");
+        assert_eq!(lower["task"]["title"], title.as_str());
     }
 
     /// The same call made twice under one key, as after an answer that did not arrive.

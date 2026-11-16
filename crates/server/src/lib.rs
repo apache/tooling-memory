@@ -29,11 +29,12 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
+pub mod approvals;
 pub mod bundle;
 pub mod contexts;
 pub mod fabric;
@@ -347,6 +348,10 @@ pub struct Memory {
     /// When this service last stamped a write; see [`next_stamp`]. Shared with the
     /// views [`Memory::for_request`] makes, which write for the same service.
     last_stamp: Arc<Mutex<OffsetDateTime>>,
+    /// Whether the memory server serves this session to a harness. What such a session
+    /// asks, an agent may have asked, whatever name the session carries. Shared by the
+    /// views of a session ([`Memory::for_request`]).
+    served: Arc<AtomicBool>,
     /// The position this session fills, when it fills one: a copy of the record taken
     /// then. Shared by the views of a session ([`Memory::for_request`]).
     seat: Arc<Mutex<Option<positions::Seated>>>,
@@ -510,6 +515,7 @@ impl Memory {
             playback: OnceLock::new(),
             recording: Arc::new(Mutex::new(tape::Recording::default())),
             last_stamp: Arc::new(Mutex::new(OffsetDateTime::UNIX_EPOCH)),
+            served: Arc::default(),
             seat: Arc::default(),
             read_domains: Arc::default(),
         })
@@ -564,6 +570,7 @@ impl Memory {
             playback: self.playback.clone(),
             recording: Arc::clone(&self.recording),
             last_stamp: Arc::clone(&self.last_stamp),
+            served: Arc::clone(&self.served),
             seat: Arc::clone(&self.seat),
             read_domains: Arc::clone(&self.read_domains),
         })
@@ -599,6 +606,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         };
         let mut f = policy
             .read_scope(&input)?
@@ -700,6 +708,18 @@ impl Memory {
         )?;
         *self.policy.write().unwrap_or_else(PoisonError::into_inner) = std::sync::Arc::new(p);
         Ok(())
+    }
+
+    /// Say that the memory server serves this session to a harness. From then on the
+    /// session signs nothing off: a person approves in a session that no harness reaches.
+    /// It cannot be taken back.
+    pub fn mark_served(&self) {
+        self.served.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the memory server serves this session to a harness.
+    pub(crate) fn served(&self) -> bool {
+        self.served.load(Ordering::Relaxed)
     }
 
     /// The task this session runs on: a launcher sets it before the harness starts,
@@ -828,6 +848,7 @@ impl Memory {
                 day_tokens,
             }),
             fetch: None,
+            approval: None,
         };
         self.fresh()?;
         let mut d = self.policy().decide(&input)?;
@@ -857,6 +878,11 @@ impl Memory {
             "denials": d.denials,
             "advisories": d.advisories,
             "held_task": input.held_task,
+            "approval": input.approval.as_ref().map(|a| serde_json::json!({
+                "of": a.of,
+                "target": a.target,
+                "version": a.version,
+            })),
         });
         reads::append_line(&self.root.join("state/decisions.jsonl"), &line.to_string());
         if dm_otel::enabled() {
@@ -1683,14 +1709,18 @@ impl Memory {
     /// another person holds stays theirs and the tier does not move; then the entry is
     /// promoted and the task completed, the entry its record. Only a live entry is
     /// approved: an erased one has nothing left to check, a replaced one is reviewed as
-    /// its successor, and a demoted one was found wanting.
+    /// its successor, and a demoted one was found wanting. The ledger keeps the approval
+    /// as an event, of the action `verify` and the version approved, before the tier
+    /// moves. A session that the memory server serves approves nothing.
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for a task that is not a live promotion proposal, an entry
-    /// that is not live or that changed since it was proposed, or an approval the policy
-    /// refuses; a ledger error for a task another holds, or a store error.
+    /// [`Error::Denied`] for a session that the memory server serves, a task that is not
+    /// a live promotion proposal, an entry that is not live or that changed since it was
+    /// proposed, or an approval the policy refuses; a ledger error for a task another
+    /// holds, or a store error.
     pub async fn approve(&self, task_id: &str) -> Result<Promotion, Error> {
+        self.may_sign_off()?;
         let task = self.ledger.lock().await.get(task_id).await?;
         self.check_task(&task)?;
         let (id, entry) = self.proposal_entry(&task).await?;
@@ -1705,6 +1735,7 @@ impl Memory {
         }
         let by = self.claim_proposal(&task).await?;
         let entry = self.still_proposed(task_id, by).await?;
+        self.record_verify_approval(&entry).await?;
         let promoted = self.set_tier(entry, TrustTier::Verified).await?;
         self.ledger
             .lock()
@@ -1991,6 +2022,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })
     }
 
@@ -2043,6 +2075,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })?;
         if !decision.allow {
             return Err(self
@@ -2429,24 +2462,32 @@ impl Memory {
     /// the domain admits its own; otherwise born proposed.
     ///
     /// A task with a proposal's origin, `promote:<id>`, is refused: only
-    /// [`Memory::promote`] files one, since [`Memory::approve`] acts on it.
+    /// [`Memory::promote`] files one, since [`Memory::approve`] acts on it. A task with
+    /// a sign-off task's origin, `signoff:<id>`, is refused too: only the service files
+    /// one, since [`Memory::sign_off`] reads the requester, the action and the version
+    /// from it.
     ///
     /// # Errors
     ///
     /// An ungranted domain, or a ledger or policy error; [`Error::Denied`] for a
-    /// `promote:` origin, which only [`Memory::promote`] files, or when the origin and
-    /// upstream event name a task already filed that this session may not read.
+    /// `promote:` origin, which only [`Memory::promote`] files, for a `signoff:` origin,
+    /// which only the service files, or when the origin and upstream event name a task
+    /// already filed that this session may not read.
     pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
         // a task from this origin is an approval task: approve reads its event as the
         // version proposed and its filer as the proposer, so one filed here would be a
         // proposal nobody made
-        if spec
-            .origin
-            .as_deref()
-            .is_some_and(|o| o.starts_with(PROPOSAL_ORIGIN))
-        {
+        let origin = spec.origin.as_deref().unwrap_or_default();
+        if origin.starts_with(PROPOSAL_ORIGIN) {
             return Err(Error::Denied(format!(
                 "a task with origin {PROPOSAL_ORIGIN}<id> is an approval task: only promote files one"
+            )));
+        }
+        // sign_off reads the requester, the action and the version from such a task
+        if origin.starts_with(approvals::SIGN_OFF_ORIGIN) {
+            return Err(Error::Denied(format!(
+                "a task with origin {}<id> is a sign-off task: only the service files one",
+                approvals::SIGN_OFF_ORIGIN
             )));
         }
         let mut l = self.ledger.lock().await;
@@ -2663,6 +2704,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })?;
         if d.admit {
             let admitted = l.admit(&task.id).await?;
@@ -3309,12 +3351,16 @@ impl Memory {
     /// destination settles the effect first. The reason is the session's own words on
     /// the task, so a session that has read above the task's classification is refused.
     ///
+    /// A sign-off task is its approver's to close, in person: to invalidate it is to
+    /// decline the request ([`Memory::may_decline`]).
+    ///
     /// # Errors
     ///
     /// A ledger error, or a task outside the grants; [`Error::Denied`] when an open task
     /// filed from it, however far down, is above the session's handling, when the task
-    /// or such an open task has an effect that is not settled, or when the session's
-    /// label is above the task's classification.
+    /// or such an open task has an effect that is not settled, when the session's label
+    /// is above the task's classification, or when the task is a sign-off task and the
+    /// session is not its approver in person.
     pub async fn invalidate(
         &self,
         id: &str,
@@ -3324,6 +3370,8 @@ impl Memory {
         let mut l = self.ledger.lock().await;
         let named = l.get(id).await?;
         self.check_task(&named)?;
+        // to invalidate a sign-off task is to decline it, which is its approver's
+        self.may_decline(&named)?;
         self.writes_within(&named, "a reason")?;
         let handling = self.handling()?;
         let mut open = Vec::new();
@@ -3455,8 +3503,15 @@ impl Memory {
     }
 
     /// Erase an entry: the body leaves every version in the record and the index, the
-    /// stub, the erasure record and the receipt remain. Only the owner may, and only
-    /// once. The receipt is written first, with the versions about to be removed and a
+    /// stub, the erasure record and the receipt remain. It runs only under an approval
+    /// of the owner for the version of the entry that is there now, given to the caller
+    /// and not expired, and only once. The owner's own call, in a session that the memory
+    /// server does not serve, is that approval: the ledger records it and the policy
+    /// checks it as any other. Any other caller that may read the entry is refused, and a
+    /// sign-off task asks the owner for the approval. When the ledger does not answer, it
+    /// keeps no approval: only the owner's own call then goes on, and it stops unfinished
+    /// at the ledger's step. The receipt is written first, with the versions about to be
+    /// removed and a
     /// line saying the erasure has not finished; then the record, the entries downstream,
     /// the index, the served bundles; then the receipt again without that line. A run
     /// that stops short leaves that receipt, and the next run picks up where it stopped,
@@ -3468,38 +3523,24 @@ impl Memory {
     /// leaves the ledger, its log and its projection alike, and the receipt counts them;
     /// who promoted which version to which tier, and when, stays. Its approval tasks
     /// keep nothing of it but its id, and an open one is invalidated: nothing is left to
-    /// approve. Run again once finished, it scrubs the ledger again, for a why recorded
+    /// approve. Its sign-off tasks are rewritten the same way, since a request for a copy
+    /// at a lower label says why in the requester's words; the receipt does not count
+    /// them. Run again once finished, it scrubs the ledger again, for a why recorded
     /// after the first run's scrub, and is refused when nothing was left there. Exports
     /// already handed out, the transcripts of sessions that read the entry, and the
     /// queries in the read log are beyond reach and the receipt says so.
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for a session that is not the owner or an entry already
-    /// erased with nothing left on the ledger to scrub, [`Error::NotFound`] for an entry in no granted domain, or a store, index
-    /// or I/O error; an index another connection holds is [`dm_index::Error::Held`],
-    /// and the erasure is finished by running it again.
+    /// [`Error::Denied`] without an approval of this version in force, with the sign-off
+    /// task that asks for one, or for an entry already erased with nothing left on the
+    /// ledger to scrub; [`Error::NotFound`] for an entry in no granted domain or one the
+    /// session may not read; or a store, index or I/O error; an index another connection
+    /// holds is [`dm_index::Error::Held`], and the erasure is finished by running it
+    /// again.
     pub async fn erase(&self, id: &str, reason: Reason) -> Result<Receipt, Error> {
-        let d = self.decide(&Input {
-            action: Action::Erase,
-            principal: self.principal(),
-            domain: self.find(id).await.map(|(d, _)| d).unwrap_or_default(),
-            filing: None,
-            task: None,
-            parent: None,
-            write: None,
-            promote: None,
-            held_task: None,
-            spend: None,
-            fetch: None,
-        })?;
-        if !d.allow || self.author != self.grants.owner {
-            return Err(Error::Denied(format!(
-                "only the owner {} may erase",
-                self.grants.owner
-            )));
-        }
         let (domain, entry) = self.find(id).await?;
+        self.erasure_approved(&domain, &entry).await?;
         let stubbed = entry.front.status == Some(Status::Erased);
         let mut receipt = match self.store.receipt(&domain, id).await? {
             Some(r) if r.is_finished() => return self.erase_again(&domain, id, r).await,
@@ -3545,7 +3586,8 @@ impl Memory {
 
     /// An erasure run again once it finished: the ledger's scrub alone. A promotion can
     /// record a why after the first run's scrub, and take it out itself only when the
-    /// ledger lets it; this takes out what it left. The scrub counts every record without
+    /// ledger lets it; this takes out what it left, and what a sign-off task filed since
+    /// then says. The scrub counts every record without
     /// a why and every task it holds redacted, so counts that grew mean it found more, and
     /// the receipt takes them; counts that did not mean the entry was erased already.
     async fn erase_again(
@@ -3560,6 +3602,7 @@ impl Memory {
             .await
             .scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
             .await?;
+        self.scrub_sign_offs(domain, id).await?;
         if scrubbed.records == receipt.promotion_whys_removed
             && scrubbed.tasks == receipt.promotion_tasks_cleared
         {
@@ -3621,6 +3664,9 @@ impl Memory {
             .await
             .scrub_entry(domain, id, &proposal_origin(id), &proposal_redaction(id))
             .await?;
+        // a request for an approval can say why in the requester's words, which can be
+        // the entry's words: the sign-off tasks keep the id and nothing else
+        self.scrub_sign_offs(domain, id).await?;
         receipt.promotion_tasks_cleared = scrubbed.tasks;
         receipt.promotion_whys_removed = scrubbed.records;
         close_receipt(&mut receipt, missed);
