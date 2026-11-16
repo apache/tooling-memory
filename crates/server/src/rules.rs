@@ -200,7 +200,7 @@ impl Memory {
             .filter(|h| rules.iter().any(|(entry, r)| *entry == h.id && !r.withheld))
             .cloned()
             .collect();
-        self.observe(&read);
+        self.observe(&read)?;
         self.reads.hits(
             "check_policy",
             Some(&format!("{action} in {domain}")),

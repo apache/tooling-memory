@@ -543,7 +543,7 @@ impl Memory {
             }
             interleave(lists, budget.hits.max(1))
         };
-        self.observe(&hits);
+        self.observe(&hits)?;
         let mut pack = Pack::empty(queries, depth);
         pack.pieces = hits
             .iter()
@@ -571,7 +571,7 @@ impl Memory {
                 gone.push(p.id.clone());
                 continue;
             };
-            if !lock(&self.session).observe(entry.front.classification) {
+            if !self.observe_entry(&p.domain, &p.id, entry.front.classification)? {
                 gone.push(p.id.clone());
                 continue;
             }
@@ -607,8 +607,11 @@ impl Memory {
                 continue;
             }
             if let Some(meta) = ix.meta(&id, f)? {
-                lock(&self.session).observe(meta.hit.classification);
-                pack.pieces.push(Piece::from_hit(&meta.hit, Via::Linked));
+                // a linked entry is read as a hit is; one the session may not handle,
+                // which the filter never gives, is not served
+                if self.observe_entry(&meta.hit.domain, &id, meta.hit.classification)? {
+                    pack.pieces.push(Piece::from_hit(&meta.hit, Via::Linked));
+                }
             }
         }
         Ok(())
@@ -664,6 +667,7 @@ impl Memory {
             return self.recall_owed(question, domain, depth, budget).await;
         };
         let deadline = Instant::now() + budget.wall;
+        let read_under = self.filter_for(domain)?;
         let mut pack = self
             .pack(&[question.to_string()], domain, Depth::Sections, budget)
             .await?;
@@ -689,6 +693,15 @@ impl Memory {
                 Ok(a) => answer = a,
                 Err(_) => break,
             }
+        }
+        // the deputy took time: the brief is released only if what this session may
+        // read is still what the pack was read under
+        if self.filter_for(domain)? != read_under {
+            return Err(Error::Stale(
+                "what this session may read changed while the brief was written, and the \
+                 brief is withheld: ask again"
+                    .into(),
+            ));
         }
         let in_pack: HashSet<String> = pack.ids().into_iter().collect();
         let mut citations: Vec<String> = answer
@@ -1066,6 +1079,65 @@ mod tests {
                     .ok_or_else(|| "out of script".to_string())
             })
         }
+    }
+
+    /// A deputy during whose answer the root's policy narrows agents to public entries.
+    struct NarrowsMeanwhile {
+        root: std::path::PathBuf,
+        brief: String,
+    }
+
+    impl Deputy for NarrowsMeanwhile {
+        fn model(&self) -> String {
+            "scripted-1".into()
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _prompt: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                let text = dm_policy::decide::BUILTIN.replace(
+                    "read_filter := base_filter\n",
+                    "read_filter := object.union(base_filter, {\"handling\": \"public\"}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n",
+                );
+                std::fs::create_dir_all(self.root.join("policy")).map_err(|e| e.to_string())?;
+                std::fs::write(self.root.join("policy/local.rego"), text)
+                    .map_err(|e| e.to_string())?;
+                Ok(self.brief.clone())
+            })
+        }
+    }
+
+    /// A brief written from what the session could read is withheld when the session
+    /// can no longer read it by the time the brief is ready.
+    #[tokio::test]
+    async fn a_brief_is_withheld_when_the_read_filter_changed_while_it_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let retry = write(
+            &owner,
+            "Retry policy",
+            "Operation R retries with backoff.\n",
+            vec![],
+        )
+        .await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let deputy: Arc<dyn Deputy> = Arc::new(NarrowsMeanwhile {
+            root: dir.path().to_path_buf(),
+            brief: format!(
+                "{{\"brief\": \"R retries [{retry}].\", \"citations\": [\"{retry}\"], \"missing\": []}}"
+            ),
+        });
+        agent.set_deputy(&deputy);
+        let r = agent
+            .recall("how does R retry", None, None, Budget::default())
+            .await;
+        assert!(
+            matches!(r, Err(Error::Stale(_))),
+            "{:?}",
+            r.map(|r| r.brief)
+        );
     }
 
     #[tokio::test]

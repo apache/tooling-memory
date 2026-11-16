@@ -101,7 +101,11 @@ pub async fn review(
 ) -> Result<Vec<Review>, Box<dyn std::error::Error>> {
     let root = memory.root();
     let mut out = Vec::new();
-    for e in memory.quarantined()? {
+    // the quarantine is the security role's to read. This command is the owner's, and
+    // the owner is in that role, so the held writes are read as the owner; the session
+    // that asks the model is the auditor's
+    let held = Memory::open(root)?.without_read_log().quarantined()?;
+    for e in held {
         if out.len() >= limit {
             break;
         }

@@ -38,6 +38,7 @@ run() {
 
 run whole '' --operator "python3 $fake operator" --drop-index "python3 $fake operator drop-index"
 run surface ''
+run clock-back clock-back --operator "python3 $fake operator" --drop-index "python3 $fake operator drop-index"
 run missing-tool missing-tool --operator "python3 $fake operator"
 run write-ignores-label write-ignores-label
 run t0-forgets t0-forgets --operator "python3 $fake operator"
@@ -82,6 +83,9 @@ expect() {
 # a conformant server passes, whole and surface-only
 expect whole 0 '7 of 7 steps passed'
 expect surface 0 '5 of 7 steps passed; not run: 6, 7'
+# and so does one whose wall clock was set back between two writes: a list is in the order
+# of the writes, whatever times the entries carry
+expect clock-back 0 '7 of 7 steps passed'
 # and each defect is reported at the step whose claim it breaks, the rest still running
 expect missing-tool 1 '6 of 7 steps passed; FAILED: 1' 'tools/list lacks heartbeat'
 expect write-ignores-label 1 '1 of 7 steps passed; not run: 6, 7; could not run: 3, 4, 5; FAILED: 2' "write at public came back 'internal'"

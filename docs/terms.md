@@ -50,6 +50,8 @@ term here in the same commit as the first document that needs it.
 | grant | One table in the grants: `[domains.<name>]`, `[destinations.<name>]` or `[taps.<name>]` | permission |
 | policy | The Rego rules that decide each action: write, read, erase, approve, declassify, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
 | perimeter | The policy, the grants and the parts that enforce them, as one part of the design | |
+| stopped (session) | A session whose grants changed after it started. Each read, decision, tool call and model call of the session is refused, and a new session starts under the grants as they are | revoked session, stale session |
+| policy stamp | `state/policy.stamp` and the digest of the root's `policy/*.rego`: what a session compares to know that the policy changed | |
 | rule | One policy entry in the record: an id, a layer, the rule, its intent, an owner and, where a machine can check it, a module | |
 | status (of a rule) | Where a rule is in its life: `proposed` (in no decision), `advisory` (reports, refuses nothing), `enforced` (refuses) or `retired` | state (of a rule) |
 | ceiling | `[gates] max_enforced_rules`: the largest number of enforced rules in one domain that need no sign-off | cap (for rules) |
@@ -77,8 +79,30 @@ term here in the same commit as the first document that needs it.
 | external action | A change that a holder makes outside the record under its claim. The holder records it on the task before it makes it | side effect |
 | settle | To record what became of an external action: the destination holds it, or does not | reconcile, resolve |
 | task definition | The record in the platform domain for one kind of work: its purpose, its tools, its acceptance checks and its outputs. A task names one as `<name>@<version>` | task type, task template |
+| position | The record for one standing role: an entry of type `position` with a charter and an authority envelope, named `pos-<name>`. It is in force when a person verified its entry | seat, role (for a position), slot, post |
+| charter | The part of a position that gives its standing orders, the task definitions that it covers, and the agent definition that fills it | mandate, job description |
+| authority envelope | The part of a position that gives the most that a session in it may do: the tools and the handling. "The envelope" after the first use | scope (for the envelope), permissions |
+| agent definition | The name of one kind of agent: the name in the author of a session, `codex` for `agent:codex`. An `agent` artifact of the platform domain has the same name. A charter names one | agent type, persona |
+| pin | The field of a task that names a position. Only a session that fills the position claims a pinned task. To pin a task is to file it with a pin | assignment, binding |
+| pin reason | Why a task is pinned: `continuity`, `relationship` or `separation` | pin type |
+| commitment | A task that is pinned to a position, is admitted and is not closed | obligation, duty |
+| handoff cache | The newest handoffs that cite a position, which a session in the position gets first in T0 | handoff history, position memory |
+| seconded session | A session that fills a position under an agent definition that the charter does not name. It reads the position and does its tasks, and it does not write the position's history | substitute (for a seconded session), stand-in |
+| fill (a position) | What a session does when a launcher puts it in a position: it then claims the position's tasks under the authority envelope | occupy, take, assume |
+| wake (a position) | To start a session in a position that has a task that waits and no live session | spawn (for a wake), summon |
+| retire (a position) | What the owner does to end a position: its tasks lose their pin, and its history stays in the record | delete (for retire), close (for retire) |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
+| event log | The log of a domain, `state/log/<domain>.jsonl`, to which `amem` only appends: each write, version, refusal, erasure, read and send, and a copy of each event of the ledger, in order. An event holds ids and digests, and no text. The paper names it the historian | historian, audit log, journal |
+| security role | The owner, and each author that `security` in `grants.toml` lists. Only this role reads the quarantine, the event log of a domain, lineage and the list of withheld entries | security team |
+| send event | An event in the event log of a domain for content that left the perimeter in a session: a handoff that a tap posted, an export, or a model call that the egress recorded as answered. It holds the place and a digest, and no text | |
+| lineage | The answer to one question about an entry, from the event log of each domain. Back: the entries that its session read before it wrote the entry, and the entries that it cites. Forward: the entries and the send events that came after a session read it | provenance |
+| informed-by edge | A step of lineage between two entries: a session read the first entry before it wrote the second. Each read of the session before the write counts | derived-from edge |
+| cited edge | A step of lineage between two entries: the second entry names the first in `cites` or in `supersedes` | reference (for a cited edge) |
+| read set | The entries that a session read before one of its events: the `read` events of that session that are before the event in the log | context (for a read set) |
+| withheld entry | An entry with `status: withheld`. An erasure reached it by lineage, or its session read the erased entry and wrote it after the erasure. Its body stays in the record, and no search, list, T0, recall, get or bundle gives it. It stays withheld until a new entry replaces it, or the owner releases it or erases it | flagged entry, quarantined entry (for a withheld entry) |
+| feed | The step that brings the index up to the event log of a domain: it takes each version that the log names above a cursor from the record, and moves the cursor. A writer does it before its write returns | sync (for the feed) |
+| freshness bound | The longest time that a version in the event log of a domain can wait for the feed: 60 seconds. `freshness` measures a domain against it | index lag |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
 
 ## Calls and tools

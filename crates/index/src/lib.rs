@@ -116,6 +116,7 @@ CREATE INDEX IF NOT EXISTS entries_origin ON entries (origin);
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5 (
     id UNINDEXED, title, summary, body, tokenize = 'porter unicode61'
 );
+CREATE TABLE IF NOT EXISTS fed (domain TEXT PRIMARY KEY, seq INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
 ";
 
@@ -178,6 +179,7 @@ fn status_from_text(id: &str, s: Option<String>) -> Result<Option<Status>, Error
         Some("demoted") => Ok(Some(Status::Demoted)),
         Some("superseded") => Ok(Some(Status::Superseded)),
         Some("erased") => Ok(Some(Status::Erased)),
+        Some("withheld") => Ok(Some(Status::Withheld)),
         Some(other) => Err(Error::BadRow {
             id: id.to_string(),
             what: format!("status {other:?}"),
@@ -190,6 +192,7 @@ fn status_to_text(s: Option<Status>) -> Option<&'static str> {
         Status::Demoted => "demoted",
         Status::Superseded => "superseded",
         Status::Erased => "erased",
+        Status::Withheld => "withheld",
     })
 }
 
@@ -275,6 +278,22 @@ impl Index {
     pub fn open(path: &Path) -> Result<Index, Error> {
         let conn = Connection::open(path)?;
         Index::init(conn)
+    }
+
+    /// An index that exists, opened to read: nothing is created or changed, and a
+    /// writer elsewhere is waited for only briefly. For a reader that may be called
+    /// while another handle of the same process is at work.
+    ///
+    /// # Errors
+    ///
+    /// When the file is not there or cannot be opened.
+    pub fn open_reader(path: &Path) -> Result<Index, Error> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        Ok(Index { conn })
     }
 
     /// An index that lives only in memory.
@@ -480,7 +499,9 @@ impl Index {
     }
 
     /// Replace the whole index with what the record holds. One transaction: a reader
-    /// sees the old index or the new one, never half.
+    /// sees the old index or the new one, never half. The cursor of every domain goes
+    /// back to zero in that transaction: the rows a feed wrote are gone, so nothing
+    /// says they are there. The caller feeds each log again ([`Index::set_fed`]).
     ///
     /// # Errors
     ///
@@ -490,7 +511,7 @@ impl Index {
         I: IntoIterator<Item = Entry>,
     {
         let tx = self.conn.transaction()?;
-        tx.execute_batch("DELETE FROM entries; DELETE FROM entries_fts;")?;
+        tx.execute_batch("DELETE FROM entries; DELETE FROM entries_fts; DELETE FROM fed;")?;
         let mut n = 0;
         for e in entries {
             Index::upsert_in(&tx, &e)?;
@@ -501,7 +522,8 @@ impl Index {
     }
 
     /// Replace one domain's part of the index with `entries`, in one transaction: what a
-    /// domain's materializer builds, leaving every other domain as it was.
+    /// domain's materializer builds, leaving every other domain as it was. The cursor of
+    /// the domain goes back to zero in that transaction, as in [`Index::rebuild`].
     ///
     /// # Errors
     ///
@@ -511,6 +533,7 @@ impl Index {
         I: IntoIterator<Item = Entry>,
     {
         let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM fed WHERE domain = ?1", params![domain])?;
         tx.execute(
             "DELETE FROM entries_fts WHERE id IN (SELECT id FROM entries WHERE domain = ?1)",
             params![domain],
@@ -760,6 +783,50 @@ impl Index {
         }))
     }
 
+    /// How far the index was fed from the log of `domain`: the sequence number of the
+    /// last event applied, or zero when none was. Zero too for an index made before the
+    /// cursor was kept, which a connection opened to read does not change.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn fed(&self, domain: &str) -> Result<u64, Error> {
+        let kept: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fed'",
+            [],
+            |r| r.get(0),
+        )?;
+        if kept == 0 {
+            return Ok(0);
+        }
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seq FROM fed WHERE domain = ?1",
+                params![domain],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(seq.and_then(|s| u64::try_from(s).ok()).unwrap_or(0))
+    }
+
+    /// Say that the index was fed from the log of `domain` up to `seq`. The cursor
+    /// never moves back: a lower number than the one kept changes nothing, so two
+    /// feeders that finish out of order leave the higher.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn set_fed(&mut self, domain: &str, seq: u64) -> Result<(), Error> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        self.conn.execute(
+            "INSERT INTO fed (domain, seq) VALUES (?1, ?2)
+             ON CONFLICT (domain) DO UPDATE SET seq = max(seq, excluded.seq)",
+            params![domain, seq],
+        )?;
+        Ok(())
+    }
+
     /// The id already indexed in `domain` with this origin, if any. Unfiltered by label
     /// on purpose: it serves the import path's dedup, which runs as the owner, and
     /// reveals only an id. Scoped to the domain, since one domain's record says nothing
@@ -795,6 +862,7 @@ mod tests {
                 author: "human:test:me".into(),
                 created: datetime!(2026-10-01 10:00 UTC),
                 cites: vec![],
+                session: None,
                 confidence: None,
                 trust_tier: TrustTier::Raw,
                 review_by: None,
@@ -1240,6 +1308,81 @@ mod tests {
             ids(&ix.search("still", &any(), 10).unwrap()),
             vec!["mem-a-1"]
         );
+    }
+
+    #[test]
+    fn the_cursor_of_a_domain_starts_at_zero_is_kept_per_domain_and_does_not_move_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let mut ix = Index::open(&path).unwrap();
+            assert_eq!(ix.fed("dom-a").unwrap(), 0, "nothing was fed");
+            ix.set_fed("dom-a", 7).unwrap();
+            assert_eq!(ix.fed("dom-a").unwrap(), 7);
+            assert_eq!(ix.fed("dom-b").unwrap(), 0, "another domain's cursor");
+            ix.set_fed("dom-b", 2).unwrap();
+            ix.set_fed("dom-a", 5).unwrap();
+            assert_eq!(ix.fed("dom-a").unwrap(), 7, "a lower number is not taken");
+            ix.set_fed("dom-a", 9).unwrap();
+            assert_eq!((ix.fed("dom-a").unwrap(), ix.fed("dom-b").unwrap()), (9, 2));
+        }
+        assert_eq!(Index::open(&path).unwrap().fed("dom-a").unwrap(), 9);
+        assert_eq!(Index::open_reader(&path).unwrap().fed("dom-b").unwrap(), 2);
+    }
+
+    #[test]
+    fn a_rebuild_puts_the_cursor_back_at_zero_with_the_rows_it_replaces() {
+        let mut ix = Index::in_memory().unwrap();
+        ix.set_fed("dom-a", 9).unwrap();
+        ix.set_fed("dom-b", 2).unwrap();
+        // one domain's rebuild moves that domain's cursor and no other
+        ix.rebuild_domain("dom-a", Vec::new()).unwrap();
+        assert_eq!((ix.fed("dom-a").unwrap(), ix.fed("dom-b").unwrap()), (0, 2));
+        ix.set_fed("dom-a", 4).unwrap();
+        assert_eq!(ix.fed("dom-a").unwrap(), 4, "the next feed sets it again");
+        // a rebuild of the whole index moves every cursor
+        ix.rebuild(Vec::new()).unwrap();
+        assert_eq!((ix.fed("dom-a").unwrap(), ix.fed("dom-b").unwrap()), (0, 0));
+    }
+
+    #[test]
+    fn a_reader_of_an_index_file_from_before_the_cursor_reads_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        drop(Index::open(&path).unwrap());
+        // as a binary from before made the file: without the table
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE fed;")
+            .unwrap();
+        let reader = Index::open_reader(&path).unwrap();
+        assert_eq!(reader.fed("dom-a").unwrap(), 0);
+        drop(reader);
+        // the next open to write makes it
+        let mut ix = Index::open(&path).unwrap();
+        ix.set_fed("dom-a", 3).unwrap();
+        assert_eq!(ix.fed("dom-a").unwrap(), 3);
+    }
+
+    #[test]
+    fn a_withheld_entry_keeps_its_status_in_the_index_and_no_query_for_active_entries_gives_it() {
+        let mut ix = Index::in_memory().unwrap();
+        let mut held = entry("dom-a", "mem-a-held", "Budget", "The budget, withheld.\n");
+        held.front.status = Some(Status::Withheld);
+        ix.upsert(&held).unwrap();
+        ix.upsert(&entry("dom-a", "mem-a-live", "Budget", "The budget.\n"))
+            .unwrap();
+        assert_eq!(
+            ids(&ix.search("budget", &any(), 10).unwrap()),
+            ["mem-a-live"]
+        );
+        assert_eq!(ids(&ix.list(&any(), None, 10).unwrap()), ["mem-a-live"]);
+        assert_eq!(ix.count(&any()).unwrap(), 1);
+        assert!(ix.meta("mem-a-held", &any()).unwrap().is_none());
+        let mut wide = any();
+        wide.include_inactive = true;
+        let meta = ix.meta("mem-a-held", &wide).unwrap().unwrap();
+        assert_eq!(meta.status, Some(Status::Withheld));
     }
 
     /// Bytes anywhere in the index's files: the database and whatever journal it keeps.

@@ -4,11 +4,10 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, ApprovalRecord, Claimant, Error, Event, Held,
-    PromotionRecord, PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task,
-    TaskSpec, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, ApprovalRecord, Claimer, Error, Event, Held,
+    PromotionRecord, PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken,
+    Task, TaskSpec, LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
-use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -412,10 +411,8 @@ impl Db {
         &mut self,
         domain: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<Option<Taken>, Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -455,24 +452,15 @@ impl Db {
             found
         };
         for task in candidates {
-            if !claimable(&task, now, manifest, handling)
+            if !claimable(&task, now, who)
                 || !deps_complete(&tx, &task.spec.depends_on)?
                 || awaits_continuation(&tx, &task)?
                 || resumes_unsettled(&tx, &task)?
             {
                 continue;
             }
-            apply(
-                &tx,
-                &task.id,
-                now,
-                &Event::Claimed {
-                    holder: who.holder.to_string(),
-                    until,
-                    generation: task.generation + 1,
-                    attempt: who.attempt.map(str::to_string),
-                },
-            )?;
+            let claimed = who.claimed(until, task.generation + 1);
+            apply(&tx, &task.id, now, &claimed)?;
             tx.commit()?;
             return Ok(Some(Taken::New(task.id)));
         }
@@ -483,15 +471,13 @@ impl Db {
         &mut self,
         id: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<(), Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let task = get_in(&tx, id)?;
-        if !claimable(&task, now, manifest, handling)
+        if !claimable(&task, now, who)
             || !deps_complete(&tx, &task.spec.depends_on)?
             || awaits_continuation(&tx, &task)?
             || resumes_unsettled(&tx, &task)?
@@ -502,17 +488,7 @@ impl Db {
                 op: "claim",
             });
         }
-        apply(
-            &tx,
-            id,
-            now,
-            &Event::Claimed {
-                holder: who.holder.to_string(),
-                until,
-                generation: task.generation + 1,
-                attempt: who.attempt.map(str::to_string),
-            },
-        )?;
+        apply(&tx, id, now, &who.claimed(until, task.generation + 1))?;
         tx.commit()?;
         Ok(())
     }
@@ -583,6 +559,35 @@ impl Db {
             .conn()
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
         Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    /// The rows of `domain` after sequence number `after`, in order, and before them the
+    /// rows that say who held the tasks those are of. The events table is one for all
+    /// domains: a task's row names its domain, and a promotion or an approval names its
+    /// own in its payload, so each of those after `after` is given and the caller keeps
+    /// its own.
+    pub(crate) fn events_after(&self, domain: &str, after: u64) -> Result<Vec<RawEvent>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT e.seq, e.task_id, e.at, e.payload, t.domain, t.label_rank
+             FROM events e LEFT JOIN tasks t ON t.id = e.task_id
+             WHERE (e.seq > ?1 OR (e.kind IN ({LEASE_KINDS})
+                    AND e.task_id IN (SELECT task_id FROM events WHERE seq > ?1)))
+               AND (t.domain = ?2 OR e.kind IN ('promoted', 'approved'))
+             ORDER BY e.seq"
+        ))?;
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![after, domain], |r| {
+            Ok(RawEvent {
+                seq: r.get(0)?,
+                task: r.get(1)?,
+                at: r.get(2)?,
+                payload: r.get(3)?,
+                domain: r.get(4)?,
+                label_rank: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub(crate) fn rebuild(&mut self) -> Result<u64, Error> {
@@ -911,8 +916,8 @@ fn insert_promotion(
     Ok(())
 }
 
-/// The projection of the events that move a task between waiting and claimable, and of
-/// those that only record something.
+/// The projection of the events that move a task between waiting and claimable, of the
+/// one that takes its pin off, and of those that only record something.
 fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Error> {
     let sql = match event {
         Event::Blocked { .. } => {
@@ -923,6 +928,12 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
         }
         Event::Retriaged { .. } => {
             "UPDATE tasks SET status = 'proposed' WHERE id = ?1 AND status IN ('open', 'blocked')"
+        }
+        // the pin leaves the row, so a replay leaves the task unpinned too. A row with
+        // no `extra` holds no pin
+        Event::Unpinned { .. } => {
+            "UPDATE tasks SET extra = json_remove(extra, '$.position', '$.pin_reason')
+             WHERE id = ?1 AND extra IS NOT NULL AND extra != ''"
         }
         // the record that someone tried, or spoke after its claim, or approved an action:
         // no task moves
@@ -971,6 +982,7 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         Event::Blocked { .. }
         | Event::Unblocked { .. }
         | Event::Retriaged { .. }
+        | Event::Unpinned { .. }
         | Event::ClaimRefused { .. }
         | Event::LateHandoff { .. }
         | Event::Approved(_) => project_waiting(conn, id, event)?,

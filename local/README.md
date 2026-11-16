@@ -385,12 +385,13 @@ that approval. The section on [approvals](#approvals-amem-approve-amem-approvals
 gives the steps for every other session. Each decision, allow or deny, goes to
 `state/decisions.jsonl`, with the policy version that made it.
 
-Detection. The write log, `state/writes.jsonl`, records which session wrote which entry.
-It is beside the read log, which now names the entries that each read served. `amem taint
-<id>` follows the reach of an entry: the sessions that read it, and the entries that those
-sessions wrote after they read it. This is the paper's lineage for erasure. It is also the
-first place to look when you find that an entry is poisoned. The curator's telemetry
-adds two alarms, from the logs only:
+Detection. The event log of each domain records each write, each read and each send, with
+the session that did it. `amem lineage <id>` follows an entry through the log: the
+entries and the sends that came after a session read it, and with `--back` the entries
+that its session read before the write. This is the paper's lineage for erasure. It is
+also the first place to look when you find that an entry is poisoned. See "The event log
+and lineage" below. The write log, `state/writes.jsonl`, and the read log beside it are
+telemetry. The curator's telemetry adds two alarms, from those two logs only:
 
 - `write-rate`: an author writes thirty or more entries in an hour.
 - `relay`: three or more other sessions read an agent's entry within an hour after it was
@@ -456,6 +457,142 @@ writes:
   it from the user. The verdict was `malicious`.
 - A release signature in base64, held as an encoded payload: `benign`.
 - Codex's handoff that quoted the injection it had refused: `report`.
+
+## The event log and lineage: `amem log`, `amem lineage` and `amem withheld`
+
+Each domain has an event log, `state/log/<domain>.jsonl`. The paper names it the
+historian. `amem` only appends to it, and each domain has one writer at a time. An event
+holds ids and digests, and never a body. Each event has a sequence number, a time and
+an author. These are the kinds of event:
+
+| Kind | What occurred |
+|---|---|
+| `write` | A session offered an entry. `amem` appends this event before the scan and the gates |
+| `put` | The record took a version of an entry |
+| `quarantined` | The scan or a gate refused a write. The event names the `write` event, the gate, and the kinds of thing that the scan found. A write that failed before the record took it gets this event too, with the gate `error`. Nothing is held in `state/quarantine` for such a write |
+| `erased` | The owner erased an entry |
+| `read` | A read gave entries to a session. An export is also a read. A read of a turn of a transcript names the transcript by its session. A turn that comes from an excerpt also names the entry that keeps the excerpt |
+| `send` | Content left the perimeter in a session: a tap posted a handoff, an export wrote a bundle, or the egress recorded a model call with its answer. The event holds the place and a digest |
+| `ledger` | A copy of one event of the ledger: the task, what occurred, the principal and the attempt key, with no text |
+
+A `write`, a `read` and a `send` name their session. Each entry names its session too:
+its frontmatter has `session: <session id>@<offset>`, and the offset is the sequence
+number of its `write` event.
+
+A `write`, a `read`, a `send` and a `ledger` event have a label: the classification of
+the entries or the task that the event names. A `put` and an `erased` event have no
+label, and an event with no label counts as `restricted`. A `quarantined` event has the
+label `restricted`. The body of the refused write stays in `state/quarantine`.
+
+**Who reads the log.** Only the security role reads the log, lineage and the
+quarantine. The security role is the owner, and each author that the `security` key of
+`grants.toml` lists. Put the key before the first table of the file, and give each
+author exactly as its session gives it:
+
+```toml
+security = ["agent:security"]
+```
+
+`amem` filters the log as it filters each read. A session gets no event above its
+handling. Only a session that handles `restricted` gets the two events of a refused
+write, `write` and `quarantined`, whatever the label of the `write` event. An event that
+a session gets is a read: the session label goes up to the label of the event. The same
+rule applies to the quarantine. `amem quarantine list` and `show` give a held write only
+to a session that handles `restricted`, and the session label goes up to `restricted`.
+
+- `amem log show [--domain <domain>] [--from <seq>]` prints the log from a sequence
+  number. First it copies the new events of the ledger into the log.
+- The `log` memory tool gives the same events, and the freshness of the domain.
+- `amem log materialize` builds the index of a domain again from its log and the
+  record. Only the owner can run it.
+
+**The feed, and the freshness bound.** The index has a cursor for each domain: the
+sequence number of the last event that the index took. After a writer appends a version
+to the log, it feeds the index from the log before its write returns. The feed reads
+each entry that the log names above the cursor from the record, and moves the cursor.
+The freshness bound is 60 seconds: a version in the log is in the index not later than
+60 seconds after its event.
+
+- `amem log freshness [--domain <domain>]` measures a domain against the bound. It gives
+  the last sequence number of the log (`log_seq`) and the cursor (`fed_seq`). It gives
+  the number of versions above the cursor (`unfed`), and the age of the oldest of them
+  (`oldest_unfed_seconds`). `within_bound` says if each version is within the bound.
+  When `within_bound` is false, the command also prints a line on standard error.
+- `amem log feed [--domain <domain>]` feeds the index now. Use it when a writer stopped
+  between the log and the index. No reader feeds the index, and no task feeds it on a
+  schedule.
+
+`amem reindex` and `amem log materialize` replace the rows of the index from the record.
+In the same transaction, they put the cursor back at zero. Then they feed the whole log.
+Another process can write while the record is read. The feed after the rebuild reads
+each entry that the log names from the record again, so the index gets that version too.
+
+**Lineage.** `amem lineage <id>` and the `lineage` memory tool read the log of each
+granted domain. The answer has two kinds of edge:
+
+- An informed-by edge (`informed`): a session read one entry before it wrote the other.
+  The read set of an entry is all that its session read before the write. Each entry in
+  the read set counts, so this edge is coarse.
+- A cited edge (`cited`): one entry names the other in `cites` or in `supersedes`.
+
+Forward is the default. `amem lineage <id>` gives the sessions that read the entry, and
+the entries that those sessions wrote after the read. It also gives the sends of those
+sessions after the read, and the entries that cite the entry. `amem lineage <id> --back`
+gives the entries that the session of the entry read before the write, and the entries
+that the entry cites. With `--back`, `<id>` can also be `<domain>@<seq>`, which names a
+send event. `--depth <n>` stops after `n` steps. Each entry in the answer has its number
+of steps (`hops`). A write that the record did not take is no entry: the answer forward
+does not name it. A session that read a turn of a transcript read the transcript. Thus an
+answer back can name a transcript, by its session, among the entries.
+
+In one log, the sequence numbers give the order. Between two domains, the times of the
+events give the order. `complete` is false when the log cannot give the full answer: for
+example, for an entry that has no `write` event, because it is older than the log or an
+import brought it.
+
+**An erasure follows lineage.** `amem erase` reads the lineage forward from the erased
+entry. An entry that is one step forward gets `status: withheld`: an entry that names
+the erased entry, or an entry that a session wrote after it read the erased entry. A
+withheld entry keeps its body in the record. No search, list, T0, recall, get or bundle
+gives it. The receipt of the erasure lists:
+
+- `withheld`: the entries that this erasure withheld.
+- `further`: the entries that are two steps or more forward, and each verified rule of
+  the policy that is one step forward. The erasure does not withhold them.
+- `sends`: each send after a read of the erased entry, with its destination and the
+  sequence numbers of its events. These are copies that the erasure cannot remove.
+
+The stub of the erased entry keeps its id, type, domain, time of creation,
+classification, `supersedes`, session and the status `erased`. Its author becomes
+`erased`. The title, the citations and each other field go with the body.
+
+A session that read the entry before the erasure can write after the erasure. `amem`
+looks at the log after each write. If the session read an entry before the erasure of
+that entry, the new entry gets `status: withheld`. The receipt of the erasure then names
+the new entry in `withheld`. The answer to the write names the erased entry
+(`withheld`). The same session cannot derive a withheld entry again. Its new entry is
+withheld too, and a reader of the old id does not get it. A session that read only the
+stub, after the erasure, is not affected. If `amem` cannot read a log for this check, the
+write fails and the new entry is withheld.
+
+An erasure does not withhold a verified rule of the policy. A rule refuses. Suppose that
+an erasure could withhold a rule. Then an agent could plant an entry that the owner must
+erase, and what the rule refused would pass. The rule stays in force, and the receipt
+lists it in `further`. Erase the rule or replace it if its text came from the erased entry. An
+exception permits, so the erasure withholds it as each other entry, and it is in no
+decision after that.
+
+A withheld entry stays withheld until one of these occurs:
+
+- It is derived again: a new entry names it in `supersedes`. Then a reader of the old
+  id gets the new entry.
+- The owner releases it: `amem withheld release <id>`. Use this when you read the entry
+  and it is correct.
+- The owner erases it.
+
+`amem withheld list [--domain <domain>]` gives the withheld entries that no entry
+replaced, each with the erased entry that caused it (`because`). `amem` files no task
+for a withheld entry.
 
 ## The trust tiers: `amem promote` and `amem approve`
 
@@ -592,6 +729,12 @@ before its expiry. Such an approval permits its action only on the version that 
 The list holds only the approvals of entries that the session can read. The receipt of an
 erasure names who erased, and it does not name the approval.
 
+The event log of the domain gets a copy of each approval, as it gets a copy of each event
+of the ledger: a `ledger` event with the operation `approved`. The copy names the
+approver, the entry and the time, and it has the highest label. The action, the version,
+the scope and the expiry stay in the event of the ledger, where `amem approvals` reads
+them.
+
 ### A copy at a lower label: `amem declassify`
 
 `amem declassify <id> --to <label> --why "<words>"` asks for a declassification: a copy
@@ -630,7 +773,7 @@ only as the owner.
 
 An erasure of the entry rewrites the sign-off tasks of the entry. They keep the id of the
 entry and lose the reason that the requester gave. The erasure closes the open ones. It
-flags a copy for review, as it flags each entry that cites the erased entry.
+withholds a copy, as it withholds each active entry that cites the erased entry.
 
 ### The two memory tools
 
@@ -693,9 +836,10 @@ each advisory module by itself. When an advisory module fails, the decision log 
 for that rule, and the decision does not change. When the module of an enforced rule
 loads and then fails in a decision, that decision fails.
 
-A session loads the policy when it starts, and again when it changes a policy entry
-itself. A change that a different session makes applies to the sessions that start after
-the change.
+A session loads the policy when it starts. Before each read and each decision, the
+session compares the policy stamp with the stamp that it loaded. When a different session
+changed a policy entry, or the root's `policy/*.rego` changed, the session loads the
+policy again and computes its read filter again. See "Access freshness" below.
 
 `[gates] max_enforced_rules` in `grants.toml` is a ceiling on the enforced rules of one
 domain. There is no ceiling by default. `amem` counts the enforced rules of a domain from
@@ -773,6 +917,57 @@ through, and how often the rule advised.
 With `--file`, `amem policy lint` files a task for the owner for each finding, except
 for a module that is not yet verified. Thus an unused rule goes to the owner. `amem` looks
 at the full decision log, not at one review period.
+
+## Access freshness
+
+A session is valid only while its authority is what the session started with. `amem`
+does these checks before each read through the read filter, each decision, each spend
+check, each call of a hosted tool, each import, and each request through the egress:
+
+- **The grants.** `amem` reads `grants.toml` and compares its digest with the digest
+  from the start of the session. If the file changed, the session stops: each call
+  gives `stopped: the grants changed after this session started`. A new session starts
+  under the grants as they are. If the file has its first text again, the session is
+  valid again. If `amem` cannot read the file, it refuses the call.
+- **The policy.** `state/policy.stamp` changes when a session writes, promotes or erases
+  a policy entry, replaces a policy entry with an entry of any type, imports a bundle,
+  resets the rules, or builds the index again (`amem reindex`, `amem materialize`).
+  The stamp also includes the digest of the root's `policy/*.rego`. When the stamp is
+  not the stamp that the session loaded, the session loads the policy again. The read
+  filter of the session has the version of the policy that computed it, and `amem`
+  computes it again for a new version. If the policy does not load, `amem` refuses the
+  call.
+- **Expiry.** `amem` compares the expiry of an exception with the clock at each
+  decision. An exception that was in force when the policy loaded lets nothing through
+  after its expiry.
+
+`recall` with a deputy does one more check. When the brief is ready, `amem` computes the
+read filter again. If the filter is not the filter that the pack was read under, `amem`
+withholds the brief.
+
+A tunnel that is open when its session stops does not stay open. The egress asks each
+second if the session is valid, and closes the tunnel when it is not.
+
+The board is the owner's session. When its session stops, the board opens a new session
+under the grants as they are. When the board cannot open one, for example because
+`grants.toml` does not parse, it answers each request with status 403 and the reason.
+It also refuses the files of a bundle that it exported before.
+
+The read filter of a session is computed again only for a new version of the policy.
+The expiry of an exception does not make a new version. Thus a root policy whose read
+filter reads the exceptions keeps its filter after an expiry, until the stamp changes.
+The built-in read filter does not read the exceptions. An advisory rule also reports
+with the exceptions as they were when the policy loaded.
+
+`amem` does not look for which grant changed: any change to `grants.toml` stops each
+open session of that record.
+
+The check is before the read. A read that waits, for example on the index, does not
+check again before it gives its answer. Only `recall` with a deputy does.
+
+Some commands of the owner and of the launcher do not do the check: for example
+`amem transcript`, `amem tape`, `amem source`, `amem quarantine`,
+`amem policy lint` and `amem policy reset`. No memory tool is in this group.
 
 ## The states of a task, and its claim: `amem task`
 
@@ -980,6 +1175,162 @@ Not built yet: the autonomy level has no effect, no suite gates a version of a
 definition, and the data scope is not enforced. An erasure of the entry of a definition
 does not remove the checks that tasks took from it.
 
+## Positions: `amem position`
+
+A position is the record for one standing role: for example, a release coordinator or
+the reviewer of a subsystem. It is an entry of type `position`. The body of the entry
+holds one fenced block with the info string `position pos-<name>`. The block is TOML:
+
+```toml
+[charter]
+orders = "Announce each release to the list after the mirrors carry it."
+covers = ["release"]
+agent = "codex"
+
+[envelope]
+tools = ["tool:fetch"]
+handling = "internal"
+```
+
+- The name on the fence is the identifier of the position. It starts with `pos-`, then
+  has lower-case letters, digits and hyphens. The id of the entry is the version.
+- `[charter] orders` gives the standing orders.
+- `[charter] covers` gives the names of the task definitions that the position takes.
+- `[charter] agent` gives the agent definition that fills the position: the name in the
+  author of a session, `codex` for `agent:codex`.
+- `[envelope] tools` gives the tools that a session in the position can call.
+- `[envelope] handling` gives the highest label that a session in the position reads.
+- `status = "retired"`, above `[charter]`, is in a version that retires the position.
+
+Write the entry with `amem write --kind position`. A position is in force when its
+entry is active and a person verified it. When two such entries define one name, the
+newer entry is in force. A block with a key that is not in this list defines no
+position. `amem position list` shows each entry and, when the entry is not in force, the
+reason.
+
+Pin a task to a position with `amem task create --position <name> --pin-reason
+<reason>`. The memory tool `create_task` takes `position` and `pin_reason`. The pin
+reason is one of three words:
+
+- `continuity`: the position holds open commitments that the task depends on.
+- `relationship`: the position holds a relationship with an outside project.
+- `separation`: the review must go to a position other than the author's.
+
+The ledger records the pin reason and does the same thing for each one. The memory
+server refuses a pin without a pin reason, and a pin to a position that is not in force.
+Only a session that fills the position claims a pinned task. `claim_next` does not
+give the task to a different session. When a different session asks for the task by its
+id, the ledger refuses, and the refusal names the position. A continuation in the same
+domain takes the pin of its parent. A subagent task and a retry do not.
+
+The memory server applies the checks of a pin to a pin that a continuation takes. A
+session can file a task with the origin `continues:<id>`. If the session cannot read
+the position of that parent, the memory server refuses the task. If the session cannot
+read the parent, the memory server refuses the task and names nothing of the parent.
+
+A task that a session pins to a position stays proposed until one of these admits it:
+
+- a person;
+- a session that fills the position under the agent definition that the charter names.
+
+This applies to each session that does not fill the position in that way: a seconded
+session, a session in a different position and a session in no position. The memory
+server does not admit their pinned task when they file it, and it refuses their
+`admit`.
+
+A pinned task waits for its continuation, and no session claims the task during that
+time. Thus only these sessions fan out a pinned task or file its continuation:
+
+- the session that holds the task, which can be a seconded session;
+- a session that can admit a task of the position.
+
+The memory server refuses each other session, and files nothing.
+
+A session that fills a position gets these, and is held to them:
+
+- It claims the tasks that are pinned to the position, and the tasks without a pin whose
+  task definition the charter covers. It claims no other task.
+- It can call only the tools that the envelope holds. The grants and the task definition
+  can make that set smaller.
+- It reads no entry above the handling of the envelope.
+- Its T0 starts with the slice of the position: the charter, the authority envelope, the
+  open commitments and the handoff cache. A commitment is a task that is pinned to the
+  position, is admitted and is not closed. A proposed task is not a commitment. The
+  slice shows the first 160 characters of the title of a commitment.
+- When it writes a handoff, the memory server adds the name of the position to the
+  citations of the handoff. The handoff cache is the newest five handoffs that cite the
+  position.
+- When the entry of the position is replaced, retired, demoted or erased, the session
+  cannot continue in the position. The memory server refuses each claim, each read, each
+  tool call and each T0 of the session from then on. The session can still write a
+  handoff, and that handoff does not get the citation. Start a new session.
+
+A session under an agent definition that the charter does not name is a seconded
+session. It claims the tasks of the position, and it reads what the position holds. It
+cannot write an entry that cites the position, so the handoff cache does not get its
+handoffs. A person has no agent definition, so a session of a person is always seconded.
+
+A session does not select its position. The operator names the position when the
+session starts, or the launcher finds one that waits:
+
+- With `amem serve --position <name>`, the session fills the position before the memory
+  server serves. The variable `MEMORY_POSITION` does the same. If the memory server
+  refuses the position, the command ends with the refusal.
+- With `amem work --position <name>`, the session fills the position before the first
+  claim.
+- `amem work --wake` reads which positions wait: each has a task that waits and no live
+  session. The session fills the first position whose charter names the agent definition
+  of this harness. It does one task and leaves the position. If that position gives it
+  no task, it leaves the position and fills the next one that waits. If a position
+  refuses the session, the launcher prints the refusal and goes to the next one. When no
+  position waits for this harness, the launcher claims nothing. It names each position
+  that waits for a different agent definition.
+
+`--position` and `--wake` do not work on the `wslc` sandbox backend. `amem work` refuses
+them there.
+
+`amem position show <name>` gives one position: the record, its open commitments, its
+handoff cache and the sessions that are live in it. A session is live in a position
+while it holds a lease on a task that it claimed from the position. A reader that cannot
+see that task does not get the name of the session. The memory tools `position` and
+`positions` give the same answers to a session.
+
+A position whose envelope has a handling below the classification of its own entry takes
+no session. `amem position list` shows `wake` as false for that position, and the wake
+list does not hold it.
+
+The owner retires a position with `amem position retire <name> --why <text>`, or with
+the memory tool `retire_position`. The memory server writes a new version with
+`status = "retired"` and the reason. It takes the pin off each task of the position
+that is not closed, so any session that matches can claim those tasks. The entries that cite the
+position stay in the record. A retired position takes no session and no pin. An owner
+that retires the position that its own session fills leaves the position.
+
+Not built yet:
+
+- The platform's standing roles are not positions, and nothing makes a position when a
+  domain is registered.
+- No curator proposes a position, and an unused position does not go to its owner.
+- The memory server does not start a session when a pinned task is admitted. A person
+  or a scheduler runs `amem work --wake`.
+- A session that holds no lease is not seen as live, and two sessions can fill one
+  position at the same time.
+- The position is not in the principal chain, and not in the input of the policy. The
+  policy does not decide who admits a pinned task. The memory server holds that rule.
+- A session whose position changed cannot complete the task that it holds. The lease
+  ends, and the task returns to the queue.
+- `amem position list` counts a proposed task in `pinned`.
+- No tap posts for a position.
+- Nothing checks that a `separation` pin names a position other than the author's.
+- The envelope has no data scope other than its handling.
+- While the next version of a position waits for review, no version is in force.
+- A retirement needs no second person.
+- A subagent that runs inside the harness writes as the session, so its handoffs cite
+  the position.
+- An import lands entries with their citations, so a bundle can bring entries that cite
+  a position.
+- A read of the handoff cache looks at the newest 200 handoffs of the domain only.
+
 ## The task fabric: `amem task rescore` and `stats`
 
 An L1 policy entry can carry the rubric that it compiles into, as a `[rubric]` table in
@@ -1045,7 +1396,8 @@ They apply the same checks as to any read. `redirected_from` names what the read
 for, so the reader cites what it read. They follow again only if the current version was
 itself replaced in between, at most eight times.
 
-A demoted or erased entry answers `gone`, as a 410 would. An entry replaced by nothing
+A demoted or erased entry answers `gone`, as a 410 would. A withheld entry answers `gone`
+until a new entry replaces it, and then it redirects. An entry replaced by nothing
 that the reader may read also answers `gone`. The memory server gives either answer only
 about an entry that the reader could read. For any other entry, the answer stays "not
 found". Thus a redirect tells nothing that a search would not tell.
@@ -1117,8 +1469,10 @@ cycle runs it.
 Demotion, erasure and export of an entry also apply to its excerpts.
 
 `amem transcript erase <session> --reason ...` erases a transcript early. This is the
-owner's act. A stub and a receipt remain, and the command flags the entries that cite the
-transcript.
+owner's act. A stub and a receipt remain, and the command withholds the entries that cite
+the transcript. It also withholds each entry that a session wrote after that session read
+a turn of the transcript, before the erasure or after it. A withheld entry keeps its body
+in the record, and no read gives it.
 
 The handoff of a live Codex session cited `#1-3`. With the clock at zero, the sweep kept
 the cited turns as excerpts, and dropped the rest and the raw lines. The erasure of the
@@ -1423,8 +1777,12 @@ way:
 - Each operation appends one event and updates the projection in one transaction.
 - `amem reindex` replays the events.
 - On PostgreSQL, a claim takes its row with `SELECT ... FOR UPDATE SKIP LOCKED`. Thus many
-  claimers on many connections each get a different task, and no claimer waits on the lock
-  of another claimer.
+  claimers on many connections each get a different task.
+- On PostgreSQL, a row of `events` gets its sequence number at the insert, and not at the
+  commit. So each transaction that appends an event takes the lock of its domain first.
+  The appends of one domain then commit in the order of their numbers, and the copy into
+  the event log misses none. The appends of one domain wait for each other. The appends
+  of two domains do not.
 - On both backends, the clock of the ledger itself decides when a lease expires.
 
 With each backend, the record, the index and the read log stay under the root. The tests

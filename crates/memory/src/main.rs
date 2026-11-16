@@ -32,6 +32,7 @@ mod mine;
 mod model;
 mod open;
 mod platform;
+mod positions;
 mod profiles;
 mod reenact;
 mod replay;
@@ -122,6 +123,7 @@ enum Kind {
     Method,
     Handoff,
     Policy,
+    Position,
 }
 
 impl From<Kind> for EntryType {
@@ -133,6 +135,7 @@ impl From<Kind> for EntryType {
             Kind::Method => EntryType::Method,
             Kind::Handoff => EntryType::Handoff,
             Kind::Policy => EntryType::Policy,
+            Kind::Position => EntryType::Position,
         }
     }
 }
@@ -305,6 +308,10 @@ enum Command {
         /// Capabilities this session carries, matched against task requirements.
         #[arg(long = "cap")]
         manifest: Vec<String>,
+        /// The position this session fills, `pos-<name>`, before it serves. A launcher
+        /// sets it; a session does not choose its own position.
+        #[arg(long, env = "MEMORY_POSITION")]
+        position: Option<String>,
     },
     /// Run a harness confined: no network except the egress, the memory server attached,
     /// model calls forwarded and metered. Credentials come from this process's
@@ -467,6 +474,16 @@ enum Command {
         /// Work this task rather than the next one, and stop after it.
         #[arg(long)]
         task: Option<String>,
+        /// Fill this position, `pos-<name>`, before the first claim: the session then
+        /// claims the tasks pinned to the position and the ones its charter covers. Not
+        /// on the `wslc` backend.
+        #[arg(long)]
+        position: Option<String>,
+        /// Before each claim, fill a position that waits for a session under this
+        /// harness's agent definition, and leave it when the task is settled. With
+        /// none that waits, nothing is claimed. Not on the `wslc` backend.
+        #[arg(long, conflicts_with_all = ["position", "task"])]
+        wake: bool,
     },
     /// The curator's survey: what in a domain needs curation, from the record and
     /// the read log, as proposals; with --file, each becomes a task for a run to do with
@@ -594,9 +611,25 @@ enum Command {
         #[command(subcommand)]
         op: QuarantineOp,
     },
-    /// What an entry may have reached: the sessions that read it and the entries they
-    /// wrote after; where to look when an entry turns out to be poison.
-    Taint { id: String },
+    /// The lineage of an entry, from the event logs: what was written and sent after a
+    /// session read it, and what cites it; with --back, what it was made from. Where to
+    /// look when an entry turns out to be poison. For the owner and the security role.
+    Lineage {
+        /// An entry id, or with --back `<domain>@<seq>` for a send event.
+        of: String,
+        /// Follow the edges back: what the entry or the send may have been made from.
+        #[arg(long)]
+        back: bool,
+        /// The most steps to follow. Without it, until a step reaches nothing new.
+        #[arg(long)]
+        depth: Option<u32>,
+    },
+    /// The entries an erasure withheld, which no read serves until each is derived
+    /// again, released or erased: list them, or release one.
+    Withheld {
+        #[command(subcommand)]
+        op: eventlog::WithheldOp,
+    },
     /// Promote an entry's trust tier. To curated at once, by anyone but its author; to
     /// verified by proposal only, a task a person who did not propose it approves.
     Promote {
@@ -948,14 +981,21 @@ enum Command {
         #[command(subcommand)]
         op: platform::PlatformOp,
     },
+    /// Positions: the standing roles of a domain, what is pinned to each, and which
+    /// wait for a session. A position is in force once a person verified its entry.
+    Position {
+        #[command(subcommand)]
+        op: positions::PositionOp,
+    },
     /// Gofannon's deployed agents: list them, or work the ledger's tasks with one, its
     /// result filed as each task's handoff. Through the `gofannon` tool's grant.
     Gofannon {
         #[command(subcommand)]
         op: gofannon::GofannonOp,
     },
-    /// The event log of a domain, the order of record of its entries, and the
-    /// materializer that builds the index from it.
+    /// The event log of a domain, the order of record of its entries; the feed of the
+    /// index from it, measured against the published bound; and the materializer that
+    /// builds the index from it.
     Log {
         #[command(subcommand)]
         op: eventlog::LogOp,
@@ -1025,8 +1065,8 @@ enum Command {
     /// Rebuild the index from the record and the ledger from its events.
     Reindex,
     /// Erase an entry: the body leaves every version and the index, a stub and a receipt
-    /// remain, and entries that cite it are flagged for review. Irreversible. It runs
-    /// only under an approval of the owner for this version of the entry, and the
+    /// remain, and entries downstream of it are withheld from retrieval. Irreversible. It
+    /// runs only under an approval of the owner for this version of the entry, and the
     /// owner's own call here is that approval.
     Erase {
         id: String,
@@ -1177,44 +1217,56 @@ enum CanaryOp {
     },
 }
 
+// What `task create` takes. Boxed in `TaskOp`: it is several times the size of any other
+// task command.
+#[derive(clap::Args)]
+struct NewTask {
+    title: String,
+    #[arg(long, default_value = "")]
+    body: String,
+    #[arg(long)]
+    domain: Option<String>,
+    #[arg(long = "require")]
+    requirements: Vec<String>,
+    #[arg(long = "after")]
+    depends_on: Vec<String>,
+    #[arg(long, default_value_t = 0)]
+    priority: i64,
+    /// The task definition this kind of work runs under, by name.
+    #[arg(long)]
+    definition: Option<String>,
+    /// A check that says this task is done; repeat for more. Without one, the task
+    /// takes those of its definition.
+    #[arg(long = "accept")]
+    acceptance: Vec<String>,
+    /// The task this one is split from.
+    #[arg(long)]
+    parent: Option<String>,
+    /// A decision this task carries out, as an entry id; repeat for more.
+    #[arg(long = "implements")]
+    implements: Vec<String>,
+    /// Whether what the task does can be undone: `reversible` or `irreversible`.
+    #[arg(long)]
+    reversibility: Option<dm_ledger::Reversibility>,
+    /// An owned path the task changes, as a glob; repeat for more.
+    #[arg(long = "touches")]
+    artifacts_touched: Vec<String>,
+    /// What triage scored it: `value,urgency,effort`, three whole numbers.
+    #[arg(long)]
+    scores: Option<String>,
+    /// Pin the task to this position, `pos-<name>`: only a session that fills the
+    /// position claims it. Give --pin-reason with it.
+    #[arg(long)]
+    position: Option<String>,
+    /// Why the task is pinned: continuity, relationship or separation.
+    #[arg(long)]
+    pin_reason: Option<dm_ledger::PinReason>,
+}
+
 #[derive(Subcommand)]
 enum TaskOp {
     /// File a task. It is born proposed.
-    Create {
-        title: String,
-        #[arg(long, default_value = "")]
-        body: String,
-        #[arg(long)]
-        domain: Option<String>,
-        #[arg(long = "require")]
-        requirements: Vec<String>,
-        #[arg(long = "after")]
-        depends_on: Vec<String>,
-        #[arg(long, default_value_t = 0)]
-        priority: i64,
-        /// The task definition this kind of work runs under, by name.
-        #[arg(long)]
-        definition: Option<String>,
-        /// A check that says this task is done; repeat for more. Without one, the task
-        /// takes those of its definition.
-        #[arg(long = "accept")]
-        acceptance: Vec<String>,
-        /// The task this one is split from.
-        #[arg(long)]
-        parent: Option<String>,
-        /// A decision this task carries out, as an entry id; repeat for more.
-        #[arg(long = "implements")]
-        implements: Vec<String>,
-        /// Whether what the task does can be undone: `reversible` or `irreversible`.
-        #[arg(long)]
-        reversibility: Option<dm_ledger::Reversibility>,
-        /// An owned path the task changes, as a glob; repeat for more.
-        #[arg(long = "touches")]
-        artifacts_touched: Vec<String>,
-        /// What triage scored it: `value,urgency,effort`, three whole numbers.
-        #[arg(long)]
-        scores: Option<String>,
-    },
+    Create(Box<NewTask>),
     /// Admit a proposed task.
     Admit { id: String },
     /// Tasks with a status.
@@ -1522,11 +1574,20 @@ fn refuse_invocation(cli: &Cli, root: &Path) -> Fallible {
 }
 
 /// `amem serve`: the root over MCP on standard input and output, as an author, holding
-/// the task `MEMORY_TASK` names if a launcher set it.
-async fn serve_stdio_cmd(root: &Path, author: Option<String>, manifest: Vec<String>) -> Fallible {
+/// the task `MEMORY_TASK` names if a launcher set it, and in the position `position`
+/// names if a launcher gave one. A position that refuses the session ends the command.
+async fn serve_stdio_cmd(
+    root: &Path,
+    author: Option<String>,
+    manifest: Vec<String>,
+    position: Option<String>,
+) -> Fallible {
     let mut m = Memory::open(root)?.with_manifest(manifest);
     if let Some(a) = author {
         m = m.with_author(a);
+    }
+    if let Some(name) = position.filter(|p| !p.is_empty()) {
+        positions::fill(&m, &name, None).await?;
     }
     // a harness working a task has it in MEMORY_TASK, as the launcher sets it;
     // what this session files or writes is judged against that task
@@ -1596,7 +1657,11 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         cmd @ (Command::Init { .. } | Command::Usage | Command::Cost { .. }) => {
             bookkeeping_cmd(&root, cmd).await
         }
-        Command::Serve { author, manifest } => serve_stdio_cmd(&root, author, manifest).await,
+        Command::Serve {
+            author,
+            manifest,
+            position,
+        } => serve_stdio_cmd(&root, author, manifest, position).await,
         cmd @ (Command::Launch { .. } | Command::Work { .. } | Command::Inside { .. }) => {
             launch_cmd(&root, cmd).await
         }
@@ -1635,8 +1700,13 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Transcript { op } => transcripts::cmd(&Memory::open(&root)?, op).await,
         Command::Reenact { op } => reenact::cmd(&root, op).await,
         Command::Log { op } => eventlog::cmd(&Memory::open(&root)?, op).await,
+        Command::Lineage { of, back, depth } => {
+            eventlog::lineage(&Memory::open(&root)?, &of, back, depth).await
+        }
+        Command::Withheld { op } => eventlog::withheld(&Memory::open(&root)?, op).await,
         Command::Gofannon { op } => gofannon::cmd(&root, op).await,
         Command::Platform { op } => platform::cmd(&Memory::open(&root)?, op).await,
+        Command::Position { op } => positions::cmd(&Memory::open(&root)?, op).await,
         Command::Tool { name, args } => sources::call(&root, &name, &args).await,
         Command::ToolServer { listen, token_env } => {
             tool_server::serve(&root, &listen, token_env.as_deref()).await
@@ -3033,6 +3103,8 @@ fn wslc_for_work(
         model,
         subagents,
         no_prefetch,
+        position,
+        wake,
         ..
     } = command
     else {
@@ -3040,6 +3112,9 @@ fn wslc_for_work(
     };
     if backend_of(*backend, *unconfined, root, (*harness).into()) != Backend::Wslc {
         return Ok(None);
+    }
+    if position.is_some() || *wake {
+        return Err(positions::NOT_ON_WSLC.into());
     }
     let mut inside_args = work_inside_args(
         run_options_args(model.as_deref(), *subagents),
@@ -3198,6 +3273,8 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         mine_via,
         no_prefetch,
         task,
+        position,
+        wake,
         ..
     } = command
     else {
@@ -3231,6 +3308,8 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         }),
         prefetch: !no_prefetch,
         task,
+        position,
+        wake,
     };
     let code = stops
         .around(work::run(&session, &options), session.abandon())
@@ -3298,6 +3377,8 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
             mine: None,
             prefetch: !no_prefetch,
             task: None,
+            position: None,
+            wake: false,
         };
         work::run(&session, &options).await?
     } else {
@@ -4700,7 +4781,7 @@ async fn approval_cmd(m: &Memory, command: Command) -> Fallible {
     }
 }
 
-/// `amem policy`, `amem quarantine`, `amem taint`, `amem canary`, `amem erase` and
+/// `amem policy`, `amem quarantine`, `amem canary`, `amem erase` and
 /// `amem reindex`: the perimeter's commands and the record's repair.
 async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
     match command {
@@ -4764,7 +4845,6 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         Command::Quarantine {
             op: QuarantineOp::Drop { id },
         } => json(&m.release_quarantined(&id, false).await?),
-        Command::Taint { id } => json(&m.taint(&id)),
         Command::Promote { id, to, why } => json(&m.promote(&id, to.parse()?, &why).await?),
         Command::Promotions { id } => json(&m.promotions(&id).await?),
         Command::Canary { op } => canary_cmd(m, op).await,
@@ -4950,8 +5030,7 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Promotions { .. }
         | Command::Reindex
         | Command::Policy { .. }
-        | Command::Quarantine { .. }
-        | Command::Taint { .. }) => perimeter_cmd(m, cmd).await,
+        | Command::Quarantine { .. }) => perimeter_cmd(m, cmd).await,
         Command::Init { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
@@ -4978,8 +5057,11 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Transcript { .. }
         | Command::Reenact { .. }
         | Command::Log { .. }
+        | Command::Lineage { .. }
+        | Command::Withheld { .. }
         | Command::Gofannon { .. }
         | Command::Platform { .. }
+        | Command::Position { .. }
         | Command::Tool { .. }
         | Command::ToolServer { .. }
         | Command::Source { .. }
@@ -5081,21 +5163,24 @@ async fn fabric_cmd(m: &Memory, op: TaskOp) -> Fallible {
 
 async fn task(m: &Memory, op: TaskOp) -> Fallible {
     match op {
-        TaskOp::Create {
-            title,
-            body,
-            domain,
-            requirements,
-            depends_on,
-            priority,
-            definition,
-            acceptance,
-            parent,
-            implements,
-            reversibility,
-            artifacts_touched,
-            scores,
-        } => {
+        TaskOp::Create(new) => {
+            let NewTask {
+                title,
+                body,
+                domain,
+                requirements,
+                depends_on,
+                priority,
+                definition,
+                acceptance,
+                parent,
+                implements,
+                reversibility,
+                artifacts_touched,
+                scores,
+                position,
+                pin_reason,
+            } = *new;
             let scores = scores.as_deref().map(scores_of).transpose()?;
             let c = m
                 .create_task(TaskSpec {
@@ -5116,6 +5201,8 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
                     implements,
                     reversibility,
                     artifacts_touched,
+                    position,
+                    pin_reason,
                     ..TaskSpec::default()
                 })
                 .await?;

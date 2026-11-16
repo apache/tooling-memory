@@ -16,7 +16,7 @@
 //! write that lands below the label of the session that makes it.
 
 use crate::rules::words_on_one_line;
-use crate::{lock, reads, Error, Memory, Promotion, PROPOSAL_ORIGIN};
+use crate::{reads, Error, Memory, Promotion, PROPOSAL_ORIGIN};
 use dm_core::{Entry, EntryType, Frontmatter, Label, TrustTier};
 use dm_ledger::{ApprovalRecord, ApprovalSpec, Redaction, Task, TaskSpec};
 use dm_policy::decide::{Action, ApprovalEvent, ApprovalInput, Class, Filing, Input, Review};
@@ -279,6 +279,9 @@ fn no_copy_of(id: &str, status: dm_core::Status) -> Error {
         }
         Status::Demoted => {
             format!("{id} was demoted by curation and gets no copy at a lower label")
+        }
+        Status::Withheld => {
+            format!("{id} is withheld after an erasure and gets no copy at a lower label")
         }
     })
 }
@@ -557,7 +560,8 @@ impl Memory {
     /// copy that was erased does not land again, and its request is refused before the
     /// guard is asked.
     ///
-    /// To ask is to read the entry: the session's label rises to the entry's label. The
+    /// To ask is to read the entry: the session's label rises to the entry's label, and
+    /// the log of the domain takes a read event. The
     /// copy is the one write that lands below the label of its session. The body is text
     /// that the record holds already, so the scan does not run again.
     ///
@@ -600,7 +604,8 @@ impl Memory {
                 "{id} is {from}, and {to} is not lower; a declassification copies an entry to a lower label"
             )));
         }
-        if !lock(&self.session).observe(from) {
+        // to ask is to read the entry: the log of its domain takes the read
+        if !self.observe_entry(&domain, id, from)? {
             return Err(Error::NotFound(id.to_string()));
         }
         let action = Gated::Declassify { to };
@@ -678,6 +683,9 @@ impl Memory {
                 author: from.author.clone(),
                 created: from.created,
                 cites: vec![at.cites.clone()],
+                // only a write gives an entry its session: the text of a copy follows
+                // from its origin alone, whichever session lands it
+                session: None,
                 confidence: from.confidence,
                 trust_tier: TrustTier::Raw,
                 review_by: from.review_by,
@@ -691,10 +699,10 @@ impl Memory {
             },
             body: source.body.clone(),
         };
-        if !self.create_logged(&copy).await? {
+        let Some(put) = self.create_logged(&copy).await? else {
             return Ok(());
-        }
-        self.index_put(&copy).await?;
+        };
+        self.feed_from(&copy.front.domain, put).await?;
         // the log of writes names who made the write: this session, not the author
         reads::wrote(
             &self.root,
@@ -1224,6 +1232,44 @@ mod tests {
         assert_eq!(m.get_task(&task.id).await.unwrap().status, Status::Done);
         let receipt = agent.erase(&id, Reason::Mistaken).await.unwrap();
         assert_eq!(receipt.erased_by, AGENT);
+    }
+
+    /// An approval is in the event log of its domain: the copy of the ledger's events
+    /// brings it, as the person who approved, at the highest label, and once.
+    #[tokio::test]
+    async fn the_log_of_the_domain_takes_an_approval_under_its_approver() {
+        use crate::log::{read, Change};
+        let dir = tempfile::tempdir().unwrap();
+        let (m, agent) = (owner(dir.path()), session(dir.path(), AGENT));
+        let id = entry(&m, "The door code is 4417.").await;
+        let task = asked(&agent, &id, "an approval").await;
+        let approval = approved(&m, &task, None).await;
+        assert_eq!(approval.spec.scope, AGENT, "given to the requester");
+        m.ledger_into_log(DOMAIN).await.unwrap();
+        let in_log = || -> Vec<(String, Option<String>, String, Option<Label>)> {
+            read(dir.path(), DOMAIN, 0)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e.change {
+                    Change::Ledger {
+                        task,
+                        op,
+                        principal,
+                        ..
+                    } if op == "approved" => Some((task, principal, e.by, e.label)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let expected = vec![(
+            format!("approval:{id}"),
+            Some(OWNER.to_string()),
+            OWNER.to_string(),
+            Some(Label::Restricted),
+        )];
+        assert_eq!(in_log(), expected);
+        assert_eq!(m.ledger_into_log(DOMAIN).await.unwrap(), 0);
+        assert_eq!(in_log(), expected, "the copy run again adds nothing");
     }
 
     /// A session that may not read the entry gets the answer a missing entry gets,
@@ -1836,7 +1882,7 @@ mod tests {
         assert!(task.spec.body.contains(said), "{:?}", task.spec);
         let receipt = m.erase(&id, Reason::Mistaken).await.unwrap();
         assert!(receipt.is_finished(), "{receipt:?}");
-        assert_eq!(receipt.flagged, [copy], "the copy is for review");
+        assert_eq!(receipt.withheld, [copy], "the copy is withheld");
         assert_eq!(closed_with_the_id_alone(&m, &id).await, 1);
         // the events hold nothing of it either: a replay brings nothing back
         m.ledger.lock().await.rebuild().await.unwrap();
