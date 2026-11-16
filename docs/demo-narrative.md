@@ -54,8 +54,9 @@ offline.
   5.3, it takes the role of a different model, swapped in behind the name qwen3.8-27b.
   In act 8, it is the other model that a session is re-enacted on.
 - **Scripted agents**: `agent:rogue`, `agent:release`, `agent:reader`, `agent:a`,
-  `agent:curator` and `agent:architect`. These are the demo script. The script uses
-  the same tools that an agent would use. No model is behind them. Say so.
+  `agent:curator`, `agent:architect`, `agent:worker` and `agent:substitute`. These are
+  the demo script. The script uses the same tools that an agent would use. No model is
+  behind them. Say so. In 4.5, the script also speaks as `agent:codex`, with no model.
 - **GitHub**, in act 9: its public API. A tap with no credential reads it.
 - **The system**: the memory server, the ledger, the policy and the egress (below), and
   the launcher, which runs and measures each harness.
@@ -66,6 +67,9 @@ offline.
 - **T0**: the short summary that every session loads first.
 - **Handoff**: the entry that a session leaves for the next session.
 - **Ledger**: the shared tasks. "The board" means its open tasks.
+- **Position**: a standing role, written as an entry with a charter and an authority
+  envelope. A task can be pinned to a position. A session fills a position, and starts
+  from the position's handoff cache (4.5).
 - **Trust tiers**: raw (anyone wrote it), curated (an agent tidied it under a curation
   task), verified (a person approved it).
 - **Quarantine**: the place where the policy holds a write, out of search, until you
@@ -243,8 +247,9 @@ finds no hit. Your own search reaches the cap of 50 results.
 
 ## Act 4 · The task fabric
 
-On stage: you filing tasks, the ledger ranking them, Claude Code delegating and later
-taking the results, and Codex doing each delegated task.
+On stage: you filing tasks and verifying a position, the ledger ranking the tasks and
+matching the pinned one, scripted sessions in the position, Claude Code delegating and
+later taking the results, and Codex doing each delegated task.
 
 The work is on the ledger. The ledger continues after any one session ends.
 
@@ -271,12 +276,35 @@ ledger still gives the task to nobody, because nobody knows if the push arrived.
 looks at the destination and settles the action as not applied. Only then does the next
 claim get the task.
 
-**4.5 The rescore.** Each move shows its reason. A task with a higher priority runs
+**4.5 A position.** A position is a standing role, written as an entry. You write the
+entry for the release coordinator: a charter and an authority envelope. `agent:curator`
+proposes it for verified, and you approve it. The charter names Codex as the agent
+definition that fills the position. Then you file a task and pin it to the position, for
+continuity. A session that fills no position asks for the task by name. The ledger
+refuses it, and the refusal names the position. The list shows one task that waits and
+no live session. Then a session that fills the position asks for the next task, and it
+gets the pinned task. It writes a handoff and releases the task. The memory
+server put the position in the citations of that handoff. A new session in the position
+loads T0. The first section of its T0 is the position: the charter, the open commitment
+and the handoff cache. No model is in this step. The sessions of `agent:codex` are the
+demo script.
+
+**4.6 Secondment, waking and retirement.** `agent:substitute` fills the same position.
+The charter names a different agent definition, so this session is seconded. It reads
+the commitment and the handoff cache. The memory server refuses its write that cites the
+position. The list shows `wake true`: a task waits, and no session is live in the
+position. With a gateway key, the demo runs `amem work --wake`. Its session fills the
+position, because Codex is the agent definition that the charter names. Codex on
+qwen3.8-27b then works on the task. Without a gateway key, the demo says that it
+skipped this part. Last, you retire the position. The pinned task loses its pin, and any
+session that matches can claim it. The entries of the position stay in the record.
+
+**4.7 The rescore.** Each move shows its reason. A task with a higher priority runs
 first. One curation task moved from 0 to 10. The reason: curation had done 17% of the
 completed work, less than its guaranteed 20%. The curation tasks filed at -1 went down
 to -2, because this period's strategy gives curation a lower weight.
 
-**4.6 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
+**4.8 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
 Claude Code calls its Agent tool twice, once for each subagent. The system stops each
 call before it runs. It files the subagent's prompt on the ledger as a task. With that
 task, it files a follow-up task that continues the comparison after the subagent's task
@@ -287,14 +315,14 @@ back on the board. The system files what Claude Code wrote as a handoff. The tas
 there. Nobody may claim it while its follow-up task is open. Thus nobody does the work
 twice.
 
-**4.7 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
+**4.9 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
 
-**4.8 Results come back.** A new Claude Code session claims the follow-up task, works on
+**4.10 Results come back.** A new Claude Code session claims the follow-up task, works on
 it with both reports, and completes it. When the follow-up task completes, the original
 task "Compare two decisions" also closes, with the same handoff. The reason: the
 follow-up task was the rest of its work. The last line shows it done.
 
-**4.9 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
+**4.11 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
 you. "promote" means the approvals to verified.
 
 ## Act 5 · Watching it

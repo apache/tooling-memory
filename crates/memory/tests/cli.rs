@@ -775,3 +775,302 @@ fn no_root_is_a_clear_error() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("give --root"));
 }
+
+/// The body of an entry that defines the position `pos-release`, which `codex` fills.
+const RELEASE: &str = "# The release coordinator\n\n```position pos-release\n[charter]\norders = \"Each release is cut from main, after the mirrors are checked.\"\ncovers = []\nagent = \"codex\"\n\n[envelope]\ntools = []\nhandling = \"restricted\"\n```\n";
+
+/// What one session of `amem serve` did.
+struct Served {
+    /// For each call, whether it was allowed, and the result or the refusal as text.
+    calls: Vec<(bool, String)>,
+    /// What the process wrote on standard error.
+    stderr: String,
+}
+
+impl Served {
+    /// The result of call `n`, which was allowed, as JSON.
+    fn result(&self, n: usize) -> serde_json::Value {
+        let (allowed, text) = &self.calls[n];
+        assert!(allowed, "call {n} was refused: {text}\n{}", self.stderr);
+        json(text)
+    }
+}
+
+/// Tool calls in one session of `amem serve` as `author`, as a harness makes them over
+/// stdio. `flags` follow `serve`, and `env` goes into the environment of the process.
+fn serve(
+    root: &Path,
+    author: &str,
+    flags: &[&str],
+    env: &[(&str, &str)],
+    calls: &[(&str, serde_json::Value)],
+) -> Served {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amem"))
+        .arg("--root")
+        .arg(root)
+        .args(["serve", "--author", author])
+        .args(flags)
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn amem serve");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |m: serde_json::Value| writeln!(stdin, "{m}").expect("write to amem serve");
+    let mut line = String::new();
+    send(
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "0"}}}),
+    );
+    stdout.read_line(&mut line).expect("the handshake");
+    send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let mut done = Vec::new();
+    for (n, (tool, arguments)) in calls.iter().enumerate() {
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "id": n + 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}}),
+        );
+        line.clear();
+        stdout.read_line(&mut line).expect("an answer");
+        let r = json(&line);
+        if let Some(e) = r.get("error") {
+            done.push((false, e["message"].as_str().unwrap_or_default().to_string()));
+            continue;
+        }
+        let text: Vec<&str> = r["result"]["content"]
+            .as_array()
+            .map(|c| c.iter().filter_map(|c| c["text"].as_str()).collect())
+            .unwrap_or_default();
+        done.push((r["result"]["isError"] != true, text.join(" ")));
+    }
+    drop(send);
+    drop(stdin);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut stderr)
+        .expect("read stderr");
+    child.wait().expect("wait for amem serve");
+    Served {
+        calls: done,
+        stderr,
+    }
+}
+
+/// Write the position `pos-release` as the owner, through `amem write`. Returns its entry.
+fn write_position(root: &Path) -> String {
+    id_of(&ok(
+        root,
+        &[
+            "write",
+            "--kind",
+            "position",
+            "--title",
+            "The release coordinator",
+        ],
+        Some(RELEASE),
+    ))
+}
+
+/// Verify an entry through the commands: an agent proposes it over `amem serve`, and
+/// the owner approves the proposal.
+fn verify(root: &Path, entry: &str) {
+    let proposed = serve(
+        root,
+        "agent:curator",
+        &[],
+        &[],
+        &[(
+            "promote",
+            serde_json::json!({"id": entry, "to": "verified", "why": "read against the charter"}),
+        )],
+    );
+    let task = proposed.result(0)["task"]["id"]
+        .as_str()
+        .expect("a proposal task")
+        .to_string();
+    ok(root, &["approve", &task], None);
+}
+
+/// File a task pinned to `pos-release` for continuity, and admit it.
+fn pinned_task(root: &Path, title: &str) -> String {
+    let filed = json(&ok(
+        root,
+        &[
+            "task",
+            "create",
+            title,
+            "--body",
+            "Tell the list.",
+            "--position",
+            "pos-release",
+            "--pin-reason",
+            "continuity",
+        ],
+        None,
+    ));
+    assert_eq!(filed["position"], "pos-release", "{filed}");
+    assert_eq!(filed["pin_reason"], "continuity", "{filed}");
+    let id = filed["id"].as_str().expect("id").to_string();
+    ok(root, &["task", "admit", &id], None);
+    id
+}
+
+fn positions(root: &Path) -> serde_json::Value {
+    json(&ok(root, &["position", "list"], None))
+}
+
+/// A position's entry is listed by its kind, and no position is in force before a
+/// person verifies the entry. Returns the entry in force after that.
+fn step_position_review_gate(root: &Path) -> String {
+    let entry = write_position(root);
+    let kinds = json(&ok(root, &["list", "--kind", "position"], None));
+    assert_eq!(kinds[0]["id"], entry, "{kinds}");
+    assert_eq!(kinds[0]["type"], "position", "{kinds}");
+    let before = positions(root);
+    assert_eq!(before[0]["entry"], entry, "{before}");
+    assert_eq!(before[0]["state"], "none", "{before}");
+    let why = before[0]["why_not"].as_str().unwrap_or_default();
+    assert!(why.contains("once a person verifies it"), "{before}");
+    verify(root, &entry);
+    let after = positions(root);
+    assert_eq!(after.as_array().map(Vec::len), Some(1), "{after}");
+    assert_eq!(after[0]["name"], "pos-release", "{after}");
+    assert_eq!(after[0]["state"], "active", "{after}");
+    after[0]["entry"].as_str().unwrap().to_string()
+}
+
+/// Half a pin, and a reason that is not one of the three words, file nothing.
+fn step_position_bad_pins(root: &Path) {
+    let create = ["task", "create", "Announce release 1.4"];
+    let half = fails(
+        root,
+        &[&create[..], &["--position", "pos-release"][..]].concat(),
+    );
+    assert!(
+        half.contains("a pin names a position and gives a reason"),
+        "{half}"
+    );
+    let pin = ["--position", "pos-release", "--pin-reason", "habit"];
+    let word = fails(root, &[&create[..], &pin[..]].concat());
+    assert!(
+        word.contains("continuity, relationship, separation"),
+        "{word}"
+    );
+    let none = json(&ok(root, &["task", "list", "--status", "proposed"], None));
+    assert_eq!(none, serde_json::json!([]), "a refused task is not filed");
+}
+
+/// A pinned task waits for a session in the position, and the listing and the view say
+/// so. Returns the task.
+fn step_position_pinned_task(root: &Path, entry: &str) -> String {
+    let id = pinned_task(root, "Announce release 1.4");
+    // the owner fills no position, and the ledger gives it no pinned task
+    let next = ok(root, &["task", "claim-next"], None);
+    assert_eq!(next.trim(), "null");
+    let waits = positions(root);
+    assert_eq!(waits[0]["pinned"], 1, "{waits}");
+    assert_eq!(waits[0]["waiting"], serde_json::json!([id]), "{waits}");
+    assert_eq!(waits[0]["sessions"], serde_json::json!([]), "{waits}");
+    assert_eq!(waits[0]["wake"], true, "{waits}");
+    assert_eq!(waits[0]["agent"], "codex", "{waits}");
+    let shown = json(&ok(root, &["position", "show", "pos-release"], None));
+    assert_eq!(shown["entry"], entry, "{shown}");
+    assert_eq!(shown["charter"]["agent"], "codex", "{shown}");
+    assert_eq!(shown["commitments"][0]["id"], id, "{shown}");
+    assert_eq!(shown["commitments"][0]["pin_reason"], "continuity");
+    id
+}
+
+/// The owner retires the position: the task loses its pin and stays open.
+fn step_position_retire(root: &Path, entry: &str, id: &str) {
+    let retire = ["position", "retire", "pos-release", "--why"];
+    let retired = json(&ok(
+        root,
+        &[&retire[..], &["the release train ended"][..]].concat(),
+        None,
+    ));
+    assert_eq!(retired["position"], "pos-release", "{retired}");
+    assert_eq!(retired["entry"], entry, "{retired}");
+    assert_eq!(retired["unpinned"], serde_json::json!([id]), "{retired}");
+    let task = json(&ok(root, &["task", "get", id], None));
+    assert_eq!(task["status"], "open", "{task}");
+    assert!(task.get("position").is_none(), "{task}");
+    let gone = positions(root);
+    assert_eq!(gone[0]["state"], "retired", "{gone}");
+    assert_eq!(gone[0]["entry"], retired["retired_by"], "{gone}");
+    assert_eq!(gone[0]["pinned"], 0, "{gone}");
+    assert!(fails(root, &["position", "show", "pos-none"]).contains("pos-none"));
+}
+
+#[test]
+fn a_position_is_written_verified_pinned_to_and_retired_through_the_commands() {
+    let d = step_init();
+    let entry = step_position_review_gate(&d.root);
+    step_position_bad_pins(&d.root);
+    let id = step_position_pinned_task(&d.root, &entry);
+    step_position_retire(&d.root, &entry, &id);
+}
+
+#[test]
+fn serve_fills_the_position_a_launcher_names_before_it_serves() {
+    let d = step_init();
+    let entry = write_position(&d.root);
+    verify(&d.root, &entry);
+    let id = pinned_task(&d.root, "Announce release 1.4");
+    let show = || ("position", serde_json::json!({"name": "pos-release"}));
+    let claim = || ("claim_next", serde_json::json!({"lease_seconds": 600}));
+
+    // a session that no launcher put in the position reads it, and gets no pinned task
+    let outside = serve(&d.root, "agent:codex", &[], &[], &[show(), claim()]);
+    assert!(
+        outside.result(0).get("seat").is_none(),
+        "{:?}",
+        outside.calls
+    );
+    assert!(outside.result(1)["task"].is_null(), "{:?}", outside.calls);
+
+    // the flag: the session fills the position under the charter's agent definition
+    let author = "agent:codex (model: test-1)";
+    let flag = ["--position", "pos-release"];
+    let filled = serve(&d.root, author, &flag, &[], &[show(), claim()]);
+    assert_eq!(
+        filled.result(0)["seat"]["seconded"],
+        false,
+        "{:?}",
+        filled.calls
+    );
+    assert_eq!(filled.result(1)["task"]["id"], id, "{:?}", filled.calls);
+    assert!(
+        filled.stderr.contains("amem: fills pos-release (mem-"),
+        "{}",
+        filled.stderr
+    );
+
+    // the variable a launcher sets: a session under another agent definition is seconded
+    let env = [("MEMORY_POSITION", "pos-release")];
+    let second = serve(&d.root, "agent:substitute", &[], &env, &[show()]);
+    let view = second.result(0);
+    assert_eq!(view["seat"]["seconded"], true, "{view}");
+    assert_eq!(view["sessions"], serde_json::json!([author]), "{view}");
+    assert!(
+        second
+            .stderr
+            .contains("amem: seconded to pos-release: its charter names codex"),
+        "{}",
+        second.stderr
+    );
+
+    // a position that is not in force ends the command before it serves
+    let refused = fails(&d.root, &["serve", "--position", "pos-none"]);
+    assert!(
+        refused.contains("no position pos-none is in force"),
+        "{refused}"
+    );
+}

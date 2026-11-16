@@ -221,6 +221,7 @@ impl Memory {
         // a stored source is released under the same check as a search
         self.fresh()?;
         self.definition_allows(tool).await?;
+        self.seat_allows(tool)?;
         let (grant, label) = self.tool_grant(tool)?;
         let id = source_id(tool, &args);
         let now = OffsetDateTime::now_utc();
