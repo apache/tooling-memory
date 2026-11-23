@@ -13,7 +13,7 @@ use dm_ledger::{Task, TaskSpec};
 use dm_policy::decide::Class;
 use dm_policy::record::{self, Finding, Meta, Status};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use time::OffsetDateTime;
 
 /// The origin of a task that proposes an amendment to a rule, before the rule's id.
@@ -632,5 +632,500 @@ impl Memory {
             }
         }
         Ok(filed)
+    }
+}
+
+/// The origin of a task that asks a curator to propose one rule for two that overlap.
+pub const MERGE_RULES_ORIGIN: &str = "curator:merge-rules";
+
+/// The origin of a task that asks a curator to propose a task definition.
+pub const TASK_DEFINITION_ORIGIN: &str = "curator:task-definition";
+
+/// How many done tasks with one normalised title and no definition are repeated work.
+pub const REPEATED_MIN: usize = 3;
+
+/// Two rules in force in one layer whose rule sentences say nearly the same.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Overlap {
+    /// The policy id of one rule. It sorts before `b`.
+    pub a: String,
+    /// The policy id of the other rule.
+    pub b: String,
+    /// The layer of the two rules.
+    pub layer: u8,
+    /// Why the two overlap: how many words the sentences share.
+    pub why: String,
+}
+
+/// Work that was done three times or more with no task definition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Repeated {
+    /// The title of the tasks, in lowercase with the digits removed.
+    pub title: String,
+    /// The done tasks with that title, sorted.
+    pub tasks: Vec<String>,
+}
+
+/// What the curator finds in the policy and in the done work.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PolicyCuration {
+    /// The pairs of rules that overlap.
+    pub overlaps: Vec<Overlap>,
+    /// The repeated work with no task definition.
+    pub repeated: Vec<Repeated>,
+}
+
+/// The words of a rule sentence: lowercase, letters and digits only.
+fn words(sentence: &str) -> BTreeSet<String> {
+    sentence
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The words that two rule sentences share and the words of the two together, when the
+/// share is four fifths or more: the Jaccard overlap is 0.8 or more.
+fn shared_words(a: &str, b: &str) -> Option<(usize, usize)> {
+    let (a, b) = (words(a), words(b));
+    let shared = a.intersection(&b).count();
+    let all = a.union(&b).count();
+    (all > 0 && shared * 5 >= all * 4).then_some((shared, all))
+}
+
+/// The pairs of `rules` that overlap. Each rule is in force. Two rules in different
+/// layers do not overlap.
+fn overlaps_among(rules: &[&Meta]) -> Vec<Overlap> {
+    let mut out = Vec::new();
+    for (i, a) in rules.iter().enumerate() {
+        for b in &rules[i + 1..] {
+            if a.layer != b.layer || a.id == b.id {
+                continue;
+            }
+            let Some((shared, all)) = shared_words(&a.rule, &b.rule) else {
+                continue;
+            };
+            let (first, second) = if a.id < b.id { (a, b) } else { (b, a) };
+            out.push(Overlap {
+                a: first.id.clone(),
+                b: second.id.clone(),
+                layer: a.layer,
+                why: format!("the rule sentences share {shared} of {all} words"),
+            });
+        }
+    }
+    out.sort_by(|x, y| (&x.a, &x.b).cmp(&(&y.a, &y.b)));
+    out
+}
+
+/// A title in lowercase with its digits removed and its spaces made single.
+fn normalised(title: &str) -> String {
+    let kept: String = title
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_ascii_digit())
+        .collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The repeated work among `done`: [`REPEATED_MIN`] tasks or more with one normalised
+/// title. A task that names a definition is not counted. A task that the system or a
+/// tap filed is not counted: its origin is absent or starts with `task:`.
+fn repeated_among(done: &[Task]) -> Vec<Repeated> {
+    let mut by_title: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for t in done {
+        let own_work = t
+            .spec
+            .origin
+            .as_deref()
+            .is_none_or(|o| o.starts_with("task:"));
+        let title = normalised(&t.spec.title);
+        if t.spec.definition.is_some() || !own_work || title.is_empty() {
+            continue;
+        }
+        by_title.entry(title).or_default().push(t.id.clone());
+    }
+    by_title
+        .into_iter()
+        .filter(|(_, tasks)| tasks.len() >= REPEATED_MIN)
+        .map(|(title, mut tasks)| {
+            tasks.sort();
+            Repeated { title, tasks }
+        })
+        .collect()
+}
+
+fn merge_rules_task(domain: &str, o: &Overlap) -> TaskSpec {
+    TaskSpec {
+        domain: domain.to_string(),
+        title: format!("Curator: propose one rule for {} and {}", o.a, o.b),
+        body: format!(
+            "{a} and {b} are in force in layer {layer}, and {why}.\n\nWrite one policy entry \
+             with status `proposed` that states the two rules as one rule and cites {a} and \
+             {b}. Then call `propose_amendment` on {a} and on {b}, with the new entry as the \
+             evidence, so that the owner of each rule decides. Change no rule that is in \
+             force.\n",
+            a = o.a,
+            b = o.b,
+            layer = o.layer,
+            why = o.why
+        ),
+        origin: Some(MERGE_RULES_ORIGIN.to_string()),
+        upstream_event: Some(format!("{}+{}", o.a, o.b)),
+        classification: dm_core::Label::Internal,
+        priority: 0,
+        ..TaskSpec::default()
+    }
+}
+
+fn task_definition_task(domain: &str, r: &Repeated) -> TaskSpec {
+    TaskSpec {
+        domain: domain.to_string(),
+        title: format!("Curator: propose a task definition for \"{}\"", r.title),
+        body: format!(
+            "{n} done tasks have the title \"{title}\" and name no task definition: \
+             {tasks}.\n\nPropose a task definition in the platform domain for this kind of \
+             work. The definition is in force only after a person verifies it.\n",
+            n = r.tasks.len(),
+            title = r.title,
+            tasks = r.tasks.join(", ")
+        ),
+        origin: Some(TASK_DEFINITION_ORIGIN.to_string()),
+        upstream_event: Some(r.title.clone()),
+        classification: dm_core::Label::Internal,
+        priority: 0,
+        ..TaskSpec::default()
+    }
+}
+
+impl Memory {
+    /// What the curator finds for one domain: the rules that overlap, and the repeated
+    /// work with no task definition.
+    ///
+    /// Two rules overlap when both are in force (advisory or enforced), both are in one
+    /// layer, and the words of their rule sentences have a Jaccard overlap of 0.8 or
+    /// more. An exception, a proposed rule and a retired rule overlap nothing. A rule
+    /// above the handling of this session is not compared. One of the two rules is a
+    /// rule of the domain.
+    ///
+    /// Work is repeated when [`REPEATED_MIN`] done tasks of the domain or more have one
+    /// title, after the title is put in lowercase and its digits are removed, and none
+    /// names a definition. The done tasks that this session sees are read.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or a ledger error.
+    pub async fn policy_curation(&self, domain: Option<&str>) -> Result<PolicyCuration, Error> {
+        let domain = self.resolve_domain(domain)?;
+        let handling = self.handling()?;
+        let p = self.policy();
+        let mut in_force: BTreeMap<&str, &record::Entry> = BTreeMap::new();
+        for e in p.entries() {
+            let state = p.state_of(e);
+            if !e.meta.is_exception()
+                && matches!(state, Status::Advisory | Status::Enforced)
+                && e.classification <= handling
+            {
+                in_force.entry(e.meta.id.as_str()).or_insert(e);
+            }
+        }
+        let rules: Vec<&Meta> = in_force.values().map(|e| &e.meta).collect();
+        let of_domain = |id: &str| in_force.get(id).is_some_and(|e| e.domain == domain);
+        let mut overlaps = overlaps_among(&rules);
+        overlaps.retain(|o| of_domain(&o.a) || of_domain(&o.b));
+        let done = self.tasks(Some(&domain), dm_ledger::Status::Done).await?;
+        Ok(PolicyCuration {
+            overlaps,
+            repeated: repeated_among(&done),
+        })
+    }
+
+    /// File one task for a curator for each finding of [`Memory::policy_curation`], in
+    /// one domain. A finding is filed once: a second run files nothing. Returns the ids
+    /// of the tasks filed now, and the number of findings that had a task already.
+    ///
+    /// An overlap gets a task with the origin [`MERGE_RULES_ORIGIN`]: the curator
+    /// proposes one rule and the owners decide. Repeated work gets a task with the
+    /// origin [`TASK_DEFINITION_ORIGIN`]: the curator proposes a task definition. The
+    /// curator changes no rule in force.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or as [`Memory::file_own`].
+    pub async fn file_policy_curation(
+        &self,
+        domain: Option<&str>,
+        found: &PolicyCuration,
+    ) -> Result<(Vec<String>, usize), Error> {
+        let domain = self.resolve_domain(domain)?;
+        let merges = found.overlaps.iter().map(|o| merge_rules_task(&domain, o));
+        let definitions = found
+            .repeated
+            .iter()
+            .map(|r| task_definition_task(&domain, r));
+        let mut filed = Vec::new();
+        let mut already = 0;
+        for spec in merges.chain(definitions).collect::<Vec<_>>() {
+            let created = self.file_own(spec).await?;
+            if created.deduplicated {
+                already += 1;
+            } else {
+                filed.push(created.task.id);
+            }
+        }
+        Ok((filed, already))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Promotion;
+    use dm_core::Label;
+    use std::path::Path;
+
+    const OWNER: &str = "human:test:me";
+    const SENTENCE: &str = "Decisions are superseded by a person, not an agent.";
+
+    fn meta(id: &str, layer: u8, rule: &str) -> Meta {
+        Meta {
+            id: id.into(),
+            layer,
+            rule: rule.into(),
+            ..Meta::default()
+        }
+    }
+
+    #[test]
+    fn two_sentences_overlap_at_four_fifths_of_their_words() {
+        assert_eq!(
+            shared_words("One two, three FOUR.", "one two three four five"),
+            Some((4, 5))
+        );
+        assert_eq!(shared_words("one two three", "one two three four"), None);
+        assert_eq!(shared_words("a b c d", "D c-b a!"), Some((4, 4)));
+        assert_eq!(shared_words("", ""), None, "no words, no overlap");
+    }
+
+    #[test]
+    fn rules_overlap_only_in_one_layer() {
+        let near = "Decisions are superseded by a person, not an agent, always.";
+        let rules = [
+            meta("pol-L2-002", 2, near),
+            meta("pol-L2-001", 2, SENTENCE),
+            meta("pol-L3-003", 3, SENTENCE),
+            meta("pol-L2-004", 2, "A handoff names the next step."),
+        ];
+        let got = overlaps_among(&rules.iter().collect::<Vec<_>>());
+        let want = Overlap {
+            a: "pol-L2-001".into(),
+            b: "pol-L2-002".into(),
+            layer: 2,
+            why: "the rule sentences share 9 of 10 words".into(),
+        };
+        assert_eq!(got, [want]);
+    }
+
+    fn done(id: &str, title: &str, origin: Option<&str>, definition: Option<&str>) -> Task {
+        Task {
+            id: id.into(),
+            spec: TaskSpec {
+                domain: "dom-me".into(),
+                title: title.into(),
+                origin: origin.map(str::to_string),
+                definition: definition.map(str::to_string),
+                ..TaskSpec::default()
+            },
+            created: OffsetDateTime::UNIX_EPOCH,
+            status: dm_ledger::Status::Done,
+            holder: None,
+            lease_until: None,
+            generation: 1,
+            handoff: None,
+            reason: None,
+            superseded_by: None,
+            posted_to: None,
+        }
+    }
+
+    #[test]
+    fn work_is_repeated_at_three_done_tasks_with_one_title_and_no_definition() {
+        let def = Some("release@1");
+        let tasks = [
+            done("t3", "Release 1.4.12", None, None),
+            done("t1", "release  1.5.0", None, None),
+            done("t2", "RELEASE 2.0.0", Some("task:t0"), None),
+            // two are not enough
+            done("t4", "Rotate key 1", None, None),
+            done("t5", "Rotate key 2", None, None),
+            // a task that names a definition is not counted
+            done("t6", "Ship build 1", None, None),
+            done("t7", "Ship build 2", None, None),
+            done("t8", "Ship build 3", None, def),
+            // a task that the system filed is not counted
+            done("t9", "Verify 1", None, None),
+            done("t10", "Verify 2", None, None),
+            done("t11", "Verify 3", Some("curator:verify"), None),
+        ];
+        let want = Repeated {
+            title: "release ..".into(),
+            tasks: vec!["t1".into(), "t2".into(), "t3".into()],
+        };
+        assert_eq!(repeated_among(&tasks), [want]);
+    }
+
+    /// A rule with no module, written by the owner and verified.
+    async fn rule(root: &Path, id: &str, layer: u8, sentence: &str, extra: &str) -> String {
+        let owner = Memory::open(root).unwrap().with_author(OWNER);
+        let body = format!(
+            "# A rule\n\n```policy\nid = \"{id}\"\nlayer = {layer}\nrule = \"{sentence}\"\n\
+             intent = \"An agent rewrote a standing decision.\"\nowner = \"human:test:lead\"\n\
+             {extra}```\n"
+        );
+        let entry = owner
+            .write(WriteRequest {
+                entry_type: EntryType::Policy,
+                body,
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        let agent = Memory::open(root).unwrap().with_author("agent:a");
+        let promoted = agent.promote(&entry, TrustTier::Verified, "reviewed");
+        let Promotion::Proposed { task } = promoted.await.unwrap() else {
+            panic!("proposed")
+        };
+        owner.approve(&task.id).await.unwrap();
+        entry
+    }
+
+    async fn tasks_of(m: &Memory, origin: &str) -> Vec<Task> {
+        let l = m.ledger.lock().await;
+        l.with_origin("dom-me", origin).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_rules_in_force_overlap_and_an_overlap_is_filed_once_for_a_curator() {
+        let dir = tempfile::tempdir().unwrap();
+        Memory::init(dir.path(), OWNER, "dom-me").unwrap();
+        let root = dir.path();
+        let near = "Decisions are superseded by a person, not an agent, always.";
+        rule(root, "pol-L2-101", 2, SENTENCE, "status = \"enforced\"\n").await;
+        rule(root, "pol-L2-102", 2, near, "status = \"advisory\"\n").await;
+        rule(root, "pol-L3-103", 3, SENTENCE, "status = \"enforced\"\n").await;
+        rule(root, "pol-L2-104", 2, SENTENCE, "status = \"retired\"\n").await;
+        rule(root, "pol-L2-105", 2, SENTENCE, "status = \"proposed\"\n").await;
+        let exception = "breaches = \"pol-L2-101\"\nscope = \"one task\"\n\
+             approver = \"human:test:me\"\njustification = \"a test\"\n\
+             expires = \"2999-01-01T00:00:00Z\"\n";
+        rule(root, "exc-2026-001", 2, SENTENCE, exception).await;
+        let m = Memory::open(root).unwrap().with_author("agent:curator");
+        let found = m.policy_curation(None).await.unwrap();
+        let pairs: Vec<(&str, &str, u8)> = found
+            .overlaps
+            .iter()
+            .map(|o| (o.a.as_str(), o.b.as_str(), o.layer))
+            .collect();
+        assert_eq!(pairs, [("pol-L2-101", "pol-L2-102", 2)]);
+        assert!(found.repeated.is_empty());
+        let before = m.check_policy("supersede a decision", None).await.unwrap();
+        let (filed, already) = m.file_policy_curation(None, &found).await.unwrap();
+        assert_eq!((filed.len(), already), (1, 0));
+        let spec = tasks_of(&m, MERGE_RULES_ORIGIN).await.remove(0).spec;
+        assert_eq!((spec.priority, spec.requirements.len()), (0, 0));
+        assert_eq!(spec.classification, Label::Internal);
+        assert_eq!(
+            spec.title,
+            "Curator: propose one rule for pol-L2-101 and pol-L2-102"
+        );
+        for part in [
+            "Write one policy entry with status `proposed`",
+            "cites pol-L2-101 and pol-L2-102",
+            "call `propose_amendment` on pol-L2-101 and on pol-L2-102",
+            "the owner of each rule decides",
+            "Change no rule that is in force.",
+        ] {
+            assert!(spec.body.contains(part), "{part}: {}", spec.body);
+        }
+        // a second run files nothing, and no rule moved
+        let again = m.policy_curation(None).await.unwrap();
+        assert_eq!(again, found);
+        assert_eq!(
+            m.file_policy_curation(None, &again).await.unwrap(),
+            (vec![], 1)
+        );
+        let after = Memory::open(root).unwrap().with_author("agent:curator");
+        let after = after.check_policy("supersede a decision", None).await;
+        assert_eq!(after.unwrap(), before);
+    }
+
+    /// File a task as `m`, do it and close it with a handoff.
+    async fn done_task(m: &Memory, title: &str) -> String {
+        let spec = TaskSpec {
+            domain: "dom-me".into(),
+            title: title.into(),
+            body: "Do it.\n".into(),
+            ..TaskSpec::default()
+        };
+        let id = m.create_task(spec).await.unwrap().task.id;
+        let _ = m.admit(&id).await;
+        m.claim(&id, time::Duration::minutes(5)).await.unwrap();
+        let handoff = WriteRequest {
+            entry_type: EntryType::Handoff,
+            body: "# Done\n\nIt is done.\n".into(),
+            ..WriteRequest::default()
+        };
+        let handoff = m.write(handoff).await.unwrap().id;
+        m.complete(&id, None, &handoff).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn repeated_work_is_filed_once_for_a_curator_to_propose_a_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), OWNER, "dom-me").unwrap();
+        let mut ids = Vec::new();
+        for n in 1..=3 {
+            ids.push(done_task(&m, &format!("Rotate the signing key {n}")).await);
+        }
+        done_task(&m, "Ship the report 1").await;
+        done_task(&m, "Ship the report 2").await;
+        // an open task with the same title is not done work
+        let open = TaskSpec {
+            domain: "dom-me".into(),
+            title: "Ship the report 3".into(),
+            body: "Do it.\n".into(),
+            ..TaskSpec::default()
+        };
+        m.create_task(open).await.unwrap();
+        ids.sort();
+        let found = m.policy_curation(None).await.unwrap();
+        let want = Repeated {
+            title: "rotate the signing key".into(),
+            tasks: ids.clone(),
+        };
+        assert_eq!(found.repeated, [want]);
+        let (filed, already) = m.file_policy_curation(None, &found).await.unwrap();
+        assert_eq!((filed.len(), already), (1, 0));
+        let spec = tasks_of(&m, TASK_DEFINITION_ORIGIN).await.remove(0).spec;
+        assert_eq!((spec.priority, spec.requirements.len()), (0, 0));
+        assert_eq!(
+            spec.title,
+            "Curator: propose a task definition for \"rotate the signing key\""
+        );
+        for part in [
+            "3 done tasks have the title \"rotate the signing key\"",
+            ids.join(", ").as_str(),
+            "Propose a task definition in the platform domain for this kind of work.",
+            "The definition is in force only after a person verifies it.",
+        ] {
+            assert!(spec.body.contains(part), "{part}: {}", spec.body);
+        }
+        let again = m.policy_curation(None).await.unwrap();
+        assert_eq!(
+            m.file_policy_curation(None, &again).await.unwrap(),
+            (vec![], 1)
+        );
     }
 }

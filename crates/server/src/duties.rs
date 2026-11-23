@@ -16,11 +16,16 @@
 //! the entry and the person who answers for it. [`Memory::file_failures`] files one task
 //! for each failure. An entry that cites a replaced entry gets a task for a curator, at
 //! a priority above each other curation task.
+//!
+//! An outcome event says what became of the result of a task: a person accepted,
+//! corrected, rejected or reverted it. A task with an outcome other than `accepted` is a
+//! correction. [`Memory::file_corrections`] puts each correction to a curator, and puts a
+//! correction that two people disagree on to a person.
 
 use crate::log::{self, Change};
 use crate::{reach, withhold, Error, Memory};
 use dm_core::{Entry, EntryType, Label, Status, TrustTier};
-use dm_ledger::TaskSpec;
+use dm_ledger::{Outcome, OutcomeKind, TaskSpec};
 use dm_policy::decide::Class;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -698,6 +703,217 @@ impl Memory {
         let mut already = 0;
         for f in failures {
             let created = self.file_own(failure_task(&domain, f)).await?;
+            if created.deduplicated {
+                already += 1;
+            } else {
+                filed.push(created.task.id);
+            }
+        }
+        Ok((filed, already))
+    }
+}
+
+/// The longest note of an outcome, in characters.
+pub const OUTCOME_NOTE_MAX: usize = 2000;
+
+/// The origin of a task that puts a correction to a curator.
+pub const CORRECTION_ORIGIN: &str = "curator:correction";
+
+/// The origin of a task that puts a disputed correction to a person.
+pub const DISPUTE_ORIGIN: &str = "correction:disputed";
+
+/// The question that a curator answers for each correction.
+pub const CORRECTION_QUESTION: &str = "Could the agent have reached the right answer from \
+    what its read filter admitted, whether or not it read that content? If it could, the \
+    method is at fault: propose a change in the platform domain. If it could not, knowledge \
+    is missing: write an entry in this domain.";
+
+/// A task whose result a person corrected, rejected or reverted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Correction {
+    /// The task.
+    pub task: String,
+    /// The title of the task.
+    pub title: String,
+    /// Each outcome event of the task, oldest first.
+    pub outcomes: Vec<Outcome>,
+    /// Whether one person accepted the result and another person did not.
+    pub disputed: bool,
+    /// The classification of the task.
+    pub classification: Label,
+}
+
+/// Whether the people who judged a result disagree: one person accepted it, and
+/// another person corrected, rejected or reverted it.
+fn disputed(outcomes: &[Outcome]) -> bool {
+    let (accepted, other): (Vec<&Outcome>, Vec<&Outcome>) = outcomes
+        .iter()
+        .partition(|o| o.outcome == OutcomeKind::Accepted);
+    accepted.iter().any(|a| other.iter().any(|o| o.by != a.by))
+}
+
+/// The task that [`Memory::file_corrections`] files for one correction. The upstream
+/// event is made from the task and the time of its newest outcome, so a later outcome
+/// is filed again.
+fn correction_task(domain: &str, c: &Correction) -> TaskSpec {
+    let newest = c.outcomes.iter().map(|o| o.at).max();
+    let stamp = newest.map_or(0, OffsetDateTime::unix_timestamp_nanos);
+    let said: String = c
+        .outcomes
+        .iter()
+        .map(|o| format!("- {}, by {}: {}\n", o.outcome.word(), o.by, o.note))
+        .collect();
+    let about = format!(
+        "People judged the result of task {} ({}):\n\n{said}\n",
+        c.task, c.title
+    );
+    let (origin, requirements, priority, title, ask) = if c.disputed {
+        (
+            DISPUTE_ORIGIN,
+            vec!["human".to_string()],
+            4,
+            format!("Disputed correction of {}", c.task),
+            "The people who judged this result disagree. The owner of the policy decides \
+             which outcome is correct. No curator works this correction before that decision."
+                .to_string(),
+        )
+    } else {
+        (
+            CORRECTION_ORIGIN,
+            Vec::new(),
+            2,
+            format!("Correction of {}", c.task),
+            CORRECTION_QUESTION.to_string(),
+        )
+    };
+    TaskSpec {
+        domain: domain.to_string(),
+        title,
+        body: format!("{about}{ask}\n"),
+        requirements,
+        origin: Some(origin.to_string()),
+        upstream_event: Some(dm_core::digest(&format!("{}\n{stamp}", c.task))),
+        classification: c.classification,
+        priority,
+        ..TaskSpec::default()
+    }
+}
+
+impl Memory {
+    /// Record what became of the result of a task: an outcome event. Only a person
+    /// records one. The note is text of this session, so a session whose label is above
+    /// the classification of the task is refused. The log of the domain takes the
+    /// event. Returns each outcome of the task, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for an agent, for a note longer than [`OUTCOME_NOTE_MAX`]
+    /// characters, and for a session above the task; the not-found of the ledger for a
+    /// task that this session cannot see.
+    pub async fn record_outcome(
+        &self,
+        task: &str,
+        outcome: OutcomeKind,
+        note: &str,
+    ) -> Result<Vec<Outcome>, Error> {
+        if !self.of_a_person() {
+            return Err(Error::Denied(
+                "only a person records the outcome of a task".into(),
+            ));
+        }
+        if note.chars().count() > OUTCOME_NOTE_MAX {
+            return Err(Error::Denied(format!(
+                "the note of an outcome has at most {OUTCOME_NOTE_MAX} characters"
+            )));
+        }
+        let (domain, said) = {
+            let mut l = self.ledger.lock().await;
+            let t = l.get(task).await?;
+            self.check_task(&t)?;
+            if self.label() > t.spec.classification {
+                return Err(Error::Denied(format!(
+                    "this session has read above the classification of {task}; its note \
+                     does not go on that task"
+                )));
+            }
+            self.observe_task(&t);
+            l.record_outcome(task, outcome, self.author(), note).await?;
+            (t.spec.domain, l.outcomes(task).await?)
+        };
+        self.ledger_into_log(&domain).await?;
+        Ok(said)
+    }
+
+    /// The outcome events of a task, oldest first. The task is read.
+    ///
+    /// # Errors
+    ///
+    /// The not-found of the ledger for a task that this session cannot see.
+    pub async fn outcomes(&self, task: &str) -> Result<Vec<Outcome>, Error> {
+        self.get_task(task).await?;
+        Ok(self.ledger.lock().await.outcomes(task).await?)
+    }
+
+    /// The corrections of a domain: each task that this session sees with an outcome
+    /// `corrected`, `rejected` or `reverted`. A task with only `accepted` outcomes is
+    /// not a correction. Each task given is read.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or a ledger error.
+    pub async fn corrections(&self, domain: Option<&str>) -> Result<Vec<Correction>, Error> {
+        let domain = self.resolve_domain(domain)?;
+        let handling = self.handling()?;
+        let l = self.ledger.lock().await;
+        let mut ids: Vec<String> = Vec::new();
+        for e in l.events_after(&domain, 0).await? {
+            if e.op == "outcome" && !ids.contains(&e.task) {
+                ids.push(e.task);
+            }
+        }
+        let mut out = Vec::new();
+        for id in ids {
+            let t = l.get(&id).await?;
+            let outcomes = l.outcomes(&id).await?;
+            let all_accepted = outcomes.iter().all(|o| o.outcome == OutcomeKind::Accepted);
+            if all_accepted || !self.sees(&t, handling) {
+                continue;
+            }
+            self.observe_task(&t);
+            out.push(Correction {
+                task: id,
+                title: t.spec.title,
+                disputed: disputed(&outcomes),
+                outcomes,
+                classification: t.spec.classification,
+            });
+        }
+        Ok(out)
+    }
+
+    /// File one task for each correction, in one domain. A correction is filed once
+    /// for its newest outcome: a second run files nothing, and a later outcome files
+    /// again. Returns the ids of the tasks filed now, and the number of corrections
+    /// that had a task already.
+    ///
+    /// A correction that is not disputed gets a task for a curator, with the origin
+    /// [`CORRECTION_ORIGIN`] and priority 2. The body holds [`CORRECTION_QUESTION`]. A
+    /// disputed correction gets a task for a person, with the origin [`DISPUTE_ORIGIN`]
+    /// and priority 4, and no task for a curator.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or as [`Memory::file_own`].
+    pub async fn file_corrections(
+        &self,
+        domain: Option<&str>,
+        found: &[Correction],
+    ) -> Result<(Vec<String>, usize), Error> {
+        let domain = self.resolve_domain(domain)?;
+        let mut filed = Vec::new();
+        let mut already = 0;
+        for c in found {
+            let created = self.file_own(correction_task(&domain, c)).await?;
             if created.deduplicated {
                 already += 1;
             } else {
@@ -1447,5 +1663,340 @@ mod tests {
         let mut tasks = tasks_of(o, origin).await;
         assert_eq!(tasks.len(), 1, "{origin}");
         tasks.remove(0).spec
+    }
+
+    const OTHER: &str = "human:test:you";
+
+    /// A new session of `who` records an outcome on `task`.
+    async fn judged(
+        dir: &Path,
+        task: &str,
+        who: &str,
+        kind: OutcomeKind,
+        note: &str,
+    ) -> Result<Vec<Outcome>, Error> {
+        agent(dir, who).record_outcome(task, kind, note).await
+    }
+
+    fn why_denied<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
+        match r {
+            Err(Error::Denied(why)) => why,
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_person_records_an_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let t = task(&o, "Count the stock", None, 0).await;
+        let kind = OutcomeKind::Corrected;
+        let why = why_denied(judged(dir.path(), &t, "agent:worker", kind, "No.").await);
+        assert_eq!(why, "only a person records the outcome of a task");
+        assert!(o.outcomes(&t).await.unwrap().is_empty());
+        judged(dir.path(), &t, OTHER, kind, "Off by one.")
+            .await
+            .unwrap();
+        let said = o
+            .record_outcome(&t, OutcomeKind::Accepted, "Fine.")
+            .await
+            .unwrap();
+        let by: Vec<(&str, OutcomeKind, &str)> = said
+            .iter()
+            .map(|s| (s.by.as_str(), s.outcome, s.note.as_str()))
+            .collect();
+        assert_eq!(
+            by,
+            [
+                (OTHER, OutcomeKind::Corrected, "Off by one."),
+                (OWNER, OutcomeKind::Accepted, "Fine.")
+            ]
+        );
+        assert_eq!(o.outcomes(&t).await.unwrap(), said);
+    }
+
+    #[tokio::test]
+    async fn a_session_above_the_task_records_no_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let t = task(&o, "A public job", None, 0).await;
+        assert_eq!(
+            o.get_task(&t).await.unwrap().spec.classification,
+            Label::Public
+        );
+        let secret = WriteRequest {
+            classification: Some(Label::Restricted),
+            ..req("The margin is nine percent.\n")
+        };
+        let secret = o.write(secret).await.unwrap().id;
+        let reader = agent(dir.path(), OWNER);
+        reader.get(&secret).await.unwrap();
+        assert_eq!(reader.label(), Label::Restricted);
+        let r = reader
+            .record_outcome(&t, OutcomeKind::Rejected, "No.")
+            .await;
+        assert!(why_denied(r).contains("has read above the classification"));
+        assert!(o.outcomes(&t).await.unwrap().is_empty());
+        // a task above the handling of a session is not found, as a missing task is
+        let high = TaskSpec {
+            domain: "dom-me".into(),
+            title: "A restricted job".into(),
+            body: "b".into(),
+            classification: Label::Restricted,
+            ..TaskSpec::default()
+        };
+        let high = o.file_own(high).await.unwrap().task.id;
+        let low = agent(dir.path(), OTHER).with_handling_cap(Label::Internal);
+        let r = low
+            .record_outcome(&high, OutcomeKind::Rejected, "No.")
+            .await;
+        assert!(
+            matches!(r, Err(Error::Ledger(dm_ledger::Error::NotFound(_)))),
+            "{r:?}"
+        );
+        let r = low.outcomes(&high).await;
+        assert!(
+            matches!(r, Err(Error::Ledger(dm_ledger::Error::NotFound(_)))),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_note_of_an_outcome_has_a_longest_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let t = task(&o, "Count the stock", None, 0).await;
+        let long = "é".repeat(OUTCOME_NOTE_MAX + 1);
+        let r = o.record_outcome(&t, OutcomeKind::Rejected, &long).await;
+        assert_eq!(
+            why_denied(r),
+            "the note of an outcome has at most 2000 characters"
+        );
+        assert!(o.outcomes(&t).await.unwrap().is_empty());
+        let fits = "é".repeat(OUTCOME_NOTE_MAX);
+        let said = o.record_outcome(&t, OutcomeKind::Rejected, &fits).await;
+        assert_eq!(said.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_log_of_the_domain_takes_an_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let t = task(&o, "Count the stock", None, 0).await;
+        judged(dir.path(), &t, OTHER, OutcomeKind::Reverted, "Undone.")
+            .await
+            .unwrap();
+        // the log as it is, with no copy of the ledger asked for
+        let events = log::read(dir.path(), "dom-me", 0).unwrap();
+        let taken: Vec<(&str, Option<&str>)> = events
+            .iter()
+            .filter_map(|e| match &e.change {
+                Change::Ledger {
+                    task,
+                    op,
+                    principal,
+                    ..
+                } if op == "outcome" => Some((task.as_str(), principal.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(taken, [(t.as_str(), Some(OTHER))]);
+        let text = serde_json::to_string(&events).unwrap();
+        assert!(!text.contains("Undone."), "the log holds no note");
+    }
+
+    fn outcome(kind: OutcomeKind, by: &str) -> Outcome {
+        Outcome {
+            outcome: kind,
+            by: by.into(),
+            note: String::new(),
+            at: datetime!(2026-11-01 09:00 UTC),
+        }
+    }
+
+    #[test]
+    fn a_correction_is_disputed_when_two_people_say_opposite_things() {
+        use OutcomeKind::{Accepted, Corrected, Rejected, Reverted};
+        for other in [Corrected, Rejected, Reverted] {
+            let two = [outcome(Accepted, OWNER), outcome(other, OTHER)];
+            assert!(disputed(&two), "{other:?}");
+            let turned = [outcome(other, OWNER), outcome(Accepted, OTHER)];
+            assert!(disputed(&turned), "{other:?}");
+            // one person who changed their mind is no dispute
+            let one = [outcome(Accepted, OWNER), outcome(other, OWNER)];
+            assert!(!disputed(&one), "{other:?}");
+        }
+        // two people who agree are no dispute
+        assert!(!disputed(&[
+            outcome(Rejected, OWNER),
+            outcome(Reverted, OTHER)
+        ]));
+        assert!(!disputed(&[
+            outcome(Accepted, OWNER),
+            outcome(Accepted, OTHER)
+        ]));
+    }
+
+    #[tokio::test]
+    async fn a_task_with_an_outcome_that_is_not_accepted_is_a_correction() {
+        use OutcomeKind::{Accepted, Corrected, Rejected, Reverted};
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let mut ids = Vec::new();
+        for (title, kind) in [
+            ("One", Corrected),
+            ("Two", Accepted),
+            ("Three", Rejected),
+            ("Four", Reverted),
+        ] {
+            let t = task(&o, title, None, 0).await;
+            judged(dir.path(), &t, OWNER, kind, title).await.unwrap();
+            ids.push(t);
+        }
+        task(&o, "Five, with no outcome", None, 0).await;
+        // the accepted task gets a second accepted outcome, and the first task a dispute
+        judged(dir.path(), &ids[1], OTHER, Accepted, "Yes.")
+            .await
+            .unwrap();
+        judged(dir.path(), &ids[0], OTHER, Accepted, "It was right.")
+            .await
+            .unwrap();
+        let found = agent(dir.path(), "agent:curator")
+            .corrections(None)
+            .await
+            .unwrap();
+        let got: Vec<(&str, &str, usize, bool)> = found
+            .iter()
+            .map(|c| {
+                (
+                    c.task.as_str(),
+                    c.title.as_str(),
+                    c.outcomes.len(),
+                    c.disputed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (ids[0].as_str(), "One", 2, true),
+                (ids[2].as_str(), "Three", 1, false),
+                (ids[3].as_str(), "Four", 1, false),
+            ]
+        );
+        assert_eq!(found[1].outcomes[0].note, "Three");
+    }
+
+    #[tokio::test]
+    async fn a_correction_above_the_handling_of_a_session_is_not_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let high = TaskSpec {
+            domain: "dom-me".into(),
+            title: "A restricted job".into(),
+            body: "b".into(),
+            classification: Label::Restricted,
+            ..TaskSpec::default()
+        };
+        let t = o.file_own(high).await.unwrap().task.id;
+        judged(dir.path(), &t, OWNER, OutcomeKind::Rejected, "No.")
+            .await
+            .unwrap();
+        let low = agent(dir.path(), "agent:curator").with_handling_cap(Label::Internal);
+        assert!(low.corrections(None).await.unwrap().is_empty());
+        assert_eq!(low.label(), Label::Public, "it read nothing");
+        let all = agent(dir.path(), "agent:curator");
+        assert_eq!(all.corrections(None).await.unwrap().len(), 1);
+        assert_eq!(all.label(), Label::Restricted, "a correction given is read");
+    }
+
+    #[tokio::test]
+    async fn a_correction_is_filed_once_for_a_curator_with_the_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let high = TaskSpec {
+            domain: "dom-me".into(),
+            title: "Price the order".into(),
+            body: "b".into(),
+            classification: Label::Restricted,
+            ..TaskSpec::default()
+        };
+        let t = o.file_own(high).await.unwrap().task.id;
+        judged(
+            dir.path(),
+            &t,
+            OTHER,
+            OutcomeKind::Corrected,
+            "Wrong currency.",
+        )
+        .await
+        .unwrap();
+        let found = o.corrections(None).await.unwrap();
+        assert_eq!(found[0].classification, Label::Restricted);
+        // a session that read nothing files it: the task keeps the classification
+        let filer = agent(dir.path(), OWNER);
+        let (filed, already) = filer.file_corrections(None, &found).await.unwrap();
+        assert_eq!((filed.len(), already), (1, 0));
+        let spec = spec_of(&o, CORRECTION_ORIGIN).await;
+        assert_eq!(spec.title, format!("Correction of {t}"));
+        assert_eq!((spec.priority, spec.requirements.len()), (2, 0));
+        assert_eq!(spec.classification, Label::Restricted);
+        assert!(spec.body.contains(&format!("task {t} (Price the order)")));
+        assert!(
+            spec.body
+                .contains(&format!("- corrected, by {OTHER}: Wrong currency.\n")),
+            "{}",
+            spec.body
+        );
+        assert!(spec.body.contains(
+            "Could the agent have reached the right answer from what its read filter \
+             admitted, whether or not it read that content? If it could, the method is at \
+             fault: propose a change in the platform domain. If it could not, knowledge is \
+             missing: write an entry in this domain."
+        ));
+        assert!(tasks_of(&o, DISPUTE_ORIGIN).await.is_empty());
+        // a second run files nothing, and a later outcome files again
+        let again = o.corrections(None).await.unwrap();
+        assert_eq!(o.file_corrections(None, &again).await.unwrap(), (vec![], 1));
+        judged(dir.path(), &t, OTHER, OutcomeKind::Reverted, "And undone.")
+            .await
+            .unwrap();
+        let later = o.corrections(None).await.unwrap();
+        let (filed, already) = o.file_corrections(None, &later).await.unwrap();
+        assert_eq!((filed.len(), already), (1, 0));
+        assert_eq!(tasks_of(&o, CORRECTION_ORIGIN).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_disputed_correction_goes_to_a_person_and_not_to_a_curator() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let t = task(&o, "Price the order", None, 0).await;
+        judged(dir.path(), &t, OTHER, OutcomeKind::Rejected, "Too low.")
+            .await
+            .unwrap();
+        judged(dir.path(), &t, OWNER, OutcomeKind::Accepted, "It is right.")
+            .await
+            .unwrap();
+        let found = o.corrections(None).await.unwrap();
+        let (filed, already) = o.file_corrections(None, &found).await.unwrap();
+        assert_eq!((filed.len(), already), (1, 0));
+        assert!(tasks_of(&o, CORRECTION_ORIGIN).await.is_empty());
+        let spec = spec_of(&o, DISPUTE_ORIGIN).await;
+        assert_eq!(spec.title, format!("Disputed correction of {t}"));
+        assert_eq!(spec.requirements, ["human"]);
+        assert_eq!(spec.priority, 4);
+        assert!(spec
+            .body
+            .contains(&format!("- rejected, by {OTHER}: Too low.\n")));
+        assert!(spec
+            .body
+            .contains(&format!("- accepted, by {OWNER}: It is right.\n")));
+        assert!(spec.body.contains(
+            "The people who judged this result disagree. The owner of the policy decides"
+        ));
+        assert!(!spec.body.contains("Could the agent"), "{}", spec.body);
+        let again = o.corrections(None).await.unwrap();
+        assert_eq!(o.file_corrections(None, &again).await.unwrap(), (vec![], 1));
     }
 }

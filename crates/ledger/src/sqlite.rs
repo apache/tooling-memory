@@ -904,7 +904,8 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
         Event::Retriaged { .. } => {
             "UPDATE tasks SET status = 'proposed' WHERE id = ?1 AND status IN ('open', 'blocked')"
         }
-        // the record that someone tried, or spoke after its claim: nothing of the task moves
+        // the record that someone tried, spoke after its claim, or judged the result: nothing
+        // of the task moves
         _ => return Ok(()),
     };
     conn.execute(sql, params![id])?;
@@ -926,7 +927,8 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         | Event::Unblocked { .. }
         | Event::Retriaged { .. }
         | Event::ClaimRefused { .. }
-        | Event::LateHandoff { .. } => project_waiting(conn, id, event)?,
+        | Event::LateHandoff { .. }
+        | Event::Outcome { .. } => project_waiting(conn, id, event)?,
         Event::Claimed { holder, until, .. } => {
             conn.execute(
                 "UPDATE tasks SET status = 'claimed', holder = ?2, lease_until = ?3,

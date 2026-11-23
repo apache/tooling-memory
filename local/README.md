@@ -1607,8 +1607,8 @@ Parquet, which you query with DuckDB or DataFusion. That shape takes the same va
 
 On each backend, the ledger adds a `task.<transition>` span for each transition that takes
 effect. The transitions are created, admitted, blocked, unblocked, retriaged, claimed,
-claim_refused, heartbeat, released, handoff_left, late_handoff, completed, invalidated and
-posted. The span holds the task as it is at that time:
+claim_refused, heartbeat, released, handoff_left, late_handoff, outcome, completed,
+invalidated and posted. The span holds the task as it is at that time:
 
 - the id, the domain, the status, the priority and the generation;
 - who filed it, its holder and its origin;

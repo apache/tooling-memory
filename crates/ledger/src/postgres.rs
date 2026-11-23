@@ -1429,8 +1429,11 @@ async fn project<C: GenericClient>(
             "SET status = 'proposed' WHERE id = $1 AND status IN ('open', 'blocked')",
             vec![&id],
         ),
-        // the record that someone tried, or spoke after its claim: nothing of the task moves
-        Event::ClaimRefused { .. } | Event::LateHandoff { .. } => return Ok(()),
+        // the record that someone tried, spoke after its claim, or judged the result: nothing
+        // of the task moves
+        Event::ClaimRefused { .. } | Event::LateHandoff { .. } | Event::Outcome { .. } => {
+            return Ok(());
+        }
         Event::Claimed { holder, .. } => (
             "SET status = 'claimed', holder = $2, lease_until = $3,
                 attempts = attempts + 1 WHERE id = $1",

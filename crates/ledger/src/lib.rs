@@ -341,6 +341,61 @@ pub struct LateHandoff {
     pub handoff: String,
 }
 
+/// What a person said of the result of a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutcomeKind {
+    /// The result was taken as it was.
+    Accepted,
+    /// The result was taken after a person changed it.
+    Corrected,
+    /// The result was not taken.
+    Rejected,
+    /// The result was taken and then undone.
+    Reverted,
+}
+
+impl OutcomeKind {
+    /// The word the ledger and the command line use for it.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            OutcomeKind::Accepted => "accepted",
+            OutcomeKind::Corrected => "corrected",
+            OutcomeKind::Rejected => "rejected",
+            OutcomeKind::Reverted => "reverted",
+        }
+    }
+
+    /// The kind that `word` names, if it names one.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        [
+            OutcomeKind::Accepted,
+            OutcomeKind::Corrected,
+            OutcomeKind::Rejected,
+            OutcomeKind::Reverted,
+        ]
+        .into_iter()
+        .find(|k| k.word() == word)
+    }
+}
+
+/// An outcome event on a task: what became of its result, who said so, and a note. It
+/// changes nothing of the task, so a closed task takes one too.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Outcome {
+    /// What became of the result.
+    pub outcome: OutcomeKind,
+    /// The person who said so.
+    pub by: String,
+    /// What that person wrote. An erasure of the task puts the redaction here.
+    pub note: String,
+    /// When.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
 /// What a promotion records: which version of an entry was moved to which tier, by
 /// whom, and why. A record of a change already judged, not work: it is no task, and no
 /// query over tasks returns it.
@@ -430,6 +485,15 @@ enum Event {
         generation: u64,
         handoff: String,
     },
+    /// What a person said of the result. Changes nothing of the task. The enum is tagged
+    /// with `kind`, so the kind of the outcome is the field `outcome`.
+    Outcome {
+        outcome: OutcomeKind,
+        by: String,
+        note: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
     Heartbeat {
         #[serde(with = "time::serde::rfc3339")]
         until: OffsetDateTime,
@@ -482,6 +546,7 @@ impl Event {
             Event::Claimed { .. } => "claimed",
             Event::ClaimRefused { .. } => "claim_refused",
             Event::LateHandoff { .. } => "late_handoff",
+            Event::Outcome { .. } => "outcome",
             Event::Heartbeat { .. } => "heartbeat",
             Event::Released => "released",
             Event::HandoffLeft { .. } => "handoff_left",
@@ -525,7 +590,8 @@ pub struct Logged {
     /// When, as the ledger wrote it.
     pub at: String,
     /// Who did it: the filer of a `created`, the holder that a `claimed`, a
-    /// `claim_refused` or a `late_handoff` names, the promoter of a `promoted`, and for a
+    /// `claim_refused` or a `late_handoff` names, the promoter of a `promoted`, the
+    /// person who said an `outcome`, and for a
     /// `heartbeat`, a `released`, a `handoff_left` and a `completed` the holder whose
     /// lease was live. Absent for the others, and for a `completed` that the task's
     /// continuation caused, which no holder did.
@@ -586,6 +652,7 @@ fn who(
             (Some(holder.clone()), None)
         }
         Event::Promoted { spec, .. } => (Some(spec.by.clone()), None),
+        Event::Outcome { by, .. } => (Some(by.clone()), None),
         Event::Heartbeat { .. } | Event::Released | Event::HandoffLeft { .. } => (holder(), None),
         Event::Completed { attempt, .. } => (holder(), attempt.clone()),
         Event::Admitted
@@ -695,6 +762,17 @@ fn redact_event(id: &str, payload: &str, redaction: &Redaction) -> Result<Option
             holder,
             generation,
             handoff: redaction.reason.clone(),
+        },
+        Event::Outcome {
+            outcome,
+            by,
+            note,
+            at,
+        } if note != redaction.reason => Event::Outcome {
+            outcome,
+            by,
+            note: redaction.reason.clone(),
+            at,
         },
         _ => return Ok(None),
     };
@@ -1568,6 +1646,63 @@ impl Ledger {
         Ok(out)
     }
 
+    /// Keep what a person said of the result of a task: an outcome event. It changes
+    /// nothing of the task, and a task in each state takes one, a closed task too. The
+    /// same outcome (kind, person, note) said twice is on the record once.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`], or a database error.
+    pub async fn record_outcome(
+        &mut self,
+        id: &str,
+        outcome: OutcomeKind,
+        by: &str,
+        note: &str,
+    ) -> Result<Task, Error> {
+        let now = self.now();
+        let task = self.get(id).await?;
+        let said = |o: &Outcome| o.outcome == outcome && o.by == by && o.note == note;
+        if self.outcomes(id).await?.iter().any(said) {
+            return Ok(task);
+        }
+        let event = Event::Outcome {
+            outcome,
+            by: by.to_string(),
+            note: note.to_string(),
+            at: now,
+        };
+        self.append_at(id, now, &event).await?;
+        self.get(id).await
+    }
+
+    /// The outcome events of a task, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn outcomes(&self, id: &str) -> Result<Vec<Outcome>, Error> {
+        let payloads = on_backend!(&self.backend, db => db.payloads_of(id, "outcome"))?;
+        let mut out = Vec::new();
+        for p in payloads {
+            if let Event::Outcome {
+                outcome,
+                by,
+                note,
+                at,
+            } = Event::parse(id, &p)?
+            {
+                out.push(Outcome {
+                    outcome,
+                    by,
+                    note,
+                    at,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// The claims of a named task that the ledger refused: who asked, and why not.
     ///
     /// # Errors
@@ -2110,6 +2245,12 @@ mod tests {
         a_late_handoff_needs_a_lost_lease_and_an_open_task_and_is_kept_once,
         a_refused_claim_is_recorded_once_and_not_on_a_closed_task,
         an_erasure_takes_a_late_handoff_too,
+        an_outcome_is_kept_on_a_task_in_each_state_and_moves_nothing,
+        an_outcome_on_an_unknown_task_is_not_found,
+        the_same_outcome_said_twice_is_kept_once,
+        a_replay_keeps_the_outcomes_and_the_tasks,
+        an_outcome_is_an_event_of_the_domain_that_names_its_person,
+        an_erasure_takes_the_note_of_an_outcome,
         a_task_is_not_admitted_onto_an_invalidated_dependency,
         an_open_task_of_an_older_ledger_is_retriaged_with_its_dependency,
         an_erasure_that_invalidates_a_task_sends_back_what_it_blocked,
@@ -2434,6 +2575,163 @@ mod tests {
             .unwrap();
         let kept = l.late_handoffs(&t.id).await.unwrap();
         assert_eq!(kept[0].handoff, redaction().reason);
+        assert!(b.payloads().await.iter().all(|p| !p.contains(SECRET)));
+    }
+
+    /// A proposed, an open, a claimed, a done and an invalidated task.
+    async fn a_task_in_each_state(l: &mut Ledger) -> Vec<Task> {
+        let proposed = l.create(spec("Proposed")).await.unwrap().task;
+        let open = admitted(l, spec("Open")).await;
+        let claimed = admitted(l, spec("Claimed")).await;
+        claim(l, &claimed.id, "s1", mins(30)).await.unwrap();
+        let done = admitted(l, spec("Done")).await;
+        claim(l, &done.id, "s2", mins(30)).await.unwrap();
+        l.complete(&done.id, held("s2", 1), "mem-a-h")
+            .await
+            .unwrap();
+        let gone = admitted(l, spec("Gone")).await;
+        l.invalidate(&gone.id, "obsolete", None).await.unwrap();
+        let ids = [proposed.id, open.id, claimed.id, done.id, gone.id];
+        get_all(l, &ids.iter().map(String::as_str).collect::<Vec<_>>()).await
+    }
+
+    async fn an_outcome_is_kept_on_a_task_in_each_state_and_moves_nothing(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let before = a_task_in_each_state(&mut l).await;
+        let states: Vec<Status> = before.iter().map(|t| t.status).collect();
+        assert_eq!(
+            states,
+            [
+                Status::Proposed,
+                Status::Open,
+                Status::Claimed,
+                Status::Done,
+                Status::Invalidated
+            ]
+        );
+        *now.lock().unwrap() = T0 + mins(3);
+        for t in &before {
+            let after = l
+                .record_outcome(
+                    &t.id,
+                    OutcomeKind::Corrected,
+                    "human:test:me",
+                    "Wrong unit.",
+                )
+                .await
+                .unwrap();
+            assert_eq!(&after, t, "the outcome moved the task");
+            assert_eq!(&l.get(&t.id).await.unwrap(), t);
+            let want = Outcome {
+                outcome: OutcomeKind::Corrected,
+                by: "human:test:me".into(),
+                note: "Wrong unit.".into(),
+                at: T0 + mins(3),
+            };
+            assert_eq!(l.outcomes(&t.id).await.unwrap(), [want]);
+        }
+    }
+
+    async fn an_outcome_on_an_unknown_task_is_not_found(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let r = l
+            .record_outcome("task-a-none", OutcomeKind::Accepted, "human:test:me", "")
+            .await;
+        assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
+        assert_eq!(l.event_count().await.unwrap(), 0);
+    }
+
+    async fn the_same_outcome_said_twice_is_kept_once(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Said twice")).await;
+        let me = "human:test:me";
+        for at in [1, 2] {
+            *now.lock().unwrap() = T0 + mins(at);
+            l.record_outcome(&t.id, OutcomeKind::Rejected, me, "No.")
+                .await
+                .unwrap();
+        }
+        let kept = l.outcomes(&t.id).await.unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].at, T0 + mins(1));
+        // another kind, another person and another note are each another outcome
+        l.record_outcome(&t.id, OutcomeKind::Reverted, me, "No.")
+            .await
+            .unwrap();
+        l.record_outcome(&t.id, OutcomeKind::Rejected, "human:test:you", "No.")
+            .await
+            .unwrap();
+        l.record_outcome(&t.id, OutcomeKind::Rejected, me, "No, again.")
+            .await
+            .unwrap();
+        assert_eq!(l.outcomes(&t.id).await.unwrap().len(), 4);
+    }
+
+    async fn a_replay_keeps_the_outcomes_and_the_tasks(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let tasks = a_task_in_each_state(&mut l).await;
+        for (t, kind) in tasks.iter().zip([
+            OutcomeKind::Accepted,
+            OutcomeKind::Corrected,
+            OutcomeKind::Rejected,
+            OutcomeKind::Reverted,
+            OutcomeKind::Accepted,
+        ]) {
+            l.record_outcome(&t.id, kind, "human:test:me", "Seen.")
+                .await
+                .unwrap();
+        }
+        let mut said = Vec::new();
+        for t in &tasks {
+            said.push(l.outcomes(&t.id).await.unwrap());
+        }
+        assert_eq!(said[3][0].outcome, OutcomeKind::Reverted);
+        l.rebuild().await.unwrap();
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(get_all(&l, &ids).await, tasks);
+        for (t, before) in tasks.iter().zip(&said) {
+            assert_eq!(&l.outcomes(&t.id).await.unwrap(), before);
+        }
+    }
+
+    async fn an_outcome_is_an_event_of_the_domain_that_names_its_person(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let internal = TaskSpec {
+            classification: Label::Internal,
+            ..spec("Judged")
+        };
+        let t = admitted(&mut l, internal).await;
+        let seen = l.events_after("dom-a", 0).await.unwrap().len();
+        l.record_outcome(&t.id, OutcomeKind::Reverted, "human:test:you", "Undone.")
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        assert_eq!(got.len(), seen + 1);
+        let e = &got[seen];
+        assert_eq!(
+            (e.task.as_str(), e.op.as_str(), e.principal.as_deref()),
+            (t.id.as_str(), "outcome", Some("human:test:you"))
+        );
+        assert_eq!(e.classification, Label::Internal);
+        assert!(l.events_after("dom-b", 0).await.unwrap().is_empty());
+    }
+
+    async fn an_erasure_takes_the_note_of_an_outcome(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let quoting = task_quoting_the_secret("promote:mem-a-1", "v1");
+        let t = admitted(&mut l, quoting).await;
+        let note = format!("it said: {SECRET}");
+        l.record_outcome(&t.id, OutcomeKind::Corrected, "human:test:me", &note)
+            .await
+            .unwrap();
+        l.scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+            .await
+            .unwrap();
+        let kept = l.outcomes(&t.id).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].note, redaction().reason);
+        assert_eq!(kept[0].outcome, OutcomeKind::Corrected);
+        assert_eq!(kept[0].by, "human:test:me");
         assert!(b.payloads().await.iter().all(|p| !p.contains(SECRET)));
     }
 

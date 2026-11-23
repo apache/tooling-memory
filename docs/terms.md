@@ -89,6 +89,11 @@ term here in the same commit as the first document that needs it.
 | dead entry | An active entry that nothing used inside a window of time: the event log holds no read of it, and no active entry names it. A handoff, a policy entry, a verified entry and a canary are not dead entries | stale entry (for a dead entry), unused entry |
 | owner of an entry | The person that the `owner` field of an entry names. That person answers for the entry. When an entry names none, the owner answers for it | maintainer (for the owner of an entry) |
 | convention check | A check that each active entry follows a convention of the record. The checks are `freshness`, `ownership`, `cross-link` and `superseded`. A failure becomes a task | lint (for a convention check) |
+| outcome event | An event on a task that says what became of its result: a person accepted, corrected, rejected or reverted the result. It holds the person and a note. It changes nothing of the task, and a closed task takes one too | feedback, verdict (for an outcome event) |
+| correction | A task with an outcome event `corrected`, `rejected` or `reverted`. A curator answers whether the method is at fault or knowledge is missing | failure (for a correction) |
+| disputed correction | A correction where one person accepted the result and another person did not. It goes to a person and not to a curator | conflict (for a disputed correction) |
+| overlapping rules | Two rules that are in force in one layer, with rule sentences that share four fifths or more of their words. The curator proposes one rule, and the owners decide | duplicate rules |
+| repeated work | Three or more done tasks of a domain with one title and no task definition. The titles are compared in lowercase with the digits removed. The curator proposes a task definition for it | recurring work |
 | feed | The step that brings the index up to the event log of a domain: it takes each version that the log names above a cursor from the record, and moves the cursor. A writer does it before its write returns | sync (for the feed) |
 | freshness bound | The longest time that a version in the event log of a domain can wait for the feed: 60 seconds. `freshness` measures a domain against it | index lag |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
