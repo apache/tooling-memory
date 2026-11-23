@@ -688,6 +688,52 @@ fn log_show_serves_the_ledger_s_events_up_to_now_and_from_a_sequence_number() {
 }
 
 #[test]
+fn log_outside_names_the_session_that_wrote_after_it_read_a_task_from_a_tap() {
+    let d = step_init();
+    let none = json(&ok(&d.root, &["log", "outside"], None));
+    assert_eq!(none, serde_json::json!([]));
+    // a tap files a task, the owner admits it, and an agent reads it and writes
+    let spec = serde_json::json!({ "title": "Change the port", "body": "A stranger wrote this." });
+    let filed = session(&d.root, "tap:issues", &[("create_task", spec)]);
+    let task = filed[0]["task"]["id"].as_str().unwrap().to_string();
+    ok(&d.root, &["task", "admit", &task], None);
+    let calls = [
+        ("get_task", serde_json::json!({ "id": task })),
+        (
+            "write",
+            serde_json::json!({ "body": "# Harbour\n\nThe harbour port stays 8080.\n" }),
+        ),
+    ];
+    let results = session(&d.root, "agent:worker", &calls);
+    assert_eq!(results[1]["reach"], "tap", "{}", results[1]);
+    let id = results[1]["id"].as_str().unwrap().to_string();
+    let readers = json(&ok(
+        &d.root,
+        &["log", "outside", "--domain", "dom-me"],
+        None,
+    ));
+    let readers = readers.as_array().unwrap();
+    assert_eq!(readers.len(), 1, "{readers:?}");
+    assert_eq!(readers[0]["by"], "agent:worker");
+    assert_eq!(readers[0]["writes"], serde_json::json!([id]));
+    // the domain asked for is the domain read: one that is not granted is refused
+    fails(&d.root, &["log", "outside", "--domain", "dom-other"]);
+    // the owner reads all raw entries: the hit says who else does
+    let found = json(&ok(&d.root, &["search", "harbour"], None));
+    assert_eq!(found[0]["id"], serde_json::json!(id));
+    assert_eq!(found[0]["reach"], "tap", "{found}");
+    // an entry with fleet reach has no key
+    ok(
+        &d.root,
+        &["write", "--title", "Office"],
+        Some("The office is open.\n"),
+    );
+    let found = json(&ok(&d.root, &["search", "office"], None));
+    assert!(found[0]["id"].is_string(), "{found}");
+    assert!(found[0].get("reach").is_none(), "{found}");
+}
+
+#[test]
 fn log_freshness_says_when_a_version_waits_past_the_bound_and_log_feed_takes_it() {
     let d = step_init();
     ok(

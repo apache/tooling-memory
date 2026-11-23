@@ -158,9 +158,37 @@ two weeks. It is also the reason that none of it is the production shape.
   - The reads of a helper session count for its parent only through the entries that
     the helper wrote.
   - An erasure does not go through an approval.
-- **Raw reach.** Each session that reads a domain reads its raw entries, and the content
-  that a tap brought in is among them. A session does not record that it read outside
-  content.
+- **Raw reach, in part.** Each entry has a reach: `chain`, `fleet` or `tap`. Each read
+  filter has a raw reach: `chain`, `fleet` or `all`. By default, an agent reads the raw
+  entries of its task chain and each raw entry whose reach is not `tap`. When a session
+  reads content from authors outside the fleet, the event log records it. Each entry that
+  the session writes after the read is raw with tap reach. Until such an entry is
+  curated, only the task chain, triage and curators read it. Only a person, or a session
+  on a task of a curator or of the auditor, can make it curated. `amem log outside` and
+  the `outside_readers` memory tool list those sessions with their writes and their
+  sends. These parts are not built:
+  - By default, an agent also reads a raw entry with chain reach that names a task outside
+    its task chain. A root policy that sets `raw_reach` to `chain` stops this.
+  - The policy sets the raw reach of a principal for all its domains, and not for one
+    domain.
+  - Triage is the owner and the other people. No triage agent has a role of its own.
+  - The task chain comes from the held task that the launcher sets. A session that only
+    claims a task with the `claim` memory tool has no task chain.
+  - A task that another process files from the held task joins the task chain only when
+    the session holds the task again.
+  - When a session reads a task from outside, the log gets no event at the read. The
+    record is on the next event of the session.
+  - A turn of the transcript of a session that read outside content is served by
+    citation. The reader of the turn gets no record.
+  - What a subagent returns to its parent inside the harness does not go through the
+    memory server.
+  - The memory files of a harness are not read as outside content.
+  - No task of the auditor reads the list of `outside_readers` yet.
+  - A request task for the part of an item that belongs to another domain is not built,
+    because coordination across domains is not built.
+  - A session of the web launcher keeps the record for one request, as it keeps its
+    session label.
+  - A re-run from a tape does not restore the record.
 - **Curation and audit, in part.** No curation task demotes an entry, checks an owner or
   a cross-link, or curates policy. No test on planted faults qualifies the auditor's
   model. The auditor does not read handoffs.
@@ -424,12 +452,12 @@ describes re-enactment, the platform domain and the Gofannon bridge.
 |---|---|---|
 | The read path | T0, BM25 search with summaries first, one body on `get`, recall as a cited brief or a pack, prefetch on claim and at fetch | `t0`, `search`, `get`, `list`, `recall`, `write` |
 | The task fabric | Tasks with leases and handoffs. A rubric from the L1 strategy ranks along the ledger's edges, at admission and in the triage cycle. Workers only claim. Subagents go on the board as children, with a continuation | `task create, admit, claim-next, complete, release, tree, retry, rescore, stats`, `work` |
-| Trust tiers | Raw, curated, verified. Only a person who did not propose an entry can make it verified. Review clocks and decay | `promote`, `approve` |
+| Trust tiers | Raw, curated, verified. Only a person who did not propose an entry can make it verified. Review clocks and decay. Raw reach: a raw entry from a session that read outside content is served only to its task chain, to triage and to curators | `promote`, `approve`; `reach` and `task` in the answers of `write`, `search` and `get` |
 | The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced after they are verified, with scoped exceptions). Admission, the read filter, the write scan and quarantine, and blast-radius gates. A log of every decision | `policy show, eval, list, lint`, `quarantine` |
 | The curator | A survey of what needs curation, an independent auditor, a search for contradictions, canaries, its own telemetry and alarms, and a cycle on a budget | `curator`, `curate`, `audit`, `canary` |
 | The egress | It forwards, meters and times model calls, holds spend limits per destination, and records decision contexts. It keeps the wall clock, CPU and peak memory of each session beside the session's tokens | `launch`, `usage`, `cost` |
 | Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned | `transcript`, `replay`, `reenact run, report, tapes, show, pin, unpin` |
-| The event log | Each write, read and send goes into the append-only log of its domain, with a label, and with ids and digests only. The log feeds the index, against a bound of 60 seconds. A materializer builds the index again from the log and replays the ledger's events. Lineage reads the log back and forward. An erasure withholds the entries that are one step forward | `log show, feed, freshness, materialize`, `lineage`, `withheld list, release`; MCP `log`, `lineage` |
+| The event log | Each write, read and send goes into the append-only log of its domain, with a label, and with ids and digests only. The log feeds the index, against a bound of 60 seconds. A materializer builds the index again from the log and replays the ledger's events. Lineage reads the log back and forward. An erasure withholds the entries that are one step forward. The log marks each event of a session that read outside content | `log show, feed, freshness, materialize, outside`, `lineage`, `withheld list, release`; MCP `log`, `lineage`, `outside_readers` |
 | The platform | Agent definitions, templates, eval suites and harness defaults as artifacts in a platform domain. They load only after a person verifies them | `platform list, show`, `golden --platform` |
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory | `savings`, `golden`, `scripts/eval.py` |
