@@ -380,8 +380,10 @@ There are two more gates:
   to quarantine, and a task for an approver is filed, because a proposer never approves
   its own proposal.
 
-Only the owner can erase. Each decision, allow or deny, goes to `state/decisions.jsonl`,
-with the policy version that made it.
+An erasure runs only under an approval of the owner. The owner's own `amem erase` is
+that approval. The section on [approvals](#approvals-amem-approve-amem-approvals-and-amem-declassify)
+gives the steps for every other session. Each decision, allow or deny, goes to
+`state/decisions.jsonl`, with the policy version that made it.
 
 Detection. The event log of each domain records each write, each read and each send, with
 the session that did it. `amem lineage <id>` follows an entry through the log: the
@@ -610,7 +612,9 @@ Verified is the review gate. Nobody sets it directly. It has two steps:
 1. One principal proposes it, with `promote` and `to: verified`. This files a task that
    requires a person.
 2. A person who did not propose it approves it, with `amem approve <task>`. An agent never
-   approves. The approval is of the version the proposal named: if the entry changed
+   approves, and a session that the memory server serves approves nothing. The ledger
+   keeps the approval as an event, with the action `verify` and the version, and
+   `amem approvals <id>` lists it. The approval is of the version the proposal named: if the entry changed
    since, `approve` refuses it, and a proposer, any proposer, proposes the entry as it
    stands. The ledger keeps one approval task per entry and version. The task names the
    version it proposes, and the promotion record on the ledger names the same version. A
@@ -626,7 +630,7 @@ if that version reached the record (`landed`). A proposal to verified is in the 
 when it is made. It lands when a person approves it. Its approval task names the entry,
 the proposer and the author, and points to `amem promotions <id>`, but does not hold the
 why. An auditor reads the why after judging the change, not before. A session reads the
-why only if it can read the entry. The why stays readable after the entry is replaced. When the owner erases the entry, the ledger removes each
+why only if it can read the entry. The why stays readable after the entry is replaced. When the entry is erased, the ledger removes each
 why. It keeps who promoted which version, to which tier, and when. The erasure also
 rewrites each approval task of the entry so that it names the entry by id alone, and it
 closes the open ones; a task from a build that still put the why in the task body loses
@@ -651,6 +655,138 @@ version of the entry, and the history of the entry keeps the old version. This i
 paper's defence against an exploit that becomes practice across the fleet. An agent
 cannot promote its own finding, whatever it finds. The gate for the verified trust tier
 refuses an agent's rewrite of a verified entry.
+
+## Approvals: `amem approve`, `amem approvals` and `amem declassify`
+
+Some actions cannot be taken back. Such an action runs only under an approval. An
+approval is an event on the ledger. It names these:
+
+- the person who approved
+- the action: `erase`, or `declassify:<label>`
+- the entry, and the version of the entry
+- the principal that can run the action (`scope`)
+- an expiry.
+
+The version is the digest of the text of the entry. Each write and each promotion makes a
+new version. The policy checks the approval each time the action runs. Thus an approval
+permits nothing after the entry changes, and nothing after its expiry. An approval cannot
+be withdrawn before its expiry.
+
+Two actions need an approval:
+
+- An erasure: `amem erase`, or the `erase` memory tool. The approver is the owner.
+- A declassification: `amem declassify`, or the `declassify` memory tool. The approver is
+  the guard of the domain.
+
+The steps are the same for the two actions:
+
+1. A session asks for the action. Each session that can read the entry can ask.
+2. No approval is in force, so the action does not run. `amem` files a sign-off task for
+   the approver. The task requires `human`, and it has the label of the entry. It names
+   the entry by id, the version, and the principal that asked. For an erasure, the
+   refusal names the task: `Task <id> asks <approver> for it.` For a declassification,
+   the answer is `proposed`, with the task.
+3. The approver reads the entry, and then runs `amem approve <task>`. This records the
+   approval, for the principal that asked and for nobody else. It does not run the
+   action. The approval expires after 24 hours, or at the time that
+   `--expires <RFC 3339 time>` gives. A time that is not after now is refused. To
+   decline, the approver invalidates the task (`amem task invalidate <task>`). The
+   request is then not made again until the entry changes. Only the approver can
+   invalidate a sign-off task, and only at the command line. `amem` refuses each other
+   session, because `amem` tells the requester that the approver declined.
+4. The session makes the same call again. The policy finds the approval, and the action
+   runs.
+
+If the entry changes between step 1 and step 3, `amem approve` refuses, because nobody
+asked about the new version. If the entry changes between step 3 and step 4, the action
+is refused, and a new sign-off task asks about the new version.
+
+When the approver runs the action at the command line, that call is the approval. `amem`
+records an approval that expires after one minute, and checks it as it checks each other
+approval. Thus the owner's `amem erase` needs no second step, and each erasure of an
+entry has an approval on the ledger. `amem transcript erase` stays the owner's act, and
+it records no approval.
+
+An agent cannot approve. Three rules hold this:
+
+- The policy lets only a person approve, and only the approver of the action. It does
+  not count an approval event from any other principal.
+- A session that the memory server serves approves nothing, with `amem approve` or with
+  its own call, whatever name the session has. A harness reaches that session, so the
+  request can come from an agent.
+- The memory server has no memory tool that approves.
+
+These rules hold only for a harness that is confined. Nobody authenticates at the command
+line. A harness without a sandbox has a shell on the host: a harness under
+`amem launch --unconfined`, or a harness that you point at `amem serve` yourself. From
+that shell, an agent can run `amem approve`, `amem erase` or `amem declassify` as the
+owner. That call is a call at the command line, so the agent approves its own request.
+
+`amem approvals [<id>] [--domain <domain>]` lists the approvals of one entry, or of a
+domain, as JSON, oldest first. Each has `id`, `domain`, `principal`, `action`, `target`,
+`version`, `scope`, `expires`, `at` and `in_force`. `in_force` says that the approval is
+before its expiry. Such an approval permits its action only on the version that it names.
+The list holds only the approvals of entries that the session can read. The receipt of an
+erasure names who erased, and it does not name the approval.
+
+The event log of the domain gets a copy of each approval, as it gets a copy of each event
+of the ledger: a `ledger` event with the operation `approved`. The copy names the
+approver, the entry and the time, and it has the highest label. The action, the version,
+the scope and the expiry stay in the event of the ledger, where `amem approvals` reads
+them.
+
+### A copy at a lower label: `amem declassify`
+
+`amem declassify <id> --to <label> --why "<words>"` asks for a declassification: a copy
+of one version of an entry at a lower label. The label must be lower than the label of
+the entry. The reason is words on one line, and the sign-off task holds it for the guard.
+
+The copy is a new raw entry at the lower label. It has the author, the date (`created`),
+the type, the title, the summary and the text of the entry. It cites the version that it
+was made from, as `<id>@<digest>`. It does not cite what the entry cites, because those
+citations can be above the label of the copy. Its `origin` names the label, the version
+and the guard:
+`declassify:<label>:<id>@<digest>:<guard>`. The entry itself does not change. The same
+call again gives the id of the copy that is there, and writes nothing. Each version and
+each label gets its own copy.
+
+`amem` makes the id of the copy from its `origin`, and the record takes an entry with
+that id only one time. Thus two calls at the same time land one copy, and two requesters
+of the same version get the same copy. If the copy was erased, `amem` refuses the call
+and files no sign-off task. No copy of that version lands at that label again. A new
+version of the entry gets a new copy.
+
+A session that asks for a copy reads the entry, so its session label goes up to the label
+of the entry. The copy is the only write that lands below the session label.
+
+The guard is the `guard` key in the grant of the domain:
+
+```toml
+[domains.dom-me]
+guard = "human:example:alex"
+```
+
+The value must name a person (`human:`). Without the key, the owner is the guard. When
+the grant names a guard that is not the owner, the owner cannot approve a
+declassification. That guard cannot approve at this time, because the command line acts
+only as the owner.
+
+An erasure of the entry rewrites the sign-off tasks of the entry. They keep the id of the
+entry and lose the reason that the requester gave. The erasure closes the open ones. It
+withholds a copy, as it withholds each active entry that cites the erased entry.
+
+### The two memory tools
+
+- `erase` takes `id` and `reason` (`requested`, `mistaken`, `sensitive` or `legal`). It
+  gives the receipt, or the refusal that names the sign-off task.
+- `declassify` takes `id`, `target_label` and `justification`. It gives `proposed` with
+  the sign-off task, or `declassified` with the id of the copy, its label, the citation
+  and the approval.
+
+Each memory tool calls the function that the command line calls. An agent calls the
+memory tool, a person approves the task at the command line, and the agent makes the same
+call again. In a re-enactment, each of the two is a call that changes the record: after
+the run diverges, the call is captured and not applied.
 
 ## Policy as memory: `amem policy list` and `lint`
 

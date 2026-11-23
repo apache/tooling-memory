@@ -77,10 +77,14 @@ offline.
   approval of a person.
 - **Policy**: the rules that check every write, read and outside request. The rules are
   entries too.
+- **Approval**: your yes to one action on one version of one entry, for one agent, until
+  a set time. The ledger keeps it. The policy checks it when the action runs.
+- **Guard**: the person who approves a copy of an entry at a lower label. In this demo,
+  the guard is you.
 - **Egress**: the only way out to a model. Every model call goes through it, from a
   harness or from the system itself, on to the model's provider or the gateway. The
   egress checks, logs and meters each call. Web fetches do not go through it. They leave
-  through the memory server's own fetch tool (3.11).
+  through the memory server's own fetch tool (3.13).
 - **Harness**: the agent program that a model works in, such as Claude Code or Codex.
 - **Gateway**: llm.apache.org, the Foundation's LLM gateway. It serves the open models
   in this demo.
@@ -94,7 +98,7 @@ offline.
   (act 8).
 - **Tap**: a component that connects to an outside system. It runs as a WebAssembly
   component, and it can reach only what its grant names. The fetch tool in
-  3.11 is a tap. The GitHub tap in act 9 is another.
+  3.13 is a tap. The GitHub tap in act 9 is another.
 - **Event log**: each write, read, send and erasure of a domain in order, by id and
   digest, never a body. The index is fed from the event log, and can be built again from
   the event log and the record (act 10).
@@ -175,8 +179,9 @@ not from the curators' own reports.
 
 ## Act 3 · The perimeter
 
-On stage: scripted agents writing, reading and fetching; gemma4-26b reading what is held;
-the policy deciding; the egress counting tokens; and you.
+On stage: scripted agents writing, reading and fetching, and asking to erase an entry and
+to copy an entry to a lower label; gemma4-26b reading what is held; the policy deciding;
+the egress counting tokens; and you, who verify, approve and decline.
 
 What gets in, what gets out, and who decides.
 
@@ -221,28 +226,44 @@ task for a person, and it names the owner of the rule.
 The task is still refused. You approve the exception, and then the task goes through.
 Every session sees the exception in T0.
 
-**3.8 A reset.** `agent:a` writes a rule, and `agent:curator` promotes it to curated. No
+**3.8 An action that cannot be taken back.** `agent:a` asks to erase an entry. The
+policy refuses: an erasure runs only under your approval, and a task asks you for it. You
+approve the task. The approval is for this version of the entry and for `agent:a`, and it
+expires after a day. It erases nothing. Then `agent:curator` promotes the entry, and the
+entry has a new version. `agent:a` asks again, and the policy refuses again: your
+approval is of the version that you saw. You approve the version that is there now, and
+the same call erases the entry. The ledger keeps both approvals. The decision log shows
+two refusals and one allow.
+
+**3.9 Down a label.** A restricted entry does not move to a lower label. `agent:a` asks
+for a copy at internal, and says why. You are the guard of the domain, so the task comes
+to you. After you approve, the same call lands the copy. The copy cites the version that
+it was made from, and its origin names you. The restricted entry stays as it is. Then
+`agent:curator` promotes the entry. The same call asks you again, and no second copy
+lands. You decline that request. `agent:a` cannot make it again until the entry changes.
+
+**3.10 A reset.** `agent:a` writes a rule, and `agent:curator` promotes it to curated. No
 person wrote or promoted that rule. You reset the rules of the domain. The reset retires that rule.
 It keeps the rule that you verified.
 
-**3.9 The lint.** This shows how often each rule blocked, allowed or advised something.
+**3.11 The lint.** This shows how often each rule blocked, allowed or advised something.
 
-**3.10 Spend limits.** For this step, the egress gives the auditor a spend limit of 400
+**3.12 Spend limits.** For this step, the egress gives the auditor a spend limit of 400
 tokens at the gateway. The call that goes over the limit still goes out. The egress
 refuses the next call. By then, more than 550 tokens are spent.
 
-**3.11 Fetch.** `agent:reader` fetches web pages through memory. No grant names
+**3.13 Fetch.** `agent:reader` fetches web pages through memory. No grant names
 example.com. After `agent:reader` has read internal entries, it can reach only trusted
 hosts, because a URL could leak what it read. The repeated fetch comes from the stored
 copy. Nothing leaves.
 
-**3.12 A grant withdrawn.** `agent:a` has an open session and searches. You lower the
+**3.14 A grant withdrawn.** `agent:a` has an open session and searches. You lower the
 handling of the record to public. The next search of that session is refused, and so is
 its next write: the session stops. A new session of `agent:a` starts under the new
 grants and finds no hit, because the record has no public entry. Then the demo puts the
 grants back.
 
-**3.13 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
+**3.15 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
 finds no hit. Your own search reaches the cap of 50 results.
 
 ## Act 4 · The task fabric

@@ -475,6 +475,160 @@ fn a_declined_proposal_is_not_printed_as_proposed_again() {
     assert!(stderr.contains(&task), "{stderr}");
 }
 
+/// One tool call as an agent, through `amem serve` on standard input and output: the
+/// text of the tool's answer, or the message of its refusal.
+fn as_agent(root: &Path, tool: &str, arguments: &serde_json::Value) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amem"))
+        .arg("--root")
+        .arg(root)
+        .args(["serve", "--author", AGENT])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+    let mut to = child.stdin.take().expect("stdin");
+    let mut from = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |message: serde_json::Value| writeln!(to, "{message}").expect("send");
+    let mut answer = || {
+        let mut line = String::new();
+        from.read_line(&mut line).expect("an answer");
+        json(&line)
+    };
+    send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "cli-test", "version": "0"},
+        },
+    }));
+    answer();
+    send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    }));
+    let reply = answer();
+    drop(to);
+    child.wait().expect("wait");
+    if let Some(message) = reply["error"]["message"].as_str() {
+        return Err(message.to_string());
+    }
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in {reply}"))
+        .to_string();
+    if reply["result"]["isError"] == true {
+        Err(text)
+    } else {
+        Ok(text)
+    }
+}
+
+const AGENT: &str = "agent:x";
+
+/// The owner is the guard of a starter root, so the owner's own `declassify` is the
+/// approval: the copy lands at the lower label, and `approvals` lists that approval.
+#[test]
+fn declassify_lands_a_copy_at_a_lower_label_and_approvals_lists_its_approval() {
+    let d = step_init();
+    let source = id_of(&ok(
+        &d.root,
+        &[
+            "write",
+            "--title",
+            "Office move",
+            "--classification",
+            "restricted",
+        ],
+        Some("The office moves on 3 March.\n"),
+    ));
+    let why = "The date was announced to all staff.";
+    let copy_at = |label: &'static str| ["declassify", &source, "--to", label, "--why", why];
+    let err = fails(&d.root, &copy_at("restricted"));
+    assert!(err.contains("restricted is not lower"), "{err}");
+    // the owner's own erasure of another entry is an approval of that entry
+    let other = id_of(&ok(&d.root, &["write"], Some("A note by mistake.\n")));
+    ok(&d.root, &["erase", &other, "--reason", "mistaken"], None);
+    let none = json(&ok(&d.root, &["approvals", &source], None));
+    assert_eq!(none, serde_json::json!([]), "a refused copy has none");
+    let landed = json(&ok(&d.root, &copy_at("internal"), None));
+    assert_eq!(landed["outcome"], "declassified", "{landed}");
+    assert_eq!(landed["classification"], "internal");
+    let copy = landed["id"].as_str().unwrap();
+    assert_ne!(copy, source);
+    let cites = landed["cites"].as_str().unwrap();
+    let version = cites.strip_prefix(&format!("{source}@")).expect(cites);
+    let text = ok(&d.root, &["get", copy], None);
+    assert!(text.contains("classification: internal"), "{text}");
+    assert!(text.contains(cites), "the copy cites {cites}: {text}");
+    assert!(text.contains("The office moves on 3 March."), "{text}");
+    let listed = json(&ok(&d.root, &["approvals", &source], None));
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let expected = serde_json::json!({
+        "id": landed["approval"]["id"], "domain": "dom-me",
+        "principal": "human:test:me", "action": "declassify:internal",
+        "target": source, "version": version, "scope": "human:test:me",
+        "expires": landed["approval"]["expires"], "at": landed["approval"]["at"],
+        "in_force": true,
+    });
+    assert_eq!(listed[0], expected);
+    // with no entry named, the approvals of the domain, oldest first
+    let all = json(&ok(&d.root, &["approvals", "--domain", "dom-me"], None));
+    let all: Vec<_> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["action"].as_str().unwrap(), a["target"].as_str().unwrap()))
+        .collect();
+    let expected = [
+        ("erase", other.as_str()),
+        ("declassify:internal", source.as_str()),
+    ];
+    assert_eq!(all, expected);
+}
+
+/// `amem approve --expires` gives the approval of a sign-off task the time that the
+/// command names. A time that is not after now permits nothing, and is refused.
+#[test]
+fn approve_gives_a_sign_off_task_the_expiry_that_the_command_names() {
+    let d = step_init();
+    let id = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Gate code"],
+        Some("The gate code is 4417.\n"),
+    ));
+    let erase = serde_json::json!({"id": id, "reason": "mistaken"});
+    let refused = as_agent(&d.root, "erase", &erase).unwrap_err();
+    let named = refused
+        .split_once("Task ")
+        .and_then(|(_, rest)| rest.split_once(" asks human:test:me for it."));
+    let Some((task, _)) = named else {
+        panic!("the refusal names no task: {refused}")
+    };
+    let err = fails(&d.root, &["approve", task, "--expires", "tomorrow"]);
+    assert!(err.contains("RFC 3339"), "{err}");
+    let past = "2020-01-01T00:00:00Z";
+    let err = fails(&d.root, &["approve", task, "--expires", past]);
+    assert!(err.contains("permits nothing"), "{err}");
+    let none = json(&ok(&d.root, &["approvals", &id], None));
+    assert_eq!(none, serde_json::json!([]), "nothing was approved");
+    let later = "2099-01-01T00:00:00Z";
+    let approved = json(&ok(&d.root, &["approve", task, "--expires", later], None));
+    assert_eq!(approved["outcome"], "approved", "{approved}");
+    assert_eq!(approved["approval"]["expires"], later);
+    assert_eq!(approved["approval"]["scope"], AGENT);
+    let listed = json(&ok(&d.root, &["approvals", &id], None));
+    assert_eq!(listed[0]["expires"], later);
+    assert_eq!(listed[0]["in_force"], true);
+    // the requester runs the action again, and it runs under that approval
+    let receipt = json(&as_agent(&d.root, "erase", &erase).unwrap());
+    assert_eq!(receipt["id"], id.as_str());
+    assert_eq!(receipt["erased_by"], AGENT);
+}
+
 /// The first file under `root` whose bytes contain `needle`.
 /// Tool calls as `author` in one session, through `amem serve` over stdio, as a harness
 /// makes them: the JSON result of each.
