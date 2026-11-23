@@ -9,8 +9,9 @@
 //! and sent after the read.
 
 use crate::log::Change;
-use crate::{Error, Memory};
-use dm_core::{Entry, Reach, TrustTier};
+use crate::{lock, Error, Memory};
+use dm_core::{Entry, RawReach, Reach, ReadFilter, TrustTier};
+use dm_ledger::Task;
 use serde::Serialize;
 
 /// Whether an entry at this tier and with this reach is content from authors outside
@@ -22,6 +23,176 @@ pub(crate) fn raw_tap(tier: TrustTier, reach: Reach) -> bool {
 /// Whether this version of an entry is content from authors outside the fleet.
 pub(crate) fn outside_content(entry: &Entry) -> bool {
     raw_tap(entry.front.trust_tier, entry.front.reach)
+}
+
+/// The task chain of a session: the tasks whose raw entries the session reads whatever
+/// the reach of each entry is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Chain {
+    /// The held task, the task that it was filed from, the tasks filed from it and the
+    /// tasks that it depends on.
+    tasks: Vec<String>,
+    /// Whether the held task is a task of a curator or of the auditor. Such a session
+    /// reads all raw entries.
+    reads_all: bool,
+}
+
+impl Chain {
+    /// The chain of a held task before the ledger is asked: that task alone.
+    pub(crate) fn of(held: &str) -> Chain {
+        Chain {
+            tasks: vec![held.to_string()],
+            reads_all: false,
+        }
+    }
+
+    /// Add a task, once.
+    fn take(&mut self, id: &str) {
+        if !self.tasks.iter().any(|t| t == id) {
+            self.tasks.push(id.to_string());
+        }
+    }
+}
+
+/// The origins that name the task that another task was filed from: a subagent task, a
+/// continuation and a retry. They are the origins that `Ledger::filed_from` looks for.
+const FILED_FROM: [&str; 3] = ["task:", "continues:", "retries:"];
+
+/// The task that `task` was filed from, when its origin names one.
+fn filed_from(task: &Task) -> Option<&str> {
+    let origin = task.spec.origin.as_deref()?;
+    FILED_FROM.iter().find_map(|p| origin.strip_prefix(p))
+}
+
+/// Whether a task is a task of a curator or of the auditor, as its origin says.
+pub(crate) fn curates(task: &Task) -> bool {
+    task.spec
+        .origin
+        .as_deref()
+        .is_some_and(|o| o.starts_with("curator:") || o.starts_with("auditor:"))
+}
+
+/// The word for a raw reach, as a root policy writes it.
+pub(crate) fn raw_reach_word(reach: RawReach) -> &'static str {
+    match reach {
+        RawReach::Chain => "chain",
+        RawReach::Fleet => "fleet",
+        RawReach::All => "all",
+    }
+}
+
+impl Memory {
+    /// The read filter of the policy with the task chain of this moment laid over it. A
+    /// session on a task of a curator or of the auditor reads all raw entries.
+    pub(crate) fn over_chain(&self, mut f: ReadFilter) -> ReadFilter {
+        let chain = lock(&self.chain);
+        f.chain.clone_from(&chain.tasks);
+        if chain.reads_all {
+            f.raw_reach = RawReach::All;
+        }
+        f
+    }
+
+    /// Ask the ledger for the task chain of the held task: the task, the task that it
+    /// was filed from, the tasks filed from it, and the tasks that it depends on. That is
+    /// one step each way. A raw entry that names one of these tasks is served to this
+    /// session whatever its reach is. A session whose held task is a task of a curator
+    /// or of the auditor reads all raw entries.
+    ///
+    /// A held task that the ledger does not hold leaves the chain as that task alone. A
+    /// held task that this session may not see gives an empty chain. This function takes
+    /// the ledger: do not call it while the ledger is held.
+    ///
+    /// # Errors
+    ///
+    /// A ledger error, or a policy that does not give the read scope.
+    pub async fn sync_chain(&self) -> Result<(), Error> {
+        self.chain_of_held().await.map(|_| ())
+    }
+
+    /// [`Memory::sync_chain`], and the held task when the ledger holds it and this
+    /// session may see it.
+    async fn chain_of_held(&self) -> Result<Option<Task>, Error> {
+        let Some(held) = self.held_task() else {
+            *lock(&self.chain) = Chain::default();
+            return Ok(None);
+        };
+        let handling = self.handling()?;
+        let l = self.ledger.lock().await;
+        let task = match l.get(&held).await {
+            Ok(task) => task,
+            Err(dm_ledger::Error::NotFound(_)) => {
+                *lock(&self.chain) = Chain::of(&held);
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if !self.sees(&task, handling) {
+            *lock(&self.chain) = Chain::default();
+            return Ok(None);
+        }
+        let mut chain = Chain::of(&task.id);
+        if let Some(parent) = filed_from(&task) {
+            chain.take(parent);
+        }
+        for child in l.filed_from(&task.id).await? {
+            chain.take(&child.id);
+        }
+        for needed in &task.spec.depends_on {
+            chain.take(needed);
+        }
+        chain.reads_all = curates(&task);
+        *lock(&self.chain) = chain;
+        Ok(Some(task))
+    }
+
+    /// Hold a task, as a launcher does before the harness starts on it: the held task is
+    /// set ([`Memory::set_held_task`]) and its task chain is read from the ledger
+    /// ([`Memory::sync_chain`]). When the task is content from outside the fleet, this
+    /// session has read outside content: the launcher puts the text of the task in the
+    /// prompt of the harness.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::sync_chain`].
+    pub async fn hold_task(&self, id: &str) -> Result<(), Error> {
+        self.set_held_task(id);
+        if let Some(task) = self.chain_of_held().await? {
+            if self.task_is_outside(&task) {
+                lock(&self.session).read_outside();
+            }
+        }
+        Ok(())
+    }
+
+    /// The tasks that this session filed from `parent` join the chain when `parent` is
+    /// the held task. The ledger is not asked.
+    pub(crate) fn chain_takes<'a>(&self, parent: &str, filed: impl Iterator<Item = &'a Task>) {
+        if self.held_task().as_deref() != Some(parent) {
+            return;
+        }
+        let mut chain = lock(&self.chain);
+        filed.for_each(|t| chain.take(&t.id));
+    }
+
+    /// Whether this session may promote `entry` to curated. A raw entry with tap reach is
+    /// content from authors outside the fleet, so only a session that reads all raw
+    /// entries curates it: a person, or a session on a task of a curator or of the
+    /// auditor. A member of the task chain reads the entry and does not curate it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for such an entry and a session that does not read all raw
+    /// entries, or a policy that does not give the read scope.
+    pub(crate) fn may_curate(&self, entry: &Entry) -> Result<(), Error> {
+        if entry.front.reach != Reach::Tap || self.session_filter()?.raw_reach == RawReach::All {
+            return Ok(());
+        }
+        Err(Error::Denied(format!(
+            "{} has tap reach: it came from outside the fleet, or its author had read content from outside the fleet. A curator or a person curates an entry with tap reach",
+            entry.front.id
+        )))
+    }
 }
 
 /// A session that read content from authors outside the fleet, as one log shows it.
@@ -145,15 +316,26 @@ mod tests {
         }
     }
 
-    /// A raw entry with tap reach in `dom-me`. The session that writes it is given the
-    /// record directly, so that a test of one way to read outside content does not rest
-    /// on another way.
+    /// The task that the writer of [`tap_entry`] holds. The ledger does not hold it.
+    const PLANTED: &str = "task-planted-1";
+
+    /// A raw entry with tap reach in `dom-me` that names [`PLANTED`]. The session that
+    /// writes it is given the record directly, so that a test of one way to read outside
+    /// content does not rest on another way.
     async fn tap_entry(root: &Path) -> String {
         let planted = agent(root, "agent:planted");
+        planted.set_held_task(PLANTED);
         lock(&planted.session).read_outside();
         let w = wrote(&planted, EntryType::Fact).await;
         assert_eq!(w.reach, Reach::Tap);
         w.id
+    }
+
+    /// An agent session in the task chain of [`tap_entry`].
+    fn in_chain(root: &Path, name: &str) -> Memory {
+        let m = agent(root, name);
+        m.set_held_task(PLANTED);
+        m
     }
 
     /// A task that a tap filed, admitted by a session of the owner.
@@ -366,7 +548,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(owner(dir.path()));
         tap_entry(dir.path()).await;
-        let a = agent(dir.path(), "agent:searches");
+        let a = in_chain(dir.path(), "agent:searches");
         let hits = a.search("planted", None, 10).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert!(a.read_outside());
@@ -378,7 +560,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(owner(dir.path()));
         tap_entry(dir.path()).await;
-        let a = agent(dir.path(), "agent:lists");
+        let a = in_chain(dir.path(), "agent:lists");
         assert_eq!(a.list(None, None, 10).await.unwrap().len(), 1);
         assert!(a.read_outside());
         assert_eq!(wrote(&a, EntryType::Fact).await.reach, Reach::Tap);
@@ -389,7 +571,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(owner(dir.path()));
         let id = tap_entry(dir.path()).await;
-        let a = agent(dir.path(), "agent:gets");
+        let a = in_chain(dir.path(), "agent:gets");
         a.get(&id).await.unwrap();
         assert!(a.read_outside());
         assert_eq!(wrote(&a, EntryType::Fact).await.reach, Reach::Tap);
@@ -562,7 +744,7 @@ mod tests {
         let o = owner(root);
         let plain = wrote(&o, EntryType::Fact).await.id;
         let planted = tap_entry(root).await;
-        let a = agent(root, "agent:reader");
+        let a = in_chain(root, "agent:reader");
         a.get(&plain).await.unwrap();
         a.get(&planted).await.unwrap();
         let w = wrote(&a, EntryType::Fact).await;
@@ -706,5 +888,467 @@ mod tests {
         let kept = again.get(&w.id).await.unwrap().front;
         assert_eq!((kept.reach, kept.task), (Reach::Chain, Some(held.id)));
         assert!(!again.read_outside());
+    }
+
+    // ---- the reader's side: the task chain ----
+
+    /// What a session is served of one entry by `search`, `list` and `get`. The three
+    /// agree.
+    async fn served(m: &Memory, query: &str, id: &str) -> bool {
+        let found = |hits: Vec<dm_index::Hit>| hits.iter().any(|h| h.id == id);
+        let search = found(m.search(query, None, 50).await.unwrap());
+        let list = found(m.list(None, None, 50).await.unwrap());
+        let get = match m.get(id).await {
+            Ok(_) => true,
+            Err(Error::NotFound(missing)) => {
+                assert_eq!(missing, id);
+                false
+            }
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!((search, list), (get, get), "search, list and get agree");
+        get
+    }
+
+    /// [`served`] for an entry that [`wrote`] wrote.
+    async fn serves(m: &Memory, id: &str) -> bool {
+        served(m, "planted", id).await
+    }
+
+    /// An agent session that holds `task`, as a launcher starts it.
+    async fn holder(root: &Path, name: &str, task: &str) -> Memory {
+        let m = agent(root, name);
+        m.hold_task(task).await.unwrap();
+        m
+    }
+
+    /// Task T, which a tap filed and the owner admitted, and note N: a handoff that
+    /// `agent:a` wrote while it held T. N is raw, has tap reach and names T.
+    async fn noted(root: &Path) -> (Task, String) {
+        let t = tap_task(root, "From the tracker").await;
+        let a = holder(root, "agent:a", &t.id).await;
+        let n = wrote(&a, EntryType::Handoff).await;
+        assert_eq!(
+            (n.reach, n.task.as_deref()),
+            (Reach::Tap, Some(t.id.as_str()))
+        );
+        (t, n.id)
+    }
+
+    /// A task that the ledger of `o` takes as it is, in `dom-me`.
+    async fn ledger_task(o: &Memory, title: &str, origin: Option<String>, needs: &[&str]) -> Task {
+        let spec = TaskSpec {
+            domain: "dom-me".into(),
+            created_by: OWNER.into(),
+            origin,
+            depends_on: needs.iter().map(|id| (*id).to_string()).collect(),
+            ..spec(title)
+        };
+        o.ledger.lock().await.create(spec).await.unwrap().task
+    }
+
+    /// Give the agents of a root one more key in their read filter.
+    fn agents_read(root: &Path, pair: &str) {
+        let text = dm_policy::decide::BUILTIN.replace(
+            "read_filter := base_filter\n",
+            &format!(
+                "read_filter := object.union(base_filter, {{{pair}}}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n"
+            ),
+        );
+        assert_ne!(text, dm_policy::decide::BUILTIN);
+        std::fs::create_dir_all(root.join("policy")).unwrap();
+        std::fs::write(root.join("policy/local.rego"), text).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_that_holds_an_outside_task_writes_with_tap_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let own = o.file_own(spec("Own work")).await.unwrap().task;
+        let plain = holder(dir.path(), "agent:plain", &own.id).await;
+        assert!(!plain.read_outside(), "a task of the fleet");
+        let t = tap_task(dir.path(), "From the tracker").await;
+        let a = agent(dir.path(), "agent:a");
+        let before = a.label();
+        a.hold_task(&t.id).await.unwrap();
+        assert!(a.read_outside(), "the launcher puts the task in the prompt");
+        assert_eq!(a.label(), before, "the label is as it was");
+        let w = wrote(&a, EntryType::Fact).await;
+        assert_eq!(
+            (w.reach, w.task.as_deref()),
+            (Reach::Tap, Some(t.id.as_str()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_raw_entry_with_tap_reach_is_served_to_a_second_session_that_holds_its_task() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(owner(dir.path()));
+        let (t, n) = noted(dir.path()).await;
+        let b = holder(dir.path(), "agent:b", &t.id).await;
+        assert!(serves(&b, &n).await);
+        assert!(b.t0(None).await.unwrap().contains(&n), "in its T0");
+        // a view of the session reads with the chain of the session
+        assert!(serves(&b.for_request().unwrap(), &n).await);
+    }
+
+    #[tokio::test]
+    async fn a_raw_entry_with_tap_reach_is_not_served_outside_its_task_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (_, n) = noted(dir.path()).await;
+        let none = agent(dir.path(), "agent:none");
+        assert!(!serves(&none, &n).await, "an agent with no task");
+        assert!(!none.t0(None).await.unwrap().contains(&n));
+        let other = o.file_own(spec("Other work")).await.unwrap().task;
+        let b = holder(dir.path(), "agent:b", &other.id).await;
+        assert!(!serves(&b, &n).await, "an agent on an unrelated task");
+        assert!(!b.t0(None).await.unwrap().contains(&n));
+        // the answer for it is the answer for an entry that does not exist
+        let missing = n.replace("mem-", "mem-no-");
+        for id in [&n, &missing] {
+            let refused = b.get(id).await.unwrap_err();
+            assert!(
+                matches!(&refused, Error::NotFound(named) if named == id),
+                "{refused}"
+            );
+        }
+        assert!(!b.read_outside(), "nothing was served");
+    }
+
+    #[tokio::test]
+    async fn the_chain_is_one_step_around_the_held_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (t, n) = noted(dir.path()).await;
+        let child = ledger_task(&o, "Child", Some(format!("task:{}", t.id)), &[]).await;
+        let around = [
+            child.clone(),
+            ledger_task(&o, "Resume", Some(dm_ledger::continues(&t.id)), &[]).await,
+            ledger_task(&o, "Retry", Some(format!("retries:{}", t.id)), &[]).await,
+            ledger_task(&o, "Needs it", None, &[&t.id]).await,
+        ];
+        for task in &around {
+            let reader = holder(dir.path(), "agent:near", &task.id).await;
+            assert!(serves(&reader, &n).await, "{}", task.spec.title);
+        }
+        let grandchild =
+            ledger_task(&o, "Grandchild", Some(format!("task:{}", child.id)), &[]).await;
+        let far = holder(dir.path(), "agent:far", &grandchild.id).await;
+        assert!(!serves(&far, &n).await, "two steps from the task");
+        // the other way: the session on the task reads what the child's session wrote
+        let c = holder(dir.path(), "agent:child", &child.id).await;
+        assert!(serves(&c, &n).await);
+        let m = wrote(&c, EntryType::Handoff).await;
+        assert_eq!(
+            (m.reach, m.task.as_deref()),
+            (Reach::Tap, Some(child.id.as_str()))
+        );
+        let parent = holder(dir.path(), "agent:parent", &t.id).await;
+        assert!(serves(&parent, &m.id).await);
+        assert!(serves(&far, &m.id).await, "a child of that task reads it");
+    }
+
+    #[tokio::test]
+    async fn a_task_that_needs_the_held_task_is_not_in_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (t, _) = noted(dir.path()).await;
+        let needs = ledger_task(&o, "Needs it", None, &[&t.id]).await;
+        let later = holder(dir.path(), "agent:later", &needs.id).await;
+        lock(&later.session).read_outside();
+        let m = wrote(&later, EntryType::Handoff).await;
+        assert_eq!(m.reach, Reach::Tap);
+        let on_t = holder(dir.path(), "agent:b", &t.id).await;
+        assert!(!serves(&on_t, &m.id).await);
+    }
+
+    #[tokio::test]
+    async fn a_held_task_that_the_ledger_does_not_hold_is_a_chain_of_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(owner(dir.path()));
+        let n = tap_entry(dir.path()).await;
+        let a = holder(dir.path(), "agent:a", PLANTED).await;
+        assert!(serves(&a, &n).await);
+        a.sync_chain().await.unwrap();
+        assert!(serves(&a, &n).await, "asked again");
+    }
+
+    #[tokio::test]
+    async fn after_a_fan_out_the_session_reads_what_a_child_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(owner(dir.path()));
+        let t = tap_task(dir.path(), "From the tracker").await;
+        let p = holder(dir.path(), "agent:p", &t.id).await;
+        let view = p.for_request().unwrap();
+        let f = p
+            .fan_out(&t.id, &[("Child".into(), "Do the child.".into())])
+            .await
+            .unwrap();
+        let (child, resume) = (&f.children[0], f.continuation.as_ref().unwrap());
+        let mut notes = Vec::new();
+        for (name, task) in [("agent:c", child), ("agent:r", resume)] {
+            let m = wrote(
+                &holder(dir.path(), name, &task.id).await,
+                EntryType::Handoff,
+            )
+            .await;
+            assert_eq!(m.reach, Reach::Tap);
+            notes.push(m.id);
+        }
+        for n in &notes {
+            assert!(serves(&p, n).await, "without holding the task again");
+            assert!(serves(&view, n).await, "a view made before the fan-out");
+        }
+        // a fan-out from a task that the session does not hold adds nothing
+        let q = agent(dir.path(), "agent:q");
+        let g = q
+            .fan_out(&child.id, &[("Deeper".into(), "Go on.".into())])
+            .await
+            .unwrap();
+        let deep = holder(dir.path(), "agent:d", &g.children[0].id).await;
+        let m = wrote(&deep, EntryType::Handoff).await;
+        assert_eq!(m.reach, Reach::Tap);
+        assert!(!serves(&q, &m.id).await);
+    }
+
+    #[tokio::test]
+    async fn the_owner_and_a_session_on_a_curator_s_task_read_every_raw_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (_, n) = noted(dir.path()).await;
+        assert!(serves(&o, &n).await, "the owner");
+        assert!(o.t0(None).await.unwrap().contains(&n));
+        for origin in ["curator:survey", "auditor:sample"] {
+            let duty = ledger_task(&o, "A duty", Some(origin.into()), &[]).await;
+            let s = holder(dir.path(), "agent:duty", &duty.id).await;
+            assert!(serves(&s, &n).await, "{origin}");
+            // a view keeps the filter of the policy, and not the reach of the task that
+            // the session held when the view was made
+            let view = s.for_request().unwrap();
+            assert!(serves(&view, &n).await, "{origin}");
+            let plain = o.file_own(spec("Plain work")).await.unwrap().task;
+            s.hold_task(&plain.id).await.unwrap();
+            assert!(!serves(&s, &n).await, "on another task after {origin}");
+            assert!(!serves(&view, &n).await, "the view, after {origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tap_is_handed_a_handoff_with_tap_reach_to_post_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let filed = TaskSpec {
+            origin: Some("github:acme/x#1".into()),
+            upstream_event: Some("open:2026-10-01T09:00:00Z".into()),
+            ..spec("From upstream")
+        };
+        let task = o.create_task(filed).await.unwrap().task;
+        o.admit(&task.id).await.unwrap();
+        let w = holder(dir.path(), "agent:w", &task.id).await;
+        lock(&w.session).read_outside();
+        w.claim(&task.id, Duration::minutes(5)).await.unwrap();
+        let h = wrote(&w, EntryType::Handoff).await;
+        assert_eq!(h.reach, Reach::Tap);
+        w.complete(&task.id, None, &h.id).await.unwrap();
+        let tap = agent(dir.path(), "tap:comments");
+        let due = tap.unposted("dom-me", Label::Restricted).await.unwrap();
+        assert_eq!(due.len(), 1, "the tap reads what it posts back");
+        assert_eq!(
+            (due[0].0.id.as_str(), &due[0].1.front.id),
+            (task.id.as_str(), &h.id)
+        );
+        assert_eq!(due[0].1.front.reach, Reach::Tap);
+        // the same question from an agent outside the chain hands out nothing
+        let outside = agent(dir.path(), "agent:other");
+        let none = outside.unposted("dom-me", Label::Restricted).await.unwrap();
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[tokio::test]
+    async fn once_curated_the_entry_is_served_to_an_agent_with_no_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (_, n) = noted(dir.path()).await;
+        assert!(!serves(&agent(dir.path(), "agent:before"), &n).await);
+        o.promote(&n, TrustTier::Curated, "Checked against the runbook.")
+            .await
+            .unwrap();
+        let after = agent(dir.path(), "agent:after");
+        assert!(serves(&after, &n).await);
+        assert!(!after.read_outside(), "a curated entry");
+    }
+
+    #[tokio::test]
+    async fn a_member_of_the_chain_does_not_curate_an_entry_with_tap_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (t, n) = noted(dir.path()).await;
+        let b = holder(dir.path(), "agent:b", &t.id).await;
+        let refused = b
+            .promote(&n, TrustTier::Curated, "It reads well.")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, Error::Denied(why) if why.contains("A curator or a person curates")),
+            "{refused}"
+        );
+        assert_eq!(o.get(&n).await.unwrap().front.trust_tier, TrustTier::Raw);
+        // a proposal for verified is a task for a person, and it is filed
+        let proposed = b
+            .promote(&n, TrustTier::Verified, "It reads well.")
+            .await
+            .unwrap();
+        assert!(matches!(proposed, crate::Promotion::Proposed { .. }));
+        // a session on a curator's task curates it, and so does the owner
+        let other = wrote(
+            &holder(dir.path(), "agent:a2", &t.id).await,
+            EntryType::Handoff,
+        )
+        .await;
+        let duty = ledger_task(&o, "Survey", Some("curator:survey".into()), &[]).await;
+        let curator = holder(dir.path(), "agent:curator", &duty.id).await;
+        for (m, id) in [(&curator, &other.id), (&o, &n)] {
+            let done = m.promote(id, TrustTier::Curated, "Checked.").await.unwrap();
+            assert!(matches!(done, crate::Promotion::Promoted { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_curates_an_entry_of_the_fleet_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let fleet = wrote(&o, EntryType::Fact).await;
+        let b = agent(dir.path(), "agent:b");
+        let done = b
+            .promote(&fleet.id, TrustTier::Curated, "Checked.")
+            .await
+            .unwrap();
+        assert!(matches!(done, crate::Promotion::Promoted { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_root_policy_narrows_an_agent_to_the_raw_entries_of_its_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (t, n) = noted(dir.path()).await;
+        let fleet = wrote(&o, EntryType::Fact).await;
+        assert_eq!(fleet.reach, Reach::Fleet);
+        let before = holder(dir.path(), "agent:b", &t.id).await;
+        assert!(serves(&before, &fleet.id).await);
+        agents_read(dir.path(), "\"raw_reach\": \"chain\"");
+        let b = holder(dir.path(), "agent:b", &t.id).await;
+        assert!(!serves(&b, &fleet.id).await, "a raw entry of the fleet");
+        assert!(serves(&b, &n).await, "a raw entry of its chain");
+        assert!(serves(&o, &fleet.id).await, "the owner reads as before");
+        let log = std::fs::read_to_string(dir.path().join("state/decisions.jsonl")).unwrap();
+        for word in [
+            "raw entries: chain",
+            "raw entries: fleet",
+            "raw entries: all",
+        ] {
+            assert!(log.contains(word), "{word}: {log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_root_policy_widens_an_agent_to_every_raw_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(owner(dir.path()));
+        let (_, n) = noted(dir.path()).await;
+        agents_read(dir.path(), "\"raw_reach\": \"all\"");
+        assert!(serves(&agent(dir.path(), "agent:none"), &n).await);
+    }
+
+    #[tokio::test]
+    async fn a_policy_that_requires_curated_entries_serves_no_raw_entry_of_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (t, n) = noted(dir.path()).await;
+        agents_read(dir.path(), "\"min_tier\": \"curated\"");
+        let b = holder(dir.path(), "agent:b", &t.id).await;
+        assert!(!serves(&b, &n).await);
+        o.promote(&n, TrustTier::Curated, "Checked.").await.unwrap();
+        assert!(serves(&b, &n).await, "curated, it is served");
+    }
+
+    #[tokio::test]
+    async fn a_held_task_above_the_handling_of_the_session_gives_no_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let internal = TaskSpec {
+            classification: Label::Internal,
+            ..spec("Internal work")
+        };
+        let t = o.file_own(internal).await.unwrap().task;
+        assert_eq!(t.spec.classification, Label::Internal);
+        agents_read(dir.path(), "\"handling\": \"public\"");
+        // a public entry with tap reach that names the task
+        let x = agent(dir.path(), "agent:x");
+        x.set_held_task(&t.id);
+        lock(&x.session).read_outside();
+        let n = x
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req(EntryType::Handoff, "# Steps\n\nFive planted steps.\n")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (n.classification, n.reach, n.task.as_deref()),
+            (Label::Public, Reach::Tap, Some(t.id.as_str()))
+        );
+        let b = holder(dir.path(), "agent:b", &t.id).await;
+        assert!(!serves(&b, &n.id).await);
+        assert!(serves(&o, &n.id).await);
+    }
+
+    #[tokio::test]
+    async fn an_import_from_another_owner_is_served_to_an_agent_once_it_is_curated() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let alice = Memory::init(a_dir.path(), "human:test:alice", "dom-a").unwrap();
+        let w = alice
+            .write(WriteRequest {
+                classification: Some(Label::Public),
+                ..req(
+                    EntryType::Decision,
+                    "Alice decided on five planted steps.\n",
+                )
+            })
+            .await
+            .unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        alice
+            .export(None, Label::Internal, bundle.path())
+            .await
+            .unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let bob = Memory::init(b_dir.path(), "human:test:bob", "dom-b").unwrap();
+        bob.import(bundle.path(), None).await.unwrap();
+        let a = agent(b_dir.path(), "agent:a");
+        assert!(!serves(&a, &w.id).await, "raw, from another owner");
+        assert!(serves(&bob, &w.id).await, "the owner looks at it first");
+        bob.promote(&w.id, TrustTier::Curated, "Read and checked.")
+            .await
+            .unwrap();
+        assert!(serves(&a, &w.id).await);
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_task_reads_the_raw_fleet_and_chain_entries_of_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let fleet = wrote(&agent(dir.path(), "agent:w1"), EntryType::Fact).await;
+        let other = o.file_own(spec("Other work")).await.unwrap().task;
+        let w2 = holder(dir.path(), "agent:w2", &other.id).await;
+        let chain = wrote(&w2, EntryType::Handoff).await;
+        assert_eq!(
+            (fleet.reach, chain.reach, chain.task.as_deref()),
+            (Reach::Fleet, Reach::Chain, Some(other.id.as_str()))
+        );
+        let none = agent(dir.path(), "agent:none");
+        assert!(serves(&none, &fleet.id).await);
+        assert!(serves(&none, &chain.id).await);
+        assert!(!none.read_outside());
     }
 }

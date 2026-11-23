@@ -1459,7 +1459,7 @@ async fn serve_stdio_cmd(root: &Path, author: Option<String>, manifest: Vec<Stri
     // a harness working a task has it in MEMORY_TASK, as the launcher sets it;
     // what this session files or writes is judged against that task
     if let Some(t) = std::env::var("MEMORY_TASK").ok().filter(|t| !t.is_empty()) {
-        m.set_held_task(&t);
+        m.hold_task(&t).await?;
     }
     m.set_tools(taps::TapTools::for_root(root));
     mcp::serve_stdio(Arc::new(m)).await?;
@@ -3841,7 +3841,7 @@ impl Session {
         let mut env = self.p.harness_env.clone();
         if let Some(t) = task {
             env.push(("MEMORY_TASK".to_string(), t.to_string()));
-            self.p.memory.set_held_task(t);
+            self.p.memory.hold_task(t).await?;
         }
         let mut full: Vec<String> = [self.program.as_slice(), args].concat();
         if let Some(m) = &self.model {

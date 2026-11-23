@@ -325,6 +325,9 @@ pub struct Memory {
     /// from is judged against that task's requirements. Shared by the views of a
     /// session ([`Memory::for_request`]), as every count below that is kept per session.
     held: Arc<Mutex<Option<String>>>,
+    /// The task chain of the held task, which the read filter carries
+    /// ([`Memory::sync_chain`]). Shared by the views of a session, as the held task is.
+    chain: Arc<Mutex<reach::Chain>>,
     /// How many entries this session has superseded: the blast-radius gate's count.
     superseded: Arc<AtomicUsize>,
     /// The claims this session made, each task with the generation the ledger gave: the
@@ -504,6 +507,7 @@ impl Memory {
             written: (AtomicUsize::new(0), AtomicUsize::new(0)),
             policy: Arc::new(std::sync::RwLock::new(std::sync::Arc::new(policy))),
             held: Arc::default(),
+            chain: Arc::default(),
             superseded: Arc::new(AtomicUsize::new(0)),
             claims: Arc::default(),
             scope: Mutex::new(None),
@@ -535,7 +539,8 @@ impl Memory {
     ///
     /// When the policy fails to give the read scope.
     pub fn for_request(&self) -> Result<Memory, Error> {
-        let scope = self.session_filter()?;
+        // without the chain: each read of the view lays the chain of that moment over it
+        let scope = self.policy_filter()?;
         let version = self.policy().version().to_string();
         let mut session = self.grants.session();
         session.handling = session.handling.min(scope.handling);
@@ -557,6 +562,7 @@ impl Memory {
             written: (AtomicUsize::new(0), AtomicUsize::new(0)),
             policy: Arc::clone(&self.policy),
             held: Arc::clone(&self.held),
+            chain: Arc::clone(&self.chain),
             superseded: Arc::clone(&self.superseded),
             claims: Arc::clone(&self.claims),
             scope: Mutex::new(Some((version, scope))),
@@ -574,8 +580,17 @@ impl Memory {
     /// The read filter for this session: the policy's read scope for this principal,
     /// evaluated once and narrowed against the grants, so the policy can take reads
     /// away and never add them. The session's handling is capped at it as well. The
-    /// decision is logged like any other.
+    /// decision is logged like any other. The task chain of the held task is laid over
+    /// it on each call, as the chain is at that moment. This function never asks the
+    /// ledger: its callers can hold the ledger.
     fn session_filter(&self) -> Result<ReadFilter, Error> {
+        Ok(self.over_chain(self.policy_filter()?))
+    }
+
+    /// The part of the read filter that the policy gives, kept until the policy in force
+    /// is another: the domains, the handling, the lowest tier, and which raw entries the
+    /// principal reads. It has no task chain.
+    fn policy_filter(&self) -> Result<ReadFilter, Error> {
         self.fresh()?;
         let policy = self.policy();
         if let Some((version, f)) = lock(&self.scope).as_ref() {
@@ -596,9 +611,9 @@ impl Memory {
             spend: None,
             fetch: None,
         };
-        let f = policy
-            .read_scope(&input)?
-            .narrow(&self.grants.read_filter());
+        let scope = policy.read_scope(&input)?;
+        let mut f = scope.narrow(&self.grants.read_filter());
+        f.raw_reach = scope.raw_reach_for(input.principal.class);
         {
             // from the grants each time, so a filter that widens again widens the
             // session's handling with it
@@ -612,10 +627,11 @@ impl Memory {
                 admit: false,
                 review: dm_policy::decide::Review::None,
                 reason: format!(
-                    "reads {} at most {} from {} up",
+                    "reads {} at most {} from {} up, raw entries: {}",
                     f.domains.join(", "),
                     f.handling,
-                    f.min_tier
+                    f.min_tier,
+                    reach::raw_reach_word(f.raw_reach)
                 ),
                 policy: policy.version().to_string(),
                 cites: Vec::new(),
@@ -688,8 +704,11 @@ impl Memory {
     /// The task this session runs on: a launcher sets it before the harness starts,
     /// so a task the session files is judged against the one it holds. A launcher that
     /// works one task after another sets it for each: the task held is the latest set.
+    /// The task chain becomes this task alone; [`Memory::hold_task`] also asks the ledger
+    /// for the tasks around it.
     pub fn set_held_task(&self, id: &str) {
         *lock(&self.held) = Some(id.to_string());
+        *lock(&self.chain) = reach::Chain::of(id);
     }
 
     /// The task this session runs on, when a launcher set one.
@@ -1436,12 +1455,13 @@ impl Memory {
         let Some(held) = &self.held_task() else {
             return TrustTier::Raw;
         };
-        let curating = self.ledger.lock().await.get(held).await.is_ok_and(|t| {
-            t.spec
-                .origin
-                .as_deref()
-                .is_some_and(|o| o.starts_with("curator:") || o.starts_with("auditor:"))
-        });
+        let curating = self
+            .ledger
+            .lock()
+            .await
+            .get(held)
+            .await
+            .is_ok_and(|t| reach::curates(&t));
         if curating {
             TrustTier::Curated
         } else {
@@ -1510,6 +1530,7 @@ impl Memory {
         if to == TrustTier::Verified {
             return self.propose(entry, why).await;
         }
+        self.may_curate(&entry)?;
         // the record first: a promotion the ledger cannot keep is not made, and one whose
         // new version fails is made again with the record it already has
         let record = self.promotion_spec(&entry, to, why);
@@ -2772,6 +2793,8 @@ impl Memory {
             });
         }
         let continuation = self.file_continuation(&mut l, &parent, ids).await?;
+        // the ledger is held here, so the chain takes them without a question to it
+        self.chain_takes(&parent.id, children.iter().chain([&continuation]));
         for old in folded {
             l.invalidate(
                 &old,
