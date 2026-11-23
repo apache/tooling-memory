@@ -1153,10 +1153,30 @@ impl Memory {
     /// The handoff a task tool names, read on behalf of that write: under the granted
     /// filter, so a session whose settings leave retrieval out, or whose snapshot is
     /// before its own handoff, still releases a task with the handoff it wrote. The
-    /// entry is checked and not returned to the caller.
+    /// entry is checked and not returned to the caller, so the read log and the
+    /// manifest of a decision context do not name it as served. The session's label
+    /// rises as for a get: the task now names the entry. An entry that is not served
+    /// is explained only as far as the session's own filter reads: a successor that the
+    /// settings or the snapshot leave out is not named.
     async fn get_for_task(&self, id: &str) -> Result<Entry, Error> {
-        let f = self.granted_filter()?;
-        self.get_under(id, &f).await
+        let granted = self.granted_filter()?;
+        let own = self.session_filter()?;
+        let meta = self.index.lock().await.meta(id, &granted)?;
+        let Some(meta) = meta else {
+            return Err(self.not_served(id, None, &own).await);
+        };
+        let entry = self
+            .store
+            .get(&meta.hit.domain, id)
+            .await?
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        if !entry.is_active() {
+            return Err(self.not_served(id, entry.front.status, &own).await);
+        }
+        if !lock(&self.session).observe(entry.front.classification) {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        Ok(entry)
     }
 
     /// [`Memory::get`] under `f`.

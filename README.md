@@ -208,6 +208,10 @@ two weeks. It is also the reason that none of it is the production shape.
     frozen task set.
   - The demo's task set has no task with a recorded failure, so the survivorship trap
     stays open and each verdict of the demo is inconclusive.
+  - The snapshot bounds entries and transcripts only. A run reads the tasks of the
+    ledger as they are now, so text that one run files as a task can reach a later run
+    in any arm. The leakage trap does not see this.
+  - The tape of a transcript-replay run does not hold the replayed text or its digest.
   - The standing holdout is not built. A scorecard compares arms only, not a change of
     model or of harness.
   - The arm flags do not reach the `wslc` sandbox backend or `amem work`.

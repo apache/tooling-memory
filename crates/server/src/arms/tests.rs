@@ -770,6 +770,25 @@ async fn transcripts_are_replayed_under_the_handling_and_the_snapshot() {
     assert_eq!(other.unwrap(), "", "no transcript in the other domain");
 }
 
+/// What a harness is given: the prompt alone, or the replayed transcripts and then the
+/// prompt. A launch and a re-run of its tape both take the text from here.
+#[tokio::test]
+async fn the_prompt_given_has_the_replayed_transcripts_in_front() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = root(dir.path());
+    let kept_at = SNAPSHOT - Duration::hours(1);
+    keep(&owner, "sess-new", Label::Internal, kept_at, "Answer two.").await;
+    let off = capped(dir.path(), None);
+    let alone = off.prompt_given("What now?", TRANSCRIPT_BUDGET_TOKENS);
+    assert_eq!(alone.await.unwrap(), "What now?");
+    let m = capped(dir.path(), Some(replay_at(SNAPSHOT)));
+    let replayed = m.transcript_context(None, TRANSCRIPT_BUDGET_TOKENS);
+    let replayed = replayed.await.unwrap();
+    assert!(replayed.contains("Answer two."));
+    let given = m.prompt_given("What now?", TRANSCRIPT_BUDGET_TOKENS);
+    assert_eq!(given.await.unwrap(), format!("{replayed}\nWhat now?"));
+}
+
 #[tokio::test]
 async fn a_transcript_that_does_not_fit_the_budget_is_left_out_whole() {
     let dir = tempfile::tempdir().unwrap();
@@ -910,6 +929,97 @@ async fn a_session_that_reads_nothing_still_writes_and_hands_off() {
         assert_eq!(m.written(), (1, 1));
         assert!(agent(dir.path(), None).get(&handoff).await.is_ok());
     }
+}
+
+async fn hand_off(m: &Memory, supersedes: Option<&str>) -> String {
+    let written = m.write(WriteRequest {
+        domain: Some("dom-a".into()),
+        entry_type: EntryType::Handoff,
+        body: "# Stopped\n\nThe importer is half tidy.\n".into(),
+        supersedes: supersedes.map(str::to_string),
+        ..WriteRequest::default()
+    });
+    written.await.unwrap().id
+}
+
+/// The handoff that a task tool names is checked, and it is not served: no line in
+/// the read log and no entry in the manifest of a decision context names it. A
+/// session whose settings leave the successor of a handoff out does not learn its id.
+#[tokio::test]
+async fn a_handoff_named_to_a_task_tool_is_checked_and_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = root(dir.path());
+    let writer = agent(dir.path(), None);
+    let old = hand_off(&writer, None).await;
+    let new = hand_off(&writer, Some(&old)).await;
+    let id = open_task(&owner, "Tidy").await;
+    let m = agent(dir.path(), Some(Arm::NoMemory.settings()));
+    m.claim(&id, Duration::minutes(5)).await.unwrap();
+    let moved = m.release(&id, None, Some(&old)).await;
+    assert!(matches!(moved, Err(Error::NotFound(_))), "{moved:?}");
+    let own = hand_off(&m, None).await;
+    let before = m.label();
+    m.release(&id, None, Some(&own)).await.unwrap();
+    assert!(m.label() >= before, "the label does not fall");
+    assert!(m.reads.take_returned().is_empty(), "nothing was served");
+    let logged = crate::reads::all(dir.path()).unwrap();
+    assert_eq!(logged.iter().filter(|r| r.tool == "get").count(), 0);
+    // a session that reads the successor is told where the handoff moved
+    let other = open_task(&owner, "Sweep").await;
+    let full = agent(dir.path(), None);
+    full.claim(&other, Duration::minutes(5)).await.unwrap();
+    let moved = full.release(&other, None, Some(&old)).await;
+    assert!(
+        matches!(&moved, Err(Error::Moved { to, .. }) if *to == new),
+        "{moved:?}"
+    );
+}
+
+/// An export is a read: settings that read no entry export none, and a snapshot
+/// bounds what an export holds.
+#[tokio::test]
+async fn an_export_holds_no_more_than_the_settings_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = root(dir.path());
+    Put::new("mem-a-fact", EntryType::Fact).into(&owner).await;
+    Put::new("mem-a-late", EntryType::Fact)
+        .created(SNAPSHOT + Duration::hours(1))
+        .into(&owner)
+        .await;
+    for arm in [Arm::NoMemory, Arm::T0Only] {
+        let m = agent(dir.path(), Some(arm.settings()));
+        let out = tempfile::tempdir().unwrap();
+        let exported = m.export(Some("dom-a"), Label::Internal, out.path()).await;
+        let why = exported.map(|e| e.manifest.entries.len());
+        assert!(
+            matches!(&why, Err(Error::Bundle(crate::bundle::Error::Invalid(w))) if w.contains("read no entry")),
+            "{arm}: {why:?}"
+        );
+        assert_eq!(m.label(), Label::Public, "{arm}");
+    }
+    let ids_of = |settings: Option<Settings>| {
+        let m = agent(dir.path(), settings);
+        async move {
+            let out = tempfile::tempdir().unwrap();
+            let exported = m.export(Some("dom-a"), Label::Internal, out.path());
+            let mut ids: Vec<String> = exported
+                .await
+                .unwrap()
+                .manifest
+                .entries
+                .into_iter()
+                .map(|e| e.id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        }
+    };
+    assert_eq!(ids_of(None).await, ["mem-a-fact", "mem-a-late"]);
+    let at_a_snapshot = Settings {
+        not_after: Some(SNAPSHOT),
+        ..Settings::default()
+    };
+    assert_eq!(ids_of(Some(at_a_snapshot)).await, ["mem-a-fact"]);
 }
 
 /// The prefetch switch alone: nothing is pushed, and retrieval stays.

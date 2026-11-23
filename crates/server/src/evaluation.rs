@@ -17,7 +17,7 @@
 //!
 //! A pair is one task and one seed with a run in an arm and a run in the baseline arm.
 //! [`compare`] takes the difference of each pair, arm minus baseline, and gives the mean
-//! with an interval from the normal approximation. The margin and the accepted cost of
+//! with a 95% interval from Student's t. The margin and the accepted cost of
 //! the plan turn the two intervals into a [`Finding`]. A finding is not a verdict. The
 //! five replay traps are checked on every scorecard, and an open trap makes each verdict
 //! [`Verdict::Inconclusive`]. A drift window of the runs' model that overlaps the runs
@@ -158,6 +158,15 @@ fn refuse(why: &str) -> Error {
     Error::Denied(format!("the plan is refused: {why}"))
 }
 
+/// Whether `name` is one word that the info line of a fence holds as it is: lower-case
+/// letters, digits and `-`, and not empty.
+fn is_one_word(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 fn arm_of(name: &str) -> Result<Arm, Error> {
     name.parse::<Arm>().map_err(|e| refuse(&e))
 }
@@ -215,7 +224,7 @@ impl Plan {
     /// # Errors
     ///
     /// [`Error::Denied`], with the reason, for text that is not TOML, that has no
-    /// `[plan]` table, no margin or a margin outside 0 to 1, fewer than two seeds, an
+    /// `[plan]` table, a name that is not one word, no margin or a margin outside 0 to 1, fewer than two seeds, an
     /// arm that is no arm, an arm named twice, a baseline that is not among the arms,
     /// no task, a task id named twice, or a judge that is the model.
     pub fn parse(text: &str) -> Result<Plan, Error> {
@@ -224,6 +233,11 @@ impl Plan {
         let Some(table) = file.plan else {
             return Err(refuse("it has no [plan] table"));
         };
+        if !is_one_word(&table.name) {
+            return Err(refuse(
+                "its name is not one word of the letters a to z, the digits and `-`",
+            ));
+        }
         let (margin, accepted_cost) = numbers_of(&table)?;
         let arms = arms_of(&table.arms)?;
         let baseline = arm_of(&table.baseline)?;
@@ -505,8 +519,30 @@ fn mean(values: &[f64]) -> f64 {
     values.iter().sum::<f64>() / values.len() as f64
 }
 
-/// The mean of `differences` with `mean ± 1.96 * sd / sqrt(n)`, the sample standard
-/// deviation. With fewer than two differences the interval is the mean alone.
+/// The 0.975 quantile of Student's t for 1 to 30 degrees of freedom.
+const T_975: [f64; 30] = [
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+    2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+    2.052, 2.048, 2.045, 2.042,
+];
+
+/// The factor of a 95% interval of a mean of `n` differences: the 0.975 quantile of
+/// Student's t with `n - 1` degrees of freedom. Above 30 degrees it is the quantile of
+/// the last tabled count below, which is never the smaller one: 30, 40, 60 or 120.
+fn factor(n: usize) -> f64 {
+    match n.saturating_sub(1) {
+        0 => f64::INFINITY,
+        df @ 1..=30 => T_975[df - 1],
+        31..=39 => 2.042,
+        40..=59 => 2.021,
+        60..=119 => 2.000,
+        _ => 1.980,
+    }
+}
+
+/// The mean of `differences` with `mean ± t * sd / sqrt(n)`: the sample standard
+/// deviation, and t from [`factor`], so that two pairs give a wide interval and not a
+/// finding from noise. With fewer than two differences the interval is the mean alone.
 fn interval(differences: &[f64]) -> Interval {
     let m = mean(differences);
     if differences.len() < 2 {
@@ -518,7 +554,7 @@ fn interval(differences: &[f64]) -> Interval {
     }
     let n = differences.len() as f64;
     let variance = differences.iter().map(|d| (d - m).powi(2)).sum::<f64>() / (n - 1.0);
-    let half = 1.96 * variance.sqrt() / n.sqrt();
+    let half = factor(differences.len()) * variance.sqrt() / n.sqrt();
     Interval {
         mean: rounded(m),
         low: rounded(m - half),
@@ -662,20 +698,39 @@ fn one_snapshot(facts: &[Fact]) -> Option<OffsetDateTime> {
         .then_some(first)
 }
 
+/// Whether every arm outside the baseline has a pair on a task of the plan that `is`:
+/// a run of the arm, and the baseline's run of the same task and seed. A task of the
+/// plan that no arm ran shows nothing.
+fn every_arm_pairs(plan: &Plan, facts: &[Fact], is: impl Fn(&PlanTask) -> bool) -> bool {
+    let ran = |arm: Arm, task: &str, seed: u32| {
+        facts
+            .iter()
+            .any(|f| f.run.arm == arm && f.run.task == task && f.run.seed == seed)
+    };
+    let outside = plan.arms.iter().filter(|a| **a != plan.baseline);
+    outside.into_iter().all(|&arm| {
+        facts.iter().any(|f| {
+            f.run.arm == arm
+                && plan.task(&f.run.task).is_some_and(&is)
+                && ran(plan.baseline, &f.run.task, f.run.seed)
+        })
+    })
+}
+
 /// The five replay traps of an evaluation, in the paper's order.
 fn traps_of(plan: &Plan, facts: &[Fact], arms: &[ArmScore], started: OffsetDateTime) -> Vec<Trap> {
-    let failed = plan.tasks.iter().any(|t| t.stratum == Stratum::Failed);
+    let failed = every_arm_pairs(plan, facts, |t| t.stratum == Stratum::Failed);
     let before = one_snapshot(facts).is_some_and(|s| s <= started);
     let seeds = arms.iter().all(|a| a.baseline || a.seeds >= 2);
     let judge = facts.iter().all(|f| f.judge == plan.judge);
-    let frozen = plan.tasks.iter().any(|t| t.set == TaskSet::Frozen);
-    let rolling = plan.tasks.iter().any(|t| t.set == TaskSet::Rolling);
+    let frozen = every_arm_pairs(plan, facts, |t| t.set == TaskSet::Frozen);
+    let rolling = every_arm_pairs(plan, facts, |t| t.set == TaskSet::Rolling);
     vec![
         trap(
             TRAPS[0],
             failed,
-            "The plan has a task that failed in production.",
-            "The plan has no task with the stratum `failed`: tasks that passed say nothing about the tasks that failed.",
+            "Every arm has a pair on a task that failed in production.",
+            "An arm has no pair on a task with the stratum `failed`: tasks that passed say nothing about the tasks that failed.",
         ),
         trap(
             TRAPS[1],
@@ -698,8 +753,8 @@ fn traps_of(plan: &Plan, facts: &[Fact], arms: &[ArmScore], started: OffsetDateT
         trap(
             TRAPS[4],
             frozen && rolling,
-            "The plan has a frozen task and a rolling task.",
-            "The plan needs a frozen task and a rolling task: one set alone does not show a shift of the tasks.",
+            "Every arm has a pair on a frozen task and a pair on a rolling task.",
+            "An arm needs a pair on a frozen task and a pair on a rolling task: one set alone does not show a shift of the tasks.",
         ),
     ]
 }
@@ -1069,7 +1124,8 @@ impl Memory {
         .await
     }
 
-    /// The scorecards the record keeps, newest first, at most `limit`. They are served
+    /// The scorecards the record keeps, newest first, at most `limit`: the entries that
+    /// the owner wrote, as [`Memory::keep_scorecard`] writes them. They are served
     /// under this session's read filter, as `list` and `get` serve entries: the label
     /// of the session rises, and a session that does not read the entry gets nothing
     /// of it. Empty when the grants name no platform domain.
@@ -1093,6 +1149,11 @@ impl Memory {
             let Ok(entry) = self.get(&hit.id).await else {
                 continue;
             };
+            // the owner keeps a scorecard: an entry of another author is none, whatever
+            // its title and its body say
+            if entry.front.author != self.grants.owner {
+                continue;
+            }
             let kept = artifacts_in(&entry)
                 .into_iter()
                 .filter(|a| a.kind == KIND)

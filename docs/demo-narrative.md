@@ -414,7 +414,8 @@ model, so the scorer does not take them on trust from the script. For each arm, 
 prints the passes, the mean cost in tokens, and the paired differences from the baseline
 in success and in cost, each with its interval. Then it prints the finding and the
 verdict. It prints the five replay traps, each held or open. Expect the survivorship
-trap to be open: the demo's tasks have no recorded failure. Thus each verdict reads
+trap to be open: the demo's tasks have no recorded failure. The two tasks of this act are
+both frozen, so the distribution-shift trap is open too. Thus each verdict reads
 `inconclusive`, and the finding from the numbers stays beside it. Say why: tasks that
 passed say nothing about tasks that failed. The scorecard is kept as a decision entry in
 the platform domain, and the last line lists the kept scorecards.

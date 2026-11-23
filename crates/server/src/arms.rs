@@ -417,6 +417,23 @@ impl Memory {
         })
     }
 
+    /// The text a harness is given for `prompt`: the transcripts of
+    /// [`Memory::transcript_context`], when there are any, and then the prompt. A launch
+    /// and a re-run of its tape both give the harness this text, so a re-run under the
+    /// settings of the transcript-replay arm is a run of that arm.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::transcript_context`].
+    pub async fn prompt_given(&self, prompt: &str, budget_tokens: usize) -> Result<String, Error> {
+        let replayed = self.transcript_context(None, budget_tokens).await?;
+        Ok(if replayed.is_empty() {
+            prompt.to_string()
+        } else {
+            format!("{replayed}\n{prompt}")
+        })
+    }
+
     /// The transcripts the transcript-replay arm puts in front of a prompt: empty
     /// unless the setting is on. Else the live transcripts of the domains this session's
     /// policy lets it read (of `domain` when one is named), at or below its handling

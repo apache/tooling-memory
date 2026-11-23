@@ -280,6 +280,10 @@ def main():
         if "plan" not in spec:
             sys.exit(f"{args.set} has no [plan] table: an arm run is a run of a plan")
         seeds = spec["plan"]["seeds"] if seeds is None else seeds
+        # a scorecard compares arms on one harness: the outcomes of two harnesses in
+        # one file are refused by `amem eval score`, after every run was paid for
+        if len(harnesses) > 1:
+            sys.exit("an arm run takes one harness: `amem eval score` refuses outcomes from more than one")
     # one snapshot for every arm run, taken before the first run of any condition
     as_of = snapshot(time.time())
     env = dict(os.environ)

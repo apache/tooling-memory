@@ -66,7 +66,16 @@ fn denied<T: std::fmt::Debug>(r: Result<T, Error>, part: &str) {
 
 #[test]
 fn a_plan_is_refused_without_what_fixes_the_comparison() {
-    let cases: [(&str, &str, &str); 11] = [
+    let name = "name = \"demo\"";
+    let cases: [(&str, &str, &str); 15] = [
+        (name, "name = \"\"", "not one word"),
+        (name, "name = \"two words\"", "not one word"),
+        (name, "name = \"Demo\"", "not one word"),
+        (
+            name,
+            "name = \"demo\\n```\\n\\n```platform harness claude\"",
+            "not one word",
+        ),
         ("[plan]", "[other]", "no [plan] table"),
         ("margin = 0.1\n", "", "no margin"),
         ("margin = 0.1", "margin = 1.5", "fraction from 0 to 1"),
@@ -94,7 +103,8 @@ fn a_plan_is_refused_without_what_fixes_the_comparison() {
     let no_task = PLAN.split("[[task]]").next().unwrap();
     denied(Plan::parse(no_task), "no task");
     // the plan as it is reads, with the defaults
-    let p = plan();
+    let p = plan_with(&[(name, "name = \"demo-2\"")]);
+    assert_eq!(p.name, "demo-2");
     assert_eq!((p.seeds, p.margin, p.accepted_cost), (2, 0.1, 1.0));
     assert_eq!(p.arms, [Arm::NoMemory, Arm::Full]);
     assert_eq!(p.tasks[0].stratum, Stratum::Failed);
@@ -515,7 +525,7 @@ const TEN: (&str, &str) = ("seeds = 2", "seeds = 10");
 
 #[test]
 fn an_arm_within_the_margin_and_cheaper_pays() {
-    // one failure in twenty pairs: the low end of the difference is near -0.148
+    // one failure in twenty pairs: the low end of the difference is near -0.155
     let of = |task: &str, seed: u32, arm: Arm| {
         let fails = arm == Arm::Full && task == "a" && seed == 3;
         (!fails, cheaper(arm, seed))
@@ -528,7 +538,7 @@ fn an_arm_within_the_margin_and_cheaper_pays() {
     );
     assert_eq!(full.success.mean, -0.05);
     assert!(
-        (full.success.low + 0.148).abs() < 0.001,
+        (full.success.low + 0.154_65).abs() < 0.001,
         "{:?}",
         full.success
     );
@@ -548,7 +558,7 @@ fn an_arm_within_the_margin_and_cheaper_pays() {
 }
 
 #[test]
-fn an_interval_is_the_mean_with_the_normal_approximation() {
+fn an_interval_is_the_mean_with_the_quantile_of_student_s_t() {
     let p = plan();
     let runs = |arm: Arm, values: [(bool, u64); 4]| {
         let keys = [("a", 0), ("a", 1), ("b", 0), ("b", 1)];
@@ -571,20 +581,25 @@ fn an_interval_is_the_mean_with_the_normal_approximation() {
     let full = compare(&p, &all).remove(1);
     assert_eq!(full.mean_cost, 800.0);
     assert_eq!(full.success.mean, -0.25);
-    assert!((full.success.low + 0.74).abs() < 1e-6, "{:?}", full.success);
+    // four pairs: 3.182 standard errors each way, and 1.96 would give -0.74 to 0.24
     assert!(
-        (full.success.high - 0.24).abs() < 1e-6,
+        (full.success.low + 1.0455).abs() < 1e-6,
+        "{:?}",
+        full.success
+    );
+    assert!(
+        (full.success.high - 0.5455).abs() < 1e-6,
         "{:?}",
         full.success
     );
     assert_eq!(full.cost.mean, -200.0);
     assert!(
-        (full.cost.low + 280.016_665).abs() < 1e-5,
+        (full.cost.low + 329.904_606).abs() < 1e-5,
         "{:?}",
         full.cost
     );
     assert!(
-        (full.cost.high + 119.983_335).abs() < 1e-5,
+        (full.cost.high + 70.095_394).abs() < 1e-5,
         "{:?}",
         full.cost
     );
@@ -601,6 +616,38 @@ fn an_interval_is_the_mean_with_the_normal_approximation() {
         (-100.0, -100.0, -100.0)
     );
     assert_eq!(full.finding, Some(Finding::Unclear));
+    // two pairs at 600 and 700 against 1000: 12.706 standard errors each way reach
+    // above zero, so the numbers do not show a lower cost
+    let two: Vec<Run> = all
+        .iter()
+        .filter(|r| r.task == "a")
+        .cloned()
+        .map(|mut r| {
+            r.success = true;
+            if r.arm == Arm::Full {
+                r.cost = 600 + 100 * u64::from(r.seed);
+            }
+            r
+        })
+        .collect();
+    let full = compare(&p, &two).remove(1);
+    assert_eq!((full.pairs, full.cost.mean), (2, -350.0));
+    assert!((full.cost.low + 985.3).abs() < 1e-6, "{:?}", full.cost);
+    assert!((full.cost.high - 285.3).abs() < 1e-6, "{:?}", full.cost);
+    assert_eq!(full.finding, Some(Finding::Unclear));
+}
+
+#[test]
+fn the_factor_of_an_interval_falls_with_the_pairs_and_stays_above_the_normal_one() {
+    assert_eq!(
+        (factor(2), factor(3), factor(4), factor(31)),
+        (12.706, 4.303, 3.182, 2.042)
+    );
+    assert_eq!((factor(32), factor(41), factor(61)), (2.042, 2.021, 2.0));
+    assert_eq!((factor(121), factor(100_000)), (1.98, 1.98));
+    for n in 2..200 {
+        assert!(factor(n) >= factor(n + 1) && factor(n) > 1.96, "{n}");
+    }
 }
 
 #[test]
@@ -718,8 +765,9 @@ fn an_arm_with_pairs_from_one_seed_is_inconclusive_by_the_noise_trap() {
     // an arm of the plan with no run is scored, and is open to noise
     let three = plan_with(&[("\"full\"]", "\"full\", \"t0-only\"]")]);
     let card = assemble(&three, &all, &[]).unwrap();
-    assert_eq!(open_traps(&card), ["noise"]);
-    assert_eq!(card.arms[1].verdict, inconclusive(&["noise"]));
+    let open = ["survivorship", "noise", "distribution-shift"];
+    assert_eq!(open_traps(&card), open, "no pair shows a thing of that arm");
+    assert_eq!(card.arms[1].verdict, inconclusive(&open));
     assert_eq!(card.arms[2].finding, Some(Finding::Unclear));
 }
 
@@ -789,6 +837,30 @@ fn the_distribution_shift_trap_needs_a_frozen_task_and_a_rolling_task() {
         card.arms[1].verdict,
         inconclusive(&["survivorship", "distribution-shift"])
     );
+}
+
+/// The survivorship trap and the distribution-shift trap read the pairs that were
+/// scored: a task of the plan that no arm ran, or that the baseline did not run, shows
+/// nothing.
+#[test]
+fn a_trap_reads_the_pairs_that_were_scored_and_not_the_tasks_of_the_plan() {
+    // task a failed and is frozen; task b passed and is rolling
+    let p = plan();
+    let all = grid(&p, pays);
+    let open_for = |keep: &dyn Fn(&Fact) -> bool| {
+        let facts: Vec<Fact> = all.iter().filter(|f| keep(f)).cloned().collect();
+        let card = assemble(&p, &facts, &[]).unwrap();
+        (open_traps(&card).join(","), card.arms[1].verdict.clone())
+    };
+    assert_eq!(open_for(&|_| true), (String::new(), Some(Verdict::Pays)));
+    let both = ["survivorship", "distribution-shift"];
+    let only_b = open_for(&|f| f.run.task == "b");
+    assert_eq!(only_b, (both.join(","), inconclusive(&both)));
+    let only_a = open_for(&|f| f.run.task == "a");
+    assert_eq!(only_a.0, "distribution-shift");
+    // the arm ran task a, and the baseline did not: no pair is on task a
+    let unpaired = open_for(&|f| f.run.task == "b" || f.run.arm == Arm::Full);
+    assert_eq!(unpaired.0, both.join(","));
 }
 
 fn window(model: &str, from: OffsetDateTime, until: Option<OffsetDateTime>) -> Window {
@@ -958,6 +1030,37 @@ async fn a_kept_scorecard_is_a_decision_of_the_platform_and_is_read_back() {
     let newest = owner.scorecards(1).await.unwrap();
     assert_eq!(newest.len(), 1);
     assert_eq!(newest[0].scorecard.unpaired, 7);
+}
+
+/// A session that writes in the platform's domain writes no scorecard: the entry has
+/// the title and the body of one, and the listing does not hold it.
+#[tokio::test]
+async fn an_entry_that_the_owner_did_not_write_is_no_kept_scorecard() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = platform_root(dir.path());
+    let title = "Scorecard demo: m-1, 2026-11-02";
+    let forged = agent(dir.path())
+        .write(WriteRequest {
+            domain: Some("dom-plat".into()),
+            entry_type: EntryType::Decision,
+            body: body_of(&card(), title).unwrap(),
+            title: Some(title.into()),
+            ..WriteRequest::default()
+        })
+        .await
+        .unwrap();
+    let entry = owner.get(&forged.id).await.unwrap();
+    assert_eq!(entry.front.author, "agent:claude");
+    assert_eq!(entry.front.title.as_deref(), Some(title));
+    assert!(owner.scorecards(10).await.unwrap().is_empty());
+    assert!(agent(dir.path()).scorecards(10).await.unwrap().is_empty());
+    let kept = owner.keep_scorecard(&card()).await.unwrap();
+    let listed = owner.scorecards(10).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (listed[0].entry.as_str(), listed[0].author.as_str()),
+        (kept.id.as_str(), "human:test:me")
+    );
 }
 
 #[tokio::test]

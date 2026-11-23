@@ -1658,7 +1658,8 @@ Writes and the task tools work in each arm. `amem eval arms` prints the settings
 arm. In a session, the `settings` memory tool gives the settings and the arm.
 
 A set with a `[plan]` table is a plan. The plan fixes these before a run: the arms, the
-baseline arm, the number of seeds, the margin, the accepted cost and the judge. A task
+baseline arm, the number of seeds, the margin, the accepted cost and the judge. The name
+of a plan is one word of lower-case letters, digits and `-`. A task
 can have `set = "frozen"` or `stratum = "failed"`. `amem eval plan evals/demo.toml` prints
 the plan and its digest. Each run records the digest of its plan in its tape, and the
 scorer refuses an outcome whose tape names a different digest.
@@ -1672,8 +1673,10 @@ amem eval scorecards
 
 With arm names in `--conditions`, the script runs each task one time for each seed in
 each arm (`--seeds`, or the plan's). It takes the snapshot one time, five seconds before
-its first run, and gives it to each run with `--as-of`. Thus no run reads what a different
-run wrote. It writes `evals/out/<set>-<stamp>.outcomes.json` and prints the path on a line
+its first run, and gives it to each run with `--as-of`. Thus no run reads an entry or a
+transcript that a different run wrote. The snapshot does not cover the ledger: a run
+reads the tasks as they are at that moment. With arm names, the script takes one harness
+only, because a scorecard compares arms on one harness. It writes `evals/out/<set>-<stamp>.outcomes.json` and prints the path on a line
 that starts with `outcomes`. An outcome is `{session, success, cost, judge}`. The cost is
 the tokens that the harness counted: input, output, cache read and cache write. The
 script leaves out a run that has no session id or no token count, and names it on
@@ -1682,26 +1685,38 @@ stderr. The script uses the binary in `AMEM`, or `target/release/amem`.
 `amem eval score` is the owner's. It reads the task, the seed, the arm, the harness, the
 model and the snapshot of each run from the tape of its session. A pair is one task and
 one seed with a run in an arm and a run in the baseline arm. For each arm, the scorecard
-gives the mean difference from the baseline in success and in cost, each with an
-interval. Then it gives a finding (`pays`, `fails` or `unclear`) under the margin of the
+gives the mean difference from the baseline in success and in cost, each with a 95%
+interval from Student's t. With few pairs the interval is wide, so two pairs that differ
+give no finding from noise. Then it gives a finding (`pays`, `fails` or `unclear`) under the margin of the
 plan. It also checks the five replay traps:
 
 | Trap | Held when |
 |---|---|
-| `survivorship` | The plan has a task with `stratum = "failed"`. |
+| `survivorship` | Each arm has a pair on a task with `stratum = "failed"`. |
 | `leakage` | All runs read the record at one snapshot that is not later than the first run. |
 | `noise` | Each arm has pairs from two seeds or more. |
 | `judge-drift` | The judge of the plan decided each outcome. |
-| `distribution-shift` | The plan has a frozen task and a rolling task. |
+| `distribution-shift` | Each arm has a pair on a frozen task and a pair on a rolling task. |
 
 When a trap is open, the verdict of each arm is `inconclusive`, and the finding stays
 beside it. When the runs spanned a drift window of their model, the verdict is
 `quarantined`. `--keep` writes the scorecard as a decision entry in the platform domain,
-and `amem eval scorecards` and the `scorecards` memory tool list the kept scorecards. The
+and `amem eval scorecards` and the `scorecards` memory tool list the kept scorecards.
+They list only the entries that the owner wrote: a session that writes in the platform
+domain cannot add a scorecard to the list. The
 `score_evaluation` memory tool scores for the owner in a session.
 
-`evals/demo.toml` has no task with a recorded failure. Thus the survivorship trap is open
-for that plan, and its verdicts are inconclusive. The arm runs and the scorecard did not
+The survivorship trap and the distribution-shift trap read the pairs that were scored. A
+task of the plan that no arm ran holds no trap. `evals/demo.toml` has no task with a
+recorded failure. Thus the survivorship trap is open for that plan, and its verdicts are
+inconclusive. Act 6 of the demo runs two frozen tasks unless `EVAL_TASKS` names others,
+so the distribution-shift trap is open there too.
+
+A session whose settings read no entry gets no export. A re-run of a tape
+(`amem reenact run`) under the settings of the transcript-replay arm puts the
+transcripts in front of the prompt again. One thing is open there: the tape holds no
+digest of that text. Thus a re-run of a launch that had no snapshot can replay a later
+transcript. The arm runs and the scorecard did not
 run through a gateway yet, so this file gives no figures for them.
 
 ### What the two conditions measured

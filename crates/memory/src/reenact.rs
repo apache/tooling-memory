@@ -571,8 +571,17 @@ async fn run_once(
         play.played().tape_calls,
         session.memory().session_id()
     );
+    // as a launch gives it: under the settings of the transcript-replay arm, the
+    // transcripts kept up to the snapshot are in front of the tape's prompt
+    let given = session
+        .memory()
+        .prompt_given(prompt, dm_server::arms::TRANSCRIPT_BUDGET_TOKENS)
+        .await;
     let began = std::time::Instant::now();
-    let ran = session.run(&h.headless(prompt), true).await;
+    let ran = match given {
+        Ok(given) => session.run(&h.headless(&given), true).await,
+        Err(e) => Err(e.into()),
+    };
     let seconds = began.elapsed().as_secs_f64();
     let id = session.memory().session_id().to_string();
     let tokens = tokens_of(&session, &id);

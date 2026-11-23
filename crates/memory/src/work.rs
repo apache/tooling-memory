@@ -187,15 +187,10 @@ pub async fn prompted(
         .ok();
     // the transcript-replay arm: earlier sessions' transcripts in front of the prompt.
     // The tape keeps the caller's prompt; nothing is added under any other setting
-    let replayed = session
+    let given = session
         .memory()
-        .transcript_context(None, TRANSCRIPT_BUDGET_TOKENS)
+        .prompt_given(prompt, TRANSCRIPT_BUDGET_TOKENS)
         .await?;
-    let given = if replayed.is_empty() {
-        prompt.to_string()
-    } else {
-        format!("{replayed}\n{prompt}")
-    };
     // the harness's own arguments follow its headless form, where every harness takes
     // a flag after the prompt
     let mut argv = session.harness().headless(&given);
