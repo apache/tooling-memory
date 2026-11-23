@@ -28,6 +28,8 @@ pub enum Kind {
     Split,
     /// A question searched for more than once that found nothing: something to write.
     Author,
+    /// An entry whose cited `file:` source no longer exists in the working tree.
+    Demote,
 }
 
 impl Kind {
@@ -38,6 +40,7 @@ impl Kind {
             Kind::Verify => "Curator: verify",
             Kind::Split => "Curator: split",
             Kind::Author => "Curator: write what was asked for and not found",
+            Kind::Demote => "Curator: demote",
         }
     }
 
@@ -48,6 +51,7 @@ impl Kind {
             Kind::Verify => "verify",
             Kind::Split => "split",
             Kind::Author => "author",
+            Kind::Demote => "demote",
         }
     }
 }
@@ -146,6 +150,24 @@ fn under_root(p: &Path, root: &Path) -> Option<std::path::PathBuf> {
         }
     }
     Some(rel)
+}
+
+/// Whether a cited `file:<path>` source no longer exists in the working tree.
+fn missing_source_file(e: &Entry, root: &Path) -> Option<String> {
+    for s in &e.front.cites {
+        let Some(rel) = s.strip_prefix("file:") else {
+            continue;
+        };
+        let Some(rel_path) = under_root(Path::new(rel), root) else {
+            continue;
+        };
+        if let Err(err) = root.join(rel_path).symlink_metadata() {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Whether a source file changed after the entry was written: the source-change trigger.
@@ -323,6 +345,23 @@ fn survey_entry(
     if e.front.cites.iter().any(|s| s == "canary") {
         return;
     }
+    if let (false, Some(missing)) = (
+        handoff,
+        options
+            .source_root
+            .as_deref()
+            .and_then(|r| missing_source_file(e, r)),
+    ) {
+        out.push(Proposal {
+            kind: Kind::Demote,
+            entries: vec![id.clone()],
+            why: format!("`{id}` cites `{missing}`, which no longer exists in the working tree"),
+            body: format!(
+                "Read `{id}` with `get`. Its cited source `{missing}` no longer exists in the working tree. Confirm whether the subject was removed or moved: if removed, demote `{id}` to the archive; if moved, `write` an updated entry with `supersedes: {id}` citing the new path. Leave a handoff."
+            ),
+        });
+        return;
+    }
     let changed = options
         .source_root
         .as_deref()
@@ -459,6 +498,55 @@ pub async fn file(
 pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn survey_proposes_demote_when_cited_source_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("alive.md"), "still here").unwrap();
+        let m = Memory::init(dir.path(), "human:local:owner", "dom-t")
+            .unwrap()
+            .without_read_log();
+        let gone = m
+            .write(dm_server::WriteRequest {
+                domain: Some("dom-t".into()),
+                entry_type: EntryType::Fact,
+                title: Some("Deleted source".into()),
+                body: "Notes on the removed module.".into(),
+                cites: vec!["file:removed.md".into()],
+                summary: Some("Documents a module whose source file was removed.".into()),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let alive = m
+            .write(dm_server::WriteRequest {
+                domain: Some("dom-t".into()),
+                entry_type: EntryType::Fact,
+                title: Some("Alive source".into()),
+                body: "Notes on the active module.".into(),
+                cites: vec!["file:alive.md".into(), "RFC-123".into()],
+                summary: Some("Documents a module whose source file still exists.".into()),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+
+        let opts = Options {
+            source_root: Some(tree),
+            ..Options::default()
+        };
+        let s = survey(&m, dir.path(), Some("dom-t"), &opts).await.unwrap();
+        let demoted: Vec<&str> = s
+            .proposals
+            .iter()
+            .filter(|p| p.kind == Kind::Demote)
+            .flat_map(|p| p.entries.iter().map(String::as_str))
+            .collect();
+        assert!(demoted.contains(&gone.id.as_str()), "{demoted:?}");
+        assert!(!demoted.contains(&alive.id.as_str()), "{demoted:?}");
+    }
 
     #[test]
     fn a_summary_the_index_should_not_serve_is_named() {
