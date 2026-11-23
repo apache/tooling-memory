@@ -206,17 +206,26 @@ impl Memory {
     /// Whether this session is a person in person: the owner or another person, in a
     /// session that the memory server does not serve. A harness reaches a served
     /// session, so an agent may have asked, whatever the session's name.
+    ///
+    /// The refusal is a line of the decision log, of the action `person_only`.
     pub(crate) fn in_person(&self, what: &str) -> Result<(), Error> {
+        if self.is_in_person() {
+            return Ok(());
+        }
+        Err(self.refusal(
+            "person_only",
+            "",
+            format!("only a person {what}, in a session that the memory server does not serve"),
+        ))
+    }
+
+    /// Whether this session is a person in person, as [`Memory::in_person`] has it.
+    pub(crate) fn is_in_person(&self) -> bool {
         let person = matches!(
             Class::of(&self.author, &self.grants.owner),
             Class::Owner | Class::Human
         );
-        if person && !self.served() {
-            return Ok(());
-        }
-        Err(Error::Denied(format!(
-            "only a person {what}, in a session that the memory server does not serve"
-        )))
+        person && !self.served()
     }
 
     /// The level that a verdict on `task` is given at, when this session may give it.
@@ -225,10 +234,14 @@ impl Memory {
     async fn may_give_verdict(&self, l: &Ledger, task: &Task) -> Result<Autonomy, Error> {
         let worker = l.claimant(&task.id, task.generation).await?;
         if worker.as_deref() == Some(self.author.as_str()) {
-            return Err(Error::Denied(format!(
-                "{} handed the work of {} in: nobody gives the verdict on its own work",
-                self.author, task.id
-            )));
+            return Err(self.refusal(
+                "verdict",
+                &task.spec.domain,
+                format!(
+                    "{} handed the work of {} in: nobody gives the verdict on its own work",
+                    self.author, task.id
+                ),
+            ));
         }
         let level = self.task_level(l, task).await?.unwrap_or_default();
         if level == Autonomy::Person {
@@ -416,7 +429,7 @@ impl Memory {
             level: level_after(&records),
             ceiling: def.autonomy,
             definition: reference,
-            records,
+            records: records.into_iter().map(|r| self.run_as_told(r)).collect(),
         })
     }
 }
@@ -831,6 +844,11 @@ mod tests {
             assert!(denied(&refused, "its own work"), "{refused:?}");
         }
         assert_eq!(owner.get_task(&task.id).await.unwrap(), parked);
+        // the refusal is a line of the decision log, so repeated ones count as probing
+        assert_eq!(
+            crate::testing::refused_actions(dir.path(), "agent:a"),
+            [("verdict".to_string(), "agent".to_string())]
+        );
         // another agent reviews, in a session that the memory server serves
         let reviewer = as_author(dir.path(), "agent:b");
         reviewer.mark_served();

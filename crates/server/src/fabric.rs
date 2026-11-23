@@ -217,6 +217,10 @@ pub fn inflated_by_creator(root: &std::path::Path) -> BTreeMap<String, usize> {
     out
 }
 
+/// The origin of the task that a probing alarm files. The task names the agent that it
+/// is about, so only a person in person sees a task of this origin.
+pub const PROBING_ORIGIN: &str = "telemetry:probing";
+
 /// How many refusals of one agent in one clock hour are reported as probing.
 pub const PROBING_DENIALS: usize = 5;
 
@@ -544,6 +548,38 @@ mod tests {
                 ("agent:b", "2026-11-15T15", 6)
             ]
         );
+    }
+
+    /// The task of a probing alarm names the agent that it is about. That agent does not
+    /// see the task, or the task would show the agent where the count starts.
+    #[tokio::test]
+    async fn the_task_of_a_probing_alarm_is_seen_only_by_a_person_in_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::testing::root(dir.path());
+        let spec = |origin: &str| dm_ledger::TaskSpec {
+            domain: "dom-me".into(),
+            title: "Curation alarm, probing: agent:a".into(),
+            body: "the policy refused agent:a at least 5 times".into(),
+            requirements: vec!["human".into()],
+            origin: Some(origin.into()),
+            ..dm_ledger::TaskSpec::default()
+        };
+        let alarm = owner.file_own(spec(PROBING_ORIGIN)).await.unwrap().task;
+        let other = owner.file_own(spec("telemetry:inflation")).await.unwrap();
+        let other = other.task;
+        let agent = crate::testing::as_author(dir.path(), "agent:a");
+        let served = Memory::open(dir.path()).unwrap();
+        served.mark_served();
+        for session in [&agent, &served] {
+            let asked = session.get_task(&alarm.id).await;
+            assert!(matches!(asked, Err(Error::Ledger(_))), "{asked:?}");
+            let open = session.tasks(Some("dom-me"), dm_ledger::Status::Open);
+            let open: Vec<String> = open.await.unwrap().into_iter().map(|t| t.id).collect();
+            assert_eq!(open, [other.id.as_str()], "{}", session.author());
+        }
+        assert_eq!(owner.get_task(&alarm.id).await.unwrap().id, alarm.id);
+        let open = owner.tasks(Some("dom-me"), dm_ledger::Status::Open);
+        assert_eq!(open.await.unwrap().len(), 2);
     }
 
     /// Rule 11.

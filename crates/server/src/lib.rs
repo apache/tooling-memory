@@ -885,17 +885,41 @@ impl Memory {
     /// [`Error::Denied`] for an ungranted domain, or when none is named and several are
     /// granted.
     pub fn resolve_domain(&self, domain: Option<&str>) -> Result<String, Error> {
-        match domain {
-            Some(d) if self.grants.may_write(d) => Ok(d.to_string()),
-            Some(d) => Err(Error::Denied(format!("domain {d} is not granted"))),
+        let domain = match domain {
+            Some(d) if self.grants.may_write(d) => d.to_string(),
+            Some(d) => return Err(Error::Denied(format!("domain {d} is not granted"))),
             None => {
                 let mut keys = self.grants.domains.keys();
                 match (keys.next(), keys.next()) {
-                    (Some(only), None) => Ok(only.clone()),
-                    _ => Err(Error::Denied("name a domain; several are granted".into())),
+                    (Some(only), None) => only.clone(),
+                    _ => return Err(Error::Denied("name a domain; several are granted".into())),
                 }
             }
-        }
+        };
+        self.may_name(&domain, "domain")?;
+        Ok(domain)
+    }
+
+    /// A refusal that the policy's modules do not make: a line of the decision log, as
+    /// a refusal of the policy is, so that repeated ones count as probing
+    /// ([`fabric::probing`]). The error says `reason`.
+    pub(crate) fn refusal(&self, action: &str, domain: &str, reason: String) -> Error {
+        let who = self.principal();
+        let line = serde_json::json!({
+            "at": OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+            "session": self.session_id,
+            "action": action,
+            "principal": who.id,
+            "class": who.class,
+            "domain": domain,
+            "allow": false,
+            "admit": false,
+            "reason": reason,
+            "policy": self.policy().version().to_string(),
+            "held_task": self.held_task(),
+        });
+        reads::append_line(&self.root.join("state/decisions.jsonl"), &line.to_string());
+        Error::Denied(reason)
     }
 
     fn filter_for(&self, domain: Option<&str>) -> Result<ReadFilter, Error> {
@@ -1106,7 +1130,7 @@ impl Memory {
     /// empty body, or a store or index error.
     pub async fn write(&self, req: WriteRequest) -> Result<Written, Error> {
         let domain = self.resolve_domain(req.domain.as_deref())?;
-        self.may_write_into(&domain)?;
+        self.may_write_into(&domain, "write")?;
         if req.body.trim().is_empty() {
             return Err(Error::Denied("an entry needs a body".into()));
         }
@@ -2179,11 +2203,18 @@ impl Memory {
         Ok(lock(&self.session).handling)
     }
 
-    /// Whether this session may see a task: one in a granted domain, classified within
-    /// `handling`. A task it may not see is left out of every result and every count, as
-    /// an entry above its handling is.
+    /// Whether this session may see a task: one in a granted domain that the session
+    /// reads, classified within `handling`. A task of the held-out domain is seen only
+    /// by a session that reads that domain, as an entry of it is. A probing alarm names
+    /// the agent that it is about, so only a person in person sees it. A task it may
+    /// not see is left out of every result and every count, as an entry above its
+    /// handling is.
     fn sees(&self, task: &Task, handling: Label) -> bool {
-        self.grants.may_write(&task.spec.domain) && task.spec.classification <= handling
+        let alarm = task.spec.origin.as_deref() == Some(fabric::PROBING_ORIGIN);
+        self.grants.may_write(&task.spec.domain)
+            && !self.withheld(&task.spec.domain)
+            && task.spec.classification <= handling
+            && (!alarm || self.is_in_person())
     }
 
     /// Whether this session may act on a named task. A task it may not see gets the
@@ -2356,6 +2387,7 @@ impl Memory {
                 .filter(|d| !d.is_empty())
                 .map(String::as_str),
         )?;
+        self.may_write_into(&spec.domain, "file_task")?;
         spec.created_by = self.author.clone();
         spec.classification = spec.classification.max(self.label());
         // the policy in force is the service's to say, not the filer's
@@ -3599,6 +3631,7 @@ impl Memory {
         into_domain: Option<&str>,
     ) -> Result<bundle::Imported, Error> {
         let domain = self.resolve_domain(into_domain)?;
+        self.may_write_into(&domain, "write")?;
         let default = self
             .grants
             .domains

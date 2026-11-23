@@ -293,6 +293,12 @@ fn rates(t: &mut Telemetry) {
     }
 }
 
+/// The origin of the task that an alarm files. The server shows a task of the origin
+/// of a probing alarm only to a person in person.
+fn origin_of(a: &Alarm) -> String {
+    format!("telemetry:{}", a.kind)
+}
+
 /// File each alarm as a task for the owner, once per alarm.
 ///
 /// # Errors
@@ -314,7 +320,7 @@ pub async fn file_alarms(
                 ),
                 requirements: vec!["human".into()],
                 depends_on: Vec::new(),
-                origin: Some(format!("telemetry:{}", a.kind)),
+                origin: Some(origin_of(a)),
                 upstream_event: Some(dm_core::digest(&a.why)[..16].to_string()),
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
@@ -413,6 +419,8 @@ mod tests {
             panic!("one alarm: {at_five:?}")
         };
         assert_eq!(alarm.kind, "probing");
+        // the origin that the server hides from the agent that the alarm names
+        assert_eq!(origin_of(alarm), dm_server::fabric::PROBING_ORIGIN);
         assert_eq!(alarm.who, "agent:a");
         assert_eq!(
             alarm.why,

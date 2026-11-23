@@ -5,8 +5,11 @@
 //! (`held_out = "dom-held"`) and one principal that grades (`evaluator = "agent:<name>"`).
 //! Only the evaluator and the owner in person read that domain: the session filter takes
 //! it away from every other session, so no read path serves a scenario to a session
-//! that claims tasks. The evaluator claims no task, and it grades no handoff that it
-//! wrote.
+//! that claims tasks. A task of that domain is hidden from the same sessions, and they
+//! file none there. The evaluator claims no task, and it grades no handoff that it
+//! wrote. It writes entries and files tasks only in the held-out domain, since it has
+//! read the suites. A session that does not read the domain is told of a run only
+//! whether it passed.
 //!
 //! A suite is a fenced block in an entry of the held-out domain, TOML:
 //!
@@ -293,16 +296,55 @@ impl Memory {
         f
     }
 
-    /// Refuse a write into the held-out domain from a session that does not read it: a
-    /// session writes only where it reads, or a worker would write the suite that
-    /// grades it.
-    pub(crate) fn may_write_into(&self, domain: &str) -> Result<(), Error> {
+    /// Refuse the held-out domain to a session that does not read it. The refusal is a
+    /// line of the decision log, of the action `action`.
+    pub(crate) fn may_name(&self, domain: &str, action: &str) -> Result<(), Error> {
         if self.withheld(domain) {
-            return Err(Error::Denied(format!(
+            return Err(self.refusal(action, domain, format!(
                 "domain {domain} is outside what this session reads, and a session writes only where it reads"
             )));
         }
         Ok(())
+    }
+
+    /// Refuse a write, of an entry or of a task, that would take text of a held-out
+    /// suite to a session that claims tasks, or text of a worker into a suite. A
+    /// session that does not read the held-out domain does not write into it, or a
+    /// worker would write the suite that grades it. The evaluator reads the suites, so
+    /// it writes only into the held-out domain. Each refusal is a line of the decision
+    /// log, of the action `action`.
+    pub(crate) fn may_write_into(&self, domain: &str, action: &str) -> Result<(), Error> {
+        self.may_name(domain, action)?;
+        let held = self.held_out_domain();
+        if self.is_evaluator() && held.as_deref() != Some(domain) {
+            return Err(self.refusal(action, domain, format!(
+                "{} is the evaluator: it reads the held-out suites, so it writes only into the held-out domain, and not into {domain}",
+                self.author
+            )));
+        }
+        Ok(())
+    }
+
+    /// A run as a session that does not read the held-out domain is told it: whether it
+    /// passed, as one of one or none of one, and no version of the suite. The counts
+    /// and the version are facts of the suite's text.
+    pub(crate) fn run_as_told(&self, mut record: DefinitionRecord) -> DefinitionRecord {
+        if self.reads_held_out() {
+            return record;
+        }
+        if let DefinitionChange::Graded {
+            suite,
+            passed,
+            of,
+            needed,
+            ..
+        } = &mut record.change
+        {
+            *passed = u32::from(*passed >= *needed);
+            (*of, *needed) = (1, 1);
+            suite.clear();
+        }
+        record
     }
 
     /// Refuse a claim from the evaluator: it grades work, so it does none.
@@ -494,7 +536,9 @@ impl Memory {
         answers: &[Answer],
     ) -> Result<Graded, Error> {
         if !self.reads_held_out() {
-            return Err(Error::Denied(
+            return Err(self.refusal(
+                "grade",
+                "",
                 "only the evaluator grades a task definition, or the owner in a session that the memory server does not serve"
                     .into(),
             ));
@@ -856,6 +900,130 @@ mod tests {
         }
     }
 
+    /// A task of the held-out domain is hidden from a session that does not read the
+    /// domain, and such a session files none there. Its title and body can hold text of
+    /// a suite, and the task of a proposal names the entry of a suite.
+    #[tokio::test]
+    async fn a_task_of_the_held_out_domain_is_hidden_from_a_session_that_does_not_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fixture(dir.path()).await;
+        let spec = |title: &str| TaskSpec {
+            domain: "dom-held".into(),
+            title: title.into(),
+            body: "Add a scenario that expects BLUEBIRD-7.\n".into(),
+            ..TaskSpec::default()
+        };
+        let grow = f.owner.create_task(spec("Grow the tidy suite")).await;
+        let grow = grow.unwrap().task;
+        let before = events(&f.owner).await;
+        let worker = as_author(dir.path(), "agent:a");
+        let person = as_author(dir.path(), "human:test:reviewer");
+        for session in [&worker, &person, &served_owner(dir.path())] {
+            let who = session.author();
+            let asked = session.get_task(&grow.id).await;
+            assert!(matches!(asked, Err(Error::Ledger(_))), "{who}: {asked:?}");
+            let claimed = session.claim(&grow.id, Duration::minutes(5)).await;
+            assert!(
+                matches!(claimed, Err(Error::Ledger(_))),
+                "{who}: {claimed:?}"
+            );
+            let listed = session.tasks(Some("dom-held"), Status::Open).await;
+            assert!(denied(&listed, "outside what this session reads"), "{who}");
+            let next = session.claim_next(Some("dom-held"), Duration::minutes(5));
+            assert!(
+                denied(&next.await, "outside what this session reads"),
+                "{who}"
+            );
+            let filed = session.create_task(spec("A scenario of my own")).await;
+            assert!(denied(&filed, "writes only where it reads"), "{who}");
+        }
+        assert_eq!(
+            events(&f.owner).await,
+            before,
+            "nothing was filed or claimed"
+        );
+        let seen = evaluator(dir.path()).get_task(&grow.id).await.unwrap();
+        assert_eq!(seen.spec.title, "Grow the tidy suite");
+    }
+
+    /// The evaluator reads the suites, so it writes no entry and files no task where a
+    /// session that claims tasks reads.
+    #[tokio::test]
+    async fn the_evaluator_writes_only_into_the_held_out_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fixture(dir.path()).await;
+        let grader = evaluator(dir.path());
+        grader.held_out_suite("tidy").await.unwrap().unwrap();
+        let before = f.owner.store.list("dom-me").await.unwrap();
+        for domain in ["dom-me", "dom-plat"] {
+            let note = WriteRequest {
+                body: "The bird is BLUEBIRD-7.\n".into(),
+                domain: Some(domain.into()),
+                ..WriteRequest::default()
+            };
+            let refused = grader.write(note).await;
+            assert!(denied(&refused, "writes only into the held-out domain"));
+            let task = TaskSpec {
+                domain: domain.into(),
+                title: "The bird is BLUEBIRD-7".into(),
+                ..TaskSpec::default()
+            };
+            let refused = grader.create_task(task).await;
+            assert!(denied(&refused, "writes only into the held-out domain"));
+            let open = f.owner.tasks(Some(domain), Status::Open).await.unwrap();
+            assert_eq!(open, [], "{domain}");
+            // a transcript and an import are writes
+            let turns = crate::transcripts::Keep {
+                domain: Some(domain.into()),
+                harness: "codex".into(),
+                origin: "session-1".into(),
+                raw: "BLUEBIRD-7".into(),
+                turns: vec![("assistant".into(), "BLUEBIRD-7".into())],
+            };
+            let refused = grader.keep_transcript(turns).await;
+            assert!(denied(&refused, "writes only into the held-out domain"));
+            let refused = grader.import(Path::new("no-bundle"), Some(domain)).await;
+            assert!(denied(&refused, "writes only into the held-out domain"));
+        }
+        assert_eq!(f.owner.store.list("dom-me").await.unwrap(), before);
+        let worker = as_author(dir.path(), "agent:a");
+        let found = worker.search("BLUEBIRD", None, 10).await.unwrap();
+        let found: Vec<String> = found.into_iter().map(|h| h.id).collect();
+        assert_eq!(
+            found,
+            [f.passing[2].as_str()],
+            "only the worker's own handoff"
+        );
+    }
+
+    /// The refusals that keep the held-out domain and the levels are lines of the
+    /// decision log, with the class of the principal, so repeated ones count as probing.
+    #[tokio::test]
+    async fn a_refusal_at_a_boundary_of_the_held_out_domain_or_of_a_level_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fixture(dir.path()).await;
+        graded(dir.path(), &f, Autonomy::Review, 2).await;
+        let worker = as_author(dir.path(), "agent:a");
+        let into = |domain: &str| WriteRequest {
+            body: "A note.\n".into(),
+            domain: Some(domain.into()),
+            ..WriteRequest::default()
+        };
+        assert!(worker.write(into("dom-held")).await.is_err());
+        let run = worker.grade("tidy", Autonomy::Review, &f.answers(3)).await;
+        assert!(denied(&run, "only the evaluator grades"), "{run:?}");
+        let raised = worker.raise("tidy").await;
+        assert!(denied(&raised, "only a person"), "{raised:?}");
+        assert!(evaluator(dir.path()).write(into("dom-me")).await.is_err());
+        let logged = |who: &str| crate::testing::refused_actions(dir.path(), who);
+        let agent = |action: &str| (action.to_string(), "agent".to_string());
+        assert_eq!(
+            logged("agent:a"),
+            [agent("domain"), agent("grade"), agent("person_only")]
+        );
+        assert_eq!(logged(EVALUATOR), [agent("write")]);
+    }
+
     /// The projection of a session is a read of the record: the held-out domain has no
     /// directory in a worker's.
     #[tokio::test]
@@ -1019,7 +1187,13 @@ mod tests {
         let f = fixture(dir.path()).await;
         let grader = evaluator(dir.path());
         let before = events(&f.owner).await;
-        let own = handoff(dir.path(), EVALUATOR, "The bird is BLUEBIRD-7.\n").await;
+        let own = WriteRequest {
+            body: "The bird is BLUEBIRD-7.\n".into(),
+            domain: Some("dom-held".into()),
+            entry_type: EntryType::Handoff,
+            ..WriteRequest::default()
+        };
+        let own = grader.write(own).await.unwrap().id;
         let a_fact = written_in(&f.owner, "dom-me", "The bird is BLUEBIRD-7.\n", false).await;
         let twice = [f.answers(1), f.answers(1)].concat();
         for (answers, why) in [
@@ -1063,10 +1237,34 @@ mod tests {
             by: EVALUATOR.into(),
         };
         let record = &run.record;
-        // the ledger holds it, and a session that reads the definition reads it
-        let worker = as_author(dir.path(), "agent:a");
-        let view = worker.autonomy("tidy").await.unwrap();
+        // the ledger holds it, and a session that reads the held-out domain reads it
+        let view = evaluator(dir.path()).autonomy("tidy").await.unwrap();
         assert_eq!(view.records.as_slice(), std::slice::from_ref(record));
+        // a session that does not is told whether the run passed, and no count of the
+        // suite and no version of it
+        let worker = as_author(dir.path(), "agent:a");
+        let told = worker.autonomy("tidy").await.unwrap().records;
+        let passed = DefinitionChange::Graded {
+            suite: String::new(),
+            level: Autonomy::Review,
+            passed: 1,
+            of: 1,
+            needed: 1,
+            by: EVALUATOR.into(),
+        };
+        assert_eq!(told.len(), 1);
+        assert_eq!((&told[0].id, &told[0].change), (&record.id, &passed));
+        graded(dir.path(), &f, Autonomy::Checks, 2).await;
+        let told = worker.autonomy("tidy").await.unwrap().records;
+        let failed = DefinitionChange::Graded {
+            suite: String::new(),
+            level: Autonomy::Checks,
+            passed: 0,
+            of: 1,
+            needed: 1,
+            by: EVALUATOR.into(),
+        };
+        assert_eq!(told[1].change, failed);
         let kept = serde_json::to_string(&view.records).unwrap();
         for text in [
             "question",

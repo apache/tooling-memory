@@ -171,6 +171,13 @@ two weeks. It is also the reason that none of it is the production shape.
   - Every session that reads the platform domain reads its raw entries.
   - Probing counts refusals for each principal and clock hour against a fixed number. It
     counts neither a lineage of several principals nor queries that walk the index.
+  - The owner at the command line reads the held-out suites and writes into every
+    domain.
+  - The server does not log a task that it hides as a refusal, so probing does not count
+    it.
+  - Two processes on one ledger can each make a check and then append. A raise can then
+    follow an outcome that it did not read, two outcomes can lower the level one step,
+    and a verdict can complete a task that was rejected in the same moment.
   - The definition records are not in the event log of the domain and not in a bundle.
   - The sign-off for the highest level is a field of the ledger record, not an approval
     event.

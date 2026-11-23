@@ -1056,7 +1056,15 @@ default_classification = "internal"
 
 The held-out domain is not the platform domain. Only the evaluator and the owner in
 person read it or write into it. For each other session, an entry of that domain is not
-found, and search and list do not show it. The evaluator claims no task.
+found, and search and list do not show it. The same is true for a task of that domain:
+each other session does not find it, cannot claim it, and cannot file a task there. The
+evaluator claims no task. The evaluator writes entries and files tasks only in the
+held-out domain, because it reads the suites. The transcript of an evaluator session is
+kept only when its domain is the held-out domain.
+
+A session that does not read the held-out domain learns only whether a run passed. For
+such a session, `amem platform level` shows a run as 1 of 1 or 0 of 1, with no
+version of the suite. A refusal of the performance gate gives no count.
 
 A held-out suite is an artifact in a verified entry of the held-out domain, in a fenced
 block with the info string `platform suite <name>`, where the name is the name of the
@@ -1116,11 +1124,30 @@ Five or more refusals of one agent in one clock hour are probing. `amem task sta
 lists them under `probing`, from the decision log. `amem curator --telemetry` raises a
 `probing` alarm for each agent and hour, and `--file` files one task for the owner. No
 memory tool lists probing, because the list would show an agent where the count starts.
+Only a person at the command line sees the task of a probing alarm, because the task
+names the agent.
+
+The decision log also keeps these refusals, so they count: a request that names the
+held-out domain from a session that does not read it, a write of the evaluator outside
+the held-out domain, a grade from a session that cannot grade, a step that only a
+person takes, a verdict on your own work, and a tool that the task definition does not
+declare.
 
 Not built yet: no model grades, and `amem` does not run the scenarios. The level
 `review` compares the names of principals, not models or vendors. A reverted task stays
 `done`. The definition records are not in the event log of the domain and not in a
 bundle.
+
+Also open:
+
+- The owner at the command line reads the suites and writes into every domain.
+- A task that the server hides gets the answer of a missing task. That answer is not in
+  the decision log, so probing does not count it.
+- The command line and the memory server are two processes on one ledger. Each makes
+  its checks and then appends, and the two steps are not one transaction. Thus a raise
+  can follow an outcome that it did not read, two outcomes at the same time can lower
+  the level one step and not two, and a verdict can complete a task that the other
+  process rejected in the same moment.
 
 ## The task fabric: `amem task rescore` and `stats`
 

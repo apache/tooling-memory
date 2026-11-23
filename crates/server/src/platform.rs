@@ -461,7 +461,7 @@ impl Memory {
             return Ok(());
         };
         let task = self.ledger.lock().await.get(&held).await?;
-        let Some(named) = task.spec.definition else {
+        let Some(named) = task.spec.definition.clone() else {
             return Ok(());
         };
         let Some(def) = self.pinned_definition(&named).await? else {
@@ -472,9 +472,13 @@ impl Memory {
         if def.tools.iter().any(|t| t == &format!("tool:{tool}")) {
             Ok(())
         } else {
-            Err(Error::Denied(format!(
-                "the task definition {named} does not declare tool:{tool}; a task reaches only the tools its definition declares"
-            )))
+            Err(self.refusal(
+                "tool",
+                &task.spec.domain,
+                format!(
+                    "the task definition {named} does not declare tool:{tool}; a task reaches only the tools its definition declares"
+                ),
+            ))
         }
     }
 
@@ -812,6 +816,12 @@ mod tests {
         assert!(
             matches!(&undeclared, Err(Error::Denied(why)) if why.contains("does not declare tool:search")),
             "{undeclared:?}"
+        );
+        // the refusal is a line of the decision log, so repeated ones count as probing
+        let logged = crate::testing::refused_actions(dir.path(), on_defined.author());
+        assert!(
+            logged.iter().any(|(action, _)| action == "tool"),
+            "{logged:?}"
         );
         let declared = on_defined.use_tool("fetch", serde_json::json!({})).await;
         assert!(

@@ -306,8 +306,10 @@ impl Memory {
             Some((version, ..)) if *version != suite.version => Run::Missing(format!(
                 "the newest run of {reference} for the level person is not of the held-out suite in force now: {first}"
             )),
-            Some((_, passed, of, needed)) if passed < needed => Run::Missing(format!(
-                "the newest run of {reference} for the level person failed, with {passed} of {of} scenarios passed where the level needs {needed}: {first}"
+            // the counts are facts of the suite's text, and the session that asks may be
+            // one that the suite is withheld from
+            Some((_, passed, _, needed)) if passed < needed => Run::Missing(format!(
+                "the newest run of {reference} for the level person on its held-out suite failed: {first}"
             )),
             Some(_) => Run::Passed,
         })
@@ -855,7 +857,15 @@ mod tests {
         );
         assert!(!graded(dir.path(), &id, &bad).await);
         let refused = owner.approve(&task.id).await;
-        assert!(denied(&refused, "failed, with 0 of 1"), "{refused:?}");
+        assert!(denied(&refused, "held-out suite failed"), "{refused:?}");
+        // the counts and the entry of the suite are facts of its text: no refusal has them
+        let Err(Error::Denied(said)) = &refused else {
+            panic!("{refused:?}")
+        };
+        assert!(
+            !said.contains("0 of 1") && !said.contains("mem-held-"),
+            "{said}"
+        );
         assert!(denied(&refused, first), "{refused:?}");
         assert_eq!(tier(&owner, &id).await, TrustTier::Raw);
         assert!(graded(dir.path(), &id, &good).await);

@@ -73,3 +73,18 @@ pub(crate) async fn verify_in(m: &Memory, domain: &str, id: &str) {
     e.front.trust_tier = TrustTier::Verified;
     m.store.put(&e).await.unwrap();
 }
+
+/// The actions that the decision log of the root `dir` holds a refusal of for
+/// `principal`, each one time, with the class of the principal in the line.
+pub(crate) fn refused_actions(dir: &Path, principal: &str) -> Vec<(String, String)> {
+    let log = std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap_or_default();
+    let mut actions = std::collections::BTreeSet::new();
+    for line in log.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["allow"] == false && v["principal"] == principal {
+            let text = |key: &str| v[key].as_str().unwrap_or_default().to_string();
+            actions.insert((text("action"), text("class")));
+        }
+    }
+    actions.into_iter().collect()
+}
