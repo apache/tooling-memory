@@ -1303,6 +1303,22 @@ enum TaskOp {
         #[arg(long)]
         generation: u64,
     },
+    /// Give the verdict on the work of a task that waits for one: `--accept` closes
+    /// the task, `--reject` puts it back on offer and lowers the level of its
+    /// definition one step.
+    Verdict {
+        id: String,
+        #[arg(long, conflicts_with = "reject", required_unless_present = "reject")]
+        accept: bool,
+        #[arg(long)]
+        reject: bool,
+    },
+    /// Record that the work of a task did not stand: `reverted` or `rejected`. The
+    /// level of the task's definition goes one step down.
+    Outcome {
+        id: String,
+        outcome: dm_ledger::WorkOutcome,
+    },
     /// Close a task without doing it, and everything still open that was filed from it.
     Invalidate {
         id: String,
@@ -5053,6 +5069,16 @@ async fn holds_cmd(m: &Memory, op: TaskOp) -> Fallible {
     }
 }
 
+/// `amem task verdict` and `amem task outcome`: what a person says of work that was
+/// handed in.
+async fn judged_cmd(m: &Memory, op: TaskOp) -> Fallible {
+    match op {
+        TaskOp::Verdict { id, accept, .. } => json(&m.verdict(&id, accept).await?),
+        TaskOp::Outcome { id, outcome } => json(&m.record_outcome(&id, outcome).await?),
+        _ => unreachable!("routed by task"),
+    }
+}
+
 /// The `--scores value,urgency,effort` of `task create`.
 fn scores_of(text: &str) -> Result<dm_ledger::Scores, Box<dyn std::error::Error>> {
     let parts: Vec<i64> = text
@@ -5148,6 +5174,7 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         TaskOp::Tree { id } => json(&m.task_tree(&id).await?),
         TaskOp::Retry { id } => json(&m.retry_task(&id).await?),
         op @ (TaskOp::Rescore { .. } | TaskOp::Stats { .. }) => fabric_cmd(m, op).await,
+        op @ (TaskOp::Verdict { .. } | TaskOp::Outcome { .. }) => judged_cmd(m, op).await,
         TaskOp::Get { id } => json(&m.get_task(&id).await?),
     }
 }

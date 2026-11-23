@@ -115,12 +115,10 @@ two weeks. It is also the reason that none of it is the production shape.
   other session. These parts are not built: an attempt key for the other operations, a
   connector that makes external actions in sequence and settles them, and taps that
   report the events. The generation does not prove who the caller is.
-- **Task definitions, in part, and autonomy levels.** A task can name a task definition.
+- **Task definitions, in part.** A task can name a task definition.
   It then takes the checks of the definition, and its holder can call only the tools that
   the definition declares. Triage requires a definition only when the grants say so,
-  because the tasks that the system files name none. No suite gates a version of a
-  definition, and the data scope is not enforced. The autonomy level has no effect, and
-  there is no held-out suite and no evaluator.
+  because the tasks that the system files name none. The data scope is not enforced.
 - **Positions.** There is no `position` entry, and a task cannot be pinned.
 - **Approvals, in part.** An approval is an event on the ledger. It names the person,
   the action, the entry, the version, the principal that it is for, and an expiry. The
@@ -154,9 +152,28 @@ two weeks. It is also the reason that none of it is the production shape.
   model. The auditor does not read handoffs.
 - **Access freshness.** A session keeps its read filter until it ends. A change to the
   grants or to a policy does not stop a session.
-- **The improvement loop.** The only gate on a platform artifact is that a person
-  verifies it. There is no performance gate, no safety gate, and no check that a change
-  adds no permission.
+- **Autonomy and the improvement loop, in part.** Each version of a task definition
+  earns an autonomy level on a held-out suite, and a reverted or rejected task lowers the
+  level. A candidate version passes a safety gate and a performance gate, and repeated
+  refusals of one agent raise a probing alarm (demo act 7). These parts are open:
+  - The evaluator's check is a substring test. No model grades.
+  - `amem` does not run the scenarios. Nothing checks that a graded handoff was written
+    under the graded version.
+  - The level `review` compares principals. The server does not know the model or the
+    vendor of a session.
+  - A task that names no definition has no level.
+  - A reverted task stays `done`, and its dependents are not sent back.
+  - A work outcome comes from a person, not from a tap.
+  - A prompt, an agent definition and a harness setting have the review of a person
+    only, with no suite of their own. A ranking or rubric change has no canary.
+  - The safety gate compares tools, scope and declared autonomy. It runs no red-team
+    suite.
+  - Every session that reads the platform domain reads its raw entries.
+  - Probing counts refusals for each principal and clock hour against a fixed number. It
+    counts neither a lineage of several principals nor queries that walk the index.
+  - The definition records are not in the event log of the domain and not in a bundle.
+  - The sign-off for the highest level is a field of the ledger record, not an approval
+    event.
 - **Measurement, in part.** `amem` computes four read metrics, cost and usage. The paper
   names 21 metrics. Upkeep share, induced work and the landing queue are not built. The
   only limit is a spend limit in tokens.
@@ -416,6 +433,7 @@ the platform domain and the Gofannon bridge.
 | Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned | `transcript`, `replay`, `reenact run, report, tapes, show, pin, unpin` |
 | The event log | Every write of an entry goes through the append-only log of its domain, with ids and digests only. A materializer builds the index from the log and replays the ledger's events | `log show`, `log materialize` |
 | The platform | Agent definitions, templates, eval suites and harness defaults as artifacts in a platform domain. They load only after a person verifies them | `platform list, show`, `golden --platform` |
+| Autonomy levels | Each version of a task definition has a level: `person`, `review` or `checks`. Work that is handed in below `checks` waits for a verdict. The evaluator grades handoffs on a held-out suite, and a passed run lets the level go up one step. A work outcome puts it down one step. A candidate version passes a safety gate and a performance gate. Repeated refusals of one agent are a probing alarm of the curator | `task verdict, outcome`, `platform level, grade, raise, gates`, `curator --telemetry`; MCP `verdict`, `autonomy`, `grade`, `raise_autonomy`, `candidate_gates` |
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory | `savings`, `golden`, `scripts/eval.py` |
 | Interchange | Bundles at or below a label, erasure with a stub and a receipt, and taps as WASI components | `export`, `import`, `erase`, `tap` |

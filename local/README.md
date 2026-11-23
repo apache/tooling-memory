@@ -927,6 +927,10 @@ outputs = ["handoff"]
 autonomy = "person"
 ```
 
+`autonomy` is the highest autonomy level that this version can earn. It is not the level
+that the version has: see "Autonomy levels" below. Without the line, the highest level
+is `person`.
+
 A definition is in force when its entry is active and a person verified it. When two
 such entries define one name, the newer entry is in force. The version of a definition is
 the id of its entry. An entry never changes, so a task that names a version names one
@@ -976,9 +980,147 @@ a task under it. To continue the work, verify a new entry for the name, invalida
 task, and file it again with `amem task retry`. The retry runs under the definition that
 is then in force.
 
-Not built yet: the autonomy level has no effect, no suite gates a version of a
-definition, and the data scope is not enforced. An erasure of the entry of a definition
+Not built yet: the data scope is not enforced. An erasure of the entry of a definition
 does not remove the checks that tasks took from it.
+
+## Autonomy levels: `amem task verdict` and `amem platform level`
+
+Each version of a task definition has an autonomy level. The level says what a
+completion of a task under that version needs before the task is `done`:
+
+| Level | What a completion needs |
+|---|---|
+| `person` | The verdict of a person, at the command line |
+| `review` | The verdict of a principal other than the one that handed the work in |
+| `checks` | Nothing more. The task is `done` at once |
+
+The ledger holds the level for each version, `<name>@<entry>`. A new version starts at
+`person`, because nobody graded the changed definition. The line `autonomy` in the text
+of the definition is the highest level that the version can earn. A task that names no
+definition has no level, and its completion counts at once.
+
+`amem platform level <definition>` prints the level, the highest level, and the records
+of the version in force: its graded runs, its raises and its work outcomes. The memory
+tool is `autonomy`.
+
+### The verdict
+
+Below the level `checks`, `complete` does not close a task. The task becomes `blocked`
+and waits on the event `verdict:<task>`. The handoff stays on the task, and the claim is
+over. Nobody can claim the task, and a task that depends on it stays blocked.
+
+```sh
+amem task verdict <task> --accept
+amem task verdict <task> --reject
+```
+
+To accept closes the task with its handoff. To reject puts the task back on offer with
+the handoff on it, and records the work outcome `rejected`. These rules apply:
+
+- Nobody gives the verdict on work that it handed in.
+- At the level `person`, only a person gives the verdict, in a session that the memory
+  server does not serve. The memory tool `verdict` refuses it there, whatever the name of
+  the session is.
+- At the level `review`, each other principal can give the verdict, also with the memory
+  tool `verdict`.
+- The session must be able to read the handoff.
+
+`amem work` reports such a task as handed in, prints the command that gives the verdict,
+and exits with 0.
+
+### A work outcome
+
+```sh
+amem task outcome <task> reverted
+amem task outcome <task> rejected
+```
+
+A work outcome records that the work of a task did not stand. It lowers the level of the
+version that the task names by one step. The same outcome of the same task is recorded
+one time. The task does not change. Only a person records a work outcome, at the command
+line. No memory tool records one. A work outcome is not the outcome of an external
+action, which is `applied` or `not_applied` (`amem task effect-settle`).
+
+### The held-out domain and the evaluator
+
+A version earns a level on a held-out suite. The grants name the domain that holds the
+suites, and the one agent that grades:
+
+```toml
+held_out = "dom-held-out"
+evaluator = "agent:evaluator"
+
+[domains.dom-held-out]
+default_classification = "internal"
+```
+
+The held-out domain is not the platform domain. Only the evaluator and the owner in
+person read it or write into it. For each other session, an entry of that domain is not
+found, and search and list do not show it. The evaluator claims no task.
+
+A held-out suite is an artifact in a verified entry of the held-out domain, in a fenced
+block with the info string `platform suite <name>`, where the name is the name of the
+task definition. The block is TOML:
+
+```toml
+[pass]
+person = 1
+review = 1
+
+[[scenario]]
+name = "entry format"
+ask = "Which decision set the format that entries travel in?"
+expect = ["DR-22"]
+```
+
+`[pass]` gives the pass mark for each level: the number of scenarios that must pass. A
+scenario passes when the handoff that answers it holds each string of `expect`.
+
+### Grade and raise
+
+```sh
+amem platform grade <definition> --level review --answer "<scenario>=<handoff entry>"
+amem platform raise <definition>
+```
+
+`grade` records one run on the version in force: how many scenarios passed, the pass
+mark, and the version of the suite. Repeat `--answer` for each scenario. A scenario with
+no answer fails. Only the evaluator grades, or the owner at the command line. A grader
+cannot grade a handoff that it wrote. The memory tool is `grade`.
+
+`raise` puts the level up one step. The newest run for the next level must have passed
+on the suite that is in force, and no work outcome can be newer than that run. The
+evaluator or a person takes the step to `review`. Only a person takes the step to
+`checks`, at the command line. That call is the sign-off, and the record names the
+person. The memory tool `raise_autonomy` takes the step to `review` only.
+
+### The gates of a candidate
+
+A candidate version of a task definition is an entry with a `platform task` block that
+is proposed for verified. It passes two gates before a person can verify it:
+
+- The safety gate refuses a candidate of an agent that adds a tool, a scope domain or a
+  higher `autonomy` than the version in force declares. A person writes such a change.
+  The decision log keeps the refusal.
+- The performance gate applies when a held-out suite gives a pass mark for `person`. The
+  newest run of the candidate for the level `person` must have passed on the suite in
+  force.
+
+The safety gate runs first. `amem platform gates <entry>` prints `performance`, `safety`
+and `review` for an entry, each with `needed`, `met` and `why`. The memory tool is
+`candidate_gates`.
+
+### Probing
+
+Five or more refusals of one agent in one clock hour are probing. `amem task stats`
+lists them under `probing`, from the decision log. `amem curator --telemetry` raises a
+`probing` alarm for each agent and hour, and `--file` files one task for the owner. No
+memory tool lists probing, because the list would show an agent where the count starts.
+
+Not built yet: no model grades, and `amem` does not run the scenarios. The level
+`review` compares the names of principals, not models or vendors. A reverted task stays
+`done`. The definition records are not in the event log of the domain and not in a
+bundle.
 
 ## The task fabric: `amem task rescore` and `stats`
 

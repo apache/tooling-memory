@@ -464,11 +464,21 @@ fn a_declined_proposal_is_not_printed_as_proposed_again() {
 /// One tool call as an agent, through `amem serve` on standard input and output: the
 /// text of the tool's answer, or the message of its refusal.
 fn as_agent(root: &Path, tool: &str, arguments: &serde_json::Value) -> Result<String, String> {
+    as_named(root, AGENT, tool, arguments)
+}
+
+/// [`as_agent`], for the agent `author`.
+fn as_named(
+    root: &Path,
+    author: &str,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> Result<String, String> {
     use std::io::{BufRead, BufReader, Write};
     let mut child = Command::new(env!("CARGO_BIN_EXE_amem"))
         .arg("--root")
         .arg(root)
-        .args(["serve", "--author", AGENT])
+        .args(["serve", "--author", author])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -616,6 +626,168 @@ fn approve_gives_a_sign_off_task_the_expiry_that_the_command_names() {
 }
 
 /// The first file under `root` whose bytes contain `needle`.
+const EVALUATOR: &str = "agent:eval";
+
+/// Give a starter root a platform domain, a held-out domain and an evaluator.
+fn with_platform(root: &Path) {
+    let path = root.join("grants.toml");
+    let grants = std::fs::read_to_string(&path).unwrap();
+    let (top, tables) = grants.split_once("\n[").expect("a table in grants.toml");
+    let keys =
+        format!("platform = \"dom-plat\"\nheld_out = \"dom-held\"\nevaluator = \"{EVALUATOR}\"\n");
+    let domain = "default_classification = \"internal\"\nadmit_own = true\n";
+    let grants = format!(
+        "{top}\n{keys}\n[{tables}\n[domains.dom-plat]\n{domain}\n[domains.dom-held]\n{domain}"
+    );
+    std::fs::write(&path, grants).unwrap();
+}
+
+/// An entry that `author` writes over the memory server and proposes for verified, and
+/// that the owner approves at the command line: its id.
+fn verified_by_owner(root: &Path, author: &str, domain: &str, body: &str) -> String {
+    let write = serde_json::json!({"domain": domain, "entry_type": "convention", "body": body});
+    let id = id_of(&as_named(root, author, "write", &write).unwrap());
+    let promote = serde_json::json!({"id": id, "to": "verified", "why": "checked"});
+    let proposal = json(&as_named(root, author, "promote", &promote).unwrap());
+    let task = proposal["task"]["id"].as_str().expect("a task").to_string();
+    ok(root, &["approve", &task], None);
+    id
+}
+
+/// A task under `tidy` that the owner files and [`AGENT`] claims and completes over
+/// the memory server: the task and its handoff. The task then waits for its verdict.
+fn handed_in(root: &Path) -> (String, String) {
+    let filed = ok(
+        root,
+        &[
+            "task",
+            "create",
+            "Tidy the importer",
+            "--domain",
+            "dom-me",
+            "--definition",
+            "tidy",
+        ],
+        None,
+    );
+    let task = id_of(&filed);
+    if json(&filed)["status"] == "proposed" {
+        ok(root, &["task", "admit", &task], None);
+    }
+    let claim = as_agent(root, "claim", &serde_json::json!({"id": task})).unwrap();
+    let generation = json(&claim)["generation"].clone();
+    let write = serde_json::json!({
+        "domain": "dom-me", "entry_type": "handoff", "body": "Changed src/importer.rs.\n",
+    });
+    let handoff = id_of(&as_agent(root, "write", &write).unwrap());
+    let complete = serde_json::json!({"id": task, "generation": generation, "handoff": handoff});
+    let parked = json(&as_agent(root, "complete", &complete).unwrap());
+    assert_eq!(parked["task"]["status"], "blocked", "{parked}");
+    (task, handoff)
+}
+
+/// The level of `tidy`, as `amem platform level` prints it.
+fn level(root: &Path) -> serde_json::Value {
+    json(&ok(root, &["platform", "level", "tidy"], None))["level"].clone()
+}
+
+/// `amem task verdict` takes exactly one of its two flags, and `--accept` closes the task.
+fn step_verdict(root: &Path, task: &str) {
+    let neither = fails(root, &["task", "verdict", task]);
+    assert!(neither.contains("--accept"), "{neither}");
+    let both = fails(root, &["task", "verdict", task, "--accept", "--reject"]);
+    assert!(both.contains("cannot be used with"), "{both}");
+    let given = json(&ok(root, &["task", "verdict", task, "--accept"], None));
+    assert_eq!(given["accepted"], true, "{given}");
+    assert_eq!(given["task"]["status"], "done", "{given}");
+}
+
+/// `amem platform grade` records a run for the level that it names, and `amem platform
+/// raise` takes the level one step up on that run.
+fn step_grade_and_raise(root: &Path, handoff: &str) {
+    let grade = ["platform", "grade", "tidy", "--level", "review", "--answer"];
+    let bad = fails(root, &[&grade[..], &["files"]].concat());
+    assert!(bad.contains("is not <scenario>=<handoff entry>"), "{bad}");
+    let answer = format!("files=which={handoff}");
+    let graded = json(&ok(root, &[&grade[..], &[&answer]].concat(), None));
+    assert_eq!(graded["pass"], true, "{graded}");
+    assert_eq!(graded["record"]["level"], "review", "{graded}");
+    let raised = json(&ok(root, &["platform", "raise", "tidy"], None));
+    assert_eq!(raised["to"], "review", "{raised}");
+    assert_eq!(raised["run"], graded["record"]["id"], "{raised}");
+}
+
+/// `amem task outcome` records the outcome that it names, and no other word.
+fn step_outcome(root: &Path, task: &str) {
+    let lost = fails(root, &["task", "outcome", task, "lost"]);
+    assert!(lost.contains("is not reverted or rejected"), "{lost}");
+    let outcome = json(&ok(root, &["task", "outcome", task, "reverted"], None));
+    assert_eq!(outcome["outcome"], "reverted", "{outcome}");
+    assert_eq!(outcome["task"], task, "{outcome}");
+}
+
+/// The owner at the command line gives a verdict, grades, raises, records an outcome
+/// and reads the gates. Each command prints what the library returns.
+#[test]
+fn the_owner_gives_a_verdict_grades_raises_and_records_an_outcome_at_the_command_line() {
+    let d = step_init();
+    with_platform(&d.root);
+    let tidy = "# Tidy a module\n\n```platform task tidy\npurpose = \"Tidy one module.\"\nacceptance = [\"The handoff names each file that changed.\"]\noutputs = [\"handoff\"]\nautonomy = \"checks\"\n```\n";
+    let suite = "# The suite for tidy\n\n```platform suite tidy\n[pass]\nreview = 1\n\n[[scenario]]\nname = \"files=which\"\nask = \"Which files changed?\"\nexpect = [\"src/importer\"]\n```\n";
+    let definition = verified_by_owner(&d.root, AGENT, "dom-plat", tidy);
+    verified_by_owner(&d.root, EVALUATOR, "dom-held", suite);
+    let (task, handoff) = handed_in(&d.root);
+    assert_eq!(level(&d.root), "person");
+    step_verdict(&d.root, &task);
+    step_grade_and_raise(&d.root, &handoff);
+    assert_eq!(level(&d.root), "review");
+    step_outcome(&d.root, &task);
+    assert_eq!(level(&d.root), "person");
+    let gates = json(&ok(&d.root, &["platform", "gates", &definition], None));
+    assert_eq!(gates["entry"], definition.as_str(), "{gates}");
+    assert_eq!(gates["review"]["met"], true, "{gates}");
+}
+
+/// Five refusals of one agent in one clock hour of the decision log: `task stats`
+/// lists the agent under `probing`, and the curator's telemetry raises one alarm. The
+/// hours are in the log, so the test reads no clock.
+#[test]
+fn the_curator_s_telemetry_raises_a_probing_alarm_from_the_decision_log() {
+    let d = step_init();
+    let refusal = |minute: usize| {
+        serde_json::json!({
+            "at": format!("2026-11-15T14:{minute:02}:07Z"), "session": "s-1",
+            "action": "promote", "principal": "agent:z", "class": "agent",
+            "domain": "dom-me", "allow": false, "admit": false, "review": "human",
+            "reason": "a reason",
+        })
+        .to_string()
+    };
+    let lines: Vec<String> = (0..5).map(refusal).collect();
+    std::fs::create_dir_all(d.root.join("state")).unwrap();
+    std::fs::write(
+        d.root.join("state/decisions.jsonl"),
+        lines.join("\n") + "\n",
+    )
+    .unwrap();
+    let stats = json(&ok(&d.root, &["task", "stats"], None));
+    assert_eq!(stats["probing"][0]["who"], "agent:z", "{stats}");
+    assert_eq!(stats["probing"][0]["hour"], "2026-11-15T14", "{stats}");
+    let telemetry = json(&ok(&d.root, &["curator", "--telemetry"], None));
+    let alarms: Vec<&serde_json::Value> = telemetry["alarms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["kind"] == "probing")
+        .collect();
+    let [alarm] = &alarms[..] else {
+        panic!("one probing alarm: {telemetry}")
+    };
+    assert_eq!(alarm["who"], "agent:z");
+    let why = alarm["why"].as_str().unwrap();
+    assert!(why.contains("in the clock hour 2026-11-15T14"), "{why}");
+}
+
 fn holds(root: &Path, needle: &[u8]) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {

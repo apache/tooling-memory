@@ -350,7 +350,8 @@ questions as they were on 12 October; two of them changed with the case study si
 ## Act 7 · The platform
 
 On stage: `agent:architect` (scripted) proposing, you verifying, Codex working on a task
-under what you verified, and the launcher and egress measuring it.
+under what you verified, and the launcher and egress measuring it. Three more scripted
+agents show the autonomy level: `agent:worker`, `agent:evaluator` and `agent:reviewer`.
 
 The claim: the fleet's own configuration is memory too, under the same rule. Only what a
 person verified runs.
@@ -374,7 +375,7 @@ The policy holds that write: an agent cannot change the instructions that the ne
 runs under.
 
 **7.4 A task under the definition.** A question goes to Codex, with no model named.
-Codex runs on qwen3.8-27b because the platform says so (7.6 names the model). Its prompt
+Codex runs on qwen3.8-27b because the platform says so (7.10 names the model). Its prompt
 includes the definition. Its handoff ends with the definition's line. That is how you
 can tell that Codex followed the definition. If a model does not follow it, the step
 says so.
@@ -385,12 +386,41 @@ when a task is done. `agent:architect` proposes one. A task that names it is ref
 because nobody verified it. After you approve it, the same task is filed. The task shows
 the definition with its version, and the checks that it took from the definition.
 
-**7.6 The suite.** The recall suite comes from the platform, not from a file. All three
+**7.6 An autonomy level.** The definition of 7.5 says `autonomy = "review"`. That is
+the highest level that this version can earn. Each version starts at the level `person`.
+`agent:worker` claims a task under the definition, writes a handoff and completes the
+task. The task is not `done`. It is `blocked` and waits on `verdict:<task>`, with the
+handoff on it. You accept the work with `amem task verdict <task> --accept`, and then the
+task is `done`.
+
+**7.7 A held-out suite.** The grants name a domain for the held-out suites and an
+evaluator. `agent:evaluator` writes a suite for the definition into that domain, and you
+verify it. `agent:worker` asks for the entry and gets "not found", as for an entry that
+does not exist. The evaluator grades the handoff of 7.6 against the suite for the level
+`review`, and then raises the level. A second task shows the level `review`: the
+worker's verdict on its own work is refused, and `agent:reviewer` accepts the work over
+the memory server. Then you record that the work of the first task was reverted. The
+level is `person` again.
+
+**7.8 A candidate that adds a tool.** `agent:architect` writes a new version of the
+definition that adds `tool:fetch`, and proposes it for verified. The safety gate refuses
+it before a person gets a task: an agent's candidate cannot add a tool, a domain or a
+higher level. `amem platform gates` shows the three gates of the candidate. The
+performance gate is also not met, because no run of the held-out suite graded this
+version. The architect asks nine times in all. The curator's telemetry counts the
+refusals of each agent in each clock hour, and raises a probing alarm for the architect.
+If act 3 ran in the same clock hour, the telemetry also shows an alarm for `agent:a`,
+which the policy refused seven times in that act.
+
+Without a gateway key, 7.4 does not run, and the steps after it have a number that is
+one lower.
+
+**7.9 The suite.** The recall suite comes from the platform, not from a file. All three
 questions find their entry in the top eight, however they are asked. When the question
 is keywords, the entry comes first every time (mean reciprocal rank 1.00). When the
 question is as written, the entry ranks lower (0.67).
 
-**7.7 What it cost.** Tokens are one resource. The task took 61 seconds of wall clock and
+**7.10 What it cost.** Tokens are one resource. The task took 61 seconds of wall clock and
 4.0 seconds of CPU. The CPU time was 2.4 in the sandbox and 1.6 in the launcher, which
 includes the egress. Its largest process had a peak of 158 MiB. It made 6 model calls,
 about 223,000 tokens including cached input. It spent 53 of its 61 seconds waiting on

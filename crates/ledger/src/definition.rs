@@ -63,6 +63,19 @@ impl std::fmt::Display for Autonomy {
     }
 }
 
+impl std::str::FromStr for Autonomy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Autonomy, String> {
+        match s {
+            "person" => Ok(Autonomy::Person),
+            "review" => Ok(Autonomy::Review),
+            "checks" => Ok(Autonomy::Checks),
+            other => Err(format!("{other:?} is not person, review or checks")),
+        }
+    }
+}
+
 /// What became of work that was handed in, when it did not stand. Not the outcome of an
 /// external effect: that is [`crate::Outcome`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -555,6 +555,44 @@ pub struct CompleteParams {
     pub attempt: Option<String>,
 }
 
+/// Parameters of `verdict`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct VerdictParams {
+    /// The id of the task whose work waits for a verdict.
+    pub id: String,
+    /// True to accept the work, false to reject it.
+    pub accept: bool,
+}
+
+/// Parameters that name a task definition.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct DefinitionParams {
+    /// The name of the task definition.
+    pub definition: String,
+}
+
+/// One answer in a graded run.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct GradeAnswer {
+    /// The name of a scenario of the held-out suite.
+    pub scenario: String,
+    /// The id of the handoff entry that answers the scenario.
+    pub handoff: String,
+}
+
+/// Parameters of `grade`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct GradeParams {
+    /// The name of the task definition.
+    pub definition: String,
+    /// The level that the run is for: `person`, `review` or `checks`.
+    pub level: String,
+    /// One answer for each scenario that was worked. A scenario without an answer
+    /// fails.
+    #[serde(default)]
+    pub answers: Vec<GradeAnswer>,
+}
+
 /// Parameters of `invalidate_task`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct InvalidateParams {
@@ -644,6 +682,8 @@ const READS: &[&str] = &[
     "task_tree",
     "get_task",
     "list_tasks",
+    "autonomy",
+    "candidate_gates",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -1259,6 +1299,77 @@ impl McpServer {
         ok(json!({ "task": t, "late_handoffs": late, "refused_claims": refused }))
     }
 
+    #[tool(
+        description = "Give the verdict on the work of a task that is `blocked` and waits on `verdict:<task>`. Read its handoff first. To accept closes the task. To reject puts the task back on offer and lowers the autonomy level of its task definition one step. You cannot give the verdict on work that you handed in. While the definition is at the level `person`, only a person gives the verdict, at the command line."
+    )]
+    async fn verdict(&self, p: Parameters<VerdictParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let v = self
+            .memory
+            .verdict(&p.id, p.accept)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(v).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "The autonomy level of a task definition: `level` is what a completion under the version in force needs before it counts (`person`, `review` or `checks`), `ceiling` is the highest level that the text of the definition lets it earn, and `records` are its graded runs, raises and work outcomes."
+    )]
+    async fn autonomy(&self, p: Parameters<DefinitionParams>) -> Result<CallToolResult, McpError> {
+        let view = self
+            .memory
+            .autonomy(&p.0.definition)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(view).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Grade handoffs against the held-out suite of a task definition, for one level. Only the evaluator grades. Each answer names a scenario of the suite and the handoff that answers it. You cannot grade a handoff that you wrote. The run is recorded on the definition, passed or not."
+    )]
+    async fn grade(&self, p: Parameters<GradeParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let level: dm_ledger::Autonomy = parse("level", Some(p.level))?
+            .ok_or_else(|| McpError::invalid_params("level: a level", None))?;
+        let answers: Vec<crate::evaluation::Answer> = p
+            .answers
+            .into_iter()
+            .map(|a| crate::evaluation::Answer {
+                scenario: a.scenario,
+                handoff: a.handoff,
+            })
+            .collect();
+        let graded = self
+            .memory
+            .grade(&p.definition, level, &answers)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(graded).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Raise the autonomy level of a task definition from `person` to `review`, on its newest graded run for `review`. The run must have passed on the suite in force, and no work outcome may be newer. Only the evaluator calls this. The step to `checks` is the sign-off of a person at the command line, and this tool refuses it."
+    )]
+    async fn raise_autonomy(
+        &self,
+        p: Parameters<DefinitionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let record = self.memory.raise(&p.0.definition).await.map_err(mcp_err)?;
+        ok(serde_json::to_value(record).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "The gates that an entry of the platform needs before a person can verify it: `performance`, `safety` and `review`, each with `needed`, `met` and `why`, and `reach`, which says what the entry would change. Call it before you propose a candidate for verified."
+    )]
+    async fn candidate_gates(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+        let gates = self
+            .memory
+            .candidate_gates(&p.0.id)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(gates).unwrap_or_default())
+    }
+
     #[tool(description = "Tasks in a domain with a status, ranked as the queue ranks them.")]
     async fn list_tasks(&self, p: Parameters<ListTasksParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -1483,6 +1594,11 @@ mod tests {
             "promotions",
             "erase",
             "declassify",
+            "verdict",
+            "autonomy",
+            "grade",
+            "raise_autonomy",
+            "candidate_gates",
         ] {
             assert!(
                 names.contains(&expected),
@@ -2275,5 +2391,278 @@ mod tests {
         );
         assert!(none["task"].is_null(), "{none}");
         assert_eq!(s.memory.label(), dm_core::Label::Public);
+    }
+
+    /// The autonomy level, the grade and the gates over the memory server.
+    mod levels {
+        use super::*;
+        use crate::testing::{as_author, held_out_root, written, written_in, EVALUATOR};
+        use dm_ledger::{Autonomy, DefinitionChange, Status};
+        use std::path::Path;
+
+        const OWNER: &str = "human:test:me";
+
+        /// A definition whose text lets it earn the highest level.
+        const TIDY: &str = "# Tidy a module\n\n```platform task tidy\npurpose = \"Tidy one module.\"\nacceptance = [\"The handoff names each file that changed.\"]\noutputs = [\"handoff\"]\nautonomy = \"checks\"\n```\n";
+
+        /// One scenario, and a pass mark of one for `review` and for `checks`.
+        const SUITE: &str = "# The suite for tidy\n\n```platform suite tidy\n[pass]\nreview = 1\nchecks = 1\n\n[[scenario]]\nname = \"files question\"\nask = \"Which files changed?\"\nexpect = [\"src/importer\"]\n```\n";
+
+        /// A root with a held-out domain, and the definition `tidy` and its suite, both
+        /// verified: the owner in person, and the entry of the definition.
+        async fn tidy_root(dir: &Path) -> (Memory, String) {
+            let owner = held_out_root(dir);
+            let entry = written(&owner, TIDY, true).await;
+            written_in(&owner, "dom-held", SUITE, true).await;
+            (owner, entry)
+        }
+
+        /// A server over a new session of `author`.
+        fn server_of(dir: &Path, author: &str) -> McpServer {
+            McpServer::new(Arc::new(as_author(dir, author)))
+        }
+
+        /// A handoff in `dom-me` that passes the scenario of the suite.
+        async fn passing_handoff(s: &McpServer) -> String {
+            let h = WriteParams {
+                domain: Some("dom-me".into()),
+                ..handoff("Changed src/importer.rs.\n").0
+            };
+            let w = payload(&s.write(Parameters(h)).await.unwrap());
+            w["id"].as_str().unwrap().to_string()
+        }
+
+        /// A task under `tidy` that `worker` claimed and completed over the memory
+        /// server: the task and its handoff. The completion parks the task.
+        async fn handed_in(owner: &Memory, dir: &Path, worker: &str) -> (String, String) {
+            let spec = dm_ledger::TaskSpec {
+                domain: "dom-me".into(),
+                title: "Tidy the importer".into(),
+                body: "Do it.\n".into(),
+                definition: Some("tidy".into()),
+                ..dm_ledger::TaskSpec::default()
+            };
+            let task = owner.create_task(spec).await.unwrap().task;
+            if task.status == Status::Proposed {
+                owner.admit(&task.id).await.unwrap();
+            }
+            let s = server_of(dir, worker);
+            let lease = LeaseParams {
+                id: task.id.clone(),
+                lease_seconds: None,
+            };
+            s.claim(Parameters(lease)).await.unwrap();
+            let h = passing_handoff(&s).await;
+            let done = CompleteParams {
+                id: task.id.clone(),
+                handoff: h.clone(),
+                ..CompleteParams::default()
+            };
+            let parked = payload(&s.complete(Parameters(done)).await.unwrap());
+            assert_eq!(parked["task"]["status"], "blocked", "{parked}");
+            let event = format!("verdict:{}", task.id);
+            assert_eq!(parked["task"]["waiting_on"], event.as_str(), "{parked}");
+            (task.id, h)
+        }
+
+        fn accept(task: &str) -> Parameters<VerdictParams> {
+            Parameters(VerdictParams {
+                id: task.into(),
+                accept: true,
+            })
+        }
+
+        fn tidy() -> Parameters<DefinitionParams> {
+            Parameters(DefinitionParams {
+                definition: "tidy".into(),
+            })
+        }
+
+        fn run(level: &str, handoff: &str) -> Parameters<GradeParams> {
+            Parameters(GradeParams {
+                definition: "tidy".into(),
+                level: level.into(),
+                answers: vec![GradeAnswer {
+                    scenario: "files question".into(),
+                    handoff: handoff.into(),
+                }],
+            })
+        }
+
+        /// At the level `person`, the verdict is a person's in person. The memory
+        /// server serves a harness, so it refuses the verdict whatever the name of the
+        /// session is. The same person at the command line gives it.
+        #[tokio::test]
+        async fn a_verdict_at_person_is_refused_over_the_memory_server_whatever_the_name() {
+            let dir = tempfile::tempdir().unwrap();
+            let (owner, _) = tidy_root(dir.path()).await;
+            let (task, _) = handed_in(&owner, dir.path(), "agent:w").await;
+            for name in [OWNER, "agent:r"] {
+                let why = refusal(server_of(dir.path(), name).verdict(accept(&task)).await);
+                let said = "only a person gives the verdict on work at the level person";
+                assert!(why.contains(said), "{name}: {why}");
+            }
+            let waits = owner.get_task(&task).await.unwrap();
+            assert_eq!(waits.status, Status::Blocked);
+            let given = owner.verdict(&task, true).await.unwrap();
+            assert_eq!(given.task.status, Status::Done);
+        }
+
+        /// At the level `review`, the worker's own verdict is refused, and the verdict
+        /// of another agent over the memory server closes the task.
+        #[tokio::test]
+        async fn a_verdict_at_review_from_another_agent_closes_the_task() {
+            let dir = tempfile::tempdir().unwrap();
+            let (owner, _) = tidy_root(dir.path()).await;
+            let reference = owner.autonomy("tidy").await.unwrap().definition;
+            let raised = DefinitionChange::Raised {
+                to: Autonomy::Review,
+                run: "def-plat-test".into(),
+                signed_by: None,
+            };
+            {
+                let mut l = owner.ledger.lock().await;
+                l.record_definition("dom-plat", &reference, raised)
+                    .await
+                    .unwrap();
+            }
+            let (task, h) = handed_in(&owner, dir.path(), "agent:w").await;
+            let own = refusal(
+                server_of(dir.path(), "agent:w")
+                    .verdict(accept(&task))
+                    .await,
+            );
+            assert!(
+                own.contains("nobody gives the verdict on its own work"),
+                "{own}"
+            );
+            let reviewer = server_of(dir.path(), "agent:r");
+            let given = payload(&reviewer.verdict(accept(&task)).await.unwrap());
+            assert_eq!(given["accepted"], true, "{given}");
+            assert_eq!(given["level"], "review", "{given}");
+            assert_eq!(given["task"]["status"], "done", "{given}");
+            assert_eq!(given["task"]["handoff"], h.as_str(), "{given}");
+            let done = owner.get_task(&task).await.unwrap();
+            assert_eq!(done.status, Status::Done);
+        }
+
+        /// Only the evaluator grades over the memory server. The level is one of the
+        /// three names. The run that the tool gives is the record on the ledger.
+        #[tokio::test]
+        async fn grade_over_the_memory_server_is_the_evaluator_s_and_records_the_run() {
+            let dir = tempfile::tempdir().unwrap();
+            let (owner, _) = tidy_root(dir.path()).await;
+            let h = passing_handoff(&server_of(dir.path(), "agent:w")).await;
+            let other = refusal(
+                server_of(dir.path(), "agent:x")
+                    .grade(run("review", &h))
+                    .await,
+            );
+            assert!(
+                other.contains("only the evaluator grades a task definition"),
+                "{other}"
+            );
+            let evaluator = server_of(dir.path(), EVALUATOR);
+            let bad = refusal(evaluator.grade(run("expert", &h)).await);
+            assert!(
+                bad.contains("level: \"expert\" is not person, review or checks"),
+                "{bad}"
+            );
+            assert_eq!(owner.autonomy("tidy").await.unwrap().records, []);
+            let graded = payload(&evaluator.grade(run("review", &h)).await.unwrap());
+            assert_eq!(graded["pass"], true, "{graded}");
+            assert_eq!(graded["failed"], json!([]), "{graded}");
+            assert_eq!(graded["record"]["change"], "graded", "{graded}");
+            assert_eq!(graded["record"]["level"], "review", "{graded}");
+            assert_eq!(graded["record"]["by"], EVALUATOR, "{graded}");
+            let records = owner.autonomy("tidy").await.unwrap().records;
+            assert_eq!(
+                serde_json::to_value(&records).unwrap(),
+                json!([graded["record"]])
+            );
+        }
+
+        /// The evaluator takes the step to `review` over the memory server. The step
+        /// to `checks` is refused there, from the evaluator and from a session with
+        /// the name of the owner: the owner takes it in person.
+        #[tokio::test]
+        async fn raise_autonomy_takes_the_step_to_review_and_refuses_the_step_to_checks() {
+            let dir = tempfile::tempdir().unwrap();
+            let (owner, _) = tidy_root(dir.path()).await;
+            let reference = owner.autonomy("tidy").await.unwrap().definition;
+            let h = passing_handoff(&server_of(dir.path(), "agent:w")).await;
+            let evaluator = server_of(dir.path(), EVALUATOR);
+            evaluator.grade(run("review", &h)).await.unwrap();
+            let worker = refusal(
+                server_of(dir.path(), "agent:w")
+                    .raise_autonomy(tidy())
+                    .await,
+            );
+            assert!(
+                worker.contains("or the evaluator raises a task definition to the level review"),
+                "{worker}"
+            );
+            let raised = payload(&evaluator.raise_autonomy(tidy()).await.unwrap());
+            assert_eq!(raised["change"], "raised", "{raised}");
+            assert_eq!(raised["to"], "review", "{raised}");
+            assert_eq!(raised["definition"], reference.as_str(), "{raised}");
+            evaluator.grade(run("checks", &h)).await.unwrap();
+            for name in [EVALUATOR, OWNER] {
+                let why = refusal(server_of(dir.path(), name).raise_autonomy(tidy()).await);
+                let said = "only a person signs a task definition off for the level checks";
+                assert!(why.contains(said), "{name}: {why}");
+            }
+            let level = owner.level_of(&reference).await.unwrap();
+            assert_eq!(level, Autonomy::Review);
+            let signed = owner.raise("tidy").await.unwrap();
+            assert!(
+                matches!(&signed.change, DefinitionChange::Raised { to: Autonomy::Checks, signed_by: Some(by), .. } if by == OWNER),
+                "{signed:?}"
+            );
+        }
+
+        /// The two reads give what the library gives to the same principal.
+        #[tokio::test]
+        async fn autonomy_and_candidate_gates_give_what_the_library_gives() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_owner, entry) = tidy_root(dir.path()).await;
+            let s = server_of(dir.path(), "agent:x");
+            let library = as_author(dir.path(), "agent:x");
+            let view = payload(&s.autonomy(tidy()).await.unwrap());
+            let same = library.autonomy("tidy").await.unwrap();
+            assert_eq!(view, serde_json::to_value(&same).unwrap());
+            assert_eq!(view["definition"], format!("tidy@{entry}").as_str());
+            assert_eq!(view["level"], "person", "{view}");
+            assert_eq!(view["ceiling"], "checks", "{view}");
+            let id = Parameters(GetParams { id: entry.clone() });
+            let gates = payload(&s.candidate_gates(id).await.unwrap());
+            let same = library.candidate_gates(&entry).await.unwrap();
+            assert_eq!(gates, serde_json::to_value(&same).unwrap());
+            assert_eq!(gates["entry"], entry.as_str(), "{gates}");
+            assert_eq!(gates["review"]["needed"], true, "{gates}");
+            assert_eq!(gates["review"]["met"], true, "{gates}");
+        }
+
+        /// A re-run serves the two reads from the record as it is, and captures the
+        /// other three as it captures a write. An outcome is a person's at the command
+        /// line, and a list of who is flagged would tell an agent where the threshold
+        /// is: no tool does either.
+        #[test]
+        fn the_reads_are_reads_and_no_tool_records_an_outcome_or_lists_probing() {
+            for read in ["autonomy", "candidate_gates"] {
+                assert_eq!(kind_of(read), tape::Kind::Read, "{read}");
+            }
+            for change in ["verdict", "grade", "raise_autonomy"] {
+                assert_eq!(kind_of(change), tape::Kind::Mutation, "{change}");
+            }
+            let router = McpServer::tool_router();
+            let tools = router.list_all();
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+            let neither: Vec<&&str> = names
+                .iter()
+                .filter(|n| n.contains("outcome") || n.contains("probing"))
+                .collect();
+            assert!(neither.is_empty(), "a tool that should not be: {neither:?}");
+        }
     }
 }
