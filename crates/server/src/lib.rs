@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
+pub mod audit;
 pub mod bundle;
 pub mod contexts;
 pub mod duties;

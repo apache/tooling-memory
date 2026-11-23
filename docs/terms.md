@@ -94,6 +94,9 @@ term here in the same commit as the first document that needs it.
 | disputed correction | A correction where one person accepted the result and another person did not. It goes to a person and not to a curator | conflict (for a disputed correction) |
 | overlapping rules | Two rules that are in force in one layer, with rule sentences that share four fifths or more of their words. The curator proposes one rule, and the owners decide | duplicate rules |
 | repeated work | Three or more done tasks of a domain with one title and no task definition. The titles are compared in lowercase with the digits removed. The curator proposes a task definition for it | recurring work |
+| planted case | One of ten fixed pairs of an entry and a summary that the library holds for the qualification of the auditor. Six summaries say what the body does not say. A planted case is never in the record | planted fault (for a sound case), test entry |
+| qualification of the auditor | The decision on how the auditor runs, made from the scores of two models on the planted cases. The mode is `other-model` or `fresh-session`. `state/auditor.json` holds it | certification, calibration |
+| human sample | The verdicts of the auditor that a person reviews in each cycle: 1 in the mode `other-model` and 3 in the mode `fresh-session`. The digest of the entry and the model chooses them | spot check |
 | feed | The step that brings the index up to the event log of a domain: it takes each version that the log names above a cursor from the record, and moves the cursor. A writer does it before its write returns | sync (for the feed) |
 | freshness bound | The longest time that a version in the event log of a domain can wait for the feed: 60 seconds. `freshness` measures a domain against it | index lag |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
