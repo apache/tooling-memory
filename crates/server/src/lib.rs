@@ -40,6 +40,7 @@ pub mod bundle;
 pub mod contexts;
 pub mod evaluation;
 pub mod fabric;
+pub mod gates;
 mod holds;
 pub mod log;
 pub mod mcp;
@@ -1247,6 +1248,9 @@ impl Memory {
                 entry.front.trust_tier
             )));
         }
+        if to == TrustTier::Verified {
+            self.platform_gates(&entry, "propose", &self.author).await?;
+        }
         let phase = if to == TrustTier::Verified {
             "propose"
         } else {
@@ -1480,6 +1484,8 @@ impl Memory {
         let task = self.ledger.lock().await.get(task_id).await?;
         self.check_task(&task)?;
         let (id, entry) = self.proposal_entry(&task).await?;
+        self.platform_gates(&entry, "approve", &task.spec.created_by)
+            .await?;
         let d = self.decide_promotion(
             &entry,
             TrustTier::Verified,
@@ -1760,7 +1766,12 @@ impl Memory {
         phase: &str,
         proposer: &str,
     ) -> Result<Decision, Error> {
-        self.decide(&Input {
+        self.decide(&self.promotion_input(entry, to, phase, proposer))
+    }
+
+    /// What the policy is asked about a promotion of `entry` to `to`.
+    fn promotion_input(&self, entry: &Entry, to: TrustTier, phase: &str, proposer: &str) -> Input {
+        Input {
             action: Action::Promote,
             principal: self.principal(),
             domain: entry.front.domain.clone(),
@@ -1778,7 +1789,7 @@ impl Memory {
             spend: None,
             fetch: None,
             approval: None,
-        })
+        }
     }
 
     /// Index an entry just put, and the entry it replaced. The store marks that one

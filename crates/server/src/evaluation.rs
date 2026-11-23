@@ -353,6 +353,24 @@ impl Memory {
         Ok(suite.and_then(Result::ok).map(|s| s.version))
     }
 
+    /// The suite in force for the definition `name`, as the record holds it, whoever
+    /// asks: none when there is no suite. The caller tells nothing of its text to a
+    /// session; [`Memory::held_out_suite`] is the read for a session.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] when the block in force does not read as a suite, in words
+    /// that quote none of its text; a store error.
+    pub(crate) async fn suite_in_force(&self, name: &str) -> Result<Option<Suite>, Error> {
+        let Some(entry) = self.suite_entry(name).await? else {
+            return Ok(None);
+        };
+        match suite_block(&entry, name) {
+            Some(Ok(suite)) => Ok(Some(suite)),
+            _ => Err(not_a_suite(name)),
+        }
+    }
+
     /// The held-out suite in force for the task definition `name`, for a session that
     /// reads the held-out domain: the one in the newest active entry of that domain
     /// that a person verified. None when there is none, or when the entry is above

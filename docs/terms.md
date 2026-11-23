@@ -83,6 +83,10 @@ term here in the same commit as the first document that needs it.
 | held-out suite | The scenarios that grade one task definition, in a verified entry of the held-out domain. Each scenario gives the strings that a handoff must hold. The grants name the held-out domain (`held_out`), and only the evaluator and the owner in person read it | test suite (for a held-out suite), golden suite (for a held-out suite) |
 | evaluator | The principal that the grants name (`evaluator`) to grade work on the held-out suites. It reads the held-out domain, and it claims no task | grader, judge |
 | pass mark | The number of scenarios of a held-out suite that must pass for one autonomy level | threshold (for a pass mark) |
+| candidate | An entry of the platform's domain that is proposed for verified. A candidate version of a task definition is a candidate with a `platform task` block | proposal (for the entry), draft |
+| safety gate | The check that refuses a candidate version of a task definition when it declares a tool, a scope domain or an autonomy level that the version before it does not, and no person wrote it | privilege check, permission gate |
+| performance gate | The check that refuses a candidate version of a task definition while it has no passed run of the held-out suite in force for the level `person`. It applies only where such a suite gives that pass mark | quality gate |
+| probing | Five or more refusals of one agent in one clock hour, counted from the decision log | scanning, abuse (for probing) |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |

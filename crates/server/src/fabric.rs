@@ -12,7 +12,7 @@ use crate::{Error, Memory};
 use dm_ledger::{Status, Task};
 use dm_policy::record::Rubric;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use time::OffsetDateTime;
 
 /// One task moved in the queue.
@@ -217,6 +217,58 @@ pub fn inflated_by_creator(root: &std::path::Path) -> BTreeMap<String, usize> {
     out
 }
 
+/// How many refusals of one agent in one clock hour are reported as probing.
+pub const PROBING_DENIALS: usize = 5;
+
+/// One agent that the policy refused many times in one clock hour.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Probing {
+    /// The principal that was refused.
+    pub who: String,
+    /// The clock hour, as the first 13 characters of a time in the log:
+    /// `2026-11-15T14`.
+    pub hour: String,
+    /// How many of its requests were refused in that hour.
+    pub denials: usize,
+    /// The actions that were refused, each one time, in the order of their names.
+    pub actions: Vec<String>,
+}
+
+/// The agents that probe, from the decision log: the paper's repeated denials from one
+/// agent. Each refused decision whose principal is an agent counts for that principal
+/// and the clock hour of the line. A principal with [`PROBING_DENIALS`] or more in one
+/// hour is in the result, in the order of principal and hour. The hour comes from the
+/// line, so no clock is read.
+#[must_use]
+pub fn probing(root: &std::path::Path) -> Vec<Probing> {
+    let text = std::fs::read_to_string(root.join("state/decisions.jsonl")).unwrap_or_default();
+    let mut per_hour: BTreeMap<(String, String), (usize, BTreeSet<String>)> = BTreeMap::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let refused = v["allow"] == false && v["class"] == "agent";
+        let hour = v["at"].as_str().and_then(|at| at.get(..13));
+        if let (true, Some(who), Some(hour)) = (refused, v["principal"].as_str(), hour) {
+            let slot = per_hour
+                .entry((who.to_string(), hour.to_string()))
+                .or_default();
+            slot.0 += 1;
+            slot.1.extend(v["action"].as_str().map(str::to_string));
+        }
+    }
+    per_hour
+        .into_iter()
+        .filter(|(_, (denials, _))| *denials >= PROBING_DENIALS)
+        .map(|((who, hour), (denials, actions))| Probing {
+            who,
+            hour,
+            denials,
+            actions: actions.into_iter().collect(),
+        })
+        .collect()
+}
+
 impl Memory {
     /// The rubric in force: the last verified L1 policy that carries one, by id, or the
     /// default.
@@ -338,7 +390,7 @@ impl Memory {
         let l = self.ledger.lock().await;
         let mut by_family: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
         let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
-        let mut done_caps = std::collections::BTreeSet::new();
+        let mut done_caps = BTreeSet::new();
         let mut waiting = Vec::new();
         for status in [
             Status::Proposed,
@@ -378,6 +430,142 @@ impl Memory {
             "domain": domain, "by_family": by_family, "invalidated_because": reasons,
             "unmatched_requirements": unmatched,
             "inflated_by_creator": inflated_by_creator(&self.root),
+            "probing": probing(&self.root),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// One line of the decision log, as [`Memory::log_decision`] writes it.
+    fn decision(at: &str, principal: &str, class: &str, action: &str, allow: bool) -> String {
+        serde_json::json!({
+            "at": at, "session": "s-1", "action": action, "principal": principal,
+            "class": class, "domain": "dom-me", "allow": allow, "admit": false,
+            "review": "none", "reason": "a reason",
+        })
+        .to_string()
+    }
+
+    /// `count` refusals of `principal` in the clock hour `hour`, one for each minute.
+    fn refusals(hour: &str, principal: &str, class: &str, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|minute| {
+                let at = format!("{hour}:{minute:02}:07.5Z");
+                decision(&at, principal, class, "write", false)
+            })
+            .collect()
+    }
+
+    /// A root whose decision log holds `lines`.
+    fn logged(dir: &Path, lines: &[String]) {
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        std::fs::write(dir.join("state/decisions.jsonl"), lines.join("\n") + "\n").unwrap();
+    }
+
+    fn found(lines: &[String]) -> Vec<Probing> {
+        let dir = tempfile::tempdir().unwrap();
+        logged(dir.path(), lines);
+        probing(dir.path())
+    }
+
+    /// Rule 10: where the count starts, and what is in a report.
+    #[test]
+    fn five_refusals_of_one_agent_in_one_clock_hour_are_probing() {
+        let hour = "2026-11-15T14";
+        let mut lines = refusals(hour, "agent:a", "agent", PROBING_DENIALS - 1);
+        assert_eq!(found(&lines), []);
+        lines.push(decision(
+            "2026-11-15T14:59:59Z",
+            "agent:a",
+            "agent",
+            "promote",
+            false,
+        ));
+        lines.push("not a line of the log".into());
+        let report = found(&lines);
+        assert_eq!(
+            report,
+            [Probing {
+                who: "agent:a".into(),
+                hour: hour.into(),
+                denials: PROBING_DENIALS,
+                actions: vec!["promote".into(), "write".into()],
+            }]
+        );
+        assert_eq!(PROBING_DENIALS, 5);
+    }
+
+    /// Rule 10: what does not count.
+    #[test]
+    fn refusals_in_other_hours_of_other_principals_and_of_persons_are_not_added_up() {
+        // five across two clock hours
+        let mut lines = refusals("2026-11-15T14", "agent:a", "agent", 3);
+        lines.extend(refusals("2026-11-15T15", "agent:a", "agent", 2));
+        assert_eq!(found(&lines), []);
+        // three each of two agents
+        let mut lines = refusals("2026-11-15T14", "agent:a", "agent", 3);
+        lines.extend(refusals("2026-11-15T14", "agent:b", "agent", 3));
+        assert_eq!(found(&lines), []);
+        // the owner, another person, a tap and the system
+        for (who, class) in [
+            ("human:test:me", "owner"),
+            ("human:test:reviewer", "human"),
+            ("tap:checks", "tap"),
+            ("curation", "system"),
+        ] {
+            assert_eq!(
+                found(&refusals("2026-11-15T14", who, class, 9)),
+                [],
+                "{who}"
+            );
+        }
+        // decisions that allowed the request
+        let allowed: Vec<String> = (0..9)
+            .map(|_| decision("2026-11-15T14:00:00Z", "agent:a", "agent", "write", true))
+            .collect();
+        assert_eq!(found(&allowed), []);
+        // each agent and each hour is a report of its own
+        let mut lines = refusals("2026-11-15T15", "agent:b", "agent", 6);
+        lines.extend(refusals("2026-11-15T14", "agent:a", "agent", 5));
+        lines.extend(refusals("2026-11-15T16", "agent:a", "agent", 4));
+        let report = found(&lines);
+        let who: Vec<_> = report
+            .iter()
+            .map(|p| (p.who.as_str(), p.hour.as_str(), p.denials))
+            .collect();
+        assert_eq!(
+            who,
+            [
+                ("agent:a", "2026-11-15T14", 5),
+                ("agent:b", "2026-11-15T15", 6)
+            ]
+        );
+    }
+
+    /// Rule 11.
+    #[tokio::test]
+    async fn the_statistics_of_the_tasks_carry_the_probing_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::testing::root(dir.path());
+        let quiet = owner.task_stats(Some("dom-me")).await.unwrap();
+        assert_eq!(quiet["probing"], serde_json::json!([]));
+        let path = dir.path().join("state/decisions.jsonl");
+        let mut log = std::fs::read_to_string(&path).unwrap_or_default();
+        for line in refusals("2026-11-15T14", "agent:a", "agent", 5) {
+            log.push_str(&line);
+            log.push('\n');
+        }
+        std::fs::write(&path, log).unwrap();
+        let stats = owner.task_stats(Some("dom-me")).await.unwrap();
+        assert_eq!(
+            stats["probing"],
+            serde_json::json!([{
+                "who": "agent:a", "hour": "2026-11-15T14", "denials": 5, "actions": ["write"],
+            }])
+        );
     }
 }

@@ -221,7 +221,9 @@ impl Memory {
             .filter(|d| self.grants.domains.contains_key(d))
     }
 
-    async fn platform_entries(&self) -> Result<Vec<Entry>, Error> {
+    /// Every entry of the platform's domain, as the record holds it, whatever its tier
+    /// and its state.
+    pub(crate) async fn platform_entries(&self) -> Result<Vec<Entry>, Error> {
         let Some(domain) = self.platform_domain() else {
             return Ok(Vec::new());
         };
