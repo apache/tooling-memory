@@ -181,6 +181,7 @@ pub async fn prompted(
             prompt: Some(prompt.to_string()),
             dirty: commit.as_ref().is_some_and(|(_, d)| *d),
             commit: commit.map(|(c, _)| c),
+            ..dm_server::tape::TapeStart::default()
         })
         .await
         .ok();

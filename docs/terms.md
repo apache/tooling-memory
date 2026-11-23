@@ -107,6 +107,9 @@ term here in the same commit as the first document that needs it.
 | replay | Send a recorded decision context to a model again | |
 | tape | The memory tool calls of one session, with their results | |
 | re-enactment | Run a session again on its prompt, and answer its memory tools from its tape | |
+| replay manifest | The part of a decision context and of a tape header that names what the session could read at that time: for each domain the offset of its event log and the number of entries in the index, the policy version, the digest of the grants, the session settings, the ranker and the digest of T0. On a decision context, it also names the entries that the session got after the decision context before | starting state (for a replay manifest), checkpoint (for a replay manifest) |
+| replay state | What `amem reenact state` gives for a tape: its replay manifest, each part that is different now, the calls that an erasure removed, and `complete` or `incomplete` | |
+| drift window | A time span for one destination and one model. It starts at the time that detected drift gives, and it ends when the owner closes it. An entry that an agent wrote in the span is not promoted, also after the owner closed the drift window | freeze (as a noun), quarantine (for a drift window) |
 | recall | The memory tool that answers a question with a cited brief, or with a pack of entries when no model is behind it | |
 | deputy | The small model that the memory server calls through the egress for recall | |
 | tap | A component that connects an outside system to `amem`. A tap with `tool = true` is a tool. Any other tap runs on a schedule, such as `github-issues` | connector, plugin (for a tap) |

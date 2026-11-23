@@ -37,6 +37,7 @@ use tokio::sync::Mutex as AsyncMutex;
 pub mod arms;
 pub mod bundle;
 pub mod contexts;
+pub mod drift_windows;
 pub mod fabric;
 pub mod log;
 pub mod mcp;
@@ -46,6 +47,7 @@ pub mod prefetch;
 pub mod projection;
 pub mod reads;
 pub mod recall;
+pub mod replay_state;
 pub mod rules;
 pub mod sources;
 pub mod t0;
@@ -1259,6 +1261,7 @@ impl Memory {
         let cites = self.cites_for_write(&domain, req.entry_type, req.cites);
         let cites = cites.await?;
         let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
+        let tier = self.tier_outside_windows(tier, now)?;
         // facts decay fast and carry mandatory review dates (the paper, §4): one written
         // without a date gets one ninety days out, which the curator enforces
         let review_by = req.review_by.or_else(|| {
@@ -1894,6 +1897,9 @@ impl Memory {
         }
     }
 
+    /// Ask the policy whether `entry` may be promoted; a promotion and an approval both
+    /// ask here before anything is recorded. An entry that a drift window holds is
+    /// refused before the policy is asked ([`drift_windows`]).
     fn decide_promotion(
         &self,
         entry: &Entry,
@@ -1901,6 +1907,7 @@ impl Memory {
         phase: &str,
         proposer: &str,
     ) -> Result<Decision, Error> {
+        self.refuse_frozen(entry)?;
         self.decide(&Input {
             action: Action::Promote,
             principal: self.principal(),

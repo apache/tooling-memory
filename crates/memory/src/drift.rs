@@ -12,15 +12,23 @@
 //! passes and refusal-probe refusals (safety filters, formatting), and median latency,
 //! reported but no alarm on its own. Logprob divergence, frozen-context replay,
 //! change-point detection over many runs and fleet metrics are not here.
+//!
+//! Confirmed drift that is filed also opens a drift window for the destination and
+//! model (`dm_server::drift_windows`): nothing that an agent wrote from the start of the
+//! window on is promoted. `amem drift window` opens one by hand, closes one and lists
+//! them. The window and the freeze are the library's; this module calls them.
 
 use clap::Subcommand;
 use dm_egress::Egress;
 use dm_sandbox::{AuthMode, Harness};
+use dm_server::drift_windows::Window;
 use dm_server::Memory;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -81,6 +89,48 @@ pub enum DriftOp {
         #[arg(long)]
         domain: Option<String>,
     },
+    /// The drift windows: nothing that an agent wrote inside one is promoted. A check
+    /// with --file opens one when it confirms drift.
+    Window {
+        #[command(subcommand)]
+        op: WindowOp,
+    },
+}
+
+/// `amem drift window`'s subcommands. Each prints JSON.
+#[derive(Subcommand)]
+pub enum WindowOp {
+    /// Open a window for a destination and model by hand. When one is open already,
+    /// that one is printed and nothing changes.
+    Open {
+        /// The destination whose model changed.
+        #[arg(long)]
+        provider: String,
+        /// The model, as the destination names it.
+        #[arg(long)]
+        model: String,
+        /// When the window starts, RFC 3339; now otherwise.
+        #[arg(long)]
+        from: Option<String>,
+        /// Why the window opens.
+        #[arg(long)]
+        why: String,
+    },
+    /// Close the open window of a destination and model, now. What agents wrote inside
+    /// it stays unpromotable.
+    Close {
+        /// The destination.
+        #[arg(long)]
+        provider: String,
+        /// The model.
+        #[arg(long)]
+        model: String,
+        /// Why the window closes: the model is pinned, or the change is understood.
+        #[arg(long)]
+        why: String,
+    },
+    /// Every window, open and closed.
+    List,
 }
 
 /// Run a drift subcommand.
@@ -122,6 +172,35 @@ pub async fn run(root: &Path, op: DriftOp) -> Fallible<()> {
             };
             check_cmd(root, &ask).await
         }
+        DriftOp::Window { op } => window_cmd(root, op),
+    }
+}
+
+fn window_cmd(root: &Path, op: WindowOp) -> Fallible<()> {
+    let memory = Memory::open(root)?;
+    match op {
+        WindowOp::Open {
+            provider,
+            model,
+            from,
+            why,
+        } => {
+            let from = match from {
+                Some(t) => OffsetDateTime::parse(&t, &Rfc3339)
+                    .map_err(|e| format!("--from {t:?} is not an RFC 3339 time: {e}"))?,
+                None => OffsetDateTime::now_utc(),
+            };
+            crate::json(&memory.open_drift_window(&provider, &model, from, &[], &why)?)
+        }
+        WindowOp::Close {
+            provider,
+            model,
+            why,
+        } => {
+            let at = OffsetDateTime::now_utc();
+            crate::json(&memory.close_drift_window(&provider, &model, at, &why)?)
+        }
+        WindowOp::List => crate::json(&memory.drift_windows()?),
     }
 }
 
@@ -931,7 +1010,7 @@ pub fn task_body(destination: &str, model: &str, c: &Comparison) -> String {
     format!(
         "The drift probe battery found a change on `{destination}/{model}` that our side does not explain: the amem version, the probe set and the request shape are the same in both runs.\n\n\
          Detectors fired: {}.\n\n## Evidence\n\n```json\n{}\n```\n\n## Playbook\n\n\
-         1. **Freeze distillation.** Stop distilling from sessions on this model from the baseline run on, and quarantine any candidate whose evaluation spanned the change: its fitness may be the vendor's change, not the harness's.\n\
+         1. **Freeze distillation.** A drift window is open for `{destination}/{model}` from the run before this one: nothing that an agent wrote from then on is promoted (`amem drift window list`). Stop distilling from sessions on this model, and quarantine any candidate whose evaluation spanned the change: its fitness may be the vendor's change, not the harness's. Close the window with `amem drift window close` when the model is pinned or the change is understood; what agents wrote inside it is written again before it is promoted.\n\
          2. **Pin or fail over.** Pin a dated snapshot if the vendor offers one, or move the work to another destination or model until this one is understood.\n\
          3. **Record.** Write a decision entry naming the change point (the two runs), the detectors and the evidence, so later readers can find what this model wrote across it.\n\
          4. **Escalate.** Ask the vendor or the gateway's operator what changed behind `{model}`, with the evidence above.\n\n\
@@ -982,9 +1061,45 @@ pub async fn scheduled(
     }
     let c = compare(first, last, &Params::default());
     if c.drift {
+        let previous = &runs[runs.len() - 2];
+        let from = window_from(Some(&previous.at), &first.at);
+        freeze(memory, destination, model, from, &c)?;
         file(memory, domain, destination, model, &c).await?;
     }
     Ok(Some(c.verdict))
+}
+
+/// When the drift window of a confirmed change starts: at the run before the checked
+/// one in the checked model's own file, since the change came after that run; at the
+/// baseline when that file holds no earlier run. Each is the time its run recorded.
+/// None when the time does not parse.
+#[must_use]
+pub fn window_from(previous: Option<&str>, baseline: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(previous.unwrap_or(baseline), &Rfc3339).ok()
+}
+
+/// Open the drift window of confirmed drift, from `from`, with the detectors that
+/// fired. A window that is open already for the destination and model is the answer.
+///
+/// # Errors
+///
+/// When the window has no start, or cannot be written.
+pub fn freeze(
+    memory: &Memory,
+    destination: &str,
+    model: &str,
+    from: Option<OffsetDateTime>,
+    c: &Comparison,
+) -> Fallible<Window> {
+    let from = from.ok_or(
+        "the run before the change has no time that parses, so the drift window has no start",
+    )?;
+    let detectors: Vec<String> = c.fired().iter().map(|d| d.name.to_string()).collect();
+    let why = format!(
+        "vendor drift on {destination}/{model}: {} fired",
+        detectors.join(", ")
+    );
+    Ok(memory.open_drift_window(destination, model, from, &detectors, &why)?)
 }
 
 pub async fn file(
@@ -1102,11 +1217,23 @@ struct CheckArgs {
     domain: Option<String>,
 }
 
-/// The baseline and current runs a check compares, with their indices.
-fn runs_for(root: &Path, a: &CheckArgs) -> Fallible<((usize, Run), (usize, Run))> {
+/// The runs that a check compares.
+struct Compared {
+    /// The baseline, with its index in its file.
+    base: (usize, Run),
+    /// The run checked, with its index in its file.
+    current: (usize, Run),
+    /// The time of the run before the checked one in the checked model's own file,
+    /// when there is one.
+    previous: Option<String>,
+}
+
+/// The baseline and current runs a check compares.
+fn runs_for(root: &Path, a: &CheckArgs) -> Fallible<Compared> {
     let mut current_runs = load(&runs_path(root, &a.destination, &a.model))?;
     let ci = current_runs.len() - 1;
     let current = current_runs.pop().ok_or("no runs")?;
+    let previous = current_runs.last().map(|r| r.at.clone());
     let base_model = a.baseline_model.as_deref().unwrap_or(&a.model);
     let mut base_runs = if base_model == a.model {
         current_runs
@@ -1121,11 +1248,19 @@ fn runs_for(root: &Path, a: &CheckArgs) -> Fallible<((usize, Run), (usize, Run))
             e
         }
     })?;
-    Ok(((bi, base_runs.swap_remove(bi)), (ci, current)))
+    Ok(Compared {
+        base: (bi, base_runs.swap_remove(bi)),
+        current: (ci, current),
+        previous,
+    })
 }
 
 async fn check_cmd(root: &Path, a: &CheckArgs) -> Fallible<()> {
-    let ((bi, base), (ci, current)) = runs_for(root, a)?;
+    let Compared {
+        base: (bi, base),
+        current: (ci, current),
+        previous,
+    } = runs_for(root, a)?;
     let c = compare(&base, &current, &a.params);
     let errors = |r: &Run| -> usize {
         r.probes
@@ -1137,17 +1272,14 @@ async fn check_cmd(root: &Path, a: &CheckArgs) -> Fallible<()> {
         "baseline_model": base.model, "model": current.model,
         "note": "the baseline is another model's run: how a repoint behind a fixed alias looks; the requested model is not compared as part of our pinned side",
     }));
-    let filed = if a.file && c.drift {
-        file(
-            &Memory::open(root)?,
-            a.domain.as_deref(),
-            &a.destination,
-            &a.model,
-            &c,
-        )
-        .await?
+    let (filed, window) = if a.file && c.drift {
+        let memory = Memory::open(root)?;
+        let from = window_from(previous.as_deref(), &base.at);
+        let window = freeze(&memory, &a.destination, &a.model, from, &c)?;
+        let filed = file(&memory, a.domain.as_deref(), &a.destination, &a.model, &c).await?;
+        (filed, Some(window))
     } else {
-        None
+        (None, None)
     };
     crate::json(&json!({
         "destination": a.destination, "model": a.model,
@@ -1155,7 +1287,7 @@ async fn check_cmd(root: &Path, a: &CheckArgs) -> Fallible<()> {
         "current": { "model": current.model, "index": ci, "at": current.at, "errors": errors(&current) },
         "simulated_repoint": repoint,
         "attribution": c.attribution, "detectors": c.detectors,
-        "drift": c.drift, "verdict": c.verdict, "filed": filed,
+        "drift": c.drift, "verdict": c.verdict, "filed": filed, "window": window,
     }))
 }
 
@@ -1446,6 +1578,48 @@ mod tests {
         assert!(baseline_index("2", 2).is_err());
         assert!(baseline_index("first", 0).is_err());
         assert!(baseline_index("newest", 2).is_err());
+    }
+
+    #[test]
+    fn drift_window_starts_at_the_run_before_the_one_that_fired_else_at_the_baseline() {
+        let (baseline, previous) = ("2026-11-01T09:00:00Z", "2026-11-03T09:00:00Z");
+        let first = OffsetDateTime::from_unix_timestamp(1_793_523_600).unwrap();
+        assert_eq!(first.format(&Rfc3339).unwrap(), baseline);
+        assert_eq!(
+            window_from(Some(previous), baseline),
+            Some(first + time::Duration::days(2)),
+            "the run before the checked one"
+        );
+        assert_eq!(
+            window_from(None, baseline),
+            Some(first),
+            "no earlier run of this model: the baseline"
+        );
+        assert_eq!(window_from(Some("t"), baseline), None);
+        assert_eq!(window_from(None, "t"), None);
+    }
+
+    #[test]
+    fn confirmed_drift_opens_a_window_with_the_detectors_that_fired() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let cur = run(["s", "s", "s"], ["t", "t", "t"], false, false);
+        let c = compare(&steady(), &cur, &Params::default());
+        assert!(c.drift);
+        let from = OffsetDateTime::from_unix_timestamp(1_793_696_400).unwrap();
+        let w = freeze(&memory, "llmao", "m", Some(from), &c).unwrap();
+        assert_eq!((w.destination.as_str(), w.model.as_str()), ("llmao", "m"));
+        assert_eq!(w.from, from);
+        assert_eq!(w.detectors, ["flip_rate", "format"]);
+        assert_eq!(w.why, "vendor drift on llmao/m: flip_rate, format fired");
+        assert_eq!(memory.drift_windows().unwrap(), std::slice::from_ref(&w));
+        // the next round finds the same drift: the same window
+        let later = Some(from + time::Duration::days(1));
+        assert_eq!(freeze(&memory, "llmao", "m", later, &c).unwrap(), w);
+        assert_eq!(memory.drift_windows().unwrap().len(), 1);
+        // a run whose time does not parse gives no start, and no window
+        assert!(freeze(&memory, "llmao", "m-2", None, &c).is_err());
+        assert_eq!(memory.drift_windows().unwrap().len(), 1);
     }
 
     #[test]

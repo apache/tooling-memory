@@ -10,6 +10,12 @@
 //! run, and the harness runs confined in it as a launch does, with a private home of
 //! its own. Nothing is substituted into the harness's model calls.
 //!
+//! A re-run starts under the settings its tape names. Each report says at which call the
+//! run left the tape, what of the tape's starting state moved since, and whether the run
+//! is complete: a run that left the tape read the record as it is now, so it is
+//! incomplete when that state moved (`dm_server::replay_state`). `amem reenact state`
+//! prints that state for a tape, and needs no model.
+//!
 //! The terms the owner checked on 11 October 2026 set two rules here. One run on the
 //! owner's own login, started by the owner, is ordinary use of the harness; repeated
 //! runs belong on an API key or the gateway, so `--runs` above one refuses a
@@ -21,6 +27,8 @@ use crate::{
     HarnessArg, RunOptions, Session, SubagentsArg,
 };
 use clap::{Subcommand, ValueEnum};
+use dm_server::arms::Settings;
+use dm_server::replay_state::{Availability, Moved, ReplayState};
 use dm_server::tape::{Playback, Played, Tape};
 use dm_server::Memory;
 use serde::{Deserialize, Serialize};
@@ -49,6 +57,13 @@ pub enum ReenactOp {
     },
     /// Let a pinned tape go on the clock again.
     Unpin {
+        /// The session.
+        session: String,
+    },
+    /// The replay state of a session's tape, as JSON: the manifest it began with, what
+    /// of that state moved since, the calls an erasure removed, and whether a re-run
+    /// that leaves the tape is complete.
+    State {
         /// The session.
         session: String,
     },
@@ -169,6 +184,50 @@ pub struct RunReport {
     pub seconds: f64,
     /// The checkout.
     pub tree: Tree,
+    /// The call at which the run left the tape, from one; none when it kept to it.
+    #[serde(default)]
+    pub left_tape_at: Option<usize>,
+    /// What of the tape's starting state was different when the run started.
+    #[serde(default)]
+    pub moved: Vec<Moved>,
+    /// The call numbers an erasure removed from the tape.
+    #[serde(default)]
+    pub missing_calls: Vec<usize>,
+    /// Whether the run is complete: it kept to the tape, or it left the tape and the
+    /// replay state was complete. False in a line kept before this was recorded.
+    #[serde(default)]
+    pub complete: bool,
+}
+
+/// Whether a run is complete. A run that kept to the tape was answered from the tape
+/// alone, so the state now does not matter. A run that left the tape read the record
+/// as it is now, so it is complete only when the replay state is.
+#[must_use]
+pub fn complete(diverged: bool, state: &ReplayState) -> bool {
+    !diverged || state.availability == Availability::Complete
+}
+
+/// The call at which a run left its tape, from one: the first call that the tape did
+/// not answer. None for a run that kept to the tape.
+#[must_use]
+pub fn left_tape_at(played: &Played) -> Option<usize> {
+    played.diverged.then_some(played.steps_to_divergence + 1)
+}
+
+/// The replay state of `tape` for a re-run. A re-run starts under the tape's settings,
+/// so the session that asks takes those settings first.
+async fn state_for(root: &Path, tape: &Tape) -> Fallibly<ReplayState> {
+    let memory = Memory::open(root)?.without_read_log();
+    memory.set_settings(tape.header.start.settings.clone())?;
+    Ok(memory.replay_state(&tape.header.session).await?)
+}
+
+/// The options a re-run starts with: the model, a home of its own, and the settings of
+/// the tape.
+fn rerun_options(model: Option<String>, home: PathBuf, settings: &Settings) -> RunOptions {
+    RunOptions::new(model, SubagentsArg::Harness, Vec::new(), None)
+        .home(home)
+        .settings(Some(settings.clone()))
 }
 
 /// Run `amem reenact`.
@@ -185,6 +244,10 @@ pub async fn cmd(root: &Path, op: ReenactOp) -> Fallible {
         }
         ReenactOp::Unpin { session } => {
             crate::json(&Memory::open(root)?.pin_tape(&session, false).await?)
+        }
+        ReenactOp::State { session } => {
+            let tape = Memory::open(root)?.tape(&session).await?;
+            crate::json(&state_for(root, &tape).await?)
         }
         ReenactOp::Run(args) => run(root, args).await,
         ReenactOp::Report { session } => {
@@ -411,6 +474,8 @@ async fn one(
     let stamp = time::OffsetDateTime::now_utc().unix_timestamp();
     let run = format!("rx-{stamp}-{}-{i}", std::process::id());
     let start = &tape.header.start;
+    // before the run: what the run reads when it leaves the tape
+    let state = state_for(root, tape).await?;
     let (workdir, scratch) = tree_for(repo, start.commit.as_deref(), &args.session, &run)?;
     let home = root.join(RUNS).join(&args.session).join(&run).join("home");
     let play = Arc::new(Playback::new(tape.clone()));
@@ -420,9 +485,8 @@ async fn one(
         root,
         args,
         h,
-        model.clone(),
         &workdir,
-        home.clone(),
+        rerun_options(model.clone(), home.clone(), &start.settings),
         prompt,
         &play,
     )
@@ -464,23 +528,27 @@ async fn one(
             original_dirty: start.dirty,
             kept_at,
         },
+        left_tape_at: left_tape_at(&played),
+        complete: complete(played.diverged, &state),
+        moved: state.moved,
+        missing_calls: state.missing_calls,
     })
 }
 
-/// One run of the harness against `play`, in `workdir`: its exit code, its answer, its
-/// memory session, what it spent, and how long it took.
-#[allow(clippy::too_many_arguments)] // one per thing a run is given
+/// One run of the harness against `play`, in `workdir`, under `options`: its exit
+/// code, its answer, its memory session, what it spent, and how long it took.
 async fn run_once(
     root: &Path,
     args: &RunArgs,
     h: Harness,
-    model: Option<String>,
     workdir: &Path,
-    home: PathBuf,
+    options: RunOptions,
     prompt: &str,
     play: &Arc<Playback>,
 ) -> Fallibly<(i32, Option<String>, String, Tokens, f64)> {
-    std::fs::create_dir_all(&home)?;
+    if let Some(home) = &options.home {
+        std::fs::create_dir_all(home)?;
+    }
     let session = Session::start(
         root,
         h,
@@ -492,7 +560,7 @@ async fn run_once(
         },
         workdir.to_path_buf(),
         runner_for(backend(args, root, h)?, root)?,
-        RunOptions::new(model, SubagentsArg::Harness, Vec::new(), None).home(home),
+        options,
     )
     .await?;
     session.memory().set_playback(play.clone());
@@ -676,7 +744,37 @@ pub fn report(root: &Path, session: &str) -> Fallibly<String> {
     if runs.is_empty() {
         s.push_str("  no runs yet; amem reenact run <session>\n");
     }
+    for r in &runs {
+        s.push_str(&format!("  {}: {}\n", r.run, replay_line(r)));
+    }
     Ok(s)
+}
+
+/// Where a run left its tape, and whether it is complete; for an incomplete run, what
+/// moved.
+fn replay_line(r: &RunReport) -> String {
+    // a line kept before the call was recorded still says how far the run kept to it
+    let left = r
+        .left_tape_at
+        .or(r.diverged.then_some(r.steps_to_divergence + 1));
+    let Some(at) = left else {
+        return "kept to the tape; complete".to_string();
+    };
+    if r.complete {
+        return format!("left the tape at call {at}; complete");
+    }
+    let mut what: Vec<String> = r.moved.iter().map(|m| m.what.clone()).collect();
+    if !r.missing_calls.is_empty() {
+        let numbers: Vec<String> = r.missing_calls.iter().map(usize::to_string).collect();
+        what.push(format!("erased calls {}", numbers.join(", ")));
+    }
+    if what.is_empty() {
+        what.push("the starting state was not recorded".to_string());
+    }
+    format!(
+        "left the tape at call {at}; incomplete: {}",
+        what.join("; ")
+    )
 }
 
 #[cfg(test)]
@@ -747,6 +845,10 @@ mod tests {
         let played = p.played();
         let (n, alignment, captured, handoff) = scored(&played);
         assert_eq!(played.steps_to_divergence, 1);
+        assert_eq!(left_tape_at(&played), Some(2), "the second call");
+        let kept = Playback::new(tape());
+        kept.answer("t0", &json!({}), Kind::Read);
+        assert_eq!(left_tape_at(&kept.played()), None, "it kept to the tape");
         assert_eq!(n, 3, "the same tools in the same order");
         assert!((alignment - 1.0).abs() < f64::EPSILON);
         assert_eq!(captured.len(), 1);
@@ -809,6 +911,10 @@ mod tests {
                 original_dirty: false,
                 kept_at: None,
             },
+            left_tape_at: (steps < 4).then_some(steps + 1),
+            moved: Vec::new(),
+            missing_calls: Vec::new(),
+            complete: true,
         };
         let path = dir.path().join(RUNS).join("sess-a.jsonl");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -837,6 +943,103 @@ mod tests {
             "{text}"
         );
         assert!(report(dir.path(), "../x").is_err());
+    }
+
+    fn state(availability: Availability, moved: Vec<Moved>) -> ReplayState {
+        ReplayState {
+            session: "sess-a".into(),
+            manifest: None,
+            moved,
+            missing_calls: Vec::new(),
+            availability,
+            why: Vec::new(),
+        }
+    }
+
+    fn log_moved() -> Moved {
+        Moved {
+            what: "log dom-me".into(),
+            then: "4".into(),
+            now: "6".into(),
+        }
+    }
+
+    #[test]
+    fn a_run_is_complete_when_it_kept_to_the_tape_or_the_state_did_not_move() {
+        let moved = state(Availability::Incomplete, vec![log_moved()]);
+        let still = state(Availability::Complete, Vec::new());
+        assert!(
+            complete(false, &moved),
+            "the tape answered every call: the record now was not read"
+        );
+        assert!(
+            !complete(true, &moved),
+            "it left the tape and read a record that moved"
+        );
+        assert!(complete(true, &still));
+        assert!(complete(false, &still));
+    }
+
+    #[test]
+    fn a_re_run_starts_under_the_settings_of_its_tape() {
+        let arm = dm_server::arms::Arm::RawOnly.settings();
+        let options = rerun_options(Some("m".into()), PathBuf::from("/h"), &arm);
+        assert_eq!(options.settings, Some(arm));
+        assert_eq!(options.home, Some(PathBuf::from("/h")));
+        assert_eq!(options.model.as_deref(), Some("m"));
+    }
+
+    /// A report line as the code before the replay state wrote it.
+    const OLD_LINE: &str = r#"{"run":"rx-old","session":"sess-a","at":"2026-11-01T10:00:00Z","harness":"claude","model":"opus","label":null,"rerun_session":"sess-b","exit":0,"tape_calls":4,"calls":3,"steps_to_divergence":2,"diverged":true,"aligned":2,"alignment":0.5,"captured":[],"handoff":false,"answer":"","tokens":{"calls":1,"input":2,"output":3,"cache_read":0},"seconds":1.5,"tree":{"commit":null,"original_dirty":false}}"#;
+
+    #[test]
+    fn the_report_says_where_each_run_left_the_tape_and_what_moved() {
+        let old: RunReport = serde_json::from_str(OLD_LINE).unwrap();
+        assert_eq!(old.left_tape_at, None);
+        assert!(old.moved.is_empty() && old.missing_calls.is_empty() && !old.complete);
+        let run = |name: &str, left: Option<usize>, complete: bool| RunReport {
+            run: name.into(),
+            diverged: left.is_some(),
+            steps_to_divergence: left.map_or(4, |n| n - 1),
+            left_tape_at: left,
+            complete,
+            ..old.clone()
+        };
+        let moved = RunReport {
+            moved: vec![log_moved()],
+            missing_calls: vec![2, 3],
+            ..run("rx-moved", Some(3), false)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RUNS).join("sess-a.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lines: Vec<String> = [
+            run("rx-kept", None, true),
+            run("rx-left", Some(2), true),
+            moved,
+        ]
+        .iter()
+        .map(|x| serde_json::to_string(x).unwrap())
+        .collect();
+        std::fs::write(&path, format!("{}\n{OLD_LINE}\n", lines.join("\n"))).unwrap();
+        let text = report(dir.path(), "sess-a").unwrap();
+        let line = |run: &str| {
+            let head = format!("  {run}: ");
+            text.lines()
+                .find_map(|l| l.strip_prefix(&head))
+                .unwrap_or_else(|| panic!("{run}: {text}"))
+                .to_string()
+        };
+        assert_eq!(line("rx-kept"), "kept to the tape; complete");
+        assert_eq!(line("rx-left"), "left the tape at call 2; complete");
+        assert_eq!(
+            line("rx-moved"),
+            "left the tape at call 3; incomplete: log dom-me; erased calls 2, 3"
+        );
+        assert_eq!(
+            line("rx-old"),
+            "left the tape at call 3; incomplete: the starting state was not recorded"
+        );
     }
 
     #[cfg(unix)]

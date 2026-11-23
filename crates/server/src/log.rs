@@ -146,6 +146,23 @@ pub fn append(root: &Path, domain: &str, by: &str, change: Change) -> Result<Eve
     Ok(event)
 }
 
+/// The offset of `domain`'s log: the sequence number of its last event, 0 for a log with
+/// no event. With an entry's id, an offset names the version the entry had then: the
+/// last version the log put at or before it.
+///
+/// # Errors
+///
+/// A domain that is not a name, or the file system.
+pub fn offset(root: &Path, domain: &str) -> Result<u64, Error> {
+    let (_, seq_file, _) = paths(root, domain)?;
+    match std::fs::read_to_string(&seq_file) {
+        // as `append` reads it: a number that does not parse is no event yet
+        Ok(s) => Ok(s.trim().parse().unwrap_or(0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(crate::io(&seq_file)(e)),
+    }
+}
+
 /// A domain's log from `from` on, in order. A line that does not parse is skipped: a
 /// write cut short by a crash leaves at most the last line torn.
 ///
