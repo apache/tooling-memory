@@ -38,6 +38,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 pub mod bundle;
 pub mod contexts;
+pub mod duties;
 pub mod fabric;
 pub mod lineage;
 pub mod log;
@@ -207,6 +208,10 @@ pub struct WriteRequest {
     /// A one-line summary; else the body's first paragraph.
     #[serde(default)]
     pub summary: Option<String>,
+    /// The person who answers for the entry, as `human:<system>:<id>`. A write that
+    /// replaces an entry and names none keeps the owner of that entry.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 fn default_type() -> EntryType {
@@ -1378,6 +1383,7 @@ impl Memory {
         if let Some(old) = &req.supersedes {
             self.may_replace(old, tier, reach, held.as_deref()).await?;
         }
+        let owner = self.owner_for_write(&domain, &req).await?;
         let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
         // facts decay fast and carry mandatory review dates (the paper, §4): one written
         // without a date gets one ninety days out, which the curator enforces
@@ -1390,6 +1396,7 @@ impl Memory {
                 entry_type: req.entry_type,
                 domain,
                 author: self.author.clone(),
+                owner,
                 created: now,
                 cites: req.cites,
                 // the log gives it, with the event that offers the entry
@@ -1409,6 +1416,33 @@ impl Memory {
             },
             body: req.body,
         })
+    }
+
+    /// The owner of the entry that a request asks for: the person that the request
+    /// names, or else the owner of the entry that it replaces. That entry is one that
+    /// the session reads ([`Memory::may_replace`] ran before this).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for an owner that is not a person, or a store error.
+    async fn owner_for_write(
+        &self,
+        domain: &str,
+        req: &WriteRequest,
+    ) -> Result<Option<String>, Error> {
+        if let Some(owner) = &req.owner {
+            if !duties::is_person(owner) {
+                return Err(Error::Denied(format!(
+                    "the owner of an entry is a person, as human:<system>:<id>, and {owner:?} is not"
+                )));
+            }
+            return Ok(Some(owner.clone()));
+        }
+        let Some(old) = &req.supersedes else {
+            return Ok(None);
+        };
+        let replaced = self.store.get(domain, old).await?;
+        Ok(replaced.and_then(|e| e.front.owner))
     }
 
     /// The row of the raw-reach table for an entry that this session writes now: tap

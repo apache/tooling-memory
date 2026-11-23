@@ -90,7 +90,7 @@ pub(crate) fn onto_receipt(receipt: &mut Receipt, found: Downstream) -> Vec<(Str
 }
 
 /// Whether `entry` names `id`: in its body, in a citation, or as the entry it replaces.
-fn names(entry: &Entry, id: &str) -> bool {
+pub(crate) fn names(entry: &Entry, id: &str) -> bool {
     cites(&entry.body, id)
         || entry.front.cites.iter().any(|c| cites(c, id))
         || entry.front.supersedes.as_deref() == Some(id)
@@ -325,7 +325,7 @@ impl Memory {
 
     /// The entries that replaced an entry of `domain`, as the record holds them: each
     /// replaced id with the active entry that names it in `supersedes`.
-    async fn successors(&self, domain: &str) -> Result<BTreeMap<String, String>, Error> {
+    pub(crate) async fn successors(&self, domain: &str) -> Result<BTreeMap<String, String>, Error> {
         let mut out = BTreeMap::new();
         for id in self.store.list(domain).await? {
             if let Some(e) = self.store.get(domain, &id).await? {

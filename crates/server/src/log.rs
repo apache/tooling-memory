@@ -124,6 +124,19 @@ pub enum Change {
         /// the request of the model call.
         digest: String,
     },
+    /// An entry was demoted behind a tombstone. The `put` before this event holds the
+    /// version. This event holds the reason as a code, and no text.
+    Demoted {
+        /// The entry.
+        id: String,
+        /// The reason code: `dead` or `wrong`.
+        reason: String,
+    },
+    /// A person restored a demoted entry. The `put` before this event holds the version.
+    Restored {
+        /// The entry.
+        id: String,
+    },
     /// A copy of one event of the ledger: what happened to a task, and no text of it.
     Ledger {
         /// The task, or the key of a promotion.
@@ -489,8 +502,10 @@ pub fn state(events: &[Event]) -> BTreeMap<String, Option<(String, bool)>> {
                 out.insert(id.clone(), None);
             }
             // offered, refused, read, sent, or the ledger's: none of these says what the
-            // record holds
+            // record holds. A demotion and a restore have a `put` that does
             Change::Write { .. }
+            | Change::Demoted { .. }
+            | Change::Restored { .. }
             | Change::Quarantined { .. }
             | Change::Read { .. }
             | Change::Send { .. }
@@ -597,6 +612,21 @@ impl Memory {
             session: &self.session_id,
             outside: self.read_outside(),
         }
+    }
+
+    /// Say in the log of its domain what a duty did to `entry`, after the `put` of the
+    /// version: a demotion or a restore. The event names this session, and carries the
+    /// classification of the entry.
+    pub(crate) fn log_duty(&self, entry: &Entry, change: Change) -> Result<Event, Error> {
+        append_with(
+            &self.root,
+            &entry.front.domain,
+            &self.author,
+            Some(self.actor()),
+            Some(entry.front.classification),
+            true,
+            |_| Ok(change),
+        )
     }
 
     /// Say in its domain's log that an entry is offered, before anything screens it.

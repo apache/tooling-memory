@@ -4209,6 +4209,7 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
                     supersedes,
                     review_by: None,
                     summary: None,
+                    owner: None,
                 })
                 .await?;
             json(&w)

@@ -783,6 +783,7 @@ impl McpServer {
             supersedes: p.supersedes,
             review_by,
             summary: p.summary,
+            owner: None,
         };
         let w = self.memory.write(req).await.map_err(mcp_err)?;
         let mut v = json!({
