@@ -183,7 +183,8 @@ two weeks. It is also the reason that none of it is the production shape.
     event.
 - **Measurement, in part.** `amem` computes four read metrics, cost and usage. The paper
   names 21 metrics. Upkeep share, induced work and the landing queue are not built. The
-  only limit is a spend limit in tokens.
+  only limit is a spend limit, in tokens or in money. The limits on throughput, on the
+  outbound rate and on upkeep are not built.
 - **The evaluation arms.** Act 6 compares memory with an empty record. The paper's five
   arms, the paired seeds and the margin are not built. No scorecard is kept in the
   platform domain.

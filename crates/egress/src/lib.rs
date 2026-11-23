@@ -826,18 +826,80 @@ fn only_destination(inner: &Inner, destination: String, rest: String) -> (String
 /// retry.
 fn over_budget(inner: &Inner, destination: &str) -> Option<String> {
     let day_ago = time::OffsetDateTime::now_utc() - time::Duration::days(1);
-    let session = inner
+    let me = inner.memory.session_id();
+    let session_tokens = inner
         .telemetry
-        .spent(destination, Some(inner.memory.session_id()), None)
+        .spent(destination, Some(me), None)
         .unwrap_or(0);
-    let day = inner
+    let day_tokens = inner
         .telemetry
         .spent(destination, None, Some(day_ago))
         .unwrap_or(0);
-    match inner.memory.check_spend(destination, session, day) {
+    let mut spend = dm_policy::decide::SpendInput {
+        destination: destination.to_string(),
+        session_tokens,
+        day_tokens,
+        ..dm_policy::decide::SpendInput::default()
+    };
+    let limit = inner.memory.grants().spend.get(destination).cloned();
+    if limit.is_some_and(|l| l.session_usd_cents.is_some() || l.day_usd_cents.is_some()) {
+        if let Err(reason) = price_spend(inner, &mut spend, day_ago) {
+            return Some(reason);
+        }
+    }
+    match inner.memory.check_spend(spend) {
         Ok(d) if !d.allow => Some(d.reason),
         _ => None,
     }
+}
+
+/// The money half of the spend input, for a destination with a limit in money: the
+/// metered tokens of this session and of the root's last day, priced by the price
+/// vector, in whole US cents rounded down, and the models that the vector does not
+/// price. The error is the reason for a refusal: a limit in money cannot be checked
+/// when the price vector or the meter cannot be read.
+fn price_spend(
+    inner: &Inner,
+    spend: &mut dm_policy::decide::SpendInput,
+    day_ago: time::OffsetDateTime,
+) -> Result<(), String> {
+    let unreadable = |what: &str, e: &dyn std::fmt::Display| {
+        format!("spend limit: {what} cannot be read, so a limit in money cannot be checked: {e}")
+    };
+    let prices = inner
+        .memory
+        .prices()
+        .map_err(|e| unreadable("the price vector", &e))?;
+    let me = inner.memory.session_id();
+    let session = inner
+        .telemetry
+        .spent_by_model(&spend.destination, Some(me), None)
+        .map_err(|e| unreadable("the meter", &e))?;
+    let day = inner
+        .telemetry
+        .spent_by_model(&spend.destination, None, Some(day_ago))
+        .map_err(|e| unreadable("the meter", &e))?;
+    let mut unpriced = std::collections::BTreeSet::new();
+    let mut cents = |rows: &[(String, telemetry::Tokens)]| {
+        // dollars are summed before the cents are rounded down, so many small calls
+        // do not each round to nothing
+        let mut usd = 0.0;
+        for (model, t) in rows {
+            match prices.cost(model, t) {
+                Some(c) => usd += c,
+                None if t.input + t.output + t.cache_read + t.cache_write > 0 => {
+                    unpriced.insert(model.clone());
+                }
+                None => {}
+            }
+        }
+        dm_policy::prices::whole_cents(usd)
+    };
+    spend.session_cents = cents(&session);
+    spend.day_cents = cents(&day);
+    spend.unpriced = unpriced.into_iter().collect();
+    spend.prices = prices.version;
+    Ok(())
 }
 
 fn admit(inner: &Inner, destination: &str) -> Result<Destination, Box<Response>> {
@@ -1945,6 +2007,98 @@ mod tests {
         assert!(
             log.contains("\"action\":\"spend\"") && log.contains("\"allow\":false"),
             "{log}"
+        );
+    }
+
+    /// An egress whose destination `openai` is metered and answers 40 input tokens of
+    /// the model `m` for each call, on a root with `spend` added to its grants.
+    async fn metered(spend: &str) -> (tempfile::TempDir, std::path::PathBuf, Egress) {
+        let fake = Router::new().route(
+            "/v1/chat/completions",
+            any(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":40,"completion_tokens":2}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("m");
+        Memory::init(&root, "human:test:me", "dom-me").unwrap();
+        let grants = root.join("grants.toml");
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("{text}\n{spend}")).unwrap();
+        let m = Arc::new(Memory::open(&root).unwrap().with_author("agent:a"));
+        let mut d = HashMap::new();
+        d.insert(
+            "openai".to_string(),
+            // a key that the launcher holds: the calls are metered, not plan quota
+            Destination::forward(
+                format!("http://{addr}"),
+                Auth::Inject {
+                    header: header::AUTHORIZATION,
+                    value: "Bearer k".into(),
+                },
+            ),
+        );
+        let e = Egress::new(m, d, &dir.path().join("t.db")).unwrap();
+        (dir, root, e)
+    }
+
+    #[tokio::test]
+    async fn a_model_call_over_a_limit_in_money_does_not_leave() {
+        let (_dir, root, e) = metered("[spend.openai]\nsession_usd_cents = 1\n").await;
+        // 80 input tokens at 125 dollars a million are one cent; the output is free
+        std::fs::write(
+            root.join("prices.toml"),
+            "version = \"t1\"\n[models.m]\ninput = 125.0\n",
+        )
+        .unwrap();
+        let ask = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        // half a cent after the first call: the second leaves
+        e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        let refused = e
+            .call("openai", "v1/chat/completions", &ask)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains(
+                "this session has spent 1 US cents at openai, its limit is 1 US cents (price vector t1)"
+            ),
+            "{refused}"
+        );
+        let log = std::fs::read_to_string(root.join("state/decisions.jsonl")).unwrap();
+        assert!(
+            log.contains("\"action\":\"spend\"") && log.contains("\"allow\":false"),
+            "{log}"
+        );
+        // a model that the price vector does not name cannot be checked in money
+        std::fs::write(root.join("prices.toml"), "version = \"t2\"\n").unwrap();
+        let refused = e
+            .call("openai", "v1/chat/completions", &ask)
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("m has no price in price vector t2"),
+            "{refused}"
+        );
+        // a price vector that does not parse refuses the call
+        std::fs::write(root.join("prices.toml"), "models = 3\n").unwrap();
+        let refused = e
+            .call("openai", "v1/chat/completions", &ask)
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("the price vector cannot be read"),
+            "{refused}"
         );
     }
 

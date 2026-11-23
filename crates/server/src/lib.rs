@@ -694,19 +694,25 @@ impl Memory {
         Ok(())
     }
 
-    /// Whether a model call may leave for `destination`, given what this session and
-    /// the root have spent there as the egress metered it. A refusal is a logged
+    /// The price vector: `prices.toml` under the root, with its version. No file is the
+    /// empty table, version `none`.
+    ///
+    /// # Errors
+    ///
+    /// A file that is there and does not parse.
+    pub fn prices(&self) -> Result<dm_policy::prices::Prices, Error> {
+        let text = std::fs::read_to_string(self.root.join("prices.toml")).unwrap_or_default();
+        Ok(dm_policy::prices::Prices::parse(&text)?)
+    }
+
+    /// Whether a model call may leave for its destination, given what this session and
+    /// the root have spent there, in tokens and in money, as the egress metered it. A refusal is a logged
     /// decision; an allow is not, since every model call asks.
     ///
     /// # Errors
     ///
     /// When the policy fails to evaluate.
-    pub fn check_spend(
-        &self,
-        destination: &str,
-        session_tokens: u64,
-        day_tokens: u64,
-    ) -> Result<Decision, Error> {
+    pub fn check_spend(&self, spend: dm_policy::decide::SpendInput) -> Result<Decision, Error> {
         let input = Input {
             action: Action::Spend,
             principal: self.principal(),
@@ -717,11 +723,7 @@ impl Memory {
             write: None,
             promote: None,
             held_task: self.held_task(),
-            spend: Some(dm_policy::decide::SpendInput {
-                destination: destination.to_string(),
-                session_tokens,
-                day_tokens,
-            }),
+            spend: Some(spend),
             fetch: None,
             approval: None,
         };

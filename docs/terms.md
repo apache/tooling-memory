@@ -103,7 +103,8 @@ term here in the same commit as the first document that needs it.
 | subscription login | The harness's own login to its provider. The egress passes it through on a forwarded call, or tunnels the call | |
 | credential | A key or token that a destination or a tap needs | secret (for a credential), password |
 | usage | The tokens, calls and time that the egress counts for each model call it forwards | telemetry (for usage) |
-| spend limit | The most tokens that one destination's model calls may use in one session, and across the root in one day, from `[spend.<destination>]` | budget (for a spend limit) |
+| spend limit | The most tokens, or the most money in US cents, that one destination's model calls may use in one session, and across the root in one day, from `[spend.<destination>]` | budget (for a spend limit) |
+| price vector | The file `prices.toml` under the root: the price of each model's tokens and of the host's resources, with a version | price list, rate card |
 | decision context | The record of what a model call sent and got back, kept for replay | trace (for a decision context), transcript |
 | replay | Send a recorded decision context to a model again | |
 | tape | The memory tool calls of one session, with their results | |

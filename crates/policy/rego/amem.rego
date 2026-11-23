@@ -16,7 +16,9 @@
 #   parent      {requirements}         (file_task, filing == held) the task held
 #   write       {supersedes, supersedes_tier, supersedes_author, session_supersedes}
 #   promote     {phase, to, author, proposer}  phase: direct | propose | approve
-#   spend       {destination, session_tokens, day_tokens}
+#   spend       {destination, session_tokens, day_tokens, session_cents, day_cents,
+#                unpriced, prices}     cents: US cents of metered calls; unpriced: the
+#                models with no price; prices: the version of the price vector
 #   fetch       {tool, method, scheme, host, port, path, private_address,
 #                loopback_address, label, hop}
 #   approval    {of, target, version, from, to, events}   (erase, declassify, approve)
@@ -369,7 +371,8 @@ default promote_decision := {"allow": false, "admit": false, "review": "none", "
 # ---- spend: limits per resource class, checked before a model call leaves ----
 
 # The grants file sets them per destination, `[spend.<destination>]`: tokens one
-# session may spend there, and tokens the root may spend there in a day. The egress
+# session may spend there, and tokens the root may spend there in a day, and the same
+# two in US cents. The egress
 # asks before every model call with what it has metered; over a limit, the call does
 # not leave. A record policy may add its own limits in the rules package.
 spend_limits := object.get(object.get(data.grants, "spend", {}), input.spend.destination, {})
@@ -385,6 +388,44 @@ spend_decision := {"allow": false, "admit": false, "review": "human", "reason": 
 spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: the root has spent %v tokens at %v in the last day, its limit is %v", [input.spend.day_tokens, input.spend.destination, spend_limits.day_tokens])} if {
 	not over_session
 	over_day
+}
+
+# Limits in money, in US cents, priced by the price vector whose version the input
+# names. A limit in money cannot be checked for a model that has no price, so such a
+# call does not leave. The limits in tokens come first.
+money_limited if spend_limits.session_usd_cents
+
+money_limited if spend_limits.day_usd_cents
+
+over_tokens if over_session
+
+over_tokens if over_day
+
+unpriced_model if {
+	money_limited
+	count(object.get(input.spend, "unpriced", [])) > 0
+}
+
+over_session_money if object.get(input.spend, "session_cents", 0) >= spend_limits.session_usd_cents
+
+over_day_money if object.get(input.spend, "day_cents", 0) >= spend_limits.day_usd_cents
+
+spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: %v has no price in price vector %v, so a limit in money cannot be checked", [input.spend.unpriced[0], object.get(input.spend, "prices", "none")])} if {
+	not over_tokens
+	unpriced_model
+}
+
+spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: this session has spent %v US cents at %v, its limit is %v US cents (price vector %v)", [input.spend.session_cents, input.spend.destination, spend_limits.session_usd_cents, object.get(input.spend, "prices", "none")])} if {
+	not over_tokens
+	not unpriced_model
+	over_session_money
+}
+
+spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: the root has spent %v US cents at %v in the last day, its limit is %v US cents (price vector %v)", [input.spend.day_cents, input.spend.destination, spend_limits.day_usd_cents, object.get(input.spend, "prices", "none")])} if {
+	not over_tokens
+	not unpriced_model
+	not over_session_money
+	over_day_money
 }
 
 default spend_decision := {"allow": true, "admit": false, "review": "none", "reason": "within the spend limits"}

@@ -16,115 +16,48 @@
 
 use dm_egress::telemetry::{Run, SessionModel, Telemetry, BILLING_PLAN};
 use dm_server::Memory;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-/// The template `amem init` writes: every rate left for the owner to fill in.
-pub const TEMPLATE: &str = r#"# What a million tokens cost, in US dollars, per model as the provider reports it in
-# `amem usage`. A key is matched exactly, else as the longest prefix of the model's
-# name, so "claude-opus-5" prices "claude-opus-5-5". Four classes, priced apart:
-# input (not from the cache), output, cache reads and cache writes. A model not named
-# here is shown unpriced. Calls on a harness's own login are plan quota, never priced.
-#
-# [models."claude-opus-5-5"]
-# input = 0.0
-# output = 0.0
-# cache_read = 0.0
-# cache_write = 0.0
-#
-# The host's own resources, per run of a harness: CPU time of the process tree and the
-# launcher, in US dollars per CPU-hour, and peak resident memory held for the run's wall
-# clock, in US dollars per GiB-hour. Left out, they are shown unpriced.
-#
-# [resources]
-# cpu_hour = 0.0
-# memory_gib_hour = 0.0
-"#;
+pub use dm_policy::prices::{Prices, Tokens, TEMPLATE};
 
-/// The rates of one model, in US dollars per million tokens.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct Rate {
-    #[serde(default)]
-    pub input: f64,
-    #[serde(default)]
-    pub output: f64,
-    #[serde(default)]
-    pub cache_read: f64,
-    #[serde(default)]
-    pub cache_write: f64,
+/// The table under `root`, or an empty one: what [`Memory::prices`] reads.
+///
+/// # Errors
+///
+/// A file that is there and does not parse.
+pub fn load(root: &Path) -> Result<Prices, Box<dyn std::error::Error>> {
+    match std::fs::read_to_string(root.join("prices.toml")) {
+        Ok(text) => Ok(Prices::parse(&text)?),
+        Err(_) => Ok(Prices::parse("")?),
+    }
 }
 
-/// What the host's resources cost, in US dollars.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct ResourceRates {
-    /// Per hour of CPU time, user and system, the run's tree and the launcher's.
-    #[serde(default)]
-    pub cpu_hour: f64,
-    /// Per GiB of peak resident memory held for an hour of the run's wall clock.
-    #[serde(default)]
-    pub memory_gib_hour: f64,
+/// What usage cost, when its model is priced.
+#[must_use]
+pub fn cost(prices: &Prices, u: &SessionModel) -> Option<f64> {
+    prices.cost(
+        &u.model,
+        &Tokens {
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_read: u.cache_read_tokens,
+            cache_write: u.cache_write_tokens,
+        },
+    )
 }
 
-/// The table.
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct Prices {
-    #[serde(default)]
-    pub models: BTreeMap<String, Rate>,
-    /// The host's resources; absent, they are not priced.
-    #[serde(default)]
-    pub resources: Option<ResourceRates>,
-}
-
-impl Prices {
-    /// The table under `root`, or an empty one.
-    ///
-    /// # Errors
-    ///
-    /// A file that is there and does not parse.
-    pub fn load(root: &Path) -> Result<Prices, Box<dyn std::error::Error>> {
-        match std::fs::read_to_string(root.join("prices.toml")) {
-            Ok(text) => Ok(toml::from_str(&text)?),
-            Err(_) => Ok(Prices::default()),
-        }
-    }
-
-    /// A model's rate: its exact name, else the longest key it starts with.
-    #[must_use]
-    pub fn rate(&self, model: &str) -> Option<&Rate> {
-        self.models.get(model).or_else(|| {
-            self.models
-                .iter()
-                .filter(|(k, _)| model.starts_with(k.as_str()))
-                .max_by_key(|(k, _)| k.len())
-                .map(|(_, r)| r)
-        })
-    }
-
-    /// What usage cost, when its model is priced.
-    #[must_use]
-    pub fn cost(&self, u: &SessionModel) -> Option<f64> {
-        let r = self.rate(&u.model)?;
-        #[allow(clippy::cast_precision_loss)] // token counts, priced
-        let usd = (u.input_tokens as f64 * r.input
-            + u.output_tokens as f64 * r.output
-            + u.cache_read_tokens as f64 * r.cache_read
-            + u.cache_write_tokens as f64 * r.cache_write)
-            / 1_000_000.0;
-        Some(usd)
-    }
-
-    /// What a run's host resources cost, when they are priced.
-    #[must_use]
-    pub fn run_cost(&self, r: &Run) -> Option<f64> {
-        let rates = self.resources.as_ref()?;
-        #[allow(clippy::cast_precision_loss)] // milliseconds and KiB, priced
-        let usd = (r.user_ms + r.sys_ms + r.launcher_cpu_ms) as f64 / 3_600_000.0 * rates.cpu_hour
-            + r.max_rss_kib as f64 / 1_048_576.0 * r.wall_ms as f64 / 3_600_000.0
-                * rates.memory_gib_hour;
-        Some(usd)
-    }
+/// What a run's host resources cost, when they are priced.
+#[must_use]
+pub fn run_cost(prices: &Prices, r: &Run) -> Option<f64> {
+    let rates = prices.resources.as_ref()?;
+    #[allow(clippy::cast_precision_loss)] // milliseconds and KiB, priced
+    let usd = (r.user_ms + r.sys_ms + r.launcher_cpu_ms) as f64 / 3_600_000.0 * rates.cpu_hour
+        + r.max_rss_kib as f64 / 1_048_576.0 * r.wall_ms as f64 / 3_600_000.0
+            * rates.memory_gib_hour;
+    Some(usd)
 }
 
 /// One session's cost.
@@ -183,6 +116,8 @@ pub struct Report {
     pub tasks: Vec<TaskCost>,
     pub usd: f64,
     pub priced_models: Vec<String>,
+    /// The version of the price vector that priced this report.
+    pub prices: String,
 }
 
 fn tokens(u: &SessionModel) -> u64 {
@@ -210,7 +145,7 @@ pub fn price(
         s.call_ms += u.call_ms;
         if u.billing == BILLING_PLAN {
             *s.plan.entry(u.model.clone()).or_default() += tokens(u);
-        } else if let Some(usd) = prices.cost(u) {
+        } else if let Some(usd) = cost(prices, u) {
             s.usd += usd;
         } else {
             *s.unpriced.entry(u.model.clone()).or_default() += tokens(u);
@@ -229,7 +164,7 @@ pub fn price(
         s.launcher_cpu_ms += r.launcher_cpu_ms;
         s.max_rss_kib = s.max_rss_kib.max(r.max_rss_kib);
         s.measured &= r.measured;
-        if let Some(usd) = prices.run_cost(r) {
+        if let Some(usd) = run_cost(prices, r) {
             s.resource_usd += usd;
             s.usd += usd;
         }
@@ -263,6 +198,7 @@ pub fn price(
         sessions,
         tasks,
         priced_models: prices.models.keys().cloned().collect(),
+        prices: prices.version.clone(),
     }
 }
 
@@ -304,7 +240,7 @@ pub async fn report(root: &Path) -> Result<Report, Box<dyn std::error::Error>> {
     Ok(price(
         &t.by_session_model()?,
         &t.runs()?,
-        &Prices::load(root)?,
+        &load(root)?,
         &completed(&m).await?,
     ))
 }
@@ -421,9 +357,9 @@ mod tests {
         .unwrap();
         let u = row("s", "claude-opus-5-5", "metered", 1_000_000, 2_000_000);
         // 1M input at 10, 1000 output at 50, 2M cache reads at 1
-        assert!((p.cost(&u).unwrap() - (10.0 + 0.05 + 2.0)).abs() < 1e-9);
+        assert!((cost(&p, &u).unwrap() - (10.0 + 0.05 + 2.0)).abs() < 1e-9);
         assert!(
-            p.cost(&row("s", "qwen3.8-27b", "metered", 1, 0)).is_none(),
+            cost(&p, &row("s", "qwen3.8-27b", "metered", 1, 0)).is_none(),
             "not named, not guessed"
         );
     }

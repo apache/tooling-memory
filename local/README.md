@@ -1416,10 +1416,21 @@ Not yet:
 ## Spend limits: `[spend]` in grants.toml
 
 Spend limits for each resource class are in the perimeter, as in the paper. In
-`grants.toml`, `[spend.<destination>]` sets two spend limits, in tokens in and out:
+`grants.toml`, `[spend.<destination>]` sets two spend limits in tokens in and out, and two
+spend limits in money:
 
 - `session_tokens`: what one session may spend at that destination;
-- `day_tokens`: what the root may spend at that destination in one day.
+- `day_tokens`: what the root may spend at that destination in one day;
+- `session_usd_cents`: what one session may spend at that destination, in US cents;
+- `day_usd_cents`: what the root may spend at that destination in one day, in US cents.
+
+For a spend limit in money, the egress prices the metered tokens with the price vector,
+`prices.toml`. It prices input, output, cache reads and cache writes, and it rounds the
+sum down to a cent. Plan calls are not priced, and they do not count. The refusal names
+the amount, the spend limit and the version of the price vector. A spend limit in money
+cannot be checked for a model that the price vector does not name. The call to that
+destination then does not leave until the owner prices the model. The same applies when
+`prices.toml` does not parse. A spend limit in tokens needs no price.
 
 A `spend` rule in the built-in Rego decides. Thus a policy entry in the record can add its
 own rule. The egress asks before each model call, with what it has metered. This applies
@@ -1451,6 +1462,10 @@ output = 0.60
 cache_read = 0.05
 cache_write = 0.25
 ```
+
+The price vector has a version. The version is the key `version` at the top of the file.
+Without that key, the version is the digest of the text of the file. Thus each change to
+the file gives a new version. `amem cost --json` gives the version in the field `prices`.
 
 The match for a model is its exact name. Otherwise, the match is the longest name in the
 table that the model's name starts with. Thus `claude-sonnet-5` prices every dated release

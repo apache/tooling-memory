@@ -25,6 +25,7 @@
 //! deny-by-default the paper asks for.
 
 pub mod decide;
+pub mod prices;
 pub mod record;
 pub mod scan;
 
@@ -58,8 +59,8 @@ pub enum Error {
     Policy(String),
 }
 
-/// What one destination's model calls may spend, in tokens in and out: per session,
-/// and across the root in the last day. Checked by the egress before a call leaves.
+/// What one destination's model calls may spend, in tokens in and out and in money: per
+/// session, and across the root in the last day. Checked by the egress before a call leaves.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendLimit {
     /// Tokens one session may spend here.
@@ -68,6 +69,13 @@ pub struct SpendLimit {
     /// Tokens the root may spend here in the last day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub day_tokens: Option<u64>,
+    /// US cents one session may spend here, as the price vector prices its metered
+    /// tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_usd_cents: Option<u64>,
+    /// US cents the root may spend here in the last day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_usd_cents: Option<u64>,
 }
 
 /// The gates on writes whose blast radius is not routine; `[gates]` in the file.
