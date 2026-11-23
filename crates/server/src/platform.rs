@@ -18,7 +18,9 @@
 //! the default `model` is read. An artifact is loaded only from an active entry a person
 //! verified, as a policy entry is enforced only once verified, so an agent cannot write
 //! the instructions the next agent runs under; the newest verified one wins. Everything
-//! else in the domain is listed, with why it is not loaded.
+//! else in the domain is listed, with why it is not loaded. One more kind is a record
+//! and is never loaded: a `scorecard`, JSON, the result of an evaluation
+//! ([`crate::evaluation`]).
 
 use crate::{Error, Memory};
 use dm_core::{Entry, TrustTier};
@@ -196,6 +198,11 @@ pub fn artifacts_in(e: &Entry) -> Vec<Artifact> {
 
 /// Why an entry's artifacts are not loaded, if they are not.
 fn why_not(e: &Entry, kind: &str) -> Option<String> {
+    if kind == crate::evaluation::KIND {
+        return Some(
+            "a scorecard is a record of an evaluation; the launcher loads no scorecard".into(),
+        );
+    }
     if !KINDS.contains(&kind) {
         return Some(format!("{kind} is not a kind the launcher reads"));
     }

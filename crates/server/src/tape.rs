@@ -19,6 +19,7 @@
 //! and no decision contexts of its own.
 
 use crate::arms::Settings;
+use crate::evaluation::RunOf;
 use crate::replay_state::ReplayManifest;
 use crate::{lock, Error, Memory};
 use dm_core::Label;
@@ -61,6 +62,11 @@ pub struct TapeStart {
     /// tape kept before manifests were, or when the state could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<ReplayManifest>,
+    /// The run of an evaluation the session is: the digest of the plan it started
+    /// under, the task, the seed and the arm. The memory server writes its own
+    /// session's, whatever a caller puts here. None for a session that is no run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<RunOf>,
 }
 
 fn is_production(settings: &Settings) -> bool {
@@ -351,9 +357,13 @@ impl Playback {
 }
 
 impl Memory {
-    /// The domain this session's records go to: the domain of the task it holds, else
-    /// the only granted one; none when there is neither.
+    /// The domain this session's records go to: for a run of an evaluation, the domain
+    /// of its plan; else the domain of the task it holds, else the only granted one;
+    /// none when there is none of these.
     pub(crate) async fn recording_domain(&self) -> Option<String> {
+        if let Some(domain) = self.evaluation_domain() {
+            return Some(domain);
+        }
         match self.held_task() {
             Some(id) => self
                 .ledger
@@ -378,9 +388,9 @@ impl Memory {
         self.playback.get()
     }
 
-    /// Say how this session was started, at the head of its tape. The settings and
-    /// the replay manifest in the header are this session's own, whatever `start`
-    /// holds in those two fields.
+    /// Say how this session was started, at the head of its tape. The settings, the
+    /// replay manifest and the run of an evaluation in the header are this session's
+    /// own, whatever `start` holds in those three fields.
     ///
     /// # Errors
     ///
@@ -404,7 +414,8 @@ impl Memory {
         Ok(())
     }
 
-    /// `start` with this session's settings and its replay manifest as it is now. A
+    /// `start` with this session's settings, its replay manifest as it is now, and the
+    /// run of an evaluation that it is. A
     /// header is written without a manifest when the state cannot be read: the prompt
     /// is what a re-run cannot do without, and the replay state then says that the
     /// starting state was not recorded.
@@ -412,6 +423,7 @@ impl Memory {
         TapeStart {
             settings: self.settings(),
             manifest: self.replay_manifest().await.ok(),
+            evaluation: self.evaluation(),
             ..start
         }
     }
@@ -489,7 +501,7 @@ impl Memory {
         Ok(())
     }
 
-    fn owner_only(&self, what: &str) -> Result<(), Error> {
+    pub(crate) fn owner_only(&self, what: &str) -> Result<(), Error> {
         if self.author == self.grants.owner {
             Ok(())
         } else {

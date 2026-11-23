@@ -823,6 +823,107 @@ fn serve_takes_an_arm_and_a_snapshot_as_flags_and_refuses_what_is_neither() {
     }
 }
 
+const EVAL_PLAN: &str = "preamble = \"Read the record. \"\n[plan]\nname = \"cli\"\ndomain = \"dom-me\"\nbaseline = \"no-memory\"\narms = [\"no-memory\", \"full\"]\nseeds = 2\nmargin = 0.1\njudge = \"regex\"\n[[task]]\nid = \"a\"\nprompt = \"What is A?\"\nexpect = \"A\"\n";
+
+#[test]
+fn eval_plan_prints_the_plan_with_its_digest_or_the_refusal() {
+    let d = step_init();
+    let file = d.root.join("plan.toml");
+    std::fs::write(&file, EVAL_PLAN).unwrap();
+    let file = file.to_str().unwrap();
+    let read = json(&ok(&d.root, &["eval", "plan", file], None));
+    assert_eq!(read["digest"].as_str().map(str::len), Some(64), "{read}");
+    assert_eq!(read["plan"]["name"], "cli");
+    assert_eq!(
+        read["plan"]["arms"],
+        serde_json::json!(["no-memory", "full"])
+    );
+    assert_eq!(read["plan"]["accepted_cost"], 1.0);
+    // a comment does not move the digest, and the margin does
+    std::fs::write(file, format!("# a comment\n{EVAL_PLAN}")).unwrap();
+    let same = json(&ok(&d.root, &["eval", "plan", file], None));
+    assert_eq!(same["digest"], read["digest"]);
+    std::fs::write(file, EVAL_PLAN.replace("margin = 0.1", "margin = 0.2")).unwrap();
+    let moved = json(&ok(&d.root, &["eval", "plan", file], None));
+    assert_ne!(moved["digest"], read["digest"]);
+    std::fs::write(file, EVAL_PLAN.replace("seeds = 2", "seeds = 1")).unwrap();
+    let refused = fails(&d.root, &["eval", "plan", file]);
+    assert!(refused.contains("two seeds or more"), "{refused}");
+}
+
+#[test]
+fn eval_score_and_scorecards_reach_the_library() {
+    let d = step_init();
+    let plan = d.root.join("plan.toml");
+    std::fs::write(&plan, EVAL_PLAN).unwrap();
+    let outcomes = d.root.join("outcomes.json");
+    std::fs::write(&outcomes, "[]").unwrap();
+    let (plan, outcomes) = (plan.to_str().unwrap(), outcomes.to_str().unwrap());
+    let refused = fails(&d.root, &["eval", "score", plan, outcomes]);
+    assert!(refused.contains("one outcome or more"), "{refused}");
+    std::fs::write(
+        outcomes,
+        r#"[{"session": "sess-none", "success": true, "cost": 1, "judge": "regex"}]"#,
+    )
+    .unwrap();
+    let refused = fails(&d.root, &["eval", "score", plan, outcomes, "--keep"]);
+    assert!(refused.contains("sess-none"), "{refused}");
+    // a root with no platform domain keeps no scorecard
+    let kept = json(&ok(&d.root, &["eval", "scorecards", "--limit", "3"], None));
+    assert_eq!(kept, serde_json::json!([]));
+}
+
+#[test]
+fn launch_takes_the_evaluation_flags_together_and_without_a_prompt() {
+    let d = step_init();
+    let plan = d.root.join("plan.toml");
+    std::fs::write(&plan, EVAL_PLAN).unwrap();
+    let plan = plan.to_str().unwrap();
+    let launch = ["launch", "--harness", "claude", "--unconfined"];
+    let run = ["--eval-plan", plan, "--eval-task", "a", "--eval-seed", "0"];
+    let arm = ["--arm", "full", "--as-of", "2026-11-01T10:00:00Z"];
+    let with = |more: &[&str]| fails(&d.root, &[&launch[..], more].concat());
+    // the argument parser refuses these before anything starts
+    let no_arm = with(&[&run[..], &arm[2..]].concat());
+    assert!(no_arm.contains("--arm <ARM>"), "{no_arm}");
+    let no_as_of = with(&[&run[..], &arm[..2]].concat());
+    assert!(no_as_of.contains("--as-of <AS_OF>"), "{no_as_of}");
+    let no_task = with(&[&run[..2], &run[4..], &arm[..]].concat());
+    assert!(no_task.contains("--eval-task <EVAL_TASK>"), "{no_task}");
+    let no_seed = with(&[&run[..4], &arm[..]].concat());
+    assert!(no_seed.contains("--eval-seed <EVAL_SEED>"), "{no_seed}");
+    for alone in [&run[2..4], &run[4..]] {
+        let no_plan = with(&[alone, &arm[..]].concat());
+        assert!(no_plan.contains("--eval-plan <EVAL_PLAN>"), "{no_plan}");
+    }
+    for flag in [
+        &["--prompt", "x"][..],
+        &["--prompt-file", "x"],
+        &["--empty-memory"],
+    ] {
+        let both = with(&[&run[..], &arm[..], flag].concat());
+        assert!(both.contains("cannot be used with"), "{both}");
+    }
+    // the plan decides the rest before the harness starts
+    let no_such = [
+        &run[..2],
+        &["--eval-task", "c", "--eval-seed", "0"],
+        &arm[..],
+    ]
+    .concat();
+    let refused = with(&no_such);
+    assert!(refused.contains("has no task c"), "{refused}");
+    let other_arm = [&run[..], &["--arm", "raw-only"], &arm[2..]].concat();
+    let refused = with(&other_arm);
+    assert!(
+        refused.contains("does not name the arm raw-only"),
+        "{refused}"
+    );
+    let late_seed = [&run[..4], &["--eval-seed", "2"], &arm[..]].concat();
+    let refused = with(&late_seed);
+    assert!(refused.contains("2 is not one"), "{refused}");
+}
+
 #[test]
 fn eval_arms_lists_the_five_arms_in_the_paper_s_order() {
     let d = step_init();

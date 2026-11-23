@@ -38,6 +38,7 @@ pub mod arms;
 pub mod bundle;
 pub mod contexts;
 pub mod drift_windows;
+pub mod evaluation;
 pub mod fabric;
 pub mod log;
 pub mod mcp;
@@ -360,6 +361,10 @@ pub struct Memory {
     /// its grants and its policy. Unset is production. A view of the session
     /// ([`Memory::for_request`]) carries them.
     settings: OnceLock<arms::Settings>,
+    /// The run of an evaluation this session is, and the domain of its plan, when a
+    /// launcher made it one ([`Memory::start_evaluation`]). A view of the session
+    /// carries them.
+    evaluation: OnceLock<(evaluation::RunOf, String)>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -519,6 +524,7 @@ impl Memory {
             last_stamp: Arc::new(Mutex::new(OffsetDateTime::UNIX_EPOCH)),
             seat: Arc::default(),
             settings: OnceLock::new(),
+            evaluation: OnceLock::new(),
         })
     }
 
@@ -574,6 +580,7 @@ impl Memory {
             last_stamp: Arc::clone(&self.last_stamp),
             seat: Arc::clone(&self.seat),
             settings: self.settings.clone(),
+            evaluation: self.evaluation.clone(),
         })
     }
 

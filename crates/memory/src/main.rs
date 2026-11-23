@@ -402,6 +402,21 @@ enum Command {
         /// read. The tasks, the policy and the grants are read as they are now.
         #[arg(long)]
         as_of: Option<String>,
+        /// Run as one run of an evaluation: the plan, an evaluation set file with a
+        /// `[plan]` table. The prompt is the plan's, the tape of the session names the
+        /// digest of the plan, and `amem eval score` reads the run from that tape.
+        #[arg(
+            long,
+            requires_all = ["arm", "as_of", "eval_task", "eval_seed"],
+            conflicts_with_all = ["prompt", "prompt_file", "empty_memory"]
+        )]
+        eval_plan: Option<PathBuf>,
+        /// With --eval-plan: the id of the task in the plan.
+        #[arg(long, requires = "eval_plan")]
+        eval_task: Option<String>,
+        /// With --eval-plan: the seed, the number of the repeated run, from 0.
+        #[arg(long, requires = "eval_plan")]
+        eval_seed: Option<u32>,
         /// After the run, mine the session's transcript for entries with a small model
         /// through the same destination; they land raw, low confidence, with the
         /// transcript as source.
@@ -955,8 +970,8 @@ enum Command {
         #[command(subcommand)]
         op: platform::PlatformOp,
     },
-    /// The evaluation: the arms of the comparison, each one fixed value of a session's
-    /// settings.
+    /// The evaluation: the arms of the comparison, the plan that is fixed before the
+    /// runs, the scorer, and the scorecards that the record keeps.
     Eval {
         #[command(subcommand)]
         op: eval::EvalOp,
@@ -1624,7 +1639,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Log { op } => eventlog::cmd(&Memory::open(&root)?, op).await,
         Command::Gofannon { op } => gofannon::cmd(&root, op).await,
         Command::Platform { op } => platform::cmd(&Memory::open(&root)?, op).await,
-        Command::Eval { op } => eval::cmd(&op),
+        Command::Eval { op } => eval::cmd(&root, op).await,
         Command::Position { op } => positions::cmd(&Memory::open(&root)?, op).await,
         Command::Tool { name, args } => sources::call(&root, &name, &args).await,
         Command::ToolServer { listen, token_env } => {
@@ -3104,6 +3119,9 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         empty_memory,
         arm,
         as_of,
+        eval_plan,
+        eval_task,
+        eval_seed,
         mine: mine_after,
         mine_model,
         mine_via,
@@ -3115,13 +3133,11 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     };
     let workdir = resolve_workdir(root, workdir)?;
     refuse_browser_unconfined(unconfined, backend)?;
-    let settings = eval::settings(arm.as_deref(), as_of.as_deref())?;
-    eval::needs_prompt(settings.as_ref(), prompt.is_some() || prompt_file.is_some())?;
-    let prompt = match (prompt, prompt_file) {
-        (Some(p), _) => Some(p),
-        (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
-        (None, None) => None,
-    };
+    let (settings, evaluation, prompt) = eval::asked(
+        &eval::RunFlags::new(eval_plan, eval_task, eval_seed, arm, as_of),
+        prompt,
+        prompt_file,
+    )?;
     let (program, args) = split_program(harness.into(), args);
     let stops = stops::Stops::listen()?;
     let session = Session::start(
@@ -3137,7 +3153,8 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         runner_for(backend_of(backend, unconfined, root, harness.into()), root)?,
         RunOptions::new(model, subagents, program, None)
             .empty_memory(empty_memory)
-            .settings(settings),
+            .settings(settings)
+            .evaluation(evaluation),
     )
     .await?;
     let code = stops
@@ -3356,6 +3373,8 @@ struct RunOptions {
     home: Option<PathBuf>,
     /// The session's settings, when the launch names an arm or a snapshot.
     settings: Option<dm_server::arms::Settings>,
+    /// The run of an evaluation that the session is, when the launch names a plan.
+    evaluation: Option<eval::RunPlan>,
 }
 
 impl RunOptions {
@@ -3373,7 +3392,13 @@ impl RunOptions {
             empty_memory: false,
             home: None,
             settings: None,
+            evaluation: None,
         }
+    }
+
+    fn evaluation(mut self, run: Option<eval::RunPlan>) -> RunOptions {
+        self.evaluation = run;
+        self
     }
 
     fn settings(mut self, settings: Option<dm_server::arms::Settings>) -> RunOptions {
@@ -3732,6 +3757,11 @@ impl Session {
         let mut options = options;
         if options.model.is_none() {
             options.model = platform_model(&p.memory, harness).await;
+        }
+        // a run of an evaluation: the library gives the settings of the arm, and
+        // refuses a harness or a model that is not the plan's
+        if let Some(run) = &options.evaluation {
+            eval::start(&p.memory, run, harness.binary(), options.model.as_deref())?;
         }
         apply_run_options(&mut p, harness, auth, &options);
         if let Some(h) = &options.home {
