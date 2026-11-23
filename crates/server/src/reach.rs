@@ -193,6 +193,53 @@ impl Memory {
             entry.front.id
         )))
     }
+
+    /// Whether this session may write an entry that replaces `old`. The entry is not
+    /// written yet: `tier`, `reach` and `task` are what the session gives it.
+    ///
+    /// The read filter of the session must admit `old`, as an active entry or as one
+    /// that the archive keeps. A write that replaces an entry takes that entry out of the
+    /// active set, so a session that cannot read an entry cannot replace it.
+    ///
+    /// A raw entry with tap reach is served only to the chain of its task and to the
+    /// readers of all raw entries. Such a write replaces only a raw entry with tap reach
+    /// that names the same task: each session that reads `old` then reads the entry that
+    /// replaces it. It replaces no other entry, or it would take that entry from its
+    /// readers before a curator saw the write.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an entry that the read filter does not admit, which is
+    /// the error for an entry that does not exist. [`Error::Denied`] for a raw write
+    /// with tap reach and an entry with other readers. An index or store error.
+    pub(crate) async fn may_replace(
+        &self,
+        old: &str,
+        tier: TrustTier,
+        reach: Reach,
+        task: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut f = self.session_filter()?;
+        f.include_inactive = true;
+        let meta = self.index.lock().await.meta(old, &f)?;
+        let Some(meta) = meta else {
+            return Err(Error::NotFound(old.to_string()));
+        };
+        if !raw_tap(tier, reach) {
+            return Ok(());
+        }
+        let same_readers = self
+            .store
+            .get(&meta.hit.domain, old)
+            .await?
+            .is_some_and(|e| outside_content(&e) && e.front.task.as_deref() == task);
+        if same_readers {
+            return Ok(());
+        }
+        Err(Error::Denied(format!(
+            "this write has tap reach: its session read content from outside the fleet. It does not replace {old}, which has other readers. Write the entry without `supersedes` and cite {old}: a curator or a person replaces {old}"
+        )))
+    }
 }
 
 /// A session that read content from authors outside the fleet, as one log shows it.
@@ -1332,6 +1379,217 @@ mod tests {
             .await
             .unwrap();
         assert!(serves(&a, &w.id).await);
+    }
+
+    /// A request for a fact with other text that replaces `old`.
+    fn replacing(old: &str) -> WriteRequest {
+        WriteRequest {
+            supersedes: Some(old.to_string()),
+            ..req(EntryType::Fact, "# Port\n\nThe replaced port is 9999.\n")
+        }
+    }
+
+    /// An agent session on a task that the owner filed from `parent`. The task is not
+    /// outside content, and `parent` is in its chain.
+    async fn child_of(o: &Memory, root: &Path, name: &str, parent: &Task) -> Memory {
+        let origin = Some(format!("task:{}", parent.id));
+        let child = ledger_task(o, "Child", origin, &[]).await;
+        let m = holder(root, name, &child.id).await;
+        assert!(!m.read_outside(), "a task of the owner");
+        m
+    }
+
+    #[tokio::test]
+    async fn a_write_does_not_replace_an_entry_that_the_read_filter_withholds() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (t, n) = noted(dir.path()).await;
+        let none = agent(dir.path(), "agent:none");
+        // the answer for it is the answer for an entry that does not exist
+        let missing = n.replace("mem-", "mem-no-");
+        for id in [&n, &missing] {
+            let refused = none.write(replacing(id)).await.unwrap_err();
+            assert!(
+                matches!(&refused, Error::NotFound(named) if named == id),
+                "{refused}"
+            );
+        }
+        assert!(o.get(&n).await.unwrap().is_active(), "it is as it was");
+        let b = holder(dir.path(), "agent:b", &t.id).await;
+        assert!(serves(&b, &n).await, "its chain reads it as before");
+        assert!(
+            none.list(None, None, 50).await.unwrap().is_empty(),
+            "the record took no entry of the refused writes"
+        );
+        // a session that reads the entry replaces it
+        let w = b.write(replacing(&n)).await.unwrap();
+        assert_eq!(
+            (w.reach, w.task.as_deref()),
+            (Reach::Tap, Some(t.id.as_str()))
+        );
+        let moved = holder(dir.path(), "agent:b2", &t.id)
+            .await
+            .get(&n)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&moved, Error::Moved { to, .. } if *to == w.id),
+            "{moved}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_raw_write_with_tap_reach_replaces_only_an_entry_with_the_same_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let fleet = wrote(&o, EntryType::Fact).await;
+        let (t, n) = noted(dir.path()).await;
+        let marked = holder(dir.path(), "agent:marked", &t.id).await;
+        assert!(marked.read_outside());
+        // an entry that the fleet reads
+        let refused = marked.write(replacing(&fleet.id)).await.unwrap_err();
+        assert!(
+            matches!(&refused, Error::Denied(why) if why.contains("has tap reach") && why.contains(&fleet.id)),
+            "{refused}"
+        );
+        let plain = agent(dir.path(), "agent:plain");
+        assert!(
+            serves(&plain, &fleet.id).await,
+            "the fleet reads it as before"
+        );
+        // a raw entry with tap reach that names another task of the chain
+        let c = child_of(&o, dir.path(), "agent:c", &t).await;
+        c.get(&n).await.unwrap();
+        assert!(c.read_outside());
+        let refused = c.write(replacing(&n)).await.unwrap_err();
+        assert!(
+            matches!(&refused, Error::Denied(why) if why.contains("has tap reach")),
+            "{refused}"
+        );
+        assert!(serves(&marked, &n).await, "its chain reads it as before");
+        // the same text without `supersedes` is taken
+        let mut alone = replacing(&n);
+        alone.supersedes = None;
+        assert_eq!(c.write(alone).await.unwrap().reach, Reach::Tap);
+        // a session on a task of a curator writes at curated, and the fleet reads that
+        let duty = ledger_task(&o, "Survey", Some("curator:survey".into()), &[]).await;
+        let curator = holder(dir.path(), "agent:curator", &duty.id).await;
+        curator.get(&n).await.unwrap();
+        assert!(curator.read_outside());
+        let w = curator.write(replacing(&fleet.id)).await.unwrap();
+        assert_eq!(w.reach, Reach::Tap);
+        let read = agent(dir.path(), "agent:after").get(&w.id).await.unwrap();
+        assert_eq!(read.front.trust_tier, TrustTier::Curated);
+    }
+
+    #[tokio::test]
+    async fn the_summaries_page_does_not_list_a_raw_entry_with_tap_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let view = dir.path().join("view");
+        let o = owner(&root);
+        let own = o
+            .write(req(
+                EntryType::Fact,
+                "# Port\n\nThe gateway port is 8443.\n",
+            ))
+            .await
+            .unwrap();
+        let (t, n) = noted(&root).await;
+        let c = child_of(&o, &root, "agent:c", &t).await;
+        let done = c.project_into(&view).await.unwrap();
+        assert_eq!(done.listed, 2, "each entry is a file");
+        let dom = view.join("dom-me");
+        let page = || std::fs::read_to_string(dom.join(crate::projection::SUMMARIES)).unwrap();
+        let first = page();
+        assert!(first.starts_with("# dom-me: 1 entries\n"), "{first}");
+        assert!(first.contains(&own.id), "{first}");
+        assert!(
+            !first.contains(&n) && !first.contains("Steps") && !first.contains("planted"),
+            "{first}"
+        );
+        assert!(first.contains("does not list the raw entries"), "{first}");
+        assert!(!c.read_outside(), "the render is not a read");
+        assert_eq!(wrote(&c, EntryType::Fact).await.reach, Reach::Fleet);
+        // the file is there, and the hook turns the open of it into a get
+        assert!(dom.join(crate::projection::entry_file(&n)).is_file());
+        c.get(&n).await.unwrap();
+        assert!(c.read_outside());
+        // once curated, the entry has a line
+        o.promote(&n, TrustTier::Curated, "Checked against the runbook.")
+            .await
+            .unwrap();
+        c.project_into(&view).await.unwrap();
+        let second = page();
+        assert!(second.contains(&format!("[Steps]({n}.md)")), "{second}");
+    }
+
+    #[tokio::test]
+    async fn a_write_after_a_recall_linked_a_raw_entry_with_tap_reach_has_tap_reach() {
+        use crate::recall::{Budget, Depth, Via};
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let (t, n) = noted(dir.path()).await;
+        let citing = o
+            .write(WriteRequest {
+                cites: vec![n.clone()],
+                ..req(EntryType::Fact, "# Port\n\nThe gateway port is 8443.\n")
+            })
+            .await
+            .unwrap();
+        assert_eq!(citing.reach, Reach::Fleet);
+        let c = child_of(&o, dir.path(), "agent:c", &t).await;
+        let pack = c
+            .pack(
+                &["gateway port".to_string()],
+                None,
+                Depth::Sections,
+                Budget::default(),
+            )
+            .await
+            .unwrap();
+        let via: Vec<(&str, Via)> = pack.pieces.iter().map(|p| (p.id.as_str(), p.via)).collect();
+        assert_eq!(
+            via,
+            [(citing.id.as_str(), Via::Query), (n.as_str(), Via::Linked)],
+            "the note is served only as a linked entry"
+        );
+        assert!(c.read_outside(), "its summary is outside content");
+        assert_eq!(wrote(&c, EntryType::Fact).await.reach, Reach::Tap);
+    }
+
+    #[tokio::test]
+    async fn a_write_after_a_recall_served_the_body_of_a_raw_entry_with_tap_reach_has_tap_reach() {
+        use crate::recall::{Budget, Depth};
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let w = o
+            .write(req(
+                EntryType::Fact,
+                "# Port\n\nThe gateway port is 8443.\n",
+            ))
+            .await
+            .unwrap();
+        // the record is ahead of the index: its version has tap reach, and the row of
+        // the index says that the entry has the reach of the fleet
+        let mut ahead = o.store.get("dom-me", &w.id).await.unwrap().unwrap();
+        ahead.front.reach = Reach::Tap;
+        o.store.put(&ahead).await.unwrap();
+        let plain = agent(dir.path(), "agent:plain");
+        let queries = ["gateway port".to_string()];
+        let titles = plain
+            .pack(&queries, None, Depth::Summaries, Budget::default())
+            .await
+            .unwrap();
+        assert_eq!(titles.pieces.len(), 1);
+        assert!(!plain.read_outside(), "the row has the reach of the fleet");
+        let pack = plain
+            .pack(&queries, None, Depth::Sections, Budget::default())
+            .await
+            .unwrap();
+        assert!(pack.pieces[0].body.is_some(), "the body was served");
+        assert!(plain.read_outside(), "the body is outside content");
+        assert_eq!(wrote(&plain, EntryType::Fact).await.reach, Reach::Tap);
     }
 
     #[tokio::test]

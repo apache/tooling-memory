@@ -1314,7 +1314,10 @@ impl Memory {
     /// # Errors
     ///
     /// An ungranted domain, an empty body, an entry over the size bound, a write the
-    /// gates refuse, or a store or index error.
+    /// gates refuse, or a store or index error. [`Error::NotFound`] when `supersedes`
+    /// names an entry that the read filter of the session does not admit, and
+    /// [`Error::Denied`] when a raw write with tap reach would replace an entry with
+    /// other readers. The log takes nothing of a write that those two refuse.
     pub async fn write(&self, req: WriteRequest) -> Result<Written, Error> {
         let mut entry = self.entry_to_write(req).await?;
         // the ledger's events so far come before the write in the log of its domain. A
@@ -1371,6 +1374,10 @@ impl Memory {
                 .ok_or_else(|| Error::Denied(format!("domain {domain} is not granted")))?
         };
         let held = self.held_task();
+        let reach = self.reach_for_write(req.entry_type, held.is_some());
+        if let Some(old) = &req.supersedes {
+            self.may_replace(old, tier, reach, held.as_deref()).await?;
+        }
         let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
         // facts decay fast and carry mandatory review dates (the paper, §4): one written
         // without a date gets one ninety days out, which the curator enforces
@@ -1387,7 +1394,7 @@ impl Memory {
                 cites: req.cites,
                 // the log gives it, with the event that offers the entry
                 session: None,
-                reach: self.reach_for_write(req.entry_type, held.is_some()),
+                reach,
                 task: held,
                 confidence: req.confidence,
                 trust_tier: tier,

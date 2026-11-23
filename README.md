@@ -164,7 +164,9 @@ two weeks. It is also the reason that none of it is the production shape.
   reads content from authors outside the fleet, the event log records it. Each entry that
   the session writes after the read is raw with tap reach. Until such an entry is
   curated, only the task chain, triage and curators read it. Only a person, or a session
-  on a task of a curator or of the auditor, can make it curated. `amem log outside` and
+  on a task of a curator or of the auditor, can make it curated. A write replaces only an
+  entry that its session reads. A raw write with tap reach replaces only a raw entry with
+  tap reach that names the same task. `amem log outside` and
   the `outside_readers` memory tool list those sessions with their writes and their
   sends. These parts are not built:
   - By default, an agent also reads a raw entry with chain reach that names a task outside

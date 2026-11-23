@@ -717,8 +717,20 @@ includes the raw entries of its own task chain. The logged `read` decision ends 
 
 Only a session with raw reach `all` can make an entry with tap reach curated: a person,
 or a session on a task of a curator or of the auditor. A member of the task chain reads
-the entry and cannot curate it. After the entry is curated, the fleet reads it. The
-record of a session blocks no other action.
+the entry and cannot curate it. After the entry is curated, the fleet reads it.
+
+A write with `supersedes` replaces an entry only when the read filter of the session
+admits that entry. If the read filter does not admit it, the write gets the answer for an
+entry that does not exist. A raw write with tap reach replaces only a raw entry with tap
+reach that names the same task. Each reader of the old entry then reads the new entry.
+The memory server refuses each other raw write with tap reach that has `supersedes`. The
+session then writes the entry without `supersedes` and cites the old entry. A curator or
+a person replaces the old entry. The record of a session blocks no other action.
+
+The summaries page of the projection is `README.md` in the directory of a domain. It has
+no line for a raw entry with tap reach, because a harness reads that page without a
+`get`. The file of the entry is in the directory. A read of that file is a `get`, and the
+`get` records that the session read outside content.
 
 An import of another owner's bundle lands each entry raw with tap reach and no task. An
 import of the same owner's bundle keeps the fields.
@@ -751,6 +763,10 @@ Limits:
   The reader of the turn gets no record.
 - A session of the web launcher keeps the record for one request.
 - A re-run from a tape does not restore the record.
+- The memory server does not keep a refused write with tap reach and `supersedes` as a
+  proposal for a curator. The session writes it again without `supersedes`.
+- A person who read outside content cannot replace an entry of the fleet in the same
+  session. The person replaces it in a new session.
 - `amem` does not check that the ledger names the session as the holder of its held
   task.
 
