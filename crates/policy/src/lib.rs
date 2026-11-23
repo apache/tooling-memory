@@ -266,9 +266,45 @@ pub struct Grants {
     /// Spend limits per resource class, by destination: `[spend.llmao]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub spend: BTreeMap<String, SpendLimit>,
+    /// Landing queues by name: `[landing.main]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub landing: BTreeMap<String, LandingQueue>,
     /// Where the task ledger lives when not in the SQLite file under the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<LedgerSettings>,
+}
+
+/// A queue through which finished changes land, one at a time, when a person says so:
+///
+/// ```toml
+/// [landing.main]
+/// domain = "dom-a"
+/// per_day = 4
+/// count_after_hours = 24
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingQueue {
+    /// The domain whose tasks the queue lands.
+    pub domain: String,
+    /// The share of the fleet: how many changes of agents the queue lands in 24 hours.
+    /// Absent is no share. The changes of people are not counted against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_day: Option<u32>,
+    /// The hours after which a landing counts as progress; 24 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_after_hours: Option<u32>,
+}
+
+impl LandingQueue {
+    /// The hours after which a landing counts when the file names none.
+    pub const COUNT_AFTER_HOURS: u32 = 24;
+
+    /// The fixed delay after which a landing counts as progress.
+    #[must_use]
+    pub fn count_after(&self) -> time::Duration {
+        let hours = self.count_after_hours.unwrap_or(Self::COUNT_AFTER_HOURS);
+        time::Duration::hours(i64::from(hours))
+    }
 }
 
 /// The ledger's backend, when it is a server rather than the file under the root:
@@ -337,6 +373,7 @@ impl Grants {
             ledger: None,
             gates: Gates::default(),
             spend: BTreeMap::new(),
+            landing: BTreeMap::new(),
         }
     }
 
@@ -864,5 +901,37 @@ ceiling = "public"
             Grants::load(Path::new("/nonexistent/grants.toml")),
             Err(Error::Io { .. })
         ));
+    }
+
+    #[test]
+    fn a_file_without_a_landing_queue_reads_and_renders_as_before() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("landing"), "{text}");
+        assert!(Grants::parse(FILE).unwrap().landing.is_empty());
+    }
+
+    #[test]
+    fn a_landing_queue_round_trips_and_its_delay_defaults_to_a_day() {
+        let mut g = Grants::starter("human:local:me", "dom-me");
+        let text = format!(
+            "{}\n[landing.main]\ndomain = \"dom-me\"\nper_day = 2\n",
+            g.render().unwrap()
+        );
+        let back = Grants::parse(&text).unwrap();
+        let q = LandingQueue {
+            domain: "dom-me".into(),
+            per_day: Some(2),
+            count_after_hours: None,
+        };
+        assert_eq!(q.count_after(), time::Duration::hours(24));
+        g.landing.insert("main".into(), q);
+        assert_eq!(back, g);
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        let short = LandingQueue {
+            count_after_hours: Some(6),
+            ..g.landing["main"].clone()
+        };
+        assert_eq!(short.count_after(), time::Duration::hours(6));
     }
 }

@@ -834,6 +834,60 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// One event of a task with the time the ledger appended it: what happened, and when.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Moment {
+    /// The task the event is of.
+    pub task: String,
+    /// The event's kind: one of [`MOMENT_KINDS`].
+    pub kind: String,
+    /// The ledger's clock when the event was appended.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+    /// Who claimed, on a `claimed` moment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    /// The outside event, on a `waiting` and on an `arrived` moment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+/// The kinds of event that [`Ledger::moments`] returns.
+pub const MOMENT_KINDS: [&str; 8] = [
+    "created",
+    "claimed",
+    "completed",
+    "released",
+    "waiting",
+    "arrived",
+    "invalidated",
+    "posted",
+];
+
+/// [`MOMENT_KINDS`] as the list of an SQL `IN`.
+fn moment_kinds_sql() -> String {
+    let quoted: Vec<String> = MOMENT_KINDS.iter().map(|k| format!("'{k}'")).collect();
+    quoted.join(", ")
+}
+
+/// A row of the events table as a moment. The time is parsed, never compared as text.
+fn moment_from_row(task: String, kind: String, at: &str, payload: &str) -> Result<Moment, Error> {
+    let at = parse_time(&task, at)?;
+    let (holder, on) = match Event::parse(&task, payload)? {
+        Event::Claimed { holder, .. } => (Some(holder), None),
+        Event::Waiting { on } => (None, Some(on)),
+        Event::Arrived { event } => (None, Some(event)),
+        _ => (None, None),
+    };
+    Ok(Moment {
+        task,
+        kind,
+        at,
+        holder,
+        on,
+    })
+}
+
 fn fmt_time(t: OffsetDateTime) -> String {
     t.format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
@@ -2462,6 +2516,16 @@ impl Ledger {
         }
     }
 
+    /// When things happened to the tasks of one domain: every event of a kind in
+    /// [`MOMENT_KINDS`], oldest first. A record that is no task's is not among them.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`Error::BadRow`] for a time or a payload that does not parse.
+    pub async fn moments(&self, domain: &str) -> Result<Vec<Moment>, Error> {
+        on_backend!(&self.backend, db => db.moments(domain))
+    }
+
     /// How many events the ledger holds.
     ///
     /// # Errors
@@ -2705,6 +2769,9 @@ mod tests {
         a_definition_record_is_no_task_and_a_replay_keeps_it,
         a_task_that_awaits_a_verdict_closes_with_its_handoff_and_opens_its_dependent,
         a_task_is_closed_on_a_verdict_only_while_it_waits_on_that_event,
+        the_moments_of_a_task_are_in_order_with_the_clock_of_each_call,
+        the_moments_of_a_domain_hold_only_the_events_of_its_tasks,
+        a_waiting_moment_and_its_arrival_name_the_event,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -5909,6 +5976,105 @@ mod tests {
         assert_eq!(
             l.get(&t.id).await.unwrap().handoff.as_deref(),
             Some("mem-a-h2")
+        );
+    }
+
+    /// What the moments say: kind, minutes after `T0`, holder, outside event.
+    fn told(ms: &[Moment], task: &str) -> Vec<(String, i64, Option<String>, Option<String>)> {
+        ms.iter()
+            .filter(|m| m.task == task)
+            .map(|m| {
+                let mins = (m.at - T0).whole_minutes();
+                (m.kind.clone(), mins, m.holder.clone(), m.on.clone())
+            })
+            .collect()
+    }
+
+    fn at(kind: &str, mins: i64) -> (String, i64, Option<String>, Option<String>) {
+        (kind.to_string(), mins, None, None)
+    }
+
+    fn by_at(holder: &str, mins: i64) -> (String, i64, Option<String>, Option<String>) {
+        ("claimed".to_string(), mins, Some(holder.to_string()), None)
+    }
+
+    async fn the_moments_of_a_task_are_in_order_with_the_clock_of_each_call(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = l.create(spec("Timed")).await.unwrap().task;
+        let step = |m: i64| *now.lock().unwrap() = T0 + mins(m);
+        step(1);
+        l.admit(&t.id).await.unwrap();
+        step(2);
+        claim(&mut l, &t.id, "agent:a", mins(30)).await.unwrap();
+        step(3);
+        l.release_as(&t.id, "agent:a", None).await.unwrap();
+        step(5);
+        claim(&mut l, &t.id, "agent:b", mins(30)).await.unwrap();
+        step(8);
+        l.complete_as(&t.id, "agent:b", "mem-a-h").await.unwrap();
+        let ms = l.moments("dom-a").await.unwrap();
+        assert_eq!(
+            told(&ms, &t.id),
+            vec![
+                at("created", 0),
+                by_at("agent:a", 2),
+                at("released", 3),
+                by_at("agent:b", 5),
+                at("completed", 8),
+            ]
+        );
+        assert_eq!(ms.len(), 5, "the admission is not a moment");
+    }
+
+    async fn the_moments_of_a_domain_hold_only_the_events_of_its_tasks(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let ours = admitted(&mut l, spec("Ours")).await;
+        let mut other = spec("Theirs");
+        other.domain = "dom-b".into();
+        let theirs = admitted(&mut l, other).await;
+        claim(&mut l, &theirs.id, "agent:b", mins(30))
+            .await
+            .unwrap();
+        assert!(l
+            .record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap());
+        l.record_approval(&approval("dom-a", "mem-a-1"))
+            .await
+            .unwrap();
+        let ms = l.moments("dom-a").await.unwrap();
+        assert_eq!(told(&ms, &ours.id), vec![at("created", 0)]);
+        assert_eq!(ms.len(), 1, "{ms:?}");
+        let b = l.moments("dom-b").await.unwrap();
+        assert_eq!(kinds_of(&b, &theirs.id), ["created", "claimed"]);
+        assert!(l.moments("dom-none").await.unwrap().is_empty());
+    }
+
+    /// The kinds of the moments, which must all be of `task`.
+    fn kinds_of<'a>(ms: &'a [Moment], task: &str) -> Vec<&'a str> {
+        assert!(ms.iter().all(|m| m.task == task), "{ms:?}");
+        ms.iter().map(|m| m.kind.as_str()).collect()
+    }
+
+    async fn a_waiting_moment_and_its_arrival_name_the_event(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Wait for the check")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        *now.lock().unwrap() = T0 + mins(4);
+        l.wait_for(&t.id, held("s1", c.generation), "check:42", None)
+            .await
+            .unwrap();
+        *now.lock().unwrap() = T0 + mins(9);
+        l.arrived("dom-a", "check:42").await.unwrap();
+        let on = Some("check:42".to_string());
+        assert_eq!(
+            told(&l.moments("dom-a").await.unwrap(), &t.id),
+            vec![
+                at("created", 0),
+                by_at("s1", 0),
+                ("waiting".to_string(), 4, None, on.clone()),
+                ("arrived".to_string(), 9, None, on),
+            ]
         );
     }
 }

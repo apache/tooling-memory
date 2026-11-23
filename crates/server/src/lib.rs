@@ -44,6 +44,7 @@ pub mod gates;
 mod holds;
 pub mod log;
 pub mod mcp;
+pub mod measure;
 pub mod platform;
 pub mod prefetch;
 pub mod projection;
