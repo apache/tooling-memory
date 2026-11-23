@@ -15,7 +15,9 @@
 //! as what the session has read. The session's label rises and never falls.
 
 use dm_core::erasure::{self, Reason, Receipt};
-use dm_core::{Confidence, Entry, EntryType, Frontmatter, Label, ReadFilter, Status, TrustTier};
+use dm_core::{
+    Confidence, Entry, EntryType, Frontmatter, Label, Reach, ReadFilter, Status, TrustTier,
+};
 use dm_index::{Hit, Index};
 use dm_ledger::{Claim, Created, Ledger, Task, TaskSpec};
 use dm_policy::decide::{
@@ -43,6 +45,7 @@ pub mod mcp;
 pub mod platform;
 pub mod prefetch;
 pub mod projection;
+pub mod reach;
 pub mod reads;
 pub mod recall;
 pub mod rules;
@@ -282,6 +285,12 @@ pub struct Written {
     /// until the owner releases it ([`Memory::release_withheld`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withheld: Option<String>,
+    /// Who reads the entry while it is raw.
+    #[serde(default, skip_serializing_if = "Reach::is_fleet")]
+    pub reach: Reach,
+    /// The task that the session held when it wrote the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 /// One root, opened.
@@ -955,6 +964,21 @@ impl Memory {
         lock(&self.session).label
     }
 
+    /// Whether this session has read content from authors outside the fleet: an answer
+    /// of a tool, a raw entry with tap reach, or a task that came from outside. Each
+    /// later event of the session says so in the log, and each later write of the
+    /// session has tap reach.
+    #[must_use]
+    pub fn read_outside(&self) -> bool {
+        lock(&self.session).outside
+    }
+
+    /// Whether a task is content from authors outside the fleet: it says so, or a tap
+    /// filed it.
+    fn task_is_outside(&self, task: &Task) -> bool {
+        task.spec.outside || Class::of(&task.spec.created_by, &self.grants.owner) == Class::Tap
+    }
+
     /// Granted domains, sorted.
     #[must_use]
     pub fn domains(&self) -> Vec<String> {
@@ -1010,7 +1034,10 @@ impl Memory {
         {
             let mut s = lock(&self.session);
             for h in hits {
-                s.observe(h.classification);
+                // before the read events below, so that they carry the record
+                if s.observe(h.classification) && reach::raw_tap(h.trust_tier, h.reach) {
+                    s.read_outside();
+                }
                 let (ids, label) = served.entry(h.domain.as_str()).or_default();
                 if !ids.contains(&h.id) {
                     ids.push(h.id.clone());
@@ -1025,15 +1052,29 @@ impl Memory {
     }
 
     /// The session reads one entry, at `label`: its label rises, and the log of the
-    /// entry's domain takes a read event. Returns whether the session may handle the
-    /// label; when it may not, nothing was served and no event is appended.
+    /// entry's domain takes a read event. `outside` says that the entry is raw with tap
+    /// reach: the session then has read outside content, and the read event says so.
+    /// Returns whether the session may handle the label; when it may not, nothing was
+    /// served and no event is appended.
     ///
     /// # Errors
     ///
     /// The event could not be appended.
-    fn observe_entry(&self, domain: &str, id: &str, label: Label) -> Result<bool, Error> {
-        if !lock(&self.session).observe(label) {
-            return Ok(false);
+    fn observe_entry(
+        &self,
+        domain: &str,
+        id: &str,
+        label: Label,
+        outside: bool,
+    ) -> Result<bool, Error> {
+        {
+            let mut s = lock(&self.session);
+            if !s.observe(label) {
+                return Ok(false);
+            }
+            if outside {
+                s.read_outside();
+            }
         }
         self.log_read(domain, vec![id.to_string()], label)?;
         Ok(true)
@@ -1099,7 +1140,8 @@ impl Memory {
         if self.withheld_from_author(&entry) {
             return Err(withhold::gone(id));
         }
-        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification)? {
+        let outside = reach::outside_content(&entry);
+        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification, outside)? {
             return Err(Error::NotFound(id.to_string()));
         }
         Ok(entry)
@@ -1163,7 +1205,8 @@ impl Memory {
             self.forget_pushed(id);
             return Err(self.not_served(id, entry.front.status).await);
         }
-        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification)? {
+        let outside = reach::outside_content(&entry);
+        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification, outside)? {
             self.forget_pushed(id);
             return Err(Error::NotFound(id.to_string()));
         }
@@ -1276,6 +1319,8 @@ impl Memory {
             domain: entry.front.domain,
             id: entry.front.id,
             withheld,
+            reach: entry.front.reach,
+            task: entry.front.task,
         })
     }
 
@@ -1306,6 +1351,7 @@ impl Memory {
                 .classification_for_write(&domain, req.classification, &s)
                 .ok_or_else(|| Error::Denied(format!("domain {domain} is not granted")))?
         };
+        let held = self.held_task();
         let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
         // facts decay fast and carry mandatory review dates (the paper, §4): one written
         // without a date gets one ninety days out, which the curator enforces
@@ -1322,8 +1368,8 @@ impl Memory {
                 cites: req.cites,
                 // the log gives it, with the event that offers the entry
                 session: None,
-                reach: dm_core::Reach::Fleet,
-                task: None,
+                reach: self.reach_for_write(req.entry_type, held.is_some()),
+                task: held,
                 confidence: req.confidence,
                 trust_tier: tier,
                 review_by,
@@ -1337,6 +1383,19 @@ impl Memory {
             },
             body: req.body,
         })
+    }
+
+    /// The row of the raw-reach table for an entry that this session writes now: tap
+    /// reach after the session read outside content, chain reach for a handoff or a
+    /// decision written under a held task, and fleet reach for all else.
+    fn reach_for_write(&self, kind: EntryType, holds_task: bool) -> Reach {
+        if self.read_outside() {
+            Reach::Tap
+        } else if holds_task && matches!(kind, EntryType::Handoff | EntryType::Decision) {
+            Reach::Chain
+        } else {
+            Reach::Fleet
+        }
     }
 
     /// What follows a write the record and the index took: the proposals of the entry it
@@ -1868,7 +1927,12 @@ impl Memory {
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         if entry.front.status == Some(Status::Erased)
             || self.withheld_from_author(&entry)
-            || !self.observe_entry(&domain, id, entry.front.classification)?
+            || !self.observe_entry(
+                &domain,
+                id,
+                entry.front.classification,
+                reach::outside_content(&entry),
+            )?
         {
             return Err(Error::NotFound(id.to_string()));
         }
@@ -2171,6 +2235,8 @@ impl Memory {
                 classification: entry.front.classification,
                 domain: entry.front.domain.clone(),
                 withheld: None,
+                reach: entry.front.reach,
+                task: entry.front.task.clone(),
             })
         } else {
             None
@@ -2354,9 +2420,14 @@ impl Memory {
         }
     }
 
-    /// A task handed out is read: the session's label rises to its classification.
+    /// A task handed out is read: the session's label rises to its classification, and
+    /// a task from outside the fleet makes the session one that read outside content.
     fn observe_task(&self, task: &Task) {
-        lock(&self.session).observe(task.spec.classification);
+        let outside = self.task_is_outside(task);
+        let mut s = lock(&self.session);
+        if s.observe(task.spec.classification) && outside {
+            s.read_outside();
+        }
     }
 
     /// Read one named task that is handed out as it is: checked, then observed.
@@ -2374,10 +2445,7 @@ impl Memory {
             .into_iter()
             .filter(|t| self.sees(t, handling))
             .collect();
-        let mut s = lock(&self.session);
-        for t in &seen {
-            s.observe(t.spec.classification);
-        }
+        seen.iter().for_each(|t| self.observe_task(t));
         Ok(seen)
     }
 
@@ -2501,6 +2569,11 @@ impl Memory {
         )?;
         spec.created_by = self.author.clone();
         spec.classification = spec.classification.max(self.label());
+        // a caller cannot clear it: a task of a tap, or of a session that read outside
+        // content, is outside content for who reads it
+        spec.outside = spec.outside
+            || self.read_outside()
+            || Class::of(&self.author, &self.grants.owner) == Class::Tap;
         // a session files no higher than the task it holds: work it delegates serves
         // that task, and rank is not something a worker can raise
         if let (Filing::Held, Some(p)) = (filing, parent) {
@@ -2620,6 +2693,7 @@ impl Memory {
             priority: parent.spec.priority,
             definition: parent.spec.definition.clone(),
             acceptance: parent.spec.acceptance.clone(),
+            outside: self.task_is_outside(parent) || self.read_outside(),
             ..TaskSpec::default()
         }
     }
@@ -2800,6 +2874,7 @@ impl Memory {
             priority: parent.spec.priority,
             definition: parent.spec.definition.clone(),
             acceptance: parent.spec.acceptance.clone(),
+            outside: self.task_is_outside(parent) || self.read_outside(),
         })
         .await?;
         let continuation = self
@@ -2963,6 +3038,8 @@ impl Memory {
                 .as_deref()
                 .map(|d| platform::definition_name(d).to_string()),
             acceptance: root.spec.acceptance.clone(),
+            // the retry holds the text of the root and names the handoffs carried
+            outside: self.read_outside() || carried.iter().any(|t| self.task_is_outside(t)),
             ..TaskSpec::default()
         };
         self.bind_definition(&mut spec).await?;
@@ -3020,7 +3097,7 @@ impl Memory {
         };
         drop(l);
         if let Some(c) = &claim {
-            lock(&self.session).observe(c.task.spec.classification);
+            self.observe_task(&c.task);
             lock(&self.claims).insert(c.task.id.clone(), c.generation);
         }
         Ok(claim)
@@ -3039,7 +3116,7 @@ impl Memory {
         let c = l
             .claim(id, &self.author, lease, &self.capabilities(), handling)
             .await?;
-        lock(&self.session).observe(c.task.spec.classification);
+        self.observe_task(&c.task);
         lock(&self.claims).insert(c.task.id.clone(), c.generation);
         Ok(c)
     }

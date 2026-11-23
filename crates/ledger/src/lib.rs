@@ -198,6 +198,10 @@ pub struct TaskSpec {
     /// The checks that say this task is done, its own or those its definition gave it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance: Vec<String>,
+    /// Whether the task is content from authors outside the fleet: a tap filed it, or a
+    /// session that had read such content filed it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside: bool,
 }
 
 /// The fields of a task that the ledger keeps and never queries by, as one JSON column.
@@ -207,6 +211,8 @@ struct Extra {
     definition: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     acceptance: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    outside: bool,
 }
 
 impl TaskSpec {
@@ -215,6 +221,7 @@ impl TaskSpec {
         let extra = Extra {
             definition: self.definition.clone(),
             acceptance: self.acceptance.clone(),
+            outside: self.outside,
         };
         serde_json::to_string(&extra).unwrap_or_default()
     }
@@ -855,6 +862,7 @@ impl RawTask {
                 priority: self.priority,
                 definition: extra.definition,
                 acceptance: extra.acceptance,
+                outside: extra.outside,
             },
             created: parse_time(&id, &self.created)?,
             status: Status::parse(&id, &self.status)?,
@@ -2143,6 +2151,7 @@ mod tests {
         a_completion_by_a_continuation_names_no_principal,
         a_completion_after_the_lease_ran_out_names_no_principal,
         the_events_given_hold_no_text_of_a_task_or_of_a_promotion,
+        a_task_filed_as_outside_keeps_it_and_another_task_does_not,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -2468,6 +2477,26 @@ mod tests {
         assert_eq!(l.get(&rests.id).await.unwrap().status, Status::Proposed);
     }
 
+    async fn a_task_filed_as_outside_keeps_it_and_another_task_does_not(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let mut from_outside = spec("From a tap");
+        from_outside.outside = true;
+        let marked = l.create(from_outside).await.unwrap().task;
+        let plain = l.create(spec("From the fleet")).await.unwrap().task;
+        for after in ["create", "replay"] {
+            assert!(l.get(&marked.id).await.unwrap().spec.outside, "{after}");
+            assert!(!l.get(&plain.id).await.unwrap().spec.outside, "{after}");
+            let listed = l.list("dom-a", Status::Proposed).await.unwrap();
+            let outside: Vec<(&str, bool)> = listed
+                .iter()
+                .map(|t| (t.id.as_str(), t.spec.outside))
+                .collect();
+            assert!(outside.contains(&(marked.id.as_str(), true)), "{after}");
+            assert!(outside.contains(&(plain.id.as_str(), false)), "{after}");
+            l.rebuild().await.unwrap();
+        }
+    }
+
     /// A ledger file from before a task carried a definition: no `extra` column.
     #[tokio::test]
     async fn on_sqlite_a_ledger_from_before_the_extra_column_is_given_it() {
@@ -2483,6 +2512,7 @@ mod tests {
             .unwrap();
         let mut l = Ledger::open(&file).unwrap();
         assert_eq!(l.get(&id).await.unwrap().spec.definition, None);
+        assert!(!l.get(&id).await.unwrap().spec.outside);
         let mut defined = spec("New");
         defined.definition = Some("review-change@mem-p-1".into());
         defined.acceptance = vec!["It is checked.".into()];

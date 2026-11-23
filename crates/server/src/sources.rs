@@ -230,6 +230,7 @@ impl Memory {
                 && s.retain_until > now
                 && lock(&self.session).observe(s.classification)
             {
+                self.serve_source(&s)?;
                 return Ok(served(&s, true));
             }
         }
@@ -294,7 +295,17 @@ impl Memory {
                 "{tool}'s results are {label}, above this session's ceiling"
             )));
         }
+        self.serve_source(&s)?;
         Ok(served(&s, false))
+    }
+
+    /// An answer of a tool goes to the agent: the session has read content from authors
+    /// outside the fleet, and the log of the tool's domain takes a `read` event that
+    /// names the source, at the label of the answer.
+    fn serve_source(&self, s: &Source) -> Result<(), Error> {
+        lock(&self.session).read_outside();
+        let cited = format!("{CITATION}{}", s.id);
+        self.log_read(&s.domain, vec![cited], s.classification)
     }
 
     /// A tool's failure as the agent is told it. What an upstream says when it fails is
@@ -309,6 +320,9 @@ impl Memory {
                 "{tool} failed, and what it said is {label}, above this session's ceiling"
             ));
         }
+        // what an upstream says when it fails is content from outside the fleet, in
+        // full or as the kinds that the scan found in it
+        lock(&self.session).read_outside();
         let findings = scan::kinds(&scan::scan(&said));
         if findings.is_empty() || self.principal().id == self.grants.owner {
             return Error::Tool(said);

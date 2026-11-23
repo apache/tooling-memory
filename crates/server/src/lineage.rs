@@ -442,6 +442,7 @@ mod tests {
             session: Some(session.into()),
             label: Some(Label::Internal),
             quarantined: matches!(change, Change::Quarantined { .. }),
+            outside: false,
             change,
         }
     }

@@ -162,9 +162,22 @@ pub struct Event {
     /// Whether this is a write the screen refused, which only the security role reads.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quarantined: bool,
+    /// Whether the session had read content from authors outside the fleet when it
+    /// appended this event. A line without the key reads as false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside: bool,
     /// What.
     #[serde(flatten)]
     pub change: Change,
+}
+
+/// The session that appends an event.
+#[derive(Clone, Copy, Debug)]
+pub struct Actor<'a> {
+    /// Its id.
+    pub session: &'a str,
+    /// Whether it has read content from authors outside the fleet.
+    pub outside: bool,
 }
 
 impl Event {
@@ -360,7 +373,7 @@ impl Writer {
     fn append(
         &mut self,
         by: &str,
-        session: Option<&str>,
+        actor: Option<Actor<'_>>,
         label: Option<Label>,
         sync: bool,
         change: Change,
@@ -369,9 +382,10 @@ impl Writer {
             seq: self.last + 1,
             at: now(),
             by: by.to_string(),
-            session: session.map(str::to_string),
+            session: actor.map(|a| a.session.to_string()),
             label,
             quarantined: matches!(change, Change::Quarantined { .. }),
+            outside: actor.is_some_and(|a| a.outside),
             change,
         };
         let line =
@@ -417,6 +431,9 @@ pub fn append(root: &Path, domain: &str, by: &str, change: Change) -> Result<Eve
 /// number the event will have, under the domain's lock, and gives the change; when it
 /// fails, nothing is appended and the number is not used.
 ///
+/// `actor` is the session that appends the event, with whether it has read content from
+/// authors outside the fleet; a `put`, an `erased` and a `ledger` name none.
+///
 /// `sync` says whether the file is synced before this returns. Only a `read` goes
 /// without: a write or a send syncs the file as it is appended, and that covers each
 /// read before it, so a read that is lost with the machine is one nothing was made from.
@@ -429,14 +446,14 @@ pub fn append_with(
     root: &Path,
     domain: &str,
     by: &str,
-    session: Option<&str>,
+    actor: Option<Actor<'_>>,
     label: Option<Label>,
     sync: bool,
     make: impl FnOnce(u64) -> Result<Change, Error>,
 ) -> Result<Event, Error> {
     let mut writer = Writer::open(root, domain)?;
     let change = make(writer.last + 1)?;
-    writer.append(by, session, label, sync, change)
+    writer.append(by, actor, label, sync, change)
 }
 
 /// A domain's log from `from` on, in order. A line that does not parse is skipped: a
@@ -573,6 +590,15 @@ impl Memory {
         Ok(first)
     }
 
+    /// This session as the one that appends an event: its id, and whether it has read
+    /// content from authors outside the fleet up to now.
+    fn actor(&self) -> Actor<'_> {
+        Actor {
+            session: &self.session_id,
+            outside: self.read_outside(),
+        }
+    }
+
     /// Say in its domain's log that an entry is offered, before anything screens it.
     /// The entry gets its `session` here, this session and the sequence number of the
     /// event, so the digest the event names is of the text the record will hold. An
@@ -604,7 +630,7 @@ impl Memory {
             &self.root,
             &domain,
             by,
-            Some(session),
+            Some(self.actor()),
             Some(label),
             true,
             offered,
@@ -632,7 +658,7 @@ impl Memory {
             &self.root,
             &entry.front.domain,
             &self.author,
-            Some(&self.session_id),
+            Some(self.actor()),
             Some(Label::Restricted),
             true,
             |_| Ok(refused),
@@ -667,7 +693,7 @@ impl Memory {
             &self.root,
             domain,
             &self.author,
-            Some(&self.session_id),
+            Some(self.actor()),
             Some(label),
             false,
             |_| Ok(Change::Read { ids }),
@@ -722,7 +748,7 @@ impl Memory {
                 &self.root,
                 &domain,
                 &self.author,
-                Some(&self.session_id),
+                Some(self.actor()),
                 Some(label),
                 true,
                 |_| Ok(sent),
@@ -2618,6 +2644,7 @@ mod tests {
             session: None,
             label: None,
             quarantined: false,
+            outside: false,
             change,
         }
     }

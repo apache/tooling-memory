@@ -954,6 +954,8 @@ impl McpServer {
             priority: p.priority.unwrap_or(0),
             definition: p.definition,
             acceptance: p.acceptance,
+            // the library sets it, from what the session read
+            outside: false,
         };
         let c = self.memory.create_task(spec).await.map_err(mcp_err)?;
         // what a task that stays proposed lacks goes back to whoever filed it

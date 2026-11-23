@@ -4975,6 +4975,8 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
                     priority,
                     definition,
                     acceptance,
+                    // the library sets it, from what the session read
+                    outside: false,
                 })
                 .await?;
             json(&c.task)
