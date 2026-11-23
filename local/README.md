@@ -77,6 +77,21 @@ session end, counts as a handoff when the launcher files it. The reason: a non-i
 launch whose outcome is only in its transcript leaves nothing for the next session. If you
 intend this, use `--no-handoff`.
 
+A launch can give the session its session settings. The session cannot change them.
+
+- `--arm <arm>` gives the settings of one of the five arms: `no-memory`,
+  `transcript-replay`, `t0-only`, `raw-only` or `full`. `amem eval arms` prints each arm
+  and its settings. The `transcript-replay` arm needs a prompt.
+- `--as-of <time>` gives the snapshot, as an RFC 3339 time. The session does not read an
+  entry that was created after it.
+- `--eval-plan <set>`, `--eval-task <id>` and `--eval-seed <n>` make the launch one run of
+  an evaluation. They need `--arm` and `--as-of`, and the prompt is the plan's.
+- `amem serve` takes `--arm` and `--as-of` too, or `MEMORY_ARM` and `MEMORY_AS_OF` from
+  its environment.
+
+These flags do not work with `--empty-memory` or on the `wslc` sandbox backend, and
+`amem work` does not have them. The section "Evaluation" below shows how they are used.
+
 `make work` claims the next open task that the session may take. It makes the prompt
 from:
 
@@ -1376,6 +1391,20 @@ all four steps: the same search, the same two opens, and an answer that overlapp
 recorded one. A replay on Gemma agreed on two of four steps: the same search and open.
 Then Gemma gave an answer where Qwen had opened another entry.
 
+Each decision context and each tape header holds a replay manifest. It names what the
+session could read at that time:
+
+- for each domain, the offset of its event log and the number of entries in the index;
+- the policy version and the digest of the grants;
+- the session settings and the ranker.
+
+`amem reenact state <session>` gives the replay state of a tape, as the owner. It prints
+the manifest, each part that is different now (`moved`), the calls that an erasure
+removed, and `complete` or `incomplete`. `amem reenact run` records where a run left its
+tape. A run that left its tape read the record as it is now. Thus the report marks that
+run incomplete when the replay state is incomplete. `amem` does not serve the record as
+it was at a log offset.
+
 ## Vendor drift: `amem drift` and `make drift`
 
 `amem drift probe --auth gateway --model <m>` runs the pinned probe set in
@@ -1407,7 +1436,25 @@ each detector:
 - median latency, which it only reports.
 
 `--file` files confirmed drift for the owner, with the paper's playbook: freeze
-distillation, pin or fail over, record, escalate.
+distillation, pin or fail over, record, escalate. It also opens a drift window for the
+destination and the model. The window starts at the run before the run that fired. When
+the model's file has no earlier run, it starts at the baseline.
+
+The freeze is the rule of a drift window: nothing that an agent wrote inside a window is
+promoted. `amem promote`, the `promote` memory tool and `amem approve` refuse such an
+entry, and the refusal names the window. The rule also applies after the window closes,
+because the change of the model can be in the entry. The remedy is to write the entry
+again after the close, and to promote that entry.
+
+```sh
+amem drift window list
+amem drift window open --provider llmao --model qwen3.8-27b --why "The vendor announced a change."
+amem drift window close --provider llmao --model qwen3.8-27b --why "The model is pinned."
+```
+
+Close a window when the model is pinned or the change is understood. While a window is
+open, the approval of each entry that an agent wrote after its start is refused, on any
+model: an entry does not record its session or its model.
 
 The gateway does not swap a model behind a name. Thus, to show what a repoint looks like,
 check the run of one model against the baseline of another, with `--baseline-model`.
@@ -1542,8 +1589,8 @@ Here, this is how it works:
 
 ## Evaluation: `scripts/eval.py`
 
-The script compares memory against no memory, and harness against harness, on a set of
-tasks. A set is a TOML file of prompts, each with the regular expression that its answer
+The script compares memory against no memory, the five arms of the paper, and harness
+against harness, on a set of tasks. A set is a TOML file of prompts, each with the regular expression that its answer
 must match. (`evals/demo.toml` asks four things that only the demo record knows.) Each
 task runs under each condition:
 
@@ -1556,8 +1603,9 @@ task runs under each condition:
 
 All conditions report the tokens that the harness itself counted, from the transcript that
 it left. Thus the script measures all conditions in the same way. The results go to
-`evals/out/` as JSON, with a table on stdout. The table gives the passes for each
-condition, the input, cached and output tokens, and the seconds.
+`evals/out/` as JSON, with a table on stdout. The table gives the seed count and the
+passes for each condition, the input, cached and output tokens, and the seconds. A
+condition can also be an arm: see "The arms, the plan and the scorecard" below.
 
 We measured on 9 October over the demo record, with four questions for each condition.
 Since then, the case study changed, and two tasks changed with it: `asf-pressures` and
@@ -1592,6 +1640,71 @@ ChatGPT login, and a provider in its config that points at the gateway. It redis
 the answers from the source files on the disk of this machine. By its own count, this used
 hundreds of millions of cached tokens. Bare Claude Code does not reach that gateway at
 all, because the launcher's egress is what folds its system message.
+
+### The arms, the plan and the scorecard
+
+The paper's evaluation compares five arms. An arm is one fixed value of the session
+settings, and only the launcher gives it (`amem launch --arm`):
+
+| Arm | What it stands for | What the session reads |
+|---|---|---|
+| `no-memory` | The floor | Nothing. The read tools are refused and T0 is one fixed line. |
+| `transcript-replay` | Today's practice | Nothing from the read tools. The launcher puts the kept transcripts of the domain in front of the prompt, in a budget of 8,000 tokens. |
+| `t0-only` | What the cheap layer buys | T0, and nothing below it. |
+| `raw-only` | What curation buys | Only entries at the raw tier. T0 holds the policy digest and two pointers. |
+| `full` | The system as built | All that its grants give. |
+
+Writes and the task tools work in each arm. `amem eval arms` prints the settings of each
+arm. In a session, the `settings` memory tool gives the settings and the arm.
+
+A set with a `[plan]` table is a plan. The plan fixes these before a run: the arms, the
+baseline arm, the number of seeds, the margin, the accepted cost and the judge. A task
+can have `set = "frozen"` or `stratum = "failed"`. `amem eval plan evals/demo.toml` prints
+the plan and its digest. Each run records the digest of its plan in its tape, and the
+scorer refuses an outcome whose tape names a different digest.
+
+```sh
+scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex --auth gateway \
+    --model qwen3.8-27b --conditions no-memory,transcript-replay,t0-only,raw-only,full
+amem eval score evals/demo.toml evals/out/demo-<stamp>.outcomes.json --keep
+amem eval scorecards
+```
+
+With arm names in `--conditions`, the script runs each task one time for each seed in
+each arm (`--seeds`, or the plan's). It takes the snapshot one time, five seconds before
+its first run, and gives it to each run with `--as-of`. Thus no run reads what a different
+run wrote. It writes `evals/out/<set>-<stamp>.outcomes.json` and prints the path on a line
+that starts with `outcomes`. An outcome is `{session, success, cost, judge}`. The cost is
+the tokens that the harness counted: input, output, cache read and cache write. The
+script leaves out a run that has no session id or no token count, and names it on
+stderr. The script uses the binary in `AMEM`, or `target/release/amem`.
+
+`amem eval score` is the owner's. It reads the task, the seed, the arm, the harness, the
+model and the snapshot of each run from the tape of its session. A pair is one task and
+one seed with a run in an arm and a run in the baseline arm. For each arm, the scorecard
+gives the mean difference from the baseline in success and in cost, each with an
+interval. Then it gives a finding (`pays`, `fails` or `unclear`) under the margin of the
+plan. It also checks the five replay traps:
+
+| Trap | Held when |
+|---|---|
+| `survivorship` | The plan has a task with `stratum = "failed"`. |
+| `leakage` | All runs read the record at one snapshot that is not later than the first run. |
+| `noise` | Each arm has pairs from two seeds or more. |
+| `judge-drift` | The judge of the plan decided each outcome. |
+| `distribution-shift` | The plan has a frozen task and a rolling task. |
+
+When a trap is open, the verdict of each arm is `inconclusive`, and the finding stays
+beside it. When the runs spanned a drift window of their model, the verdict is
+`quarantined`. `--keep` writes the scorecard as a decision entry in the platform domain,
+and `amem eval scorecards` and the `scorecards` memory tool list the kept scorecards. The
+`score_evaluation` memory tool scores for the owner in a session.
+
+`evals/demo.toml` has no task with a recorded failure. Thus the survivorship trap is open
+for that plan, and its verdicts are inconclusive. The arm runs and the scorecard did not
+run through a gateway yet, so this file gives no figures for them.
+
+### What the two conditions measured
 
 That is the claim of the paper in one table. With the record, the harness gives every
 answer in much less time, and on fewer tokens, than a search for it. On a Max login,

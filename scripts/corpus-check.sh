@@ -47,6 +47,8 @@ with open(sys.argv[2], "w") as out:
         out.write(f"answers = {json.dumps(t['answers'], ensure_ascii=False)}\n")
 PY
 "$amem" --root "$root" golden "$work/evals.toml" --json >"$work/evals.json"
+# the set is also the plan of the demo's evaluation (act 6): the library must accept it
+"$amem" --root "$root" eval plan evals/demo.toml >"$work/plan.json" || { echo "evals/demo.toml: it is not a plan that \`amem eval plan\` accepts" >&2; exit 1; }
 python3 - "$work" "$root/record/dom-demo" evals/demo.toml <<'PY'
 import json, pathlib, re, sys, tomllib
 work, record, evals_toml = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]

@@ -1,10 +1,15 @@
 #!/bin/sh
 # Act 5: watching it. Traces to a collector: model calls, reads, policy decisions and
 # task transitions; the paper's read metrics; vendor-drift probes; and transcripts kept
-# as sources, reached only by citation. Each part runs when this build has it.
+# as sources, reached only by citation. Each part runs when this build has it. The last
+# step is the freeze: a drift window, and what it stops. It needs no model.
 . "$(dirname "$0")/lib.sh"
 act 5 "Watching it" "What the system shows about itself: traces of every model call, read, decision and task transition; the paper's read metrics; probes for a vendor changing a model under its name; transcripts kept as sources; and replay of a session's decisions on another model." "the system itself: a loopback OpenTelemetry sink counting spans; the drift probes, run against $WORKER_MODEL and then $AUDITOR_MODEL; the egress, whose recorded decision contexts are replayed; and $WORKER_MODEL, replaying a session another model ran."
 has() { a "$1" --help >/dev/null 2>&1; }
+# the open drift windows, one `destination model` per line
+open_windows() { a drift window list | j "'\n'.join(w['destination'] + ' ' + w['model'] for w in d if not w['until'])"; }
+# the windows that were open before this act: the act leaves them as they are
+has drift && windows_before=$(open_windows) || windows_before=
 
 say "Traces" "Every model call, read, policy decision and task transition is an OpenTelemetry span, sent when a collector is named. Here a small loopback sink counts them."
 spans=$(mktemp)
@@ -42,7 +47,8 @@ if has drift && gateway; then
   a drift check --provider llmao --model "$WORKER_MODEL" | python3 -c "import json,sys; d=json.load(sys.stdin); $show_drift"
   echo "  a repoint, as a vendor swapping the model behind a name would look: $AUDITOR_MODEL against $WORKER_MODEL's baseline"
   a drift probe --auth gateway --model "$AUDITOR_MODEL" >/dev/null
-  a drift check --provider llmao --model "$AUDITOR_MODEL" --baseline-model "$WORKER_MODEL" | python3 -c "import json,sys; d=json.load(sys.stdin); $show_drift"
+  # --file: confirmed drift is filed as a task for the owner, and it opens a drift window
+  a drift check --provider llmao --model "$AUDITOR_MODEL" --baseline-model "$WORKER_MODEL" --file --domain dom-demo | python3 -c "import json,sys; d=json.load(sys.stdin); $show_drift"
 fi
 
 if has transcript; then
@@ -78,4 +84,44 @@ if has transcript; then
       [ -n "$rs" ] && a replay "$rs" --limit 4 --model "$WORKER_MODEL" | j "(f\"  recorded at {d['retargeted_from']}, replayed at {d['destination']}: an accuracy, speed and cost comparison across vendors\n\" if d.get('retargeted_from') else '') + f\"  agreement {d['agreement']:.0%} with the recorded steps, observed by the {d['observed_by']}\n\" + '\n'.join(f\"    turn {p['turn']:>2}: recorded {p['recorded_tool'] or 'a reply'}, replayed {p['replayed_tool'] or 'a reply'}  {'agrees' if p['agrees'] else 'differs'}\" for p in d['points']) + ('\n  (the egress saw these calls itself; a run with no contexts would replay the transcript, a self-report, and say so)' if d['observed_by'] == 'egress' else '\n  (no contexts: the recorded side is the transcript, a self-report by the harness)')" || true
     fi
   fi
+fi
+
+if has drift; then
+  say "The freeze" "Confirmed drift opens a drift window for the destination and the model. Nothing that an agent wrote inside a window is promoted, also after the window closes: the change of the model may be in it. The agent writes the entry again, and that one is promoted."
+  # one promotion to curated by agent:curator: the outcome, or the refusal
+  promote() {
+    got=$(agent agent:curator promote "{\"id\": \"$1\", \"to\": \"curated\", \"why\": \"read against its source\"}" 2>&1) || true
+    case $got in
+      refused:*) echo "$got" | fold -s -w 70 | sed 's/^/      /' ;;
+      *) echo "$got" | j "f\"      {d['outcome']}: {d['id']} is {d['tier']}\"" ;;
+    esac
+  }
+  # the windows this act opened: a window that was open before the act stays as it is
+  mine() { open_windows | while read -r destination model; do [ -n "$destination" ] || continue; echo "$windows_before" | grep -qxF "$destination $model" || echo "$destination $model"; done; }
+  if [ -z "$(mine)" ]; then
+    a drift window open --provider llmao --model "$WORKER_MODEL" --why "The demo opens a window by hand: no check confirmed drift in this run." >/dev/null
+    echo "  no check opened a window in this run, so the owner opens one by hand:"
+  else
+    echo "  the repoint check confirmed drift, and that opened a window:"
+  fi
+  a drift window list | j "'\n'.join(f\"    {w['destination']}/{w['model']} from {w['from'][:19]}Z, {'open' if not w['until'] else 'closed ' + w['until'][:19] + 'Z'}; detectors: {', '.join(w['detectors']) or 'none, opened by hand'}\" for w in d if not w['until'])"
+  # the wall clock of a host can step back by a part of a second; the pauses keep each
+  # write and each close on its own side of the window's times
+  sleep 2
+  inside=$(agent agent:a write '{"title": "The mirror list, read inside the window", "domain": "dom-demo", "body": "Three mirrors carry the release."}' | j "d['id']")
+  echo "  agent:a writes $inside inside the window; agent:curator promotes it to curated:"
+  promote "$inside"
+  sleep 2
+  # close what this act opened, by a check or by hand; a window that stays open would
+  # also refuse the approvals of act 7
+  mine | while read -r destination model; do
+    a drift window close --provider "$destination" --model "$model" --why "The demo closes the window: the change is understood." >/dev/null
+    echo "  the owner closes the window of $destination/$model"
+  done
+  echo "  the same promotion, after the close:"
+  promote "$inside"
+  sleep 2
+  after=$(agent agent:a write '{"title": "The mirror list, read after the window", "domain": "dom-demo", "body": "Three mirrors carry the release. Read again after the window closed."}' | j "d['id']")
+  echo "  agent:a writes the entry again as $after; agent:curator promotes that one:"
+  promote "$after"
 fi

@@ -11,6 +11,11 @@ Anything that a model decides can change more:
 - the answers in act 6
 - the re-enactments in act 8.
 
+Some steps are newer than that run: 5.6, act 6, and the manifest lines of act 8. The
+steps of these that need no model ran on 23 November 2026, and their figures are from
+that day. The steps of these that need the gateway did not run yet. For those steps,
+these notes say what the step prints, and they hold no figures.
+
 ```sh
 make demo-ready HARNESS=claude RESET=1
 make demo-all HARNESS=claude TRANSCRIPT=demo.txt
@@ -21,12 +26,13 @@ assume Claude Code, `HARNESS=claude`. Codex on qwen3.8-27b always does the work 
 2 and 6, and the delegated tasks in act 4. In act 7, Codex runs on the model that the
 platform names. In act 8, it also runs on gemma4-26b.
 
-The run takes about twenty minutes. Each act takes about this long:
+The run of 12 October took about twenty minutes. Each act takes about this long:
 
 - acts 1 to 3: a minute each
 - act 4: nine minutes
 - act 5: five or six minutes
-- act 6: three minutes
+- act 6: not measured yet. It makes 20 launches, where the run of 12 October made 8 in
+  three minutes
 - act 7: a minute
 - act 8: half a minute
 - acts 9 to 11: seconds each.
@@ -45,7 +51,7 @@ offline.
   LLM gateway, llm.apache.org. Codex does:
   - a curation task in act 2
   - the delegated work in act 4
-  - both conditions in act 6
+  - each run of each arm in act 6
   - the task in act 7
   - the re-runs in act 8, one of them on gemma4-26b.
 - **qwen3.8-27b on its own**. The system calls it directly: to answer a question in 1.5,
@@ -53,6 +59,8 @@ offline.
 - **gemma4-26b**, the auditor. It reads summaries in act 2 and held writes in act 3. In
   5.3, it takes the role of a different model, swapped in behind the name qwen3.8-27b.
   In act 8, it is the other model that a session is re-enacted on.
+- **The launcher**, in act 6. It gives each session its settings, and the session cannot
+  change them.
 - **Scripted agents**: `agent:rogue`, `agent:release`, `agent:reader`, `agent:a`,
   `agent:curator`, `agent:architect`, `agent:worker` and `agent:substitute`. These are
   the demo script. The script uses the same tools that an agent would use. No model is
@@ -92,6 +100,14 @@ offline.
 - **Tape**: a session's prompt, harness and model, and what each of its memory tool calls
   returned. Sessions leave a tape. A session that started with a prompt can run again
   (act 8).
+- **Arm**: one fixed set of session settings for an evaluation, from no memory to the
+  system as built (act 6).
+- **Plan**: the evaluation set file. It fixes the arms, the seeds and the margin before
+  a run (6.3).
+- **Scorecard**: the result of one evaluation, kept as an entry in the platform domain
+  (6.5).
+- **Drift window**: a time span for one model at one destination, from detected drift
+  until you close it. Nothing that an agent wrote in the span is promoted (5.6).
 - **Tap**: a component that connects to an outside system. It runs as a WebAssembly
   component, and it can reach only what its grant names. The fetch tool in
   3.11 is a tap. The GitHub tap in act 9 is another.
@@ -334,22 +350,79 @@ and both wrote. Where Claude Code checked the task tree, qwen wrote. Where Claud
 ended with a reply, qwen released the task itself. Replay measures whether another model
 would agree, not which model is right. The agreement changes from run to run.
 
-## Act 6 · Memory against no memory
+**5.6 The freeze.** The claim: when a vendor changes a model, nothing that an agent
+wrote since then moves up a trust tier on an agent's word or on yours. The repoint check
+of 5.3 now files its confirmed drift, and that opens a drift window for the checked
+model. The step lists the open window. Without the gateway, no check runs, and the step
+opens a window by hand and says so. Then `agent:a` writes an entry, and `agent:curator`
+tries to promote it to curated. The memory server refuses, and the refusal names the
+window and its start. You close the window. The same promotion is still refused: the
+change of the model can be in that entry. `agent:a` writes the entry again, and that
+entry is promoted. The step needs no model. It ran on 23 November without the gateway,
+as step 5.4 of that run, and printed these four results in this order. The step closes
+each window that the act opened, because an open window also refuses your approvals in
+act 7. The window that detection opens did not run through the gateway yet.
 
-On stage: Codex on qwen3.8-27b, twice, and a grader that is a regular expression, not a
-model.
+## Act 6 · The evaluation
 
-**6.1 With and without.** Both runs use the same four questions, the same harness, the
-same model and the same sandbox. With this memory: 4 of 4. With an empty memory: 0 of 4.
-Codex searches, finds nothing, and says so or gives a wrong answer. With memory, it
-finished in 71 seconds against 126. It wrote less than half as much: about 1,600 tokens
-against 3,600. It read more fresh input, about 19,000 tokens against 11,000. It read
-less cached input, the `c` figures: about 147,000 against 256,000. Cached tokens are
-input that the provider has seen before in the session, and the provider charges less
-for them. These are amounts, not cost. The provider's prices decide whether the memory
-run was cheaper. The demo also measures the host's side: 7.4 seconds of CPU against
-10.3. In both runs, the same harness had a peak of about 166 MiB. These counts are for the
-questions as they were on 12 October; two of them changed with the case study since.
+On stage: the launcher, `agent:a`, Codex on qwen3.8-27b, a grader that is a regular
+expression and not a model, and you.
+
+The claim: the comparison that says what memory buys has five arms, and its rules are
+fixed before a run. Steps 6.1 to 6.3 need no model. They ran on 23 November.
+
+**6.1 The arms.** An arm is one fixed set of session settings. The step prints the five
+arms in the paper's order, each with what it stands for and its settings:
+
+- `no-memory`, the floor: memory access off, T0 off.
+- `transcript-replay`, today's practice: memory access off, and the launcher puts kept
+  transcripts in front of the prompt.
+- `t0-only`, what the cheap layer buys: T0, and nothing below it.
+- `raw-only`, what curation buys: entries at the raw tier only, and T0 as a digest.
+- `full`, the system as built.
+
+The launcher gives the settings one time. A session cannot change them.
+
+**6.2 One question under each arm.** `agent:a` starts a session under each arm and asks
+for its settings, for T0, and for a search for DR-19. On 23 November, on a small
+record seeded from `examples/decisions`, the step printed this. Under `no-memory`, T0
+is one line of 136 characters, and the search is refused with the setting named. Under
+`transcript-replay`, no session starts: that arm needs a prompted launch. Under
+`t0-only`, T0 is 1,980 characters, and the search is refused because the depth is T0.
+Under `raw-only`, T0 is 230 characters, and the search finds 4 hits. Under `full`, T0 is
+1,980 characters, and the search finds 4 hits. Say that the scripted
+agent shows the settings, not what a model does with them.
+
+**6.3 The plan.** The evaluation set is also the plan. The step prints what the plan
+fixes: the baseline arm `no-memory`, 2 seeds, a margin of 0.1, an accepted cost of 1.0
+times the baseline, and the judge, `regex`. It prints the four tasks. The two DR-19 tasks
+are the frozen set, and the two case-study tasks are the rolling set. No task has the
+stratum `failed`. Then it prints the digest of the plan. Each run records that digest,
+and the scorer refuses an outcome whose run names a different digest. Thus nobody can
+move the margin after the runs.
+
+**6.4 The runs.** This step needs the gateway. It did not run yet, and these notes hold
+no figures for it. Codex on qwen3.8-27b runs two of the tasks, one time for each seed,
+under each arm: 20 launches. Each run reads the record at one snapshot, taken five
+seconds before the first run. Thus no run reads what a different run wrote. The step
+prints one line for each run, with pass or fail, the seconds and the tokens, and then a
+table for each arm.
+
+**6.5 The scorecard.** This step needs the gateway too, and these notes hold no figures
+for it. You score the runs. The tape of each run gives its task, seed, arm, harness and
+model, so the scorer does not take them on trust from the script. For each arm, the step
+prints the passes, the mean cost in tokens, and the paired differences from the baseline
+in success and in cost, each with its interval. Then it prints the finding and the
+verdict. It prints the five replay traps, each held or open. Expect the survivorship
+trap to be open: the demo's tasks have no recorded failure. Thus each verdict reads
+`inconclusive`, and the finding from the numbers stays beside it. Say why: tasks that
+passed say nothing about tasks that failed. The scorecard is kept as a decision entry in
+the platform domain, and the last line lists the kept scorecards.
+
+The run of 12 October compared two conditions only, memory and an empty record, on four
+questions: 4 of 4 with memory and 0 of 4 without, in 71 seconds against 126. That
+comparison is still in `scripts/eval.py`, as the conditions `memory` and `empty`. The
+demo does not run it now.
 
 ## Act 7 · The platform
 
@@ -402,12 +475,15 @@ them. Nothing in this record has a price, so these are quantities, not money.
 `prices.toml` can set prices for CPU-hours and GiB-hours, as well as for tokens. The last
 line gives the total of every run in this record so far. It does not include act 6's
 empty-memory runs, because they used records of their own. The total is about 12 minutes
-of wall clock, 11 of them waiting on models, and less than a minute of CPU.
+of wall clock, 11 of them waiting on models, and less than a minute of CPU. Act 6 now
+runs its arms in this record. Thus the total of a new run includes them.
 
 ## Act 8 · Run it again
 
 On stage: Codex re-running a session from act 6, on qwen3.8-27b and then on gemma4-26b,
-with the tape answering its memory tool calls.
+with the tape answering its memory tool calls. The figures of this act are from 12
+October, when act 6 left one session for each question with memory. The act now takes a
+session of the `full` arm. It did not run through the gateway in this form yet.
 
 The claim: you can run a session again later, on another model, and score it on whether
 it would have done the same.
@@ -416,13 +492,21 @@ it would have done the same.
 memory tool call returned. A session that started with a prompt can run again. Act 6's
 four questions with memory used a session each, and left four. This one asked who the
 promotion gate is, and made 2 memory tool calls. It is the question as it was on 12
-October.
+October. The step now takes a session of the `full` arm, or a session that is no run of
+an evaluation. A session of the `no-memory` arm made no memory tool call, so it has
+nothing to run again. The step also prints the replay manifest of the tape in one line:
+the log offset of each domain, the policy version and the session settings that the
+session began with. Below it is the replay state now, `complete` or `incomplete`, with
+each part that moved since.
 
 **8.2 The same model again.** The control, on qwen3.8-27b: the same tools in the same
 order as the tape. Its second call asked differently, for example with a different
 search. So from there, the record answered it, not the tape. It gave the same answer as
 in act 6, where it passed. A model is not deterministic, so even the control can be
-different.
+different. The line of each run now also says where the run left the tape, and
+`complete` or `incomplete`. A run that left the tape read the record as it is now. When
+the record moved since the session, the run is incomplete, and the line names what
+moved. Expect that here: the demo wrote to the record after act 6.
 
 **8.3 Another model.** On gemma4-26b, its first call already asked differently. Its
 tools align with the tape's less well: alignment 67%. Alignment counts the tools that
