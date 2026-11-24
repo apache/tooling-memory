@@ -48,7 +48,7 @@ term here in the same commit as the first document that needs it.
 | ledger | The tasks of each domain, with their leases and origins, on SQLite under `state/` or on PostgreSQL | queue, task list |
 | grants | The file `grants.toml`: the owner, handling, the domains, destinations, taps, gates, spend limits and the ledger | permissions (for the grants), config (for the grants) |
 | grant | One table in the grants: `[domains.<name>]`, `[destinations.<name>]` or `[taps.<name>]` | permission |
-| policy | The Rego rules that decide each action: write, read, erase, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
+| policy | The Rego rules that decide each action: write, read, erase, approve, declassify, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
 | perimeter | The policy, the grants and the parts that enforce them, as one part of the design | |
 | stopped (session) | A session whose grants changed after it started. Each read, decision, tool call and model call of the session is refused, and a new session starts under the grants as they are | revoked session, stale session |
 | policy stamp | `state/policy.stamp` and the digest of the root's `policy/*.rego`: what a session compares to know that the policy changed | |
@@ -58,6 +58,11 @@ term here in the same commit as the first document that needs it.
 | reset | `amem policy reset`: the owner retires each rule of a domain that no person wrote, promoted or approved | purge |
 | amendment | A task for the owner of a rule, with evidence, that asks for a change to the rule | |
 | gates | The `[gates]` rules on a write: how many entries one session may supersede, and whether a verified entry needs an approver | |
+| version (of an entry) | The text of an entry at one time. Each write and each promotion makes a new version. The digest of the text names the version: `<id>@<digest>` cites one version, and an approval names one | revision |
+| approval | An event on the ledger: a person approved one action on one version of one entry, for one principal, until a time. The policy checks it when the action runs | permission (for an approval) |
+| guard | The person who approves a copy of an entry at a lower label: `guard` in the grant of the domain, or the owner | |
+| declassification | A copy of one version of an entry at a lower label, written under an approval of the guard. The copy cites that version, and its origin names the guard. The source does not change | downgrade, lowering (of an entry) |
+| sign-off task | A task that the service files when an action has no approval: it asks the approver for one approval, of one action on one version of one entry, for the principal that asked | approval request |
 | scan | The check of a write and of a tool's answer for instructions, secrets, hidden text and the like. The scan finds; the policy decides | |
 | label | `public`, `internal` or `restricted`, in that order | level, tier (for a label), sensitivity |
 | classification | The label of an entry | |
@@ -70,7 +75,22 @@ term here in the same commit as the first document that needs it.
 | generation | The number of a claim of a task. Each claim gets the next number. A heartbeat, a completion and a release carry it, and the ledger refuses an earlier one | attempt (for a generation), fencing token |
 | late handoff | A handoff that a holder leaves on a task after its claim is over | |
 | attempt key | A key that a caller makes for one claim or one completion. The same key asked again gives the same result, and the ledger does the operation one time | idempotency key, request id |
+| outside event | Something that occurs outside the system and that a task waits on: a check that completes, a reply, a change that lands. A tap or a person reports it by name | signal, trigger |
+| external action | A change that a holder makes outside the record under its claim. The holder records it on the task before it makes it | side effect |
+| settle | To record what became of an external action: the destination holds it, or does not | reconcile, resolve |
 | task definition | The record in the platform domain for one kind of work: its purpose, its tools, its acceptance checks and its outputs. A task names one as `<name>@<version>` | task type, task template |
+| position | The record for one standing role: an entry of type `position` with a charter and an authority envelope, named `pos-<name>`. It is in force when a person verified its entry | seat, role (for a position), slot, post |
+| charter | The part of a position that gives its standing orders, the task definitions that it covers, and the agent definition that fills it | mandate, job description |
+| authority envelope | The part of a position that gives the most that a session in it may do: the tools and the handling. "The envelope" after the first use | scope (for the envelope), permissions |
+| agent definition | The name of one kind of agent: the name in the author of a session, `codex` for `agent:codex`. An `agent` artifact of the platform domain has the same name. A charter names one | agent type, persona |
+| pin | The field of a task that names a position. Only a session that fills the position claims a pinned task. To pin a task is to file it with a pin | assignment, binding |
+| pin reason | Why a task is pinned: `continuity`, `relationship` or `separation` | pin type |
+| commitment | A task that is pinned to a position, is admitted and is not closed | obligation, duty |
+| handoff cache | The newest handoffs that cite a position, which a session in the position gets first in T0 | handoff history, position memory |
+| seconded session | A session that fills a position under an agent definition that the charter does not name. It reads the position and does its tasks, and it does not write the position's history | substitute (for a seconded session), stand-in |
+| fill (a position) | What a session does when a launcher puts it in a position: it then claims the position's tasks under the authority envelope | occupy, take, assume |
+| wake (a position) | To start a session in a position that has a task that waits and no live session | spawn (for a wake), summon |
+| retire (a position) | What the owner does to end a position: its tasks lose their pin, and its history stays in the record | delete (for retire), close (for retire) |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
 | event log | The log of a domain, `state/log/<domain>.jsonl`, to which `amem` only appends: each write, version, refusal, erasure, read and send, and a copy of each event of the ledger, in order. An event holds ids and digests, and no text. The paper names it the historian | historian, audit log, journal |
@@ -121,6 +141,7 @@ a different thing. Name that thing in full where it could be read as the term.
 
 | Word | The other sense | Write |
 |---|---|---|
+| guard | The hook `.claude/hooks/guard-bash.sh`, which refuses some commands of a Claude Code session | the guard hook |
 | budget | The tasks or tokens that one curation cycle may use (`--budget-tasks`, `--budget-tokens`), or LiteLLM's budget for each project | curation budget, LiteLLM budget |
 | projection | The ledger built from the event log | the ledger's projection of the log |
 | root | The root user, or the `/` directory, or the top of a URL | root user, root directory |

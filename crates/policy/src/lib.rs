@@ -132,6 +132,11 @@ pub struct DomainGrant {
     /// owner sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_retention_days: Option<u32>,
+    /// The guard of the domain: the person whose approval lets an entry of the domain be
+    /// copied to a lower label. The owner when unset. A guard is a person, so the name
+    /// starts `human:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
 }
 
 /// How long a transcript is kept whole when the domain says nothing.
@@ -292,6 +297,7 @@ impl Grants {
                 default_classification: Label::Internal,
                 admit_own: true,
                 transcript_retention_days: None,
+                guard: None,
             },
         );
         let mut destinations = BTreeMap::new();
@@ -334,7 +340,7 @@ impl Grants {
     /// # Errors
     ///
     /// [`Error::Parse`] for bad TOML or a value outside the schema, [`Error::Invalid`] for
-    /// an empty owner or no domains.
+    /// an empty owner, no domains, or a guard that is not a person.
     pub fn parse(text: &str) -> Result<Grants, Error> {
         let g: Grants = toml::from_str(text)?;
         if g.owner.trim().is_empty() {
@@ -343,6 +349,7 @@ impl Grants {
         if g.domains.is_empty() {
             return Err(Error::Invalid("at least one domain is required".into()));
         }
+        g.guards_are_people()?;
         for (name, t) in &g.taps {
             if let Some(url) = &t.hosted {
                 let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
@@ -382,6 +389,18 @@ impl Grants {
         Ok(g)
     }
 
+    /// A guard approves in person, so a grant that names one names a person.
+    fn guards_are_people(&self) -> Result<(), Error> {
+        for (name, d) in &self.domains {
+            if let Some(guard) = d.guard.as_deref().filter(|p| !p.starts_with("human:")) {
+                return Err(Error::Invalid(format!(
+                    "[domains.{name}] guard = {guard:?}: a guard is a person, named `human:<system>:<name>`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Read and parse the file.
     ///
     /// # Errors
@@ -408,6 +427,14 @@ impl Grants {
     #[must_use]
     pub fn read_filter(&self) -> ReadFilter {
         ReadFilter::for_domains(self.domains.keys().cloned(), self.handling)
+    }
+
+    /// The guard of a domain: the person the domain's grant names, or the owner when it
+    /// names none. `None` when the domain is not granted.
+    #[must_use]
+    pub fn guard(&self, domain: &str) -> Option<&str> {
+        let d = self.domains.get(domain)?;
+        Some(d.guard.as_deref().unwrap_or(&self.owner))
     }
 
     /// A tap's grant, if the file names it and its domain is one the owner holds.
@@ -721,6 +748,33 @@ ceiling = "public"
             assert_eq!(back.ceiling(d), Some(Label::Internal), "{d}");
         }
         assert_eq!(back.ceiling("qwen"), None, "no such destination");
+    }
+
+    #[test]
+    fn a_guard_is_a_person_and_the_owner_when_the_grant_names_none() {
+        let named = "owner = \"human:local:me\"\n[domains.dom-a]\nguard = \"human:local:guard\"\n[domains.dom-b]\n";
+        let g = Grants::parse(named).unwrap();
+        assert_eq!(g.guard("dom-a"), Some("human:local:guard"));
+        assert_eq!(g.guard("dom-b"), Some("human:local:me"), "the owner");
+        assert_eq!(g.guard("dom-else"), None, "not granted");
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        for not_a_person in ["agent:x", "tap:github-issues", "curation", ""] {
+            let text = format!(
+                "owner = \"human:local:me\"\n[domains.dom-a]\nguard = \"{not_a_person}\"\n"
+            );
+            assert!(
+                matches!(Grants::parse(&text), Err(Error::Invalid(_))),
+                "{not_a_person:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grants_file_without_a_guard_renders_without_the_key() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("guard"), "{text}");
+        assert_eq!(Grants::parse(&text).unwrap(), g);
     }
 
     #[test]

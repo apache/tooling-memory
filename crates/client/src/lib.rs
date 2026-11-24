@@ -103,7 +103,7 @@ pub struct Entry {
     pub id: String,
     /// Its title.
     pub title: String,
-    /// decision, fact, convention, method, or handoff.
+    /// decision, fact, convention, method, handoff, policy, or position.
     pub entry_type: String,
     /// The Markdown body.
     pub body: String,
@@ -112,7 +112,7 @@ pub struct Entry {
 /// An entry to write.
 #[derive(Clone, Debug, Default)]
 pub struct NewEntry<'a> {
-    /// decision, fact, convention, method, or handoff.
+    /// decision, fact, convention, method, handoff, policy, or position.
     pub kind: &'a str,
     /// One line.
     pub title: &'a str,

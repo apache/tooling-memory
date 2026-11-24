@@ -405,7 +405,10 @@ impl Writer {
 
     /// Sync what was appended without a sync of its own.
     fn sync(&self) -> Result<(), Error> {
-        std::fs::File::open(&self.log)
+        // opened for writing: Windows refuses to flush a handle that can only read
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.log)
             .and_then(|f| f.sync_data())
             .map_err(crate::io(&self.log))
     }
@@ -755,6 +758,27 @@ impl Memory {
             )?;
         }
         Ok(())
+    }
+
+    /// Write an entry that the record holds once, through its domain's log: the change
+    /// is appended first, then the record takes the entry only when it holds none with
+    /// this id. When this call wrote it, gives the sequence number of its `put` event:
+    /// where a feed of the index starts to take it ([`Memory::feed_from`]). The text of
+    /// such an entry follows from its id alone, so the version that the log names is the
+    /// version that the record holds, whichever call wrote it.
+    pub(crate) async fn create_logged(&self, entry: &Entry) -> Result<Option<u64>, Error> {
+        let put = append(
+            &self.root,
+            &entry.front.domain,
+            &self.author,
+            Change::Put {
+                id: entry.front.id.clone(),
+                digest: dm_core::digest(&entry.render()),
+                active: entry.is_active(),
+            },
+        )?
+        .seq;
+        Ok(self.store.create(entry).await?.then_some(put))
     }
 
     /// Copy the ledger's events of `domain` that its log does not hold yet into the log,
@@ -1141,8 +1165,9 @@ mod tests {
         m.store.put(&early).await.unwrap();
         assert!(m.search("steps", None, 10).await.unwrap().is_empty());
         let done = m.materialize(None).await.unwrap();
-        // three writes offered, the five events above, and no read: nothing was served
-        assert_eq!((done.events, done.live), (8, 2), "{done:?}");
+        // three writes offered, the five events above, and the copy of the approval that
+        // the owner's own erasure is; no read: nothing was served
+        assert_eq!((done.events, done.live), (9, 2), "{done:?}");
         assert!(done.behind.is_empty(), "{done:?}");
         let hits = m.search("steps", None, 10).await.unwrap();
         assert_eq!(

@@ -118,20 +118,56 @@ two weeks. It is also the reason that none of it is the production shape.
   - CPU or memory limits on the sandbox
 - **The task record, in part.** A claim has a generation, and the ledger refuses a
   holder that gives an earlier one. A task can be `blocked` on a task that it depends on.
-  A claim and a completion can carry an attempt key. These parts are not built: an
-  attempt key for the other operations, a block on a new claim
-  while an external effect is uncertain, and a `blocked` state for a task that waits on an
-  outside event. The generation does not prove who the caller is.
+  A claim and a completion can carry an attempt key. A holder can give a task up until an
+  outside event comes, and a task with an external action that is not settled goes to no
+  other session. These parts are not built: an attempt key for the other operations, a
+  connector that makes external actions in sequence and settles them, and taps that
+  report the events. The generation does not prove who the caller is.
 - **Task definitions, in part, and autonomy levels.** A task can name a task definition.
   It then takes the checks of the definition, and its holder can call only the tools that
   the definition declares. Triage requires a definition only when the grants say so,
   because the tasks that the system files name none. No suite gates a version of a
   definition, and the data scope is not enforced. The autonomy level has no effect, and
   there is no held-out suite and no evaluator.
-- **Positions.** There is no `position` entry, and a task cannot be pinned.
-- **Approval events.** An approval is the completion of a promotion task. It has no
-  scope and no expiry, and the perimeter does not check it when an action runs. There is
-  no `declassify` and no guard.
+- **Positions, in part.** A verified entry of type `position` gives a standing role a
+  charter and an authority envelope, and a task can be pinned to that position. Only a
+  session that fills the position claims a pinned task, and that session gets the
+  position's commitments and handoff cache first in T0.
+
+  These parts are not built:
+  - the platform's standing roles as positions, made when a domain is registered
+  - a position that a curator proposes, and an unused position sent to its owner
+  - a session that the memory server starts when a pinned task is admitted: a launcher
+    with `--wake` starts it, and not on the `wslc` sandbox backend
+  - a record of a live session other than the lease that it holds, and one session in
+    a position at a time
+  - the position in the principal chain and in the input of the policy
+  - a tap that posts for a position
+  - a check that a `separation` pin names a position other than the author's
+  - the data scope of the authority envelope
+  - a version in force while its next version waits for review
+  - a retirement that a second person approves
+  - the pin on a retry of a pinned task
+  - the writes of a subagent kept out of the history of its parent's position
+  - a check on the entries that an import brings with a citation of a position
+- **Approvals, in part.** An approval is an event on the ledger. It names the person,
+  the action, the entry, the version, the principal that it is for, and an expiry. The
+  policy checks the approval when an erasure or a declassification runs. A
+  declassification lands a copy at the lower label. The copy cites the entry and names
+  the guard. The copy of a raw entry keeps the reach and the task of the entry. These
+  parts are not built:
+  - The copy of an approval in the event log of the domain names the approver, the
+    entry and the time. The action, the version, the scope and the expiry stay in the
+    event of the ledger.
+  - A copy at a lower label has no write event in the event log. Lineage does not name
+    the copy as made from its source. An erasure of the source withholds the copy,
+    because the copy cites the source.
+  - No approval gates an external action of a task, a change that leaves the fleet, or a
+    higher spend limit.
+  - A guard that is not the owner cannot approve, because the command line acts only as
+    the owner.
+  - The memory server has no memory tool that approves.
+  - The erasure of a transcript makes no approval.
 - **The rule lifecycle, in part.** `check_policy` gives all the rules in force for a
   domain. It does not select rules by the action. The lint reports a rule after its
   review date and an unused rule, from the full decision log and not from one review
@@ -157,7 +193,6 @@ two weeks. It is also the reason that none of it is the production shape.
   - No task is filed for a withheld entry.
   - The reads of a helper session count for its parent only through the entries that
     the helper wrote.
-  - An erasure does not go through an approval.
 - **Raw reach, in part.** Each entry has a reach: `chain`, `fleet` or `tap`. Each read
   filter has a raw reach: `chain`, `fleet` or `all`. By default, an agent reads the raw
   entries of its task chain and each raw entry whose reach is not `tap`. When a session
@@ -191,6 +226,9 @@ two weeks. It is also the reason that none of it is the production shape.
   - A session of the web launcher keeps the record for one request, as it keeps its
     session label.
   - A re-run from a tape does not restore the record.
+  - A session that read outside content can name the event that its task waits on, and
+    the id of an external action. Each is one token. The task does not become outside
+    content.
 - **Curation and audit, in part.** No curation task demotes an entry, checks an owner or
   a cross-link, or curates policy. No test on planted faults qualifies the auditor's
   model. The auditor does not read handoffs.
@@ -264,6 +302,11 @@ These parts do what the paper says, on one laptop. Each item names what replaces
 - **Transcripts' citations**: `amem` finds them on every lookup, with a read of all the
   entries of a domain. It finds the citations that keep a tool's source past its clock
   in the same way.
+- **Positions**: `amem` reads every entry of type `position` in a domain to find the
+  position in force. It does this on each claim, each read, each tool call and each T0
+  of a session in a position.
+  A read of the handoff cache looks at the newest 200 handoffs of the domain only.
+  Production: a lookup in the index, by the name of the position and by citation.
 - **Tools** fetch and search in one of these ways:
   - from the launcher's own machine, with one compiled component for each call. The
     component connects to the address that the policy checked.
@@ -442,7 +485,9 @@ The policy still decides what it reads and writes over MCP. But the harness keep
 network and credentials. Nothing meters its model calls. No model's ceiling applies to
 what it may read. `amem launch --unconfined` is the middle case. At this time it is only
 for Claude Code and Codex. It gives no sandbox, but the model calls still go through the
-egress.
+egress. A harness with no sandbox has a shell on the host. From that shell, an agent can
+run `amem approve` as the owner, because nobody authenticates at the command line. Thus
+an approval stops an agent only when the harness is confined.
 
 ## The parts, and their commands
 
@@ -453,8 +498,10 @@ describes re-enactment, the platform domain and the Gofannon bridge.
 | Part | What it does | Commands |
 |---|---|---|
 | The read path | T0, BM25 search with summaries first, one body on `get`, recall as a cited brief or a pack, prefetch on claim and at fetch | `t0`, `search`, `get`, `list`, `recall`, `write` |
-| The task fabric | Tasks with leases and handoffs. A rubric from the L1 strategy ranks along the ledger's edges, at admission and in the triage cycle. Workers only claim. Subagents go on the board as children, with a continuation | `task create, admit, claim-next, complete, release, tree, retry, rescore, stats`, `work` |
+| The task fabric | Tasks with leases and handoffs. A rubric from the L1 strategy ranks along the ledger's edges, at admission and in the triage cycle. Workers only claim. Subagents go on the board as children, with a continuation | `task create` (with `--position` and `--pin-reason` for a pinned task), `task admit, claim-next, complete, release, tree, retry, rescore, stats`, `work` (with `--position` or `--wake` for a session in a position) |
+| Positions | A standing role as a verified entry: a charter and an authority envelope. A task pinned to a position goes only to a session that fills it. That session gets the position's commitments and handoff cache first in T0. A session under another agent definition is seconded. The owner retires a position | `position list, show, retire`, `write --kind position`, `serve --position`; MCP `position`, `positions`, `retire_position` |
 | Trust tiers | Raw, curated, verified. Only a person who did not propose an entry can make it verified. Review clocks and decay. Raw reach: a raw entry from a session that read outside content is served only to its task chain, to triage and to curators | `promote`, `approve`; `reach` and `task` in the answers of `write`, `search` and `get` |
+| Approvals | An erasure and a declassification run only under an approval: a person approves one action on one version of one entry, for one principal, until an expiry. An action without an approval is refused, and a sign-off task asks the owner or the guard | `approve`, `approvals`, `declassify`, `erase`; MCP `erase`, `declassify` |
 | The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced after they are verified, with scoped exceptions). Admission, the read filter, the write scan and quarantine, and blast-radius gates. A log of every decision | `policy show, eval, list, lint`, `quarantine` |
 | The curator | A survey of what needs curation, an independent auditor, a search for contradictions, canaries, its own telemetry and alarms, and a cycle on a budget | `curator`, `curate`, `audit`, `canary` |
 | The egress | It forwards, meters and times model calls, holds spend limits per destination, and records decision contexts. It keeps the wall clock, CPU and peak memory of each session beside the session's tokens | `launch`, `usage`, `cost` |
@@ -528,10 +575,12 @@ It says what is missing and how to fix it. At the end, it shows the command to r
    in at curated. A person approves an entry for verified.
 3. **The perimeter.** The policy holds in quarantine a write that speaks to agents. Then
    lineage from the event log, policy as memory with a scoped exception, and the read
-   filter. A spend limit refuses a call.
-4. **The task fabric.** The rubric, compiled from a strategy. A rescore along the edges.
-   Subagents go on the board. A follow-up task brings back their reports, and its
-   completion closes the task that delegated.
+   filter. An erasure and a copy at a lower label wait for a person's approval of one
+   version. A spend limit refuses a call.
+4. **The task fabric.** The rubric, compiled from a strategy. A position, a task pinned
+   to it, a seconded session and a retirement. A rescore along the edges. Subagents go on
+   the board. A follow-up task brings back their reports, and its completion closes the
+   task that delegated.
 5. **Watching it.** Traces in a collector, the read metrics, drift probes, transcripts by
    citation, and replay.
 6. **Memory against no memory.** The same questions go to a harness with memory and with

@@ -380,8 +380,10 @@ There are two more gates:
   to quarantine, and a task for an approver is filed, because a proposer never approves
   its own proposal.
 
-Only the owner can erase. Each decision, allow or deny, goes to `state/decisions.jsonl`,
-with the policy version that made it.
+An erasure runs only under an approval of the owner. The owner's own `amem erase` is
+that approval. The section on [approvals](#approvals-amem-approve-amem-approvals-and-amem-declassify)
+gives the steps for every other session. Each decision, allow or deny, goes to
+`state/decisions.jsonl`, with the policy version that made it.
 
 Detection. The event log of each domain records each write, each read and each send, with
 the session that did it. `amem lineage <id>` follows an entry through the log: the
@@ -611,7 +613,9 @@ Verified is the review gate. Nobody sets it directly. It has two steps:
 1. One principal proposes it, with `promote` and `to: verified`. This files a task that
    requires a person.
 2. A person who did not propose it approves it, with `amem approve <task>`. An agent never
-   approves. The approval is of the version the proposal named: if the entry changed
+   approves, and a session that the memory server serves approves nothing. The ledger
+   keeps the approval as an event, with the action `verify` and the version, and
+   `amem approvals <id>` lists it. The approval is of the version the proposal named: if the entry changed
    since, `approve` refuses it, and a proposer, any proposer, proposes the entry as it
    stands. The ledger keeps one approval task per entry and version. The task names the
    version it proposes, and the promotion record on the ledger names the same version. A
@@ -627,7 +631,7 @@ if that version reached the record (`landed`). A proposal to verified is in the 
 when it is made. It lands when a person approves it. Its approval task names the entry,
 the proposer and the author, and points to `amem promotions <id>`, but does not hold the
 why. An auditor reads the why after judging the change, not before. A session reads the
-why only if it can read the entry. The why stays readable after the entry is replaced. When the owner erases the entry, the ledger removes each
+why only if it can read the entry. The why stays readable after the entry is replaced. When the entry is erased, the ledger removes each
 why. It keeps who promoted which version, to which tier, and when. The erasure also
 rewrites each approval task of the entry so that it names the entry by id alone, and it
 closes the open ones; a task from a build that still put the why in the task body loses
@@ -763,12 +767,148 @@ Limits:
   The reader of the turn gets no record.
 - A session of the web launcher keeps the record for one request.
 - A re-run from a tape does not restore the record.
+- A session that read outside content can name the event that its task waits on, and the
+  id of an external action. Each is one token. The task does not become outside content.
 - The memory server does not keep a refused write with tap reach and `supersedes` as a
   proposal for a curator. The session writes it again without `supersedes`.
 - A person who read outside content cannot replace an entry of the fleet in the same
   session. The person replaces it in a new session.
 - `amem` does not check that the ledger names the session as the holder of its held
   task.
+## Approvals: `amem approve`, `amem approvals` and `amem declassify`
+
+Some actions cannot be taken back. Such an action runs only under an approval. An
+approval is an event on the ledger. It names these:
+
+- the person who approved
+- the action: `erase`, or `declassify:<label>`
+- the entry, and the version of the entry
+- the principal that can run the action (`scope`)
+- an expiry.
+
+The version is the digest of the text of the entry. Each write and each promotion makes a
+new version. The policy checks the approval each time the action runs. Thus an approval
+permits nothing after the entry changes, and nothing after its expiry. An approval cannot
+be withdrawn before its expiry.
+
+Two actions need an approval:
+
+- An erasure: `amem erase`, or the `erase` memory tool. The approver is the owner.
+- A declassification: `amem declassify`, or the `declassify` memory tool. The approver is
+  the guard of the domain.
+
+The steps are the same for the two actions:
+
+1. A session asks for the action. Each session that can read the entry can ask.
+2. No approval is in force, so the action does not run. `amem` files a sign-off task for
+   the approver. The task requires `human`, and it has the label of the entry. It names
+   the entry by id, the version, and the principal that asked. For an erasure, the
+   refusal names the task: `Task <id> asks <approver> for it.` For a declassification,
+   the answer is `proposed`, with the task.
+3. The approver reads the entry, and then runs `amem approve <task>`. This records the
+   approval, for the principal that asked and for nobody else. It does not run the
+   action. The approval expires after 24 hours, or at the time that
+   `--expires <RFC 3339 time>` gives. A time that is not after now is refused. To
+   decline, the approver invalidates the task (`amem task invalidate <task>`). The
+   request is then not made again until the entry changes. Only the approver can
+   invalidate a sign-off task, and only at the command line. `amem` refuses each other
+   session, because `amem` tells the requester that the approver declined.
+4. The session makes the same call again. The policy finds the approval, and the action
+   runs.
+
+If the entry changes between step 1 and step 3, `amem approve` refuses, because nobody
+asked about the new version. If the entry changes between step 3 and step 4, the action
+is refused, and a new sign-off task asks about the new version.
+
+When the approver runs the action at the command line, that call is the approval. `amem`
+records an approval that expires after one minute, and checks it as it checks each other
+approval. Thus the owner's `amem erase` needs no second step, and each erasure of an
+entry has an approval on the ledger. `amem transcript erase` stays the owner's act, and
+it records no approval.
+
+An agent cannot approve. Three rules hold this:
+
+- The policy lets only a person approve, and only the approver of the action. It does
+  not count an approval event from any other principal.
+- A session that the memory server serves approves nothing, with `amem approve` or with
+  its own call, whatever name the session has. A harness reaches that session, so the
+  request can come from an agent.
+- The memory server has no memory tool that approves.
+
+These rules hold only for a harness that is confined. Nobody authenticates at the command
+line. A harness without a sandbox has a shell on the host: a harness under
+`amem launch --unconfined`, or a harness that you point at `amem serve` yourself. From
+that shell, an agent can run `amem approve`, `amem erase` or `amem declassify` as the
+owner. That call is a call at the command line, so the agent approves its own request.
+
+`amem approvals [<id>] [--domain <domain>]` lists the approvals of one entry, or of a
+domain, as JSON, oldest first. Each has `id`, `domain`, `principal`, `action`, `target`,
+`version`, `scope`, `expires`, `at` and `in_force`. `in_force` says that the approval is
+before its expiry. Such an approval permits its action only on the version that it names.
+The list holds only the approvals of entries that the session can read. The receipt of an
+erasure names who erased, and it does not name the approval.
+
+The event log of the domain gets a copy of each approval, as it gets a copy of each event
+of the ledger: a `ledger` event with the operation `approved`. The copy names the
+approver, the entry and the time, and it has the highest label. The action, the version,
+the scope and the expiry stay in the event of the ledger, where `amem approvals` reads
+them.
+
+### A copy at a lower label: `amem declassify`
+
+`amem declassify <id> --to <label> --why "<words>"` asks for a declassification: a copy
+of one version of an entry at a lower label. The label must be lower than the label of
+the entry. The reason is words on one line, and the sign-off task holds it for the guard.
+
+The copy is a new raw entry at the lower label. It has the author, the date (`created`),
+the type, the title, the summary and the text of the entry. It cites the version that it
+was made from, as `<id>@<digest>`. It does not cite what the entry cites, because those
+citations can be above the label of the copy. Its `origin` names the label, the version
+and the guard:
+`declassify:<label>:<id>@<digest>:<guard>`. The copy of a raw entry keeps the `reach` and
+the `task` of the entry, so the same sessions read the copy while it is raw. The copy of
+a curated or verified entry has fleet reach and names no task. A request for a copy of a
+raw entry with tap reach is a read of outside content. The entry itself does not change.
+The same call again gives the id of the copy that is there, and writes nothing. Each
+version and each label gets its own copy.
+
+`amem` makes the id of the copy from its `origin`, and the record takes an entry with
+that id only one time. Thus two calls at the same time land one copy, and two requesters
+of the same version get the same copy. If the copy was erased, `amem` refuses the call
+and files no sign-off task. No copy of that version lands at that label again. A new
+version of the entry gets a new copy.
+
+A session that asks for a copy reads the entry, so its session label goes up to the label
+of the entry. The copy is the only write that lands below the session label.
+
+The guard is the `guard` key in the grant of the domain:
+
+```toml
+[domains.dom-me]
+guard = "human:example:alex"
+```
+
+The value must name a person (`human:`). Without the key, the owner is the guard. When
+the grant names a guard that is not the owner, the owner cannot approve a
+declassification. That guard cannot approve at this time, because the command line acts
+only as the owner.
+
+An erasure of the entry rewrites the sign-off tasks of the entry. They keep the id of the
+entry and lose the reason that the requester gave. The erasure closes the open ones. It
+withholds a copy, as it withholds each active entry that cites the erased entry.
+
+### The two memory tools
+
+- `erase` takes `id` and `reason` (`requested`, `mistaken`, `sensitive` or `legal`). It
+  gives the receipt, or the refusal that names the sign-off task.
+- `declassify` takes `id`, `target_label` and `justification`. It gives `proposed` with
+  the sign-off task, or `declassified` with the id of the copy, its label, the citation
+  and the approval.
+
+Each memory tool calls the function that the command line calls. An agent calls the
+memory tool, a person approves the task at the command line, and the agent makes the same
+call again. In a re-enactment, each of the two is a call that changes the record: after
+the run diverges, the call is captured and not applied.
 
 ## Policy as memory: `amem policy list` and `lint`
 
@@ -1020,9 +1160,75 @@ completion. The ledger looks for the key in the transaction that makes
 the claim. The key is in the event of the claim or the completion, so the ledger finds it
 again after a rebuild. A command has no session, so `amem task` has no attempt key.
 
-Not built yet: an attempt key for the other operations, a block on a new claim while an
-external effect is uncertain, and a `blocked` state for a task that waits on an outside
-event.
+A session does not wait for an outside event, for example a check that runs or a reply.
+The holder gives the task up with `wait_for` (`amem task wait <id> <event>`), and names
+the event with one token. The task is then `blocked`, and its `waiting_on` field gives
+the event. No session can claim it. A tap or a person reports the event with
+`amem task arrived <event>`. Each task of the domain that waited on that event is then
+`open` again. `amem` refuses an agent that reports an event, because the agent would
+decide that its own wait is over.
+
+A holder records an external action before it makes the action: `effect_begun`
+(`amem task effect-begin <id> <action>`). The action id is one token of at most 64
+characters, and a retry of the action gives the same id. The ledger checks the claim in
+the transaction that records the action, so it refuses a holder of an earlier claim.
+The task's `effects` field lists the actions that are not settled. While the list is not
+empty:
+
+- no session can claim the task, also after the lease expires;
+- the holder cannot complete the task;
+- the ledger files no retry, no continuation and no subagent task of the task, so
+  `retry_task` and `fan_out` fail;
+- no session can claim a task that continues or retries the task, however far down;
+- `amem` does not invalidate the task, or a task that has such a task open below it;
+- `fan_out` does not close an open continuation that has such an action.
+
+The work of the task thus goes to no other session, under the name of the task or under
+a different name. A refused claim goes on the record of the task with its reason. The
+reason names the event that the task waited on, or the action that was not settled.
+
+`effect_settled` (`amem task effect-settle <id> <action> applied|not_applied`) records
+what the destination holds. The holder can settle its action while its claim is in force.
+After that, only a person or a tap can settle it. An agent that lost its claim cannot,
+because it cannot know if the destination got the action. The same outcome for a settled
+action changes nothing. The ledger refuses a different outcome for a settled action, and
+the record keeps the first outcome.
+
+A continuation can be done while its task has an action that is not settled. The task
+then stays open, and no session can claim it. When the last action is settled, the ledger
+closes the task with the handoff of that continuation.
+
+An event name, an action id and the reason of an invalidation are words of the session.
+Each session that can read the task reads them. Thus `amem` refuses `wait_for`,
+`effect_begun` and `invalidate_task` from a session whose session label is above the
+classification of the task.
+
+`amem work` and `amem gofannon work` do not complete a task that has an action that is
+not settled. They release the task with a handoff. With `amem work`, the handoff names
+the action.
+
+A task also has these fields: `parent`, `scores`, `implements`, `reversibility`,
+`artifacts_touched` and `policy_context`. `amem task create` and `create_task` take them,
+but not `policy_context`, and `create_task` does not take `scores`. `amem` sets
+`policy_context` to the ids of the verified policy entries at the time of the filing. It
+sets `parent` for a task that a session files while it holds a task. `amem` refuses a
+`parent` that the session cannot read. The fields are a record: no rule reads
+`scores`, `implements`, `reversibility` or `artifacts_touched`.
+
+Not built yet: an attempt key for the other operations, and a connector that puts
+external actions in sequence and settles them. `amem` does not make the external action,
+so the holder must record it. The taps do not report events yet: a person does, or a
+script that runs `amem task arrived`.
+
+These limits are open:
+
+- The ledger knows the work of a task only from the `origin` of a task filed from it. A
+  new task with the same text and no such `origin` is not held.
+- `amem` does not raise the classification of a task. A session that read above the
+  classification of its task cannot record an action or a wait on that task.
+- A continuation can be done while a holder has its task under a lease in force. The
+  ledger does not close that task, because the holder completes it. If the lease expires
+  first, the task is on offer again.
 
 ## Task definitions: `platform task`
 
@@ -1090,6 +1296,162 @@ is then in force.
 Not built yet: the autonomy level has no effect, no suite gates a version of a
 definition, and the data scope is not enforced. An erasure of the entry of a definition
 does not remove the checks that tasks took from it.
+
+## Positions: `amem position`
+
+A position is the record for one standing role: for example, a release coordinator or
+the reviewer of a subsystem. It is an entry of type `position`. The body of the entry
+holds one fenced block with the info string `position pos-<name>`. The block is TOML:
+
+```toml
+[charter]
+orders = "Announce each release to the list after the mirrors carry it."
+covers = ["release"]
+agent = "codex"
+
+[envelope]
+tools = ["tool:fetch"]
+handling = "internal"
+```
+
+- The name on the fence is the identifier of the position. It starts with `pos-`, then
+  has lower-case letters, digits and hyphens. The id of the entry is the version.
+- `[charter] orders` gives the standing orders.
+- `[charter] covers` gives the names of the task definitions that the position takes.
+- `[charter] agent` gives the agent definition that fills the position: the name in the
+  author of a session, `codex` for `agent:codex`.
+- `[envelope] tools` gives the tools that a session in the position can call.
+- `[envelope] handling` gives the highest label that a session in the position reads.
+- `status = "retired"`, above `[charter]`, is in a version that retires the position.
+
+Write the entry with `amem write --kind position`. A position is in force when its
+entry is active and a person verified it. When two such entries define one name, the
+newer entry is in force. A block with a key that is not in this list defines no
+position. `amem position list` shows each entry and, when the entry is not in force, the
+reason.
+
+Pin a task to a position with `amem task create --position <name> --pin-reason
+<reason>`. The memory tool `create_task` takes `position` and `pin_reason`. The pin
+reason is one of three words:
+
+- `continuity`: the position holds open commitments that the task depends on.
+- `relationship`: the position holds a relationship with an outside project.
+- `separation`: the review must go to a position other than the author's.
+
+The ledger records the pin reason and does the same thing for each one. The memory
+server refuses a pin without a pin reason, and a pin to a position that is not in force.
+Only a session that fills the position claims a pinned task. `claim_next` does not
+give the task to a different session. When a different session asks for the task by its
+id, the ledger refuses, and the refusal names the position. A continuation in the same
+domain takes the pin of its parent. A subagent task and a retry do not.
+
+The memory server applies the checks of a pin to a pin that a continuation takes. A
+session can file a task with the origin `continues:<id>`. If the session cannot read
+the position of that parent, the memory server refuses the task. If the session cannot
+read the parent, the memory server refuses the task and names nothing of the parent.
+
+A task that a session pins to a position stays proposed until one of these admits it:
+
+- a person;
+- a session that fills the position under the agent definition that the charter names.
+
+This applies to each session that does not fill the position in that way: a seconded
+session, a session in a different position and a session in no position. The memory
+server does not admit their pinned task when they file it, and it refuses their
+`admit`.
+
+A pinned task waits for its continuation, and no session claims the task during that
+time. Thus only these sessions fan out a pinned task or file its continuation:
+
+- the session that holds the task, which can be a seconded session;
+- a session that can admit a task of the position.
+
+The memory server refuses each other session, and files nothing.
+
+A session that fills a position gets these, and is held to them:
+
+- It claims the tasks that are pinned to the position, and the tasks without a pin whose
+  task definition the charter covers. It claims no other task.
+- It can call only the tools that the envelope holds. The grants and the task definition
+  can make that set smaller.
+- It reads no entry above the handling of the envelope.
+- Its T0 starts with the slice of the position: the charter, the authority envelope, the
+  open commitments and the handoff cache. A commitment is a task that is pinned to the
+  position, is admitted and is not closed. A proposed task is not a commitment. The
+  slice shows the first 160 characters of the title of a commitment.
+- When it writes a handoff, the memory server adds the name of the position to the
+  citations of the handoff. The handoff cache is the newest five handoffs that cite the
+  position.
+- When the entry of the position is replaced, retired, demoted or erased, the session
+  cannot continue in the position. The memory server refuses each claim, each read, each
+  tool call and each T0 of the session from then on. The session can still write a
+  handoff, and that handoff does not get the citation. Start a new session.
+
+A session under an agent definition that the charter does not name is a seconded
+session. It claims the tasks of the position, and it reads what the position holds. It
+cannot write an entry that cites the position, so the handoff cache does not get its
+handoffs. A person has no agent definition, so a session of a person is always seconded.
+
+A session does not select its position. The operator names the position when the
+session starts, or the launcher finds one that waits:
+
+- With `amem serve --position <name>`, the session fills the position before the memory
+  server serves. The variable `MEMORY_POSITION` does the same. If the memory server
+  refuses the position, the command ends with the refusal.
+- With `amem work --position <name>`, the session fills the position before the first
+  claim.
+- `amem work --wake` reads which positions wait: each has a task that waits and no live
+  session. The session fills the first position whose charter names the agent definition
+  of this harness. It does one task and leaves the position. If that position gives it
+  no task, it leaves the position and fills the next one that waits. If a position
+  refuses the session, the launcher prints the refusal and goes to the next one. When no
+  position waits for this harness, the launcher claims nothing. It names each position
+  that waits for a different agent definition.
+
+`--position` and `--wake` do not work on the `wslc` sandbox backend. `amem work` refuses
+them there.
+
+`amem position show <name>` gives one position: the record, its open commitments, its
+handoff cache and the sessions that are live in it. A session is live in a position
+while it holds a lease on a task that it claimed from the position. A reader that cannot
+see that task does not get the name of the session. The memory tools `position` and
+`positions` give the same answers to a session.
+
+A position whose envelope has a handling below the classification of its own entry takes
+no session. `amem position list` shows `wake` as false for that position, and the wake
+list does not hold it.
+
+The owner retires a position with `amem position retire <name> --why <text>`, or with
+the memory tool `retire_position`. The memory server writes a new version with
+`status = "retired"` and the reason. It takes the pin off each task of the position
+that is not closed, so any session that matches can claim those tasks. The entries that cite the
+position stay in the record. A retired position takes no session and no pin. An owner
+that retires the position that its own session fills leaves the position.
+
+Not built yet:
+
+- The platform's standing roles are not positions, and nothing makes a position when a
+  domain is registered.
+- No curator proposes a position, and an unused position does not go to its owner.
+- The memory server does not start a session when a pinned task is admitted. A person
+  or a scheduler runs `amem work --wake`.
+- A session that holds no lease is not seen as live, and two sessions can fill one
+  position at the same time.
+- The position is not in the principal chain, and not in the input of the policy. The
+  policy does not decide who admits a pinned task. The memory server holds that rule.
+- A session whose position changed cannot complete the task that it holds. The lease
+  ends, and the task returns to the queue.
+- `amem position list` counts a proposed task in `pinned`.
+- No tap posts for a position.
+- Nothing checks that a `separation` pin names a position other than the author's.
+- The envelope has no data scope other than its handling.
+- While the next version of a position waits for review, no version is in force.
+- A retirement needs no second person.
+- A subagent that runs inside the harness writes as the session, so its handoffs cite
+  the position.
+- An import lands entries with their citations, so a bundle can bring entries that cite
+  a position.
+- A read of the handoff cache looks at the newest 200 handoffs of the domain only.
 
 ## The task fabric: `amem task rescore` and `stats`
 

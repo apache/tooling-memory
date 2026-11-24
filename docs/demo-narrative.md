@@ -54,8 +54,9 @@ offline.
   5.3, it takes the role of a different model, swapped in behind the name qwen3.8-27b.
   In act 8, it is the other model that a session is re-enacted on.
 - **Scripted agents**: `agent:rogue`, `agent:release`, `agent:reader`, `agent:a`,
-  `agent:curator` and `agent:architect`. These are the demo script. The script uses
-  the same tools that an agent would use. No model is behind them. Say so.
+  `agent:curator`, `agent:architect`, `agent:worker` and `agent:substitute`. These are
+  the demo script. The script uses the same tools that an agent would use. No model is
+  behind them. Say so. In 4.5, the script also speaks as `agent:codex`, with no model.
 - **GitHub**, in act 9: its public API. A tap with no credential reads it.
 - **The system**: the memory server, the ledger, the policy and the egress (below), and
   the launcher, which runs and measures each harness.
@@ -66,6 +67,9 @@ offline.
 - **T0**: the short summary that every session loads first.
 - **Handoff**: the entry that a session leaves for the next session.
 - **Ledger**: the shared tasks. "The board" means its open tasks.
+- **Position**: a standing role, written as an entry with a charter and an authority
+  envelope. A task can be pinned to a position. A session fills a position, and starts
+  from the position's handoff cache (4.5).
 - **Trust tiers**: raw (anyone wrote it), curated (an agent tidied it under a curation
   task), verified (a person approved it).
 - **Quarantine**: the place where the policy holds a write, out of search, until you
@@ -73,10 +77,14 @@ offline.
   approval of a person.
 - **Policy**: the rules that check every write, read and outside request. The rules are
   entries too.
+- **Approval**: your yes to one action on one version of one entry, for one agent, until
+  a set time. The ledger keeps it. The policy checks it when the action runs.
+- **Guard**: the person who approves a copy of an entry at a lower label. In this demo,
+  the guard is you.
 - **Egress**: the only way out to a model. Every model call goes through it, from a
   harness or from the system itself, on to the model's provider or the gateway. The
   egress checks, logs and meters each call. Web fetches do not go through it. They leave
-  through the memory server's own fetch tool (3.11).
+  through the memory server's own fetch tool (3.13).
 - **Harness**: the agent program that a model works in, such as Claude Code or Codex.
 - **Gateway**: llm.apache.org, the Foundation's LLM gateway. It serves the open models
   in this demo.
@@ -90,7 +98,7 @@ offline.
   (act 8).
 - **Tap**: a component that connects to an outside system. It runs as a WebAssembly
   component, and it can reach only what its grant names. The fetch tool in
-  3.11 is a tap. The GitHub tap in act 9 is another.
+  3.13 is a tap. The GitHub tap in act 9 is another.
 - **Event log**: each write, read, send and erasure of a domain in order, by id and
   digest, never a body. The index is fed from the event log, and can be built again from
   the event log and the record (act 10).
@@ -171,8 +179,9 @@ not from the curators' own reports.
 
 ## Act 3 · The perimeter
 
-On stage: scripted agents writing, reading and fetching; gemma4-26b reading what is held;
-the policy deciding; the egress counting tokens; and you.
+On stage: scripted agents writing, reading and fetching, and asking to erase an entry and
+to copy an entry to a lower label; gemma4-26b reading what is held; the policy deciding;
+the egress counting tokens; and you, who verify, approve and decline.
 
 What gets in, what gets out, and who decides.
 
@@ -217,34 +226,51 @@ task for a person, and it names the owner of the rule.
 The task is still refused. You approve the exception, and then the task goes through.
 Every session sees the exception in T0.
 
-**3.8 A reset.** `agent:a` writes a rule, and `agent:curator` promotes it to curated. No
+**3.8 An action that cannot be taken back.** `agent:a` asks to erase an entry. The
+policy refuses: an erasure runs only under your approval, and a task asks you for it. You
+approve the task. The approval is for this version of the entry and for `agent:a`, and it
+expires after a day. It erases nothing. Then `agent:curator` promotes the entry, and the
+entry has a new version. `agent:a` asks again, and the policy refuses again: your
+approval is of the version that you saw. You approve the version that is there now, and
+the same call erases the entry. The ledger keeps both approvals. The decision log shows
+two refusals and one allow.
+
+**3.9 Down a label.** A restricted entry does not move to a lower label. `agent:a` asks
+for a copy at internal, and says why. You are the guard of the domain, so the task comes
+to you. After you approve, the same call lands the copy. The copy cites the version that
+it was made from, and its origin names you. The restricted entry stays as it is. Then
+`agent:curator` promotes the entry. The same call asks you again, and no second copy
+lands. You decline that request. `agent:a` cannot make it again until the entry changes.
+
+**3.10 A reset.** `agent:a` writes a rule, and `agent:curator` promotes it to curated. No
 person wrote or promoted that rule. You reset the rules of the domain. The reset retires that rule.
 It keeps the rule that you verified.
 
-**3.9 The lint.** This shows how often each rule blocked, allowed or advised something.
+**3.11 The lint.** This shows how often each rule blocked, allowed or advised something.
 
-**3.10 Spend limits.** For this step, the egress gives the auditor a spend limit of 400
+**3.12 Spend limits.** For this step, the egress gives the auditor a spend limit of 400
 tokens at the gateway. The call that goes over the limit still goes out. The egress
 refuses the next call. By then, more than 550 tokens are spent.
 
-**3.11 Fetch.** `agent:reader` fetches web pages through memory. No grant names
+**3.13 Fetch.** `agent:reader` fetches web pages through memory. No grant names
 example.com. After `agent:reader` has read internal entries, it can reach only trusted
 hosts, because a URL could leak what it read. The repeated fetch comes from the stored
 copy. Nothing leaves.
 
-**3.12 A grant withdrawn.** `agent:a` has an open session and searches. You lower the
+**3.14 A grant withdrawn.** `agent:a` has an open session and searches. You lower the
 handling of the record to public. The next search of that session is refused, and so is
 its next write: the session stops. A new session of `agent:a` starts under the new
 grants and finds no hit, because the record has no public entry. Then the demo puts the
 grants back.
 
-**3.13 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
+**3.15 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
 finds no hit. Your own search reaches the cap of 50 results.
 
 ## Act 4 · The task fabric
 
-On stage: you filing tasks, the ledger ranking them, Claude Code delegating and later
-taking the results, and Codex doing each delegated task.
+On stage: you filing tasks and verifying a position, the ledger ranking the tasks and
+matching the pinned one, scripted sessions in the position, Claude Code delegating and
+later taking the results, and Codex doing each delegated task.
 
 The work is on the ledger. The ledger continues after any one session ends.
 
@@ -262,12 +288,44 @@ ledger refuses it, and gives the two generations. The holder's name does not hel
 two holders have the same name. The first holder leaves what it learned as a late
 handoff, which the next holder reads.
 
-**4.4 The rescore.** Each move shows its reason. A task with a higher priority runs
+**4.4 Waiting, and an effect that nobody has settled.** The holder of a task gives the
+task up until a check completes. The task shows as blocked, and it names the event that
+it waits on. The next claim gets a different task, although this task has the highest
+priority. Then the event comes, and the task is open again. The next holder records an
+external action, a push, before it makes the push. Its lease of one second expires. The
+ledger still gives the task to nobody, because nobody knows if the push arrived. A person
+looks at the destination and settles the action as not applied. Only then does the next
+claim get the task.
+
+**4.5 A position.** A position is a standing role, written as an entry. You write the
+entry for the release coordinator: a charter and an authority envelope. `agent:curator`
+proposes it for verified, and you approve it. The charter names Codex as the agent
+definition that fills the position. Then you file a task and pin it to the position, for
+continuity. A session that fills no position asks for the task by name. The ledger
+refuses it, and the refusal names the position. The list shows one task that waits and
+no live session. Then a session that fills the position asks for the next task, and it
+gets the pinned task. It writes a handoff and releases the task. The memory
+server put the position in the citations of that handoff. A new session in the position
+loads T0. The first section of its T0 is the position: the charter, the open commitment
+and the handoff cache. No model is in this step. The sessions of `agent:codex` are the
+demo script.
+
+**4.6 Secondment, waking and retirement.** `agent:substitute` fills the same position.
+The charter names a different agent definition, so this session is seconded. It reads
+the commitment and the handoff cache. The memory server refuses its write that cites the
+position. The list shows `wake true`: a task waits, and no session is live in the
+position. With a gateway key, the demo runs `amem work --wake`. Its session fills the
+position, because Codex is the agent definition that the charter names. Codex on
+qwen3.8-27b then works on the task. Without a gateway key, the demo says that it
+skipped this part. Last, you retire the position. The pinned task loses its pin, and any
+session that matches can claim it. The entries of the position stay in the record.
+
+**4.7 The rescore.** Each move shows its reason. A task with a higher priority runs
 first. One curation task moved from 0 to 10. The reason: curation had done 17% of the
 completed work, less than its guaranteed 20%. The curation tasks filed at -1 went down
 to -2, because this period's strategy gives curation a lower weight.
 
-**4.5 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
+**4.8 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
 Claude Code calls its Agent tool twice, once for each subagent. The system stops each
 call before it runs. It files the subagent's prompt on the ledger as a task. With that
 task, it files a follow-up task that continues the comparison after the subagent's task
@@ -278,14 +336,14 @@ back on the board. The system files what Claude Code wrote as a handoff. The tas
 there. Nobody may claim it while its follow-up task is open. Thus nobody does the work
 twice.
 
-**4.6 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
+**4.9 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
 
-**4.7 Results come back.** A new Claude Code session claims the follow-up task, works on
+**4.10 Results come back.** A new Claude Code session claims the follow-up task, works on
 it with both reports, and completes it. When the follow-up task completes, the original
 task "Compare two decisions" also closes, with the same handoff. The reason: the
 follow-up task was the rest of its work. The last line shows it done.
 
-**4.8 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
+**4.11 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
 you. "promote" means the approvals to verified.
 
 ## Act 5 · Watching it
