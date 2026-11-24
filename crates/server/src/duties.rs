@@ -58,6 +58,14 @@ impl DemoteReason {
             DemoteReason::Wrong => "wrong",
         }
     }
+
+    /// The reason that `code` names, if it names one.
+    #[must_use]
+    pub fn parse(code: &str) -> Option<Self> {
+        [DemoteReason::Dead, DemoteReason::Wrong]
+            .into_iter()
+            .find(|r| r.code() == code)
+    }
 }
 
 /// What a demotion did.

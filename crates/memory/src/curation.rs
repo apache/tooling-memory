@@ -22,7 +22,7 @@ pub struct AuthorStats {
     pub body_changed: usize,
     /// How much the bodies changed, averaged: one minus the word overlap.
     pub mean_body_change: f64,
-    /// Entries this author demoted.
+    /// Entries that a session of this principal demoted, from the log of the domain.
     pub demotions: usize,
     /// Curation tasks this author completed, from the ledger.
     pub tasks_completed: usize,
@@ -76,7 +76,7 @@ pub async fn telemetry(
     };
     let active = memory.list(Some(&domain), None, 5000).await?;
     curations(memory, &active, &mut t).await;
-    demotions(memory, &domain, &active, &mut t).await?;
+    demotions(memory.root(), &domain, &mut t)?;
     completed(memory, &domain, &mut t).await?;
     rates(&mut t);
     inflation(memory.root(), &mut t);
@@ -184,26 +184,23 @@ async fn curations(memory: &Memory, active: &[dm_index::Hit], t: &mut Telemetry)
     }
 }
 
-/// Archived entries whose status says demoted, counted for the author of the demotion.
-async fn demotions(
-    memory: &Memory,
-    domain: &str,
-    active: &[dm_index::Hit],
-    t: &mut Telemetry,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let active_ids: BTreeSet<&str> = active.iter().map(|h| h.id.as_str()).collect();
-    for h in memory.list_archive(Some(domain), 5000).await? {
-        if active_ids.contains(h.id.as_str()) {
-            continue;
+/// The demotions that the events of a log hold, counted for the principal of each
+/// `demoted` event: the session that demoted, and not the author of the entry.
+#[must_use]
+pub fn demotions_among(events: &[dm_server::log::Event]) -> BTreeMap<String, usize> {
+    let mut by: BTreeMap<String, usize> = BTreeMap::new();
+    for e in events {
+        if matches!(e.change, dm_server::log::Change::Demoted { .. }) {
+            *by.entry(e.by.clone()).or_default() += 1;
         }
-        if let Ok(e) = memory.archived(&h.id).await {
-            if e.front.status == Some(dm_core::Status::Demoted) {
-                t.by_author
-                    .entry(e.front.author.clone())
-                    .or_default()
-                    .demotions += 1;
-            }
-        }
+    }
+    by
+}
+
+/// The demotions of a domain, from its log.
+fn demotions(root: &Path, domain: &str, t: &mut Telemetry) -> Result<(), dm_server::Error> {
+    for (who, n) in demotions_among(&dm_server::log::read(root, domain, 0)?) {
+        t.by_author.entry(who).or_default().demotions += n;
     }
     Ok(())
 }
@@ -339,6 +336,23 @@ pub struct Cycle {
     pub rescored: usize,
     /// The vendor-drift verdict on the auditor's model, when the cycle probed it.
     pub drift: Option<String>,
+    /// The mode of the auditor in this cycle, `other-model` or `fresh-session`, and
+    /// whether a qualification on file gives it.
+    pub auditor_mode: String,
+    pub qualified: bool,
+    /// The failures of the convention checks, the corrections, and the findings of the
+    /// curation of the policy. The cycle files each one.
+    pub conventions: usize,
+    pub corrections: usize,
+    pub policy_curation: usize,
+    /// The pairs of entries that carry a finding only when they are read together.
+    pub together: usize,
+    /// The curations checked against their sources, and the handoffs that the model
+    /// read for an instruction to the next agent.
+    pub curations_judged: usize,
+    pub handoffs_sampled: usize,
+    /// The verdicts of the auditor that this cycle filed for a person to review.
+    pub human_review: usize,
 }
 
 /// Append a cycle's record.
@@ -362,6 +376,35 @@ pub fn log_cycle(root: &Path, cycle: &Cycle) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_demotion_counts_for_the_principal_that_demoted_and_not_for_the_author() {
+        use dm_server::duties::DemoteReason;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let writer = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:writer");
+        let note = |body: &str| dm_server::WriteRequest {
+            body: body.into(),
+            ..dm_server::WriteRequest::default()
+        };
+        let one = writer.write(note("The port is 8080.\n")).await.unwrap().id;
+        let two = writer.write(note("The host is alpha.\n")).await.unwrap().id;
+        owner.demote(&one, DemoteReason::Wrong).await.unwrap();
+        owner.demote(&two, DemoteReason::Dead).await.unwrap();
+        // a restore does not take the demotion back out of the count
+        owner.restore(&two).await.unwrap();
+
+        let t = telemetry(&owner, None).await.unwrap();
+        assert_eq!(t.by_author["human:test:me"].demotions, 2, "{t:?}");
+        let of_writer = t.by_author.get("agent:writer").map_or(0, |s| s.demotions);
+        assert_eq!(of_writer, 0, "{t:?}");
+        let events = dm_server::log::read(dir.path(), "dom-me", 0).unwrap();
+        let counted = demotions_among(&events);
+        assert_eq!(counted.len(), 1, "{counted:?}");
+        assert_eq!(counted["human:test:me"], 2);
+    }
 
     #[test]
     fn body_change_is_word_overlap() {

@@ -325,6 +325,97 @@ with a budget of 1,500 tokens, the auditor stopped after five entries, as the lo
 shows. The curator left one side remark in its handoff: the Makefile's usage examples
 still implied a default harness. That remark was correct, and the issue is now fixed.
 
+## The duties of the curator and the auditor
+
+These commands and memory tools reach the duties. Each command and each tool calls one
+function of the library, so the two give the same answer. A command prints JSON.
+
+| Command | Memory tool | What it does |
+|---|---|---|
+| `amem dead [--domain D] [--days 90]` | `dead` | Lists the dead entries: the candidates for a demotion |
+| `amem demote <id> --reason dead\|wrong` | `demote` | Puts an entry behind a tombstone |
+| `amem restore <id>` | `restore` | Makes a demoted entry active again. Only a person |
+| `amem conventions [--domain D] [--overdue-days 30] [--file]` | `check_conventions` | Runs the convention checks. With `--file`, it files a task for each failure |
+| `amem task outcome <id> --kind K [--note TEXT]` | `record_outcome` | Records an outcome event. Only a person |
+| `amem task outcomes <id>` | `outcomes` | Gives the outcome events of a task |
+| `amem corrections [--domain D] [--file]` | `corrections` | Gives the corrections. With `--file`, it files a task for each |
+| `amem policy curate [--domain D] [--file]` | `policy_curation` | Gives the overlapping rules and the repeated work. With `--file`, it files a task for each |
+| `amem auditor mode` | `auditor_mode` | Gives the auditor mode |
+| `amem auditor qualify --curator-model M [--model C]` | none | Decides the qualification of the auditor. It calls a model, so it has no memory tool |
+| `amem auditor case <id>` | `curation_case` | Gives the curation case of one entry |
+| `amem auditor together [--domain D] [--sample 8] [--file]` | `test_together` | Tests entries together. With `--file`, it files a task for each pair |
+| `amem auditor handoffs [--domain D] [--sample 8]` | none | Lists the handoffs that a cycle gives to the auditor |
+
+`amem write --owner human:...` and the `owner` parameter of the `write` tool name the
+owner of an entry. The `get` tool gives the owner when an entry names one.
+
+A demotion deletes nothing. The entry gets a new version with `status: demoted`, and
+this version is the tombstone. `get` answers that the entry was demoted. Search, list and
+T0 do not give the entry. The log of the domain gets a `put` event and then a `demoted`
+event. The `demoted` event holds who demoted the entry and a reason code, `dead` or
+`wrong`. It holds no text.
+
+A person demotes each entry that the person reads, for either reason. An agent demotes
+only when all of these are true:
+
+- Its session holds a task of a curator or of the auditor.
+- The reason is `dead`.
+- The entry is a dead entry inside a window of 90 days.
+
+A handoff and a policy entry are not demoted. Only a person restores an entry.
+
+The convention checks are `freshness`, `ownership`, `cross-link` and `superseded`. A
+failure of the first three checks becomes a task that requires a person, with the origin
+`convention:<check>`. The text of the task names the owner of the entry. A failure of
+the check `superseded` becomes a task for a curator, with the origin `curator:rederive`
+and priority 3. A verify for an entry whose source file changed has the same priority.
+These two kinds of curation go first.
+
+An outcome event has one of four kinds: `accepted`, `corrected`, `rejected` or
+`reverted`. A task with an outcome that is not `accepted` is a correction.
+`amem corrections --file` files a task for a curator with the origin
+`curator:correction`. The task asks whether the method was at fault or knowledge was
+missing. A disputed correction becomes a task for a person, with the origin
+`correction:disputed`.
+
+`amem auditor qualify` puts each of the ten planted cases to the model of the curators,
+and to the candidate that `--model` names. A candidate qualifies when all of these are
+true:
+
+- It is not the model of the curators.
+- It catches at least as many faults as the model of the curators.
+- It gives no more false alarms.
+
+The command keeps the decision in `state/auditor.json`. It needs a destination with a
+credential, as `amem audit` does. With no qualification on file, the auditor mode is
+`fresh-session`, and a person reviews three verdicts in each cycle. In the mode
+`other-model`, a person reviews one verdict.
+
+A curation cycle (`amem curate`) does the duties too:
+
+- It runs the auditor on the model that the qualification names. With no qualification
+  on file, it uses `--model`.
+- It tests entries together, and files a task for each pair (`auditor:together`).
+- It gives each of the newest curations to the model as a curation case. The model does
+  not get the handoff of the curator or the reason of a promotion. A curation that the
+  cited entries do not support becomes a task for a person (`auditor:curation`). A
+  curation that cites no entry becomes such a task without a model call.
+- It asks the model whether each of the newest handoffs holds an instruction for the
+  next agent. A finding becomes a task for a person (`auditor:handoff`).
+- It files the human sample of the verdicts for a person (`auditor:review`).
+- It files the failures of the convention checks, the corrections, and the findings of
+  the curation of the policy.
+
+The line of the cycle in `state/curation.jsonl` has these fields for the duties:
+`auditor_mode`, `qualified`, `conventions`, `corrections`, `policy_curation`,
+`together`, `curations_judged`, `handoffs_sampled` and `human_review`. The budget of open
+curation tasks (`--budget-tasks`) counts only the tasks for a curator run. A task that
+requires a person does not count.
+
+The telemetry of the curator (`amem curator --telemetry`) counts a demotion for the
+principal of the `demoted` event in the log of the domain. It does not count the
+demotion for the author of the entry.
+
 ## The perimeter: policy, admission and the gates
 
 Every later session reads shared memory. Thus shared memory can send messages to agents

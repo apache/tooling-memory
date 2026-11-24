@@ -97,7 +97,8 @@ two weeks. It is also the reason that none of it is the production shape.
     the next write, or for `amem log feed`.
   - A read event names the entries, and not their versions. The version of an entry is
     the last version that the log holds before the read.
-  - Curation events are not in the log.
+  - A demotion and a restore are in the log. A merge and a rewrite of a summary are
+    not in the log as curation events.
   - An erasure does not rewrite the log. The events of an erased entry keep its id, its
     author and its session.
 - **Drift over many runs.** The detectors read answers and also metadata: fingerprint
@@ -191,9 +192,42 @@ two weeks. It is also the reason that none of it is the production shape.
   - A session of the web launcher keeps the record for one request, as it keeps its
     session label.
   - A re-run from a tape does not restore the record.
-- **Curation and audit, in part.** No curation task demotes an entry, checks an owner or
-  a cross-link, or curates policy. No test on planted faults qualifies the auditor's
-  model. The auditor does not read handoffs.
+- **Curation and audit, in part.** A demotion puts an entry behind a tombstone, and a
+  person can restore the entry. An agent demotes only a dead entry, on a task of a curator
+  or of the auditor. The convention checks cover freshness, ownership, cross-links and
+  citations of a replaced entry, and each failure becomes a task. A person records the
+  outcome of a task, and a corrected result becomes a task for a curator. The curator
+  proposes a merge of overlapping rules, and a task definition for repeated work. The
+  auditor qualifies on ten planted cases. It then runs on another model, or in a fresh
+  session with a larger human sample. A curation cycle also checks each curation against
+  the entries that it cites, tests entries together, and reads a sample of handoffs.
+  These parts are not built:
+  - A second person does not approve a tombstone redirect, a change of a domain boundary
+    or a distillation into the platform domain.
+  - No library function splits an entry that is too large. The split stays a task for a
+    curator run.
+  - Nothing checks the answer of the curator on a correction: method, knowledge or
+    dispute.
+  - Only a person records an outcome. A revert or a rejection in an outside tracker is
+    not recorded.
+  - A correction that puts the method at fault ends as a task. No loop tests the proposed
+    change.
+  - The qualification calls a model only through a gateway key. Without a key, the
+    auditor stays a fresh session that is not qualified.
+  - A fresh session is a new session of the cycle. The check for another model compares
+    the model names, and not the vendors of the base models.
+  - The auditor does not sample the handoffs that left search, because handoffs do not
+    leave search yet.
+  - The task for a failed convention check requires a person and names the owner in its
+    text. The ledger does not route it to that one person.
+  - A cross-link to an entry of a domain that the session cannot read is reported as
+    broken.
+  - The unused-rule check does not run over one review period. Overlapping rules get only
+    a proposal to their owners.
+  - The alarms for each curator on summary drift and on skew in the search results are as
+    before. Only the count of demotions now comes from the event log.
+  - No task of the auditor traces a bad outcome back to the entries that fed it. The
+    `lineage` tool gives that trace.
 - **Access freshness, in part.** Any change to the grants file stops each open session,
   not only a session that the change affects. The files that a session rendered before
   the change stay on disk. A harness that a stopped session started continues to run,
@@ -457,6 +491,7 @@ describes re-enactment, the platform domain and the Gofannon bridge.
 | Trust tiers | Raw, curated, verified. Only a person who did not propose an entry can make it verified. Review clocks and decay. Raw reach: a raw entry from a session that read outside content is served only to its task chain, to triage and to curators | `promote`, `approve`; `reach` and `task` in the answers of `write`, `search` and `get` |
 | The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced after they are verified, with scoped exceptions). Admission, the read filter, the write scan and quarantine, and blast-radius gates. A log of every decision | `policy show, eval, list, lint`, `quarantine` |
 | The curator | A survey of what needs curation, an independent auditor, a search for contradictions, canaries, its own telemetry and alarms, and a cycle on a budget | `curator`, `curate`, `audit`, `canary` |
+| The duties of the curator and the auditor | Demotion of a dead entry behind a tombstone, and its restore. Convention checks, each failure a task. Outcome events on a task, and corrections for a curator. Overlapping rules and repeated work. The qualification of the auditor on planted cases, and its mode. A curation against the entries that it cites, entries tested together, and a sample of handoffs | `demote`, `restore`, `dead`, `conventions`, `task outcome, outcomes`, `corrections`, `policy curate`, `auditor mode, qualify, case, together, handoffs`; MCP `demote`, `restore`, `dead`, `check_conventions`, `record_outcome`, `outcomes`, `corrections`, `policy_curation`, `auditor_mode`, `curation_case`, `test_together` |
 | The egress | It forwards, meters and times model calls, holds spend limits per destination, and records decision contexts. It keeps the wall clock, CPU and peak memory of each session beside the session's tokens | `launch`, `usage`, `cost` |
 | Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned | `transcript`, `replay`, `reenact run, report, tapes, show, pin, unpin` |
 | The event log | Each write, read and send goes into the append-only log of its domain, with a label, and with ids and digests only. The log feeds the index, against a bound of 60 seconds. A materializer builds the index again from the log and replays the ledger's events. Lineage reads the log back and forward. An erasure withholds the entries that are one step forward. The log marks each event of a session that read outside content | `log show, feed, freshness, materialize, outside`, `lineage`, `withheld list, release`; MCP `log`, `lineage`, `outside_readers` |
