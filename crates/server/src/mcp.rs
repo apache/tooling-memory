@@ -5,6 +5,7 @@
 //! ledger operations, and a `memory://t0/<domain>` resource per granted domain. What it
 //! never gets is a path on disk, a credential, or an entry its grants do not admit.
 
+use crate::lineage::Direction;
 use crate::recall::{self, Budget, Depth};
 use crate::{tape, Error, Memory, WriteRequest};
 use dm_core::TrustTier;
@@ -119,7 +120,7 @@ fn rfc3339(t: time::OffsetDateTime) -> String {
 }
 
 fn hit_json(h: &Hit) -> Value {
-    json!({
+    let mut v = json!({
         "id": h.id,
         "domain": h.domain,
         "type": h.entry_type.to_string(),
@@ -128,7 +129,21 @@ fn hit_json(h: &Hit) -> Value {
         "title": h.title,
         "summary": h.summary,
         "review_due": h.review_due,
-    })
+    });
+    put_reach(&mut v, h.reach, None);
+    v
+}
+
+/// Put the reach of an entry into an answer when it is not the fleet's, and the task
+/// that the entry names when it names one. An answer about an entry with fleet reach
+/// and no task has neither key.
+fn put_reach(v: &mut Value, reach: dm_core::Reach, task: Option<&str>) {
+    if !reach.is_fleet() {
+        v["reach"] = json!(reach.to_string());
+    }
+    if let Some(task) = task {
+        v["task"] = json!(task);
+    }
 }
 
 fn lease(seconds: Option<i64>) -> Duration {
@@ -197,6 +212,39 @@ pub struct RecallParams {
 pub struct GetParams {
     /// The entry id, as a hit or T0 names it.
     pub id: String,
+}
+
+/// Parameters of `outside_readers`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct OutsideReadersParams {
+    /// The domain; the only granted one when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters of `lineage`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct LineageParams {
+    /// An entry id. With `back`, also `<domain>@<seq>`: a send event of that domain's log.
+    pub of: String,
+    /// true for what it may have been made from. Default false: what may have been made
+    /// from it, and where that went.
+    #[serde(default)]
+    pub back: Option<bool>,
+    /// The most steps to follow. Default: until a step reaches nothing new.
+    #[serde(default)]
+    pub depth: Option<u32>,
+}
+
+/// Parameters of `log`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct LogParams {
+    /// A granted domain; the only one when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// The first sequence number wanted. Default 0: the whole log.
+    #[serde(default)]
+    pub from: Option<u64>,
 }
 
 /// Parameters of `fetch`.
@@ -347,6 +395,18 @@ pub struct CreateTaskParams {
     /// Checks that say this task is done, in place of its definition's.
     #[serde(default)]
     pub acceptance: Vec<String>,
+    /// The task this one is split from, when it is not the task you hold.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// The decisions this task carries out, as entry ids.
+    #[serde(default)]
+    pub implements: Vec<String>,
+    /// Whether what the task does can be undone: `reversible` or `irreversible`.
+    #[serde(default)]
+    pub reversibility: Option<String>,
+    /// The owned paths the task changes, as globs.
+    #[serde(default)]
+    pub artifacts_touched: Vec<String>,
     /// The position this task is pinned to, `pos-<name>`: only a session that fills
     /// the position claims the task. Give `pin_reason` with it.
     #[serde(default)]
@@ -354,6 +414,40 @@ pub struct CreateTaskParams {
     /// Why the task is pinned: continuity, relationship, or separation.
     #[serde(default)]
     pub pin_reason: Option<String>,
+}
+
+/// Parameters of `wait_for`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct WaitParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// The name of the outside event the task waits on, one token, as the tap that
+    /// reports it will name it.
+    pub on: String,
+    /// A handoff entry you wrote about what you did before waiting; the next claimant
+    /// starts from it. Optional.
+    #[serde(default)]
+    pub handoff: Option<String>,
+}
+
+/// Parameters of `effect_begun` and `effect_settled`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct EffectParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// A stable id for the external action, one token of at most 64 characters. A retry
+    /// of the action names the same id.
+    pub action: String,
+    /// For `effect_settled`: `applied` when the destination holds the effect,
+    /// `not_applied` when it does not.
+    #[serde(default)]
+    pub outcome: Option<String>,
 }
 
 /// Parameters of `position`.
@@ -520,6 +614,29 @@ pub struct ProposeAmendmentParams {
     pub evidence: String,
 }
 
+/// Parameters of `erase`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct EraseParams {
+    /// The entry id.
+    pub id: String,
+    /// Why, as a class: `requested`, `mistaken`, `sensitive` or `legal`. The receipt
+    /// keeps it.
+    pub reason: String,
+}
+
+/// Parameters of `declassify`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct DeclassifyParams {
+    /// The entry id.
+    pub id: String,
+    /// The label of the copy, lower than the label of the entry: `public` or
+    /// `internal`.
+    pub target_label: String,
+    /// Why the text may be read at the lower label, in words on one line. The guard
+    /// reads it.
+    pub justification: String,
+}
+
 /// Parameters of `claim`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct LeaseParams {
@@ -653,6 +770,9 @@ const READS: &[&str] = &[
     "positions",
     "settings",
     "scorecards",
+    "lineage",
+    "log",
+    "outside_readers",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -705,6 +825,8 @@ impl McpServer {
     /// session's tape, or answered from the tape the session re-enacts.
     #[must_use]
     pub fn new(memory: Arc<Memory>) -> Self {
+        // what a harness asks through this server, an agent may have asked
+        memory.mark_served();
         Self {
             memory,
             tool_router: Self::tool_router(),
@@ -772,6 +894,7 @@ impl McpServer {
             "title": e.title(),
             "body": e.body,
         });
+        put_reach(&mut v, f.reach, f.task.as_deref());
         if !from.is_empty() {
             // as a client shows the URL it was redirected to: cite this id, not the one asked
             v["redirected_from"] = json!(from);
@@ -786,7 +909,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Write an entry. It lands at raw trust under this session's author. Write a `handoff` when you stop so the next session continues from it, not from your transcript; write a `decision` with context, options, choice and rationale; write a `fact` with a review_by date."
+        description = "Write an entry. It lands at raw trust under this session's author. Write a `handoff` when you stop so the next session continues from it, not from your transcript; write a `decision` with context, options, choice and rationale; write a `fact` with a review_by date. An answer with `withheld` names something this session read that was erased since: the entry is kept, and no read gives it until the owner releases it. An answer with `reach: tap` means that this session read content from outside the fleet: only the task chain, triage and curators read the entry until it is curated. `task` names the task that this session holds."
     )]
     async fn write(&self, p: Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -810,11 +933,17 @@ impl McpServer {
             summary: p.summary,
         };
         let w = self.memory.write(req).await.map_err(mcp_err)?;
-        ok(json!({
+        let mut v = json!({
             "id": w.id,
             "domain": w.domain,
             "classification": w.classification.to_string(),
-        }))
+        });
+        // the entry landed withheld: this session read something that is erased now
+        if let Some(erased) = w.withheld {
+            v["withheld"] = json!(erased);
+        }
+        put_reach(&mut v, w.reach, w.task.as_deref());
+        ok(v)
     }
 
     #[tool(
@@ -904,6 +1033,54 @@ impl McpServer {
     }
 
     #[tool(
+        description = "For the owner and the security role; refused to any other author. The lineage of an entry, from the event log of each granted domain. Forward, the default: the entries and the sends that came after a session read it, and the entries that cite it. With `back`: the entries its session had read before it wrote the entry, and the entries it cites; `of` may then be `<domain>@<seq>`, a send event. Each entry comes with its `hops` and whether it was `informed` (a read came before the write), `cited`, or both. `complete` is false when the log could not say. Reading it raises your label as reading the log does."
+    )]
+    async fn lineage(&self, p: Parameters<LineageParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let direction = if p.back.unwrap_or(false) {
+            Direction::Back
+        } else {
+            Direction::Forward
+        };
+        let found = self
+            .memory
+            .lineage(&p.of, direction, p.depth)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!(found))
+    }
+
+    #[tool(
+        description = "For the owner and the security role; refused to any other author. The sessions that read content from authors outside the fleet, from the event log of a domain: each with its author, the sequence number of its first event after that read (`since`), the entries it wrote after it (`writes`) and the sends it made after it (`sends`). An auditor checks those sends first. Reading it raises your label as reading the log does."
+    )]
+    async fn outside_readers(
+        &self,
+        p: Parameters<OutsideReadersParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let readers = self
+            .memory
+            .outside_readers(p.0.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "readers": readers }))
+    }
+
+    #[tool(
+        description = "For the owner and the security role; refused to any other author. The event log of a domain from sequence number `from`: each write offered, each version put, each write refused, each erasure, each read, each send and each event of the ledger, by id and digest and never a body, within what you may handle. `freshness` says how far the index is behind the log, against the published bound of 60 seconds. Reading it raises your label to the highest classification among the events served."
+    )]
+    async fn log(&self, p: Parameters<LogParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let domain = p.domain.as_deref();
+        let events = self
+            .memory
+            .log_synced(domain, p.from.unwrap_or(0))
+            .await
+            .map_err(mcp_err)?;
+        let freshness = self.memory.freshness(domain).map_err(mcp_err)?;
+        ok(json!({ "events": events, "freshness": freshness }))
+    }
+
+    #[tool(
         description = "Entries of one kind, newest first: the latest handoffs, the standing decisions. A keyed lookup, not a search."
     )]
     async fn list(&self, p: Parameters<ListParams>) -> Result<CallToolResult, McpError> {
@@ -965,8 +1142,15 @@ impl McpServer {
             priority: p.priority.unwrap_or(0),
             definition: p.definition,
             acceptance: p.acceptance,
+            // the library sets it, from what the session read
+            outside: false,
+            parent: p.parent,
+            implements: p.implements,
+            reversibility: parse("reversibility", p.reversibility)?,
+            artifacts_touched: p.artifacts_touched,
             position: p.position,
             pin_reason: parse("pin_reason", p.pin_reason)?,
+            ..dm_ledger::TaskSpec::default()
         };
         let c = self.memory.create_task(spec).await.map_err(mcp_err)?;
         // what a task that stays proposed lacks goes back to whoever filed it
@@ -1092,6 +1276,50 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Give a held task up until an outside event comes: a check that runs, a reply, a change that has not landed. Do not wait in the session. The task is blocked, and nobody may claim it, until a tap or a person reports the event; then it is offered again. Pass the id of a handoff you wrote so the next claimant starts where you stopped."
+    )]
+    async fn wait_for(&self, p: Parameters<WaitParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .wait_for(&p.id, p.generation, &p.on, p.handoff.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Record that you are about to make an external action under your claim, before you make it. Until the action is settled, the task goes to nobody else, even when your lease runs out. A retry of the action names the same action id."
+    )]
+    async fn effect_begun(&self, p: Parameters<EffectParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .effect_begun(&p.id, p.generation, &p.action)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Record what became of an external action you began: `applied` when the destination holds the effect, `not_applied` when it does not. Only while your claim is in force. After that a person reconciles it: you cannot tell a lost answer from an action that was not made."
+    )]
+    async fn effect_settled(
+        &self,
+        p: Parameters<EffectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let outcome = parse::<dm_ledger::Outcome>("outcome", p.outcome)?
+            .ok_or_else(|| McpError::invalid_params("outcome: applied or not_applied", None))?;
+        let t = self
+            .memory
+            .effect_settled(&p.id, p.generation, &p.action, outcome)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
         description = "Leave a handoff on a task after your claim on it is over: the lease ran out, or the task was claimed again. Write the handoff first with `write`. It changes nothing of the task; the next holder reads it with get_task."
     )]
     async fn late_handoff(
@@ -1159,6 +1387,35 @@ impl McpServer {
             .await
             .map_err(mcp_err)?;
         ok(json!({ "task": created.task, "deduplicated": created.deduplicated }))
+    }
+
+    #[tool(
+        description = "Erase an entry. It cannot be taken back: the text leaves every version and the index, and a stub and a receipt remain. It runs only under an approval of the owner for this version of the entry. Without one, the call is refused, and the refusal names the task that asks the owner for the approval. Call again after the approval. If the entry changed since, the approval is of another version, and a new task asks again."
+    )]
+    async fn erase(&self, p: Parameters<EraseParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let reason: dm_core::erasure::Reason = parse("reason", Some(p.reason))?
+            .ok_or_else(|| McpError::invalid_params("reason: a class of reason", None))?;
+        let receipt = self.memory.erase(&p.id, reason).await.map_err(mcp_err)?;
+        ok(serde_json::to_value(receipt).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Ask the guard of the domain for a copy of an entry at a lower label, with your reason in words on one line. `proposed` means that the guard has a task and that nothing exists at the lower label. Call again after the approval to land the copy: `declassified`, with the id of the copy. The copy cites the entry and the version it was made from. If the entry changed since, the approval is of another version, and a new task asks again."
+    )]
+    async fn declassify(
+        &self,
+        p: Parameters<DeclassifyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let to: dm_core::Label = parse("target_label", Some(p.target_label))?
+            .ok_or_else(|| McpError::invalid_params("target_label: a label", None))?;
+        let answer = self
+            .memory
+            .declassify(&p.id, to, &p.justification)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(answer).unwrap_or_default())
     }
 
     #[tool(
@@ -1517,12 +1774,17 @@ mod tests {
             "task_tree",
             "retry_task",
             "promotions",
+            "erase",
+            "declassify",
             "position",
             "positions",
             "retire_position",
             "settings",
             "scorecards",
             "score_evaluation",
+            "lineage",
+            "log",
+            "outside_readers",
         ] {
             assert!(
                 names.contains(&expected),
@@ -1541,6 +1803,25 @@ mod tests {
                 t.name
             );
         }
+    }
+
+    /// An agent reaches every tool of the memory server, so the server has no tool that
+    /// approves: a person approves at the command line. The two gated actions are tools,
+    /// and a re-run captures them as it captures a write.
+    #[test]
+    fn the_gated_actions_are_tools_and_no_tool_approves() {
+        let router = McpServer::tool_router();
+        let tools = router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        for gated in ["erase", "declassify"] {
+            assert!(names.contains(&gated), "missing tool {gated}: {names:?}");
+            assert_eq!(kind_of(gated), tape::Kind::Mutation, "{gated}");
+        }
+        let approving: Vec<&&str> = names
+            .iter()
+            .filter(|n| n.contains("approv") || n.contains("sign_off"))
+            .collect();
+        assert!(approving.is_empty(), "a tool that approves: {approving:?}");
     }
 
     #[test]
@@ -1723,7 +2004,10 @@ mod tests {
         else {
             panic!("proposed")
         };
-        s.memory.approve(&task.id).await.unwrap();
+        // a served session approves nothing: the owner approves in a session of its own
+        let owner = crate::Memory::open(s.memory.root()).unwrap();
+        owner.approve(&task.id).await.unwrap();
+        s.memory.reload_policy().await.unwrap();
         let rules = payload(
             &s.check_policy(Parameters(CheckPolicyParams {
                 action: "tag a release".into(),
@@ -1761,6 +2045,113 @@ mod tests {
         assert_eq!(filed["exception"]["task"]["requirements"][0], "human");
         let none = s.propose_amendment(Parameters(amend(""))).await;
         assert!(none.is_err());
+    }
+
+    const AGENT: &str = "agent:x";
+
+    /// A server over the session of an agent, and the owner in person on the same root.
+    fn agent_and_owner() -> (tempfile::TempDir, McpServer, Memory) {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author(AGENT);
+        (dir, McpServer::new(Arc::new(agent)), owner)
+    }
+
+    /// An entry of the owner at a label.
+    async fn entry_at(owner: &Memory, label: dm_core::Label, body: &str) -> String {
+        let req = WriteRequest {
+            title: Some("Door code".into()),
+            body: body.into(),
+            classification: Some(label),
+            ..WriteRequest::default()
+        };
+        owner.write(req).await.unwrap().id
+    }
+
+    /// A refusal of a tool: its message, which is in the class of a bad request.
+    fn refusal_text(answer: Result<CallToolResult, McpError>) -> String {
+        let invalid = McpError::invalid_params("", None).code;
+        match answer {
+            Err(e) if e.code == invalid => e.message.to_string(),
+            other => panic!("expected a refusal: {other:?}"),
+        }
+    }
+
+    /// An erasure that an agent asks for over the memory server is refused, and the
+    /// refusal names the task that asks the owner. After the owner signed that task off
+    /// in person, the same call erases.
+    #[tokio::test]
+    async fn erase_over_mcp_waits_for_the_owner_s_approval_and_then_gives_the_receipt() {
+        let (_dir, s, owner) = agent_and_owner();
+        let id = entry_at(&owner, dm_core::Label::Internal, "The door code is 4417.").await;
+        let erase = |reason: &str| {
+            s.erase(Parameters(EraseParams {
+                id: id.clone(),
+                reason: reason.into(),
+            }))
+        };
+        let bad = refusal_text(erase("because").await);
+        assert!(bad.contains("reason: reason \"because\" is not"), "{bad}");
+        let why = refusal_text(erase("mistaken").await);
+        let named = why
+            .split_once("Task ")
+            .and_then(|(_, rest)| rest.split_once(" asks human:test:me for it."));
+        let Some((task, _)) = named else {
+            panic!("the refusal names no task: {why}")
+        };
+        // the reason that did not parse asked nobody: this is the one request
+        let asked = owner.tasks(None, dm_ledger::Status::Open).await.unwrap();
+        let asked: Vec<&str> = asked.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(asked, [task]);
+        assert!(
+            owner.get(&id).await.is_ok(),
+            "a refused erasure erases nothing"
+        );
+        owner.sign_off(task, None).await.unwrap();
+        let receipt = payload(&erase("mistaken").await.unwrap());
+        assert_eq!(receipt["id"], id.as_str());
+        assert_eq!(receipt["erased_by"], AGENT);
+        assert_eq!(receipt["reason"], "mistaken");
+        assert!(matches!(owner.get(&id).await, Err(Error::Gone(_))));
+    }
+
+    fn copy_at(id: &str, label: &str) -> Parameters<DeclassifyParams> {
+        Parameters(DeclassifyParams {
+            id: id.into(),
+            target_label: label.into(),
+            justification: "Every visitor gets the code at the door.".into(),
+        })
+    }
+
+    /// A declassification that an agent asks for over the memory server is `proposed`,
+    /// with the task for the guard. After the guard signed that task off in person, the
+    /// same call lands the copy at the label that the call named.
+    #[tokio::test]
+    async fn declassify_over_mcp_is_proposed_and_lands_after_the_guard_s_approval() {
+        let (_dir, s, owner) = agent_and_owner();
+        let id = entry_at(&owner, dm_core::Label::Restricted, "The door code is 4417.").await;
+        let bad = refusal_text(s.declassify(copy_at(&id, "secret")).await);
+        assert!(bad.contains("target_label: "), "{bad}");
+        let asked = payload(&s.declassify(copy_at(&id, "internal")).await.unwrap());
+        assert_eq!(asked["outcome"], "proposed", "{asked}");
+        let title = format!("Approve: copy of {id} at internal");
+        assert_eq!(asked["task"]["title"], title.as_str());
+        assert_eq!(asked["task"]["created_by"], AGENT);
+        let task = asked["task"]["id"].as_str().unwrap();
+        owner.sign_off(task, None).await.unwrap();
+        let landed = payload(&s.declassify(copy_at(&id, "internal")).await.unwrap());
+        assert_eq!(landed["outcome"], "declassified", "{landed}");
+        assert_eq!(landed["classification"], "internal");
+        let cites = landed["cites"].as_str().unwrap();
+        assert!(cites.starts_with(&format!("{id}@")), "{cites}");
+        let copy = owner.get(landed["id"].as_str().unwrap()).await.unwrap();
+        assert_eq!(copy.front.classification, dm_core::Label::Internal);
+        assert_eq!(copy.front.cites, [cites]);
+        // the approval was of a copy at internal: a copy at public is another request
+        let lower = payload(&s.declassify(copy_at(&id, "public")).await.unwrap());
+        assert_eq!(lower["outcome"], "proposed", "{lower}");
+        let title = format!("Approve: copy of {id} at public");
+        assert_eq!(lower["task"]["title"], title.as_str());
     }
 
     /// The same call made twice under one key, as after an answer that did not arrive.
@@ -1824,6 +2215,27 @@ mod tests {
             why,
             "the attempt key try-1 was used before, and that attempt is over"
         );
+    }
+
+    #[tokio::test]
+    async fn a_write_says_when_it_landed_withheld() {
+        let (dir, s) = server().await;
+        let owner = Memory::open(dir.path()).unwrap();
+        let note = crate::WriteRequest {
+            body: "Written in error.\n".into(),
+            ..crate::WriteRequest::default()
+        };
+        let gone = owner.write(note).await.unwrap().id;
+        let read = GetParams { id: gone.clone() };
+        s.get(Parameters(read)).await.unwrap();
+        let before = payload(&s.write(handoff("Stopped at step 1.\n")).await.unwrap());
+        assert!(before.get("withheld").is_none(), "{before}");
+        owner
+            .erase(&gone, dm_core::erasure::Reason::Mistaken)
+            .await
+            .unwrap();
+        let after = payload(&s.write(handoff("Stopped at step 2.\n")).await.unwrap());
+        assert_eq!(after["withheld"], json!(gone), "{after}");
     }
 
     #[test]
@@ -2542,5 +2954,252 @@ mod tests {
         );
         assert_eq!(kind_of("scorecards"), tape::Kind::Read);
         assert_eq!(kind_of("score_evaluation"), tape::Kind::Mutation);
+    }
+
+    /// A server over the record at `dir`, for a session of `author`.
+    fn server_of(dir: &std::path::Path, author: &str) -> McpServer {
+        let memory = Memory::open(dir).unwrap().with_author(author);
+        McpServer::new(Arc::new(memory))
+    }
+
+    /// Write `body` through the `write` tool of `s`: the id of the entry.
+    async fn write_note(s: &McpServer, body: &str) -> String {
+        let params = WriteParams {
+            body: body.into(),
+            ..WriteParams::default()
+        };
+        let w = payload(&s.write(Parameters(params)).await.unwrap());
+        w["id"].as_str().unwrap().to_string()
+    }
+
+    /// Read `id` through the `get` tool of a new session of `author`, and write `body`
+    /// in that session: the id of the entry it wrote.
+    async fn read_then_write(dir: &std::path::Path, author: &str, id: &str, body: &str) -> String {
+        let s = server_of(dir, author);
+        s.get(Parameters(GetParams { id: id.into() }))
+            .await
+            .unwrap();
+        write_note(&s, body).await
+    }
+
+    /// The ids of the entries in a lineage answer, in its order.
+    fn reached(answer: &Value) -> Vec<&str> {
+        let entries = answer["entries"].as_array().unwrap();
+        entries.iter().map(|e| e["id"].as_str().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_lineage_tool_gives_the_owner_s_server_the_same_answer_as_the_library() {
+        let (dir, s) = server().await;
+        let x = write_note(&s, "# Port\n\nIt listens on 8080.\n").await;
+        let y = read_then_write(dir.path(), "agent:r", &x, "# Proxy\n\nIt forwards.\n").await;
+        let z = read_then_write(dir.path(), "agent:q", &y, "# Runbook\n\nRestart it.\n").await;
+        let ask = |of: &str, back, depth| {
+            let params = LineageParams {
+                of: of.into(),
+                back,
+                depth,
+            };
+            s.lineage(Parameters(params))
+        };
+        let library = |l: crate::lineage::Lineage| serde_json::to_value(l).unwrap();
+        // forward is the default, and with no depth it runs to the end
+        let forward = payload(&ask(&x, None, None).await.unwrap());
+        assert_eq!(reached(&forward), [y.as_str(), z.as_str()]);
+        assert_eq!(forward["direction"], "forward");
+        let same = s.memory.lineage(&x, Direction::Forward, None).await;
+        assert_eq!(forward, library(same.unwrap()));
+        assert_eq!(forward, payload(&ask(&x, Some(false), None).await.unwrap()));
+        // a depth bounds the steps
+        let near = payload(&ask(&x, None, Some(1)).await.unwrap());
+        assert_eq!(reached(&near), [y.as_str()]);
+        // and back gives what the entry was made from
+        let back = payload(&ask(&z, Some(true), None).await.unwrap());
+        assert_eq!(reached(&back), [y.as_str(), x.as_str()]);
+        assert_eq!(back["direction"], "back");
+        let same = s.memory.lineage(&z, Direction::Back, None).await;
+        assert_eq!(back, library(same.unwrap()));
+        assert_eq!(back["entries"][0]["informed"], true);
+        assert_eq!(back["entries"][0]["hops"], 1);
+    }
+
+    /// The `lineage` tool of `s`, forward from `of`.
+    async fn forward_of(s: &McpServer, of: &str) -> Result<CallToolResult, McpError> {
+        let params = LineageParams {
+            of: of.into(),
+            ..LineageParams::default()
+        };
+        s.lineage(Parameters(params)).await
+    }
+
+    #[tokio::test]
+    async fn lineage_and_log_are_refused_outside_the_security_role_and_served_inside_it() {
+        let (dir, owner) = server().await;
+        let grants = dir.path().join(crate::GRANTS_FILE);
+        let text = std::fs::read_to_string(&grants).unwrap();
+        std::fs::write(&grants, format!("security = [\"agent:security\"]\n{text}")).unwrap();
+        // the owner's session started under the grants as they were: a new one
+        drop(owner);
+        let owner = server_of(dir.path(), "human:test:me");
+        let x = write_note(&owner, "# Port\n\nIt listens on 8080.\n").await;
+        let worker = server_of(dir.path(), "agent:worker");
+        let refused = forward_of(&worker, &x).await.unwrap_err();
+        assert_eq!(refused.code, McpError::invalid_params("", None).code);
+        let why = "lineage is for the owner and the security role";
+        assert!(refused.message.contains(why), "{refused:?}");
+        let refused = worker
+            .log(Parameters(LogParams::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, McpError::invalid_params("", None).code);
+        let why = "the log is for the owner and the security role";
+        assert!(refused.message.contains(why), "{refused:?}");
+        assert_eq!(worker.memory.label(), dm_core::Label::Public);
+
+        let security = server_of(dir.path(), "agent:security");
+        let answer = payload(&forward_of(&security, &x).await.unwrap());
+        assert_eq!(
+            (&answer["of"], &answer["complete"]),
+            (&json!(x), &json!(true))
+        );
+        // a task filed after the last write: the tool serves the log with the ledger's
+        // events up to now
+        admitted_task(&owner, "Move the port", None).await;
+        let log = payload(
+            &security
+                .log(Parameters(LogParams::default()))
+                .await
+                .unwrap(),
+        );
+        let events = log["events"].as_array().unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds[..2], ["write", "put"], "{kinds:?}");
+        assert!(kinds.contains(&"ledger"), "{kinds:?}");
+        assert_eq!(events[0]["id"], x);
+        let fresh = &log["freshness"];
+        assert_eq!(fresh["domain"], "dom-me");
+        assert_eq!(
+            (&fresh["within_bound"], &fresh["unfed"]),
+            (&json!(true), &json!(0))
+        );
+        assert_eq!(fresh["bound_seconds"], 60);
+        assert_eq!(fresh["log_seq"], events[events.len() - 1]["seq"]);
+        // an event served is a read: the label of the session rose, and to the highest,
+        // since a `put` names no label
+        assert_eq!(security.memory.label(), dm_core::Label::Restricted);
+        // `from` is the first sequence number served
+        let from = LogParams {
+            domain: Some("dom-me".into()),
+            from: Some(2),
+        };
+        let tail = payload(&security.log(Parameters(from)).await.unwrap());
+        assert_eq!(tail["events"][0]["seq"], 2);
+        assert_eq!(tail["events"].as_array().unwrap().len(), events.len() - 1);
+    }
+
+    /// A task that a tap filed in the record at `dir`, admitted by the owner: its id.
+    async fn tap_task(dir: &std::path::Path, owner: &McpServer) -> String {
+        let spec = dm_ledger::TaskSpec {
+            title: "Change the port".into(),
+            body: "A stranger wrote this.\n".into(),
+            ..dm_ledger::TaskSpec::default()
+        };
+        let tap = server_of(dir, "tap:issues");
+        let id = tap.memory.create_task(spec).await.unwrap().task.id;
+        owner
+            .admit_task(Parameters(TaskIdParams { id: id.clone() }))
+            .await
+            .unwrap();
+        id
+    }
+
+    /// The hits of the `search` tool of `s` for the word `harbour`.
+    async fn harbour(s: &McpServer) -> Vec<Value> {
+        let params = SearchParams {
+            query: "harbour".into(),
+            ..SearchParams::default()
+        };
+        let found = payload(&s.search(Parameters(params)).await.unwrap());
+        found["hits"].as_array().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_write_after_an_outside_read_answers_with_tap_reach_and_the_task() {
+        let (dir, owner) = server().await;
+        let task = tap_task(dir.path(), &owner).await;
+        let worker = server_of(dir.path(), "agent:worker");
+        // before the read: the answer has no key for the reach or for a task
+        let before = payload(&worker.write(handoff("Nothing yet.\n")).await.unwrap());
+        assert!(before.get("reach").is_none() && before.get("task").is_none());
+        worker.memory.hold_task(&task).await.unwrap();
+        let params = WriteParams {
+            body: "# Harbour\n\nThe harbour port stays 8080.\n".into(),
+            entry_type: Some("decision".into()),
+            ..WriteParams::default()
+        };
+        let w = payload(&worker.write(Parameters(params)).await.unwrap());
+        assert_eq!((&w["reach"], &w["task"]), (&json!("tap"), &json!(task)));
+        let id = w["id"].as_str().unwrap().to_string();
+        // the hit and the entry say the same to a session in the chain
+        let hits = harbour(&worker).await;
+        assert_eq!((hits.len(), &hits[0]["reach"]), (1, &json!("tap")));
+        let got = GetParams { id: id.clone() };
+        let entry = payload(&worker.get(Parameters(got)).await.unwrap());
+        assert_eq!(
+            (&entry["reach"], &entry["task"]),
+            (&json!("tap"), &json!(task))
+        );
+        // an agent outside the chain reads neither
+        let reader = server_of(dir.path(), "agent:reader");
+        assert!(harbour(&reader).await.is_empty());
+        let got = GetParams { id: id.clone() };
+        assert!(reader.get(Parameters(got)).await.is_err());
+        // an entry with fleet reach has no key in a hit. The session that admitted the
+        // task read it, so a new session of the owner writes
+        let fresh = server_of(dir.path(), "human:test:me");
+        write_note(&fresh, "# Harbour office\n\nThe harbour office is open.\n").await;
+        let hits = harbour(&reader).await;
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].get("reach").is_none(), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn outside_readers_is_refused_to_an_agent_and_gives_the_owner_the_library_s_answer() {
+        let (dir, owner) = server().await;
+        let task = tap_task(dir.path(), &owner).await;
+        let none = OutsideReadersParams::default();
+        let empty = payload(&owner.outside_readers(Parameters(none)).await.unwrap());
+        assert_eq!(empty, json!({ "readers": [] }));
+        let worker = server_of(dir.path(), "agent:worker");
+        worker.memory.hold_task(&task).await.unwrap();
+        let id = write_note(&worker, "# Port\n\nIt listens on 8080.\n").await;
+        let none = OutsideReadersParams::default();
+        let refused = worker.outside_readers(Parameters(none)).await.unwrap_err();
+        assert_eq!(refused.code, McpError::invalid_params("", None).code);
+        let why = "the log is for the owner and the security role";
+        assert!(refused.message.contains(why), "{refused:?}");
+        let named = OutsideReadersParams {
+            domain: Some("dom-me".into()),
+        };
+        let answer = payload(&owner.outside_readers(Parameters(named)).await.unwrap());
+        let readers = answer["readers"].as_array().unwrap();
+        assert_eq!(readers.len(), 1, "{answer}");
+        assert_eq!(readers[0]["by"], "agent:worker");
+        assert_eq!(readers[0]["writes"], json!([id]));
+        let library = owner.memory.outside_readers(None).await.unwrap();
+        assert_eq!(answer["readers"], serde_json::to_value(library).unwrap());
+        // the domain asked for is the domain read: one that is not granted is refused
+        let other = OutsideReadersParams {
+            domain: Some("dom-other".into()),
+        };
+        assert!(owner.outside_readers(Parameters(other)).await.is_err());
+    }
+
+    #[test]
+    fn lineage_and_log_only_read() {
+        assert_eq!(kind_of("lineage"), tape::Kind::Read);
+        assert_eq!(kind_of("log"), tape::Kind::Read);
+        assert_eq!(kind_of("outside_readers"), tape::Kind::Read);
+        assert_eq!(kind_of("write"), tape::Kind::Mutation);
     }
 }

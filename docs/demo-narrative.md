@@ -64,7 +64,7 @@ offline.
 - **Scripted agents**: `agent:rogue`, `agent:release`, `agent:reader`, `agent:a`,
   `agent:curator`, `agent:architect`, `agent:worker` and `agent:substitute`. These are
   the demo script. The script uses the same tools that an agent would use. No model is
-  behind them. Say so. In 4.4, the script also speaks as `agent:codex`, with no model.
+  behind them. Say so. In 4.5, the script also speaks as `agent:codex`, with no model.
 - **GitHub**, in act 9: its public API. A tap with no credential reads it.
 - **The system**: the memory server, the ledger, the policy and the egress (below), and
   the launcher, which runs and measures each harness.
@@ -77,7 +77,7 @@ offline.
 - **Ledger**: the shared tasks. "The board" means its open tasks.
 - **Position**: a standing role, written as an entry with a charter and an authority
   envelope. A task can be pinned to a position. A session fills a position, and starts
-  from the position's handoff cache (4.4).
+  from the position's handoff cache (4.5).
 - **Trust tiers**: raw (anyone wrote it), curated (an agent tidied it under a curation
   task), verified (a person approved it).
 - **Quarantine**: the place where the policy holds a write, out of search, until you
@@ -85,10 +85,14 @@ offline.
   approval of a person.
 - **Policy**: the rules that check every write, read and outside request. The rules are
   entries too.
+- **Approval**: your yes to one action on one version of one entry, for one agent, until
+  a set time. The ledger keeps it. The policy checks it when the action runs.
+- **Guard**: the person who approves a copy of an entry at a lower label. In this demo,
+  the guard is you.
 - **Egress**: the only way out to a model. Every model call goes through it, from a
   harness or from the system itself, on to the model's provider or the gateway. The
   egress checks, logs and meters each call. Web fetches do not go through it. They leave
-  through the memory server's own fetch tool (3.11).
+  through the memory server's own fetch tool (3.13).
 - **Harness**: the agent program that a model works in, such as Claude Code or Codex.
 - **Gateway**: llm.apache.org, the Foundation's LLM gateway. It serves the open models
   in this demo.
@@ -110,9 +114,15 @@ offline.
   until you close it. Nothing that an agent wrote in the span is promoted (5.6).
 - **Tap**: a component that connects to an outside system. It runs as a WebAssembly
   component, and it can reach only what its grant names. The fetch tool in
-  3.11 is a tap. The GitHub tap in act 9 is another.
-- **Event log**: every write and erasure in order, by id and digest, never a body. The
-  index can be rebuilt from the event log and the record (act 10).
+  3.13 is a tap. The GitHub tap in act 9 is another.
+- **Event log**: each write, read, send and erasure of a domain in order, by id and
+  digest, never a body. The index is fed from the event log, and can be built again from
+  the event log and the record (act 10).
+- **Lineage**: what the event log says about an entry. Back: what its session read
+  before it wrote the entry. Forward: what was written and sent after a session read it
+  (3.4 and 10.6).
+- **Withheld**: an entry that an erasure reached by lineage. No read gives it until a new
+  entry replaces it or you release it (10.6).
 - **Bundle**: entries exported at or below a label, as Markdown and a manifest, for
   another record to import (act 10).
 
@@ -185,8 +195,9 @@ not from the curators' own reports.
 
 ## Act 3 · The perimeter
 
-On stage: scripted agents writing, reading and fetching; gemma4-26b reading what is held;
-the policy deciding; the egress counting tokens; and you.
+On stage: scripted agents writing, reading and fetching, and asking to erase an entry and
+to copy an entry to a lower label; gemma4-26b reading what is held; the policy deciding;
+the egress counting tokens; and you, who verify, approve and decline.
 
 What gets in, what gets out, and who decides.
 
@@ -200,9 +211,15 @@ holds it too, on purpose: a false hold costs little.
 malicious, two benign. One of the benign writes is the rewrite that the policy held in
 2.4. The auditor only advises. You decide.
 
-**3.4 Taint.** This step answers a question: if an entry turned out to be bad, who read
-it, and what did they write after? Here `agent:reader` read one and wrote a note. Thus
-the list shows the note.
+**3.4 Lineage.** The event log holds the write that the policy refused in 3.1. It holds
+the write as `agent:rogue` offered it, by digest, and the refusal, with the gate and the
+kinds of thing that the scan found. Only a session that handles the highest label gets
+these two events. You read them because you are the owner. `agent:reader` asks for the
+log and is refused, because it is not in the security role. Then `agent:reader` reads one
+decision and writes a note, in one session. Suppose that the note is bad: lineage back
+from the note names the decision that its session read. Suppose that the decision is bad:
+lineage one step forward from the decision names the note, with each other entry that a
+session wrote after it read the decision.
 
 **3.5 Policy is memory.** A rule written as an entry: a person, not an agent, supersedes
 decisions. The rule has an owner and a review date. Its block says `advisory`, as for a
@@ -225,28 +242,44 @@ task for a person, and it names the owner of the rule.
 The task is still refused. You approve the exception, and then the task goes through.
 Every session sees the exception in T0.
 
-**3.8 A reset.** `agent:a` writes a rule, and `agent:curator` promotes it to curated. No
+**3.8 An action that cannot be taken back.** `agent:a` asks to erase an entry. The
+policy refuses: an erasure runs only under your approval, and a task asks you for it. You
+approve the task. The approval is for this version of the entry and for `agent:a`, and it
+expires after a day. It erases nothing. Then `agent:curator` promotes the entry, and the
+entry has a new version. `agent:a` asks again, and the policy refuses again: your
+approval is of the version that you saw. You approve the version that is there now, and
+the same call erases the entry. The ledger keeps both approvals. The decision log shows
+two refusals and one allow.
+
+**3.9 Down a label.** A restricted entry does not move to a lower label. `agent:a` asks
+for a copy at internal, and says why. You are the guard of the domain, so the task comes
+to you. After you approve, the same call lands the copy. The copy cites the version that
+it was made from, and its origin names you. The restricted entry stays as it is. Then
+`agent:curator` promotes the entry. The same call asks you again, and no second copy
+lands. You decline that request. `agent:a` cannot make it again until the entry changes.
+
+**3.10 A reset.** `agent:a` writes a rule, and `agent:curator` promotes it to curated. No
 person wrote or promoted that rule. You reset the rules of the domain. The reset retires that rule.
 It keeps the rule that you verified.
 
-**3.9 The lint.** This shows how often each rule blocked, allowed or advised something.
+**3.11 The lint.** This shows how often each rule blocked, allowed or advised something.
 
-**3.10 Spend limits.** For this step, the egress gives the auditor a spend limit of 400
+**3.12 Spend limits.** For this step, the egress gives the auditor a spend limit of 400
 tokens at the gateway. The call that goes over the limit still goes out. The egress
 refuses the next call. By then, more than 550 tokens are spent.
 
-**3.11 Fetch.** `agent:reader` fetches web pages through memory. No grant names
+**3.13 Fetch.** `agent:reader` fetches web pages through memory. No grant names
 example.com. After `agent:reader` has read internal entries, it can reach only trusted
 hosts, because a URL could leak what it read. The repeated fetch comes from the stored
 copy. Nothing leaves.
 
-**3.12 A grant withdrawn.** `agent:a` has an open session and searches. You lower the
+**3.14 A grant withdrawn.** `agent:a` has an open session and searches. You lower the
 handling of the record to public. The next search of that session is refused, and so is
 its next write: the session stops. A new session of `agent:a` starts under the new
 grants and finds no hit, because the record has no public entry. Then the demo puts the
 grants back.
 
-**3.13 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
+**3.15 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
 finds no hit. Your own search reaches the cap of 50 results.
 
 ## Act 4 · The task fabric
@@ -271,7 +304,16 @@ ledger refuses it, and gives the two generations. The holder's name does not hel
 two holders have the same name. The first holder leaves what it learned as a late
 handoff, which the next holder reads.
 
-**4.4 A position.** A position is a standing role, written as an entry. You write the
+**4.4 Waiting, and an effect that nobody has settled.** The holder of a task gives the
+task up until a check completes. The task shows as blocked, and it names the event that
+it waits on. The next claim gets a different task, although this task has the highest
+priority. Then the event comes, and the task is open again. The next holder records an
+external action, a push, before it makes the push. Its lease of one second expires. The
+ledger still gives the task to nobody, because nobody knows if the push arrived. A person
+looks at the destination and settles the action as not applied. Only then does the next
+claim get the task.
+
+**4.5 A position.** A position is a standing role, written as an entry. You write the
 entry for the release coordinator: a charter and an authority envelope. `agent:curator`
 proposes it for verified, and you approve it. The charter names Codex as the agent
 definition that fills the position. Then you file a task and pin it to the position, for
@@ -284,7 +326,7 @@ loads T0. The first section of its T0 is the position: the charter, the open com
 and the handoff cache. No model is in this step. The sessions of `agent:codex` are the
 demo script.
 
-**4.5 Secondment, waking and retirement.** `agent:substitute` fills the same position.
+**4.6 Secondment, waking and retirement.** `agent:substitute` fills the same position.
 The charter names a different agent definition, so this session is seconded. It reads
 the commitment and the handoff cache. The memory server refuses its write that cites the
 position. The list shows `wake true`: a task waits, and no session is live in the
@@ -294,12 +336,12 @@ qwen3.8-27b then works on the task. Without a gateway key, the demo says that it
 skipped this part. Last, you retire the position. The pinned task loses its pin, and any
 session that matches can claim it. The entries of the position stay in the record.
 
-**4.6 The rescore.** Each move shows its reason. A task with a higher priority runs
+**4.7 The rescore.** Each move shows its reason. A task with a higher priority runs
 first. One curation task moved from 0 to 10. The reason: curation had done 17% of the
 completed work, less than its guaranteed 20%. The curation tasks filed at -1 went down
 to -2, because this period's strategy gives curation a lower weight.
 
-**4.7 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
+**4.8 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
 Claude Code calls its Agent tool twice, once for each subagent. The system stops each
 call before it runs. It files the subagent's prompt on the ledger as a task. With that
 task, it files a follow-up task that continues the comparison after the subagent's task
@@ -310,14 +352,14 @@ back on the board. The system files what Claude Code wrote as a handoff. The tas
 there. Nobody may claim it while its follow-up task is open. Thus nobody does the work
 twice.
 
-**4.8 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
+**4.9 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
 
-**4.9 Results come back.** A new Claude Code session claims the follow-up task, works on
+**4.10 Results come back.** A new Claude Code session claims the follow-up task, works on
 it with both reports, and completes it. When the follow-up task completes, the original
 task "Compare two decisions" also closes, with the same handoff. The reason: the
 follow-up task was the rest of its work. The last line shows it done.
 
-**4.10 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
+**4.11 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
 you. "promote" means the approvals to verified.
 
 ## Act 5 · Watching it
@@ -520,7 +562,8 @@ calls again. Re-enactment runs the whole session.
 
 ## Act 9 · From outside
 
-On stage: the GitHub issues tap, GitHub's public API, and you.
+On stage: the GitHub issues tap, GitHub's public API, and you. In 9.5, also the scripted
+agents `agent:a` and `agent:reader`.
 
 **9.1 The grant.** The tap may reach api.github.com and nothing else. It files into
 `dom-demo`, and it holds no credential. It runs as a WebAssembly component with only that
@@ -536,20 +579,42 @@ there. The ledger knows each issue by its origin and last update.
 **9.4 A person admits.** What a tap brings is proposed. No worker claims it until a
 person admits it. You admit one.
 
+**9.5 Raw reach.** An issue is text from a stranger. `agent:a` holds the admitted task,
+reads it and writes a decision. The answer of the write says `reach: tap` and names the
+task, because the session read outside content. Then the step shows who reads the entry
+while it is raw:
+
+- A new session of `agent:a` on the same task finds it. That session is in the task
+  chain.
+- `agent:reader` holds no task. Its search finds nothing, and its `get` is refused as
+  not found.
+- You find it. A person reads all raw entries.
+
+You promote the entry to curated, and then `agent:reader` finds it. Last, `amem log
+outside` lists the sessions that read outside content. For the session of `agent:a`, it
+gives one write and no send. An auditor checks the sends of such a session first.
+
 ## Act 10 · The record moves
 
-On stage: the event log and its materializer, you, and a second record, another owner's.
+On stage: the event log, its feed and its materializer; you; a second record, another
+owner's; and `agent:reader`, played by the demo script.
 
 The claim: the record lasts longer than every component. You can rebuild it from its log
 and move it to another owner. When you do, it keeps its erasures.
 
-**10.1 The event log.** The log has 319 events: 318 writes and the erasure from 1.4, by
-id and digest, never a body. An erasure of a body adds an erasure to the log. It changes
-nothing already in the log.
+**10.1 The event log.** The step counts the events of each kind that the log holds, and
+shows the first event of each kind. The kinds are the writes as sessions offered them,
+the versions that the record took, and the writes that the policy refused. They are also
+the erasures, such as the one from 1.4, the reads, the sends, and the copies of the
+ledger's events. Each event has ids and digests, never a body. An erasure of a body adds
+an erasure to the log. It changes nothing already in the log.
 
-**10.2 The index, rebuilt.** The materializer rebuilds the index from the log and the
-record. 304 entries are live: all except the four superseded entries and the one erased
-entry. It replays 172 ledger events. Nothing is behind the log.
+**10.2 The index, fed and rebuilt.** Each writer fed the index from the log before its
+write returned. Thus the index has each version that the log holds, no version waits, and
+the domain is within the published bound of 60 seconds. Then the materializer builds the
+index again from the log and the record. 304 entries are live: all except the four
+superseded entries and the one erased entry. It replays the ledger's events. Nothing is
+behind the log.
 
 **10.3 Exported at a label.** You write one new note, marked public. A public export
 carries that one entry. An internal export carries all 309 entries of `dom-demo`: the 304
@@ -563,6 +628,18 @@ internal bundle: 309 entries. A search of it for DR-19 finds 10 hits.
 imports the same bundle again. The import skips 308 entries as already there, and it
 refuses 1. It refuses that entry because its erasure receipt holds a fingerprint of the
 removed text, and the bundle's copy matches it.
+
+**10.6 An erasure follows lineage.** You write a note in error. `agent:reader` reads it
+and writes a second note, which does not name the first note. Then you export the domain.
+You erase the first note. The receipt lists the second note as withheld. It also lists
+the export as a send: a copy that the erasure cannot reach. The stub in the record keeps
+the id, the type, the domain, the date, the session, the label and the erased status. Its
+author is now the word `erased`. It keeps no text. The session of `agent:reader` is still
+open, and the first note is in its context. It writes a third note. The answer to that
+write says that the note is withheld, and names the erased note. A search for the second
+note finds nothing. `amem withheld list` names the second note and the third note, each
+with the erased note as the cause. You read the second note, you decide that it is
+correct, and you release it. The search finds it again.
 
 ## Act 11 · What this is not, yet
 

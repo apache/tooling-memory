@@ -27,7 +27,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReplayManifest {
-    /// Per granted domain: the offset of its event log.
+    /// Per granted domain: the offset of its event log, which is the sequence number
+    /// of the last event that names a version of an entry.
     pub log: BTreeMap<String, u64>,
     /// Per granted domain: how many active entries the index held, at every label.
     pub index: BTreeMap<String, u64>,
@@ -293,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_state_the_offset_of_a_log_is_the_number_of_its_last_event() {
+    fn replay_state_the_offset_of_a_log_is_the_number_of_its_last_version_event() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(log::offset(dir.path(), "dom-a").unwrap(), 0, "no log yet");
         let put = |id: &str| log::Change::Put {
@@ -306,6 +307,15 @@ mod tests {
         log::append(dir.path(), "dom-b", "me", put("c")).unwrap();
         assert_eq!(log::offset(dir.path(), "dom-a").unwrap(), 2);
         assert_eq!(log::offset(dir.path(), "dom-b").unwrap(), 1, "per domain");
+        // an event that names no version leaves the offset where it is
+        let read = log::Change::Read {
+            ids: vec!["a".into()],
+        };
+        log::append(dir.path(), "dom-a", "me", read).unwrap();
+        assert_eq!(log::offset(dir.path(), "dom-a").unwrap(), 2, "after a read");
+        let erased = log::Change::Erased { id: "a".into() };
+        log::append(dir.path(), "dom-a", "me", erased).unwrap();
+        assert_eq!(log::offset(dir.path(), "dom-a").unwrap(), 4, "an erasure");
         assert!(
             log::offset(dir.path(), "../x").is_err(),
             "a name, not a path"
@@ -384,7 +394,8 @@ mod tests {
             "no read is logged"
         );
         assert_eq!(agent.label(), label_before, "the label stays");
-        assert_eq!(m.log, BTreeMap::from([("dom-me".to_string(), 2)]));
+        // each write is two events, the offer and the version: the second version is 4
+        assert_eq!(m.log, BTreeMap::from([("dom-me".to_string(), 4)]));
         assert_eq!(
             m.index,
             BTreeMap::from([("dom-me".to_string(), 2)]),
@@ -400,6 +411,12 @@ mod tests {
         let t0 = agent.t0(None).await.unwrap();
         let m = agent.replay_manifest().await.unwrap();
         assert_eq!(m.t0, Some(dm_core::digest(&t0)));
+        // a read by the owner goes into the log and leaves the offset where it is
+        let before = log::read(dir.path(), "dom-me", 0).unwrap().len();
+        assert_eq!(owner.list(None, None, 10).await.unwrap().len(), 2);
+        assert!(log::read(dir.path(), "dom-me", 0).unwrap().len() > before);
+        let after = agent.replay_manifest().await.unwrap();
+        assert_eq!(after.log, m.log, "a read moves no offset");
         // a session that may read the entries and has read none: its label stays too
         let fresh = Memory::open(dir.path()).unwrap().with_author("agent:b");
         fresh.replay_manifest().await.unwrap();
@@ -432,14 +449,14 @@ mod tests {
             state.moved,
             [Moved {
                 what: "log dom-me".into(),
-                then: "1".into(),
-                now: "2".into()
+                then: "2".into(),
+                now: "4".into()
             }]
         );
         assert_eq!(state.availability, Availability::Incomplete);
         assert_eq!(
             state.why,
-            ["The log dom-me moved: it was 1 and it is 2 now."]
+            ["The log dom-me moved: it was 2 and it is 4 now."]
         );
         // a caller under other settings than the tape's is told so
         let other = Memory::open(dir.path()).unwrap();

@@ -48,7 +48,7 @@ term here in the same commit as the first document that needs it.
 | ledger | The tasks of each domain, with their leases and origins, on SQLite under `state/` or on PostgreSQL | queue, task list |
 | grants | The file `grants.toml`: the owner, handling, the domains, destinations, taps, gates, spend limits and the ledger | permissions (for the grants), config (for the grants) |
 | grant | One table in the grants: `[domains.<name>]`, `[destinations.<name>]` or `[taps.<name>]` | permission |
-| policy | The Rego rules that decide each action: write, read, erase, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
+| policy | The Rego rules that decide each action: write, read, erase, approve, declassify, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
 | perimeter | The policy, the grants and the parts that enforce them, as one part of the design | |
 | stopped (session) | A session whose grants changed after it started. Each read, decision, tool call and model call of the session is refused, and a new session starts under the grants as they are | revoked session, stale session |
 | policy stamp | `state/policy.stamp` and the digest of the root's `policy/*.rego`: what a session compares to know that the policy changed | |
@@ -58,6 +58,11 @@ term here in the same commit as the first document that needs it.
 | reset | `amem policy reset`: the owner retires each rule of a domain that no person wrote, promoted or approved | purge |
 | amendment | A task for the owner of a rule, with evidence, that asks for a change to the rule | |
 | gates | The `[gates]` rules on a write: how many entries one session may supersede, and whether a verified entry needs an approver | |
+| version (of an entry) | The text of an entry at one time. Each write and each promotion makes a new version. The digest of the text names the version: `<id>@<digest>` cites one version, and an approval names one | revision |
+| approval | An event on the ledger: a person approved one action on one version of one entry, for one principal, until a time. The policy checks it when the action runs | permission (for an approval) |
+| guard | The person who approves a copy of an entry at a lower label: `guard` in the grant of the domain, or the owner | |
+| declassification | A copy of one version of an entry at a lower label, written under an approval of the guard. The copy cites that version, and its origin names the guard. The source does not change | downgrade, lowering (of an entry) |
+| sign-off task | A task that the service files when an action has no approval: it asks the approver for one approval, of one action on one version of one entry, for the principal that asked | approval request |
 | scan | The check of a write and of a tool's answer for instructions, secrets, hidden text and the like. The scan finds; the policy decides | |
 | label | `public`, `internal` or `restricted`, in that order | level, tier (for a label), sensitivity |
 | classification | The label of an entry | |
@@ -70,6 +75,9 @@ term here in the same commit as the first document that needs it.
 | generation | The number of a claim of a task. Each claim gets the next number. A heartbeat, a completion and a release carry it, and the ledger refuses an earlier one | attempt (for a generation), fencing token |
 | late handoff | A handoff that a holder leaves on a task after its claim is over | |
 | attempt key | A key that a caller makes for one claim or one completion. The same key asked again gives the same result, and the ledger does the operation one time | idempotency key, request id |
+| outside event | Something that occurs outside the system and that a task waits on: a check that completes, a reply, a change that lands. A tap or a person reports it by name | signal, trigger |
+| external action | A change that a holder makes outside the record under its claim. The holder records it on the task before it makes it | side effect |
+| settle | To record what became of an external action: the destination holds it, or does not | reconcile, resolve |
 | task definition | The record in the platform domain for one kind of work: its purpose, its tools, its acceptance checks and its outputs. A task names one as `<name>@<version>` | task type, task template |
 | position | The record for one standing role: an entry of type `position` with a charter and an authority envelope, named `pos-<name>`. It is in force when a person verified its entry | seat, role (for a position), slot, post |
 | charter | The part of a position that gives its standing orders, the task definitions that it covers, and the agent definition that fills it | mandate, job description |
@@ -85,6 +93,20 @@ term here in the same commit as the first document that needs it.
 | retire (a position) | What the owner does to end a position: its tasks lose their pin, and its history stays in the record | delete (for retire), close (for retire) |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
+| event log | The log of a domain, `state/log/<domain>.jsonl`, to which `amem` only appends: each write, version, refusal, erasure, read and send, and a copy of each event of the ledger, in order. An event holds ids and digests, and no text. The paper names it the historian | historian, audit log, journal |
+| security role | The owner, and each author that `security` in `grants.toml` lists. Only this role reads the quarantine, the event log of a domain, lineage and the list of withheld entries | security team |
+| send event | An event in the event log of a domain for content that left the perimeter in a session: a handoff that a tap posted, an export, or a model call that the egress recorded as answered. It holds the place and a digest, and no text | |
+| lineage | The answer to one question about an entry, from the event log of each domain. Back: the entries that its session read before it wrote the entry, and the entries that it cites. Forward: the entries and the send events that came after a session read it | provenance |
+| informed-by edge | A step of lineage between two entries: a session read the first entry before it wrote the second. Each read of the session before the write counts | derived-from edge |
+| cited edge | A step of lineage between two entries: the second entry names the first in `cites` or in `supersedes` | reference (for a cited edge) |
+| read set | The entries that a session read before one of its events: the `read` events of that session that are before the event in the log | context (for a read set) |
+| outside content | Content from an author outside the fleet: the answer of a tool, a raw entry with tap reach, or a task that a tap filed. A task that a session filed after it read outside content is outside content too. The event log marks each event that a session appends after it read outside content | untrusted content, tainted content |
+| raw reach | Who reads an entry while it is raw. An entry has `reach`: `chain`, `fleet` (the default) or `tap`. A read filter has `raw_reach`: `chain` (only the raw entries of the task chain), `fleet` (those, and each raw entry whose reach is not `tap`) or `all` (each raw entry) | visibility (for raw reach), scope (for raw reach) |
+| held task | The task that a session works. The launcher sets it for the session, in `MEMORY_TASK` for a memory server on stdio | current task, active task |
+| task chain | The held task of a session, the task that it was filed from, the tasks that were filed from it, and the tasks that it depends on. A session reads each raw entry that names a task of its task chain | task tree (for a task chain), lineage (for a task chain) |
+| withheld entry | An entry with `status: withheld`. An erasure reached it by lineage, or its session read the erased entry and wrote it after the erasure. Its body stays in the record, and no search, list, T0, recall, get or bundle gives it. It stays withheld until a new entry replaces it, or the owner releases it or erases it | flagged entry, quarantined entry (for a withheld entry) |
+| feed | The step that brings the index up to the event log of a domain: it takes each version that the log names above a cursor from the record, and moves the cursor. A writer does it before its write returns | sync (for the feed) |
+| freshness bound | The longest time that a version in the event log of a domain can wait for the feed: 60 seconds. `freshness` measures a domain against it | index lag |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
 | session settings | The values that a launcher gives a session one time, before the session reads. They make what the session reads smaller, and the session cannot change them | session config, switches, flags (for session settings) |
 | arm | One fixed value of the session settings, for an evaluation: `no-memory`, `transcript-replay`, `t0-only`, `raw-only` or `full` | variant, condition, mode (for an arm) |
@@ -107,7 +129,7 @@ term here in the same commit as the first document that needs it.
 | replay | Send a recorded decision context to a model again | |
 | tape | The memory tool calls of one session, with their results | |
 | re-enactment | Run a session again on its prompt, and answer its memory tools from its tape | |
-| replay manifest | The part of a decision context and of a tape header that names what the session could read at that time: for each domain the offset of its event log and the number of entries in the index, the policy version, the digest of the grants, the session settings, the ranker and the digest of T0. On a decision context, it also names the entries that the session got after the decision context before | starting state (for a replay manifest), checkpoint (for a replay manifest) |
+| replay manifest | The part of a decision context and of a tape header that names what the session could read at that time: for each domain the offset of its event log (the number of the last event that names a version of an entry) and the number of entries in the index, the policy version, the digest of the grants, the session settings, the ranker and the digest of T0. On a decision context, it also names the entries that the session got after the decision context before | starting state (for a replay manifest), checkpoint (for a replay manifest) |
 | replay state | What `amem reenact state` gives for a tape: its replay manifest, each part that is different now, the calls that an erasure removed, and `complete` or `incomplete` | |
 | drift window | A time span for one destination and one model. It starts at the time that detected drift gives, and it ends when the owner closes it. An entry that an agent wrote in the span is not promoted, also after the owner closed the drift window | freeze (as a noun), quarantine (for a drift window) |
 | freeze | The rule of a drift window: nothing that an agent wrote inside the window is promoted, also after the window closes | hold (for the freeze), lock (for the freeze) |
@@ -133,6 +155,7 @@ a different thing. Name that thing in full where it could be read as the term.
 
 | Word | The other sense | Write |
 |---|---|---|
+| guard | The hook `.claude/hooks/guard-bash.sh`, which refuses some commands of a Claude Code session | the guard hook |
 | budget | The tasks or tokens that one curation cycle may use (`--budget-tasks`, `--budget-tokens`), or LiteLLM's budget for each project | curation budget, LiteLLM budget |
 | projection | The ledger built from the event log | the ledger's projection of the log |
 | root | The root user, or the `/` directory, or the top of a URL | root user, root directory |

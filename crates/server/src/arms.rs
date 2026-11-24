@@ -307,11 +307,16 @@ pub(crate) struct T0Lists {
 }
 
 impl T0Lists {
-    /// The session has read what the lists hold.
-    pub(crate) fn observed_by(&self, m: &Memory) {
-        m.observe(&self.handoffs);
-        m.observe(&self.decisions);
-        m.observe(&self.conventions);
+    /// The session has read what the lists hold: one read event for each domain.
+    pub(crate) fn observed_by(&self, m: &Memory) -> Result<(), Error> {
+        m.observe(
+            &[
+                &self.handoffs[..],
+                &self.decisions[..],
+                &self.conventions[..],
+            ]
+            .concat(),
+        )
     }
 }
 
@@ -373,19 +378,20 @@ impl Memory {
         }
     }
 
-    /// The filter T0 is read under, for one domain: the granted filter under the
-    /// bounds of the settings. It is not closed when the depth is T0, since T0 is what
-    /// that depth serves.
+    /// The filter T0 is read under, for one domain: the granted filter over the task
+    /// chain, under the bounds of the settings. It is not closed when the depth is T0,
+    /// since T0 is what that depth serves.
     pub(crate) fn t0_filter(&self, domain: &str) -> Result<ReadFilter, Error> {
-        let f = self.settings().bounds(self.granted_filter()?);
+        let f = self.settings().bounds(self.chained_filter()?);
         self.in_domain(f, Some(domain))
     }
 
-    /// The filter the text of the policy's rules is read under: the granted filter, or
-    /// nothing when memory access is off. The policy in force is read as it is now, at
-    /// every tier, so the tier ceiling and the snapshot do not apply to it.
+    /// The filter the text of the policy's rules is read under: the granted filter over
+    /// the task chain, or nothing when memory access is off. The policy in force is read
+    /// as it is now, at every tier, so the tier ceiling and the snapshot do not apply to
+    /// it.
     pub(crate) fn policy_filter(&self) -> Result<ReadFilter, Error> {
-        let f = self.granted_filter()?;
+        let f = self.chained_filter()?;
         Ok(if self.settings().memory {
             f
         } else {
@@ -441,7 +447,8 @@ impl Memory {
     /// transcript is served whole or not at all: one that does not fit what is left of
     /// `budget_tokens`, or of [`TRANSCRIPT_MAX_BYTES`], is left out, and an older,
     /// shorter one may still fit. The session's label rises to the classification of
-    /// each transcript served. An agent in production reads a transcript only by
+    /// each transcript served, and the log of its domain gets a `read` event that names
+    /// the transcript by its session. An agent in production reads a transcript only by
     /// citation, one turn at a time; this is the one path that serves one whole, and
     /// only a launcher's setting opens it.
     ///
@@ -457,7 +464,7 @@ impl Memory {
         if !settings.transcripts {
             return Ok(String::new());
         }
-        let f = self.in_domain(settings.bounds(self.granted_filter()?), domain)?;
+        let f = self.in_domain(settings.bounds(self.chained_filter()?), domain)?;
         let mut live = Vec::new();
         for d in self.domains() {
             if !f.domains.contains(&d) {
@@ -488,6 +495,8 @@ impl Memory {
             if !fits || !lock(&self.session).observe(t.classification) {
                 continue;
             }
+            // a transcript served is read: the log of its domain names it, as for a turn
+            self.log_read(&t.domain, vec![t.session.clone()], t.classification)?;
             tokens += cost;
             out.push_str(&section);
             served += 1;

@@ -101,13 +101,16 @@ impl<'a> Put<'a> {
                 classification: self.label,
                 status: None,
                 origin: None,
+                session: None,
+                reach: dm_core::Reach::Fleet,
+                task: None,
                 summary: None,
                 title: Some(format!("Backoff note {}", self.id)),
             },
             body: format!("The backoff is exponential, says {}.\n", self.id),
         };
-        m.put_logged(&entry).await.unwrap();
-        m.index_put(&entry).await.unwrap();
+        let put = m.put_logged(&entry).await.unwrap();
+        m.feed_from("dom-a", put).await.unwrap();
     }
 }
 
@@ -699,6 +702,21 @@ fn transcript(session: &str, label: Label, kept_at: OffsetDateTime, text: &str) 
     }
 }
 
+/// The ids that the `read` events of `m`'s session name in the log of `domain`.
+fn reads_in_log(dir: &Path, domain: &str, m: &Memory) -> Vec<String> {
+    let session = m.session_id.clone();
+    crate::log::read(dir, domain, 0)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.session.as_deref() == Some(session.as_str()))
+        .filter_map(|e| match e.change {
+            crate::log::Change::Read { ids } => Some(ids),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 async fn keep(m: &Memory, session: &str, label: Label, kept_at: OffsetDateTime, text: &str) {
     let t = transcript(session, label, kept_at, text);
     m.put_transcript(&t, None).await.unwrap();
@@ -760,6 +778,10 @@ async fn transcripts_are_replayed_under_the_handling_and_the_snapshot() {
     let logged = crate::reads::all(dir.path()).unwrap();
     let lines = logged.iter().filter(|r| r.tool == "transcripts").count();
     assert_eq!(lines, 1, "one line in the read log");
+    // each transcript served is a read event in the log of its domain, and no other is
+    let mut read = reads_in_log(dir.path(), "dom-a", &m);
+    read.sort_unstable();
+    assert_eq!(read, ["sess-new", "sess-old"]);
     // a snapshot at the older transcript leaves the newer one out, and the label lower
     let earlier = capped(dir.path(), Some(replay_at(old)));
     let text = earlier.transcript_context(Some("dom-a"), 8000).await;
@@ -964,6 +986,8 @@ async fn a_handoff_named_to_a_task_tool_is_checked_and_not_served() {
     assert!(m.reads.take_returned().is_empty(), "nothing was served");
     let logged = crate::reads::all(dir.path()).unwrap();
     assert_eq!(logged.iter().filter(|r| r.tool == "get").count(), 0);
+    // the handoff is read on behalf of the release: the log of the domain says so
+    assert!(reads_in_log(dir.path(), "dom-a", &m).contains(&own));
     // a session that reads the successor is told where the handoff moved
     let other = open_task(&owner, "Sweep").await;
     let full = agent(dir.path(), None);
@@ -973,6 +997,29 @@ async fn a_handoff_named_to_a_task_tool_is_checked_and_not_served() {
         matches!(&moved, Err(Error::Moved { to, .. }) if *to == new),
         "{moved:?}"
     );
+}
+
+/// An erasure reads the record, where the index does not hold the snapshot: an entry
+/// that the snapshot leaves out is not found, and no sign-off task tells that it is
+/// there. A session that reads the entry is told that it needs an approval.
+#[tokio::test]
+async fn an_erasure_does_not_find_an_entry_after_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = root(dir.path());
+    Put::new("mem-a-late", EntryType::Fact)
+        .created(SNAPSHOT + Duration::hours(1))
+        .into(&owner)
+        .await;
+    let at_a_snapshot = Settings {
+        not_after: Some(SNAPSHOT),
+        ..Settings::default()
+    };
+    let m = agent(dir.path(), Some(at_a_snapshot));
+    let erased = m.erase("mem-a-late", crate::Reason::Mistaken).await;
+    assert!(matches!(erased, Err(Error::NotFound(_))), "{erased:?}");
+    let now = agent(dir.path(), None);
+    let erased = now.erase("mem-a-late", crate::Reason::Mistaken).await;
+    assert!(matches!(erased, Err(Error::Denied(_))), "{erased:?}");
 }
 
 /// An export is a read: settings that read no entry export none, and a snapshot

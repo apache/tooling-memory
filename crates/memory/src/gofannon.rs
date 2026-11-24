@@ -132,7 +132,7 @@ pub async fn work(m: &Arc<Memory>, plan: &Plan) -> Result<usize, Box<dyn std::er
             "amem: claimed {}: {} for gofannon {}",
             task.id, task.title, plan.agent
         );
-        m.set_held_task(&task.id);
+        m.hold_task(&task.id).await?;
         let heartbeat = keep_lease(client.clone(), task.id.clone(), plan.lease_seconds);
         let ran = run(m, plan, &task).await;
         heartbeat.abort();
@@ -191,7 +191,8 @@ async fn run(m: &Arc<Memory>, plan: &Plan, task: &dm_client::Task) -> Result<Val
 }
 
 /// File the run's outcome: a completed run's result as the handoff of a completed task,
-/// anything else as the handoff of a released one.
+/// anything else as the handoff of a released one. A task with an external action that
+/// nobody has settled is released whatever its run says.
 async fn settle(
     client: &MemoryClient,
     plan: &Plan,
@@ -233,12 +234,26 @@ async fn settle(
     let handoff = client
         .write_handoff(&title, &body, Some(&task.domain))
         .await?;
-    if done {
+    // the ledger refuses to complete a task with an external action that nobody has
+    // settled: such a task goes back with the handoff, and waits for whoever settles it
+    let unsettled = if done {
+        let now = client.get_task(&task.id).await?;
+        crate::work::unsettled(&now).map(str::to_string)
+    } else {
+        None
+    };
+    if done && unsettled.is_none() {
         client.complete(&task.id, &handoff).await?;
         eprintln!("amem: {} completed, handoff {handoff}", task.id);
     } else {
         client.release(&task.id, Some(&handoff)).await?;
         eprintln!("amem: {} released, handoff {handoff}", task.id);
+    }
+    if let Some(action) = unsettled {
+        eprintln!(
+            "amem: external action {action} of {} is not settled; nobody can claim the task until it is",
+            task.id
+        );
     }
     Ok(())
 }
@@ -254,12 +269,14 @@ mod tests {
     struct Scripted {
         calls: Mutex<Vec<Value>>,
         refuse: bool,
+        /// An external action the run begins under the task's claim and does not settle.
+        begins: Option<&'static str>,
     }
 
     impl Tools for Scripted {
         fn call(
             &self,
-            _m: Arc<Memory>,
+            m: Arc<Memory>,
             _tool: String,
             _config: String,
             args: String,
@@ -271,6 +288,7 @@ mod tests {
                 c.len()
             };
             let refuse = self.refuse;
+            let begins = self.begins;
             let answered = |v: Value| {
                 Ok(Answered {
                     answer: v.to_string(),
@@ -282,7 +300,14 @@ mod tests {
                     Some("start") if refuse => {
                         Err("127.0.0.1: not a host the gofannon tool is granted".into())
                     }
-                    Some("start") => answered(json!({"run_id": "run-1"})),
+                    Some("start") => {
+                        if let (Some(action), Some(id)) =
+                            (begins, args["input"]["task_id"].as_str())
+                        {
+                            m.effect_begun(id, None, action).await.unwrap();
+                        }
+                        answered(json!({"run_id": "run-1"}))
+                    }
                     _ if n == 2 => answered(json!({"run_id": "run-1", "status": "running"})),
                     _ => answered(
                         json!({"run_id": "run-1", "status": "completed", "result": {"label": "bug"}}),
@@ -293,6 +318,14 @@ mod tests {
     }
 
     fn root(dir: &Path, refuse: bool) -> (Arc<Memory>, Arc<Scripted>) {
+        root_with(dir, refuse, None)
+    }
+
+    fn root_with(
+        dir: &Path,
+        refuse: bool,
+        begins: Option<&'static str>,
+    ) -> (Arc<Memory>, Arc<Scripted>) {
         Memory::init(dir, "human:test:me", "dom-me").unwrap();
         let path = dir.join(dm_server::GRANTS_FILE);
         let mut g = dm_policy::Grants::load(&path).unwrap();
@@ -311,6 +344,7 @@ mod tests {
         let s = Arc::new(Scripted {
             calls: Mutex::new(Vec::new()),
             refuse,
+            begins,
         });
         m.set_tools(s.clone());
         (m, s)
@@ -390,5 +424,22 @@ mod tests {
             "{}",
             h.body
         );
+    }
+
+    /// The ledger refuses to complete a task with an action that nobody has settled. The
+    /// worker does not stop on that refusal: the task goes back with the run's result.
+    #[tokio::test]
+    async fn a_run_that_left_an_action_not_settled_gives_the_task_back_with_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = root_with(dir.path(), false, Some("post-1"));
+        let owner = Memory::open(dir.path()).unwrap();
+        let id = filed(&owner).await;
+        let worked = work(&m, &plan()).await.map_err(|e| e.to_string());
+        assert_eq!(worked, Ok(1));
+        let t = owner.get_task(&id).await.unwrap();
+        assert_eq!(t.status, dm_ledger::Status::Open);
+        assert_eq!(t.effects, vec!["post-1".to_string()]);
+        let h = owner.get(&t.handoff.unwrap()).await.unwrap();
+        assert!(h.body.contains("\"label\": \"bug\""), "{}", h.body);
     }
 }

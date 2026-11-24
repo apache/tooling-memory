@@ -307,7 +307,8 @@ pub fn export_scope(
     Ok(scoped)
 }
 
-/// Export `hits`, the entries [`export_scope`] listed for `domain`, into `dest`, with
+/// Export `hits`, the entries [`export_scope`] listed for `domain`, into `dest`, a
+/// withheld entry left out, with
 /// the `promotions` of those exported at or below the bound; those of an entry exported
 /// as its erased stub go without the why. The index is consulted before this is called and never held across the record reads,
 /// so the export can run on any executor thread. The manifest's word on each entry's
@@ -335,6 +336,10 @@ pub async fn export(
             continue;
         };
         let front = Entry::parse(&text)?.front;
+        // a withheld entry is served to nobody, and a bundle is a way out of the record
+        if front.status == Some(Status::Withheld) {
+            continue;
+        }
         if front.status == Some(Status::Erased) {
             stubs.insert(hit.id.clone());
         }
@@ -564,7 +569,11 @@ pub async fn import(
             entry.front.id = dm_core::id::new_entry_id(into_domain);
         }
         if !same_owner {
+            // what another owner wrote is content from authors outside the fleet, and
+            // the task that it names is a task of that owner's ledger
             entry.front.trust_tier = TrustTier::Raw;
+            entry.front.reach = dm_core::Reach::Tap;
+            entry.front.task = None;
         }
         entry.front.classification = entry.front.classification.max(default_classification);
         // through the domain's log, as every write of an entry goes
@@ -618,6 +627,7 @@ mod tests {
             summary: "Held.".into(),
             score: 0.0,
             review_due: false,
+            reach: dm_core::Reach::Fleet,
         };
         let dest = tempfile::tempdir().unwrap();
         let ex = export(
@@ -661,6 +671,7 @@ mod tests {
             summary: "Held.".into(),
             score: 0.0,
             review_due: false,
+            reach: dm_core::Reach::Fleet,
         };
         let record = |id: &str| PromotionRecord {
             spec: dm_ledger::PromotionSpec {

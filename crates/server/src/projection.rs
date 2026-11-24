@@ -42,17 +42,23 @@ pub fn id_of(path: &Path) -> Option<&str> {
 }
 
 /// The summaries page: what the index serves before anyone opens a body, one line per
-/// entry, newest first, with the file to open beside it.
+/// entry, newest first, with the file to open beside it. A raw entry with tap reach has
+/// no line: the harness reads this page with no `get`, and the title and the summary of
+/// such an entry are content from outside the fleet. Its file is in the directory, and
+/// the `search`, `list` and `get` of the memory serve it and record the read.
 #[must_use]
 pub fn render_summaries(domain: &str, hits: &[Hit]) -> String {
+    let (outside, listed): (Vec<&Hit>, Vec<&Hit>) = hits
+        .iter()
+        .partition(|h| crate::reach::raw_tap(h.trust_tier, h.reach));
     let mut out = format!(
         "# {domain}: {} entries\n\nThe memory's summaries for this domain, newest first. Each \
          line names the file holding the entry; opening one is a read of the memory and \
          raises this session's label to the entry's. Search is cheaper than reading: use \
          the memory's `search` tool before opening files here.\n\n",
-        hits.len()
+        listed.len()
     );
-    for h in hits {
+    for h in listed {
         out.push_str(&format!(
             "- [{title}]({file}) · {kind} · {tier} · {label}: {summary}\n",
             title = h.title.replace(['[', ']', '\n', '\r'], " "),
@@ -63,8 +69,15 @@ pub fn render_summaries(domain: &str, hits: &[Hit]) -> String {
             summary = h.summary.lines().next().unwrap_or_default()
         ));
     }
+    if !outside.is_empty() {
+        out.push_str(OUTSIDE_NOT_LISTED);
+    }
     out
 }
+
+/// What the summaries page says when it leaves out a raw entry with tap reach.
+const OUTSIDE_NOT_LISTED: &str = "\nThis page does not list the raw entries that came from \
+     outside the fleet. The memory's `search` and `list` tools give them.\n";
 
 /// What one render did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -203,6 +203,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: Some(fetch),
+            approval: None,
         })
     }
 
@@ -225,14 +226,9 @@ impl Memory {
         let (grant, label) = self.tool_grant(tool)?;
         let id = source_id(tool, &args);
         let now = OffsetDateTime::now_utc();
-        if let Some(s) = self.source(&grant.domain, &id).await? {
-            if !s.held
-                && !grant.fresh
-                && s.retain_until > now
-                && lock(&self.session).observe(s.classification)
-            {
-                return Ok(served(&s, true));
-            }
+        let kept = self.live_source(&grant.domain, &id, now, grant.fresh);
+        if let Some(kept) = kept.await? {
+            return Ok(kept);
         }
         let runner = self
             .tools
@@ -295,7 +291,38 @@ impl Memory {
                 "{tool}'s results are {label}, above this session's ceiling"
             )));
         }
+        self.serve_source(&s)?;
         Ok(served(&s, false))
+    }
+
+    /// The answer that the source `id` keeps, served to this session, when the source
+    /// is not held, is still retained, and has a label that the session may handle. A
+    /// tool whose grant says `fresh` is always called, so its source is not served.
+    async fn live_source(
+        &self,
+        domain: &str,
+        id: &str,
+        now: OffsetDateTime,
+        fresh: bool,
+    ) -> Result<Option<Value>, Error> {
+        let Some(s) = self.source(domain, id).await? else {
+            return Ok(None);
+        };
+        let live = !s.held && !fresh && s.retain_until > now;
+        if !live || !lock(&self.session).observe(s.classification) {
+            return Ok(None);
+        }
+        self.serve_source(&s)?;
+        Ok(Some(served(&s, true)))
+    }
+
+    /// An answer of a tool goes to the agent: the session has read content from authors
+    /// outside the fleet, and the log of the tool's domain takes a `read` event that
+    /// names the source, at the label of the answer.
+    fn serve_source(&self, s: &Source) -> Result<(), Error> {
+        lock(&self.session).read_outside();
+        let cited = format!("{CITATION}{}", s.id);
+        self.log_read(&s.domain, vec![cited], s.classification)
     }
 
     /// A tool's failure as the agent is told it. What an upstream says when it fails is
@@ -310,6 +337,9 @@ impl Memory {
                 "{tool} failed, and what it said is {label}, above this session's ceiling"
             ));
         }
+        // what an upstream says when it fails is content from outside the fleet, in
+        // full or as the kinds that the scan found in it
+        lock(&self.session).read_outside();
         let findings = scan::kinds(&scan::scan(&said));
         if findings.is_empty() || self.principal().id == self.grants.owner {
             return Error::Tool(said);

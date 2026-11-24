@@ -28,6 +28,12 @@
 //! claims it, lists it, or reads it as delivered work. It is kept once per version of the
 //! entry, and a rebuild replays it with the rest.
 //!
+//! An approval is recorded on the same log too, as one event under the key
+//! `approval:<target>`, and projected nowhere: the events are the store, and
+//! [`Ledger::approvals`] reads them. It is no task either. It names one action, one
+//! entry, one version of that entry, who approved, who may act under it and when it
+//! expires. The ledger keeps it and judges nothing: the policy decides what it permits.
+//!
 //! A task may name a position, with a reason: it is then pinned. A pinned task goes only
 //! to a claimant that fills that position, and a claimant that fills a position takes an
 //! unpinned task only when the position's charter covers the task's definition. One
@@ -255,6 +261,28 @@ pub struct TaskSpec {
     /// The checks that say this task is done, its own or those its definition gave it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance: Vec<String>,
+    /// Whether the task is content from authors outside the fleet: a tap filed it, or a
+    /// session that had read such content filed it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside: bool,
+    /// The task this one was split from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// What triage scored it, beside the one number the queue is ordered by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scores: Option<Scores>,
+    /// The decisions this task carries out: entries of the record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implements: Vec<String>,
+    /// Whether what the task does can be undone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversibility: Option<Reversibility>,
+    /// The owned paths the task changes, as globs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts_touched: Vec<String>,
+    /// The policy in force when the task was filed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_context: Vec<String>,
     /// The position the task is pinned to: only a claimant that fills it claims the
     /// task. Absent when any matching claimant may.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,6 +292,67 @@ pub struct TaskSpec {
     pub pin_reason: Option<PinReason>,
 }
 
+/// What triage scored a task: the parts its rank is made of.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scores {
+    /// What it is worth done.
+    #[serde(default)]
+    pub value: i64,
+    /// How soon it loses that worth.
+    #[serde(default)]
+    pub urgency: i64,
+    /// What it costs to do.
+    #[serde(default)]
+    pub effort: i64,
+    /// The tasks that wait on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unblocks: Vec<String>,
+}
+
+/// Whether what a task does can be undone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reversibility {
+    /// It can.
+    Reversible,
+    /// It cannot.
+    Irreversible,
+}
+
+impl std::str::FromStr for Reversibility {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Reversibility, String> {
+        match s {
+            "reversible" => Ok(Reversibility::Reversible),
+            "irreversible" => Ok(Reversibility::Irreversible),
+            other => Err(format!("{other:?} is not reversible or irreversible")),
+        }
+    }
+}
+
+impl std::str::FromStr for Outcome {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Outcome, String> {
+        match s {
+            "applied" => Ok(Outcome::Applied),
+            "not_applied" => Ok(Outcome::NotApplied),
+            other => Err(format!("{other:?} is not applied or not_applied")),
+        }
+    }
+}
+
+/// How an external effect turned out, as whoever reconciled it found the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// The destination holds the effect.
+    Applied,
+    /// The destination does not hold it, so the action may be made again.
+    NotApplied,
+}
+
 /// The fields of a task that the ledger keeps and never queries by, as one JSON column.
 #[derive(Default, Serialize, Deserialize)]
 struct Extra {
@@ -271,10 +360,70 @@ struct Extra {
     definition: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     acceptance: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    outside: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scores: Option<Scores>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    implements: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reversibility: Option<Reversibility>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    artifacts_touched: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    policy_context: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     position: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pin_reason: Option<PinReason>,
+    /// The outside event the task waits on. Not of the spec: events set and clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    waits_on: Option<String>,
+    /// The external actions begun under a claim and not yet settled, by action id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    effects: Vec<String>,
+}
+
+impl Extra {
+    fn parse(id: &str, text: Option<&str>) -> Result<Extra, Error> {
+        match text {
+            // a row from before the column has none, and reads as a task with nothing more
+            None | Some("") => Ok(Extra::default()),
+            Some(text) => serde_json::from_str(text).map_err(|_| Error::BadRow {
+                id: id.to_string(),
+                what: format!("extra {text:?}"),
+            }),
+        }
+    }
+}
+
+/// The `extra` column of task `id` after `event`, when the event changes it: the event
+/// a task waits on, and the effects not settled. Both backends project through this.
+pub(crate) fn extra_after(
+    id: &str,
+    extra: Option<&str>,
+    event: &Event,
+) -> Result<Option<String>, Error> {
+    let mut e = Extra::parse(id, extra)?;
+    match event {
+        Event::Waiting { on } => e.waits_on = Some(on.clone()),
+        Event::Arrived { .. } => e.waits_on = None,
+        Event::EffectBegun { action } => {
+            if !e.effects.contains(action) {
+                e.effects.push(action.clone());
+            }
+        }
+        Event::EffectSettled { action, .. } => e.effects.retain(|a| a != action),
+        _ => return Ok(None),
+    }
+    serde_json::to_string(&e)
+        .map(Some)
+        .map_err(|err| Error::BadRow {
+            id: id.to_string(),
+            what: format!("extra serialises: {err}"),
+        })
 }
 
 impl TaskSpec {
@@ -283,8 +432,17 @@ impl TaskSpec {
         let extra = Extra {
             definition: self.definition.clone(),
             acceptance: self.acceptance.clone(),
+            outside: self.outside,
+            parent: self.parent.clone(),
+            scores: self.scores.clone(),
+            implements: self.implements.clone(),
+            reversibility: self.reversibility,
+            artifacts_touched: self.artifacts_touched.clone(),
+            policy_context: self.policy_context.clone(),
             position: self.position.clone(),
             pin_reason: self.pin_reason,
+            waits_on: None,
+            effects: Vec::new(),
         };
         serde_json::to_string(&extra).unwrap_or_default()
     }
@@ -336,6 +494,29 @@ pub struct Task {
     /// Where its handoff was posted back upstream, once a tap has done so.
     #[serde(default)]
     pub posted_to: Option<String>,
+    /// The outside event it waits on: a check that runs, a reply, a change that has not
+    /// landed. Nobody may claim it until that event arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+    /// The external actions begun under a claim of it whose outcome nobody has recorded.
+    /// Nobody may claim it while there is one: a lease that ran out does not say whether
+    /// the destination holds the effect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<String>,
+}
+
+impl Task {
+    /// Why nobody may claim this task whatever its lease says, when something holds it
+    /// back: the event it waits on, or an effect nobody has settled.
+    #[must_use]
+    pub fn held_back(&self) -> Option<String> {
+        if let Some(on) = &self.waiting_on {
+            return Some(format!("waits on {on}"));
+        }
+        self.effects
+            .first()
+            .map(|a| format!("effect {a} is not settled"))
+    }
 }
 
 /// What an erasure did to an entry's promotion records and approval tasks.
@@ -493,6 +674,53 @@ pub struct PromotionRecord {
     pub at: OffsetDateTime,
 }
 
+/// What an approval records: a person approved one action on one version of one entry,
+/// for one principal, until a time. It holds no free text, so an erasure of the entry
+/// has nothing to remove from it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalSpec {
+    /// The domain the entry lives in, whose ledger keeps the approval.
+    pub domain: String,
+    /// The person who approved, system-qualified.
+    pub principal: String,
+    /// The action approved, as one token: `erase`, `declassify:internal`. The ledger
+    /// does not interpret it.
+    pub action: String,
+    /// The entry the action is on.
+    pub target: String,
+    /// The digest of the entry text that was approved: the approval is of that version
+    /// and of no other.
+    pub version: String,
+    /// The principal that may run the action under this approval.
+    pub scope: String,
+    /// When the approval stops permitting anything.
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires: OffsetDateTime,
+}
+
+/// An approval as the ledger holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    /// The approval's id, `apr-<domain>-<suffix>`.
+    pub id: String,
+    /// What was approved.
+    #[serde(flatten)]
+    pub spec: ApprovalSpec,
+    /// When it was recorded, on the ledger's clock.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
+impl ApprovalRecord {
+    /// Whether the approval permits nothing any more at `now`: at its expiry and after
+    /// it. The two are compared as times, since the text of a time does not order as the
+    /// time does.
+    #[must_use]
+    pub fn expired(&self, now: OffsetDateTime) -> bool {
+        now >= self.spec.expires
+    }
+}
+
 type Clock = Box<dyn Fn() -> OffsetDateTime + Send + Sync>;
 
 /// One appended event, as replay reads it.
@@ -501,7 +729,8 @@ type Clock = Box<dyn Fn() -> OffsetDateTime + Send + Sync>;
 enum Event {
     Created {
         id: String,
-        spec: TaskSpec,
+        /// Boxed: a spec is several times the size of any other event.
+        spec: Box<TaskSpec>,
     },
     Admitted,
     /// Admitted with a dependency that is not done: not claimable until each is.
@@ -562,6 +791,26 @@ enum Event {
         reason: String,
         superseded_by: Option<String>,
     },
+    /// The holder gave the task up until an outside event comes: nobody's to claim
+    /// until [`Event::Arrived`].
+    Waiting {
+        on: String,
+    },
+    /// The outside event a task waited on came.
+    Arrived {
+        event: String,
+    },
+    /// The holder is about to make an external action. Until [`Event::EffectSettled`]
+    /// names the same action, nobody else may claim the task.
+    EffectBegun {
+        action: String,
+    },
+    /// Someone looked at the destination and recorded what became of an action.
+    EffectSettled {
+        action: String,
+        outcome: Outcome,
+        by: String,
+    },
     /// The handoff of a completed task was posted back where the task came from.
     Posted {
         to: String,
@@ -587,6 +836,10 @@ enum Event {
         #[serde(default, skip_serializing_if = "is_false")]
         why_erased: bool,
     },
+    /// A person approved one action on one version of one entry. Appended under
+    /// [`approval_key`], never a task id, and projected nowhere: the event is the record.
+    /// Boxed: a record is larger than every other event but a boxed one.
+    Approved(Box<ApprovalRecord>),
 }
 
 impl Event {
@@ -606,10 +859,15 @@ impl Event {
             Event::HandoffLeft { .. } => "handoff_left",
             Event::Completed { .. } => "completed",
             Event::Invalidated { .. } => "invalidated",
+            Event::Waiting { .. } => "waiting",
+            Event::Arrived { .. } => "arrived",
+            Event::EffectBegun { .. } => "effect_begun",
+            Event::EffectSettled { .. } => "effect_settled",
             Event::Posted { .. } => "posted",
             Event::Rescored { .. } => "rescored",
             Event::Unpinned { .. } => "unpinned",
             Event::Promoted { .. } => "promoted",
+            Event::Approved(_) => "approved",
         }
     }
 
@@ -627,6 +885,172 @@ impl Event {
             what: format!("event payload: {e}"),
         })
     }
+}
+
+/// One event of the ledger as the log of its domain takes it: which task, what happened
+/// to it, who did it and under which attempt key. It has no field for a title, a body, a
+/// handoff, a reason or a why, so no text of a task or of a promotion leaves the ledger
+/// in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Logged {
+    /// Its place among the ledger's events: the order the ledger appended them in.
+    pub seq: u64,
+    /// The task, or the key that a promotion or an approval of an entry is appended
+    /// under.
+    pub task: String,
+    /// What happened: `created`, `claimed`, `completed` and the rest, as the ledger's
+    /// `kind` column names them.
+    pub op: String,
+    /// When, as the ledger wrote it.
+    pub at: String,
+    /// Who did it: the filer of a `created`, the holder that a `claimed`, a
+    /// `claim_refused` or a `late_handoff` names, the promoter of a `promoted`, the
+    /// approver of an `approved`, and for a
+    /// `heartbeat`, a `released`, a `handoff_left`, a `waiting`, an `effect_begun` and a
+    /// `completed` the holder whose lease was live; for an `effect_settled`, who settled
+    /// it. Absent for the others, and for a `completed` that the task's
+    /// continuation caused, which no holder did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// The attempt key a `claimed` or a `completed` was made under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<String>,
+    /// The classification of the task, or of the promotion. An approval records none,
+    /// and is given at the highest label.
+    pub classification: Label,
+}
+
+/// The kinds of event that say who holds a task: a backend gives these for a task from
+/// before the number asked for too, so the holder of a later event can be named.
+pub(crate) const LEASE_KINDS: &str = "'claimed', 'heartbeat', 'released', 'waiting'";
+
+/// A row of the events table, with what the task's row says of the task.
+pub(crate) struct RawEvent {
+    pub(crate) seq: i64,
+    pub(crate) task: String,
+    pub(crate) at: String,
+    pub(crate) payload: String,
+    /// The domain of the task's row. None for an event of no task: a promotion or an
+    /// approval.
+    pub(crate) domain: Option<String>,
+    /// The label rank of the task's row.
+    pub(crate) label_rank: Option<i64>,
+}
+
+/// The claim in force on a task, as the events read so far say.
+struct Lease {
+    holder: String,
+    until: OffsetDateTime,
+}
+
+/// Who caused `event`, and the attempt key it was made under. `lease` is the claim in
+/// force on the task before the event, `at` the event's time. An event only the holder
+/// may cause names the holder when the lease was live at that time, which is what the
+/// ledger checked as it appended the event; a time that does not parse names the holder.
+fn who(
+    event: &Event,
+    lease: Option<&Lease>,
+    at: Option<OffsetDateTime>,
+) -> (Option<String>, Option<String>) {
+    let holder = || {
+        lease
+            .filter(|l| at.is_none_or(|at| l.until >= at))
+            .map(|l| l.holder.clone())
+    };
+    match event {
+        Event::Created { spec, .. } => (
+            Some(spec.created_by.clone()).filter(|by| !by.is_empty()),
+            None,
+        ),
+        Event::Claimed {
+            holder, attempt, ..
+        } => (Some(holder.clone()), attempt.clone()),
+        Event::ClaimRefused { holder, .. } | Event::LateHandoff { holder, .. } => {
+            (Some(holder.clone()), None)
+        }
+        Event::Promoted { spec, .. } => (Some(spec.by.clone()), None),
+        // the person who approved, as the event records it; never the one it is for
+        Event::Approved(record) => (Some(record.spec.principal.clone()), None),
+        Event::Heartbeat { .. }
+        | Event::Released
+        | Event::HandoffLeft { .. }
+        | Event::Waiting { .. }
+        | Event::EffectBegun { .. } => (holder(), None),
+        // the one who settled it is on the event: the holder, or who reconciled after
+        Event::EffectSettled { by, .. } => (Some(by.clone()), None),
+        Event::Completed { attempt, .. } => (holder(), attempt.clone()),
+        Event::Admitted
+        | Event::Blocked { .. }
+        | Event::Unblocked { .. }
+        | Event::Retriaged { .. }
+        | Event::Invalidated { .. }
+        | Event::Posted { .. }
+        | Event::Arrived { .. }
+        | Event::Rescored { .. }
+        // the event names the position the pin was on, and no person
+        | Event::Unpinned { .. } => (None, None),
+    }
+}
+
+/// The events of `domain` after sequence number `after`, from `rows` in the ledger's
+/// order. The rows hold the earlier events of [`LEASE_KINDS`] too: they say who held
+/// each task, and none of them is given back.
+fn logged(rows: Vec<RawEvent>, domain: &str, after: u64) -> Result<Vec<Logged>, Error> {
+    let mut held: std::collections::HashMap<String, Lease> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let event = Event::parse(&row.task, &row.payload)?;
+        let at = OffsetDateTime::parse(&row.at, &Rfc3339).ok();
+        let (principal, attempt) = who(&event, held.get(&row.task), at);
+        let (own_domain, own_label) = match &event {
+            Event::Claimed { holder, until, .. } => {
+                let lease = Lease {
+                    holder: holder.clone(),
+                    until: *until,
+                };
+                held.insert(row.task.clone(), lease);
+                (None, None)
+            }
+            Event::Heartbeat { until } => {
+                if let Some(lease) = held.get_mut(&row.task) {
+                    lease.until = *until;
+                }
+                (None, None)
+            }
+            // a holder that waits for an outside event gives the task up, as a release does
+            Event::Released | Event::Waiting { .. } => {
+                held.remove(&row.task);
+                (None, None)
+            }
+            // a created event and a promoted one name their own domain and label
+            Event::Created { spec, .. } => (Some(spec.domain.as_str()), Some(spec.classification)),
+            Event::Promoted { spec, .. } => (Some(spec.domain.as_str()), Some(spec.classification)),
+            // an approval names its own domain. It records no label and has no task row,
+            // so it is at the highest label, as an event of a task whose row is gone
+            Event::Approved(record) => (Some(record.spec.domain.as_str()), None),
+            _ => (None, None),
+        };
+        let seq = u64::try_from(row.seq).unwrap_or(0);
+        if seq <= after || own_domain.or(row.domain.as_deref()) != Some(domain) {
+            continue;
+        }
+        let classification = match (own_label, row.label_rank) {
+            (Some(label), _) => label,
+            (None, Some(rank)) => label_from_rank(&row.task, rank)?,
+            // a task whose row is gone: nothing says what it is, so it is the highest
+            (None, None) => Label::Restricted,
+        };
+        out.push(Logged {
+            seq,
+            task: row.task,
+            op: event.kind().to_string(),
+            at: row.at,
+            principal,
+            attempt,
+            classification,
+        });
+    }
+    Ok(out)
 }
 
 /// What a PostgreSQL ledger keeps of a why after the rows are rewritten: the server, not
@@ -728,6 +1152,12 @@ fn promotion_key(entry: &str) -> String {
     format!("promotion:{entry}")
 }
 
+/// The key an approval's event is appended under. A task id starts `task-`, so the two
+/// never meet.
+fn approval_key(target: &str) -> String {
+    format!("approval:{target}")
+}
+
 /// The columns of a promotion row, in the order both backends read them.
 const PROMOTION_COLUMNS: &str =
     "domain, entry, tier, promoter, author, why, label_rank, digest, new_digest, at, why_erased";
@@ -814,14 +1244,7 @@ impl RawTask {
         };
         let requirements = json_list(&self.requirements, "requirements")?;
         let depends_on = json_list(&self.depends_on, "depends_on")?;
-        // a row from before the column has none, and reads as a task with nothing more
-        let extra: Extra = match self.extra.as_deref() {
-            None | Some("") => Extra::default(),
-            Some(text) => serde_json::from_str(text).map_err(|_| Error::BadRow {
-                id: id.clone(),
-                what: format!("extra {text:?}"),
-            })?,
-        };
+        let extra = Extra::parse(&id, self.extra.as_deref())?;
         Ok(Task {
             spec: TaskSpec {
                 domain: self.domain,
@@ -836,6 +1259,13 @@ impl RawTask {
                 priority: self.priority,
                 definition: extra.definition,
                 acceptance: extra.acceptance,
+                outside: extra.outside,
+                parent: extra.parent,
+                scores: extra.scores,
+                implements: extra.implements,
+                reversibility: extra.reversibility,
+                artifacts_touched: extra.artifacts_touched,
+                policy_context: extra.policy_context,
                 position: extra.position,
                 pin_reason: extra.pin_reason,
             },
@@ -849,6 +1279,8 @@ impl RawTask {
             reason: self.reason,
             superseded_by: self.superseded_by,
             posted_to: self.posted_to,
+            waiting_on: extra.waits_on,
+            effects: extra.effects,
             id,
         })
     }
@@ -859,6 +1291,24 @@ impl RawTask {
 #[must_use]
 pub fn continues(parent: &str) -> String {
     format!("continues:{parent}")
+}
+
+/// The task whose work `task` is under another name: the one it continues, or the one
+/// it retries. An effect of that task that nobody has settled holds this one too.
+pub(crate) fn resumed(task: &Task) -> Option<&str> {
+    let origin = task.spec.origin.as_deref()?;
+    origin
+        .strip_prefix("continues:")
+        .or_else(|| origin.strip_prefix("retries:"))
+}
+
+/// The task a filing with this origin is filed from: the one it continues, retries, or
+/// is a part of.
+fn filed_from_of(origin: Option<&str>) -> Option<&str> {
+    let origin = origin?;
+    ["continues:", "retries:", "task:"]
+        .iter()
+        .find_map(|p| origin.strip_prefix(p))
 }
 
 /// Whether a claimant in `seat` takes a task filed as `spec`, as far as positions go. A
@@ -891,15 +1341,16 @@ fn matches_task(task: &Task, who: Claimer<'_>) -> bool {
 }
 
 /// Whether `who` may claim `task` now: it is admitted, or claimed under a lease that has
-/// run out, and `who` matches it. Whether its dependencies are complete is the backend's
-/// question, asked inside the transaction.
+/// run out; nothing holds it back, an event it waits on or an effect nobody has settled;
+/// and `who` matches it. Whether its dependencies are complete is the backend's question,
+/// asked inside the transaction.
 fn claimable(task: &Task, now: OffsetDateTime, who: Claimer<'_>) -> bool {
     let lease_live = task.lease_until.is_some_and(|t| t >= now);
     // a blocked task is a candidate too: the backend asks whether its dependencies are
     // done, so one whose last dependency closed without the event reaching it is not lost
     let state = matches!(task.status, Status::Open | Status::Blocked)
         || (task.status == Status::Claimed && !lease_live);
-    state && matches_task(task, who)
+    state && task.held_back().is_none() && matches_task(task, who)
 }
 
 /// Whether `by` acts under the claim in force: its generation first, since a claim made
@@ -1056,7 +1507,10 @@ impl Ledger {
         self.clock = Box::new(clock);
     }
 
-    fn now(&self) -> OffsetDateTime {
+    /// The ledger's clock. A lease and the expiry of an approval are measured against
+    /// it, so whoever judges one asks the ledger for the time.
+    #[must_use]
+    pub fn now(&self) -> OffsetDateTime {
         (self.clock)()
     }
 
@@ -1071,7 +1525,9 @@ impl Ledger {
     /// # Errors
     ///
     /// [`Error::BadPin`] for a position without a reason, a reason without a position,
-    /// or a position with no name; a database error.
+    /// or a position with no name; [`Error::WrongState`], naming the task, when the
+    /// origin files this one from a task whose work is held by an effect that nobody has
+    /// settled; a database error.
     pub async fn create(&mut self, mut spec: TaskSpec) -> Result<Created, Error> {
         if let (Some(o), Some(u)) = (&spec.origin, &spec.upstream_event) {
             let existing = on_backend!(&self.backend, db => db.find_origin(&spec.domain, o, u))?;
@@ -1083,12 +1539,23 @@ impl Ledger {
             }
         }
         spec.check_pin()?;
+        // the work of a task with an effect that nobody has settled goes to nobody else,
+        // under another task's name either: no continuation, retry or part of it is filed
+        if let Some(from) = filed_from_of(spec.origin.as_deref()) {
+            if let Some(unsettled) = self.unsettled_above(from).await? {
+                return Err(Error::WrongState {
+                    id: unsettled.id,
+                    status: unsettled.status,
+                    op: "hand its work on while an effect of it is not settled",
+                });
+            }
+        }
         self.inherit_pin(&mut spec).await?;
         let id = dm_core::id::new_task_id(&spec.domain);
         let now = self.now();
         let event = Event::Created {
             id: id.clone(),
-            spec,
+            spec: Box::new(spec),
         };
         self.append_at(&id, now, &event).await?;
         Ok(Created {
@@ -1113,6 +1580,29 @@ impl Ledger {
             Ok(_) | Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// The task whose unsettled effect holds the work of `id`: `id` itself, or a task
+    /// that `id` continues or retries, however far up. A task this ledger does not hold
+    /// ends the walk.
+    async fn unsettled_above(&self, id: &str) -> Result<Option<Task>, Error> {
+        let mut seen = std::collections::HashSet::new();
+        let mut up = Some(id.to_string());
+        while let Some(id) = up.take() {
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            let task = match self.get(&id).await {
+                Ok(t) => t,
+                Err(Error::NotFound(_)) => break,
+                Err(e) => return Err(e),
+            };
+            if !task.effects.is_empty() {
+                return Ok(Some(task));
+            }
+            up = resumed(&task).map(str::to_string);
+        }
+        Ok(None)
     }
 
     /// Admit a proposed task, making it claimable.
@@ -1142,7 +1632,8 @@ impl Ledger {
         }
         self.append(id, &Event::Admitted).await?;
         let waits_on = self.not_done(&task.spec.depends_on).await?;
-        if !waits_on.is_empty() {
+        // a task sent back to triage while it waited on an event waits on it still
+        if !waits_on.is_empty() || task.waiting_on.is_some() {
             self.append(id, &Event::Blocked { on: waits_on }).await?;
         }
         self.get(id).await
@@ -1382,6 +1873,11 @@ impl Ledger {
             )
         } else if task.status == Status::Proposed {
             "the task was not admitted".to_string()
+        } else if let Some(held_back) = self.why_held_back(&task).await? {
+            format!(
+                "after the claim of generation {}, {held_back}",
+                task.generation
+            )
         } else {
             // claimable by someone, and still not this session's to take
             format!(
@@ -1499,6 +1995,28 @@ impl Ledger {
         Ok(out)
     }
 
+    /// What holds `task` back from every claim, in words for its record: the event it
+    /// waits on, an effect of it that nobody has settled, or such an effect of the task
+    /// whose work it resumes.
+    async fn why_held_back(&self, task: &Task) -> Result<Option<String>, Error> {
+        if let Some(on) = &task.waiting_on {
+            return Ok(Some(format!("the task waited on {on}")));
+        }
+        if let Some(action) = task.effects.first() {
+            return Ok(Some(format!("effect {action} of the task was not settled")));
+        }
+        let Some(up) = resumed(task) else {
+            return Ok(None);
+        };
+        Ok(self.unsettled_above(up).await?.map(|t| {
+            format!(
+                "effect {} of {}, whose work the task resumes, was not settled",
+                t.effects.first().map_or("", String::as_str),
+                t.id
+            )
+        }))
+    }
+
     /// Renew a lease. Refused when the caller does not hold the task or the lease has
     /// already expired, in which case the task is back in the pool and the caller must
     /// stop. Returns the task so a caller can see an invalidation.
@@ -1551,6 +2069,7 @@ impl Ledger {
                 op: "complete",
             });
         }
+        Self::effects_settled(&task)?;
         let completed = Event::Completed {
             handoff: handoff.to_string(),
             attempt: attempt.map(str::to_string),
@@ -1606,6 +2125,7 @@ impl Ledger {
         let held = task.status == Status::Claimed && task.lease_until.is_some_and(|t| t >= now);
         let resumed_it = continuation.spec.origin.as_deref() == Some(continues(id).as_str())
             && continuation.status == Status::Done;
+        Self::effects_settled(&task)?;
         if task.status.is_terminal() || held || !resumed_it {
             return Err(Error::WrongState {
                 id: id.to_string(),
@@ -1654,6 +2174,240 @@ impl Ledger {
         }
         self.append_held(id, now, by, &Event::Released).await?;
         self.get(id).await
+    }
+
+    /// A task with an effect nobody has settled is not done, whoever says so: whether
+    /// the destination holds the effect is part of what done means.
+    fn effects_settled(task: &Task) -> Result<(), Error> {
+        if task.effects.is_empty() {
+            return Ok(());
+        }
+        Err(Error::WrongState {
+            id: task.id.clone(),
+            status: task.status,
+            op: "complete while an effect of it is not settled",
+        })
+    }
+
+    /// Give a task up until an outside event comes: a check that runs, a reply, a change
+    /// that has not landed. The task is blocked and nobody's to claim until
+    /// [`Ledger::arrived`] is told of `on`; the holder's session can end meanwhile. A
+    /// handoff says where the next holder starts.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`], [`Error::NotHolder`], [`Error::Fenced`], or
+    /// [`Error::WrongState`].
+    pub async fn wait_for(
+        &mut self,
+        id: &str,
+        by: Held<'_>,
+        on: &str,
+        handoff: Option<&str>,
+    ) -> Result<Task, Error> {
+        let now = self.now();
+        let task = self.get(id).await?;
+        if task.status != Status::Claimed {
+            return Err(Error::WrongState {
+                id: id.to_string(),
+                status: task.status,
+                op: "wait",
+            });
+        }
+        if let Some(handoff) = handoff {
+            let left = Event::HandoffLeft {
+                handoff: handoff.to_string(),
+            };
+            self.append_held(id, now, by, &left).await?;
+        }
+        let waiting = Event::Waiting { on: on.to_string() };
+        self.append_held(id, now, by, &waiting).await?;
+        self.get(id).await
+    }
+
+    /// An outside event came: every task of the domain that waited on it waits on it no
+    /// more, and is open again once its dependencies are done. The tasks that waited.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn arrived(&mut self, domain: &str, event: &str) -> Result<Vec<Task>, Error> {
+        let mut woken = Vec::new();
+        // whatever its state says: a task sent back to triage while it waited waits still
+        for status in [Status::Blocked, Status::Proposed, Status::Open] {
+            for t in self.list(domain, status).await? {
+                if t.waiting_on.as_deref() != Some(event) {
+                    continue;
+                }
+                let came = Event::Arrived {
+                    event: event.to_string(),
+                };
+                self.append(&t.id, &came).await?;
+                if status == Status::Blocked && self.not_done(&t.spec.depends_on).await?.is_empty()
+                {
+                    let by = event.to_string();
+                    self.append(&t.id, &Event::Unblocked { by }).await?;
+                }
+                woken.push(self.get(&t.id).await?);
+            }
+        }
+        Ok(woken)
+    }
+
+    /// Record that the holder is about to make an external action, before it makes it.
+    /// From here until [`Ledger::effect_settled`] names the action, nobody else may
+    /// claim the task: a lease that runs out does not say whether the destination holds
+    /// the effect. A retry of the action carries the same id, and is the same effect.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`], [`Error::NotHolder`], or [`Error::Fenced`]: the claim is
+    /// checked in the transaction that records the effect.
+    pub async fn effect_begun(
+        &mut self,
+        id: &str,
+        by: Held<'_>,
+        action: &str,
+    ) -> Result<Task, Error> {
+        let now = self.now();
+        let begun = Event::EffectBegun {
+            action: action.to_string(),
+        };
+        self.append_held(id, now, by, &begun).await?;
+        self.get(id).await
+    }
+
+    /// Record what became of an external action, as `by` found the destination. With
+    /// `held`, it is the holder that says so, and the claim is checked in the
+    /// transaction that records it. Without, it is someone who reconciles after the
+    /// claim: whether `by` may is the caller's rule, and the ledger records who did.
+    /// Asked again for an action already settled with the same outcome, it changes
+    /// nothing. With the last effect settled, a task whose continuation finished
+    /// meanwhile closes, as [`Ledger::close_resumed`] closes it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]; [`Error::WrongState`] for an action the task never began,
+    /// or one already settled with the other outcome; with `held`,
+    /// [`Error::NotHolder`] or [`Error::Fenced`].
+    pub async fn effect_settled(
+        &mut self,
+        id: &str,
+        action: &str,
+        outcome: Outcome,
+        (by, held): (&str, Option<Held<'_>>),
+    ) -> Result<Task, Error> {
+        let task = self.get(id).await?;
+        if !task.effects.iter().any(|a| a == action) {
+            return self.settled_before(task, action, outcome).await;
+        }
+        let settled = Event::EffectSettled {
+            action: action.to_string(),
+            outcome,
+            by: by.to_string(),
+        };
+        match held {
+            Some(held) => {
+                let now = self.now();
+                self.append_held(id, now, held, &settled).await?;
+            }
+            None => self.append(id, &settled).await?,
+        }
+        self.close_after_settlement(id).await?;
+        self.get(id).await
+    }
+
+    /// The answer for an action that is not pending. Settled before with this outcome,
+    /// it is the same settlement, and the task comes back as it is. Settled with the
+    /// other outcome, the record stays as it is and the caller is told: an answer of
+    /// "taken" would say that the record now holds what it does not.
+    async fn settled_before(
+        &self,
+        task: Task,
+        action: &str,
+        outcome: Outcome,
+    ) -> Result<Task, Error> {
+        let op = match self.settlement(&task.id, action).await? {
+            Some((was, _)) if was == outcome => return Ok(task),
+            Some(_) => "settle with another outcome an effect that is settled",
+            None => "settle an effect the task did not begin",
+        };
+        Err(Error::WrongState {
+            id: task.id,
+            status: task.status,
+            op,
+        })
+    }
+
+    /// A completion of a continuation leaves the task it resumed open while an effect of
+    /// that task is not settled. With the last effect settled, the task closes with the
+    /// continuation that finished it. Otherwise its work would be on offer a second time.
+    async fn close_after_settlement(&mut self, id: &str) -> Result<(), Error> {
+        let task = self.get(id).await?;
+        if !task.effects.is_empty() || task.status.is_terminal() {
+            return Ok(());
+        }
+        let marker = continues(id);
+        let finished = self.filed_from(id).await?.into_iter().rev().find(|t| {
+            t.status == Status::Done && t.spec.origin.as_deref() == Some(marker.as_str())
+        });
+        if let Some(continuation) = finished {
+            self.close_resumed(&continuation).await;
+        }
+        Ok(())
+    }
+
+    /// A continuation that is done finishes the task it resumed, and that one the task
+    /// it resumed in turn: up the chain, with the continuation's handoff, while each is
+    /// open, nobody holds it and every effect of it is settled. The chain stops at the
+    /// first task that does not close.
+    pub async fn close_resumed(&mut self, done: &Task) {
+        let Some(handoff) = done.handoff.clone() else {
+            return;
+        };
+        let mut by = done.clone();
+        while let Some(parent) = by
+            .spec
+            .origin
+            .as_deref()
+            .and_then(|o| o.strip_prefix("continues:"))
+            .map(str::to_string)
+        {
+            let Ok(closed) = self
+                .complete_by_continuation(&parent, &by.id, &handoff)
+                .await
+            else {
+                break;
+            };
+            by = closed;
+        }
+    }
+
+    /// How an action of a task was settled, and by whom, when it was.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn settlement(
+        &self,
+        id: &str,
+        action: &str,
+    ) -> Result<Option<(Outcome, String)>, Error> {
+        let payloads = on_backend!(&self.backend, db => db.payloads_of(id, "effect_settled"))?;
+        let mut last = None;
+        for p in payloads {
+            if let Event::EffectSettled {
+                action: a,
+                outcome,
+                by,
+            } = Event::parse(id, &p)?
+            {
+                if a == action {
+                    last = Some((outcome, by));
+                }
+            }
+        }
+        Ok(last)
     }
 
     /// Leave a handoff on a task after the claim it was written under is over: the
@@ -1981,6 +2735,53 @@ impl Ledger {
         on_backend!(&self.backend, db => db.promotions(domain, entry))
     }
 
+    /// Record an approval: one event, projected nowhere. The ledger gives it an id and
+    /// the time of its clock. Nothing is checked and nothing is deduplicated: the same
+    /// spec recorded twice is two approvals, each with its own id.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn record_approval(&mut self, spec: &ApprovalSpec) -> Result<ApprovalRecord, Error> {
+        let record = ApprovalRecord {
+            id: dm_core::id::new_task_id(&spec.domain).replacen("task-", "apr-", 1),
+            spec: spec.clone(),
+            at: self.now(),
+        };
+        on_backend!(&mut self.backend, db => db.record_approval(&record))?;
+        Ok(record)
+    }
+
+    /// The approvals of a domain, oldest first: those of one entry when `target` names
+    /// it, else all of them. Expired ones are returned too; [`ApprovalRecord::expired`]
+    /// says which.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn approvals(
+        &self,
+        domain: &str,
+        target: Option<&str>,
+    ) -> Result<Vec<ApprovalRecord>, Error> {
+        let key = target.map(approval_key);
+        let payloads = match &self.backend {
+            Backend::Sqlite(db) => db.approval_payloads(key.as_deref())?,
+            Backend::Postgres(db) => db.approval_payloads(domain, key.as_deref()).await?,
+        };
+        let mut out = Vec::new();
+        for p in payloads {
+            if let Event::Approved(record) = Event::parse(key.as_deref().unwrap_or("approval"), &p)?
+            {
+                // SQLite keeps every domain's events in one table
+                if record.spec.domain == domain {
+                    out.push(*record);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Remove the why from every promotion record of an entry, for its erasure: the
     /// events that hold it are rewritten and the projection with them, so no replay
     /// brings it back. Who promoted which version to which tier, and when, is kept.
@@ -2079,6 +2880,19 @@ impl Ledger {
     /// A database error.
     pub async fn event_count(&self) -> Result<u64, Error> {
         on_backend!(&self.backend, db => db.event_count())
+    }
+
+    /// The events of `domain` after sequence number `after`, each once, in the order the
+    /// ledger appended them: what the log of the domain copies. `after` is the `seq` of
+    /// the last event a caller has, or zero. A domain the ledger has no event of gives
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn events_after(&self, domain: &str, after: u64) -> Result<Vec<Logged>, Error> {
+        let rows = on_backend!(&self.backend, db => db.events_after(domain, after))?;
+        logged(rows, domain, after)
     }
 
     /// Drop the projection and replay every event into a fresh one. Returns the number
@@ -2288,6 +3102,14 @@ mod tests {
         two_claimers_on_two_connections_get_two_tasks,
         a_domain_claims_only_its_own_queue,
         a_rescore_moves_the_queue_and_keeps_the_filed_priority,
+        a_task_that_waits_on_an_event_is_nobody_s_until_the_event_comes,
+        an_effect_not_settled_holds_the_task_past_its_lease,
+        a_settled_effect_gives_the_task_back_and_fences_who_began_it,
+        a_task_keeps_the_rest_of_its_record,
+        a_task_sent_back_to_triage_while_it_waits_still_waits,
+        no_work_is_filed_from_a_task_whose_effect_is_not_settled,
+        a_task_that_resumes_one_with_an_unsettled_effect_is_nobody_s,
+        a_task_closes_with_its_done_continuation_when_its_last_effect_is_settled,
         a_task_waits_on_its_continuation,
         a_task_closes_with_its_continuation,
         a_continuation_given_up_on_gives_its_task_back,
@@ -2299,6 +3121,10 @@ mod tests {
         a_restored_record_keeps_its_time_and_its_erased_why,
         an_erasure_rewrites_the_tasks_filed_from_an_origin,
         an_erasure_takes_the_reason_and_the_handoff_of_the_tasks_too,
+        an_approval_is_one_event_and_is_read_back_whole,
+        approvals_are_of_one_target_and_one_domain,
+        an_approval_is_no_task_and_a_replay_keeps_it,
+        the_event_of_an_approval_names_its_approver_and_its_own_domain,
         half_a_pin_is_refused_and_nothing_is_filed,
         a_pinned_task_goes_only_to_a_claimant_that_fills_its_position,
         a_claim_of_a_pinned_task_from_outside_its_position_is_refused_and_recorded,
@@ -2309,6 +3135,17 @@ mod tests {
         a_continuation_of_a_pinned_task_takes_its_pin,
         a_position_is_seated_while_a_claim_made_from_it_is_under_a_live_lease,
         the_tasks_pinned_to_a_position_are_its_open_ones_in_queue_order,
+        a_pinned_task_that_is_held_back_goes_to_nobody_and_keeps_its_pin,
+        an_unpin_leaves_an_effect_that_is_not_settled_and_the_task_stays_held_back,
+        the_event_of_an_unpin_names_no_principal,
+        events_after_gives_each_event_of_a_domain_once_in_the_ledger_s_order,
+        events_after_gives_only_the_events_after_the_number_given,
+        the_events_of_a_wait_and_of_an_effect_name_who_caused_them,
+        each_event_given_names_its_task_its_kind_its_principal_and_its_attempt_key,
+        a_completion_by_a_continuation_names_no_principal,
+        a_completion_after_the_lease_ran_out_names_no_principal,
+        the_events_given_hold_no_text_of_a_task_or_of_a_promotion,
+        a_task_filed_as_outside_keeps_it_and_another_task_does_not,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -2634,6 +3471,26 @@ mod tests {
         assert_eq!(l.get(&rests.id).await.unwrap().status, Status::Proposed);
     }
 
+    async fn a_task_filed_as_outside_keeps_it_and_another_task_does_not(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let mut from_outside = spec("From a tap");
+        from_outside.outside = true;
+        let marked = l.create(from_outside).await.unwrap().task;
+        let plain = l.create(spec("From the fleet")).await.unwrap().task;
+        for after in ["create", "replay"] {
+            assert!(l.get(&marked.id).await.unwrap().spec.outside, "{after}");
+            assert!(!l.get(&plain.id).await.unwrap().spec.outside, "{after}");
+            let listed = l.list("dom-a", Status::Proposed).await.unwrap();
+            let outside: Vec<(&str, bool)> = listed
+                .iter()
+                .map(|t| (t.id.as_str(), t.spec.outside))
+                .collect();
+            assert!(outside.contains(&(marked.id.as_str(), true)), "{after}");
+            assert!(outside.contains(&(plain.id.as_str(), false)), "{after}");
+            l.rebuild().await.unwrap();
+        }
+    }
+
     /// A ledger file from before a task carried a definition: no `extra` column.
     #[tokio::test]
     async fn on_sqlite_a_ledger_from_before_the_extra_column_is_given_it() {
@@ -2649,6 +3506,7 @@ mod tests {
             .unwrap();
         let mut l = Ledger::open(&file).unwrap();
         assert_eq!(l.get(&id).await.unwrap().spec.definition, None);
+        assert!(!l.get(&id).await.unwrap().spec.outside);
         let mut defined = spec("New");
         defined.definition = Some("review-change@mem-p-1".into());
         defined.acceptance = vec!["It is checked.".into()];
@@ -3937,6 +4795,217 @@ mod tests {
         assert_eq!(l.list("dom-a", Status::Open).await.unwrap().len(), 1);
     }
 
+    fn approval(domain: &str, target: &str) -> ApprovalSpec {
+        ApprovalSpec {
+            domain: domain.into(),
+            principal: "human:test:me".into(),
+            action: "erase".into(),
+            target: target.into(),
+            version: "d1".into(),
+            scope: "agent:test:asker".into(),
+            expires: T0 + Duration::hours(24),
+        }
+    }
+
+    async fn an_approval_is_one_event_and_is_read_back_whole(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        // a time with a fraction, which the text of the event must keep
+        let at = T0 + Duration::milliseconds(90_500);
+        *now.lock().unwrap() = at;
+        let events = l.event_count().await.unwrap();
+        let spec = approval("dom-a", "mem-a-1");
+        let first = l.record_approval(&spec).await.unwrap();
+        assert!(first.id.starts_with("apr-"), "{}", first.id);
+        assert_eq!((&first.spec, first.at), (&spec, at));
+        assert_eq!(l.event_count().await.unwrap(), events + 1, "one event");
+        assert_eq!(
+            l.approvals("dom-a", Some("mem-a-1")).await.unwrap(),
+            vec![first.clone()]
+        );
+        the_event_holds_the_approval_and_nothing_else(b, &first).await;
+        the_same_spec_again_is_another_approval(&mut l, first, events).await;
+    }
+
+    /// The log of a domain takes an approval as it takes a promotion: the event names
+    /// the person who approved and never the principal it is for, it is given to its own
+    /// domain alone, and it is at the highest label, since an approval records none.
+    async fn the_event_of_an_approval_names_its_approver_and_its_own_domain(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        for (domain, target) in [("dom-a", "mem-a-1"), ("dom-b", "mem-b-1")] {
+            l.record_approval(&approval(domain, target)).await.unwrap();
+        }
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let seen: Vec<_> = got
+            .iter()
+            .map(|e| {
+                let (who, attempt) = (e.principal.as_deref(), e.attempt.as_deref());
+                (
+                    e.op.as_str(),
+                    e.task.as_str(),
+                    who,
+                    attempt,
+                    e.classification,
+                )
+            })
+            .collect();
+        let approver = Some("human:test:me");
+        let expected = (
+            "approved",
+            "approval:mem-a-1",
+            approver,
+            None,
+            Label::Restricted,
+        );
+        assert_eq!(seen, vec![expected], "{got:?}");
+        let other = l.events_after("dom-b", 0).await.unwrap();
+        let tasks: Vec<&str> = other.iter().map(|e| e.task.as_str()).collect();
+        assert_eq!(tasks, ["approval:mem-b-1"], "{other:?}");
+        let after = l.events_after("dom-a", got[0].seq).await.unwrap();
+        assert!(after.is_empty(), "{after:?}");
+    }
+
+    async fn the_same_spec_again_is_another_approval(
+        l: &mut Ledger,
+        first: ApprovalRecord,
+        events: u64,
+    ) {
+        let second = l.record_approval(&first.spec).await.unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(l.event_count().await.unwrap(), events + 2);
+        assert_eq!(
+            l.approvals("dom-a", Some("mem-a-1")).await.unwrap(),
+            vec![first, second],
+            "oldest first"
+        );
+    }
+
+    async fn the_event_holds_the_approval_and_nothing_else(b: &Site, record: &ApprovalRecord) {
+        let payloads = b.payloads().await;
+        assert_eq!(payloads.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "action",
+                "at",
+                "domain",
+                "expires",
+                "id",
+                "kind",
+                "principal",
+                "scope",
+                "target",
+                "version"
+            ]
+        );
+        assert_eq!(v["kind"], "approved");
+        assert_eq!(v["id"], record.id.as_str());
+        assert_eq!(v["at"], "2026-10-01T10:01:30.5Z");
+    }
+
+    async fn approvals_are_of_one_target_and_one_domain(b: &Site) {
+        let mut l = b.open().await;
+        // neither domain has filed a task: an approval is the first thing each records
+        let one = l
+            .record_approval(&approval("dom-a", "mem-a-1"))
+            .await
+            .unwrap();
+        let two = l
+            .record_approval(&approval("dom-a", "mem-a-2"))
+            .await
+            .unwrap();
+        // the same entry id, in another domain
+        let elsewhere = l
+            .record_approval(&approval("dom-b", "mem-a-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            l.approvals("dom-a", Some("mem-a-1")).await.unwrap(),
+            vec![one.clone()],
+            "not another target's, and not another domain's"
+        );
+        assert_eq!(
+            l.approvals("dom-a", Some("mem-a-2")).await.unwrap(),
+            vec![two.clone()]
+        );
+        assert_eq!(l.approvals("dom-a", None).await.unwrap(), vec![one, two]);
+        the_other_domain_lists_its_own(&l, elsewhere).await;
+    }
+
+    async fn the_other_domain_lists_its_own(l: &Ledger, elsewhere: ApprovalRecord) {
+        assert_eq!(
+            l.approvals("dom-b", None).await.unwrap(),
+            vec![elsewhere.clone()]
+        );
+        assert_eq!(
+            l.approvals("dom-b", Some("mem-a-1")).await.unwrap(),
+            vec![elsewhere]
+        );
+        assert!(l
+            .approvals("dom-b", Some("mem-a-2"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(l.approvals("dom-c", None).await.unwrap().is_empty());
+    }
+
+    async fn an_approval_is_no_task_and_a_replay_keeps_it(b: &Site) {
+        let mut l = b.open().await;
+        let parent = admitted(&mut l, spec("A task beside it")).await;
+        let record = l
+            .record_approval(&approval("dom-a", "mem-a-1"))
+            .await
+            .unwrap();
+        no_task_query_finds_the_approval(&l, &parent, &record).await;
+        let before = l.approvals("dom-a", None).await.unwrap();
+        assert_eq!(before, vec![record.clone()]);
+        assert_eq!(l.rebuild().await.unwrap(), 3, "created, admitted, approved");
+        assert_eq!(l.approvals("dom-a", None).await.unwrap(), before);
+        assert_eq!(l.get(&parent.id).await.unwrap(), parent);
+        no_task_query_finds_the_approval(&l, &parent, &record).await;
+    }
+
+    async fn no_task_query_finds_the_approval(l: &Ledger, parent: &Task, record: &ApprovalRecord) {
+        only_the_task_is_listed(l, parent).await;
+        for name in [record.id.as_str(), "approval:mem-a-1", "mem-a-1"] {
+            assert!(
+                l.with_origin("dom-a", name).await.unwrap().is_empty(),
+                "{name}"
+            );
+            assert!(l.filed_from(name).await.unwrap().is_empty(), "{name}");
+            assert!(l.dependents(name).await.unwrap().is_empty(), "{name}");
+        }
+        assert!(l.unposted("dom-a").await.unwrap().is_empty());
+        for id in [record.id.as_str(), "approval:mem-a-1"] {
+            assert!(matches!(l.get(id).await, Err(Error::NotFound(_))), "{id}");
+        }
+    }
+
+    /// The text of a time does not order as the time does: `10:00:00Z` sorts after
+    /// `10:00:00.5Z`, and `10:00:00.5Z` after `10:00:00.50001Z`.
+    #[test]
+    fn an_approval_is_expired_at_its_expiry_and_after_it_and_not_before() {
+        let at = |s: &str| OffsetDateTime::parse(s, &Rfc3339).unwrap();
+        let until = |expires: &str| ApprovalRecord {
+            id: "apr-a-1".into(),
+            spec: ApprovalSpec {
+                expires: at(expires),
+                ..approval("dom-a", "mem-a-1")
+            },
+            at: T0,
+        };
+        let half = until("2026-10-01T10:00:00.5Z");
+        assert!(!half.expired(at("2026-10-01T10:00:00.123Z")), "before");
+        assert!(!half.expired(at("2026-10-01T10:00:00Z")), "before");
+        assert!(half.expired(at("2026-10-01T10:00:00.5Z")), "at its expiry");
+        assert!(half.expired(at("2026-10-01T10:00:00.50001Z")), "after");
+        let whole = until("2026-10-01T10:00:00Z");
+        assert!(whole.expired(at("2026-10-01T10:00:00.5Z")), "after");
+        assert!(!whole.expired(at("2026-10-01T09:59:59.999Z")), "before");
+    }
+
     async fn invalidate_is_terminal(l: &mut Ledger, t: &Task) {
         let t = l
             .invalidate(&t.id, "duplicate", Some("task-a-other"))
@@ -4072,6 +5141,224 @@ mod tests {
         l.invalidate(&b.id, "obsolete", None).await.unwrap();
         assert_eq!(l.event_count().await.unwrap(), 9);
         (a, b)
+    }
+
+    /// Each event as the task and what happened to it.
+    fn ops(events: &[Logged]) -> Vec<(&str, &str)> {
+        events
+            .iter()
+            .map(|e| (e.task.as_str(), e.op.as_str()))
+            .collect()
+    }
+
+    async fn events_after_gives_each_event_of_a_domain_once_in_the_ledger_s_order(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let (a, second) = nine_events(&mut l, &now).await;
+        let elsewhere = TaskSpec {
+            domain: "dom-b".into(),
+            ..spec("In b")
+        };
+        let other = admitted(&mut l, elsewhere).await;
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let (a, second) = (a.id.as_str(), second.id.as_str());
+        assert_eq!(
+            ops(&got),
+            [
+                (a, "created"),
+                (a, "admitted"),
+                (a, "claimed"),
+                (a, "heartbeat"),
+                (a, "released"),
+                (a, "claimed"),
+                (a, "completed"),
+                (second, "created"),
+                (second, "invalidated"),
+                ("promotion:mem-a-1", "promoted"),
+            ]
+        );
+        assert!(got.windows(2).all(|w| w[0].seq < w[1].seq), "{got:?}");
+        let got = l.events_after("dom-b", 0).await.unwrap();
+        let other = other.id.as_str();
+        assert_eq!(ops(&got), [(other, "created"), (other, "admitted")]);
+        assert!(l.events_after("dom-none", 0).await.unwrap().is_empty());
+    }
+
+    async fn the_events_of_a_wait_and_of_an_effect_name_who_caused_them(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Post, then wait")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        l.effect_settled(&t.id, "act-1", Outcome::Applied, ("human:a:x", None))
+            .await
+            .unwrap();
+        l.wait_for(&t.id, by, "check:1", Some("mem-a-h1"))
+            .await
+            .unwrap();
+        l.arrived("dom-a", "check:1").await.unwrap();
+        let events = l.events_after("dom-a", 0).await.unwrap();
+        let by_op = |op: &str| -> Vec<Option<String>> {
+            let of_op = events.iter().filter(|e| e.op == op);
+            of_op.map(|e| e.principal.clone()).collect()
+        };
+        let s1 = Some("s1".to_string());
+        assert_eq!(by_op("effect_begun"), vec![s1.clone()]);
+        assert_eq!(by_op("effect_settled"), vec![Some("human:a:x".to_string())]);
+        // the handoff left before the wait, and the wait: the holder's. What comes
+        // after the wait is nobody's, since the wait gave the task up
+        assert_eq!(by_op("handoff_left"), vec![s1.clone()]);
+        assert_eq!(by_op("waiting"), vec![s1]);
+        assert_eq!(by_op("arrived"), vec![None]);
+        assert_eq!(by_op("unblocked"), vec![None]);
+    }
+
+    async fn events_after_gives_only_the_events_after_the_number_given(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        nine_events(&mut l, &now).await;
+        let all = l.events_after("dom-a", 0).await.unwrap();
+        assert_eq!(all.len(), 9);
+        // from the heartbeat on: the release after it is by the holder of a claim from
+        // before the number given, and is given as it was
+        assert_eq!(all[4].principal.as_deref(), Some("s1"), "{:?}", all[4]);
+        let rest = l.events_after("dom-a", all[3].seq).await.unwrap();
+        assert_eq!(rest, all[4..]);
+        let last = all[8].seq;
+        assert!(l.events_after("dom-a", last).await.unwrap().is_empty());
+    }
+
+    async fn each_event_given_names_its_task_its_kind_its_principal_and_its_attempt_key(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let internal = TaskSpec {
+            classification: Label::Internal,
+            ..spec("Keyed")
+        };
+        let t = admitted(&mut l, internal).await;
+        let c = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
+        assert_eq!(c.task.id, t.id);
+        assert!(is_wrong_state(&claim(&mut l, &t.id, "s2", mins(5)).await));
+        *now.lock().unwrap() = T0 + mins(2);
+        l.heartbeat_as(&t.id, "s1", mins(30)).await.unwrap();
+        l.complete_once(&t.id, held("s1", 1), "mem-a-h", "done-1")
+            .await
+            .unwrap();
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let named: Vec<(&str, Option<&str>, Option<&str>)> = got
+            .iter()
+            .map(|e| (e.op.as_str(), e.principal.as_deref(), e.attempt.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("created", Some("human:test:me"), None),
+                ("admitted", None, None),
+                ("claimed", Some("s1"), Some("key-1")),
+                ("claim_refused", Some("s2"), None),
+                ("heartbeat", Some("s1"), None),
+                ("completed", Some("s1"), Some("done-1")),
+                ("promoted", Some("agent:curator"), None),
+            ]
+        );
+        assert!(got[..6].iter().all(|e| e.task == t.id), "{got:?}");
+        each_event_given_is_classified_as_its_task_is(&mut l, &got).await;
+    }
+
+    /// `got` is of an internal task and an internal promotion.
+    async fn each_event_given_is_classified_as_its_task_is(l: &mut Ledger, got: &[Logged]) {
+        assert!(
+            got.iter().all(|e| e.classification == Label::Internal),
+            "{got:?}"
+        );
+        let public = admitted(l, spec("Public")).await;
+        let after = got.last().unwrap().seq;
+        let got = l.events_after("dom-a", after).await.unwrap();
+        assert_eq!(ops(&got)[0], (public.id.as_str(), "created"));
+        assert!(got.iter().all(|e| e.classification == Label::Public));
+    }
+
+    async fn a_completion_by_a_continuation_names_no_principal(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let (parent, child, cont) = delegated(&mut l).await;
+        claim(&mut l, &child.id, "s2", mins(5)).await.unwrap();
+        l.complete_as(&child.id, "s2", "mem-a-child").await.unwrap();
+        claim(&mut l, &cont.id, "s3", mins(5)).await.unwrap();
+        l.complete_as(&cont.id, "s3", "mem-a-done").await.unwrap();
+        l.complete_by_continuation(&parent.id, &cont.id, "mem-a-done")
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let of_parent: Vec<(&str, Option<&str>)> = got
+            .iter()
+            .filter(|e| e.task == parent.id)
+            .map(|e| (e.op.as_str(), e.principal.as_deref()))
+            .collect();
+        // s1 held it, left a handoff and released it: the completion after is nobody's
+        assert_eq!(
+            of_parent[2..],
+            [
+                ("claimed", Some("s1")),
+                ("handoff_left", Some("s1")),
+                ("released", Some("s1")),
+                ("completed", None),
+            ]
+        );
+        let by_holder = got
+            .iter()
+            .find(|e| e.task == cont.id && e.op == "completed");
+        assert_eq!(by_holder.unwrap().principal.as_deref(), Some("s3"));
+    }
+
+    async fn a_completion_after_the_lease_ran_out_names_no_principal(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let parent = admitted(&mut l, spec("Compare two decisions")).await;
+        claim(&mut l, &parent.id, "s1", mins(5)).await.unwrap();
+        let cont = admitted(&mut l, resume(&parent, &[])).await;
+        // s1 did not release it: its lease ran out, and the continuation closed the task
+        *now.lock().unwrap() = T0 + mins(10);
+        claim(&mut l, &cont.id, "s3", mins(5)).await.unwrap();
+        l.complete_as(&cont.id, "s3", "mem-a-done").await.unwrap();
+        l.complete_by_continuation(&parent.id, &cont.id, "mem-a-done")
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let closed = got
+            .iter()
+            .find(|e| e.task == parent.id && e.op == "completed");
+        assert_eq!(closed.unwrap().principal, None, "{got:?}");
+    }
+
+    async fn the_events_given_hold_no_text_of_a_task_or_of_a_promotion(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Rotate the signing key")).await;
+        claim(&mut l, &t.id, "s1", mins(5)).await.unwrap();
+        l.release_as(&t.id, "s1", Some("mem-a-left")).await.unwrap();
+        claim(&mut l, &t.id, "s1", mins(5)).await.unwrap();
+        l.complete_as(&t.id, "s1", "mem-a-handoff").await.unwrap();
+        let dropped = admitted(&mut l, spec("Second")).await;
+        l.invalidate(&dropped.id, "the vault moved", None)
+            .await
+            .unwrap();
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        assert_eq!(got.len(), 11, "{got:?}");
+        let json = serde_json::to_string(&got).unwrap();
+        for text in [
+            "Rotate the signing key",
+            "Do it.",
+            "mem-a-left",
+            "mem-a-handoff",
+            "the vault moved",
+            "checked against the tree",
+        ] {
+            assert!(!json.contains(text), "{text:?} in {json}");
+        }
     }
 
     async fn not_found_and_persistence(b: &Site) {
@@ -4286,6 +5573,53 @@ mod tests {
         );
     }
 
+    /// PostgreSQL gives an event its number at the insert, and not at the commit. Without
+    /// the lock, the second append here commits number 4 while number 3 is in flight, a
+    /// copy that reads then moves its cursor to 4, and number 3 is never copied.
+    #[tokio::test]
+    async fn on_postgres_an_append_waits_for_the_append_in_flight_in_its_domain() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        let a = l.create(spec("A")).await.unwrap().task;
+        let b = l.create(spec("B")).await.unwrap().task;
+        // an append in flight, as the ledger makes one: it holds the lock of the domain,
+        // its row has its number, and it has not committed
+        let mut c = pg_client(&server).await;
+        let tx = c.transaction().await.unwrap();
+        crate::postgres::lock_domain(&tx, "dom-a").await.unwrap();
+        let s = crate::postgres::schema_for("dom-a");
+        let admitted = Event::Admitted;
+        tx.execute(
+            &format!("INSERT INTO {s}.events (task_id, kind, at, payload) VALUES ($1, $2, $3, $4)"),
+            &[
+                &a.id,
+                &admitted.kind(),
+                &fmt_time(T0),
+                &admitted.payload(&a.id).unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        // another connection appends an event of another task of the domain
+        let mut other = Ledger::connect(server.url()).await.unwrap();
+        let second = other.admit(&b.id);
+        tokio::pin!(second);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut second).await;
+        assert!(early.is_err(), "the second append waits for the first");
+        let seqs = |events: Vec<Logged>| events.into_iter().map(|e| e.seq).collect::<Vec<_>>();
+        let seen = seqs(l.events_after("dom-a", 0).await.unwrap());
+        tx.commit().await.unwrap();
+        second.await.unwrap();
+        // a copy that read while the first was in flight goes on from its last number
+        let cursor = seen.last().copied().unwrap_or(0);
+        let rest = seqs(l.events_after("dom-a", cursor).await.unwrap());
+        let all = seqs(l.events_after("dom-a", 0).await.unwrap());
+        assert_eq!(all.len(), 4, "{all:?}");
+        assert_eq!([seen, rest].concat(), all, "and misses no event");
+    }
+
     #[tokio::test]
     async fn on_postgres_a_ledger_from_before_domain_schemas_moves_into_them() {
         let Some(server) = PgServer::start().await.unwrap() else {
@@ -4306,10 +5640,10 @@ mod tests {
             let id = dm_core::id::new_task_id(domain);
             let created = Event::Created {
                 id: id.clone(),
-                spec: TaskSpec {
+                spec: Box::new(TaskSpec {
                     domain: domain.into(),
                     ..spec("Old")
-                },
+                }),
             };
             let mut events = vec![created];
             if admit {
@@ -4568,6 +5902,400 @@ mod tests {
         assert_eq!(attr(2, "task.generation"), Some(Value::I64(1)));
         assert_eq!(attr(3, "task.status"), Some(Value::from("done")));
         assert_eq!(attr(3, "memory.domain"), Some(Value::from("dom-a")));
+    }
+
+    async fn a_task_that_waits_on_an_event_is_nobody_s_until_the_event_comes(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Open the change and wait for its check")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        let parked = l
+            .wait_for(&t.id, by, "check:42", Some("mem-a-h1"))
+            .await
+            .unwrap();
+        it_is_parked(&parked);
+        // its dependencies are done and no lease is live, and still nobody gets it
+        assert!(next(&mut l, "s2", mins(30)).await.is_none());
+        *now.lock().unwrap() = T0 + mins(90);
+        nobody_gets_it(&mut l, &t.id).await;
+        // and its record says what the claim lost to
+        assert_eq!(
+            last_refusal(&l, &t.id).await,
+            (
+                "s2".to_string(),
+                "after the claim of generation 1, the task waited on check:42".to_string()
+            )
+        );
+        it_waits_through_a_replay(&mut l, &t.id, by).await;
+        only_its_event_wakes_it(&mut l, &t).await;
+        the_woken_task_is_claimed_again(&mut l, &t).await;
+    }
+
+    fn it_is_parked(parked: &Task) {
+        assert_eq!(parked.status, Status::Blocked);
+        assert_eq!(parked.waiting_on.as_deref(), Some("check:42"));
+        assert_eq!(parked.holder, None);
+        assert_eq!(parked.handoff.as_deref(), Some("mem-a-h1"));
+        assert_eq!(parked.held_back().as_deref(), Some("waits on check:42"));
+    }
+
+    async fn it_waits_through_a_replay(l: &mut Ledger, id: &str, by: Held<'_>) {
+        // who gave it up holds it no more
+        assert!(is_not_holder(&l.heartbeat(id, by, mins(30)).await));
+        // a replay reads the same from the events
+        l.rebuild().await.unwrap();
+        let replayed = l.get(id).await.unwrap();
+        assert_eq!(replayed.waiting_on.as_deref(), Some("check:42"));
+        assert!(next(l, "s2", mins(30)).await.is_none());
+    }
+
+    /// Neither the next claim nor a claim by name gets the task.
+    async fn nobody_gets_it(l: &mut Ledger, id: &str) {
+        assert!(next(l, "s2", mins(30)).await.is_none());
+        assert!(is_wrong_state(&claim(l, id, "s2", mins(30)).await));
+    }
+
+    /// The last refused claim on the task's record: who asked, and why not.
+    async fn last_refusal(l: &Ledger, id: &str) -> (String, String) {
+        l.refused_claims(id).await.unwrap().pop().unwrap()
+    }
+
+    async fn only_its_event_wakes_it(l: &mut Ledger, t: &Task) {
+        assert!(l.arrived("dom-a", "check:41").await.unwrap().is_empty());
+        assert!(l.arrived("dom-b", "check:42").await.unwrap().is_empty());
+        assert!(next(l, "s2", mins(30)).await.is_none());
+        let woken = l.arrived("dom-a", "check:42").await.unwrap();
+        assert_eq!(woken.len(), 1);
+        assert_eq!(woken[0].id, t.id);
+        assert_eq!(woken[0].status, Status::Open);
+        assert_eq!(woken[0].waiting_on, None);
+    }
+
+    async fn the_woken_task_is_claimed_again(l: &mut Ledger, t: &Task) {
+        // told twice, the event wakes nothing more
+        assert!(l.arrived("dom-a", "check:42").await.unwrap().is_empty());
+        let c = next(l, "s2", mins(30)).await.unwrap();
+        assert_eq!(c.task.id, t.id);
+        assert_eq!(c.generation, 2);
+        assert_eq!(c.task.handoff.as_deref(), Some("mem-a-h1"));
+        assert!(is_fenced(
+            &l.wait_for(&t.id, held("s1", 1), "check:43", None).await,
+            1,
+            2
+        ));
+    }
+
+    async fn an_effect_not_settled_holds_the_task_past_its_lease(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Post the release note")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        // the retry of the action is the same effect
+        let again = l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        assert_eq!(again.effects, vec!["act-1".to_string()]);
+        // its holder cannot call it done while nobody knows what the destination holds
+        assert!(is_wrong_state(&l.complete(&t.id, by, "mem-a-h").await));
+        // and says what it holds itself while its claim is in force
+        l.effect_begun(&t.id, by, "act-0").await.unwrap();
+        let own = l
+            .effect_settled(&t.id, "act-0", Outcome::Applied, ("s1", Some(by)))
+            .await
+            .unwrap();
+        assert_eq!(own.effects, vec!["act-1".to_string()]);
+        *now.lock().unwrap() = T0 + mins(31);
+        the_lease_that_ran_out_gives_it_to_nobody(&mut l, &t.id).await;
+        the_effect_holds_through_a_replay(&mut l, &t.id, by).await;
+    }
+
+    /// The lease ran out, and that alone gives the task to nobody. Its record says what
+    /// the claim lost to.
+    async fn the_lease_that_ran_out_gives_it_to_nobody(l: &mut Ledger, id: &str) {
+        nobody_gets_it(l, id).await;
+        assert_eq!(
+            last_refusal(l, id).await.1,
+            "after the claim of generation 1, effect act-1 of the task was not settled"
+        );
+    }
+
+    async fn the_effect_holds_through_a_replay(l: &mut Ledger, id: &str, by: Held<'_>) {
+        let held_back = l.get(id).await.unwrap().held_back();
+        assert_eq!(held_back.as_deref(), Some("effect act-1 is not settled"));
+        // nor may the one who lost the lease begin another
+        assert!(is_not_holder(&l.effect_begun(id, by, "act-2").await));
+        l.rebuild().await.unwrap();
+        assert_eq!(l.get(id).await.unwrap().effects, vec!["act-1"]);
+        assert!(next(l, "s2", mins(30)).await.is_none());
+    }
+
+    async fn a_settled_effect_gives_the_task_back_and_fences_who_began_it(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Post the release note")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        *now.lock().unwrap() = T0 + mins(31);
+        not_settled_by_a_wrong_name_or_a_stale_holder(&mut l, &t.id, by).await;
+        assert_eq!(l.settlement(&t.id, "act-1").await.unwrap(), None);
+        let settled = l
+            .effect_settled(&t.id, "act-1", Outcome::NotApplied, ("human:a:x", None))
+            .await
+            .unwrap();
+        assert!(settled.effects.is_empty());
+        assert_eq!(
+            l.settlement(&t.id, "act-1").await.unwrap(),
+            Some((Outcome::NotApplied, "human:a:x".to_string()))
+        );
+        settled_once_and_claimed_again(&mut l, &t, by).await;
+    }
+
+    async fn not_settled_by_a_wrong_name_or_a_stale_holder(l: &mut Ledger, id: &str, by: Held<'_>) {
+        let unknown = l
+            .effect_settled(id, "act-9", Outcome::Applied, ("human:a:x", None))
+            .await;
+        assert!(is_wrong_state(&unknown));
+        // who lost the lease does not say what became of it
+        let stale = l
+            .effect_settled(id, "act-1", Outcome::Applied, ("s1", Some(by)))
+            .await;
+        assert!(is_not_holder(&stale));
+    }
+
+    async fn settled_once_and_claimed_again(l: &mut Ledger, t: &Task, by: Held<'_>) {
+        // said again, it is the same settlement and no second event
+        let events = l.event_count().await.unwrap();
+        l.effect_settled(&t.id, "act-1", Outcome::NotApplied, ("human:a:y", None))
+            .await
+            .unwrap();
+        // said again with the other outcome, it is refused: the record keeps the first
+        let other = l
+            .effect_settled(&t.id, "act-1", Outcome::Applied, ("human:a:y", None))
+            .await;
+        assert!(is_wrong_state(&other), "{other:?}");
+        assert_eq!(l.event_count().await.unwrap(), events);
+        assert_eq!(
+            l.settlement(&t.id, "act-1").await.unwrap(),
+            Some((Outcome::NotApplied, "human:a:x".to_string()))
+        );
+        let c2 = next(l, "s2", mins(30)).await.unwrap();
+        assert_eq!((c2.task.id.as_str(), c2.generation), (t.id.as_str(), 2));
+        // the delayed request of the first holder is refused where the effect is recorded
+        assert!(is_fenced(&l.effect_begun(&t.id, by, "act-1").await, 1, 2));
+        assert!(l.get(&t.id).await.unwrap().effects.is_empty());
+    }
+
+    /// A task that `s1` claimed and gave up for `check:42`, then sent back to triage. No
+    /// call sends a waiting task back today: a task is claimed only when each task it
+    /// depends on is done, and a done task is not invalidated. The events can hold it
+    /// all the same, so the test appends the event.
+    async fn parked_and_sent_back(l: &mut Ledger, title: &str) -> Task {
+        let t = admitted(l, spec(title)).await;
+        let c = claim(l, &t.id, "s1", mins(30)).await.unwrap();
+        l.wait_for(&t.id, held("s1", c.generation), "check:42", None)
+            .await
+            .unwrap();
+        let because = "task-a-gone".to_string();
+        l.append(&t.id, &Event::Retriaged { because })
+            .await
+            .unwrap();
+        let back = l.get(&t.id).await.unwrap();
+        assert_eq!(back.status, Status::Proposed);
+        assert_eq!(back.waiting_on.as_deref(), Some("check:42"));
+        back
+    }
+
+    async fn a_task_sent_back_to_triage_while_it_waits_still_waits(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        // admitted again before the event: it shows as blocked, and it is nobody's
+        let first = parked_and_sent_back(&mut l, "Admitted before the event").await;
+        let again = l.admit(&first.id).await.unwrap();
+        assert_eq!(again.status, Status::Blocked);
+        assert_eq!(again.waiting_on.as_deref(), Some("check:42"));
+        nobody_gets_it(&mut l, &first.id).await;
+        // still in triage when the event comes: the event reaches it there
+        let second = parked_and_sent_back(&mut l, "Admitted after the event").await;
+        // the blocked task first, then the proposed one: the order in which arrived looks
+        let woken = l.arrived("dom-a", "check:42").await.unwrap();
+        let seen: Vec<_> = woken
+            .iter()
+            .map(|t| (t.id.as_str(), t.status, t.waiting_on.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (first.id.as_str(), Status::Open, None),
+                (second.id.as_str(), Status::Proposed, None)
+            ]
+        );
+        assert_eq!(l.admit(&second.id).await.unwrap().status, Status::Open);
+        for id in [&first.id, &second.id] {
+            let c = claim(&mut l, id, "s2", mins(30)).await.unwrap();
+            assert_eq!(c.generation, 2);
+        }
+    }
+
+    /// A task filed from `from` under `kind`: `continues`, `retries` or `task`.
+    fn filed_from(kind: &str, from: &str, title: &str) -> TaskSpec {
+        TaskSpec {
+            origin: Some(format!("{kind}:{from}")),
+            ..spec(title)
+        }
+    }
+
+    async fn no_work_is_filed_from_a_task_whose_effect_is_not_settled(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Post the release note")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        let resumes = l
+            .create(filed_from("continues", &t.id, "Resume"))
+            .await
+            .unwrap()
+            .task;
+        l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        l.release(&t.id, by, None).await.unwrap();
+        nothing_is_filed_from(&mut l, &t.id, &resumes.id).await;
+        // a task filed from nothing this ledger holds is filed as before
+        l.create(filed_from("task", "task-a-nowhere", "Elsewhere"))
+            .await
+            .unwrap();
+        l.effect_settled(&t.id, "act-1", Outcome::NotApplied, ("human:a:x", None))
+            .await
+            .unwrap();
+        let retry = l.create(filed_from("retries", &t.id, "Again")).await;
+        assert_eq!(retry.unwrap().task.status, Status::Proposed);
+    }
+
+    /// No retry, no continuation and no part of `id` is filed, nor a retry of the task
+    /// that resumes it. Each refusal names `id`, and none leaves an event.
+    async fn nothing_is_filed_from(l: &mut Ledger, id: &str, resumes: &str) {
+        let before = l.event_count().await.unwrap();
+        for (kind, from) in [
+            ("retries", id),
+            ("continues", id),
+            ("task", id),
+            ("retries", resumes),
+        ] {
+            let filed = l.create(filed_from(kind, from, "Again")).await;
+            assert!(
+                matches!(&filed, Err(Error::WrongState { id: held, .. }) if held == id),
+                "{kind}:{from} gave {filed:?}"
+            );
+        }
+        assert_eq!(l.event_count().await.unwrap(), before);
+    }
+
+    async fn a_task_that_resumes_one_with_an_unsettled_effect_is_nobody_s(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Post the release note")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        // filed before the effect began, so the filing was not refused
+        let resumes = admitted(&mut l, filed_from("continues", &t.id, "Resume")).await;
+        let again = admitted(&mut l, filed_from("retries", &resumes.id, "Again")).await;
+        l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        l.release(&t.id, by, None).await.unwrap();
+        neither_is_claimed(&mut l, &t.id, [&resumes.id, &again.id]).await;
+        l.effect_settled(&t.id, "act-1", Outcome::Applied, ("human:a:x", None))
+            .await
+            .unwrap();
+        let c2 = claim(&mut l, &resumes.id, "s2", mins(30)).await.unwrap();
+        assert_eq!(c2.generation, 1);
+    }
+
+    /// Nobody gets the task that resumes `id`, or the retry of that task, by the next
+    /// claim or by name. The record of the first says which effect the claim lost to.
+    async fn neither_is_claimed(l: &mut Ledger, id: &str, resuming: [&String; 2]) {
+        assert!(next(l, "s2", mins(30)).await.is_none());
+        for r in resuming {
+            assert!(is_wrong_state(&claim(l, r, "s2", mins(30)).await));
+        }
+        assert_eq!(
+            last_refusal(l, resuming[0]).await.1,
+            format!(
+                "after the claim of generation 0, effect act-1 of {id}, whose work the task resumes, was not settled"
+            )
+        );
+    }
+
+    async fn a_task_closes_with_its_done_continuation_when_its_last_effect_is_settled(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        // a root that was given up, the task that resumes it, and the task that resumes that
+        let root = given_up(&mut l, "Ship the release").await;
+        let t = admitted(&mut l, filed_from("continues", &root.id, "Resume")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let resumes = admitted(&mut l, filed_from("continues", &t.id, "Resume")).await;
+        let c2 = claim(&mut l, &resumes.id, "s2", mins(120)).await.unwrap();
+        // its holder begins an effect while the continuation runs, and its lease runs out
+        l.effect_begun(&t.id, held("s1", c.generation), "act-1")
+            .await
+            .unwrap();
+        *now.lock().unwrap() = T0 + mins(31);
+        let done = l
+            .complete(&resumes.id, held("s2", c2.generation), "mem-a-h2")
+            .await
+            .unwrap();
+        l.close_resumed(&done).await;
+        the_chain_stays_open_and_nobody_s(&mut l, &t.id, &root.id).await;
+        the_settlement_closes_the_chain(&mut l, &t.id, &root.id).await;
+    }
+
+    /// Not done while nobody knows what the destination holds, and nobody's meanwhile.
+    async fn the_chain_stays_open_and_nobody_s(l: &mut Ledger, id: &str, root: &str) {
+        let left = get_all(l, &[id, root]).await;
+        assert_eq!(left[0].status, Status::Claimed);
+        assert_eq!(left[1].status, Status::Open);
+        assert!(next(l, "s3", mins(30)).await.is_none());
+    }
+
+    /// A task that `s0` claimed and gave back.
+    async fn given_up(l: &mut Ledger, title: &str) -> Task {
+        let t = admitted(l, spec(title)).await;
+        let c = claim(l, &t.id, "s0", mins(30)).await.unwrap();
+        l.release(&t.id, held("s0", c.generation), None)
+            .await
+            .unwrap()
+    }
+
+    /// With `act-1` of `id` settled, `id` and `root` are done with the handoff of the
+    /// continuation. The work was finished once, so nothing is on offer again.
+    async fn the_settlement_closes_the_chain(l: &mut Ledger, id: &str, root: &str) {
+        let settled = l
+            .effect_settled(id, "act-1", Outcome::Applied, ("human:a:x", None))
+            .await
+            .unwrap();
+        assert_eq!(settled.status, Status::Done);
+        assert_eq!(settled.handoff.as_deref(), Some("mem-a-h2"));
+        let root = l.get(root).await.unwrap();
+        assert_eq!(root.status, Status::Done);
+        assert_eq!(root.handoff.as_deref(), Some("mem-a-h2"));
+        assert!(next(l, "s3", mins(30)).await.is_none());
+    }
+
+    async fn a_task_keeps_the_rest_of_its_record(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let mut s = spec("Carry out the decision");
+        s.parent = Some("task-a-1".into());
+        s.scores = Some(Scores {
+            value: 8,
+            urgency: 5,
+            effort: 3,
+            unblocks: vec!["task-a-9".into()],
+        });
+        s.implements = vec!["mem-a-0847".into()];
+        s.reversibility = Some(Reversibility::Irreversible);
+        s.artifacts_touched = vec!["docs/**".into()];
+        s.policy_context = vec!["pol-L1-007".into()];
+        let filed = l.create(s.clone()).await.unwrap().task;
+        assert_eq!(filed.spec, s);
+        drop(l);
+        let l = b.open().await;
+        assert_eq!(l.get(&filed.id).await.unwrap().spec, s);
+        // a task without them says nothing of them
+        let plain = serde_json::to_value(spec("Plain")).unwrap();
+        for absent in ["parent", "scores", "implements", "reversibility"] {
+            assert!(plain.get(absent).is_none(), "{absent}");
+        }
     }
 
     async fn a_rescore_moves_the_queue_and_keeps_the_filed_priority(b: &Site) {
@@ -4873,6 +6601,104 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(after[0].spec.position, None);
         assert_eq!(after[1].spec.position.as_deref(), Some(QA));
+    }
+
+    /// A pinned task that its holder, a session in the position, gave up until the event
+    /// `check:1` comes.
+    async fn pinned_and_waiting(l: &mut Ledger) -> Task {
+        let t = admitted(l, pinned("Announce", QA)).await;
+        let c = claim_from(l, &t.id, "s1", seat(QA)).await.unwrap();
+        l.wait_for(&t.id, held("s1", c.generation), "check:1", None)
+            .await
+            .unwrap();
+        t
+    }
+
+    /// A pinned task with an external action that its holder, a session in the position,
+    /// began and never settled. The lease of that holder ran out.
+    async fn pinned_with_an_effect(l: &mut Ledger, now: &Mutex<OffsetDateTime>) -> Task {
+        let t = admitted(l, pinned("Announce", QA)).await;
+        let c = claim_from(l, &t.id, "s1", seat(QA)).await.unwrap();
+        l.effect_begun(&t.id, held("s1", c.generation), "act-1")
+            .await
+            .unwrap();
+        *now.lock().unwrap() = T0 + mins(31);
+        t
+    }
+
+    /// A claimant in `seat` does not get task `id`: not as the next task, and not by
+    /// name, where the refusal is that of a task nobody may claim now.
+    async fn held_back_from(l: &mut Ledger, id: &str, seat: Option<Seat<'_>>) {
+        assert!(next_from(l, "s2", seat).await.is_none());
+        let asked = claim_from(l, id, "s2", seat).await;
+        assert!(is_wrong_state(&asked));
+    }
+
+    /// Task `id` goes to a claimant that fills `QA`, and to no claimant outside it.
+    async fn only_the_position_gets(l: &mut Ledger, id: &str) {
+        assert!(next_from(l, "s3", None).await.is_none());
+        let outside = claim_from(l, id, "s3", None).await;
+        assert!(is_pinned_to(&outside, QA));
+        let again = next_from(l, "s2", seat(QA)).await.unwrap();
+        assert_eq!(again.task.id, id);
+    }
+
+    async fn a_replay_gives_the_same_task(l: &mut Ledger, id: &str) {
+        let before = l.get(id).await.unwrap();
+        l.rebuild().await.unwrap();
+        assert_eq!(l.get(id).await.unwrap(), before);
+    }
+
+    async fn a_pinned_task_that_is_held_back_goes_to_nobody_and_keeps_its_pin(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = pinned_and_waiting(&mut l).await;
+        // it waits on an event: a session that fills its position does not get it
+        held_back_from(&mut l, &t.id, seat(QA)).await;
+        l.arrived("dom-a", "check:1").await.unwrap();
+        // the event came, and the task is pinned as it was filed
+        let back = l.get(&t.id).await.unwrap();
+        assert_eq!(back.status, Status::Open);
+        assert_eq!(
+            back.spec, t.spec,
+            "the wait changed nothing of what was filed"
+        );
+        only_the_position_gets(&mut l, &t.id).await;
+        a_replay_gives_the_same_task(&mut l, &t.id).await;
+    }
+
+    async fn an_unpin_leaves_an_effect_that_is_not_settled_and_the_task_stays_held_back(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = pinned_with_an_effect(&mut l, &now).await;
+        let unpinned = l.unpin(&t.id, RETIRED).await.unwrap();
+        assert_eq!(unpinned.spec.position, None);
+        assert_eq!(unpinned.effects, ["act-1"], "the effect is still there");
+        // no pin now, and nobody gets it: nobody knows what became of the action
+        held_back_from(&mut l, &t.id, None).await;
+        a_replay_gives_the_same_task(&mut l, &t.id).await;
+        l.effect_settled(&t.id, "act-1", Outcome::NotApplied, ("human:a:x", None))
+            .await
+            .unwrap();
+        let taken = next_from(&mut l, "s2", None).await.unwrap();
+        assert_eq!(taken.task.id, t.id);
+    }
+
+    async fn the_event_of_an_unpin_names_no_principal(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, pinned("Announce", QA)).await;
+        // held under a live lease when the pin leaves: the holder did not take it off
+        claim_from(&mut l, &t.id, "s1", seat(QA)).await.unwrap();
+        l.unpin(&t.id, RETIRED).await.unwrap();
+        let events = l.events_after("dom-a", 0).await.unwrap();
+        let of = |op: &str| -> Vec<&Logged> { events.iter().filter(|e| e.op == op).collect() };
+        let unpinned = of("unpinned");
+        assert_eq!(unpinned.len(), 1, "{events:?}");
+        assert_eq!(unpinned[0].task, t.id);
+        assert_eq!(unpinned[0].principal, None);
+        assert_eq!(unpinned[0].attempt, None);
+        // the claim made from the position names its holder, as any claim does
+        let claimed = of("claimed");
+        assert_eq!(claimed.len(), 1, "{events:?}");
+        assert_eq!(claimed[0].principal.as_deref(), Some("s1"));
     }
 
     /// A pinned task that is done, one that is invalidated, a task never pinned and one

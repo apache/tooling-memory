@@ -27,6 +27,11 @@ could have, so the test can show which step of conformance.py catches it:
     reindex-forgets     reindex drops the ledger
     silent              nothing is ever answered
 
+One value is not a defect of the server. It is a clock that was set back, and a run with
+it must pass:
+
+    clock-back          the wall clock reads an hour ahead at the first write, and is right at the next
+
 Not part of the product: it exists to be imperfect on request.
 """
 
@@ -121,8 +126,11 @@ class Fake:
 
     # ---- entries
     def entries(self, kind=None):
+        """The entries, newest first: the record grows only at its end, so that is the
+        order of the writes, last first. Not the order of `created`: a wall clock that
+        steps back (WSL2's does when it resyncs) dates a later write before an earlier one."""
         es = [e for e in self.state["entries"] if kind is None or e["type"] == kind]
-        return sorted(es, key=lambda e: e["created"], reverse=True)
+        return es[::-1]
 
     def hit(self, e, body=False):
         h = {k: e[k] for k in ("id", "domain", "type", "title", "summary", "classification")}
@@ -167,6 +175,7 @@ class Fake:
         if "body" not in a:
             raise Refused("body is required")
         self.state["seq"] += 1
+        ahead = 3600 if FLAW == "clock-back" and self.state["seq"] == 1 else 0
         body = a["body"]
         first = next((l for l in body.splitlines() if l.strip()), "")
         e = {
@@ -177,7 +186,7 @@ class Fake:
             "summary": a.get("summary") or first,
             "body": body,
             "author": "human:fake:owner",
-            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + f"{self.state['seq']:04d}",
+            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + ahead)),
             "classification": "internal" if FLAW == "write-ignores-label" else a.get("classification") or "internal",
         }
         self.state["entries"].append(e)

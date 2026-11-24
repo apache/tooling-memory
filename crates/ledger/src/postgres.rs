@@ -15,11 +15,17 @@
 //! exactly as it was written and a replay produces the same projection on either side.
 //! A claim takes its candidates `FOR UPDATE SKIP LOCKED`, so two claimers on two
 //! connections cannot both win the same task.
+//!
+//! A row of `events` gets its sequence number when it is inserted, and not when its
+//! transaction commits. So every transaction that appends an event takes the lock of
+//! its domain first, before it locks a row ([`lock_domain`]). The appends of one domain
+//! then commit in the order of their numbers: no event commits below a number that a
+//! reader has seen, and a reader that asks for the events after a number misses none.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimer, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
-    PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, ApprovalRecord, Claimer, Error, Event, Held,
+    PromotionRecord, PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken,
+    Task, TaskSpec, LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -364,9 +370,7 @@ impl Db {
         let tx = self.client.transaction().await?;
         let s = match event {
             Event::Created { spec, .. } => ensure_domain(&tx, &spec.domain).await?,
-            _ => schema_of_task_in(&tx, id)
-                .await?
-                .ok_or_else(|| Error::NotFound(id.to_string()))?,
+            _ => lock_task_domain(&tx, id).await?,
         };
         apply(&tx, &s, id, at, event).await?;
         tx.commit().await?;
@@ -385,8 +389,8 @@ impl Db {
         by: Held<'_>,
         event: &Event,
     ) -> Result<(), Error> {
-        let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
+        let s = lock_task_domain(&tx, id).await?;
         let row = tx
             .query_opt(
                 &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $1 FOR UPDATE"),
@@ -512,6 +516,42 @@ impl Db {
         Ok(true)
     }
 
+    /// Append an approval's event, in one transaction. It projects nothing. The domain's
+    /// schema is made if this is the first thing the domain records.
+    pub(crate) async fn record_approval(&mut self, record: &ApprovalRecord) -> Result<(), Error> {
+        let tx = self.client.transaction().await?;
+        let s = ensure_domain(&tx, &record.spec.domain).await?;
+        let key = crate::approval_key(&record.spec.target);
+        let event = Event::Approved(Box::new(record.clone()));
+        apply(&tx, &s, &key, record.at, &event).await?;
+        tx.commit().await?;
+        self.remember(&record.spec.domain, &s);
+        Ok(())
+    }
+
+    /// The payloads of a domain's approval events, oldest first: those under `key` when
+    /// it is given, else all of them. A domain that has recorded nothing has none.
+    pub(crate) async fn approval_payloads(
+        &self,
+        domain: &str,
+        key: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT payload FROM {s}.events
+                     WHERE kind = 'approved' AND ($1::text IS NULL OR task_id = $1) ORDER BY seq"
+                ),
+                &[&key],
+            )
+            .await?;
+        rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    }
+
     /// Remove the why from an entry's promotion events and rows, in one transaction under
     /// the domain's lock. Returns how many records of the entry hold no why now.
     pub(crate) async fn scrub_promotions(
@@ -633,10 +673,10 @@ impl Db {
         // after a later one with more
         let claimable_now = "status IN ('open', 'blocked', 'claimed')";
         let tx = self.client.transaction().await?;
-        // the claim this key made in this domain, looked for under the domain's lock, so
-        // two connections with one key make one claim
+        // the claim this key made in this domain is looked for under the domain's lock,
+        // so two connections with one key make one claim; and a claim appends an event
+        lock_domain(&tx, domain).await?;
         if let Some(key) = who.attempt {
-            lock_domain(&tx, domain).await?;
             let before = tx
                 .query_opt(
                     &format!(
@@ -697,8 +737,8 @@ impl Db {
             },
             who.1,
         );
-        let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
+        let s = lock_task_domain(&tx, id).await?;
         let taken = take(&tx, &s, id, now, who).await?;
         tx.commit().await?;
         Ok(taken)
@@ -711,8 +751,8 @@ impl Db {
         who: Claimer<'_>,
         until: OffsetDateTime,
     ) -> Result<(), Error> {
-        let s = self.schema_of_task(id).await?;
         let tx = self.client.transaction().await?;
+        let s = lock_task_domain(&tx, id).await?;
         let row = tx
             .query_opt(
                 &format!("SELECT {TASK_COLUMNS} FROM {s}.tasks WHERE id = $1 FOR UPDATE"),
@@ -724,6 +764,7 @@ impl Db {
         if !claimable(&task, now, who)
             || !deps_complete(&tx, &task.spec.depends_on).await?
             || awaits_continuation(&tx, &s, &task.id).await?
+            || resumes_unsettled(&tx, &task).await?
         {
             return Err(Error::WrongState {
                 id: id.to_string(),
@@ -851,6 +892,45 @@ impl Db {
         Ok(n)
     }
 
+    /// The rows of `domain` after sequence number `after`, in order, and before them the
+    /// rows that say who held the tasks those are of. The events are those of the
+    /// domain's schema; a domain without one has none.
+    pub(crate) async fn events_after(
+        &self,
+        domain: &str,
+        after: u64,
+    ) -> Result<Vec<RawEvent>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT e.seq, e.task_id, e.at, e.payload, t.label_rank
+                     FROM {s}.events e LEFT JOIN {s}.tasks t ON t.id = e.task_id
+                     WHERE e.seq > $1 OR (e.kind IN ({LEASE_KINDS})
+                           AND e.task_id IN (SELECT task_id FROM {s}.events WHERE seq > $1))
+                     ORDER BY e.seq"
+                ),
+                &[&after],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(RawEvent {
+                    seq: r.try_get(0)?,
+                    task: r.try_get(1)?,
+                    at: r.try_get(2)?,
+                    payload: r.try_get(3)?,
+                    domain: Some(domain.to_string()),
+                    label_rank: r.try_get(4)?,
+                })
+            })
+            .collect()
+    }
+
     /// Replay every domain's events into a fresh projection, one transaction for all.
     pub(crate) async fn rebuild(&mut self) -> Result<u64, Error> {
         let schemas = self.schemas().await?;
@@ -933,6 +1013,7 @@ async fn take<C: GenericClient>(
     if !claimable(&task, now, who.0)
         || !deps_complete(tx, &task.spec.depends_on).await?
         || awaits_continuation(tx, s, &task.id).await?
+        || resumes_unsettled(tx, &task).await?
     {
         return Ok(false);
     }
@@ -941,14 +1022,34 @@ async fn take<C: GenericClient>(
     Ok(true)
 }
 
-/// Take a domain's lock until the transaction ends.
-async fn lock_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<(), Error> {
+/// Take a domain's lock until the transaction ends. A transaction that appends an event
+/// takes it before the event's row gets its sequence number, and before it locks a row
+/// of `tasks`: two that took a row and the lock in different orders would wait for each
+/// other.
+pub(crate) async fn lock_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<(), Error> {
     conn.execute(
         "SELECT pg_advisory_xact_lock(hashtext('ledger_domain:' || $1))",
         &[&domain],
     )
     .await?;
     Ok(())
+}
+
+/// Take the lock of the domain that task `id` is in, until the transaction ends, and
+/// give the schema of that domain: the first step of a transaction that appends an
+/// event of the task.
+async fn lock_task_domain<C: GenericClient>(conn: &C, id: &str) -> Result<String, Error> {
+    let row = conn
+        .query_opt(
+            "SELECT d.domain, d.schema FROM public.ledger_tasks t
+             JOIN public.ledger_domains d ON d.domain = t.domain WHERE t.id = $1",
+            &[&id],
+        )
+        .await?
+        .ok_or_else(|| Error::NotFound(id.to_string()))?;
+    let (domain, schema): (String, String) = (row.try_get(0)?, row.try_get(1)?);
+    lock_domain(conn, &domain).await?;
+    Ok(schema)
 }
 
 /// Give a domain's schema its promotions table if it has none, under the domain's lock,
@@ -1071,6 +1172,32 @@ async fn awaits_continuation<C: GenericClient>(conn: &C, s: &str, id: &str) -> R
         )
         .await?
         .is_some())
+}
+
+/// Whether the work of `task` is held by an effect that nobody has settled: an effect of
+/// the task it continues or retries, however far up and in whichever domain. Such an
+/// effect holds the work under each of its names, so the task is nobody's to claim.
+async fn resumes_unsettled<C: GenericClient>(conn: &C, task: &Task) -> Result<bool, Error> {
+    let mut seen = std::collections::HashSet::new();
+    let mut up = crate::resumed(task).map(str::to_string);
+    while let Some(id) = up.take() {
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        let Some(s) = schema_of_task_in(conn, &id).await? else {
+            break;
+        };
+        let above = match get_in(conn, &s, &id).await {
+            Ok(t) => t,
+            Err(Error::NotFound(_)) => break,
+            Err(e) => return Err(e),
+        };
+        if !above.effects.is_empty() {
+            return Ok(true);
+        }
+        up = crate::resumed(&above).map(str::to_string);
+    }
+    Ok(false)
 }
 
 /// Drop one domain's projection and replay its events into it.
@@ -1321,6 +1448,41 @@ async fn insert_promotion<C: GenericClient>(
     Ok(())
 }
 
+/// The projection of the events that hold a task back from a claim, or stop doing so:
+/// what it waits on and which effects are not settled live in `extra`.
+async fn project_hold<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    id: &str,
+    event: &Event,
+) -> Result<(), Error> {
+    let row = conn
+        .query_opt(
+            &format!("SELECT extra FROM {s}.tasks WHERE id = $1 FOR UPDATE"),
+            &[&id],
+        )
+        .await?;
+    let extra: Option<String> = row.map(|r| r.try_get(0)).transpose()?.flatten();
+    if let Some(next) = crate::extra_after(id, extra.as_deref(), event)? {
+        conn.execute(
+            &format!("UPDATE {s}.tasks SET extra = $2 WHERE id = $1"),
+            &[&id, &next],
+        )
+        .await?;
+    }
+    if matches!(event, Event::Waiting { .. }) {
+        conn.execute(
+            &format!(
+                "UPDATE {s}.tasks SET status = 'blocked', holder = NULL, lease_until = NULL
+                 WHERE id = $1"
+            ),
+            &[&id],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Update the projection for one event. Replay calls this and nothing else.
 async fn project<C: GenericClient>(
     conn: &C,
@@ -1359,8 +1521,11 @@ async fn project<C: GenericClient>(
              WHERE id = $1 AND extra IS NOT NULL AND extra <> ''",
             vec![&id],
         ),
-        // the record that someone tried, or spoke after its claim: nothing of the task moves
-        Event::ClaimRefused { .. } | Event::LateHandoff { .. } => return Ok(()),
+        // the record that someone tried, or spoke after its claim, or approved an action:
+        // no task moves
+        Event::ClaimRefused { .. } | Event::LateHandoff { .. } | Event::Approved(_) => {
+            return Ok(())
+        }
         Event::Claimed { holder, .. } => (
             "SET status = 'claimed', holder = $2, lease_until = $3,
                 attempts = attempts + 1 WHERE id = $1",
@@ -1384,6 +1549,10 @@ async fn project<C: GenericClient>(
                 lease_until = NULL WHERE id = $1",
             vec![&id, reason, superseded_by],
         ),
+        Event::Waiting { .. }
+        | Event::Arrived { .. }
+        | Event::EffectBegun { .. }
+        | Event::EffectSettled { .. } => return project_hold(conn, s, id, event).await,
         Event::Posted { to } => ("SET posted_to = $2 WHERE id = $1", vec![&id, to]),
         Event::Rescored { priority, .. } => {
             ("SET priority = $2 WHERE id = $1", vec![&id, priority])

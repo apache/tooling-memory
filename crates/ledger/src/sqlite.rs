@@ -4,9 +4,9 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimer, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
-    PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, ApprovalRecord, Claimer, Error, Event, Held,
+    PromotionRecord, PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken,
+    Task, TaskSpec, LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::Path;
@@ -295,6 +295,29 @@ impl Db {
         Ok(true)
     }
 
+    /// Append an approval's event, in one transaction. It projects nothing.
+    pub(crate) fn record_approval(&mut self, record: &ApprovalRecord) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let key = crate::approval_key(&record.spec.target);
+        let event = Event::Approved(Box::new(record.clone()));
+        apply(&tx, &key, record.at, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The payloads of the approval events, oldest first: those under `key` when it is
+    /// given, else all of them, whatever their domain.
+    pub(crate) fn approval_payloads(&self, key: Option<&str>) -> Result<Vec<String>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events
+             WHERE kind = 'approved' AND (?1 IS NULL OR task_id = ?1) ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![key], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Remove the why from an entry's promotion events and rows in one transaction, with
     /// the space they leave overwritten, then rebuild the file without that space and
     /// fold the log into it, so the old text is in neither. Returns how many records of
@@ -432,6 +455,7 @@ impl Db {
             if !claimable(&task, now, who)
                 || !deps_complete(&tx, &task.spec.depends_on)?
                 || awaits_continuation(&tx, &task)?
+                || resumes_unsettled(&tx, &task)?
             {
                 continue;
             }
@@ -456,6 +480,7 @@ impl Db {
         if !claimable(&task, now, who)
             || !deps_complete(&tx, &task.spec.depends_on)?
             || awaits_continuation(&tx, &task)?
+            || resumes_unsettled(&tx, &task)?
         {
             return Err(Error::WrongState {
                 id: id.to_string(),
@@ -534,6 +559,35 @@ impl Db {
             .conn()
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
         Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    /// The rows of `domain` after sequence number `after`, in order, and before them the
+    /// rows that say who held the tasks those are of. The events table is one for all
+    /// domains: a task's row names its domain, and a promotion or an approval names its
+    /// own in its payload, so each of those after `after` is given and the caller keeps
+    /// its own.
+    pub(crate) fn events_after(&self, domain: &str, after: u64) -> Result<Vec<RawEvent>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT e.seq, e.task_id, e.at, e.payload, t.domain, t.label_rank
+             FROM events e LEFT JOIN tasks t ON t.id = e.task_id
+             WHERE (e.seq > ?1 OR (e.kind IN ({LEASE_KINDS})
+                    AND e.task_id IN (SELECT task_id FROM events WHERE seq > ?1)))
+               AND (t.domain = ?2 OR e.kind IN ('promoted', 'approved'))
+             ORDER BY e.seq"
+        ))?;
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![after, domain], |r| {
+            Ok(RawEvent {
+                seq: r.get(0)?,
+                task: r.get(1)?,
+                at: r.get(2)?,
+                payload: r.get(3)?,
+                domain: r.get(4)?,
+                label_rank: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub(crate) fn rebuild(&mut self) -> Result<u64, Error> {
@@ -770,6 +824,29 @@ fn awaits_continuation(conn: &Connection, task: &Task) -> Result<bool, Error> {
         .is_some())
 }
 
+/// Whether the work of `task` is held by an effect that nobody has settled: an effect of
+/// the task it continues or retries, however far up. Such an effect holds the work
+/// under each of its names, so the task is nobody's to claim.
+fn resumes_unsettled(conn: &Connection, task: &Task) -> Result<bool, Error> {
+    let mut seen = std::collections::HashSet::new();
+    let mut up = crate::resumed(task).map(str::to_string);
+    while let Some(id) = up.take() {
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        let above = match get_in(conn, &id) {
+            Ok(t) => t,
+            Err(Error::NotFound(_)) => break,
+            Err(e) => return Err(e),
+        };
+        if !above.effects.is_empty() {
+            return Ok(true);
+        }
+        up = crate::resumed(&above).map(str::to_string);
+    }
+    Ok(false)
+}
+
 /// Append the event and project it, in the caller's transaction.
 fn apply(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Result<(), Error> {
     conn.execute(
@@ -840,7 +917,7 @@ fn insert_promotion(
 }
 
 /// The projection of the events that move a task between waiting and claimable, of the
-/// one that takes its pin off, and of the two that only record something.
+/// one that takes its pin off, and of those that only record something.
 fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Error> {
     let sql = match event {
         Event::Blocked { .. } => {
@@ -858,10 +935,36 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
             "UPDATE tasks SET extra = json_remove(extra, '$.position', '$.pin_reason')
              WHERE id = ?1 AND extra IS NOT NULL AND extra != ''"
         }
-        // the record that someone tried, or spoke after its claim: nothing of the task moves
+        // the record that someone tried, or spoke after its claim, or approved an action:
+        // no task moves
         _ => return Ok(()),
     };
     conn.execute(sql, params![id])?;
+    Ok(())
+}
+
+/// The projection of the events that hold a task back from a claim, or stop doing so:
+/// what it waits on and which effects are not settled live in `extra`.
+fn project_hold(conn: &Connection, id: &str, event: &Event) -> Result<(), Error> {
+    let extra: Option<String> = conn
+        .query_row("SELECT extra FROM tasks WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .flatten();
+    if let Some(next) = crate::extra_after(id, extra.as_deref(), event)? {
+        conn.execute(
+            "UPDATE tasks SET extra = ?2 WHERE id = ?1",
+            params![id, next],
+        )?;
+    }
+    if matches!(event, Event::Waiting { .. }) {
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', holder = NULL, lease_until = NULL
+             WHERE id = ?1",
+            params![id],
+        )?;
+    }
     Ok(())
 }
 
@@ -881,7 +984,8 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         | Event::Retriaged { .. }
         | Event::Unpinned { .. }
         | Event::ClaimRefused { .. }
-        | Event::LateHandoff { .. } => project_waiting(conn, id, event)?,
+        | Event::LateHandoff { .. }
+        | Event::Approved(_) => project_waiting(conn, id, event)?,
         Event::Claimed { holder, until, .. } => {
             conn.execute(
                 "UPDATE tasks SET status = 'claimed', holder = ?2, lease_until = ?3,
@@ -925,6 +1029,10 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
                 params![id, reason, superseded_by],
             )?;
         }
+        Event::Waiting { .. }
+        | Event::Arrived { .. }
+        | Event::EffectBegun { .. }
+        | Event::EffectSettled { .. } => project_hold(conn, id, event)?,
         Event::Posted { to } => {
             conn.execute(
                 "UPDATE tasks SET posted_to = ?2 WHERE id = ?1",

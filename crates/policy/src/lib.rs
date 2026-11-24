@@ -132,6 +132,11 @@ pub struct DomainGrant {
     /// owner sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_retention_days: Option<u32>,
+    /// The guard of the domain: the person whose approval lets an entry of the domain be
+    /// copied to a lower label. The owner when unset. A guard is a person, so the name
+    /// starts `human:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
 }
 
 /// How long a transcript is kept whole when the domain says nothing.
@@ -237,6 +242,11 @@ pub struct Grants {
     /// suites and harness configurations, loaded by the launcher only once verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// The security role: the authors, beside the owner, that read a quarantined write.
+    /// Each is an author as an entry names one, `agent:<name>` or
+    /// `human:<system>:<user-id>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security: Vec<String>,
     /// Domains the owner holds, by id.
     #[serde(default)]
     pub domains: BTreeMap<String, DomainGrant>,
@@ -287,6 +297,7 @@ impl Grants {
                 default_classification: Label::Internal,
                 admit_own: true,
                 transcript_retention_days: None,
+                guard: None,
             },
         );
         let mut destinations = BTreeMap::new();
@@ -314,6 +325,7 @@ impl Grants {
             owner: owner.to_string(),
             handling: Label::Restricted,
             platform: None,
+            security: Vec::new(),
             domains,
             destinations,
             taps: BTreeMap::new(),
@@ -328,7 +340,7 @@ impl Grants {
     /// # Errors
     ///
     /// [`Error::Parse`] for bad TOML or a value outside the schema, [`Error::Invalid`] for
-    /// an empty owner or no domains.
+    /// an empty owner, no domains, or a guard that is not a person.
     pub fn parse(text: &str) -> Result<Grants, Error> {
         let g: Grants = toml::from_str(text)?;
         if g.owner.trim().is_empty() {
@@ -337,6 +349,7 @@ impl Grants {
         if g.domains.is_empty() {
             return Err(Error::Invalid("at least one domain is required".into()));
         }
+        g.guards_are_people()?;
         for (name, t) in &g.taps {
             if let Some(url) = &t.hosted {
                 let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
@@ -376,6 +389,18 @@ impl Grants {
         Ok(g)
     }
 
+    /// A guard approves in person, so a grant that names one names a person.
+    fn guards_are_people(&self) -> Result<(), Error> {
+        for (name, d) in &self.domains {
+            if let Some(guard) = d.guard.as_deref().filter(|p| !p.starts_with("human:")) {
+                return Err(Error::Invalid(format!(
+                    "[domains.{name}] guard = {guard:?}: a guard is a person, named `human:<system>:<name>`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Read and parse the file.
     ///
     /// # Errors
@@ -404,10 +429,25 @@ impl Grants {
         ReadFilter::for_domains(self.domains.keys().cloned(), self.handling)
     }
 
+    /// The guard of a domain: the person the domain's grant names, or the owner when it
+    /// names none. `None` when the domain is not granted.
+    #[must_use]
+    pub fn guard(&self, domain: &str) -> Option<&str> {
+        let d = self.domains.get(domain)?;
+        Some(d.guard.as_deref().unwrap_or(&self.owner))
+    }
+
     /// A tap's grant, if the file names it and its domain is one the owner holds.
     #[must_use]
     pub fn tap(&self, name: &str) -> Option<&TapGrant> {
         self.taps.get(name).filter(|t| self.may_write(&t.domain))
+    }
+
+    /// Whether `author` is in the security role, which reads a quarantined write: the
+    /// owner always, and each author that `security` lists.
+    #[must_use]
+    pub fn is_security(&self, author: &str) -> bool {
+        author == self.owner || self.security.iter().any(|a| a == author)
     }
 
     /// Whether the owner may write into a domain.
@@ -446,6 +486,7 @@ impl Grants {
         Session {
             handling: self.handling,
             label: Label::Public,
+            outside: false,
         }
     }
 }
@@ -457,6 +498,10 @@ pub struct Session {
     pub handling: Label,
     /// The highest classification it has read. Rises, never falls.
     pub label: Label,
+    /// Whether it has read content from authors outside the fleet: an answer of a tool,
+    /// a raw entry with tap reach, or a task that came from outside. Once true, it
+    /// stays true.
+    pub outside: bool,
 }
 
 impl Session {
@@ -471,6 +516,12 @@ impl Session {
         }
         self.label = self.label.max(classification);
         true
+    }
+
+    /// Record that the session read content from authors outside the fleet. Nothing
+    /// sets the record back.
+    pub fn read_outside(&mut self) {
+        self.outside = true;
     }
 
     /// Whether this session may send to a destination with the given ceiling. `None`
@@ -532,6 +583,32 @@ ceiling = "public"
             !starter.render().unwrap().contains("[taps"),
             "no section until one is granted"
         );
+    }
+
+    #[test]
+    fn the_security_role_is_the_owner_and_each_author_the_grants_list() {
+        // a file from before the role was kept names nobody, and is written as it was
+        let plain = Grants::parse(FILE).unwrap();
+        assert!(plain.security.is_empty());
+        assert!(!plain.render().unwrap().contains("security"));
+        assert!(
+            plain.is_security("human:local:striker"),
+            "the owner, always"
+        );
+        assert!(!plain.is_security("agent:auditor"));
+        let listed = Grants::parse(&FILE.replacen(
+            "handling = \"internal\"\n",
+            "handling = \"internal\"\nsecurity = [\"agent:auditor\"]\n",
+            1,
+        ))
+        .unwrap();
+        assert!(listed.is_security("agent:auditor"), "a listed author");
+        assert!(
+            listed.is_security("human:local:striker"),
+            "the owner, always"
+        );
+        assert!(!listed.is_security("agent:worker"), "another author");
+        assert_eq!(Grants::parse(&listed.render().unwrap()).unwrap(), listed);
     }
 
     #[test]
@@ -671,6 +748,33 @@ ceiling = "public"
             assert_eq!(back.ceiling(d), Some(Label::Internal), "{d}");
         }
         assert_eq!(back.ceiling("qwen"), None, "no such destination");
+    }
+
+    #[test]
+    fn a_guard_is_a_person_and_the_owner_when_the_grant_names_none() {
+        let named = "owner = \"human:local:me\"\n[domains.dom-a]\nguard = \"human:local:guard\"\n[domains.dom-b]\n";
+        let g = Grants::parse(named).unwrap();
+        assert_eq!(g.guard("dom-a"), Some("human:local:guard"));
+        assert_eq!(g.guard("dom-b"), Some("human:local:me"), "the owner");
+        assert_eq!(g.guard("dom-else"), None, "not granted");
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        for not_a_person in ["agent:x", "tap:github-issues", "curation", ""] {
+            let text = format!(
+                "owner = \"human:local:me\"\n[domains.dom-a]\nguard = \"{not_a_person}\"\n"
+            );
+            assert!(
+                matches!(Grants::parse(&text), Err(Error::Invalid(_))),
+                "{not_a_person:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grants_file_without_a_guard_renders_without_the_key() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("guard"), "{text}");
+        assert_eq!(Grants::parse(&text).unwrap(), g);
     }
 
     #[test]

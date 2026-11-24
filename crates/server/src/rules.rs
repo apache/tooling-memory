@@ -120,6 +120,14 @@ fn is_person(author: &str, owner: &str) -> bool {
     matches!(Class::of(author, owner), Class::Owner | Class::Human)
 }
 
+/// Whether `words` are words on one line: no line break, no code fence and no markup.
+/// A task or an entry shows such text to a person, and to the agents that read the task.
+pub(crate) fn words_on_one_line(words: &str) -> bool {
+    !["```", "~~~", "\n", "\r", "<"]
+        .iter()
+        .any(|mark| words.contains(mark))
+}
+
 fn live(status: Status) -> bool {
     matches!(status, Status::Enforced | Status::Advisory)
 }
@@ -192,7 +200,7 @@ impl Memory {
             .filter(|h| rules.iter().any(|(entry, r)| *entry == h.id && !r.withheld))
             .cloned()
             .collect();
-        self.observe(&read);
+        self.observe(&read)?;
         self.reads.hits(
             "check_policy",
             Some(&format!("{action} in {domain}")),
@@ -240,11 +248,10 @@ impl Memory {
     /// no code fence, an expiry that is a time to come, and a task to hold for. Gives
     /// the task and the time of the check.
     fn exception_asked(&self, ask: &ExceptionRequest) -> Result<(String, OffsetDateTime), Error> {
-        if [&ask.scope, &ask.justification].iter().any(|words| {
-            ["```", "~~~", "\n", "\r", "<"]
-                .iter()
-                .any(|mark| words.contains(mark))
-        }) {
+        if ![&ask.scope, &ask.justification]
+            .iter()
+            .all(|words| words_on_one_line(words))
+        {
             return Err(Error::Denied(
                 "the scope and the justification of an exception are words on one line, with \
                  no code fence and no markup"

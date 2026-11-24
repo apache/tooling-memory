@@ -383,7 +383,7 @@ impl Memory {
         };
         // under the filter the grants and the policy give, and before anything of the
         // entry is told. Filing a task is a write: the session's settings do not narrow it
-        let filter = self.granted_filter()?;
+        let filter = self.chained_filter()?;
         let seen = self.index.lock().await.meta(&entry.front.id, &filter)?;
         if seen.is_none() {
             return Err(none());
@@ -391,7 +391,13 @@ impl Memory {
         let Some(Ok(def)) = definition_in(&entry, name) else {
             return Err(unreadable(name));
         };
-        crate::lock(&self.session).observe(def.classification);
+        // binding reads the entry that holds the definition
+        self.observe_entry(
+            &entry.front.domain,
+            &entry.front.id,
+            def.classification,
+            crate::reach::outside_content(&entry),
+        )?;
         spec.definition = Some(def.reference());
         spec.classification = spec.classification.max(def.classification);
         if spec.acceptance.is_empty() {

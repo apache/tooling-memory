@@ -6,9 +6,9 @@
 //! A window starts at a time and stays open until the owner closes it. An entry is
 //! inside a window when its `created` is at or after the start and, for a closed
 //! window, at or before the end. Such an entry stays unpromotable after the window
-//! closes: the remedy is to write it again. An entry does not record its session or
-//! its model, so a window holds every entry that an agent wrote inside it, on any
-//! model. An entry that a person wrote is not held.
+//! closes: the remedy is to write it again. An entry records its session and not its
+//! model, and the freeze does not read the session, so a window holds every entry that
+//! an agent wrote inside it, on any model. An entry that a person wrote is not held.
 //!
 //! On disk, under the root: `state/drift/windows.jsonl`, one event on each line, opened
 //! or closed. The windows are the fold of the events. A line that does not parse is

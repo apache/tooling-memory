@@ -5,6 +5,7 @@
 // #[cfg(test)] modules; here a panic is the failure being reported.
 #![allow(clippy::unwrap_used)]
 
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -301,8 +302,20 @@ fn the_seven_m0_steps() {
     step_reindex(&d);
 }
 
+/// `id` is withheld: a get says why, and its body, with `text` in it, is still in the
+/// record.
+fn is_withheld(root: &Path, id: &str, text: &str) {
+    let err = fails(root, &["get", id]);
+    assert!(err.contains("gone") && err.contains("withheld"), "{err}");
+    let kept = std::fs::read_to_string(root.join(format!("record/dom-me/{id}.md"))).unwrap();
+    assert!(
+        kept.contains("status: withheld") && kept.contains(text),
+        "{kept}"
+    );
+}
+
 #[test]
-fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
+fn erasure_leaves_a_stub_a_receipt_and_the_citing_entry_withheld() {
     let mut d = step_init();
     step_write(&mut d);
     let marker = "passphrase-Qz7xx";
@@ -343,9 +356,10 @@ fn erasure_leaves_a_stub_a_receipt_and_a_flag_on_the_citing_entry() {
     assert_eq!(receipt["id"], secret);
     assert_eq!(receipt["reason"], "sensitive");
     assert_eq!(receipt["removed"][0]["version"], "current");
-    assert_eq!(receipt["flagged"], serde_json::json!([citing]));
+    assert_eq!(receipt["withheld"], serde_json::json!([citing]));
     assert_eq!(receipt["promotion_whys_removed"], 1);
     assert!(!ids(&ok(&d.root, &["search", "vault opens"], None)).contains(&secret));
+    is_withheld(&d.root, &citing, &format!("See {secret}."));
     let err = fails(&d.root, &["get", &secret]);
     assert!(err.contains("gone") && err.contains("erased"), "{err}");
     let err = fails(&d.root, &["erase", &secret, "--reason", "legal"]);
@@ -461,7 +475,460 @@ fn a_declined_proposal_is_not_printed_as_proposed_again() {
     assert!(stderr.contains(&task), "{stderr}");
 }
 
+/// One tool call as an agent, through `amem serve` on standard input and output: the
+/// text of the tool's answer, or the message of its refusal.
+fn as_agent(root: &Path, tool: &str, arguments: &serde_json::Value) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amem"))
+        .arg("--root")
+        .arg(root)
+        .args(["serve", "--author", AGENT])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+    let mut to = child.stdin.take().expect("stdin");
+    let mut from = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut send = |message: serde_json::Value| writeln!(to, "{message}").expect("send");
+    let mut answer = || {
+        let mut line = String::new();
+        from.read_line(&mut line).expect("an answer");
+        json(&line)
+    };
+    send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "cli-test", "version": "0"},
+        },
+    }));
+    answer();
+    send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    }));
+    let reply = answer();
+    drop(to);
+    child.wait().expect("wait");
+    if let Some(message) = reply["error"]["message"].as_str() {
+        return Err(message.to_string());
+    }
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in {reply}"))
+        .to_string();
+    if reply["result"]["isError"] == true {
+        Err(text)
+    } else {
+        Ok(text)
+    }
+}
+
+const AGENT: &str = "agent:x";
+
+/// The owner is the guard of a starter root, so the owner's own `declassify` is the
+/// approval: the copy lands at the lower label, and `approvals` lists that approval.
+#[test]
+fn declassify_lands_a_copy_at_a_lower_label_and_approvals_lists_its_approval() {
+    let d = step_init();
+    let source = id_of(&ok(
+        &d.root,
+        &[
+            "write",
+            "--title",
+            "Office move",
+            "--classification",
+            "restricted",
+        ],
+        Some("The office moves on 3 March.\n"),
+    ));
+    let why = "The date was announced to all staff.";
+    let copy_at = |label: &'static str| ["declassify", &source, "--to", label, "--why", why];
+    let err = fails(&d.root, &copy_at("restricted"));
+    assert!(err.contains("restricted is not lower"), "{err}");
+    // the owner's own erasure of another entry is an approval of that entry
+    let other = id_of(&ok(&d.root, &["write"], Some("A note by mistake.\n")));
+    ok(&d.root, &["erase", &other, "--reason", "mistaken"], None);
+    let none = json(&ok(&d.root, &["approvals", &source], None));
+    assert_eq!(none, serde_json::json!([]), "a refused copy has none");
+    let landed = json(&ok(&d.root, &copy_at("internal"), None));
+    assert_eq!(landed["outcome"], "declassified", "{landed}");
+    assert_eq!(landed["classification"], "internal");
+    let copy = landed["id"].as_str().unwrap();
+    assert_ne!(copy, source);
+    let cites = landed["cites"].as_str().unwrap();
+    let version = cites.strip_prefix(&format!("{source}@")).expect(cites);
+    let text = ok(&d.root, &["get", copy], None);
+    assert!(text.contains("classification: internal"), "{text}");
+    assert!(text.contains(cites), "the copy cites {cites}: {text}");
+    assert!(text.contains("The office moves on 3 March."), "{text}");
+    let listed = json(&ok(&d.root, &["approvals", &source], None));
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let expected = serde_json::json!({
+        "id": landed["approval"]["id"], "domain": "dom-me",
+        "principal": "human:test:me", "action": "declassify:internal",
+        "target": source, "version": version, "scope": "human:test:me",
+        "expires": landed["approval"]["expires"], "at": landed["approval"]["at"],
+        "in_force": true,
+    });
+    assert_eq!(listed[0], expected);
+    // with no entry named, the approvals of the domain, oldest first
+    let all = json(&ok(&d.root, &["approvals", "--domain", "dom-me"], None));
+    let all: Vec<_> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["action"].as_str().unwrap(), a["target"].as_str().unwrap()))
+        .collect();
+    let expected = [
+        ("erase", other.as_str()),
+        ("declassify:internal", source.as_str()),
+    ];
+    assert_eq!(all, expected);
+}
+
+/// `amem approve --expires` gives the approval of a sign-off task the time that the
+/// command names. A time that is not after now permits nothing, and is refused.
+#[test]
+fn approve_gives_a_sign_off_task_the_expiry_that_the_command_names() {
+    let d = step_init();
+    let id = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Gate code"],
+        Some("The gate code is 4417.\n"),
+    ));
+    let erase = serde_json::json!({"id": id, "reason": "mistaken"});
+    let refused = as_agent(&d.root, "erase", &erase).unwrap_err();
+    let named = refused
+        .split_once("Task ")
+        .and_then(|(_, rest)| rest.split_once(" asks human:test:me for it."));
+    let Some((task, _)) = named else {
+        panic!("the refusal names no task: {refused}")
+    };
+    let err = fails(&d.root, &["approve", task, "--expires", "tomorrow"]);
+    assert!(err.contains("RFC 3339"), "{err}");
+    let past = "2020-01-01T00:00:00Z";
+    let err = fails(&d.root, &["approve", task, "--expires", past]);
+    assert!(err.contains("permits nothing"), "{err}");
+    let none = json(&ok(&d.root, &["approvals", &id], None));
+    assert_eq!(none, serde_json::json!([]), "nothing was approved");
+    let later = "2099-01-01T00:00:00Z";
+    let approved = json(&ok(&d.root, &["approve", task, "--expires", later], None));
+    assert_eq!(approved["outcome"], "approved", "{approved}");
+    assert_eq!(approved["approval"]["expires"], later);
+    assert_eq!(approved["approval"]["scope"], AGENT);
+    let listed = json(&ok(&d.root, &["approvals", &id], None));
+    assert_eq!(listed[0]["expires"], later);
+    assert_eq!(listed[0]["in_force"], true);
+    // the requester runs the action again, and it runs under that approval
+    let receipt = json(&as_agent(&d.root, "erase", &erase).unwrap());
+    assert_eq!(receipt["id"], id.as_str());
+    assert_eq!(receipt["erased_by"], AGENT);
+}
+
 /// The first file under `root` whose bytes contain `needle`.
+/// Tool calls as `author` in one session, through `amem serve` over stdio, as a harness
+/// makes them: the JSON result of each.
+fn session(root: &Path, author: &str, calls: &[(&str, serde_json::Value)]) -> Vec<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amem"))
+        .arg("--root")
+        .arg(root)
+        .args(["serve", "--author", author])
+        .env_remove("MEMORY_ROOT")
+        .env_remove("MEMORY_TASK")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    let hello = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "0"}}});
+    writeln!(stdin, "{hello}").unwrap();
+    stdout.read_line(&mut line).unwrap();
+    let ready = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    writeln!(stdin, "{ready}").unwrap();
+    let mut results = Vec::new();
+    for (n, (tool, arguments)) in calls.iter().enumerate() {
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": n + 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}});
+        writeln!(stdin, "{call}").unwrap();
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        let answer = json(&line);
+        let text = answer["result"]["content"][0]["text"].as_str();
+        let text = text.unwrap_or_else(|| panic!("{tool} as {author}: {answer}"));
+        assert_ne!(answer["result"]["isError"], true, "{tool}: {text}");
+        results.push(json(text));
+    }
+    drop(stdin);
+    child.wait().unwrap();
+    results
+}
+
+/// A session of `author` that reads `id` and then writes a note: the id of the note.
+fn reads_then_writes(root: &Path, author: &str, id: &str, body: &str) -> String {
+    let calls = [
+        ("get", serde_json::json!({ "id": id })),
+        ("write", serde_json::json!({ "body": body })),
+    ];
+    let results = session(root, author, &calls);
+    results[1]["id"].as_str().unwrap().to_string()
+}
+
+/// The entries of a lineage answer, each as its id, its hops, and whether a read
+/// informed it.
+fn edges(lineage: &Value) -> Vec<(String, u64, bool)> {
+    let entries = lineage["entries"].as_array().unwrap();
+    let edge = |e: &Value| {
+        let id = e["id"].as_str().unwrap().to_string();
+        (id, e["hops"].as_u64().unwrap(), e["informed"] == true)
+    };
+    entries.iter().map(edge).collect()
+}
+
+#[test]
+fn lineage_gives_forward_and_with_back_backward_edges_of_a_session_that_read_then_wrote() {
+    let d = step_init();
+    let x = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Port"],
+        Some("The service listens on 8080.\n"),
+    ));
+    let y = reads_then_writes(&d.root, "agent:reader", &x, "The proxy forwards to it.\n");
+    let forward = json(&ok(&d.root, &["lineage", &x], None));
+    assert_eq!(forward["direction"], "forward");
+    assert_eq!(edges(&forward), [(y.clone(), 1, true)]);
+    let back = json(&ok(&d.root, &["lineage", &y, "--back"], None));
+    assert_eq!(back["direction"], "back");
+    assert_eq!(edges(&back), [(x.clone(), 1, true)]);
+    // one session read the entry and wrote the note
+    assert_eq!(forward["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(forward["sessions"], back["sessions"]);
+    assert_eq!(back["complete"], true);
+
+    // a step further on, and a depth that leaves it out
+    let z = reads_then_writes(&d.root, "agent:other", &y, "Restart the proxy first.\n");
+    let all = json(&ok(&d.root, &["lineage", &x], None));
+    assert_eq!(edges(&all), [(y.clone(), 1, true), (z.clone(), 2, true)]);
+    let near = json(&ok(&d.root, &["lineage", &x, "--depth", "1"], None));
+    assert_eq!(edges(&near), [(y.clone(), 1, true)]);
+    let far = json(&ok(&d.root, &["lineage", &z, "--back"], None));
+    assert_eq!(edges(&far), [(y, 1, true), (x.clone(), 2, true)]);
+
+    // an export is a send: forward names where it went, and back from the send event
+    // gives what the export read
+    let bundle = d.dir.path().join("bundle");
+    let bundle = bundle.to_str().unwrap();
+    ok(
+        &d.root,
+        &["export", bundle, "--max-label", "internal"],
+        None,
+    );
+    let sent = json(&ok(&d.root, &["lineage", &x], None));
+    let sends = sent["sends"].as_array().unwrap();
+    assert_eq!(sends.len(), 1, "{sent}");
+    assert!(sends[0]["to"].as_str().unwrap().starts_with("export:"));
+    let of = format!("dom-me@{}", sends[0]["first"]);
+    let from = json(&ok(
+        &d.root,
+        &["lineage", &of, "--back", "--depth", "1"],
+        None,
+    ));
+    let read: Vec<String> = edges(&from).into_iter().map(|e| e.0).collect();
+    assert!(read.contains(&x) && read.contains(&z), "{from}");
+    let why = fails(&d.root, &["lineage", &of]);
+    assert!(why.contains("no lineage forward"), "{why}");
+}
+
+#[test]
+fn withheld_list_names_an_entry_that_an_erasure_withheld_and_release_serves_it_again() {
+    let d = step_init();
+    let secret = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Vault"],
+        Some("The vault opens with a passphrase.\n"),
+    ));
+    let citing = id_of(&ok(
+        &d.root,
+        &["write", "--title", "Where the vault is explained"],
+        Some(&format!("See {secret}.\n")),
+    ));
+    let none = json(&ok(&d.root, &["withheld", "list"], None));
+    assert_eq!(none, serde_json::json!([]));
+    let receipt = json(&ok(
+        &d.root,
+        &["erase", &secret, "--reason", "mistaken"],
+        None,
+    ));
+    assert_eq!(receipt["withheld"], serde_json::json!([citing]));
+    let listed = json(&ok(
+        &d.root,
+        &["withheld", "list", "--domain", "dom-me"],
+        None,
+    ));
+    assert_eq!(
+        listed,
+        serde_json::json!([{ "id": citing, "because": secret }])
+    );
+    let why = fails(&d.root, &["withheld", "list", "--domain", "dom-other"]);
+    assert!(why.contains("not granted"), "{why}");
+    is_withheld(&d.root, &citing, &format!("See {secret}."));
+    let released = json(&ok(&d.root, &["withheld", "release", &citing], None));
+    assert_eq!(released, serde_json::json!({ "released": citing }));
+    let served = ok(&d.root, &["get", &citing], None);
+    assert!(
+        served.contains(&format!("See {secret}.")) && !served.contains("status: withheld"),
+        "{served}"
+    );
+    let none = json(&ok(&d.root, &["withheld", "list"], None));
+    assert_eq!(none, serde_json::json!([]));
+    let why = fails(&d.root, &["withheld", "release", &citing]);
+    assert!(why.contains("is not withheld"), "{why}");
+}
+
+/// `amem log freshness`: whether it succeeded is asserted; its answer, and what it
+/// said on standard error.
+fn freshness(root: &Path) -> (Value, String) {
+    let out = memory(root, &["log", "freshness"], None);
+    assert!(out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    (json(&String::from_utf8_lossy(&out.stdout)), said)
+}
+
+#[test]
+fn log_freshness_reports_a_domain_within_the_bound_after_a_write() {
+    let d = step_init();
+    ok(
+        &d.root,
+        &["write", "--title", "Port"],
+        Some("It is 8080.\n"),
+    );
+    let (fresh, said) = freshness(&d.root);
+    assert_eq!(fresh["domain"], "dom-me");
+    assert_eq!(fresh["within_bound"], true);
+    assert_eq!(fresh["unfed"], 0);
+    assert_eq!(fresh["bound_seconds"], 60);
+    assert_eq!(fresh["fed_seq"], fresh["log_seq"]);
+    assert!(fresh["log_seq"].as_u64().unwrap() >= 2, "{fresh}");
+    assert_eq!(said, "", "nothing waits, so nothing is said");
+}
+
+#[test]
+fn log_show_serves_the_ledger_s_events_up_to_now_and_from_a_sequence_number() {
+    let d = step_init();
+    ok(
+        &d.root,
+        &["write", "--title", "Port"],
+        Some("It is 8080.\n"),
+    );
+    // filed after the last write: nothing copied the ledger into the log since
+    ok(&d.root, &["task", "create", "Move the port"], None);
+    let events = json(&ok(&d.root, &["log", "show"], None));
+    let events = events.as_array().unwrap();
+    assert_eq!(events[0]["kind"], "write");
+    let last = &events[events.len() - 1];
+    assert_eq!(last["kind"], "ledger", "{last}");
+    let from = last["seq"].to_string();
+    let tail = json(&ok(&d.root, &["log", "show", "--from", &from], None));
+    assert_eq!(tail, serde_json::json!([last]));
+}
+
+#[test]
+fn log_outside_names_the_session_that_wrote_after_it_read_a_task_from_a_tap() {
+    let d = step_init();
+    let none = json(&ok(&d.root, &["log", "outside"], None));
+    assert_eq!(none, serde_json::json!([]));
+    // a tap files a task, the owner admits it, and an agent reads it and writes
+    let spec = serde_json::json!({ "title": "Change the port", "body": "A stranger wrote this." });
+    let filed = session(&d.root, "tap:issues", &[("create_task", spec)]);
+    let task = filed[0]["task"]["id"].as_str().unwrap().to_string();
+    ok(&d.root, &["task", "admit", &task], None);
+    let calls = [
+        ("get_task", serde_json::json!({ "id": task })),
+        (
+            "write",
+            serde_json::json!({ "body": "# Harbour\n\nThe harbour port stays 8080.\n" }),
+        ),
+    ];
+    let results = session(&d.root, "agent:worker", &calls);
+    assert_eq!(results[1]["reach"], "tap", "{}", results[1]);
+    let id = results[1]["id"].as_str().unwrap().to_string();
+    let readers = json(&ok(
+        &d.root,
+        &["log", "outside", "--domain", "dom-me"],
+        None,
+    ));
+    let readers = readers.as_array().unwrap();
+    assert_eq!(readers.len(), 1, "{readers:?}");
+    assert_eq!(readers[0]["by"], "agent:worker");
+    assert_eq!(readers[0]["writes"], serde_json::json!([id]));
+    // the domain asked for is the domain read: one that is not granted is refused
+    fails(&d.root, &["log", "outside", "--domain", "dom-other"]);
+    // the owner reads all raw entries: the hit says who else does
+    let found = json(&ok(&d.root, &["search", "harbour"], None));
+    assert_eq!(found[0]["id"], serde_json::json!(id));
+    assert_eq!(found[0]["reach"], "tap", "{found}");
+    // an entry with fleet reach has no key
+    ok(
+        &d.root,
+        &["write", "--title", "Office"],
+        Some("The office is open.\n"),
+    );
+    let found = json(&ok(&d.root, &["search", "office"], None));
+    assert!(found[0]["id"].is_string(), "{found}");
+    assert!(found[0].get("reach").is_none(), "{found}");
+}
+
+#[test]
+fn log_freshness_says_when_a_version_waits_past_the_bound_and_log_feed_takes_it() {
+    let d = step_init();
+    ok(
+        &d.root,
+        &["write", "--title", "Port"],
+        Some("It is 8080.\n"),
+    );
+    // a version that a stopped writer left in the log an hour ago
+    let seq = freshness(&d.root).0["log_seq"].as_u64().unwrap() + 1;
+    let old = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let old = old
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let line = serde_json::json!({"seq": seq, "at": old, "by": "human:test:me",
+        "kind": "put", "id": "mem-me-left", "digest": "d", "active": true});
+    let log = d.root.join("state/log/dom-me.jsonl");
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    text.push_str(&format!("{line}\n"));
+    std::fs::write(&log, text).unwrap();
+    // the answer says so, and so does a line on standard error
+    let (stale, said) = freshness(&d.root);
+    assert_eq!(stale["within_bound"], false);
+    assert_eq!(stale["unfed"], 1);
+    let waited = stale["oldest_unfed_seconds"].as_i64().unwrap();
+    assert!(waited >= 3600, "{stale}");
+    assert!(
+        said.contains("behind its log") && said.contains("dom-me"),
+        "{said}"
+    );
+    // the feed takes it, once, and the domain is within the bound again
+    let fed = json(&ok(&d.root, &["log", "feed"], None));
+    assert_eq!(fed["to"], seq);
+    assert_eq!(fed["applied"], 1);
+    let again = json(&ok(&d.root, &["log", "feed", "--domain", "dom-me"], None));
+    assert_eq!(again["applied"], 0);
+    let (fresh, said) = freshness(&d.root);
+    assert_eq!(fresh["within_bound"], true);
+    assert_eq!(fresh["fed_seq"], seq);
+    assert_eq!(said, "");
+}
+
 fn holds(root: &Path, needle: &[u8]) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -1156,23 +1623,24 @@ fn reenact_state_gives_the_replay_state_of_a_tape() {
     assert_eq!(tapes.len(), 1, "{tapes:?}");
     let session = tapes[0]["session"].as_str().unwrap().to_string();
     assert_eq!(tapes[0]["settings"]["max_tier"], "raw", "{tapes:?}");
-    assert_eq!(tapes[0]["manifest"]["log"]["dom-me"], 2, "{tapes:?}");
+    // two writes, each an offer and a version: the last version is event 4
+    assert_eq!(tapes[0]["manifest"]["log"]["dom-me"], 4, "{tapes:?}");
 
     let state = json(&ok(&d.root, &["reenact", "state", &session], None));
     assert_eq!(state["availability"], "complete", "{state}");
     assert_eq!(state["moved"], serde_json::json!([]), "{state}");
     assert_eq!(state["manifest"]["settings"]["max_tier"], "raw", "{state}");
-    assert_eq!(state["manifest"]["log"]["dom-me"], 2, "{state}");
+    assert_eq!(state["manifest"]["log"]["dom-me"], 4, "{state}");
 
-    // the record moves
+    // the record moves: after the read of the search, event 5, the offer and the version
     ok(&d.root, &["write"], Some("The export has two steps.\n"));
     let state = json(&ok(&d.root, &["reenact", "state", &session], None));
     assert_eq!(state["availability"], "incomplete", "{state}");
-    let moved = serde_json::json!([{"what": "log dom-me", "then": "2", "now": "3"}]);
+    let moved = serde_json::json!([{"what": "log dom-me", "then": "4", "now": "7"}]);
     assert_eq!(state["moved"], moved, "{state}");
     assert_eq!(
         state["why"],
-        serde_json::json!(["The log dom-me moved: it was 2 and it is 3 now."])
+        serde_json::json!(["The log dom-me moved: it was 4 and it is 7 now."])
     );
     assert!(fails(&d.root, &["reenact", "state", "sess-none"]).contains("no tape"));
 }

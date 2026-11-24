@@ -188,6 +188,11 @@ impl Memory {
     /// the state cannot be read, since the model's input is the evidence that has no
     /// other copy.
     ///
+    /// The call was answered, so its request left: first a `send` event goes into the
+    /// log of that domain and of each domain the session has read, whether a context is
+    /// kept or not. It names the destination and the digest of the request, read as
+    /// text. A send event that cannot be appended does not stop the context.
+    ///
     /// # Errors
     ///
     /// A store error.
@@ -198,10 +203,13 @@ impl Memory {
         request: &[u8],
         response: &[u8],
     ) -> Result<(), Error> {
+        let home = self.recording_domain().await;
+        let digest = dm_core::digest(&String::from_utf8_lossy(request));
+        let _ = self.log_send(home.as_deref(), destination, digest).await;
         if !self.keeps_contexts() {
             return Ok(());
         }
-        let Some(domain) = self.recording_domain().await else {
+        let Some(domain) = home else {
             return Ok(());
         };
         let n = self.contexts_kept.fetch_add(1, Ordering::Relaxed) + 1;
@@ -446,7 +454,8 @@ mod tests {
                 state
             );
         }
-        assert_eq!(state.log["dom-me"], 3);
+        // the third version: each write is two events, and no read moves the offset
+        assert_eq!(state.log["dom-me"], 6);
         // a session whose reads are not logged names none
         let quiet = Memory::open(dir.path())
             .unwrap()
