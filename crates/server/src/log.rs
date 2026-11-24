@@ -101,7 +101,8 @@ pub enum Change {
         id: String,
         /// The sequence number of the `write` event refused.
         of: u64,
-        /// Which gate refused it: `policy`, `verified`, `blast-radius` or `injection`.
+        /// Which gate refused it: `policy`, `verified`, `blast-radius`, `injection`, or
+        /// `personal` for a proposal to a personal domain.
         /// [`GATE_ERROR`] when no gate answered or the record did not take the version:
         /// nothing is held in quarantine then.
         gate: String,

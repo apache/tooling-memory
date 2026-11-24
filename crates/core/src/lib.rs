@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 pub mod erasure;
 pub mod filter;
 pub mod id;
+pub mod identity;
 pub mod manifest;
 
 pub use filter::{RawReach, ReadFilter};
@@ -560,6 +561,20 @@ mod tests {
         let back = Entry::parse(&text).unwrap();
         assert_eq!(written, back);
         assert_eq!(text, back.render());
+    }
+
+    #[test]
+    fn an_entry_with_a_dated_author_and_owner_round_trips() {
+        let mut e = sample();
+        e.front.author = "human:example.org,2026-11-01:check".into();
+        e.front.owner = Some("human:example.org,2019-05-01:lead".into());
+        let text = e.render();
+        let back = Entry::parse(&text).unwrap();
+        assert_eq!(e, back);
+        assert_eq!(text, back.render());
+        assert!(identity::parse(&back.front.author).unwrap().is_dated());
+        let owner = identity::parse(back.front.owner.as_deref().unwrap()).unwrap();
+        assert_eq!(owner.held, Some(date!(2019 - 05 - 01)));
     }
 
     /// The sample as a binary from before the reach rendered it, byte for byte.

@@ -24,6 +24,7 @@ use dm_policy::decide::{
     Action, Class, Decision, Filing, Input, ParentInput, Policy, Principal, PromoteInput,
     TaskInput, WriteInput,
 };
+use dm_policy::registry::Registry;
 use dm_policy::{scan, Grants, Session};
 use dm_store::Store;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,7 @@ pub mod projection;
 pub mod reach;
 pub mod reads;
 pub mod recall;
+pub mod registry;
 pub mod rules;
 pub mod sources;
 pub mod t0;
@@ -60,6 +62,9 @@ pub mod withhold;
 
 /// The grants file, relative to the root.
 pub const GRANTS_FILE: &str = "grants.toml";
+/// The ownership registry, relative to the root: beside the grants, and absent in a root
+/// whose owner answers for each domain.
+pub const REGISTRY_FILE: &str = "registry.toml";
 /// The most bytes an entry may hold as the record keeps it, frontmatter and body
 /// together; a bundle's entry file holds no more. It keeps one entry well inside what a
 /// reply can carry; [`mcp::MAX_REPLY_BYTES`] bounds the reply itself.
@@ -349,6 +354,10 @@ pub struct Memory {
     /// The digest of the grants file this session was opened from. The session is
     /// valid only while the file reads the same.
     grants_stamp: String,
+    /// The ownership registry this session opened under, and the stamp of its file:
+    /// [`Memory::fresh`] compares the stamp with the file as it is.
+    registry: Arc<Option<Registry>>,
+    registry_stamp: String,
     /// The policy stamp this session last loaded its policy at: what
     /// `state/policy.stamp` read then. Shared with the session's views.
     policy_seen: Arc<Mutex<String>>,
@@ -478,6 +487,7 @@ impl Memory {
     pub fn open(root: &Path) -> Result<Memory, Error> {
         let grants_text = std::fs::read_to_string(root.join(GRANTS_FILE)).map_err(io(root))?;
         let grants = Grants::parse(&grants_text)?;
+        let (registry, registry_stamp) = registry::load(root)?;
         let policy_seen = policy_stamp(root);
         std::fs::create_dir_all(root.join("state")).map_err(io(root))?;
         let store = Store::open_dir(root)?;
@@ -518,6 +528,8 @@ impl Memory {
             claims: Arc::default(),
             scope: Mutex::new(None),
             grants_stamp: dm_core::digest(&grants_text),
+            registry: Arc::new(registry),
+            registry_stamp,
             policy_seen: Arc::new(Mutex::new(policy_seen)),
             contexts_kept: Arc::new(AtomicUsize::new(0)),
             tools: OnceLock::new(),
@@ -573,6 +585,8 @@ impl Memory {
             claims: Arc::clone(&self.claims),
             scope: Mutex::new(Some((version, scope))),
             grants_stamp: self.grants_stamp.clone(),
+            registry: Arc::clone(&self.registry),
+            registry_stamp: self.registry_stamp.clone(),
             policy_seen: Arc::clone(&self.policy_seen),
             contexts_kept: Arc::clone(&self.contexts_kept),
             tools: self.tools.clone(),
@@ -677,6 +691,7 @@ impl Memory {
                     .into(),
             ));
         }
+        self.registry_fresh()?;
         let stamp = policy_stamp(&self.root);
         let mut seen = lock(&self.policy_seen);
         if *seen != stamp {
@@ -687,6 +702,26 @@ impl Memory {
                 ))
             })?;
             *seen = stamp;
+        }
+        Ok(())
+    }
+
+    /// Show that the ownership registry reads as it did when the session opened. A
+    /// registry that was written, changed or removed since stops the session: who
+    /// answers for a domain, and whose a personal domain is, are part of its authority.
+    fn registry_fresh(&self) -> Result<(), Error> {
+        let now = registry::stamp(&self.root).map_err(|e| {
+            Error::Stale(format!(
+                "the ownership registry cannot be read ({e}), so this session's access \
+                 cannot be shown"
+            ))
+        })?;
+        if now != self.registry_stamp {
+            return Err(Error::Stale(
+                "the ownership registry changed after this session started. A session \
+                 keeps no registry that was changed under it: start a new session"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -2176,6 +2211,8 @@ impl Memory {
                 .quarantine(entry.clone(), offered, &decision, &findings)
                 .await);
         }
+        // the policy allowed it: in a personal domain, only the person writes
+        self.hold_proposal(entry, offered).await?;
         Ok(old)
     }
 
@@ -2198,6 +2235,20 @@ impl Memory {
             _ if findings.is_empty() => "blast-radius",
             _ => "injection",
         };
+        self.hold(entry, offered, kind, &decision.reason, findings)
+            .await
+    }
+
+    /// Hold a write outside the record for the gate `kind`, with the task for the owner.
+    /// The error returned says why and where the write is held.
+    async fn hold(
+        &self,
+        entry: Entry,
+        offered: u64,
+        kind: &str,
+        reason: &str,
+        findings: &[scan::Finding],
+    ) -> Error {
         if let Err(e) = self.log_quarantined(&entry, offered, kind, scan::kinds(findings)) {
             return e;
         }
@@ -2212,8 +2263,8 @@ impl Memory {
             };
         }
         let mut body = format!(
-            "{}\n\nThe entry is held as `state/quarantine/{id}.md`, written by `{}` in session `{}`, not in the record and not served. `amem quarantine show {id}` prints it; `amem quarantine release {id}` writes it into the record as it was; `amem quarantine drop {id}` discards it. `amem lineage {id} --back` names the entries its session had read before it wrote this.",
-            decision.reason, entry.front.author, self.session_id
+            "{reason}\n\nThe entry is held as `state/quarantine/{id}.md`, written by `{}` in session `{}`, not in the record and not served. `amem quarantine show {id}` prints it; `amem quarantine release {id}` writes it into the record as it was; `amem quarantine drop {id}` discards it. `amem lineage {id} --back` names the entries its session had read before it wrote this.",
+            entry.front.author, self.session_id
         );
         if !findings.is_empty() {
             body.push_str("\n\nWhat the scan found:\n");
@@ -2241,8 +2292,8 @@ impl Memory {
             .await;
         match filed {
             Ok(c) => Error::Denied(format!(
-                "{} Quarantined as {id}; task {} for the owner.",
-                decision.reason, c.task.id
+                "{reason} Quarantined as {id}; task {} for the owner.",
+                c.task.id
             )),
             Err(e) => e,
         }
@@ -2335,6 +2386,8 @@ impl Memory {
             source: e,
         })?;
         let _ = std::fs::remove_file(path.with_extension("review.json"));
+        // the mark of a proposal to a personal domain goes with the entry
+        let _ = std::fs::remove_file(path.with_extension("personal"));
         Ok(written)
     }
 

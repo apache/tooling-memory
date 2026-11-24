@@ -26,6 +26,7 @@
 
 pub mod decide;
 pub mod record;
+pub mod registry;
 pub mod scan;
 
 use dm_core::{Label, ReadFilter};
@@ -56,6 +57,10 @@ pub enum Error {
     /// The policy would not compile or evaluate.
     #[error("policy: {0}")]
     Policy(String),
+    /// The ownership registry is not valid TOML, does not fit the schema, or holds a
+    /// value that is not allowed.
+    #[error("ownership registry: {0}")]
+    Registry(String),
 }
 
 /// What one destination's model calls may spend, in tokens in and out: per session,
