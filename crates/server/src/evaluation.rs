@@ -1,1611 +1,1176 @@
-//! Earning an autonomy level: a held-out suite, the evaluator that grades on it, and the
-//! raise that a passing run permits.
+//! The evaluation: a plan fixed before the runs, arms paired across seeds, the replay
+//! traps, and a scorecard kept in the platform's domain (the paper's section 11).
 //!
-//! The grants may name one domain that holds the held-out suites
-//! (`held_out = "dom-held"`) and one principal that grades (`evaluator = "agent:<name>"`).
-//! Only the evaluator and the owner in person read that domain: the session filter takes
-//! it away from every other session, so no read path serves a scenario to a session
-//! that claims tasks. A task of that domain is hidden from the same sessions, and they
-//! file none there. The evaluator claims no task, and it grades no handoff that it
-//! wrote. It writes entries and files tasks only in the held-out domain, since it has
-//! read the suites. A session that does not read the domain is told of a run only
-//! whether it passed.
+//! A [`Plan`] is an evaluation set file with a `[plan]` table: the tasks, the arms, the
+//! baseline arm, the number of seeds, the margin and the judge. The plan has a digest.
+//! A launcher starts each run with [`Memory::start_evaluation`], which gives the session
+//! the settings of its arm at one snapshot. The head of the session's tape then names
+//! the digest of the plan, the task, the seed and the arm ([`RunOf`]). The memory server
+//! writes that head, so the margin is shown to be fixed before the run, and a run that
+//! no session made has no tape.
 //!
-//! A suite is a fenced block in an entry of the held-out domain, TOML:
+//! [`Memory::score`] reads the facts of each run from its tape: the task, the seed, the
+//! arm, the harness, the model, the start time and the snapshot. It takes three things
+//! from the caller and trusts them: whether the run succeeded, what the run cost in
+//! tokens, and the name of the judge that decided the success. The runner is the party
+//! that has the answer of the harness, so nothing in the record can check them.
 //!
-//! ````text
-//! ```platform suite tidy
-//! [pass]
-//! review = 2
+//! A pair is one task and one seed with a run in an arm and a run in the baseline arm.
+//! [`compare`] takes the difference of each pair, arm minus baseline, and gives the mean
+//! with a 95% interval from Student's t. The margin and the accepted cost of
+//! the plan turn the two intervals into a [`Finding`]. A finding is not a verdict. The
+//! five replay traps are checked on every scorecard, and an open trap makes each verdict
+//! [`Verdict::Inconclusive`]. A drift window of the runs' model that overlaps the runs
+//! makes each verdict [`Verdict::Quarantined`].
 //!
-//! [[scenario]]
-//! name = "lease-length"
-//! ask = "Which decision set the lease length?"
-//! expect = ["DR-"]
-//! ```
-//! ````
-//!
-//! The name in the info string is the name of the task definition that the suite
-//! grades. A suite is in force only from an active entry that a person verified, and
-//! the newest one is in force. `[pass]` says how many scenarios must pass for each
-//! level; a level with no pass mark cannot be graded.
-//!
-//! [`Memory::grade`] grades one version of a definition for one level: each scenario
-//! passes when the handoff that answers it holds every string of `expect`. The run is a
-//! record on the ledger with the counts, and with no text of the suite.
-//! [`Memory::raise`] moves the version in force one level up when its newest run for
-//! that level passed on the suite in force. The step to `checks` is a person's, in a
-//! session that the memory server does not serve, and that call is the sign-off.
+//! A scorecard is kept as a `decision` entry in the platform's domain, with the
+//! scorecard as JSON in a fenced block `platform scorecard <plan>`. The launcher loads
+//! no scorecard: it is a record. [`Memory::scorecards`] serves the kept scorecards under
+//! the read filter of the session, as `list` and `get` serve entries.
 
-use crate::autonomy::level_after;
-use crate::platform::{artifacts_in, definition_block, definition_name, unreadable};
-use crate::platform::{Autonomy, TaskDefinition};
-use crate::{lock, Error, Memory};
-use dm_core::{Entry, EntryType, ReadFilter, TrustTier};
-use dm_ledger::{DefinitionChange, DefinitionRecord};
+use crate::arms::Arm;
+use crate::drift_windows::Window;
+use crate::platform::artifacts_in;
+use crate::tape::canonical;
+use crate::{Error, Memory, WriteRequest, Written};
+use dm_core::EntryType;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
-/// The kind of the block that holds a suite: `platform suite <definition name>`. It is
-/// not one of [`crate::platform::KINDS`]: the launcher loads nothing from it.
-pub const SUITE_KIND: &str = "suite";
+/// The kind of the fenced block that holds a scorecard.
+pub const KIND: &str = "scorecard";
 
-/// One scenario of a held-out suite.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Scenario {
-    /// Its name, one time in its suite. An answer names it.
-    pub name: String,
-    /// What the work is asked.
-    #[serde(default)]
-    pub ask: String,
-    /// The strings that the handoff of the work must hold, each of them.
-    pub expect: Vec<String>,
-}
+/// How the title of a scorecard's entry starts. [`Memory::scorecards`] reads the body of
+/// an entry only when its title starts so.
+pub const TITLE: &str = "Scorecard ";
 
-/// How many scenarios of a suite must pass for each autonomy level.
+/// The most decisions [`Memory::scorecards`] lists to find the scorecards.
+const LISTED: usize = 1000;
+
+/// The names of the five replay traps, in the paper's order.
+pub const TRAPS: [&str; 5] = [
+    "survivorship",
+    "leakage",
+    "noise",
+    "judge-drift",
+    "distribution-shift",
+];
+
+/// Whether a task is one that production passed or one that it failed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PassMarks {
-    /// For work at the level `person`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub person: Option<u32>,
-    /// To earn the level `review`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review: Option<u32>,
-    /// To earn the level `checks`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checks: Option<u32>,
+#[serde(rename_all = "lowercase")]
+pub enum Stratum {
+    /// A task with no recorded failure.
+    #[default]
+    Passed,
+    /// A task that failed in production: the survivorship trap needs one.
+    Failed,
 }
 
-impl PassMarks {
-    /// The pass mark for `level`, when the suite gives one.
-    #[must_use]
-    pub fn for_level(self, level: Autonomy) -> Option<u32> {
-        match level {
-            Autonomy::Person => self.person,
-            Autonomy::Review => self.review,
-            Autonomy::Checks => self.checks,
+/// Which of the two task sets a task is in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskSet {
+    /// The set that follows production.
+    #[default]
+    Rolling,
+    /// The set that does not change: the distribution-shift trap needs one of each.
+    Frozen,
+}
+
+/// One task of a plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanTask {
+    /// Its name in the plan.
+    pub id: String,
+    /// What the harness is asked, after the preamble.
+    pub prompt: String,
+    /// The regular expression that the answer must match.
+    pub expect: String,
+    /// Whether production passed it or failed it.
+    #[serde(default)]
+    pub stratum: Stratum,
+    /// The task set it is in.
+    #[serde(default)]
+    pub set: TaskSet,
+}
+
+/// The plan of an evaluation: everything that is fixed before the first run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Plan {
+    /// The plan's name: one word, the name of its scorecards.
+    pub name: String,
+    /// The domain the runs read, and where their tapes are kept.
+    pub domain: String,
+    /// The arm every other arm is compared with.
+    pub baseline: Arm,
+    /// The arms, the baseline among them.
+    pub arms: Vec<Arm>,
+    /// How many times each task runs in each arm. A seed is a number below this.
+    pub seeds: u32,
+    /// The margin: how much lower the success rate of an arm may be, as a fraction, and
+    /// the arm is still no worse than the baseline.
+    pub margin: f64,
+    /// The accepted cost: the most an arm that is better may cost, as a factor of the
+    /// cost of the baseline.
+    pub accepted_cost: f64,
+    /// The name of the judge that decides the success of a run.
+    pub judge: String,
+    /// The harness every run uses, when the plan fixes one.
+    pub harness: Option<String>,
+    /// The model every run uses, when the plan fixes one.
+    pub model: Option<String>,
+    /// The text in front of the prompt of every task.
+    pub preamble: String,
+    /// The tasks.
+    pub tasks: Vec<PlanTask>,
+}
+
+/// The evaluation set file, as TOML holds it. A key that is not named here is ignored.
+#[derive(Deserialize)]
+struct File {
+    #[serde(default)]
+    preamble: String,
+    plan: Option<Table>,
+    #[serde(default)]
+    task: Vec<PlanTask>,
+}
+
+/// The `[plan]` table.
+#[derive(Deserialize)]
+struct Table {
+    name: String,
+    domain: String,
+    baseline: String,
+    arms: Vec<String>,
+    seeds: u32,
+    margin: Option<f64>,
+    accepted_cost: Option<f64>,
+    judge: String,
+    harness: Option<String>,
+    model: Option<String>,
+}
+
+fn refuse(why: &str) -> Error {
+    Error::Denied(format!("the plan is refused: {why}"))
+}
+
+/// Whether `name` is one word that the info line of a fence holds as it is: lower-case
+/// letters, digits and `-`, and not empty.
+fn is_one_word(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn arm_of(name: &str) -> Result<Arm, Error> {
+    name.parse::<Arm>().map_err(|e| refuse(&e))
+}
+
+/// The arms of a plan, each named once.
+fn arms_of(names: &[String]) -> Result<Vec<Arm>, Error> {
+    let mut arms = Vec::new();
+    for name in names {
+        let arm = arm_of(name)?;
+        if arms.contains(&arm) {
+            return Err(refuse(&format!("it names the arm {arm} twice")));
+        }
+        arms.push(arm);
+    }
+    Ok(arms)
+}
+
+/// The tasks of a plan: at least one, each id once.
+fn tasks_of(tasks: Vec<PlanTask>) -> Result<Vec<PlanTask>, Error> {
+    if tasks.is_empty() {
+        return Err(refuse("it has no task"));
+    }
+    let mut ids = BTreeSet::new();
+    for t in &tasks {
+        if !ids.insert(t.id.as_str()) {
+            return Err(refuse(&format!("it names the task {} twice", t.id)));
         }
     }
+    Ok(tasks)
 }
 
-/// The text of a suite block.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SuiteText {
-    #[serde(default)]
-    pass: PassMarks,
-    #[serde(default)]
-    scenario: Vec<Scenario>,
-}
-
-/// A held-out suite: the scenarios that grade one task definition.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct Suite {
-    /// The name of the task definition that it grades, from the block's info string.
-    pub name: String,
-    /// The entry it is in.
-    pub entry: String,
-    /// Its version: `<entry>@<digest of the entry's text>`. A run names it, so a run on
-    /// a suite that changed since is known as one.
-    pub version: String,
-    /// How many scenarios must pass for each level.
-    pub pass: PassMarks,
-    /// Its scenarios, in the order of the text.
-    pub scenarios: Vec<Scenario>,
-}
-
-/// One answer to a scenario: the handoff of the work that was done on it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Answer {
-    /// The scenario, by its name in the suite.
-    pub scenario: String,
-    /// The handoff entry that records the work.
-    pub handoff: String,
-}
-
-/// What a graded run gave.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct Graded {
-    /// The record of the run on the ledger: the counts, the version of the suite and
-    /// the grader.
-    pub record: DefinitionRecord,
-    /// Whether as many scenarios passed as the level needs.
-    pub pass: bool,
-    /// The scenarios that did not pass, by name, in the order of the suite. Text of the
-    /// suite: it goes to the grader and is in no record.
-    pub failed: Vec<String>,
-}
-
-/// The suite that the block of `e` named `name` gives: none when the entry has no such
-/// block, and an error when the block does not read as a suite.
-fn suite_block(e: &Entry, name: &str) -> Option<Result<Suite, ()>> {
-    let block = artifacts_in(e)
-        .into_iter()
-        .find(|a| a.kind == SUITE_KIND && a.name == name)?;
-    Some(read_suite(&block.text, name, e))
-}
-
-/// Read the text of a suite block. It reads as a suite when it has a scenario, each
-/// scenario has a name of its own that is not blank and expects a string that is not
-/// blank, and each pass mark is from 1 to the number of scenarios.
-fn read_suite(text: &str, name: &str, e: &Entry) -> Result<Suite, ()> {
-    let parsed: SuiteText = toml::from_str(text).map_err(|_| ())?;
-    let count = u32::try_from(parsed.scenario.len()).map_err(|_| ())?;
-    let mut names = BTreeSet::new();
-    let scenarios_read = parsed.scenario.iter().all(|s| {
-        !s.name.trim().is_empty()
-            && names.insert(s.name.as_str())
-            && !s.expect.is_empty()
-            && s.expect.iter().all(|x| !x.trim().is_empty())
-    });
-    let marks = [parsed.pass.person, parsed.pass.review, parsed.pass.checks];
-    let marks_read = marks.iter().flatten().all(|m| (1..=count).contains(m));
-    if count == 0 || !scenarios_read || !marks_read {
-        return Err(());
+/// The numbers of a `[plan]` table: the margin and the accepted cost.
+fn numbers_of(table: &Table) -> Result<(f64, f64), Error> {
+    let Some(margin) = table.margin else {
+        return Err(refuse("it names no margin"));
+    };
+    if !(0.0..=1.0).contains(&margin) {
+        return Err(refuse("the margin is a fraction from 0 to 1"));
     }
-    Ok(Suite {
+    let accepted_cost = table.accepted_cost.unwrap_or(1.0);
+    if !accepted_cost.is_finite() || accepted_cost <= 0.0 {
+        return Err(refuse("the accepted cost is a factor above 0"));
+    }
+    if table.seeds < 2 {
+        return Err(refuse(
+            "it needs two seeds or more: one run of a task says nothing about noise",
+        ));
+    }
+    Ok((margin, accepted_cost))
+}
+
+impl Plan {
+    /// Read a plan from the text of an evaluation set file.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`], with the reason, for text that is not TOML, that has no
+    /// `[plan]` table, a name that is not one word, no margin or a margin outside 0 to 1, fewer than two seeds, an
+    /// arm that is no arm, an arm named twice, a baseline that is not among the arms,
+    /// no task, a task id named twice, or a judge that is the model.
+    pub fn parse(text: &str) -> Result<Plan, Error> {
+        let file: File =
+            toml::from_str(text).map_err(|e| refuse(&format!("it does not read: {e}")))?;
+        let Some(table) = file.plan else {
+            return Err(refuse("it has no [plan] table"));
+        };
+        if !is_one_word(&table.name) {
+            return Err(refuse(
+                "its name is not one word of the letters a to z, the digits and `-`",
+            ));
+        }
+        let (margin, accepted_cost) = numbers_of(&table)?;
+        let arms = arms_of(&table.arms)?;
+        let baseline = arm_of(&table.baseline)?;
+        if !arms.contains(&baseline) {
+            return Err(refuse(&format!(
+                "the baseline {baseline} is not among its arms"
+            )));
+        }
+        if table.model.as_deref() == Some(table.judge.as_str()) {
+            return Err(refuse(
+                "the judge is the model of the runs: a model does not judge its own answers",
+            ));
+        }
+        Ok(Plan {
+            name: table.name,
+            domain: table.domain,
+            baseline,
+            arms,
+            seeds: table.seeds,
+            margin,
+            accepted_cost,
+            judge: table.judge,
+            harness: table.harness,
+            model: table.model,
+            preamble: file.preamble,
+            tasks: tasks_of(file.task)?,
+        })
+    }
+
+    /// The digest of the plan: of the plan as canonical JSON, keys sorted. A comment,
+    /// the order of the keys and an ignored key do not change it.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let plan = serde_json::to_value(self).unwrap_or(Value::Null);
+        dm_core::digest(&canonical(&plan))
+    }
+
+    /// The task named `id`.
+    #[must_use]
+    pub fn task(&self, id: &str) -> Option<&PlanTask> {
+        self.tasks.iter().find(|t| t.id == id)
+    }
+
+    /// The prompt of a run of the task `id`: the preamble, then the task's prompt.
+    #[must_use]
+    pub fn prompt_of(&self, id: &str) -> Option<String> {
+        self.task(id)
+            .map(|t| format!("{}{}", self.preamble, t.prompt))
+    }
+
+    /// Whether a run of the task `task` at the seed `seed` in the arm `arm` is a run
+    /// of this plan.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a task the plan does not hold, an arm the plan does not
+    /// name, and a seed at or above the plan's seeds.
+    pub fn holds(&self, task: &str, seed: u32, arm: Arm) -> Result<(), Error> {
+        if self.task(task).is_none() {
+            return Err(Error::Denied(format!(
+                "the plan {} has no task {task}",
+                self.name
+            )));
+        }
+        if !self.arms.contains(&arm) {
+            return Err(Error::Denied(format!(
+                "the plan {} does not name the arm {arm}",
+                self.name
+            )));
+        }
+        if seed >= self.seeds {
+            return Err(Error::Denied(format!(
+                "the plan {} has {} seeds, from 0: {seed} is not one",
+                self.name, self.seeds
+            )));
+        }
+        Ok(())
+    }
+
+    /// The digest of the frozen task set: of the frozen tasks, in the plan's order.
+    #[must_use]
+    pub fn frozen_digest(&self) -> String {
+        let frozen: Vec<&PlanTask> = self
+            .tasks
+            .iter()
+            .filter(|t| t.set == TaskSet::Frozen)
+            .collect();
+        dm_core::digest(&canonical(&json!(frozen)))
+    }
+}
+
+/// Which run of which plan a session is. The head of the session's tape holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOf {
+    /// The digest of the plan.
+    pub plan: String,
+    /// The task.
+    pub task: String,
+    /// The seed: the number of the repeated run.
+    pub seed: u32,
+    /// The arm.
+    pub arm: Arm,
+}
+
+/// What the runner says of one run. The scorer trusts these three values.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Outcome {
+    /// The session of the run: its tape gives every other fact.
+    pub session: String,
+    /// Whether the judge accepted the answer.
+    pub success: bool,
+    /// What the run cost, in tokens, as the harness counted them.
+    pub cost: u64,
+    /// The name of the judge.
+    pub judge: String,
+}
+
+/// One run, as [`compare`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Run {
+    /// The task.
+    pub task: String,
+    /// The seed.
+    pub seed: u32,
+    /// The arm.
+    pub arm: Arm,
+    /// Whether the run succeeded.
+    pub success: bool,
+    /// What it cost, in tokens.
+    pub cost: u64,
+}
+
+/// A mean of paired differences with its interval.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Interval {
+    /// The mean.
+    pub mean: f64,
+    /// The low end.
+    pub low: f64,
+    /// The high end.
+    pub high: f64,
+}
+
+/// What the numbers alone say of an arm against the baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Finding {
+    /// No worse than the baseline and cheaper, or better at an accepted cost.
+    Pays,
+    /// Worse than the baseline, or no better and dearer.
+    Fails,
+    /// The intervals do not decide.
+    Unclear,
+}
+
+/// What a scorecard says of an arm.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Verdict {
+    /// The arm pays.
+    Pays,
+    /// The arm fails.
+    Fails,
+    /// The intervals do not decide.
+    Unclear,
+    /// A replay trap is open, so the finding is not a verdict.
+    Inconclusive {
+        /// The traps that are open.
+        traps: Vec<String>,
+    },
+    /// The runs spanned a drift window of their model.
+    Quarantined {
+        /// The destination of the window.
+        destination: String,
+        /// The model of the window.
+        model: String,
+    },
+}
+
+/// One replay trap on a scorecard.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trap {
+    /// Its name.
+    pub name: String,
+    /// Whether the evaluation is safe from it.
+    pub held: bool,
+    /// Why, in one sentence.
+    pub why: String,
+}
+
+/// The score of one arm.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArmScore {
+    /// The arm.
+    pub arm: Arm,
+    /// Whether it is the baseline.
+    pub baseline: bool,
+    /// How many runs it has.
+    pub runs: usize,
+    /// How many of them succeeded.
+    pub passed: usize,
+    /// The mean cost of its runs, in tokens.
+    pub mean_cost: f64,
+    /// How many of its runs have a partner in the baseline.
+    pub pairs: usize,
+    /// How many seeds its pairs come from; for the baseline, its runs.
+    pub seeds: usize,
+    /// The difference in success, arm minus baseline, over the pairs.
+    pub success: Interval,
+    /// The difference in cost, arm minus baseline, over the pairs.
+    pub cost: Interval,
+    /// What the numbers alone say; none for the baseline.
+    pub finding: Option<Finding>,
+    /// What the scorecard says; none for the baseline.
+    pub verdict: Option<Verdict>,
+}
+
+/// The result of an evaluation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Scorecard {
+    /// The plan's name.
+    pub plan: String,
+    /// The digest of the plan that every run started under.
+    pub plan_digest: String,
+    /// The digest of the plan's frozen task set.
+    pub frozen_digest: String,
+    /// The domain the runs read.
+    pub domain: String,
+    /// The harness of the runs.
+    pub harness: String,
+    /// The model of the runs, when the launches named one.
+    pub model: Option<String>,
+    /// The judge of the plan.
+    pub judge: String,
+    /// The baseline arm.
+    pub baseline: Arm,
+    /// The margin of the plan.
+    pub margin: f64,
+    /// The accepted cost of the plan.
+    pub accepted_cost: f64,
+    /// When the first run started.
+    pub started: String,
+    /// When the last run made its last tool call.
+    pub ended: String,
+    /// The snapshot of the runs, when every run has the same one.
+    pub snapshot: Option<String>,
+    /// The arms, in the plan's order.
+    pub arms: Vec<ArmScore>,
+    /// The five replay traps.
+    pub traps: Vec<Trap>,
+    /// How many runs outside the baseline have no partner in it.
+    pub unpaired: usize,
+    /// The drift window the runs spanned, when they spanned one.
+    pub quarantined: Option<Window>,
+}
+
+/// A scorecard that the record keeps.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KeptScorecard {
+    /// The entry that holds it.
+    pub entry: String,
+    /// When that entry was written.
+    pub created: String,
+    /// Who wrote that entry.
+    pub author: String,
+    /// The scorecard.
+    pub scorecard: Scorecard,
+}
+
+/// A value at six decimals: such a value is read back from JSON as it was written.
+fn rounded(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
+}
+
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+/// The 0.975 quantile of Student's t for 1 to 30 degrees of freedom.
+const T_975: [f64; 30] = [
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+    2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+    2.052, 2.048, 2.045, 2.042,
+];
+
+/// The factor of a 95% interval of a mean of `n` differences: the 0.975 quantile of
+/// Student's t with `n - 1` degrees of freedom. Above 30 degrees it is the quantile of
+/// the last tabled count below, which is never the smaller one: 30, 40, 60 or 120.
+fn factor(n: usize) -> f64 {
+    match n.saturating_sub(1) {
+        0 => f64::INFINITY,
+        df @ 1..=30 => T_975[df - 1],
+        31..=39 => 2.042,
+        40..=59 => 2.021,
+        60..=119 => 2.000,
+        _ => 1.980,
+    }
+}
+
+/// The mean of `differences` with `mean ± t * sd / sqrt(n)`: the sample standard
+/// deviation, and t from [`factor`], so that two pairs give a wide interval and not a
+/// finding from noise. With fewer than two differences the interval is the mean alone.
+fn interval(differences: &[f64]) -> Interval {
+    let m = mean(differences);
+    if differences.len() < 2 {
+        return Interval {
+            mean: rounded(m),
+            low: rounded(m),
+            high: rounded(m),
+        };
+    }
+    let n = differences.len() as f64;
+    let variance = differences.iter().map(|d| (d - m).powi(2)).sum::<f64>() / (n - 1.0);
+    let half = factor(differences.len()) * variance.sqrt() / n.sqrt();
+    Interval {
+        mean: rounded(m),
+        low: rounded(m - half),
+        high: rounded(m + half),
+    }
+}
+
+/// What the two intervals say under the plan's margin. `accepted` is whether the arm
+/// costs no more than the accepted cost allows.
+fn finding_of(plan: &Plan, success: &Interval, cost: &Interval, accepted: bool) -> Finding {
+    let worse = success.high < -plan.margin;
+    let no_worse = success.low >= -plan.margin;
+    let better = success.low > 0.0;
+    let cheaper = cost.high < 0.0;
+    let dearer = cost.low > 0.0;
+    if worse {
+        Finding::Fails
+    } else if (no_worse && cheaper) || (better && accepted) {
+        Finding::Pays
+    } else if no_worse && !better && dearer {
+        Finding::Fails
+    } else {
+        Finding::Unclear
+    }
+}
+
+fn cost_of(run: &Run) -> f64 {
+    run.cost as f64
+}
+
+fn seeds_of<'a>(runs: impl Iterator<Item = &'a Run>) -> usize {
+    runs.map(|r| r.seed).collect::<BTreeSet<u32>>().len()
+}
+
+/// The totals of an arm over its own runs, before any pair.
+fn totals(arm: Arm, own: &[&Run]) -> ArmScore {
+    let costs: Vec<f64> = own.iter().map(|r| cost_of(r)).collect();
+    ArmScore {
+        arm,
+        baseline: false,
+        runs: own.len(),
+        passed: own.iter().filter(|r| r.success).count(),
+        mean_cost: rounded(mean(&costs)),
+        pairs: 0,
+        seeds: 0,
+        success: Interval::default(),
+        cost: Interval::default(),
+        finding: None,
+        verdict: None,
+    }
+}
+
+/// `score` with the paired differences of the arm against the baseline.
+fn paired(plan: &Plan, mut score: ArmScore, pairs: &[(&Run, &Run)]) -> ArmScore {
+    let success: Vec<f64> = pairs
+        .iter()
+        .map(|(a, b)| f64::from(u8::from(a.success)) - f64::from(u8::from(b.success)))
+        .collect();
+    let cost: Vec<f64> = pairs.iter().map(|(a, b)| cost_of(a) - cost_of(b)).collect();
+    let of_arm: Vec<f64> = pairs.iter().map(|(a, _)| cost_of(a)).collect();
+    let of_baseline: Vec<f64> = pairs.iter().map(|(_, b)| cost_of(b)).collect();
+    let accepted = mean(&of_arm) <= plan.accepted_cost * mean(&of_baseline);
+    score.pairs = pairs.len();
+    score.seeds = seeds_of(pairs.iter().map(|(a, _)| *a));
+    score.success = interval(&success);
+    score.cost = interval(&cost);
+    score.finding = Some(if pairs.len() < 2 {
+        Finding::Unclear
+    } else {
+        finding_of(plan, &score.success, &score.cost, accepted)
+    });
+    score
+}
+
+/// Compare each arm of the plan with the baseline arm over `runs`, in the plan's
+/// order. A pair is a task and a seed with a run in the arm and a run in the baseline;
+/// a run with no partner is in the totals of its arm and in no difference. The
+/// baseline gets no finding, and no arm gets a verdict here: a verdict also needs the
+/// traps and the drift windows.
+#[must_use]
+pub fn compare(plan: &Plan, runs: &[Run]) -> Vec<ArmScore> {
+    let baseline: BTreeMap<(&str, u32), &Run> = runs
+        .iter()
+        .filter(|r| r.arm == plan.baseline)
+        .map(|r| ((r.task.as_str(), r.seed), r))
+        .collect();
+    plan.arms
+        .iter()
+        .map(|&arm| {
+            let own: Vec<&Run> = runs.iter().filter(|r| r.arm == arm).collect();
+            let mut score = totals(arm, &own);
+            if arm == plan.baseline {
+                score.baseline = true;
+                score.seeds = seeds_of(own.iter().copied());
+                return score;
+            }
+            let pairs: Vec<(&Run, &Run)> = own
+                .iter()
+                .filter_map(|r| baseline.get(&(r.task.as_str(), r.seed)).map(|b| (*r, *b)))
+                .collect();
+            paired(plan, score, &pairs)
+        })
+        .collect()
+}
+
+/// One run with the facts its tape gives and the judge its outcome names.
+#[derive(Clone, Debug)]
+struct Fact {
+    run: Run,
+    harness: String,
+    model: Option<String>,
+    judge: String,
+    started: OffsetDateTime,
+    ended: OffsetDateTime,
+    snapshot: Option<OffsetDateTime>,
+}
+
+fn at(text: &str) -> Result<OffsetDateTime, Error> {
+    OffsetDateTime::parse(text, &Rfc3339)
+        .map_err(|e| Error::Transcript(format!("tape: the time {text:?} does not read: {e}")))
+}
+
+fn rfc3339(t: OffsetDateTime) -> String {
+    t.format(&Rfc3339).unwrap_or_default()
+}
+
+fn trap(name: &str, held: bool, safe: &str, open: &str) -> Trap {
+    Trap {
         name: name.to_string(),
-        entry: e.front.id.clone(),
-        version: format!("{}@{}", e.front.id, dm_core::digest(&e.render())),
-        pass: parsed.pass,
-        scenarios: parsed.scenario,
+        held,
+        why: if held { safe } else { open }.to_string(),
+    }
+}
+
+/// The snapshot every run has, when every run has the same one.
+fn one_snapshot(facts: &[Fact]) -> Option<OffsetDateTime> {
+    let first = facts.first()?.snapshot?;
+    facts
+        .iter()
+        .all(|f| f.snapshot == Some(first))
+        .then_some(first)
+}
+
+/// Whether every arm outside the baseline has a pair on a task of the plan that `is`:
+/// a run of the arm, and the baseline's run of the same task and seed. A task of the
+/// plan that no arm ran shows nothing.
+fn every_arm_pairs(plan: &Plan, facts: &[Fact], is: impl Fn(&PlanTask) -> bool) -> bool {
+    let ran = |arm: Arm, task: &str, seed: u32| {
+        facts
+            .iter()
+            .any(|f| f.run.arm == arm && f.run.task == task && f.run.seed == seed)
+    };
+    let outside = plan.arms.iter().filter(|a| **a != plan.baseline);
+    outside.into_iter().all(|&arm| {
+        facts.iter().any(|f| {
+            f.run.arm == arm
+                && plan.task(&f.run.task).is_some_and(&is)
+                && ran(plan.baseline, &f.run.task, f.run.seed)
+        })
     })
 }
 
-/// The refusal for a block that is no suite: the name of its definition, and nothing of
-/// its text.
-fn not_a_suite(name: &str) -> Error {
-    Error::Denied(format!(
-        "the held-out suite for {name} does not read as one: it needs a scenario, a name of its own and an expected string for each scenario, and pass marks from 1 to the number of scenarios"
-    ))
+/// The five replay traps of an evaluation, in the paper's order.
+fn traps_of(plan: &Plan, facts: &[Fact], arms: &[ArmScore], started: OffsetDateTime) -> Vec<Trap> {
+    let failed = every_arm_pairs(plan, facts, |t| t.stratum == Stratum::Failed);
+    let before = one_snapshot(facts).is_some_and(|s| s <= started);
+    let seeds = arms.iter().all(|a| a.baseline || a.seeds >= 2);
+    let judge = facts.iter().all(|f| f.judge == plan.judge);
+    let frozen = every_arm_pairs(plan, facts, |t| t.set == TaskSet::Frozen);
+    let rolling = every_arm_pairs(plan, facts, |t| t.set == TaskSet::Rolling);
+    vec![
+        trap(
+            TRAPS[0],
+            failed,
+            "Every arm has a pair on a task that failed in production.",
+            "An arm has no pair on a task with the stratum `failed`: tasks that passed say nothing about the tasks that failed.",
+        ),
+        trap(
+            TRAPS[1],
+            before,
+            "Every run read the record at one snapshot that is not later than the first run.",
+            "The runs do not have one snapshot that is not later than the first run: a run can read what a later session wrote.",
+        ),
+        trap(
+            TRAPS[2],
+            seeds,
+            "Every arm has pairs from two seeds or more.",
+            "An arm has pairs from fewer than two seeds: one run of a task does not show the noise.",
+        ),
+        trap(
+            TRAPS[3],
+            judge,
+            "The judge of the plan decided every outcome.",
+            "An outcome names a judge that is not the judge of the plan.",
+        ),
+        trap(
+            TRAPS[4],
+            frozen && rolling,
+            "Every arm has a pair on a frozen task and a pair on a rolling task.",
+            "An arm needs a pair on a frozen task and a pair on a rolling task: one set alone does not show a shift of the tasks.",
+        ),
+    ]
 }
 
-/// The refusal for an answer that does not fit the suite. It quotes the caller's own
-/// words and nothing of the suite.
-fn answers_fit(suite: &Suite, answers: &[Answer]) -> Result<(), Error> {
+/// Refuse runs that are not one evaluation: no run, two runs of one task, seed and
+/// arm, two harnesses or models, or a harness or model that is not the plan's.
+fn one_evaluation(plan: &Plan, facts: &[Fact]) -> Result<(), Error> {
+    let Some(first) = facts.first() else {
+        return Err(Error::Denied(
+            "an evaluation is scored from one outcome or more".into(),
+        ));
+    };
     let mut seen = BTreeSet::new();
-    for a in answers {
-        if !suite.scenarios.iter().any(|s| s.name == a.scenario) {
+    for f in facts {
+        let r = &f.run;
+        if !seen.insert((r.task.as_str(), r.seed, r.arm.name())) {
             return Err(Error::Denied(format!(
-                "the held-out suite for {} has no scenario {:?}",
-                suite.name, a.scenario
+                "two outcomes are the run of task {}, seed {}, arm {}",
+                r.task, r.seed, r.arm
             )));
         }
-        if !seen.insert(a.scenario.as_str()) {
-            return Err(Error::Denied(format!(
-                "the scenario {:?} has two answers: a run gives one handoff for each scenario",
-                a.scenario
-            )));
+        if f.harness != first.harness || f.model != first.model {
+            return Err(Error::Denied(
+                "the runs differ in harness or model: a scorecard compares arms and nothing else"
+                    .into(),
+            ));
         }
+    }
+    let harness = plan.harness.as_ref().is_none_or(|h| *h == first.harness);
+    let model = plan.model.is_none() || plan.model == first.model;
+    if !harness || !model {
+        return Err(Error::Denied(
+            "the runs are on a harness or a model that is not the plan's".into(),
+        ));
     }
     Ok(())
 }
 
-/// The newest run in `records`, the records of `reference`, that was graded for the
-/// level `next`, when a raise to that level can stand on it: it passed, it is of the
-/// suite version `in_force`, and no work outcome was recorded after it.
-fn run_to_raise_on<'a>(
-    reference: &str,
-    records: &'a [DefinitionRecord],
-    next: Autonomy,
-    in_force: Option<&str>,
-) -> Result<&'a DefinitionRecord, Error> {
-    let newest = records.iter().enumerate().rev().find_map(|(at, r)| {
-        if let DefinitionChange::Graded {
-            suite,
-            level,
-            passed,
-            of,
-            needed,
-            ..
-        } = &r.change
-        {
-            (*level == next).then_some((at, r, suite, (*passed, *of, *needed)))
-        } else {
-            None
-        }
-    });
-    let Some((at, run, suite, (passed, of, needed))) = newest else {
-        return Err(Error::Denied(format!(
-            "no run of {reference} was graded for the level {next}: a level is earned on a run of the held-out suite"
-        )));
-    };
-    if passed < needed {
-        return Err(Error::Denied(format!(
-            "the newest run for the level {next} failed: {passed} of {of} scenarios passed, and the level needs {needed}"
-        )));
-    }
-    if in_force != Some(suite.as_str()) {
-        return Err(Error::Denied(format!(
-            "the newest run for the level {next} is not of the held-out suite in force now: grade the definition again"
-        )));
-    }
-    let lowered_since = records[at + 1..]
+/// Give each arm its verdict: quarantined when the runs spanned a drift window, else
+/// inconclusive when a trap is open, else its finding.
+fn give_verdicts(arms: &mut [ArmScore], traps: &[Trap], window: Option<&Window>) {
+    let open: Vec<String> = traps
         .iter()
-        .any(|r| matches!(r.change, DefinitionChange::Outcome { .. }));
-    if lowered_since {
-        return Err(Error::Denied(format!(
-            "a work outcome was recorded after the newest run for the level {next}: grade the definition again"
-        )));
+        .filter(|t| !t.held)
+        .map(|t| t.name.clone())
+        .collect();
+    for arm in arms {
+        let Some(finding) = arm.finding else {
+            continue;
+        };
+        arm.verdict = Some(match (window, open.is_empty(), finding) {
+            (Some(w), _, _) => Verdict::Quarantined {
+                destination: w.destination.clone(),
+                model: w.model.clone(),
+            },
+            (None, false, _) => Verdict::Inconclusive {
+                traps: open.clone(),
+            },
+            (None, true, Finding::Pays) => Verdict::Pays,
+            (None, true, Finding::Fails) => Verdict::Fails,
+            (None, true, Finding::Unclear) => Verdict::Unclear,
+        });
     }
-    Ok(run)
+}
+
+/// The scorecard of `facts` under `plan`, with `windows` as the drift windows.
+fn assemble(plan: &Plan, facts: &[Fact], windows: &[Window]) -> Result<Scorecard, Error> {
+    one_evaluation(plan, facts)?;
+    let first = &facts[0];
+    let runs: Vec<Run> = facts.iter().map(|f| f.run.clone()).collect();
+    let mut arms = compare(plan, &runs);
+    let started = facts
+        .iter()
+        .map(|f| f.started)
+        .min()
+        .unwrap_or(first.started);
+    let ended = facts.iter().map(|f| f.ended).max().unwrap_or(first.ended);
+    let traps = traps_of(plan, facts, &arms, started);
+    let quarantined = first.model.as_ref().and_then(|model| {
+        windows
+            .iter()
+            .find(|w| w.model == *model && w.overlaps(started, ended))
+            .cloned()
+    });
+    give_verdicts(&mut arms, &traps, quarantined.as_ref());
+    let outside = runs.iter().filter(|r| r.arm != plan.baseline).count();
+    let pairs: usize = arms.iter().map(|a| a.pairs).sum();
+    Ok(Scorecard {
+        plan: plan.name.clone(),
+        plan_digest: plan.digest(),
+        frozen_digest: plan.frozen_digest(),
+        domain: plan.domain.clone(),
+        harness: first.harness.clone(),
+        model: first.model.clone(),
+        judge: plan.judge.clone(),
+        baseline: plan.baseline,
+        margin: plan.margin,
+        accepted_cost: plan.accepted_cost,
+        started: rfc3339(started),
+        ended: rfc3339(ended),
+        snapshot: one_snapshot(facts).map(rfc3339),
+        arms,
+        traps,
+        unpaired: outside - pairs,
+        quarantined,
+    })
+}
+
+fn verdict_words(verdict: Option<&Verdict>) -> String {
+    match verdict {
+        None => "the baseline".into(),
+        Some(Verdict::Pays) => "pays".into(),
+        Some(Verdict::Fails) => "fails".into(),
+        Some(Verdict::Unclear) => "unclear".into(),
+        Some(Verdict::Inconclusive { traps }) => {
+            format!("inconclusive ({})", traps.join(", "))
+        }
+        Some(Verdict::Quarantined { destination, model }) => {
+            format!("quarantined (drift window of {destination}/{model})")
+        }
+    }
+}
+
+fn finding_words(finding: Option<Finding>) -> &'static str {
+    match finding {
+        None => "",
+        Some(Finding::Pays) => "pays",
+        Some(Finding::Fails) => "fails",
+        Some(Finding::Unclear) => "unclear",
+    }
+}
+
+fn interval_words(i: &Interval) -> String {
+    format!("{:.3} ({:.3} to {:.3})", i.mean, i.low, i.high)
+}
+
+/// The verdicts of a scorecard on one line.
+fn summary_of(card: &Scorecard) -> String {
+    let verdicts: Vec<String> = card
+        .arms
+        .iter()
+        .filter(|a| !a.baseline)
+        .map(|a| format!("{} {}", a.arm, verdict_words(a.verdict.as_ref())))
+        .collect();
+    format!(
+        "Against {}, margin {}: {}.",
+        card.baseline,
+        card.margin,
+        verdicts.join("; ")
+    )
+}
+
+/// The body of a scorecard's entry: the table, the traps, and the scorecard as JSON.
+fn body_of(card: &Scorecard, title: &str) -> Result<String, Error> {
+    let mut out = format!("# {title}\n\n{}\n\n", summary_of(card));
+    out.push_str(
+        "| Arm | Runs | Passed | Mean cost | Pairs | Success, arm minus baseline | Cost, arm minus baseline | Numbers alone | Verdict |\n|---|---|---|---|---|---|---|---|---|\n",
+    );
+    for a in &card.arms {
+        let (success, cost) = if a.baseline {
+            (String::new(), String::new())
+        } else {
+            (interval_words(&a.success), interval_words(&a.cost))
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {:.0} | {} | {success} | {cost} | {} | {} |\n",
+            a.arm,
+            a.runs,
+            a.passed,
+            a.mean_cost,
+            a.pairs,
+            finding_words(a.finding),
+            verdict_words(a.verdict.as_ref()),
+        ));
+    }
+    out.push_str("\n## Replay traps\n\n");
+    for t in &card.traps {
+        let state = if t.held { "held" } else { "open" };
+        out.push_str(&format!("- `{}`, {state}: {}\n", t.name, t.why));
+    }
+    let json = serde_json::to_string_pretty(card)
+        .map_err(|e| Error::Transcript(format!("scorecard: {e}")))?;
+    out.push_str(&format!(
+        "\n```platform {KIND} {}\n{json}\n```\n",
+        card.plan
+    ));
+    Ok(out)
+}
+
+/// How a launcher starts a run: on which harness and model.
+#[derive(Clone, Copy, Debug)]
+pub struct Launched<'a> {
+    /// The harness, by its binary name.
+    pub harness: &'a str,
+    /// The model, when the launch names one.
+    pub model: Option<&'a str>,
 }
 
 impl Memory {
-    /// The domain that holds the held-out suites, when the grants name one they hold.
-    #[must_use]
-    pub fn held_out_domain(&self) -> Option<String> {
-        self.grants
-            .held_out
-            .clone()
-            .filter(|d| self.grants.domains.contains_key(d))
-    }
-
-    /// Whether this session's principal is the evaluator that the grants name.
-    fn is_evaluator(&self) -> bool {
-        self.grants.evaluator.as_deref() == Some(self.author.as_str())
-    }
-
-    /// Whether this session reads the held-out domain: its principal is the evaluator,
-    /// or it is the owner in a session that the memory server does not serve. A harness
-    /// reaches a served session, so an agent could read the scenarios through it,
-    /// whatever the name of the session.
-    #[must_use]
-    pub fn reads_held_out(&self) -> bool {
-        self.is_evaluator() || (self.author == self.grants.owner && !self.served())
-    }
-
-    /// Whether `domain` is the held-out domain and this session does not read it.
-    pub(crate) fn withheld(&self, domain: &str) -> bool {
-        self.held_out_domain().as_deref() == Some(domain) && !self.reads_held_out()
-    }
-
-    /// `f` without the held-out domain, for a session that does not read it. A filter
-    /// that then names no domain names one that no entry has: an empty list means
-    /// every domain to the index.
-    pub(crate) fn without_held_out(&self, mut f: ReadFilter) -> ReadFilter {
-        if !f.domains.iter().any(|d| self.withheld(d)) {
-            return f;
-        }
-        f.domains.retain(|d| !self.withheld(d));
-        if f.domains.is_empty() {
-            f.domains = vec![String::new()];
-        }
-        f
-    }
-
-    /// Refuse the held-out domain to a session that does not read it. The refusal is a
-    /// line of the decision log, of the action `action`.
-    pub(crate) fn may_name(&self, domain: &str, action: &str) -> Result<(), Error> {
-        if self.withheld(domain) {
-            return Err(self.refusal(action, domain, format!(
-                "domain {domain} is outside what this session reads, and a session writes only where it reads"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Refuse a write, of an entry or of a task, that would take text of a held-out
-    /// suite to a session that claims tasks, or text of a worker into a suite. A
-    /// session that does not read the held-out domain does not write into it, or a
-    /// worker would write the suite that grades it. The evaluator reads the suites, so
-    /// it writes only into the held-out domain. Each refusal is a line of the decision
-    /// log, of the action `action`.
-    pub(crate) fn may_write_into(&self, domain: &str, action: &str) -> Result<(), Error> {
-        self.may_name(domain, action)?;
-        let held = self.held_out_domain();
-        if self.is_evaluator() && held.as_deref() != Some(domain) {
-            return Err(self.refusal(action, domain, format!(
-                "{} is the evaluator: it reads the held-out suites, so it writes only into the held-out domain, and not into {domain}",
-                self.author
-            )));
-        }
-        Ok(())
-    }
-
-    /// A run as a session that does not read the held-out domain is told it: whether it
-    /// passed, as one of one or none of one, and no version of the suite. The counts
-    /// and the version are facts of the suite's text.
-    pub(crate) fn run_as_told(&self, mut record: DefinitionRecord) -> DefinitionRecord {
-        if self.reads_held_out() {
-            return record;
-        }
-        if let DefinitionChange::Graded {
-            suite,
-            passed,
-            of,
-            needed,
-            ..
-        } = &mut record.change
-        {
-            *passed = u32::from(*passed >= *needed);
-            (*of, *needed) = (1, 1);
-            suite.clear();
-        }
-        record
-    }
-
-    /// Refuse a claim from the evaluator: it grades work, so it does none.
-    pub(crate) fn claims_work(&self) -> Result<(), Error> {
-        if self.is_evaluator() {
-            return Err(Error::Denied(format!(
-                "{} is the evaluator: the evaluator grades work and claims none",
-                self.author
-            )));
-        }
-        Ok(())
-    }
-
-    /// The entry that holds the suite in force for the definition `name`: the newest
-    /// active entry of the held-out domain that a person verified and that has a suite
-    /// block of that name, whether or not the block reads. Read as the record holds it,
-    /// whoever asks: nothing of it is told to a session here.
-    async fn suite_entry(&self, name: &str) -> Result<Option<Entry>, Error> {
-        let Some(domain) = self.held_out_domain() else {
-            return Ok(None);
-        };
-        let mut newest: Option<Entry> = None;
-        for id in self.store.list(&domain).await? {
-            let Some(e) = self.store.get(&domain, &id).await? else {
-                continue;
-            };
-            let in_force = e.is_active()
-                && e.front.trust_tier == TrustTier::Verified
-                && artifacts_in(&e)
-                    .iter()
-                    .any(|a| a.kind == SUITE_KIND && a.name == name);
-            let later = newest
-                .as_ref()
-                .is_none_or(|n| e.front.created > n.front.created);
-            if in_force && later {
-                newest = Some(e);
-            }
-        }
-        Ok(newest)
-    }
-
-    /// The version of the suite in force for the definition `name`: none when there is
-    /// no suite, or when the block in force does not read as one. The version is an
-    /// entry id and a digest, so it tells nothing of the suite's text.
-    async fn suite_version_in_force(&self, name: &str) -> Result<Option<String>, Error> {
-        let entry = self.suite_entry(name).await?;
-        let suite = entry.and_then(|e| suite_block(&e, name));
-        Ok(suite.and_then(Result::ok).map(|s| s.version))
-    }
-
-    /// The suite in force for the definition `name`, as the record holds it, whoever
-    /// asks: none when there is no suite. The caller tells nothing of its text to a
-    /// session; [`Memory::held_out_suite`] is the read for a session.
+    /// Make this session one run of `plan`: the task `task`, the seed `seed`, the arm
+    /// `arm`, with the record read as of `as_of`. The session gets the settings of the
+    /// arm with that snapshot. Its tape is kept in the plan's domain, and the head of
+    /// the tape names the run. A launcher calls this once, where it would give the
+    /// session its settings; nothing a session can call does.
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] when the block in force does not read as a suite, in words
-    /// that quote none of its text; a store error.
-    pub(crate) async fn suite_in_force(&self, name: &str) -> Result<Option<Suite>, Error> {
-        let Some(entry) = self.suite_entry(name).await? else {
-            return Ok(None);
-        };
-        match suite_block(&entry, name) {
-            Some(Ok(suite)) => Ok(Some(suite)),
-            _ => Err(not_a_suite(name)),
-        }
-    }
-
-    /// The held-out suite in force for the task definition `name`, for a session that
-    /// reads the held-out domain: the one in the newest active entry of that domain
-    /// that a person verified. None when there is none, or when the entry is above
-    /// what the session may read. The session has then read the entry, and its label
-    /// is no lower.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::NotFound`] for every session that does not read the held-out domain,
-    /// whether or not a suite is there; [`Error::Denied`] when the block in force does
-    /// not read as a suite, in words that quote none of its text; a store or index
-    /// error.
-    pub async fn held_out_suite(&self, name: &str) -> Result<Option<Suite>, Error> {
-        if !self.reads_held_out() {
-            return Err(Error::NotFound(name.to_string()));
-        }
-        let Some(entry) = self.suite_entry(name).await? else {
-            return Ok(None);
-        };
-        // under the filter that every read is under, before anything of the entry is told
-        let filter = self.session_filter()?;
-        let seen = self.index.lock().await.meta(&entry.front.id, &filter)?;
-        if seen.is_none() {
-            return Ok(None);
-        }
-        let Some(Ok(suite)) = suite_block(&entry, name) else {
-            return Err(not_a_suite(name));
-        };
-        lock(&self.session).observe(entry.front.classification);
-        Ok(Some(suite))
-    }
-
-    /// The version of a definition that a run grades. A bare name is the version in
-    /// force. `<name>@<entry>` is an active entry of the platform's domain that has a
-    /// task block of that name which reads, verified or not: a candidate is graded
-    /// before a person verifies it. The session must be one that may read the entry,
-    /// and it has then read it.
-    async fn gradable_definition(&self, named: &str) -> Result<TaskDefinition, Error> {
-        let name = definition_name(named);
-        let Some((_, entry)) = named.split_once('@') else {
-            return self.readable_definition(name).await;
-        };
-        let none = || {
-            Error::Denied(format!(
-                "no version {named} of a task definition is there to grade: an active entry of the platform's domain defines one"
-            ))
-        };
-        let Some(domain) = self.platform_domain() else {
-            return Err(none());
-        };
-        // an id that is no id names no entry
-        let found = self.store.get(&domain, entry).await.ok().flatten();
-        let Some(entry) = found.filter(Entry::is_active) else {
-            return Err(none());
-        };
-        let filter = self.session_filter()?;
-        let seen = self.index.lock().await.meta(&entry.front.id, &filter)?;
-        if seen.is_none() {
-            return Err(none());
-        }
-        match definition_block(&entry, name) {
-            None => Err(none()),
-            Some(Err(())) => Err(unreadable(name)),
-            Some(Ok(def)) => {
-                lock(&self.session).observe(def.classification);
-                Ok(def)
-            }
-        }
-    }
-
-    /// Whether the handoff that `answer` names passes `scenario`: its body holds every
-    /// string that the scenario expects. The session reads the handoff, as
-    /// [`Memory::get`] does.
-    async fn answer_holds(&self, scenario: &Scenario, answer: &Answer) -> Result<bool, Error> {
-        let handoff = self.get(&answer.handoff).await?;
-        if handoff.front.entry_type != EntryType::Handoff {
-            return Err(Error::Denied(format!(
-                "{} is no handoff: an answer names the handoff of the work",
-                answer.handoff
-            )));
-        }
-        if handoff.front.author == self.author {
-            return Err(Error::Denied(format!(
-                "{} wrote {}: nobody grades its own work",
-                self.author, answer.handoff
-            )));
-        }
-        Ok(scenario.expect.iter().all(|x| handoff.body.contains(x)))
-    }
-
-    /// Grade one version of a task definition for one autonomy level on the held-out
-    /// suite in force for it, and record the run. `definition` is a bare name, for the
-    /// version in force, or `<name>@<entry>`, for an active entry of the platform's
-    /// domain that defines it, verified or not.
-    ///
-    /// Each answer names a scenario of the suite and the handoff of the work on it. A
-    /// scenario passes when its handoff holds every string that the scenario expects. A
-    /// scenario with no answer fails. The run passes when as many scenarios passed as
-    /// the suite asks for the level. The record of the run holds the counts, the
-    /// version of the suite and the grader, and no text of the suite. A run moves no
-    /// level: [`Memory::raise`] does, on the newest run.
-    ///
-    /// The caller is the evaluator, or the owner in a session that the memory server
-    /// does not serve. It reads the suite and each handoff, so its label is no lower
-    /// than they are.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Denied`] from every other principal; when no such version of the
-    /// definition is there for this session; when no suite is in force for the
-    /// definition, the suite does not read as one, or it gives no pass mark for the
-    /// level; for an answer to a scenario that the suite does not have, a second answer
-    /// to one scenario, an answer that names an entry which is no handoff, and a handoff
-    /// that the grader wrote. [`Error::NotFound`], or what else [`Memory::get`] gives,
-    /// for a handoff that the session cannot read. A ledger, store or index error. A
-    /// refused run records nothing.
-    pub async fn grade(
+    /// [`Error::Denied`] for a task the plan does not hold, an arm the plan does not
+    /// name, a seed at or above the plan's seeds, a domain that is not granted, a
+    /// harness or a model that is not the plan's when the plan names one, and a
+    /// session that is a run or has its settings already.
+    pub fn start_evaluation(
         &self,
-        definition: &str,
-        level: Autonomy,
-        answers: &[Answer],
-    ) -> Result<Graded, Error> {
-        if !self.reads_held_out() {
-            return Err(self.refusal(
-                "grade",
-                "",
-                "only the evaluator grades a task definition, or the owner in a session that the memory server does not serve"
-                    .into(),
+        plan: &Plan,
+        (task, seed, arm): (&str, u32, Arm),
+        as_of: OffsetDateTime,
+        launched: Launched<'_>,
+    ) -> Result<RunOf, Error> {
+        if self.evaluation.get().is_some() {
+            return Err(Error::Denied(
+                "this session is a run of an evaluation already".into(),
             ));
         }
-        let def = self.gradable_definition(definition).await?;
-        let name = def.name.as_str();
-        let (Some(domain), Some(suite)) =
-            (self.platform_domain(), self.held_out_suite(name).await?)
-        else {
+        plan.holds(task, seed, arm)?;
+        if !self.grants.domains.contains_key(&plan.domain) {
             return Err(Error::Denied(format!(
-                "no held-out suite is in force for the task definition {name}: a verified entry of the held-out domain holds one"
+                "the domain {} of the plan {} is not granted",
+                plan.domain, plan.name
             )));
-        };
-        let Some(needed) = suite.pass.for_level(level) else {
-            return Err(Error::Denied(format!(
-                "the held-out suite for {name} gives no pass mark for the level {level}"
-            )));
-        };
-        answers_fit(&suite, answers)?;
-        let mut failed = Vec::new();
-        for scenario in &suite.scenarios {
-            let passed = match answers.iter().find(|a| a.scenario == scenario.name) {
-                Some(answer) => self.answer_holds(scenario, answer).await?,
-                None => false,
-            };
-            if !passed {
-                failed.push(scenario.name.clone());
-            }
         }
-        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        let of = count(suite.scenarios.len());
-        let passed = of - count(failed.len());
-        let change = DefinitionChange::Graded {
-            suite: suite.version,
-            level,
-            passed,
-            of,
-            needed,
-            by: self.author.clone(),
+        let harness = plan
+            .harness
+            .as_deref()
+            .is_none_or(|h| h == launched.harness);
+        let model = plan.model.is_none() || plan.model.as_deref() == launched.model;
+        if !harness || !model {
+            return Err(Error::Denied(format!(
+                "the plan {} fixes the harness or the model, and this launch is on another",
+                plan.name
+            )));
+        }
+        let mut settings = arm.settings();
+        settings.not_after = Some(as_of);
+        self.set_settings(settings)?;
+        let run = RunOf {
+            plan: plan.digest(),
+            task: task.to_string(),
+            seed,
+            arm,
         };
-        let mut l = self.ledger.lock().await;
-        let record = l
-            .record_definition(&domain, &def.reference(), change)
-            .await?;
-        Ok(Graded {
-            record,
-            pass: passed >= needed,
-            failed,
+        let _ = self.evaluation.set((run.clone(), plan.domain.clone()));
+        Ok(run)
+    }
+
+    /// The run this session is, when a launcher made it one.
+    #[must_use]
+    pub fn evaluation(&self) -> Option<RunOf> {
+        self.evaluation.get().map(|(run, _)| run.clone())
+    }
+
+    /// The domain this session's tape goes to as a run of an evaluation.
+    pub(crate) fn evaluation_domain(&self) -> Option<String> {
+        self.evaluation.get().map(|(_, domain)| domain.clone())
+    }
+
+    /// The facts of one outcome, from the tape of its session.
+    async fn fact_of(&self, plan: &Plan, digest: &str, outcome: &Outcome) -> Result<Fact, Error> {
+        let session = &outcome.session;
+        let tape = self.tape(session).await?;
+        let start = &tape.header.start;
+        let Some(run) = &start.evaluation else {
+            return Err(Error::Denied(format!(
+                "the tape of {session} names no evaluation: the session was not started as a run"
+            )));
+        };
+        if run.plan != digest {
+            return Err(Error::Denied(format!(
+                "the session {session} started under another plan ({}): this plan is {digest}",
+                run.plan
+            )));
+        }
+        let prompt = plan.prompt_of(&run.task);
+        if prompt.is_none() || start.prompt != prompt {
+            return Err(Error::Denied(format!(
+                "the prompt of {session} is not the prompt of the task {} in the plan",
+                run.task
+            )));
+        }
+        let started = at(&tape.header.started_at)?;
+        let last = match tape.calls.last() {
+            Some(call) => at(&call.at)?,
+            None => started,
+        };
+        Ok(Fact {
+            run: Run {
+                task: run.task.clone(),
+                seed: run.seed,
+                arm: run.arm,
+                success: outcome.success,
+                cost: outcome.cost,
+            },
+            harness: start.harness.clone(),
+            model: start.model.clone(),
+            judge: outcome.judge.clone(),
+            started,
+            ended: last.max(started),
+            snapshot: start.settings.not_after,
         })
     }
 
-    /// Who signs a raise to `next` off, when this session may make it. The step to
-    /// `review` is the evaluator's or a person's, and nobody signs it. The step to
-    /// `checks` is a person's, in a session that the memory server does not serve, and
-    /// the call is that person's sign-off.
-    fn may_raise_to(&self, next: Autonomy) -> Result<Option<String>, Error> {
-        if next == Autonomy::Checks {
-            self.in_person("signs a task definition off for the level checks")?;
-            return Ok(Some(self.author.clone()));
-        }
-        if self.is_evaluator() {
-            return Ok(None);
-        }
-        self.in_person("or the evaluator raises a task definition to the level review")?;
-        Ok(None)
-    }
-
-    /// Raise the autonomy level of the version in force of the task definition `name`
-    /// one step, on its newest graded run for the next level. The run must have
-    /// passed, on the version of the held-out suite that is in force now, and no work
-    /// outcome may be newer than the run. The level does not go above the `autonomy`
-    /// that the text of the definition declares.
-    ///
-    /// The step to `review` is the evaluator's, or a person's in a session that the
-    /// memory server does not serve. The step to `checks` is only such a person's: the
-    /// call is the sign-off, and the record names the person in `signed_by`.
+    /// Score an evaluation: the scorecard of `outcomes` under `plan`. The task, the
+    /// seed, the arm, the harness, the model, the start time and the snapshot of each
+    /// run come from the tape of its session, never from the caller. The success, the
+    /// cost and the judge of each outcome are the caller's, and are trusted. The
+    /// owner's alone, because it reads tapes.
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] when no definition of that name is in force for this session,
-    /// in the words a task that names it is refused in; for `<name>@<entry>` that is
-    /// not the version in force; when the level is `checks` already; when the text of
-    /// the definition declares a lower level than the next; from a principal that may
-    /// not take the step; when there is no run for the next level, or the newest one
-    /// failed, is of another version of the suite than the one in force, or is older
-    /// than a work outcome. A ledger, store or index error. A refused raise records
-    /// nothing.
-    pub async fn raise(&self, name: &str) -> Result<DefinitionRecord, Error> {
-        let def = self.readable_definition(definition_name(name)).await?;
-        let reference = def.reference();
-        if name.contains('@') && name != reference {
+    /// [`Error::Denied`] for anyone but the owner; for no outcome; for an outcome whose
+    /// tape names no evaluation, names another plan, or has a prompt that is not the
+    /// task's; for two outcomes of one task, seed and arm; and for runs that differ in
+    /// harness or model, or are not on the plan's. [`Error::NotFound`] for a session
+    /// with no tape. A store error.
+    pub async fn score(&self, plan: &Plan, outcomes: &[Outcome]) -> Result<Scorecard, Error> {
+        self.owner_only("tapes")?;
+        let digest = plan.digest();
+        let mut facts = Vec::new();
+        for outcome in outcomes {
+            facts.push(self.fact_of(plan, &digest, outcome).await?);
+        }
+        assemble(plan, &facts, &self.drift_windows()?)
+    }
+
+    /// Keep a scorecard: one `decision` entry in the platform's domain. Its title names
+    /// the plan, the model and the date of the first run, its summary gives the
+    /// verdicts, and its body holds a table, the traps, and the scorecard as JSON in a
+    /// fenced block. The owner's alone, as the scoring is.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for anyone but the owner, and when the grants name no
+    /// platform domain. What a write refuses.
+    pub async fn keep_scorecard(&self, card: &Scorecard) -> Result<Written, Error> {
+        if self.author != self.grants.owner {
             return Err(Error::Denied(format!(
-                "{name} is not the version in force: a level is raised for the version in force, which is {reference}"
+                "the owner keeps a scorecard: {}",
+                self.grants.owner
             )));
         }
         let Some(domain) = self.platform_domain() else {
             return Err(Error::Denied(
-                "the grants name no platform domain, so no ledger keeps a record of a task definition"
+                "a scorecard is kept in the platform's domain, and the grants name none (`platform = \"<domain>\"`)"
                     .into(),
             ));
         };
-        let in_force = self.suite_version_in_force(&def.name).await?;
-        let mut l = self.ledger.lock().await;
-        let records = l.definition_records(&domain, Some(&reference)).await?;
-        let Some(next) = level_after(&records).next() else {
-            return Err(Error::Denied(format!(
-                "{reference} is at the level checks already: no level is above it"
-            )));
+        let on = card.model.as_deref().unwrap_or(&card.harness);
+        let date: String = card.started.chars().take(10).collect();
+        let title = format!("{TITLE}{}: {on}, {date}", card.plan);
+        self.write(WriteRequest {
+            domain: Some(domain),
+            entry_type: EntryType::Decision,
+            body: body_of(card, &title)?,
+            title: Some(title),
+            summary: Some(summary_of(card)),
+            ..WriteRequest::default()
+        })
+        .await
+    }
+
+    /// The scorecards the record keeps, newest first, at most `limit`: the entries that
+    /// the owner wrote, as [`Memory::keep_scorecard`] writes them. They are served
+    /// under this session's read filter, as `list` and `get` serve entries: the label
+    /// of the session rises, and a session that does not read the entry gets nothing
+    /// of it. Empty when the grants name no platform domain.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] when the platform's domain is outside what this session
+    /// reads. An index or a store error.
+    pub async fn scorecards(&self, limit: usize) -> Result<Vec<KeptScorecard>, Error> {
+        let Some(domain) = self.platform_domain() else {
+            return Ok(Vec::new());
         };
-        if def.autonomy < next {
-            return Err(Error::Denied(format!(
-                "the text of {reference} declares autonomy = \"{}\": that is the highest level that it can earn",
-                def.autonomy
-            )));
+        let listed = self
+            .list(Some(&domain), Some(EntryType::Decision), LISTED)
+            .await?;
+        let mut out = Vec::new();
+        for hit in listed.iter().filter(|h| h.title.starts_with(TITLE)) {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok(entry) = self.get(&hit.id).await else {
+                continue;
+            };
+            // the owner keeps a scorecard: an entry of another author is none, whatever
+            // its title and its body say
+            if entry.front.author != self.grants.owner {
+                continue;
+            }
+            let kept = artifacts_in(&entry)
+                .into_iter()
+                .filter(|a| a.kind == KIND)
+                .find_map(|a| {
+                    let scorecard = serde_json::from_str::<Scorecard>(&a.text).ok()?;
+                    Some(KeptScorecard {
+                        entry: a.entry,
+                        created: a.created,
+                        author: entry.front.author.clone(),
+                        scorecard,
+                    })
+                });
+            out.extend(kept);
         }
-        let signed_by = self.may_raise_to(next)?;
-        let run = run_to_raise_on(&reference, &records, next, in_force.as_deref())?;
-        let raised = DefinitionChange::Raised {
-            to: next,
-            run: run.id.clone(),
-            signed_by,
-        };
-        Ok(l.record_definition(&domain, &reference, raised).await?)
+        Ok(out)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testing::{as_author, held_out_root, verify_in, written, written_in, EVALUATOR};
-    use crate::WriteRequest;
-    use dm_core::Label;
-    use dm_ledger::{Status, TaskSpec, WorkOutcome};
-    use std::path::Path;
-    use time::Duration;
-
-    const OWNER: &str = "human:test:me";
-
-    /// A definition whose text lets it earn the highest level.
-    const TIDY: &str = "# Tidy a module\n\n```platform task tidy\npurpose = \"Tidy one module.\"\nacceptance = [\"The handoff names each file that changed.\"]\noutputs = [\"handoff\"]\nautonomy = \"checks\"\n```\n";
-
-    /// Three scenarios. The pass marks: two for `review`, three for `checks`, and none
-    /// for `person`.
-    const SUITE: &str = "# The suite for tidy\n\n```platform suite tidy\n[pass]\nreview = 2\nchecks = 3\n\n[[scenario]]\nname = \"lease question\"\nask = \"Which decision set the lease length?\"\nexpect = [\"DECISION-12\", \"five minutes\"]\n\n[[scenario]]\nname = \"files question\"\nask = \"Which files changed?\"\nexpect = [\"src/importer\"]\n\n[[scenario]]\nname = \"bird question\"\nask = \"Name the bird.\"\nexpect = [\"BLUEBIRD-7\"]\n```\n";
-
-    /// A root with the definition `tidy` and its suite, both verified.
-    struct Fixture {
-        owner: Memory,
-        /// The version of `tidy` in force, as a task names it.
-        reference: String,
-        /// The entry of the suite.
-        suite: String,
-        /// Handoffs of `agent:a`: one that passes each scenario, in the order of the
-        /// suite, and one that holds only the first string of the first scenario.
-        passing: [String; 3],
-        partial: String,
-    }
-
-    async fn fixture(dir: &Path) -> Fixture {
-        let owner = held_out_root(dir);
-        let entry = written(&owner, TIDY, true).await;
-        let suite = written_in(&owner, "dom-held", SUITE, true).await;
-        let by = "agent:a";
-        Fixture {
-            owner,
-            reference: format!("tidy@{entry}"),
-            suite,
-            passing: [
-                handoff(dir, by, "DECISION-12 set the lease to five minutes.\n").await,
-                handoff(dir, by, "Changed src/importer.rs.\n").await,
-                handoff(dir, by, "The bird is BLUEBIRD-7.\n").await,
-            ],
-            partial: handoff(dir, by, "DECISION-12 says so.\n").await,
-        }
-    }
-
-    impl Fixture {
-        /// Answers to the first `n` scenarios, each with the handoff that passes it.
-        fn answers(&self, n: usize) -> Vec<Answer> {
-            ["lease question", "files question", "bird question"]
-                .iter()
-                .zip(&self.passing)
-                .take(n)
-                .map(|(scenario, handoff)| answer(scenario, handoff))
-                .collect()
-        }
-    }
-
-    fn answer(scenario: &str, handoff: &str) -> Answer {
-        Answer {
-            scenario: scenario.into(),
-            handoff: handoff.into(),
-        }
-    }
-
-    /// A handoff entry in `dom-me`, written in a session of `author` of its own.
-    async fn handoff(dir: &Path, author: &str, text: &str) -> String {
-        let h = WriteRequest {
-            body: text.into(),
-            domain: Some("dom-me".into()),
-            entry_type: EntryType::Handoff,
-            ..WriteRequest::default()
-        };
-        as_author(dir, author).write(h).await.unwrap().id
-    }
-
-    fn evaluator(dir: &Path) -> Memory {
-        as_author(dir, EVALUATOR)
-    }
-
-    /// A session with the owner's name that the memory server serves.
-    fn served_owner(dir: &Path) -> Memory {
-        let session = Memory::open(dir).unwrap();
-        session.mark_served();
-        session
-    }
-
-    async fn events(m: &Memory) -> u64 {
-        m.ledger.lock().await.event_count().await.unwrap()
-    }
-
-    fn denied<T>(r: &Result<T, Error>, saying: &str) -> bool {
-        matches!(r, Err(Error::Denied(why)) if why.contains(saying))
-    }
-
-    fn not_found<T>(r: &Result<T, Error>) -> bool {
-        matches!(r, Err(Error::NotFound(_)))
-    }
-
-    /// A run of `n` passing answers for `level`, graded by the evaluator.
-    async fn graded(dir: &Path, f: &Fixture, level: Autonomy, n: usize) -> Graded {
-        let run = evaluator(dir).grade("tidy", level, &f.answers(n)).await;
-        run.unwrap()
-    }
-
-    fn raised(to: Autonomy, run: &Graded, signed_by: Option<&str>) -> DefinitionChange {
-        DefinitionChange::Raised {
-            to,
-            run: run.record.id.clone(),
-            signed_by: signed_by.map(str::to_string),
-        }
-    }
-
-    fn ids(hits: &[dm_index::Hit]) -> Vec<&str> {
-        hits.iter().map(|h| h.id.as_str()).collect()
-    }
-
-    /// Rule 2: the sessions that do not read the held-out domain.
-    #[tokio::test]
-    async fn a_session_that_claims_tasks_reads_nothing_of_the_held_out_domain() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let worker = as_author(dir.path(), "agent:a");
-        let person = as_author(dir.path(), "human:test:reviewer");
-        let served = served_owner(dir.path());
-        for session in [&worker, &person, &served] {
-            let who = session.author();
-            let got = session.get(&f.suite).await;
-            assert!(not_found(&got), "{who}: {got:?}");
-            let found = session.search("bluebird", None, 10).await.unwrap();
-            assert_eq!(ids(&found), [f.passing[2].as_str()], "{who}");
-            let listed = session.list(None, None, 100).await.unwrap();
-            assert!(!ids(&listed).contains(&f.suite.as_str()), "{who}");
-            // the domain by name is outside what the session reads
-            assert!(session
-                .search("bluebird", Some("dom-held"), 10)
-                .await
-                .is_err());
-            assert!(session.list(Some("dom-held"), None, 10).await.is_err());
-            let suite = session.held_out_suite("tidy").await;
-            assert!(not_found(&suite), "{who}: {suite:?}");
-            let none = session.held_out_suite("no-such").await;
-            assert_eq!(
-                format!("{suite:?}"),
-                format!("{none:?}").replace("no-such", "tidy")
-            );
-            // what it read before, it reads still
-            session.get(&f.passing[0]).await.unwrap();
-        }
-    }
-
-    /// Rule 2: the sessions that read it, and a session that is served after its first
-    /// read.
-    #[tokio::test]
-    async fn the_evaluator_and_the_owner_in_person_read_the_held_out_domain() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let owner = Memory::open(dir.path()).unwrap();
-        for session in [&evaluator(dir.path()), &owner] {
-            let who = session.author();
-            assert!(session.reads_held_out(), "{who}");
-            assert_eq!(session.get(&f.suite).await.unwrap().front.id, f.suite);
-            let found = session.search("bluebird", Some("dom-held"), 10).await;
-            assert_eq!(ids(&found.unwrap()), [f.suite.as_str()], "{who}");
-            let listed = session.list(Some("dom-held"), None, 10).await.unwrap();
-            assert_eq!(ids(&listed), [f.suite.as_str()], "{who}");
-            let suite = session.held_out_suite("tidy").await.unwrap().unwrap();
-            assert_eq!(suite.entry, f.suite, "{who}");
-        }
-        // the scope of a session is kept after its first read: the held-out domain
-        // leaves it when the memory server starts to serve the session
-        owner.mark_served();
-        assert!(!owner.reads_held_out());
-        let got = owner.get(&f.suite).await;
-        assert!(not_found(&got), "{got:?}");
-    }
-
-    /// Rule 2: a filter that names no domain means every domain to the index, so a
-    /// session whose one granted domain is the held-out one gets no such filter.
-    #[tokio::test]
-    async fn a_session_with_no_domain_but_the_held_out_one_reads_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        Memory::init(dir.path(), OWNER, "dom-held").unwrap();
-        let path = dir.path().join(crate::GRANTS_FILE);
-        let mut g = dm_policy::Grants::load(&path).unwrap();
-        g.held_out = Some("dom-held".into());
-        std::fs::write(&path, g.render().unwrap()).unwrap();
-        let owner = Memory::open(dir.path()).unwrap();
-        let id = written_in(&owner, "dom-held", SUITE, true).await;
-        let worker = as_author(dir.path(), "agent:a");
-        let listed = worker.list(None, None, 10).await.unwrap();
-        assert_eq!(ids(&listed), [""; 0]);
-        let found = worker.search("bluebird", None, 10).await.unwrap();
-        assert_eq!(ids(&found), [""; 0]);
-        let got = worker.get(&id).await;
-        assert!(not_found(&got), "{got:?}");
-        let listed = owner.list(None, None, 10).await.unwrap();
-        assert_eq!(ids(&listed), [id.as_str()]);
-    }
-
-    /// Rule 3.
-    #[tokio::test]
-    async fn a_session_that_does_not_read_the_held_out_domain_writes_nothing_into_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let suite = |body: &str| WriteRequest {
-            body: body.into(),
-            domain: Some("dom-held".into()),
-            entry_type: EntryType::Convention,
-            ..WriteRequest::default()
-        };
-        let worker = as_author(dir.path(), "agent:a");
-        let person = as_author(dir.path(), "human:test:reviewer");
-        for session in [&worker, &person, &served_owner(dir.path())] {
-            let refused = session.write(suite(SUITE)).await;
-            assert!(
-                denied(&refused, "writes only where it reads"),
-                "{}: {refused:?}",
-                session.author()
-            );
-        }
-        let held = f.owner.store.list("dom-held").await.unwrap();
-        assert_eq!(held, [f.suite.as_str()], "nothing was written");
-        // the two that read it write into it, at the trust tier of every write
-        for session in [&evaluator(dir.path()), &f.owner] {
-            let id = session.write(suite("A note.\n")).await.unwrap().id;
-            let e = f.owner.store.get("dom-held", &id).await.unwrap().unwrap();
-            assert_eq!(e.front.trust_tier, TrustTier::Raw);
-        }
-    }
-
-    /// A task of the held-out domain is hidden from a session that does not read the
-    /// domain, and such a session files none there. Its title and body can hold text of
-    /// a suite, and the task of a proposal names the entry of a suite.
-    #[tokio::test]
-    async fn a_task_of_the_held_out_domain_is_hidden_from_a_session_that_does_not_read_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let spec = |title: &str| TaskSpec {
-            domain: "dom-held".into(),
-            title: title.into(),
-            body: "Add a scenario that expects BLUEBIRD-7.\n".into(),
-            ..TaskSpec::default()
-        };
-        let grow = f.owner.create_task(spec("Grow the tidy suite")).await;
-        let grow = grow.unwrap().task;
-        let before = events(&f.owner).await;
-        let worker = as_author(dir.path(), "agent:a");
-        let person = as_author(dir.path(), "human:test:reviewer");
-        for session in [&worker, &person, &served_owner(dir.path())] {
-            let who = session.author();
-            let asked = session.get_task(&grow.id).await;
-            assert!(matches!(asked, Err(Error::Ledger(_))), "{who}: {asked:?}");
-            let claimed = session.claim(&grow.id, Duration::minutes(5)).await;
-            assert!(
-                matches!(claimed, Err(Error::Ledger(_))),
-                "{who}: {claimed:?}"
-            );
-            let listed = session.tasks(Some("dom-held"), Status::Open).await;
-            assert!(denied(&listed, "outside what this session reads"), "{who}");
-            let next = session.claim_next(Some("dom-held"), Duration::minutes(5));
-            assert!(
-                denied(&next.await, "outside what this session reads"),
-                "{who}"
-            );
-            let filed = session.create_task(spec("A scenario of my own")).await;
-            assert!(denied(&filed, "writes only where it reads"), "{who}");
-        }
-        assert_eq!(
-            events(&f.owner).await,
-            before,
-            "nothing was filed or claimed"
-        );
-        let seen = evaluator(dir.path()).get_task(&grow.id).await.unwrap();
-        assert_eq!(seen.spec.title, "Grow the tidy suite");
-    }
-
-    /// The evaluator reads the suites, so it writes no entry and files no task where a
-    /// session that claims tasks reads.
-    #[tokio::test]
-    async fn the_evaluator_writes_only_into_the_held_out_domain() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let grader = evaluator(dir.path());
-        grader.held_out_suite("tidy").await.unwrap().unwrap();
-        let before = f.owner.store.list("dom-me").await.unwrap();
-        for domain in ["dom-me", "dom-plat"] {
-            let note = WriteRequest {
-                body: "The bird is BLUEBIRD-7.\n".into(),
-                domain: Some(domain.into()),
-                ..WriteRequest::default()
-            };
-            let refused = grader.write(note).await;
-            assert!(denied(&refused, "writes only into the held-out domain"));
-            let task = TaskSpec {
-                domain: domain.into(),
-                title: "The bird is BLUEBIRD-7".into(),
-                ..TaskSpec::default()
-            };
-            let refused = grader.create_task(task).await;
-            assert!(denied(&refused, "writes only into the held-out domain"));
-            let open = f.owner.tasks(Some(domain), Status::Open).await.unwrap();
-            assert_eq!(open, [], "{domain}");
-            // a transcript and an import are writes
-            let turns = crate::transcripts::Keep {
-                domain: Some(domain.into()),
-                harness: "codex".into(),
-                origin: "session-1".into(),
-                raw: "BLUEBIRD-7".into(),
-                turns: vec![("assistant".into(), "BLUEBIRD-7".into())],
-            };
-            let refused = grader.keep_transcript(turns).await;
-            assert!(denied(&refused, "writes only into the held-out domain"));
-            let refused = grader.import(Path::new("no-bundle"), Some(domain)).await;
-            assert!(denied(&refused, "writes only into the held-out domain"));
-        }
-        assert_eq!(f.owner.store.list("dom-me").await.unwrap(), before);
-        let worker = as_author(dir.path(), "agent:a");
-        let found = worker.search("BLUEBIRD", None, 10).await.unwrap();
-        let found: Vec<String> = found.into_iter().map(|h| h.id).collect();
-        assert_eq!(
-            found,
-            [f.passing[2].as_str()],
-            "only the worker's own handoff"
-        );
-    }
-
-    /// The refusals that keep the held-out domain and the levels are lines of the
-    /// decision log, with the class of the principal, so repeated ones count as probing.
-    #[tokio::test]
-    async fn a_refusal_at_a_boundary_of_the_held_out_domain_or_of_a_level_is_logged() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        graded(dir.path(), &f, Autonomy::Review, 2).await;
-        let worker = as_author(dir.path(), "agent:a");
-        let into = |domain: &str| WriteRequest {
-            body: "A note.\n".into(),
-            domain: Some(domain.into()),
-            ..WriteRequest::default()
-        };
-        assert!(worker.write(into("dom-held")).await.is_err());
-        let run = worker.grade("tidy", Autonomy::Review, &f.answers(3)).await;
-        assert!(denied(&run, "only the evaluator grades"), "{run:?}");
-        let raised = worker.raise("tidy").await;
-        assert!(denied(&raised, "only a person"), "{raised:?}");
-        assert!(evaluator(dir.path()).write(into("dom-me")).await.is_err());
-        let logged = |who: &str| crate::testing::refused_actions(dir.path(), who);
-        let agent = |action: &str| (action.to_string(), "agent".to_string());
-        assert_eq!(
-            logged("agent:a"),
-            [agent("domain"), agent("grade"), agent("person_only")]
-        );
-        assert_eq!(logged(EVALUATOR), [agent("write")]);
-    }
-
-    /// The projection of a session is a read of the record: the held-out domain has no
-    /// directory in a worker's.
-    #[tokio::test]
-    async fn the_projection_of_a_worker_has_no_directory_for_the_held_out_domain() {
-        let dir = tempfile::tempdir().unwrap();
-        fixture(dir.path()).await;
-        let out = tempfile::tempdir().unwrap();
-        let worker = as_author(dir.path(), "agent:a");
-        let theirs = out.path().join("worker");
-        worker.project_into(&theirs).await.unwrap();
-        assert!(theirs.join("dom-me").is_dir());
-        assert!(!theirs.join("dom-held").exists());
-        let graders = out.path().join("evaluator");
-        evaluator(dir.path()).project_into(&graders).await.unwrap();
-        assert!(graders.join("dom-held").is_dir());
-    }
-
-    /// Rule 4.
-    #[tokio::test]
-    async fn a_suite_is_in_force_once_verified_and_the_newest_one_is() {
-        let dir = tempfile::tempdir().unwrap();
-        let owner = held_out_root(dir.path());
-        let first = written_in(&owner, "dom-held", SUITE, false).await;
-        assert_eq!(owner.held_out_suite("tidy").await.unwrap(), None);
-        // a suite block outside the held-out domain is no suite, whatever its tier
-        written_in(&owner, "dom-me", SUITE, true).await;
-        written(&owner, SUITE, true).await;
-        assert_eq!(owner.held_out_suite("tidy").await.unwrap(), None);
-        verify_in(&owner, "dom-held", &first).await;
-        let suite = owner.held_out_suite("tidy").await.unwrap().unwrap();
-        let text = owner.store.get("dom-held", &first).await.unwrap().unwrap();
-        let version = format!("{first}@{}", dm_core::digest(&text.render()));
-        assert_eq!((&suite.entry, &suite.version), (&first, &version));
-        assert_eq!((suite.pass.person, suite.pass.review), (None, Some(2)));
-        assert_eq!(suite.scenarios.len(), 3);
-        assert_eq!(suite.scenarios[0].expect, ["DECISION-12", "five minutes"]);
-        let easier = SUITE.replace("review = 2", "review = 1");
-        let second = written_in(&owner, "dom-held", &easier, true).await;
-        let suite = owner.held_out_suite("tidy").await.unwrap().unwrap();
-        assert_eq!((&suite.entry, suite.pass.review), (&second, Some(1)));
-        // a newer suite that nobody verified replaces nothing
-        written_in(&owner, "dom-held", SUITE, false).await;
-        let suite = owner.held_out_suite("tidy").await.unwrap().unwrap();
-        assert_eq!(suite.entry, second);
-        assert_eq!(owner.held_out_suite("sweep").await.unwrap(), None);
-        // the launcher reads no suite: its artifacts are the platform domain's kinds
-        let loaded = owner.platform_artifact(SUITE_KIND, "tidy").await.unwrap();
-        assert_eq!(loaded, None);
-    }
-
-    /// Each text that is no suite, with the mark `BLUEBIRD` in it.
-    const NOT_A_SUITE: &[(&str, &str)] = &[
-        ("no scenario", "# BLUEBIRD\n"),
-        (
-            "two scenarios of one name",
-            "[[scenario]]\nname = \"BLUEBIRD\"\nexpect = [\"a\"]\n[[scenario]]\nname = \"BLUEBIRD\"\nexpect = [\"b\"]\n",
-        ),
-        ("a blank name", "[[scenario]]\nname = \" \"\nexpect = [\"BLUEBIRD\"]\n"),
-        ("no expected string", "[[scenario]]\nname = \"BLUEBIRD\"\nexpect = []\n"),
-        (
-            "a blank expected string",
-            "[[scenario]]\nname = \"one\"\nexpect = [\"BLUEBIRD\", \" \"]\n",
-        ),
-        (
-            "a pass mark of 0",
-            "[pass]\nreview = 0\n[[scenario]]\nname = \"one\"\nexpect = [\"BLUEBIRD\"]\n",
-        ),
-        (
-            "a pass mark above the number of scenarios",
-            "[pass]\nchecks = 2\n[[scenario]]\nname = \"one\"\nexpect = [\"BLUEBIRD\"]\n",
-        ),
-        (
-            "a key that this code does not know",
-            "bird = \"BLUEBIRD\"\n[[scenario]]\nname = \"one\"\nexpect = [\"a\"]\n",
-        ),
-    ];
-
-    /// Rule 5.
-    #[tokio::test]
-    async fn a_block_that_is_no_suite_is_refused_and_its_text_is_not_quoted() {
-        let dir = tempfile::tempdir().unwrap();
-        let owner = held_out_root(dir.path());
-        written(&owner, TIDY, true).await;
-        let before = events(&owner).await;
-        let said = |r: Result<String, Error>| match r {
-            Err(Error::Denied(why)) => why,
-            other => format!("it read: {other:?}"),
-        };
-        for (what, text) in NOT_A_SUITE {
-            let body = format!("```platform suite tidy\n{text}```\n");
-            let id = written_in(&owner, "dom-held", &body, true).await;
-            let read = owner.held_out_suite("tidy").await;
-            let why = said(read.map(|s| format!("{s:?}")));
-            assert!(why.contains("does not read as one"), "{what}: {why}");
-            assert!(!why.to_lowercase().contains("bluebird"), "{what}: {why}");
-            let run = owner.grade("tidy", Autonomy::Review, &[]).await;
-            assert_eq!(said(run.map(|g| format!("{g:?}"))), why, "{what}");
-            owner.store.demote("dom-held", &id).await.unwrap();
-        }
-        assert_eq!(events(&owner).await, before, "no run was recorded");
-    }
-
-    /// Rule 6.
-    #[tokio::test]
-    async fn only_the_evaluator_and_the_owner_in_person_grade() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let answers = f.answers(3);
-        let before = events(&f.owner).await;
-        let worker = as_author(dir.path(), "agent:a");
-        let person = as_author(dir.path(), "human:test:reviewer");
-        let tap = as_author(dir.path(), "tap:checks");
-        for session in [&worker, &person, &tap, &served_owner(dir.path())] {
-            let refused = session.grade("tidy", Autonomy::Review, &answers).await;
-            assert!(
-                denied(&refused, "only the evaluator grades"),
-                "{}: {refused:?}",
-                session.author()
-            );
-        }
-        assert_eq!(events(&f.owner).await, before, "nothing appended");
-        for session in [&evaluator(dir.path()), &f.owner] {
-            let run = session.grade("tidy", Autonomy::Review, &answers).await;
-            assert!(run.unwrap().pass, "{}", session.author());
-        }
-        assert_eq!(events(&f.owner).await, before + 2);
-    }
-
-    /// Rule 7, what passes.
-    #[tokio::test]
-    async fn a_scenario_passes_only_when_its_handoff_holds_every_expected_string() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let grader = evaluator(dir.path());
-        // the first handoff holds one of the two strings; the third has no answer
-        let mut answers = f.answers(2);
-        answers[0].handoff.clone_from(&f.partial);
-        let run = grader.grade("tidy", Autonomy::Review, &answers).await;
-        let run = run.unwrap();
-        assert_eq!(run.failed, ["lease question", "bird question"]);
-        assert!(!run.pass, "one of three, and review needs two");
-        let run = graded(dir.path(), &f, Autonomy::Review, 2).await;
-        assert_eq!(run.failed, ["bird question"]);
-        assert!(run.pass);
-        // the same answers do not reach the pass mark of the next level
-        let run = graded(dir.path(), &f, Autonomy::Checks, 2).await;
-        assert!(!run.pass);
-        let run = graded(dir.path(), &f, Autonomy::Checks, 3).await;
-        assert_eq!((run.pass, run.failed.len()), (true, 0));
-        // a run moves no level
-        assert_eq!(
-            f.owner.level_of(&f.reference).await.unwrap(),
-            Autonomy::Person
-        );
-    }
-
-    /// Rule 7, what is refused.
-    #[tokio::test]
-    async fn an_answer_that_does_not_fit_the_suite_or_is_the_grader_s_own_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let grader = evaluator(dir.path());
-        let before = events(&f.owner).await;
-        let own = WriteRequest {
-            body: "The bird is BLUEBIRD-7.\n".into(),
-            domain: Some("dom-held".into()),
-            entry_type: EntryType::Handoff,
-            ..WriteRequest::default()
-        };
-        let own = grader.write(own).await.unwrap().id;
-        let a_fact = written_in(&f.owner, "dom-me", "The bird is BLUEBIRD-7.\n", false).await;
-        let twice = [f.answers(1), f.answers(1)].concat();
-        for (answers, why) in [
-            (vec![answer("bird question", &own)], "grades its own work"),
-            (vec![answer("bird question", &a_fact)], "is no handoff"),
-            (vec![answer("no such", &f.partial)], "has no scenario"),
-            (twice, "has two answers"),
-        ] {
-            let refused = grader.grade("tidy", Autonomy::Review, &answers).await;
-            assert!(denied(&refused, why), "{why}: {refused:?}");
-        }
-        let unread = [answer("bird question", "mem-me-nothere")];
-        let refused = grader.grade("tidy", Autonomy::Review, &unread).await;
-        assert!(not_found(&refused), "{refused:?}");
-        // the suite gives no pass mark for person
-        let refused = grader.grade("tidy", Autonomy::Person, &f.answers(3)).await;
-        assert!(denied(&refused, "gives no pass mark"), "{refused:?}");
-        // a definition with no suite
-        written(&f.owner, &TIDY.replace("tidy", "sweep"), true).await;
-        let refused = grader.grade("sweep", Autonomy::Review, &[]).await;
-        assert!(
-            denied(&refused, "no held-out suite is in force"),
-            "{refused:?}"
-        );
-        assert_eq!(events(&f.owner).await, before, "nothing appended");
-    }
-
-    /// Rule 8.
-    #[tokio::test]
-    async fn the_record_of_a_run_holds_the_counts_and_no_text_of_the_suite() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let run = graded(dir.path(), &f, Autonomy::Review, 2).await;
-        let suite = f.owner.held_out_suite("tidy").await.unwrap().unwrap();
-        let counted = DefinitionChange::Graded {
-            suite: suite.version,
-            level: Autonomy::Review,
-            passed: 2,
-            of: 3,
-            needed: 2,
-            by: EVALUATOR.into(),
-        };
-        let record = &run.record;
-        // the ledger holds it, and a session that reads the held-out domain reads it
-        let view = evaluator(dir.path()).autonomy("tidy").await.unwrap();
-        assert_eq!(view.records.as_slice(), std::slice::from_ref(record));
-        // a session that does not is told whether the run passed, and no count of the
-        // suite and no version of it
-        let worker = as_author(dir.path(), "agent:a");
-        let told = worker.autonomy("tidy").await.unwrap().records;
-        let passed = DefinitionChange::Graded {
-            suite: String::new(),
-            level: Autonomy::Review,
-            passed: 1,
-            of: 1,
-            needed: 1,
-            by: EVALUATOR.into(),
-        };
-        assert_eq!(told.len(), 1);
-        assert_eq!((&told[0].id, &told[0].change), (&record.id, &passed));
-        graded(dir.path(), &f, Autonomy::Checks, 2).await;
-        let told = worker.autonomy("tidy").await.unwrap().records;
-        let failed = DefinitionChange::Graded {
-            suite: String::new(),
-            level: Autonomy::Checks,
-            passed: 0,
-            of: 1,
-            needed: 1,
-            by: EVALUATOR.into(),
-        };
-        assert_eq!(told[1].change, failed);
-        let kept = serde_json::to_string(&view.records).unwrap();
-        for text in [
-            "question",
-            "Which",
-            "bird",
-            "DECISION",
-            "five minutes",
-            "src/importer",
-            "BLUEBIRD",
-        ] {
-            assert!(!kept.contains(text), "{text} is in {kept}");
-        }
-        assert_eq!(
-            (record.domain.as_str(), &record.definition, &record.change),
-            ("dom-plat", &f.reference, &counted)
-        );
-    }
-
-    /// Rule 9.
-    #[tokio::test]
-    async fn a_passing_run_on_the_suite_in_force_raises_the_level_one_step() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        // a run for each of the two levels above, before any raise
-        let for_checks = graded(dir.path(), &f, Autonomy::Checks, 3).await;
-        let for_review = graded(dir.path(), &f, Autonomy::Review, 2).await;
-        let record = f.owner.raise("tidy").await.unwrap();
-        assert_eq!(record.definition, f.reference);
-        assert_eq!(record.change, raised(Autonomy::Review, &for_review, None));
-        assert_eq!(
-            f.owner.level_of(&f.reference).await.unwrap(),
-            Autonomy::Review
-        );
-        let view = f.owner.autonomy("tidy").await.unwrap();
-        assert_eq!((view.level, view.records.len()), (Autonomy::Review, 3));
-        assert_eq!(view.records[2], record);
-        // the next step stands on the run for its own level, by the reference too
-        let record = f.owner.raise(&f.reference).await.unwrap();
-        assert_eq!(
-            record.change,
-            raised(Autonomy::Checks, &for_checks, Some(OWNER))
-        );
-        assert_eq!(
-            f.owner.level_of(&f.reference).await.unwrap(),
-            Autonomy::Checks
-        );
-    }
-
-    /// Rule 10: no run for the next level, and a run that failed.
-    #[tokio::test]
-    async fn a_raise_needs_a_run_for_the_next_level_that_passed() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let refused = f.owner.raise("tidy").await;
-        assert!(denied(&refused, "no run of tidy@"), "{refused:?}");
-        // a run for another level is no run for this one
-        graded(dir.path(), &f, Autonomy::Checks, 3).await;
-        let refused = f.owner.raise("tidy").await;
-        assert!(
-            denied(&refused, "was graded for the level review"),
-            "{refused:?}"
-        );
-        // the newest run decides: a run that failed after one that passed
-        graded(dir.path(), &f, Autonomy::Review, 2).await;
-        graded(dir.path(), &f, Autonomy::Review, 1).await;
-        let before = events(&f.owner).await;
-        let refused = f.owner.raise("tidy").await;
-        assert!(
-            denied(&refused, "failed: 1 of 3 scenarios passed"),
-            "{refused:?}"
-        );
-        assert_eq!(events(&f.owner).await, before, "nothing appended");
-        assert_eq!(
-            f.owner.level_of(&f.reference).await.unwrap(),
-            Autonomy::Person
-        );
-    }
-
-    /// Rule 10: a run of an older version of the suite, and a run older than an outcome.
-    #[tokio::test]
-    async fn a_raise_needs_a_run_of_the_suite_in_force_that_is_newer_than_each_outcome() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        graded(dir.path(), &f, Autonomy::Review, 2).await;
-        // a person verifies a changed suite: the run is of the version before it
-        let harder = SUITE.replace("BLUEBIRD-7", "BLUEBIRD-8");
-        written_in(&f.owner, "dom-held", &harder, true).await;
-        let refused = f.owner.raise("tidy").await;
-        assert!(
-            denied(&refused, "is not of the held-out suite in force now"),
-            "{refused:?}"
-        );
-        // the same answers pass on the suite in force, and then work is reverted
-        graded(dir.path(), &f, Autonomy::Review, 2).await;
-        let reverted = DefinitionChange::Outcome {
-            task: "task-me-1".into(),
-            outcome: WorkOutcome::Reverted,
-            by: OWNER.into(),
-            to: Autonomy::Person,
-        };
-        let mut l = f.owner.ledger.lock().await;
-        l.record_definition("dom-plat", &f.reference, reverted)
-            .await
-            .unwrap();
-        drop(l);
-        let before = events(&f.owner).await;
-        let refused = f.owner.raise("tidy").await;
-        assert!(
-            denied(&refused, "a work outcome was recorded after"),
-            "{refused:?}"
-        );
-        assert_eq!(events(&f.owner).await, before, "nothing appended");
-        // a run after the outcome earns the level
-        let again = graded(dir.path(), &f, Autonomy::Review, 2).await;
-        let record = f.owner.raise("tidy").await.unwrap();
-        assert_eq!(record.change, raised(Autonomy::Review, &again, None));
-    }
-
-    /// Rule 10: the level that the text declares is the highest, and `checks` is the top.
-    #[tokio::test]
-    async fn a_level_goes_no_higher_than_the_text_declares_and_not_above_checks() {
-        let dir = tempfile::tempdir().unwrap();
-        let owner = held_out_root(dir.path());
-        let capped = TIDY.replace("autonomy = \"checks\"", "autonomy = \"review\"");
-        written(&owner, &capped, true).await;
-        written_in(&owner, "dom-held", SUITE, true).await;
-        let by = "agent:a";
-        let all = handoff(
-            dir.path(),
-            by,
-            "DECISION-12: five minutes. src/importer. BLUEBIRD-7.\n",
-        )
-        .await;
-        let answers: Vec<Answer> = ["lease question", "files question", "bird question"]
-            .iter()
-            .map(|s| answer(s, &all))
-            .collect();
-        for level in [Autonomy::Review, Autonomy::Checks] {
-            let run = owner.grade("tidy", level, &answers).await.unwrap();
-            assert!(run.pass);
-        }
-        owner.raise("tidy").await.unwrap();
-        let before = events(&owner).await;
-        let refused = owner.raise("tidy").await;
-        assert!(
-            denied(&refused, "declares autonomy = \"review\""),
-            "{refused:?}"
-        );
-        // a text that declares `checks`, at `checks`
-        written(&owner, TIDY, true).await;
-        for level in [Autonomy::Review, Autonomy::Checks] {
-            owner.grade("tidy", level, &answers).await.unwrap();
-        }
-        owner.raise("tidy").await.unwrap();
-        owner.raise("tidy").await.unwrap();
-        let top = events(&owner).await;
-        assert_eq!(top, before + 4, "the new version: two runs and two raises");
-        let refused = owner.raise("tidy").await;
-        assert!(
-            denied(&refused, "is at the level checks already"),
-            "{refused:?}"
-        );
-        assert_eq!(events(&owner).await, top, "nothing appended");
-    }
-
-    /// Rule 11.
-    #[tokio::test]
-    async fn the_step_to_checks_is_a_person_s_sign_off_and_the_step_to_review_is_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let for_review = graded(dir.path(), &f, Autonomy::Review, 2).await;
-        let for_checks = graded(dir.path(), &f, Autonomy::Checks, 3).await;
-        let worker = as_author(dir.path(), "agent:a");
-        let grader = evaluator(dir.path());
-        let before = events(&f.owner).await;
-        for session in [&worker, &served_owner(dir.path())] {
-            let refused = session.raise("tidy").await;
-            assert!(
-                denied(&refused, "only a person or the evaluator raises"),
-                "{}: {refused:?}",
-                session.author()
-            );
-        }
-        assert_eq!(events(&f.owner).await, before, "nothing appended");
-        let record = grader.raise("tidy").await.unwrap();
-        assert_eq!(record.change, raised(Autonomy::Review, &for_review, None));
-        let before = events(&f.owner).await;
-        for session in [&grader, &worker, &served_owner(dir.path())] {
-            let refused = session.raise("tidy").await;
-            assert!(
-                denied(&refused, "only a person signs a task definition off"),
-                "{}: {refused:?}",
-                session.author()
-            );
-        }
-        assert_eq!(events(&f.owner).await, before, "nothing appended");
-        let record = Memory::open(dir.path()).unwrap().raise("tidy").await;
-        assert_eq!(
-            record.unwrap().change,
-            raised(Autonomy::Checks, &for_checks, Some(OWNER))
-        );
-    }
-
-    /// Rule 12, and a candidate version that is graded before a person verifies it.
-    #[tokio::test]
-    async fn a_new_version_of_a_definition_starts_at_person() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        graded(dir.path(), &f, Autonomy::Review, 2).await;
-        f.owner.raise("tidy").await.unwrap();
-        let changed = TIDY.replace("Tidy one module.", "Tidy one module and its tests.");
-        let candidate = written(&f.owner, &changed, false).await;
-        let next = format!("tidy@{candidate}");
-        // the candidate is graded while the first version is in force
-        let run = evaluator(dir.path())
-            .grade(&next, Autonomy::Review, &f.answers(2))
-            .await
-            .unwrap();
-        assert_eq!((&run.record.definition, run.pass), (&next, true));
-        let refused = f.owner.raise(&next).await;
-        assert!(
-            denied(&refused, "is not the version in force"),
-            "{refused:?}"
-        );
-        crate::testing::verify(&f.owner, &candidate).await;
-        let view = f.owner.autonomy("tidy").await.unwrap();
-        assert_eq!(
-            (view.definition.as_str(), view.level, view.records.len()),
-            (next.as_str(), Autonomy::Person, 1)
-        );
-        // what the first version earned is that version's
-        assert_eq!(
-            f.owner.level_of(&f.reference).await.unwrap(),
-            Autonomy::Review
-        );
-        let refused = f.owner.raise(&f.reference).await;
-        assert!(
-            denied(&refused, "is not the version in force"),
-            "{refused:?}"
-        );
-        // and the new version earns its own level on its own run
-        let record = f.owner.raise("tidy").await.unwrap();
-        assert_eq!(
-            (&record.definition, &record.change),
-            (&next, &raised(Autonomy::Review, &run, None))
-        );
-    }
-
-    /// A version that is not active is not graded, and neither is a name with no entry.
-    #[tokio::test]
-    async fn only_an_active_entry_of_the_platform_domain_is_graded() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = fixture(dir.path()).await;
-        let grader = evaluator(dir.path());
-        let entry = f.reference.trim_start_matches("tidy@");
-        let elsewhere = written_in(&f.owner, "dom-me", TIDY, true).await;
-        let no_block = written(&f.owner, "A note.\n", true).await;
-        f.owner.store.demote("dom-plat", entry).await.unwrap();
-        let before = events(&f.owner).await;
-        for version in [entry, elsewhere.as_str(), no_block.as_str(), "nowhere", ""] {
-            let named = format!("tidy@{version}");
-            let refused = grader.grade(&named, Autonomy::Review, &f.answers(2)).await;
-            assert!(
-                denied(&refused, "of a task definition is there to grade"),
-                "{named}: {refused:?}"
-            );
-        }
-        let refused = grader.grade("tidy", Autonomy::Review, &f.answers(2)).await;
-        assert!(
-            denied(&refused, "no task definition tidy is in force"),
-            "{refused:?}"
-        );
-        assert_eq!(events(&f.owner).await, before, "nothing appended");
-    }
-
-    /// The grader reads the definition and the suite under its own filter, and its
-    /// label rises to what it read.
-    #[tokio::test]
-    async fn a_grader_reads_the_definition_and_the_suite_under_its_filter() {
-        let dir = tempfile::tempdir().unwrap();
-        let owner = held_out_root(dir.path());
-        let restricted = |domain: &str, body: &str| WriteRequest {
-            body: body.into(),
-            domain: Some(domain.into()),
-            entry_type: EntryType::Convention,
-            classification: Some(Label::Restricted),
-            ..WriteRequest::default()
-        };
-        let entry = written(&owner, TIDY, true).await;
-        let high = owner.write(restricted("dom-plat", TIDY)).await.unwrap().id;
-        let suite = owner.write(restricted("dom-held", SUITE)).await.unwrap().id;
-        verify_in(&owner, "dom-held", &suite).await;
-        let low = evaluator(dir.path()).with_handling_cap(Label::Internal);
-        assert_eq!(low.held_out_suite("tidy").await.unwrap(), None);
-        let refused = low.grade("tidy", Autonomy::Review, &[]).await;
-        assert!(
-            denied(&refused, "no held-out suite is in force"),
-            "{refused:?}"
-        );
-        let words = |r: Result<Graded, Error>| match r {
-            Err(Error::Denied(why)) => why.replace("nowhere", &high),
-            other => format!("{other:?}"),
-        };
-        let hidden = low
-            .grade(&format!("tidy@{high}"), Autonomy::Review, &[])
-            .await;
-        let missing = low.grade("tidy@nowhere", Autonomy::Review, &[]).await;
-        assert_eq!(words(hidden), words(missing));
-        assert_eq!(low.label(), Label::Internal, "the definition {entry}");
-        let grader = evaluator(dir.path());
-        assert_eq!(grader.label(), Label::Public);
-        grader.held_out_suite("tidy").await.unwrap().unwrap();
-        assert_eq!(grader.label(), Label::Restricted, "it read the suite");
-    }
-
-    /// Rule 13.
-    #[tokio::test]
-    async fn the_evaluator_claims_no_task() {
-        let dir = tempfile::tempdir().unwrap();
-        let owner = held_out_root(dir.path());
-        let spec = TaskSpec {
-            domain: "dom-me".into(),
-            title: "Sweep the floor".into(),
-            body: "Do it.\n".into(),
-            ..TaskSpec::default()
-        };
-        let mut task = owner.create_task(spec).await.unwrap().task;
-        if task.status == Status::Proposed {
-            task = owner.admit(&task.id).await.unwrap();
-        }
-        let lease = Duration::minutes(5);
-        let grader = evaluator(dir.path());
-        let before = events(&owner).await;
-        let named = grader.claim(&task.id, lease).await;
-        assert!(denied(&named, "claims none"), "{named:?}");
-        let next = grader.claim_next(Some("dom-me"), lease).await;
-        assert!(denied(&next, "claims none"), "{next:?}");
-        assert_eq!(events(&owner).await, before, "nothing appended");
-        // the task is still on offer to a session that does work
-        let worker = as_author(dir.path(), "agent:a");
-        let claimed = worker.claim_next(Some("dom-me"), lease).await.unwrap();
-        assert_eq!(claimed.unwrap().task.id, task.id);
-    }
-}
+mod tests;

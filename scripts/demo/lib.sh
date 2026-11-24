@@ -17,6 +17,14 @@ agent() { python3 "$here/scripts/demo/mcp.py" "$memory" "$root" "$@"; }
 export LLMAO_URL=${LLMAO_URL:-https://llm.apache.org}
 export LLMAO_KEY=${LLMAO_KEY:-$(cat "$here/local/.virtual-key" 2>/dev/null || true)}
 gateway() { [ -n "$LLMAO_KEY" ]; }
+# make dom-platform the platform's domain in the grants, when the grants name none
+platform_domain() {
+  if ! grep -q '^platform = ' "$root/grants.toml"; then
+    # a top-level key, before the first table
+    sed -i 's/^handling = \(.*\)$/handling = \1\nplatform = "dom-platform"/' "$root/grants.toml"
+    printf '\n[domains.dom-platform]\ndefault_classification = "internal"\nadmit_own = true\n' >> "$root/grants.toml"
+  fi
+}
 # the models the acts use on the gateway: an auditor, and a cheap worker
 AUDITOR_MODEL=${AUDITOR_MODEL:-gemma4-26b}
 WORKER_MODEL=${WORKER_MODEL:-qwen3.8-27b}

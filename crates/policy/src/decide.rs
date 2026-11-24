@@ -47,6 +47,19 @@ impl Class {
             Class::System
         }
     }
+
+    /// Which raw entries a principal of this class reads when the policy does not say.
+    /// An agent reads the raw entries of the fleet and of its task chain. The owner,
+    /// another person, a tap and the system read all raw entries: a person looks at
+    /// content from outside the fleet before a session of the fleet reads it, and a tap
+    /// reads what it posts back.
+    #[must_use]
+    pub fn raw_reach(self) -> dm_core::RawReach {
+        match self {
+            Class::Agent => dm_core::RawReach::Fleet,
+            Class::Owner | Class::Human | Class::Tap | Class::System => dm_core::RawReach::All,
+        }
+    }
 }
 
 /// What is being asked.
@@ -473,11 +486,24 @@ pub struct ReadScope {
     pub handling: dm_core::Label,
     /// The lowest trust tier returned.
     pub min_tier: dm_core::TrustTier,
+    /// Which raw entries are readable, when the policy says: it can narrow the default
+    /// of the principal's class or widen it. Absent means that default.
+    #[serde(default)]
+    pub raw_reach: Option<dm_core::RawReach>,
 }
 
 impl ReadScope {
+    /// Which raw entries a principal of `class` reads under this scope: what the policy
+    /// gives, else the default of the class ([`Class::raw_reach`]).
+    #[must_use]
+    pub fn raw_reach_for(&self, class: Class) -> dm_core::RawReach {
+        self.raw_reach.unwrap_or_else(|| class.raw_reach())
+    }
+
     /// The filter the index applies: this scope intersected with what the grants
-    /// allow, so a policy can narrow a session's reads and never widen them.
+    /// allow, so a policy can narrow a session's reads and never widen them. The raw
+    /// reach and the chain of the granted filter stay as they are: the caller sets
+    /// them, from [`ReadScope::raw_reach_for`] and the task that the session holds.
     #[must_use]
     pub fn narrow(&self, granted: &dm_core::ReadFilter) -> dm_core::ReadFilter {
         let mut f = granted.clone();
@@ -511,6 +537,10 @@ pub struct Policy {
     refused: Vec<(String, String)>,
     /// The entries of the rules the ceiling holds at advisory.
     held_back: Vec<String>,
+    /// The data the record gave the engine, and when each exception in it lapses: an
+    /// expiry is read against the clock at each decision, never compiled in.
+    data: serde_json::Value,
+    lapses: Vec<(String, time::OffsetDateTime)>,
     /// One engine for each advisory rule: the base with that rule's module alone. What
     /// it denies is reported and never joins the decision, and a module that fails
     /// takes no other rule's report with it.
@@ -548,16 +578,38 @@ impl Policy {
     /// A policy that will not compile, or a file that cannot be read.
     pub fn load(root: &Path, grants: &Grants) -> Result<Policy, Error> {
         let dir = root.join("policy");
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .map(|d| {
-                d.filter_map(Result::ok)
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|x| x == "rego"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        match Policy::root_text(root)? {
+            Some(text) => Policy::compile(&text, &dir.display().to_string(), grants),
+            None => Policy::builtin(grants),
+        }
+    }
+
+    /// The text of a root's own policy, its `policy/*.rego` in the order of their
+    /// names; none when the root has no such file and the built-in policy stands.
+    ///
+    /// # Errors
+    ///
+    /// A policy file that cannot be read.
+    pub fn root_text(root: &Path) -> Result<Option<String>, Error> {
+        let dir = root.join("policy");
+        // no directory is no policy of the root's own; one that cannot be read is an
+        // error, since the built-in policy may allow what the root's would not
+        let mut files: Vec<_> = match std::fs::read_dir(&dir) {
+            Ok(d) => d
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "rego"))
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(Error::Io {
+                    path: dir.display().to_string(),
+                    source: e,
+                })
+            }
+        };
         if files.is_empty() {
-            return Policy::builtin(grants);
+            return Ok(None);
         }
         files.sort();
         let mut text = String::new();
@@ -568,7 +620,7 @@ impl Policy {
             })?);
             text.push('\n');
         }
-        Policy::compile(&text, &dir.display().to_string(), grants)
+        Ok(Some(text))
     }
 
     /// This policy with the record's policy entries: each verified entry's module is
@@ -651,6 +703,12 @@ impl Policy {
             .map(|(id, engine)| Ok((id, Policy::with_data(engine, &data)?)))
             .collect::<Result<_, Error>>()?;
         self.version = digest(&texts);
+        self.lapses = entries
+            .iter()
+            .filter(|e| e.in_force(now))
+            .filter_map(|e| Some((e.meta.id.clone(), e.lapses()?)))
+            .collect();
+        self.data = data;
         self.entries = entries;
         self.held_back = over;
         Ok(self)
@@ -771,6 +829,8 @@ impl Policy {
             entries: Vec::new(),
             refused: Vec::new(),
             held_back: Vec::new(),
+            data: serde_json::Value::Null,
+            lapses: Vec::new(),
             watch: Vec::new(),
         })
     }
@@ -799,12 +859,35 @@ impl Policy {
     ///
     /// When the policy fails to evaluate or its answer is not a scope.
     pub fn read_scope(&self, input: &Input) -> Result<ReadScope, Error> {
-        let json = self.eval("data.amem.read_filter", input)?;
+        let json = self.eval(
+            "data.amem.read_filter",
+            input,
+            time::OffsetDateTime::now_utc(),
+        )?;
         serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))
     }
 
-    fn eval(&self, rule: &str, input: &Input) -> Result<String, Error> {
-        let mut engine = self.engine.clone();
+    /// The engine as it stands at `now`: without the exceptions that have lapsed since
+    /// the policy was compiled.
+    fn engine_at(&self, now: time::OffsetDateTime) -> Result<regorus::Engine, Error> {
+        let lapsed: Vec<&str> = self
+            .lapses
+            .iter()
+            .filter(|(_, at)| *at <= now)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if lapsed.is_empty() {
+            return Ok(self.engine.clone());
+        }
+        let mut data = self.data.clone();
+        if let Some(list) = data["exceptions"].as_array_mut() {
+            list.retain(|e| !lapsed.contains(&e["id"].as_str().unwrap_or_default()));
+        }
+        Policy::with_data(self.engine.clone(), &data)
+    }
+
+    fn eval(&self, rule: &str, input: &Input, now: time::OffsetDateTime) -> Result<String, Error> {
+        let mut engine = self.engine_at(now)?;
         let value = regorus::Value::from_json_str(
             &serde_json::to_string(input).map_err(|e| Error::Policy(e.to_string()))?,
         )
@@ -823,7 +906,17 @@ impl Policy {
     ///
     /// When the policy fails to evaluate or its decision is not the shape expected.
     pub fn decide(&self, input: &Input) -> Result<Decision, Error> {
-        let json = self.eval("data.amem.decision", input)?;
+        self.decide_at(input, time::OffsetDateTime::now_utc())
+    }
+
+    /// Decide one request as the clock reads `now`: an exception that has lapsed by
+    /// then lets nothing through, whenever the policy was compiled.
+    ///
+    /// # Errors
+    ///
+    /// As [`Policy::decide`].
+    pub fn decide_at(&self, input: &Input, now: time::OffsetDateTime) -> Result<Decision, Error> {
+        let json = self.eval("data.amem.decision", input, now)?;
         let mut d: Decision =
             serde_json::from_str(&json).map_err(|e| Error::Policy(format!("{e}: {json}")))?;
         d.policy = self.version.clone();
@@ -1351,6 +1444,96 @@ mod tests {
         assert_eq!(scope.handling, g.handling);
         assert_eq!(scope.min_tier, dm_core::TrustTier::Raw);
         assert_eq!(scope.narrow(&g.read_filter()), g.read_filter());
+        assert_eq!(
+            scope.raw_reach, None,
+            "the built-in policy leaves the default"
+        );
+    }
+
+    const ALL_CLASSES: [Class; 5] = [
+        Class::Owner,
+        Class::Human,
+        Class::Agent,
+        Class::Tap,
+        Class::System,
+    ];
+
+    #[test]
+    fn an_agent_reads_the_raw_entries_of_the_fleet_and_each_other_class_reads_all() {
+        use dm_core::RawReach;
+        for class in ALL_CLASSES {
+            let want = if class == Class::Agent {
+                RawReach::Fleet
+            } else {
+                RawReach::All
+            };
+            assert_eq!(class.raw_reach(), want, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn the_raw_reach_is_the_policy_s_when_it_gives_one_and_else_the_default_of_the_class() {
+        use dm_core::RawReach;
+        let g = grants();
+        let builtin = Policy::builtin(&g).unwrap();
+        for class in ALL_CLASSES {
+            let scope = builtin.read_scope(&read_input(class)).unwrap();
+            assert_eq!(scope.raw_reach_for(class), class.raw_reach(), "{class:?}");
+        }
+        for given in [RawReach::Chain, RawReach::Fleet, RawReach::All] {
+            let scope = ReadScope {
+                domains: Vec::new(),
+                handling: dm_core::Label::Public,
+                min_tier: dm_core::TrustTier::Raw,
+                raw_reach: Some(given),
+            };
+            for class in ALL_CLASSES {
+                assert_eq!(scope.raw_reach_for(class), given, "{class:?}");
+            }
+        }
+    }
+
+    /// The built-in policy with a `read_filter` that sets `raw_reach` for agents.
+    fn with_raw_reach(value: &str) -> String {
+        let text = BUILTIN.replace(
+            "read_filter := base_filter\n",
+            &format!("read_filter := object.union(base_filter, {{\"raw_reach\": \"{value}\"}}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n"),
+        );
+        assert_ne!(text, BUILTIN, "the rule was replaced");
+        text
+    }
+
+    #[test]
+    fn a_policy_sets_the_raw_reach_and_an_unknown_value_is_an_error() {
+        use dm_core::RawReach;
+        let g = grants();
+        for (word, want) in [
+            ("chain", RawReach::Chain),
+            ("fleet", RawReach::Fleet),
+            ("all", RawReach::All),
+        ] {
+            let p = Policy::compile(&with_raw_reach(word), "test", &g).unwrap();
+            let scope = p.read_scope(&read_input(Class::Agent)).unwrap();
+            assert_eq!(scope.raw_reach, Some(want), "{word}");
+            assert_eq!(scope.raw_reach_for(Class::Agent), want, "{word}");
+            // the rule names agents, so the owner keeps the default of its class
+            let owner = p.read_scope(&read_input(Class::Owner)).unwrap();
+            assert_eq!(owner.raw_reach, None);
+            assert_eq!(owner.raw_reach_for(Class::Owner), RawReach::All);
+            // the granted filter keeps its raw reach and its chain through `narrow`
+            let mut granted = g.read_filter();
+            granted.raw_reach = RawReach::Fleet;
+            granted.chain = vec!["task-x".into()];
+            let narrowed = scope.narrow(&granted);
+            assert_eq!(narrowed.raw_reach, RawReach::Fleet);
+            assert_eq!(narrowed.chain, ["task-x"]);
+        }
+        let p = Policy::compile(&with_raw_reach("tap"), "test", &g).unwrap();
+        let refused = p.read_scope(&read_input(Class::Agent)).unwrap_err();
+        assert!(
+            matches!(&refused, Error::Policy(m) if m.contains("raw_reach") && m.contains("tap")),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -1387,6 +1570,7 @@ mod tests {
             domains: Vec::new(),
             handling: dm_core::Label::Restricted,
             min_tier: dm_core::TrustTier::Raw,
+            raw_reach: None,
         };
         let f = none.narrow(&g.read_filter());
         assert_eq!(f.domains, vec![String::new()]);
@@ -1410,7 +1594,11 @@ mod tests {
     }
 
     fn supersede_decision(p: &Policy, held: Option<&str>) -> Decision {
-        p.decide(&Input {
+        p.decide(&supersede_input(held)).unwrap()
+    }
+
+    fn supersede_input(held: Option<&str>) -> Input {
+        Input {
             action: Action::Write,
             principal: Principal {
                 id: "agent:x".into(),
@@ -1432,8 +1620,49 @@ mod tests {
             spend: None,
             fetch: None,
             approval: None,
-        })
-        .unwrap()
+        }
+    }
+
+    /// An expiry is read against the clock at each decision: a policy compiled while
+    /// an exception was in force refuses once the exception has lapsed.
+    #[test]
+    fn an_exception_lapses_at_its_expiry_whenever_the_policy_was_compiled() {
+        use dm_core::TrustTier::Verified;
+        let g = grants();
+        let rule = rule_entry("pol-L2-031", 2, Verified, "", true);
+        let exception = |id: &str, expires: &str| {
+            rule_entry(
+                id,
+                2,
+                Verified,
+                &format!(
+                    "breaches = \"pol-L2-031\"\nscope_task = \"task-t-1\"\nexpires = \"{expires}\""
+                ),
+                false,
+            )
+        };
+        let compiled = time::macros::datetime!(2026-11-01 00:00 UTC);
+        let short = exception("exc-2026-010", "2026-11-02T00:00:00Z");
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![rule.clone(), short.clone()], compiled)
+            .unwrap();
+        let input = supersede_input(Some("task-t-1"));
+        let before = time::macros::datetime!(2026-11-01 12:00 UTC);
+        let at = time::macros::datetime!(2026-11-02 00:00 UTC);
+        assert!(p.decide_at(&input, before).unwrap().allow);
+        let d = p.decide_at(&input, at).unwrap();
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(d.cites, ["pol-L2-031"]);
+        // an exception that still runs is kept when another lapses
+        let long = exception("exc-2026-011", "2026-12-01T00:00:00Z");
+        let p = Policy::builtin(&g)
+            .unwrap()
+            .with_record(&g, vec![rule, short, long], compiled)
+            .unwrap();
+        let d = p.decide_at(&input, at).unwrap();
+        assert!(d.allow, "{d:?}");
+        assert_eq!(d.cites, ["exc-2026-011"]);
     }
 
     fn with(g: &Grants, entries: Vec<crate::record::Entry>) -> Policy {

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Act 3: the perimeter. Shared memory is a channel to every later session, so a write
-# that speaks to agents is held for the owner; the auditor gives its verdict; taint follows
-# an entry's reach; policy is memory, enforced once a person verifies it, with an
+# that speaks to agents is held for the owner; the auditor gives its verdict; lineage,
+# read from the event log, goes back from a bad entry to what its session read and forward
+# to what was written after; policy is memory, enforced once a person verifies it, with an
 # exception scoped to one task; an erasure and a copy at a lower label run only under a
 # person's approval of one version; and the policy narrows what an agent reads, inside
 # the query.
@@ -23,10 +24,18 @@ fi
 echo "  the owner's queue, each held write with who wrote it and the auditor's verdict:"
 a quarantine list | j "'\n'.join(f\"  {e['id']}  {e['author']:<14} {(e['review'] or {}).get('verdict','unreviewed'):<10} {e['title']}\" for e in d)"
 
-say "Taint" "If an entry turns out to be bad: which sessions read it, and what they wrote afterwards that may carry it on. Erasure flags the same entries for review."
+say "Lineage" "The event log of the domain holds each write as it was offered, each read and each send. The write refused in 3.1 is in the log too: the owner and the security role read it, in a session that handles the highest label. When an entry is bad, the log says what its session read before the write, and what was written after a session read it."
+rogue=$(a quarantine list | j "max((e for e in d if e['author'].startswith('agent:rogue')), key=lambda e: e['created'])['id']")
+echo "  the write that the scan refused in 3.1, as the owner reads it in the log:"
+a log show --domain dom-demo | j "'\n'.join('  %6d  %-11s %-10s %s' % (e['seq'], e['kind'], e.get('label', ''), 'the write as it was offered, digest ' + e['digest'][:16] if e['kind'] == 'write' else 'refused by ' + e['gate'] + '; found: ' + ', '.join(e.get('findings', []))) for e in d if e.get('id') == '$rogue' and e['kind'] in ('write', 'quarantined'))"
+echo "  an agent outside the security role asks for the log:"
+agent agent:reader log '{"domain": "dom-demo"}' | cut -c1-160 | sed 's/^/  /' || true
 read_one=$(a list --kind decision --limit 3 | j "d[-1]['id']")
-agent agent:reader batch "[{\"tool\": \"get\", \"arguments\": {\"id\": \"$read_one\"}}, {\"tool\": \"write\", \"arguments\": {\"title\": \"Drawn from what I read\", \"body\": \"A conclusion drawn from the decision just read.\"}}]" >/dev/null
-a taint "$read_one" | j "f\"  {d['id']}: read by {len(d['readers'])} session(s), who wrote {d['written']} after reading it\""
+note=$(agent agent:reader batch "[{\"tool\": \"get\", \"arguments\": {\"id\": \"$read_one\"}}, {\"tool\": \"write\", \"arguments\": {\"title\": \"Drawn from what I read\", \"body\": \"A conclusion drawn from the decision just read.\"}}]" | j "d['id']")
+echo "  agent:reader read $read_one and wrote $note in one session. Suppose the note is bad:"
+a lineage "$note" --back | python3 "$here/scripts/demo/lineage.py"
+echo "  and suppose the entry that it read is bad. One step forward:"
+a lineage "$read_one" --depth 1 | python3 "$here/scripts/demo/lineage.py" "$note"
 
 say "Policy is memory" "A rule is an entry, with an owner, a review date and a Rego module. A rule written after an incident enters as advisory. It is in a decision only once a person verified it, and each step up is a version that a person verifies."
 rule_text() { cat <<POL
@@ -215,9 +224,39 @@ for line in sys.stdin:
 '
 fi
 
+say "A grant withdrawn mid-session" "A session is valid only while its grants read as they did when it started. The owner lowers the handling of the record while an agent's session is open. The session's next read is refused, and so is its next write: a request made after a revocation cannot use the old grant. A new session starts under the grants as they are."
+# the grants go back however the step ends, a signal included; a copy that an
+# interrupted run left is put back first, so it is never overwritten with lowered grants
+restore_grants() {
+  if [ -f "$root/grants.toml.before-revoke" ]; then
+    mv "$root/grants.toml.before-revoke" "$root/grants.toml"
+  fi
+}
+restore_grants
+trap restore_grants EXIT
+trap 'restore_grants; trap - EXIT; exit 130' INT TERM HUP
+cp "$root/grants.toml" "$root/grants.toml.before-revoke"
+sed 's/^handling = .*/handling = "public"/' "$root/grants.toml" > "$root/grants.toml.lowered"
+agent agent:a steps "[
+  {\"tool\": \"search\", \"arguments\": {\"query\": \"decision\", \"limit\": 50}},
+  {\"run\": \"mv '$root/grants.toml.lowered' '$root/grants.toml'\"},
+  {\"tool\": \"search\", \"arguments\": {\"query\": \"decision\", \"limit\": 50}},
+  {\"tool\": \"write\", \"arguments\": {\"title\": \"A late note\", \"body\": \"Written after the grant was withdrawn.\"}}
+]" | python3 -c "
+import json, sys
+for line in sys.stdin:
+    d = json.loads(line)
+    if d['ok']:
+        print(f\"  {d['tool']}: {len(d['result']['hits'])} hits, under the grants the session started with\")
+    else:
+        print(f\"  {d['tool']}: {d['refused'][:150]}\")
+"
+echo "  a new session, under the grants as they are now: $(agent agent:a search '{"query": "decision", "limit": 50}' | j "len(d['hits'])") hits"
+mv "$root/grants.toml.before-revoke" "$root/grants.toml"
+
 say "Reads are the policy's too" "A root's policy can narrow what agents read, here to public entries, and the narrowing is compiled into the search query itself, not applied after."
 mkdir -p "$root/policy"
 sed 's/^read_filter := base_filter$/read_filter := object.union(base_filter, {"handling": "public"}) if class == "agent"\n\nread_filter := base_filter if class != "agent"/' \
   "$here/crates/policy/rego/amem.rego" > "$root/policy/local.rego"
-echo "  an agent searching 'decision': $(agent agent:a search '{"query": "decision", "limit": 50}' | j 'len(d)') hits; the owner: $(a search decision --limit 50 | j 'len(d)')"
+echo "  an agent searching 'decision': $(agent agent:a search '{"query": "decision", "limit": 50}' | j "len(d['hits'])") hits; the owner: $(a search decision --limit 50 | j 'len(d)')"
 rm -r "$root/policy"

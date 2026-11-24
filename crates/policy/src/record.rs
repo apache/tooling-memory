@@ -243,6 +243,13 @@ impl Entry {
         self.state() == Status::Advisory && self.rego.is_some() && !self.meta.is_exception()
     }
 
+    /// When, as an exception, it lapses: its expiry, if that is a time.
+    #[must_use]
+    pub fn lapses(&self) -> Option<time::OffsetDateTime> {
+        let expires = self.meta.expires.as_deref()?;
+        time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339).ok()
+    }
+
     /// Whether, as an exception, it is in force at `now`: verified, not expired, and
     /// not retired.
     #[must_use]
@@ -250,10 +257,7 @@ impl Entry {
         self.meta.is_exception()
             && self.meta.status != Some(Status::Retired)
             && self.tier == dm_core::TrustTier::Verified
-            && self.meta.expires.as_deref().is_some_and(|e| {
-                time::OffsetDateTime::parse(e, &time::format_description::well_known::Rfc3339)
-                    .is_ok_and(|t| t > now)
-            })
+            && self.lapses().is_some_and(|t| t > now)
     }
 }
 

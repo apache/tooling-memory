@@ -124,6 +124,9 @@ impl Memory {
     ///
     /// An index error.
     pub async fn read_with(&self, id: &str, max: usize) -> Result<Vec<Hit>, Error> {
+        if !self.settings().prefetches() {
+            return Ok(Vec::new());
+        }
         let f = self.session_filter()?;
         let pairs = reads::co_retrieved(&reads::all(&self.root).unwrap_or_default(), |_| true);
         let mut out = Vec::new();
@@ -139,7 +142,7 @@ impl Memory {
             }
         }
         if !out.is_empty() {
-            self.observe(&out);
+            self.observe(&out)?;
             self.reads.hits("read_with", Some(id), &out);
         }
         Ok(out)
@@ -159,6 +162,9 @@ impl Memory {
             query: query.to_string(),
             ..Prefetched::default()
         };
+        if !self.settings().prefetches() {
+            return Ok(out);
+        }
         let pairs = reads::co_retrieved(&reads::all(&self.root).unwrap_or_default(), |_| true);
         {
             let index = self.index.lock().await;
@@ -186,7 +192,7 @@ impl Memory {
                 }
             }
         }
-        self.observe(&out.hits);
+        self.observe(&out.hits)?;
         let ids = out.ids();
         self.reads.served_ids(
             "prefetch",

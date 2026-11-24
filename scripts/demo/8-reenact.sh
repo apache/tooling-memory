@@ -4,23 +4,31 @@
 # again, on the same model or another, with the memory calls answered from the tape
 # until the run asks for something the original did not; then it reports how far the
 # run kept to the original. Replay (5.7) resends recorded model calls; this runs the
-# whole session.
+# whole session. The tape's head also holds the replay manifest: the state the session
+# began with. A run that left the tape read the record as it is now, so the report marks
+# it incomplete when that state moved.
 . "$(dirname "$0")/lib.sh"
 act 8 "Run it again" "A session recorded in act 6 run again from its tape: once on its own model, as a control, and once on another, each scored on how far it kept to the original's memory calls, beside its answer, tokens and time." "$WORKER_HARNESS, re-running a session from act 6 on $WORKER_MODEL and then on $AUDITOR_MODEL; the tape, answering its memory calls; and the report."
 
 say "The tapes" "Each prompted session's prompt, harness, model and memory calls, kept with the transcripts and on their clock unless pinned."
-tape=$(a reenact tapes | j "next((t['session'] for t in d if t.get('prompt') and t.get('harness') == '$WORKER_HARNESS' and t.get('model') == '$WORKER_MODEL'), '')")
+# a session that read memory: a run of the full arm, or a session that is no run of an
+# evaluation. A session of the no-memory arm made no memory call, so it has nothing to
+# run again.
+tape=$(a reenact tapes | j "next((t['session'] for t in d if t.get('prompt') and t.get('harness') == '$WORKER_HARNESS' and t.get('model') == '$WORKER_MODEL' and (t.get('evaluation') or {'arm': 'full'})['arm'] == 'full'), '')")
 if [ -z "$tape" ]; then
   echo "  no prompted $WORKER_HARNESS session on $WORKER_MODEL to run again: act 6 runs them"
   exit 0
 fi
 a reenact tapes | j "f\"  {len([t for t in d if t.get('prompt')])} tapes with a prompt, of {len(d)}\""
 a reenact show "$tape" | j "f\"  {d['header']['session']}: {d['header']['harness']} on {d['header']['model']}, {len(d['calls'])} memory calls; its prompt:\n    \" + d['header']['prompt'].split('; it holds what you need. ')[-1][:200]"
+# the replay manifest of the tape, and whether a run that leaves the tape is complete
+manifest_line="(lambda m: '  it began at: no manifest, the tape is older than the manifest' if not m else '  it began at: log ' + ', '.join(f'{k} {v}' for k, v in m['log'].items()) + f\"; policy {m['policy']}; settings: memory {'on' if m['settings']['memory'] else 'off'}, T0 {m['settings']['t0']}, depth {m['settings']['depth']}, tier up to {m['settings']['max_tier']}\" + (', as of ' + m['settings']['not_after'] if m['settings'].get('not_after') else ''))(d.get('manifest'))"
+a reenact state "$tape" | j "$manifest_line + f\"\n  replay state now: {d['availability']}\" + ''.join(f\"\n    moved: {m['what']}, then {m['then']}, now {m['now']}\" for m in d['moved'])"
 
 if gateway; then
   run() {
     ( cd "$(mktemp -d)" && a reenact run "$tape" --auth gateway --model "$1" --runs 1 2>/dev/null ) \
-      | j "f\"  {d['model']}: {'the same tools in the same order as the tape' if d['alignment'] == 1 else 'its tools in line with the tape' + chr(39) + 's: alignment ' + format(d['alignment'], '.0%')}; {'every call asked as on the tape' if not d['diverged'] else 'first asked differently at call ' + str(d['steps_to_divergence'] + 1) + ' of ' + str(d['tape_calls'])}; {d['seconds']:.0f} s, {d['tokens']['input']}+{d['tokens']['cache_read']}c tokens in\n    answer: {d['answer'].strip().splitlines()[0][:150] if d['answer'].strip() else '(none)'}\""
+      | j "f\"  {d['model']}: {'the same tools in the same order as the tape' if d['alignment'] == 1 else 'its tools in line with the tape' + chr(39) + 's: alignment ' + format(d['alignment'], '.0%')}; {'every call asked as on the tape' if not d['diverged'] else 'first asked differently at call ' + str(d['steps_to_divergence'] + 1) + ' of ' + str(d['tape_calls'])}; {d['seconds']:.0f} s, {d['tokens']['input']}+{d['tokens']['cache_read']}c tokens in\n    {'kept to the tape' if d.get('left_tape_at') is None else 'left the tape at call ' + str(d['left_tape_at'])}; {'complete' if d.get('complete') else 'incomplete: ' + (', '.join([m['what'] + ' moved' for m in d.get('moved', [])] + (['calls removed by an erasure'] if d.get('missing_calls') else [])) or 'the starting state was not recorded')}\n    answer: {d['answer'].strip().splitlines()[0][:150] if d['answer'].strip() else '(none)'}\""
   }
   say "The same model again" "The control: $WORKER_HARNESS on $WORKER_MODEL, as the original ran. A model is not deterministic, so even this may differ."
   run "$WORKER_MODEL" || true
