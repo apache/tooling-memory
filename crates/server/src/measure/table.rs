@@ -567,6 +567,7 @@ fn upkeep(x: &Logs) -> Metric {
         json!({
             "share": share,
             "upkeep": x.flow.upkeep,
+            "self_filed": x.flow.self_filed,
             "done": x.flow.done,
             "ceiling_percent": x.ceiling,
         }),

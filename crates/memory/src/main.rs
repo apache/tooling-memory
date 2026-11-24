@@ -28,6 +28,7 @@ mod hosted;
 mod image;
 mod mcp_http;
 mod mcp_meta;
+mod measure;
 mod mine;
 mod model;
 mod open;
@@ -755,6 +756,36 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// The metric table of the paper for a domain: 21 rows, each with a value from the
+    /// logs or with the reason that it is not measured, and then the published targets
+    /// with what is measured against them.
+    Metrics {
+        #[arg(long)]
+        domain: Option<String>,
+        /// The length of the window, in days.
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// The table and the targets as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The five limits of a domain, each in its own unit: spend, the share of
+    /// throughput, the outbound rate, the enforced rules, and the share of upkeep.
+    /// `raise` raises one for a time.
+    Limits {
+        #[command(subcommand)]
+        op: Option<measure::LimitsOp>,
+        #[arg(long)]
+        domain: Option<String>,
+        /// The rows as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// A landing queue: the changes that wait to land, and the landing of the first.
+    Landing {
+        #[command(subcommand)]
+        op: measure::LandingOp,
+    },
     /// The paper's read-path claims measured on this record: recovery from T0 and a
     /// handoff against transcript replay, a page of hits against bodies and corpus,
     /// known-item lookups in the top three, and tokens served per session beside what
@@ -1343,6 +1374,23 @@ enum TaskOp {
     Stats {
         #[arg(long)]
         domain: Option<String>,
+    },
+    /// The times of one task from the ledger: its first claim, its completion, when it
+    /// was queued for landing, and the seconds from the claim to each.
+    Times { id: String },
+    /// Hand the change of a held task to a landing queue, in place of `complete`. The
+    /// task is blocked until a person lands the change with `amem landing land`.
+    QueueLanding {
+        id: String,
+        /// The landing queue, as the grants name it.
+        #[arg(long)]
+        queue: String,
+        /// The handoff entry that describes the change.
+        #[arg(long)]
+        handoff: String,
+        /// The generation of the claim.
+        #[arg(long)]
+        generation: Option<u64>,
     },
 }
 
@@ -4968,6 +5016,9 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Policy { .. }
         | Command::Quarantine { .. }
         | Command::Taint { .. }) => perimeter_cmd(m, cmd).await,
+        cmd @ (Command::Metrics { .. } | Command::Limits { .. } | Command::Landing { .. }) => {
+            measure::cmd(m, cmd).await
+        }
         Command::Init { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
@@ -5097,10 +5148,19 @@ fn scores_of(text: &str) -> Result<dm_ledger::Scores, Box<dyn std::error::Error>
 }
 
 /// `amem task rescore` and `amem task stats`: the fabric's ranking and its telemetry.
+/// `amem task times` and `amem task queue-landing`: the times of a task, and its change
+/// handed to a landing queue.
 async fn fabric_cmd(m: &Memory, op: TaskOp) -> Fallible {
     match op {
         TaskOp::Rescore { domain } => json(&m.rescore(domain.as_deref()).await?),
         TaskOp::Stats { domain } => json(&m.task_stats(domain.as_deref()).await?),
+        TaskOp::Times { id } => json(&m.task_times(&id).await?),
+        TaskOp::QueueLanding {
+            id,
+            queue,
+            handoff,
+            generation,
+        } => json(&m.queue_landing(&id, generation, &queue, &handoff).await?),
         _ => unreachable!("routed by task"),
     }
 }
@@ -5173,7 +5233,10 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         TaskOp::Invalidate { id, reason } => json(&m.invalidate(&id, &reason, None).await?),
         TaskOp::Tree { id } => json(&m.task_tree(&id).await?),
         TaskOp::Retry { id } => json(&m.retry_task(&id).await?),
-        op @ (TaskOp::Rescore { .. } | TaskOp::Stats { .. }) => fabric_cmd(m, op).await,
+        op @ (TaskOp::Rescore { .. }
+        | TaskOp::Stats { .. }
+        | TaskOp::Times { .. }
+        | TaskOp::QueueLanding { .. }) => fabric_cmd(m, op).await,
         op @ (TaskOp::Verdict { .. } | TaskOp::Outcome { .. }) => judged_cmd(m, op).await,
         TaskOp::Get { id } => json(&m.get_task(&id).await?),
     }

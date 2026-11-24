@@ -672,6 +672,51 @@ async fn the_report_gives_each_limit_in_its_unit_with_its_count() {
     assert!((now - 100.0 / 3.0).abs() < 1e-9, "{now}");
 }
 
+/// The caller that can read the meter of the egress gives the spend of one day. A row
+/// over one day then has its count, in its own unit. A row over one session has none.
+#[tokio::test]
+async fn the_report_counts_the_spend_of_a_day_from_the_meter_that_the_caller_read() {
+    let site = Site::new(DomainLimits::default());
+    site.grants(|g| {
+        let spend = dm_policy::SpendLimit {
+            session_tokens: Some(50),
+            day_tokens: Some(1000),
+            session_usd_cents: None,
+            day_usd_cents: Some(200),
+        };
+        g.spend.insert("openai".into(), spend.clone());
+        g.spend.insert("other".into(), spend);
+    });
+    let read = Metered {
+        tokens: 250,
+        cents: 30,
+        unpriced: vec!["m-x".into()],
+    };
+    let metered = BTreeMap::from([("openai".to_string(), read)]);
+    let owner = site.owner().await;
+    let rows = owner.limits_metered(None, &metered).await.unwrap();
+    let of = |unit: &str, scope: &str| {
+        let found = rows.iter().find(|r| r.unit == unit && r.scope == scope);
+        found.unwrap_or_else(|| panic!("no row of {scope} in {unit}: {rows:?}"))
+    };
+    let tokens = of("tokens", "openai, one day");
+    assert_eq!((tokens.now, tokens.fraction), (Some(250.0), Some(0.25)));
+    assert_eq!(tokens.note, None);
+    let cents = of("US cents", "openai, one day");
+    assert_eq!((cents.now, cents.fraction), (Some(30.0), Some(0.15)));
+    let note = cents.note.as_deref().unwrap();
+    assert!(note.contains("does not price m-x"), "{note}");
+    let session = of("tokens", "openai, one session");
+    assert_eq!((session.now, session.cap), (None, Some(50.0)));
+    let note = session.note.as_deref().unwrap();
+    assert!(note.contains("the egress meters spend"), "{note}");
+    // the meter of the other destination was not read
+    assert_eq!(of("tokens", "other, one day").now, None);
+    // without a meter the report is the one that the memory server gives
+    let plain = owner.limits(None).await.unwrap();
+    assert!(plain.iter().all(|r| r.limit != "spend" || r.now.is_none()));
+}
+
 #[tokio::test]
 async fn a_change_of_an_agent_over_the_share_lands_after_a_person_raised_it() {
     let site = Site::new(DomainLimits::default());

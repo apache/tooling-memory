@@ -3,7 +3,7 @@
 # model, and each memory call with what it returned. Re-enactment runs the session
 # again, on the same model or another, with the memory calls answered from the tape
 # until the run asks for something the original did not; then it reports how far the
-# run kept to the original. Replay (5.5) resends recorded model calls; this runs the
+# run kept to the original. Replay (5.7) resends recorded model calls; this runs the
 # whole session.
 . "$(dirname "$0")/lib.sh"
 act 8 "Run it again" "A session recorded in act 6 run again from its tape: once on its own model, as a control, and once on another, each scored on how far it kept to the original's memory calls, beside its answer, tokens and time." "$WORKER_HARNESS, re-running a session from act 6 on $WORKER_MODEL and then on $AUDITOR_MODEL; the tape, answering its memory calls; and the report."

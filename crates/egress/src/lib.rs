@@ -880,23 +880,8 @@ fn price_spend(
         .spent_by_model(&spend.destination, None, Some(day_ago))
         .map_err(|e| unreadable("the meter", &e))?;
     let mut unpriced = std::collections::BTreeSet::new();
-    let mut cents = |rows: &[(String, telemetry::Tokens)]| {
-        // dollars are summed before the cents are rounded down, so many small calls
-        // do not each round to nothing
-        let mut usd = 0.0;
-        for (model, t) in rows {
-            match prices.cost(model, t) {
-                Some(c) => usd += c,
-                None if t.input + t.output + t.cache_read + t.cache_write > 0 => {
-                    unpriced.insert(model.clone());
-                }
-                None => {}
-            }
-        }
-        dm_policy::prices::whole_cents(usd)
-    };
-    spend.session_cents = cents(&session);
-    spend.day_cents = cents(&day);
+    spend.session_cents = prices.cents(&session, &mut unpriced);
+    spend.day_cents = prices.cents(&day, &mut unpriced);
     spend.unpriced = unpriced.into_iter().collect();
     spend.prices = prices.version;
     Ok(())

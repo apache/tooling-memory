@@ -109,6 +109,14 @@ term here in the same commit as the first document that needs it.
 | outbound rate | The most handoffs of one family of origins that a tap gets to post in 24 hours, from `[limits.<domain>.outbound]`. The family is the origin of the task before its first colon | |
 | upkeep | Completed work that no person and no tap asked for and that only the fleet handled: curation, and a task that an agent filed and completed itself | |
 | share of upkeep | The highest percentage of the completed tasks of a window that may be upkeep, from `[limits.<domain>] upkeep_percent` | |
+| limit | One of the five values that hold the fleet back, each in its own unit: a spend limit, the share of throughput, the outbound rate, the ceiling on enforced rules, and the share of upkeep. `amem limits` lists them | quota (for a limit), cap (for a limit) |
+| requested work | Completed work that a person or a tap asked for: a task that one of them filed, and each task that is a part of it | |
+| induced work | Work that an agent or the system filed and that is not upkeep: a completed task that another principal than its filer completed, and each such task that is still open | |
+| self-filed task | A completed task that an agent filed and completed itself. It is upkeep | |
+| landing queue | A queue in which the change of a task waits until a person lands it, from `[landing.<queue>]`. The task is `blocked` on `landing:<queue>` until then | merge queue |
+| claim-to-landed time | The time from the first claim of a task to its landing through a landing queue | lead time (for this time) |
+| metric table | The 21 metrics that the paper names, as `amem metrics` prints them for one domain. A row has a value from a log, or the reason that it is not measured | scorecard (for the metric table) |
+| target | A value that the paper publishes for a time or a rank of the system, such as the search latency. `amem metrics` prints what is measured against each | SLO (for a target) |
 | raise of a limit | An approval on the ledger that sets a limit above the value in the grants file, for one principal or one domain, until a time | |
 | decision context | The record of what a model call sent and got back, kept for replay | trace (for a decision context), transcript |
 | replay | Send a recorded decision context to a model again | |

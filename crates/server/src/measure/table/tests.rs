@@ -511,6 +511,31 @@ async fn a_release_is_a_stop_of_its_definition_and_a_wait_for_a_verdict_or_a_lan
     );
 }
 
+/// The row of the share of upkeep counts the upkeep among the completed tasks. Of the
+/// upkeep, it counts the tasks that an agent filed and completed itself: a curation
+/// task is upkeep and is not one of them.
+#[tokio::test]
+async fn the_upkeep_row_counts_the_tasks_that_an_agent_filed_and_completed_itself() {
+    let site = Site::new();
+    let own = TaskSpec {
+        created_by: "agent:a".into(),
+        ..spec("Its own")
+    };
+    let specs = [spec("Asked"), own, from("Curate", "curator:stale:mem-x")];
+    for spec in specs {
+        let t = site.task(spec).await;
+        site.completed(&t.id).await;
+    }
+    let v = site.value("Share of throughput spent on upkeep").await;
+    assert_eq!((&v["upkeep"], &v["done"]), (&json!(2), &json!(3)), "{v}");
+    assert_eq!(v["self_filed"], 1, "{v}");
+    assert!(
+        (v["share"].as_f64().unwrap() - 2.0 / 3.0).abs() < 1e-9,
+        "{v}"
+    );
+    assert_eq!(v["ceiling_percent"], Value::Null, "{v}");
+}
+
 #[tokio::test]
 async fn claim_to_landed_is_the_median_over_the_landed_tasks_of_a_queue() {
     let site = Site::new();

@@ -593,6 +593,45 @@ pub struct GradeParams {
     pub answers: Vec<GradeAnswer>,
 }
 
+/// Parameters of `metrics`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct MetricsParams {
+    /// A granted domain; the only one when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// The length of the window, in days. Default 7.
+    #[serde(default)]
+    pub days: Option<u32>,
+}
+
+/// Parameters of `task_times`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct TaskTimesParams {
+    /// The task id.
+    pub task: String,
+}
+
+/// Parameters that name a landing queue.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct QueueParams {
+    /// The name of the landing queue, as the grants name it.
+    pub queue: String,
+}
+
+/// Parameters of `queue_landing`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct QueueLandingParams {
+    /// The id of the task that you hold.
+    pub task: String,
+    /// The name of the landing queue, as the grants name it.
+    pub queue: String,
+    /// The id of the handoff entry you wrote with `write` describing the change.
+    pub handoff: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
+}
+
 /// Parameters of `invalidate_task`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct InvalidateParams {
@@ -684,6 +723,10 @@ const READS: &[&str] = &[
     "list_tasks",
     "autonomy",
     "candidate_gates",
+    "metrics",
+    "limits",
+    "task_times",
+    "landing",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -1370,6 +1413,63 @@ impl McpServer {
         ok(serde_json::to_value(gates).unwrap_or_default())
     }
 
+    #[tool(
+        description = "The metric table of the paper for a domain, over the last `days` days: 21 rows. A row has `measured`, a `value` and the log it comes `from`, or `why_not` says why no log answers it. Read `Share of throughput spent on upkeep` and `Induced work` before you file work of your own. The cost of a completed task is not measured here: `amem cost` gives it at the command line."
+    )]
+    async fn metrics(&self, p: Parameters<MetricsParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let table = self
+            .memory
+            .metrics(p.domain.as_deref(), p.days.unwrap_or(7), None)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(table).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "The five limits of a domain as they stand, each in its own unit: spend, your share of throughput, the outbound rate, the enforced rules, and the share of upkeep. A row has the count `now`, the `cap` in force, and `raised_by` when an approval raised it. A refusal with the action `limit` names one of them. Do not work around a limit: only a person raises one, at the command line."
+    )]
+    async fn limits(&self, p: Parameters<DomainParams>) -> Result<CallToolResult, McpError> {
+        let rows = self
+            .memory
+            .limits(p.0.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(rows).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "The times of one task from the ledger: its first claim, its completion, when it was queued for landing, and the seconds from the claim to the completion and from the claim to the landing."
+    )]
+    async fn task_times(&self, p: Parameters<TaskTimesParams>) -> Result<CallToolResult, McpError> {
+        let times = self.memory.task_times(&p.0.task).await.map_err(mcp_err)?;
+        ok(serde_json::to_value(times).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "A landing queue as it stands: the changes that wait, in landing order with the changes of people first, the share of the fleet in 24 hours, and how many changes of agents landed in the last 24 hours. Read it before you queue a change, to see how long the queue is."
+    )]
+    async fn landing(&self, p: Parameters<QueueParams>) -> Result<CallToolResult, McpError> {
+        let view = self.memory.landing(&p.0.queue).await.map_err(mcp_err)?;
+        ok(serde_json::to_value(view).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Hand the change of a task that you hold to a landing queue, in place of `complete`. Write the handoff first with `write`, entry_type handoff. The task comes back `blocked`, waiting on `landing:<queue>`: your claim is over, and the task is done when a person lands the change. Do not complete it and do not queue it again."
+    )]
+    async fn queue_landing(
+        &self,
+        p: Parameters<QueueLandingParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .queue_landing(&p.task, p.generation, &p.queue, &p.handoff)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
     #[tool(description = "Tasks in a domain with a status, ranked as the queue ranks them.")]
     async fn list_tasks(&self, p: Parameters<ListTasksParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -1599,6 +1699,11 @@ mod tests {
             "grade",
             "raise_autonomy",
             "candidate_gates",
+            "metrics",
+            "limits",
+            "task_times",
+            "landing",
+            "queue_landing",
         ] {
             assert!(
                 names.contains(&expected),
@@ -2663,6 +2768,224 @@ mod tests {
                 .filter(|n| n.contains("outcome") || n.contains("probing"))
                 .collect();
             assert!(neither.is_empty(), "a tool that should not be: {neither:?}");
+        }
+    }
+
+    /// The metrics, the limits and the landing queue over the memory server.
+    mod measurement {
+        use super::*;
+        use crate::testing::as_author;
+        use dm_ledger::Status;
+        use std::path::Path;
+        use time::OffsetDateTime;
+
+        /// A root with the domains `dom-me` and `dom-plat`, the landing queue `main` on
+        /// `dom-me`, and a share of throughput and of upkeep there.
+        fn site(dir: &Path) {
+            crate::testing::root(dir);
+            let path = dir.join(crate::GRANTS_FILE);
+            let mut g = dm_policy::Grants::load(&path).unwrap();
+            let queue = dm_policy::LandingQueue {
+                domain: "dom-me".into(),
+                per_day: Some(2),
+                count_after_hours: None,
+            };
+            g.landing.insert("main".into(), queue);
+            let limits = dm_policy::DomainLimits {
+                claims_per_hour: Some(5),
+                upkeep_percent: Some(50),
+                ..dm_policy::DomainLimits::default()
+            };
+            g.limits.insert("dom-me".into(), limits);
+            std::fs::write(&path, g.render().unwrap()).unwrap();
+        }
+
+        /// A new session of `author` whose ledger reads the time `now`, so that two
+        /// sessions give the same numbers.
+        async fn session(dir: &Path, author: &str, now: OffsetDateTime) -> Memory {
+            let m = as_author(dir, author);
+            m.ledger.lock().await.set_clock(move || now);
+            m
+        }
+
+        async fn server_at(dir: &Path, author: &str, now: OffsetDateTime) -> McpServer {
+            McpServer::new(Arc::new(session(dir, author, now).await))
+        }
+
+        /// A task of `dom-me` that the owner filed and `worker` claimed over the memory
+        /// server, and a handoff of the worker: the task, the generation of the claim,
+        /// and the handoff.
+        async fn claimed(dir: &Path, worker: &str, now: OffsetDateTime) -> (String, u64, String) {
+            let owner = session(dir, "human:test:me", now).await;
+            let spec = dm_ledger::TaskSpec {
+                domain: "dom-me".into(),
+                title: "Change the importer".into(),
+                body: "Do it.\n".into(),
+                ..dm_ledger::TaskSpec::default()
+            };
+            let task = owner.create_task(spec).await.unwrap().task;
+            if task.status == Status::Proposed {
+                owner.admit(&task.id).await.unwrap();
+            }
+            let s = server_at(dir, worker, now).await;
+            let lease = LeaseParams {
+                id: task.id.clone(),
+                lease_seconds: None,
+            };
+            let held = payload(&s.claim(Parameters(lease)).await.unwrap());
+            let generation = held["task"]["generation"].as_u64().unwrap();
+            let h = WriteParams {
+                domain: Some("dom-me".into()),
+                ..handoff("Changed src/importer.rs.\n").0
+            };
+            let w = payload(&s.write(Parameters(h)).await.unwrap());
+            (task.id, generation, w["id"].as_str().unwrap().to_string())
+        }
+
+        fn json_of<T: serde::Serialize>(v: &T) -> Value {
+            serde_json::to_value(v).unwrap()
+        }
+
+        fn queue_main(
+            task: &str,
+            generation: u64,
+            handoff: &str,
+        ) -> Parameters<QueueLandingParams> {
+            Parameters(QueueLandingParams {
+                task: task.into(),
+                queue: "main".into(),
+                handoff: handoff.into(),
+                generation: Some(generation),
+            })
+        }
+
+        /// Each of the five tools gives what the library gives to the same principal.
+        /// The change is queued from a second session of the worker, under the
+        /// generation of the claim.
+        #[tokio::test]
+        async fn the_five_tools_of_measurement_give_what_the_library_gives() {
+            let dir = tempfile::tempdir().unwrap();
+            site(dir.path());
+            let now = OffsetDateTime::now_utc();
+            let (task, generation, h) = claimed(dir.path(), "agent:x", now).await;
+            let s = server_at(dir.path(), "agent:x", now).await;
+            let library = session(dir.path(), "agent:x", now).await;
+
+            let queued = payload(
+                &s.queue_landing(queue_main(&task, generation, &h))
+                    .await
+                    .unwrap(),
+            );
+            let same = library.get_task(&task).await.unwrap();
+            assert_eq!(queued["task"], json_of(&same));
+            assert_eq!(queued["task"]["status"], "blocked", "{queued}");
+            assert_eq!(queued["task"]["waiting_on"], "landing:main", "{queued}");
+            assert_eq!(queued["task"]["handoff"], h.as_str(), "{queued}");
+
+            let queue = Parameters(QueueParams {
+                queue: "main".into(),
+            });
+            let view = payload(&s.landing(queue).await.unwrap());
+            assert_eq!(view, json_of(&library.landing("main").await.unwrap()));
+            assert_eq!(view["waiting"][0]["task"], task.as_str(), "{view}");
+            assert_eq!(view["waiting"][0]["by"], "agent:x", "{view}");
+
+            let of = Parameters(TaskTimesParams { task: task.clone() });
+            let times = payload(&s.task_times(of).await.unwrap());
+            assert_eq!(times, json_of(&library.task_times(&task).await.unwrap()));
+            assert_eq!(times["task"], task.as_str(), "{times}");
+            assert_eq!(times["queue"], "main", "{times}");
+
+            let me = || Some("dom-me".to_string());
+            let rows = payload(
+                &s.limits(Parameters(DomainParams { domain: me() }))
+                    .await
+                    .unwrap(),
+            );
+            let same = library.limits(Some("dom-me")).await.unwrap();
+            assert_eq!(rows, json_of(&same));
+            let claims = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["limit"] == "throughput");
+            let claims = claims.unwrap();
+            assert_eq!(claims["scope"], "agent:x", "{claims}");
+            assert_eq!((&claims["now"], &claims["cap"]), (&json!(1.0), &json!(5.0)));
+
+            let week = MetricsParams {
+                domain: me(),
+                days: None,
+            };
+            let table = payload(&s.metrics(Parameters(week)).await.unwrap());
+            let same = library.metrics(Some("dom-me"), 7, None).await.unwrap();
+            assert_eq!(table, json_of(&same));
+            assert_eq!(
+                table["window_days"], 7,
+                "the window is 7 days when none is named"
+            );
+            assert_eq!(table["rows"].as_array().unwrap().len(), 21);
+            assert_eq!(
+                table["rows"][0]["measured"], false,
+                "no tool reads the meter"
+            );
+            let three = MetricsParams {
+                domain: me(),
+                days: Some(3),
+            };
+            let table = payload(&s.metrics(Parameters(three)).await.unwrap());
+            assert_eq!(table["window_days"], 3, "{table}");
+        }
+
+        /// A re-run serves the four reads from the record as it is, and captures a
+        /// queued change as it captures a write. Only a person in person lands a change
+        /// or raises a limit: no tool does either.
+        #[test]
+        fn the_reads_of_measurement_are_reads_and_no_tool_lands_or_raises() {
+            for read in ["metrics", "limits", "task_times", "landing"] {
+                assert_eq!(kind_of(read), tape::Kind::Read, "{read}");
+            }
+            assert_eq!(kind_of("queue_landing"), tape::Kind::Mutation);
+            let router = McpServer::tool_router();
+            let tools = router.list_all();
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+            let neither: Vec<&&str> = names
+                .iter()
+                .filter(|n| {
+                    **n == "land" || n.contains("raise_limit") || n.contains("limits_raise")
+                })
+                .collect();
+            assert!(neither.is_empty(), "a tool that should not be: {neither:?}");
+        }
+
+        /// A session that does not hold the task cannot queue its change, though it
+        /// names the generation of the claim. The answer is a refusal, and the task
+        /// stays with its holder.
+        #[tokio::test]
+        async fn queue_landing_by_a_session_that_does_not_hold_the_task_is_a_refusal() {
+            let dir = tempfile::tempdir().unwrap();
+            site(dir.path());
+            let now = OffsetDateTime::now_utc();
+            let (task, generation, h) = claimed(dir.path(), "agent:x", now).await;
+            let other = server_at(dir.path(), "agent:y", now).await;
+            let why = refusal(other.queue_landing(queue_main(&task, generation, &h)).await);
+            assert!(
+                why.contains(&format!("task {task} is not held by agent:y")),
+                "{why}"
+            );
+            let unnamed = Parameters(QueueLandingParams {
+                generation: None,
+                ..queue_main(&task, generation, &h).0
+            });
+            let why = refusal(other.queue_landing(unnamed).await);
+            assert!(
+                why.contains("in a session that made no claim on it"),
+                "{why}"
+            );
+            let still = other.memory.get_task(&task).await.unwrap();
+            assert_eq!(still.status, Status::Claimed);
+            assert_eq!(still.holder.as_deref(), Some("agent:x"));
+            assert_eq!(still.waiting_on, None);
         }
     }
 }

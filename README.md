@@ -104,7 +104,6 @@ two weeks. It is also the reason that none of it is the production shape.
     session
 
   These are not built yet:
-  - the duration of a task, from claim to completion
   - accelerator time, which only the gateway can count
   - bytes stored
   - CPU or memory limits on the sandbox
@@ -181,11 +180,32 @@ two weeks. It is also the reason that none of it is the production shape.
   - The definition records are not in the event log of the domain and not in a bundle.
   - The sign-off for the highest level is a field of the ledger record, not an approval
     event.
-- **Measurement, in part.** `amem` computes four read metrics, cost and usage. The paper
-  names 21 metrics. Upkeep share, induced work and the landing queue have no command. The
-  grants file sets the five limits: spend, the share of throughput, the outbound rate,
-  the ceiling on enforced rules, and the share of upkeep. No command raises a limit or
-  lists the limits yet. A spend limit is raised only by a change to the grants file.
+- **Measurement, in part.** `amem metrics` prints the 21 rows of the metric table of the
+  paper and the published targets. `amem limits` lists the five limits, and a person
+  raises one with an approval. A change lands through a landing queue. These points
+  are still open:
+  - No log here answers these rows: the omissions in summaries, the entries that were
+    found but misleading, the agreement between reviewers, missed commitments, the cost
+    of verification, pinned tasks, and the queue of each position. The first two need a
+    model or paired replays. Missed commitments and the last two need positions.
+  - Only the command line gives the cost of a completed task. The memory server cannot
+    read the meter of the egress.
+  - The search latency is the only target that is measured. The other targets are
+    published, and nothing is measured against them.
+  - The memory server checks the share of throughput, the outbound rate and the share of
+    upkeep in its own code. No policy module decides them.
+  - A spend limit is raised by a change to the grants file, not by an approval.
+  - A session does not see its running cost. Nothing tells a principal that it used a
+    fraction of its spend limit.
+  - The share of upkeep counts tasks. It does not count tokens or time.
+  - The ceiling on upkeep holds at admission. It does not hold at the claim.
+  - A person lands a change at the command line. No tap reports a landing, and the
+    landing queue lands no change in a repository.
+  - A task that is queued for landing does not wait for the verdict of its task
+    definition.
+  - The price vector is a file under the root, with a version. It is not an entry of
+    the record. No setting is computed again when the price vector changes.
+  - Accelerator time and bytes stored are not measured.
 - **The evaluation arms.** Act 6 compares memory with an empty record. The paper's five
   arms, the paired seeds and the margin are not built. No scorecard is kept in the
   platform domain.
@@ -336,7 +356,7 @@ names another. The process touches nothing outside the root:
 | `grants.toml` | The perimeter's data: domains and their labels, destinations and their ceilings, `[gates]`, `[spend.<destination>]`, `[taps.<name>]` for taps and tools (`hosted` for a tool that a tool server serves), `platform = "<domain>"`, and `[ledger]` for PostgreSQL |
 | `credentials.env` | API keys, `LLMAO_KEY`, `GH_TOKEN`, as `NAME=value`, mode 600. The environment overrides this file |
 | `profiles.toml` | Named launches: harness, auth, model, subagents |
-| `prices.toml` | USD per million tokens per model, and per CPU-hour and GiB-hour under `[resources]`, for `amem cost` |
+| `prices.toml` | The price vector: USD per million tokens per model, and per CPU-hour and GiB-hour under `[resources]`, for `amem cost` and for a spend limit in money. It has a version: the key `version`, or the digest of the file |
 | `policy/*.rego` | Optional: replaces the built-in policy |
 | `record/<domain>/` | The entries, as Markdown with frontmatter. Nothing edits an entry in place. Beside them: `.history`, `.erasures`, `.transcripts`, `.contexts` and `.tapes` (re-enactment's tapes, which are the owner's alone) |
 | `state/` | Operational data. All of it is rebuildable, except the event log. It holds: `log/<domain>.jsonl`, the event log, which is the order of record that the index is rebuilt from; `index.db`, `ledger.db`, `telemetry.db`; the read, write and decision logs as JSONL; the quarantine; drift, replay and re-enactment runs |
@@ -444,7 +464,8 @@ the platform domain and the Gofannon bridge.
 | The platform | Agent definitions, templates, eval suites and harness defaults as artifacts in a platform domain. They load only after a person verifies them | `platform list, show`, `golden --platform` |
 | Autonomy levels | Each version of a task definition has a level: `person`, `review` or `checks`. Work that is handed in below `checks` waits for a verdict. The evaluator grades handoffs on a held-out suite, and a passed run lets the level go up one step. A work outcome puts it down one step. A candidate version passes a safety gate and a performance gate. Repeated refusals of one agent are a probing alarm of the curator | `task verdict, outcome`, `platform level, grade, raise, gates`, `curator --telemetry`; MCP `verdict`, `autonomy`, `grade`, `raise_autonomy`, `candidate_gates` |
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
-| Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory | `savings`, `golden`, `scripts/eval.py` |
+| Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory. The metric table of the paper with its targets, and the times of a task | `savings`, `golden`, `scripts/eval.py`, `metrics`, `task times`; MCP `metrics`, `task_times` |
+| Limits and landing | The five limits, each in its own unit, and the raise of a limit by an approval. A landing queue, in which the change of a task waits until a person lands it | `limits`, `limits raise`, `task queue-landing`, `landing show, land`; MCP `limits`, `landing`, `queue_landing` |
 | Interchange | Bundles at or below a label, erasure with a stub and a receipt, and taps as WASI components | `export`, `import`, `erase`, `tap` |
 | Tools | Fetch and search as taps that an agent calls in a turn. The policy decides every request at the session label. The answers are scanned and kept as sources. Or hosted: a tool server serves the same components, and another launcher calls it through its egress. This path reaches only the hosts that the calling session may reach, and says where it went. The source keeps that | `tool`, `source`, `tool-server`; MCP `fetch`, `web_search` |
 | Gofannon | Its deployed agents as a tool tap on the same terms: listed, run and read back. Also a worker that runs one of them on the ledger's tasks and files its result as the handoff | `gofannon agents`, `gofannon work`; MCP `gofannon` |
@@ -469,6 +490,10 @@ amem reenact report <session>              # each harness and model against the 
 amem cost                                  # spend, wall clock, CPU and memory per session and task
 amem savings                               # the paper's read-path claims, measured
 amem savings --judge-provider anthropic   # with a small model judging what was "used"
+amem metrics                               # the paper's metric table and its targets
+amem limits                                # the five limits, each in its own unit
+amem limits raise upkeep --to 40           # your approval raises a limit for 24 hours
+amem landing show main                     # the changes that wait to land
 ```
 
 `crates/memory/tests/cli.rs` runs the paper's first milestone from end to end against the
@@ -514,8 +539,9 @@ It says what is missing and how to fix it. At the end, it shows the command to r
 4. **The task fabric.** The rubric, compiled from a strategy. A rescore along the edges.
    Subagents go on the board. A follow-up task brings back their reports, and its
    completion closes the task that delegated.
-5. **Watching it.** Traces in a collector, the read metrics, drift probes, transcripts by
-   citation, and replay.
+5. **Watching it.** Traces in a collector, the read metrics, the metric table of the
+   paper, the limits with a ceiling on upkeep and a landing queue, drift probes,
+   transcripts by citation, and replay.
 6. **Memory against no memory.** The same questions go to a harness with memory and with
    an empty one. The demo grades and times the answers, and counts them in tokens, CPU and
    memory.

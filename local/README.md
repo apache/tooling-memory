@@ -1199,6 +1199,63 @@ whoever files it.
   holds. This is the paper's requirements inflation. The curator's telemetry flags it at
   three.
 
+## The landing queue: `amem task times`, `queue-landing` and `amem landing`
+
+`amem task times <task>` gives the times of one task, from the events of the ledger:
+
+- the first claim;
+- the completion;
+- the moment at which its holder queued its change for landing;
+- the seconds from the first claim to the completion;
+- the seconds from the first claim to the landing, for a task that landed through a
+  landing queue. This is the claim-to-landed time.
+
+The memory tool is `task_times`.
+
+In a landing queue, the change of a task waits until a person lands it.
+`[landing.<queue>]` in `grants.toml` names a landing queue:
+
+```toml
+[landing.main]
+domain = "dom-demo"
+per_day = 20
+count_after_hours = 24
+```
+
+- `domain` is the domain whose tasks the queue lands.
+- `per_day` is the share of the fleet: the number of changes of agents that land in 24
+  hours. Without the key, there is no share. The changes of people are not counted.
+- `count_after_hours` is the delay after which a landing counts as progress. It is 24
+  without the key.
+
+The holder of a task queues its change in place of a completion:
+
+```sh
+amem task queue-landing <task> --queue main --handoff <entry> --generation <g>
+```
+
+The memory tool is `queue_landing`. The task is then `blocked` and waits on
+`landing:<queue>`, with the handoff on it. The claim of the holder is over, and nobody
+can claim the task. The task does not wait for the verdict of its task definition: the
+landing by a person closes it.
+
+`amem landing show <queue>` shows the landing queue as it is. The memory tool is
+`landing`. It shows:
+
+- the changes that wait, in landing order. The changes of people are first, and then
+  the change that was queued first;
+- the share of the fleet, and the number of changes of agents that landed in the last 24
+  hours;
+- the number of landings that count as progress, and the number that are too new;
+- the median claim-to-landed time.
+
+`amem landing land <queue>` lands the first change of the queue. The task is `done` with
+the handoff that its holder queued, and each task that waited on it opens. Only a person
+at the command line lands a change, and no memory tool lands one. The change of an agent
+does not land while the landings of the fleet in the last 24 hours are at the share. No
+later change lands in its place. That refusal is a line in the decision log with the
+action `limit`. `amem limits raise landing:<queue>` raises the share.
+
 ## When an entry has moved: redirects
 
 A list or a search can show an entry that a curation replaces a short time later. The
@@ -1257,6 +1314,41 @@ filter and logs them as a read.
 A Codex run on the gateway's Qwen prefetched eight summaries and opened three bodies. Only
 co-retrieval had found one of those three. The run scored fetch-through 2/3, depth 4.0,
 prefetch precision 5/8 and no wasted reads.
+
+## The metric table and the targets: `amem metrics`
+
+`amem metrics` prints the metric table of the paper for one domain: 21 rows, in the order
+of the paper. `--domain` names the domain. `--days` sets the window, which is 7 days
+without the flag. Each row has a value from a log, or it says why it is not measured. A
+row can have a value and also name a part that is not measured. The line of a row ends
+with the source of the value: the ledger, the read log, the decision log, the grants or
+the caller.
+
+`--json` gives the same table for a script. Each row has `measured`, `value`, `from` and
+`why_not`. `prices` is the version of the price vector, and `targets` holds the targets.
+
+The first row is the cost of a completed task. Only the command line gives it, because
+the memory server cannot read the meter of the egress. The value is the mean of the costs
+that `amem cost` gives for the completed tasks of the domain. It also gives the number of
+those tasks, the number whose session has unpriced tokens or plan quota, and the version
+of the price vector. This row is not limited to the window.
+
+No log here answers these rows, or these parts of rows:
+
+- the omissions in summaries, which need a model as a judge;
+- the entries that were found but misleading, which need paired replays;
+- the agreement between reviewers, because one reviewer decides each approval;
+- missed commitments, pinned tasks and the queue of each position, because the table
+  reads no position;
+- the cost of verification, because the table reads no meter.
+
+After the rows, `amem metrics` prints the 10 targets that the paper publishes. The read
+log keeps the time of each search, so the median and the 99th percentile of the search
+latency are measured against their targets. Each of the other 8 targets says why nothing
+is measured against it.
+
+The memory tool `metrics` gives the table with no cost in the first row. It does not
+give the targets.
 
 ## Transcripts are sources: `amem transcript`
 
@@ -1491,12 +1583,46 @@ new value, and a time at which it expires. For the share of throughput, the appr
 applies to one agent. For the other limits, it applies to the domain. The approval
 applies to the value that the grants file has at that moment. Thus a change to that value
 in the grants file ends the raise. An approval with a lower value than the grants file
-changes nothing. The library function is `Memory::raise_limit`, and `Memory::limits`
-lists the five limits with their counts. No command and no memory tool calls these
-functions yet. A spend limit is not raised by an approval. The owner changes the grants
+changes nothing. A spend limit is not raised by an approval. The owner changes the grants
 file.
 
 All counts use the clock of the ledger.
+
+### The report and the raise: `amem limits`
+
+`amem limits` lists the limits of one domain, one line for each. A line gives the count
+now, the limit in force, the unit, and whose limit it is. `--domain` names the domain,
+and `--json` gives the rows for a script. The rows are in the order of the paper:
+
+| Row | Unit | Whose limit |
+|---|---|---|
+| `spend` | tokens, or US cents | one destination, for one session or for one day |
+| `throughput` | claims per hour | the principal of the session |
+| `outbound:<family>` | posts per day | the domain |
+| `landing:<queue>` | changes per day | the domain |
+| `rules` | rules | the domain |
+| `upkeep` | percent of completed tasks | the domain |
+
+A limit that the grants file does not set has the note `not set`. At the command line, a
+row of spend for one day has a count: `amem` reads the meter of the egress for the last 24
+hours. The count is the tokens in and out, or their price in US cents. A row of spend for
+one session has no count, because the report is not of a session. The memory tool
+`limits` gives the same rows, and its rows of spend have no count.
+
+`amem limits raise` raises a limit:
+
+```sh
+amem limits raise upkeep --to 40
+amem limits raise throughput --to 12 --for agent:worker --hours 2
+amem limits raise outbound:github --to 30
+amem limits raise landing:main --to 40
+```
+
+`--hours` sets the time after which the raise expires, which is 24 hours without the
+flag. `--for` names the agent whose share of throughput rises, and `throughput` needs it.
+`--domain` names the domain. The command prints the approval. The row of the limit then
+shows the value in force, the configured value, and the id of the approval in
+`raised_by`. Only a person at the command line raises a limit. No memory tool raises one.
 
 ## Cost: `prices.toml` and `amem cost`
 
@@ -1524,7 +1650,8 @@ cache_write = 0.25
 
 The price vector has a version. The version is the key `version` at the top of the file.
 Without that key, the version is the digest of the text of the file. Thus each change to
-the file gives a new version. `amem cost --json` gives the version in the field `prices`.
+the file gives a new version. `amem cost --json` gives the version in the field `prices`,
+and the text of `amem cost` ends with the line `prices: <version>`.
 
 The match for a model is its exact name. Otherwise, the match is the longest name in the
 table that the model's name starts with. Thus `claude-sonnet-5` prices every dated release

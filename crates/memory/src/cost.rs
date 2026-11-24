@@ -325,7 +325,28 @@ pub fn render(r: &Report) -> String {
         "\ntotal metered spend on priced models and resources: ${:.4}\n",
         r.usd
     ));
+    s.push_str(&format!("prices: {}\n", r.prices));
     s
+}
+
+/// The first row of the metric table, from this report: the mean cost of the completed
+/// tasks that `counts` keeps, how many they are, how many of them have tokens that are
+/// unpriced or plan quota, and the version of the price vector. `None` when the report
+/// has no such task.
+#[must_use]
+pub fn per_task(r: &Report, counts: impl Fn(&str) -> bool) -> Option<serde_json::Value> {
+    let tasks: Vec<&TaskCost> = r.tasks.iter().filter(|t| counts(&t.task)).collect();
+    if tasks.is_empty() {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)] // a count of tasks
+    let mean = tasks.iter().map(|t| t.usd).sum::<f64>() / tasks.len() as f64;
+    Some(serde_json::json!({
+        "usd": mean,
+        "tasks": tasks.len(),
+        "partial": tasks.iter().filter(|t| t.partial).count(),
+        "prices": r.prices,
+    }))
 }
 
 #[cfg(test)]
@@ -395,6 +416,42 @@ mod tests {
         let s3 = r.sessions.iter().find(|s| s.session == "s3").unwrap();
         assert_eq!(s3.unpriced.get("other"), Some(&1005));
         assert!(render(&r).contains("on a plan"));
+    }
+
+    #[test]
+    fn the_text_report_names_the_version_of_the_price_vector() {
+        let p = Prices::parse("version = \"t1\"\n").unwrap();
+        let text = render(&price(&[], &[], &p, &[]));
+        assert!(text.ends_with("\nprices: t1\n"), "{text}");
+    }
+
+    #[test]
+    fn the_cost_of_a_completed_task_is_the_mean_over_the_tasks_that_count() {
+        let p = Prices::parse("version = \"t1\"\n[models.m]\ninput = 1.0\n").unwrap();
+        let rows = vec![
+            row("s1", "m", "metered", 3_000_000, 0),
+            row("s2", "m", "metered", 1_000_000, 0),
+            row("s3", "m", BILLING_PLAN, 1_000_000, 0),
+        ];
+        let done = |t: &str, s: &str| (t.to_string(), t.to_uppercase(), s.to_string());
+        let done = vec![done("t1", "s1"), done("t2", "s2"), done("t3", "s3")];
+        let r = price(&rows, &[], &p, &done);
+        assert_eq!(per_task(&r, |_| false), None, "no task counts");
+        // 3 dollars, 1 dollar, and a plan session that costs no money
+        let all = per_task(&r, |_| true).unwrap();
+        assert!(
+            (all["usd"].as_f64().unwrap() - 4.0 / 3.0).abs() < 1e-9,
+            "{all}"
+        );
+        assert_eq!(
+            (&all["tasks"], &all["partial"]),
+            (&serde_json::json!(3), &serde_json::json!(1))
+        );
+        assert_eq!(all["prices"], "t1");
+        let two = per_task(&r, |t| t != "t1").unwrap();
+        assert!((two["usd"].as_f64().unwrap() - 0.5).abs() < 1e-9, "{two}");
+        assert_eq!(two["tasks"], 2);
+        assert_eq!(per_task(&price(&rows, &[], &p, &[]), |_| true), None);
     }
 
     fn run(session: &str, measured: bool) -> Run {

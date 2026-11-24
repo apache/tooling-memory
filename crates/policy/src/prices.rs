@@ -9,7 +9,7 @@
 
 use crate::Error;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The version of the empty table: no file, or a file with no text.
 pub const NO_VERSION: &str = "none";
@@ -136,6 +136,24 @@ impl Prices {
             + t.cache_write as f64 * r.cache_write)
             / 1_000_000.0;
         Some(usd)
+    }
+
+    /// What the tokens of `rows`, by model, cost in whole US cents, rounded down. The
+    /// dollars are summed before the cents are rounded, so many small calls do not each
+    /// round to nothing. A model with tokens that the table does not price goes into
+    /// `unpriced`, and its tokens cost nothing here.
+    pub fn cents(&self, rows: &[(String, Tokens)], unpriced: &mut BTreeSet<String>) -> u64 {
+        let mut usd = 0.0;
+        for (model, t) in rows {
+            match self.cost(model, t) {
+                Some(c) => usd += c,
+                None if t.input + t.output + t.cache_read + t.cache_write > 0 => {
+                    unpriced.insert(model.clone());
+                }
+                None => {}
+            }
+        }
+        whole_cents(usd)
     }
 }
 

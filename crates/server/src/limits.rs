@@ -119,6 +119,18 @@ pub struct LimitRow {
     pub note: Option<String>,
 }
 
+/// What the meter of the egress holds for one destination over the last 24 hours. The
+/// library cannot read the meter, so the caller that can passes this.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Metered {
+    /// The tokens in and out: what a limit in tokens is held against.
+    pub tokens: u64,
+    /// The metered tokens as the price vector prices them, in whole US cents.
+    pub cents: u64,
+    /// The models with metered tokens that the price vector does not price.
+    pub unpriced: Vec<String>,
+}
+
 #[allow(clippy::cast_precision_loss)] // counts of tasks, rules, tokens and cents
 fn number(n: u64) -> f64 {
     n as f64
@@ -459,9 +471,23 @@ impl Memory {
     ///
     /// An ungranted domain, or a ledger error.
     pub async fn limits(&self, domain: Option<&str>) -> Result<Vec<LimitRow>, Error> {
+        self.limits_metered(domain, &BTreeMap::new()).await
+    }
+
+    /// [`Memory::limits`], with the count of each row of spend over one day from what
+    /// the caller read off the meter of the egress, by destination.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::limits`].
+    pub async fn limits_metered(
+        &self,
+        domain: Option<&str>,
+        metered: &BTreeMap<String, Metered>,
+    ) -> Result<Vec<LimitRow>, Error> {
         let domain = self.resolve_domain(domain)?;
         let l = self.ledger.lock().await;
-        let mut rows = self.spend_rows();
+        let mut rows = self.spend_rows(metered);
         rows.push(self.throughput_row(&l, &domain).await?);
         rows.extend(self.outbound_rows(&l, &domain).await?);
         rows.push(self.rules_row(&domain));
@@ -470,24 +496,32 @@ impl Memory {
     }
 
     /// The rows of spend: one for each value that a destination has. The egress counts
-    /// spend, so no row has a count.
-    fn spend_rows(&self) -> Vec<LimitRow> {
+    /// spend. A row over one day has a count when the caller read the meter for its
+    /// destination. A row over one session has none: the report is of no session.
+    fn spend_rows(&self, metered: &BTreeMap<String, Metered>) -> Vec<LimitRow> {
         const METER: &str = "the egress meters spend; amem cost and the refusal of a call show it";
         let mut rows = Vec::new();
         for (dest, s) in &self.grants.spend {
+            let day = metered.get(dest);
             let values = [
-                ("tokens", "session", s.session_tokens),
-                ("tokens", "day", s.day_tokens),
-                ("US cents", "session", s.session_usd_cents),
-                ("US cents", "day", s.day_usd_cents),
+                ("tokens", "session", s.session_tokens, None),
+                ("tokens", "day", s.day_tokens, day.map(|m| m.tokens)),
+                ("US cents", "session", s.session_usd_cents, None),
+                ("US cents", "day", s.day_usd_cents, day.map(|m| m.cents)),
             ];
-            for (unit, window, value) in values {
-                if let Some(value) = value {
-                    let mut row = LimitRow::new("spend", unit, &format!("{dest}, one {window}"));
-                    row.cap = Some(number(value));
-                    row.configured = row.cap;
-                    rows.push(row.noted(METER));
-                }
+            for (unit, window, value, now) in values {
+                let Some(value) = value else { continue };
+                let mut row = LimitRow::new("spend", unit, &format!("{dest}, one {window}"));
+                row.cap = Some(number(value));
+                row.configured = row.cap;
+                let unpriced = day.map(|m| m.unpriced.join(", ")).unwrap_or_default();
+                rows.push(match now {
+                    None => row.noted(METER),
+                    Some(now) if unit == "US cents" && !unpriced.is_empty() => row
+                        .counted(number(now))
+                        .noted(&format!("the price vector does not price {unpriced}: the egress refuses a call there")),
+                    Some(now) => row.counted(number(now)),
+                });
             }
         }
         if rows.is_empty() {
