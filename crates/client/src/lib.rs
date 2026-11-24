@@ -103,7 +103,7 @@ pub struct Entry {
     pub id: String,
     /// Its title.
     pub title: String,
-    /// decision, fact, convention, method, or handoff.
+    /// decision, fact, convention, method, handoff, policy, or position.
     pub entry_type: String,
     /// The Markdown body.
     pub body: String,
@@ -112,7 +112,7 @@ pub struct Entry {
 /// An entry to write.
 #[derive(Clone, Debug, Default)]
 pub struct NewEntry<'a> {
-    /// decision, fact, convention, method, or handoff.
+    /// decision, fact, convention, method, handoff, policy, or position.
     pub kind: &'a str,
     /// One line.
     pub title: &'a str,
@@ -428,6 +428,7 @@ impl MemoryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dm_server::arms::{Arm, Settings};
     use dm_server::{mcp::McpServer, Memory};
     use std::sync::Arc;
 
@@ -639,7 +640,20 @@ mod tests {
         dir: &std::path::Path,
         tape: dm_server::tape::Tape,
     ) -> (Arc<dm_server::tape::Playback>, MemoryClient) {
+        re_run_under(dir, tape, None).await
+    }
+
+    /// A client of a re-run of `tape` over the root at `dir`, in a session under
+    /// `settings` when given.
+    async fn re_run_under(
+        dir: &std::path::Path,
+        tape: dm_server::tape::Tape,
+        settings: Option<Settings>,
+    ) -> (Arc<dm_server::tape::Playback>, MemoryClient) {
         let rerun = Arc::new(Memory::open(dir).unwrap().with_author("agent:test"));
+        if let Some(s) = settings {
+            rerun.set_settings(s).unwrap();
+        }
         let play = Arc::new(dm_server::tape::Playback::new(tape));
         rerun.set_playback(play.clone());
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -652,6 +666,154 @@ mod tests {
         });
         let (cr, cw) = tokio::io::split(client_io);
         (play, MemoryClient::connect((cr, cw)).await.unwrap())
+    }
+
+    /// A client of `server` over an in-process pipe.
+    async fn client_of(server: McpServer) -> MemoryClient {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server_io);
+        tokio::spawn(async move {
+            if let Ok(s) = server.serve((sr, sw)).await {
+                let _ = s.waiting().await;
+            }
+        });
+        let (cr, cw) = tokio::io::split(client_io);
+        MemoryClient::connect((cr, cw)).await.unwrap()
+    }
+
+    /// A session of an agent under `settings`, over a record that holds one handoff
+    /// and one task that waits: the session, a harness's client and the launcher's.
+    async fn session_under(
+        settings: Settings,
+    ) -> (tempfile::TempDir, Arc<Memory>, MemoryClient, MemoryClient) {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let handoff = dm_server::WriteRequest {
+            entry_type: dm_core::EntryType::Handoff,
+            body: IMPORT.into(),
+            ..dm_server::WriteRequest::default()
+        };
+        owner.write(handoff).await.unwrap();
+        let spec = dm_ledger_spec("Finish the import", "Steps 3 to 5.");
+        let task = owner.create_task(spec).await.unwrap().task;
+        owner.admit(&task.id).await.unwrap();
+        let memory = Arc::new(Memory::open(dir.path()).unwrap().with_author("agent:test"));
+        memory.set_settings(settings).unwrap();
+        memory
+            .tape_start(dm_server::tape::TapeStart::default())
+            .await
+            .unwrap();
+        let harness = client_of(McpServer::new(memory.clone())).await;
+        let launcher = client_of(McpServer::for_launcher(memory.clone())).await;
+        (dir, memory, harness, launcher)
+    }
+
+    /// The retrieval tools, each with arguments it accepts.
+    fn retrieval_calls() -> Vec<(&'static str, Value)> {
+        vec![
+            ("search", json!({"query": "import"})),
+            ("get", json!({"id": "mem-me-nothere"})),
+            ("list", json!({})),
+            ("recall", json!({"question": "how many steps"})),
+            (
+                "transcript_turn",
+                json!({"session": "sess-none", "turn": 1}),
+            ),
+        ]
+    }
+
+    /// The door: a harness's retrieval calls are refused in words that name the
+    /// setting, the launcher's own get empty answers, and the writes and the task tools
+    /// work as before.
+    #[tokio::test]
+    async fn a_session_that_does_not_retrieve_is_told_so_and_still_writes_and_works() {
+        for (arm, why) in [
+            (Arm::NoMemory, "memory access is off"),
+            (Arm::T0Only, "disclosure depth of this session is T0"),
+        ] {
+            let (dir, memory, harness, launcher) = session_under(arm.settings()).await;
+            for (tool, args) in retrieval_calls() {
+                let refused = harness.call(tool, args).await.unwrap_err().to_string();
+                assert!(refused.contains(why), "{arm} {tool}: {refused}");
+                assert!(refused.contains(&format!("`{tool}`")), "{refused}");
+            }
+            let told = harness.call("settings", json!({})).await.unwrap();
+            assert_eq!(told["arm"], arm.name(), "{told}");
+            assert_eq!(told["settings"]["memory"], arm == Arm::T0Only, "{told}");
+            // the launcher's own client is not refused, and reads nothing
+            let listed = launcher.call("list", json!({})).await.unwrap();
+            assert_eq!(listed["entries"], json!([]), "{listed}");
+            let hits = launcher.call("search", json!({"query": "import"})).await;
+            assert_eq!(hits.unwrap()["hits"], json!([]));
+            assert!(launcher.handoffs(None, 100).await.unwrap().is_empty());
+            // the writes and the task tools
+            let task = harness.claim_next(None, 60).await.unwrap().unwrap();
+            let handoff = harness.write_handoff("Stopped", "Step 3 is done.", None);
+            let handoff = handoff.await.unwrap();
+            let released = harness.release(&task.id, Some(&handoff)).await.unwrap();
+            assert_eq!(released.handoff.as_deref(), Some(handoff.as_str()));
+            assert_eq!(memory.written(), (1, 1));
+            harness.close().await.unwrap();
+            launcher.close().await.unwrap();
+            // a refusal is the call's result, kept on the tape like any other error
+            let owner = Memory::open(dir.path()).unwrap();
+            let tape = owner.tape(memory.session_id()).await.unwrap();
+            let kept: Vec<(&str, bool)> = tape
+                .calls
+                .iter()
+                .map(|c| (c.tool.as_str(), c.is_error))
+                .collect();
+            let mut want: Vec<(&str, bool)> = retrieval_calls()
+                .iter()
+                .map(|(tool, _)| (*tool, true))
+                .collect();
+            want.extend([
+                ("settings", false),
+                ("claim_next", false),
+                ("write", false),
+                ("release", false),
+            ]);
+            assert_eq!(kept, want, "{arm}");
+        }
+    }
+
+    /// A session that retrieves is not refused, whatever else its settings narrow.
+    #[tokio::test]
+    async fn a_session_that_retrieves_is_served_under_its_settings() {
+        let (_dir, _memory, harness, _launcher) = session_under(Arm::RawOnly.settings()).await;
+        let hits = harness.call("search", json!({"query": "import"})).await;
+        assert_eq!(hits.unwrap()["hits"].as_array().unwrap().len(), 1);
+        let told = harness.call("settings", json!({})).await.unwrap();
+        assert_eq!(told["arm"], "raw-only", "{told}");
+        assert_eq!(told["settings"]["max_tier"], "raw", "{told}");
+        let (_dir, _memory, harness, _launcher) = session_under(Settings::default()).await;
+        let told = harness.call("settings", json!({})).await.unwrap();
+        assert_eq!(told["arm"], "full", "{told}");
+        let odd = Settings {
+            prefetch: false,
+            ..Settings::default()
+        };
+        let (_dir, _memory, harness, _launcher) = session_under(odd).await;
+        let told = harness.call("settings", json!({})).await.unwrap();
+        assert!(told["arm"].is_null(), "{told}");
+        assert_eq!(told["settings"]["prefetch"], false, "{told}");
+    }
+
+    /// In a re-run, a read the tape does not hold is served live, and so is asked of the
+    /// session's settings first.
+    #[tokio::test]
+    async fn a_live_read_in_a_re_run_is_refused_when_the_session_does_not_retrieve() {
+        let (dir, tape, wrote, _) = recorded().await;
+        let off = Some(Arm::NoMemory.settings());
+        let (play, again) = re_run_under(dir.path(), tape, off).await;
+        again.call("t0", json!({})).await.unwrap();
+        let rewrote = again.call("write", json!({ "body": IMPORT })).await;
+        assert_eq!(rewrote.unwrap()["id"], wrote["id"], "the recorded answer");
+        let live = again.call("search", json!({"query": "retry"})).await;
+        let refused = live.unwrap_err().to_string();
+        assert!(refused.contains("memory access is off"), "{refused}");
+        again.close().await.unwrap();
+        assert!(play.played().diverged);
     }
 
     #[tokio::test]

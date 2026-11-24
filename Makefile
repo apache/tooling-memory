@@ -7,7 +7,7 @@ endif
 NEXTEST := $(shell cargo nextest --version 2>/dev/null)
 TEST_CMD := $(if $(NEXTEST),cargo nextest run --workspace --no-fail-fast,cargo test --workspace)
 
-.PHONY: demo-ready podman-ready e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test no-image-push-test conformance-test conformance deny machete coverage wasm-check msrv-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
+.PHONY: demo-ready podman-ready e2e hosted install init check verify fmt fmt-check clippy test guard-test docs-only-test no-image-push-test conformance-test eval-test conformance deny machete coverage wasm-check msrv-check run build wslcsdk-test wslcsdk unsafe-check windows-target \
 	local-up local-down local-logs local-key local-memory launch usage golden corpus-check drift taps-check taps-build wasip2-target
 
 # ---- the local stack: LiteLLM and Postgres in containers, the memory root on disk.
@@ -173,7 +173,7 @@ local-memory:
 	else target/release/amem --root "$$MEMORY_ROOT" init --domain dom-me; fi
 
 # `make check` is the pre-commit gate: fast, and what every commit must pass.
-check: wasip2-target fmt-check clippy test guard-test docs-only-test no-image-push-test wslcsdk-test conformance-test unsafe-check taps-check
+check: wasip2-target fmt-check clippy test guard-test docs-only-test no-image-push-test wslcsdk-test conformance-test eval-test unsafe-check taps-check
 
 # The demo's Markdown, checked as the golden suites, the evals and the acts read it.
 corpus-check:
@@ -208,6 +208,8 @@ wslcsdk-test:
 	sh scripts/fetch-wslcsdk.test.sh
 conformance-test:
 	sh scripts/conformance.test.sh
+eval-test:
+	sh scripts/eval.test.sh
 
 # The seven M0 steps against a server exposing the surface: a fresh record served by this
 # build, or URL=<mcp endpoint> for another server, with OPERATOR=<command> taking

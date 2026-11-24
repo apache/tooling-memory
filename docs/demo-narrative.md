@@ -11,6 +11,11 @@ Anything that a model decides can change more:
 - the answers in act 6
 - the re-enactments in act 8.
 
+Some steps are newer than that run: 5.6, act 6, and the manifest lines of act 8. The
+steps of these that need no model ran on 23 November 2026, and their figures are from
+that day. The steps of these that need the gateway did not run yet. For those steps,
+these notes say what the step prints, and they hold no figures.
+
 ```sh
 make demo-ready HARNESS=claude RESET=1
 make demo-all HARNESS=claude TRANSCRIPT=demo.txt
@@ -21,12 +26,13 @@ assume Claude Code, `HARNESS=claude`. Codex on qwen3.8-27b always does the work 
 2 and 6, and the delegated tasks in act 4. In act 7, Codex runs on the model that the
 platform names. In act 8, it also runs on gemma4-26b.
 
-The run takes about twenty minutes. Each act takes about this long:
+The run of 12 October took about twenty minutes. Each act takes about this long:
 
 - acts 1 to 3: a minute each
 - act 4: nine minutes
 - act 5: five or six minutes
-- act 6: three minutes
+- act 6: not measured yet. It makes 20 launches, where the run of 12 October made 8 in
+  three minutes
 - act 7: a minute
 - act 8: half a minute
 - acts 9 to 11: seconds each.
@@ -45,7 +51,7 @@ offline.
   LLM gateway, llm.apache.org. Codex does:
   - a curation task in act 2
   - the delegated work in act 4
-  - both conditions in act 6
+  - each run of each arm in act 6
   - the task in act 7
   - the re-runs in act 8, one of them on gemma4-26b.
 - **qwen3.8-27b on its own**. The system calls it directly: to answer a question in 1.5,
@@ -53,9 +59,12 @@ offline.
 - **gemma4-26b**, the auditor. It reads summaries in act 2 and held writes in act 3. In
   5.3, it takes the role of a different model, swapped in behind the name qwen3.8-27b.
   In act 8, it is the other model that a session is re-enacted on.
+- **The launcher**, in act 6. It gives each session its settings, and the session cannot
+  change them.
 - **Scripted agents**: `agent:rogue`, `agent:release`, `agent:reader`, `agent:a`,
-  `agent:curator` and `agent:architect`. These are the demo script. The script uses
-  the same tools that an agent would use. No model is behind them. Say so.
+  `agent:curator`, `agent:architect`, `agent:worker` and `agent:substitute`. These are
+  the demo script. The script uses the same tools that an agent would use. No model is
+  behind them. Say so. In 4.5, the script also speaks as `agent:codex`, with no model.
 - **GitHub**, in act 9: its public API. A tap with no credential reads it.
 - **The system**: the memory server, the ledger, the policy and the egress (below), and
   the launcher, which runs and measures each harness.
@@ -66,6 +75,9 @@ offline.
 - **T0**: the short summary that every session loads first.
 - **Handoff**: the entry that a session leaves for the next session.
 - **Ledger**: the shared tasks. "The board" means its open tasks.
+- **Position**: a standing role, written as an entry with a charter and an authority
+  envelope. A task can be pinned to a position. A session fills a position, and starts
+  from the position's handoff cache (4.5).
 - **Trust tiers**: raw (anyone wrote it), curated (an agent tidied it under a curation
   task), verified (a person approved it).
 - **Quarantine**: the place where the policy holds a write, out of search, until you
@@ -92,11 +104,25 @@ offline.
 - **Tape**: a session's prompt, harness and model, and what each of its memory tool calls
   returned. Sessions leave a tape. A session that started with a prompt can run again
   (act 8).
+- **Arm**: one fixed set of session settings for an evaluation, from no memory to the
+  system as built (act 6).
+- **Plan**: the evaluation set file. It fixes the arms, the seeds and the margin before
+  a run (6.3).
+- **Scorecard**: the result of one evaluation, kept as an entry in the platform domain
+  (6.5).
+- **Drift window**: a time span for one model at one destination, from detected drift
+  until you close it. Nothing that an agent wrote in the span is promoted (5.6).
 - **Tap**: a component that connects to an outside system. It runs as a WebAssembly
   component, and it can reach only what its grant names. The fetch tool in
   3.13 is a tap. The GitHub tap in act 9 is another.
-- **Event log**: every write and erasure in order, by id and digest, never a body. The
-  index can be rebuilt from the event log and the record (act 10).
+- **Event log**: each write, read, send and erasure of a domain in order, by id and
+  digest, never a body. The index is fed from the event log, and can be built again from
+  the event log and the record (act 10).
+- **Lineage**: what the event log says about an entry. Back: what its session read
+  before it wrote the entry. Forward: what was written and sent after a session read it
+  (3.4 and 10.6).
+- **Withheld**: an entry that an erasure reached by lineage. No read gives it until a new
+  entry replaces it or you release it (10.6).
 - **Bundle**: entries exported at or below a label, as Markdown and a manifest, for
   another record to import (act 10).
 
@@ -185,9 +211,15 @@ holds it too, on purpose: a false hold costs little.
 malicious, two benign. One of the benign writes is the rewrite that the policy held in
 2.4. The auditor only advises. You decide.
 
-**3.4 Taint.** This step answers a question: if an entry turned out to be bad, who read
-it, and what did they write after? Here `agent:reader` read one and wrote a note. Thus
-the list shows the note.
+**3.4 Lineage.** The event log holds the write that the policy refused in 3.1. It holds
+the write as `agent:rogue` offered it, by digest, and the refusal, with the gate and the
+kinds of thing that the scan found. Only a session that handles the highest label gets
+these two events. You read them because you are the owner. `agent:reader` asks for the
+log and is refused, because it is not in the security role. Then `agent:reader` reads one
+decision and writes a note, in one session. Suppose that the note is bad: lineage back
+from the note names the decision that its session read. Suppose that the decision is bad:
+lineage one step forward from the decision names the note, with each other entry that a
+session wrote after it read the decision.
 
 **3.5 Policy is memory.** A rule written as an entry: a person, not an agent, supersedes
 decisions. The rule has an owner and a review date. Its block says `advisory`, as for a
@@ -241,13 +273,20 @@ example.com. After `agent:reader` has read internal entries, it can reach only t
 hosts, because a URL could leak what it read. The repeated fetch comes from the stored
 copy. Nothing leaves.
 
-**3.14 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
-finds one hit. Your own search reaches the cap of 50 results.
+**3.14 A grant withdrawn.** `agent:a` has an open session and searches. You lower the
+handling of the record to public. The next search of that session is refused, and so is
+its next write: the session stops. A new session of `agent:a` starts under the new
+grants and finds no hit, because the record has no public entry. Then the demo puts the
+grants back.
+
+**3.15 Reads.** A policy limits agents to public entries. When `agent:a` searches, it
+finds no hit. Your own search reaches the cap of 50 results.
 
 ## Act 4 · The task fabric
 
-On stage: you filing tasks, the ledger ranking them, Claude Code delegating and later
-taking the results, and Codex doing each delegated task.
+On stage: you filing tasks and verifying a position, the ledger ranking the tasks and
+matching the pinned one, scripted sessions in the position, Claude Code delegating and
+later taking the results, and Codex doing each delegated task.
 
 The work is on the ledger. The ledger continues after any one session ends.
 
@@ -274,12 +313,35 @@ ledger still gives the task to nobody, because nobody knows if the push arrived.
 looks at the destination and settles the action as not applied. Only then does the next
 claim get the task.
 
-**4.5 The rescore.** Each move shows its reason. A task with a higher priority runs
+**4.5 A position.** A position is a standing role, written as an entry. You write the
+entry for the release coordinator: a charter and an authority envelope. `agent:curator`
+proposes it for verified, and you approve it. The charter names Codex as the agent
+definition that fills the position. Then you file a task and pin it to the position, for
+continuity. A session that fills no position asks for the task by name. The ledger
+refuses it, and the refusal names the position. The list shows one task that waits and
+no live session. Then a session that fills the position asks for the next task, and it
+gets the pinned task. It writes a handoff and releases the task. The memory
+server put the position in the citations of that handoff. A new session in the position
+loads T0. The first section of its T0 is the position: the charter, the open commitment
+and the handoff cache. No model is in this step. The sessions of `agent:codex` are the
+demo script.
+
+**4.6 Secondment, waking and retirement.** `agent:substitute` fills the same position.
+The charter names a different agent definition, so this session is seconded. It reads
+the commitment and the handoff cache. The memory server refuses its write that cites the
+position. The list shows `wake true`: a task waits, and no session is live in the
+position. With a gateway key, the demo runs `amem work --wake`. Its session fills the
+position, because Codex is the agent definition that the charter names. Codex on
+qwen3.8-27b then works on the task. Without a gateway key, the demo says that it
+skipped this part. Last, you retire the position. The pinned task loses its pin, and any
+session that matches can claim it. The entries of the position stay in the record.
+
+**4.7 The rescore.** Each move shows its reason. A task with a higher priority runs
 first. One curation task moved from 0 to 10. The reason: curation had done 17% of the
 completed work, less than its guaranteed 20%. The curation tasks filed at -1 went down
 to -2, because this period's strategy gives curation a lower weight.
 
-**4.6 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
+**4.8 Delegation.** The demo asks Claude Code to compare two decisions with subagents.
 Claude Code calls its Agent tool twice, once for each subagent. The system stops each
 call before it runs. It files the subagent's prompt on the ledger as a task. With that
 task, it files a follow-up task that continues the comparison after the subagent's task
@@ -290,14 +352,14 @@ back on the board. The system files what Claude Code wrote as a handoff. The tas
 there. Nobody may claim it while its follow-up task is open. Thus nobody does the work
 twice.
 
-**4.7 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
+**4.9 The delegated work.** Codex on qwen3.8-27b takes each task and files a report.
 
-**4.8 Results come back.** A new Claude Code session claims the follow-up task, works on
+**4.10 Results come back.** A new Claude Code session claims the follow-up task, works on
 it with both reports, and completes it. When the follow-up task completes, the original
 task "Compare two decisions" also closes, with the same handoff. The reason: the
 follow-up task was the rest of its work. The last line shows it done.
 
-**4.9 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
+**4.11 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
 you. "promote" means the approvals to verified.
 
 ## Act 5 · Watching it
@@ -330,22 +392,80 @@ and both wrote. Where Claude Code checked the task tree, qwen wrote. Where Claud
 ended with a reply, qwen released the task itself. Replay measures whether another model
 would agree, not which model is right. The agreement changes from run to run.
 
-## Act 6 · Memory against no memory
+**5.6 The freeze.** The claim: when a vendor changes a model, nothing that an agent
+wrote since then moves up a trust tier on an agent's word or on yours. The repoint check
+of 5.3 now files its confirmed drift, and that opens a drift window for the checked
+model. The step lists the open window. Without the gateway, no check runs, and the step
+opens a window by hand and says so. Then `agent:a` writes an entry, and `agent:curator`
+tries to promote it to curated. The memory server refuses, and the refusal names the
+window and its start. You close the window. The same promotion is still refused: the
+change of the model can be in that entry. `agent:a` writes the entry again, and that
+entry is promoted. The step needs no model. It ran on 23 November without the gateway,
+as step 5.4 of that run, and printed these four results in this order. The step closes
+each window that the act opened, because an open window also refuses your approvals in
+act 7. The window that detection opens did not run through the gateway yet.
 
-On stage: Codex on qwen3.8-27b, twice, and a grader that is a regular expression, not a
-model.
+## Act 6 · The evaluation
 
-**6.1 With and without.** Both runs use the same four questions, the same harness, the
-same model and the same sandbox. With this memory: 4 of 4. With an empty memory: 0 of 4.
-Codex searches, finds nothing, and says so or gives a wrong answer. With memory, it
-finished in 71 seconds against 126. It wrote less than half as much: about 1,600 tokens
-against 3,600. It read more fresh input, about 19,000 tokens against 11,000. It read
-less cached input, the `c` figures: about 147,000 against 256,000. Cached tokens are
-input that the provider has seen before in the session, and the provider charges less
-for them. These are amounts, not cost. The provider's prices decide whether the memory
-run was cheaper. The demo also measures the host's side: 7.4 seconds of CPU against
-10.3. In both runs, the same harness had a peak of about 166 MiB. These counts are for the
-questions as they were on 12 October; two of them changed with the case study since.
+On stage: the launcher, `agent:a`, Codex on qwen3.8-27b, a grader that is a regular
+expression and not a model, and you.
+
+The claim: the comparison that says what memory buys has five arms, and its rules are
+fixed before a run. Steps 6.1 to 6.3 need no model. They ran on 23 November.
+
+**6.1 The arms.** An arm is one fixed set of session settings. The step prints the five
+arms in the paper's order, each with what it stands for and its settings:
+
+- `no-memory`, the floor: memory access off, T0 off.
+- `transcript-replay`, today's practice: memory access off, and the launcher puts kept
+  transcripts in front of the prompt.
+- `t0-only`, what the cheap layer buys: T0, and nothing below it.
+- `raw-only`, what curation buys: entries at the raw tier only, and T0 as a digest.
+- `full`, the system as built.
+
+The launcher gives the settings one time. A session cannot change them.
+
+**6.2 One question under each arm.** `agent:a` starts a session under each arm and asks
+for its settings, for T0, and for a search for DR-19. On 23 November, on a small
+record seeded from `examples/decisions`, the step printed this. Under `no-memory`, T0
+is one line of 136 characters, and the search is refused with the setting named. Under
+`transcript-replay`, no session starts: that arm needs a prompted launch. Under
+`t0-only`, T0 is 1,980 characters, and the search is refused because the depth is T0.
+Under `raw-only`, T0 is 230 characters, and the search finds 4 hits. Under `full`, T0 is
+1,980 characters, and the search finds 4 hits. Say that the scripted
+agent shows the settings, not what a model does with them.
+
+**6.3 The plan.** The evaluation set is also the plan. The step prints what the plan
+fixes: the baseline arm `no-memory`, 2 seeds, a margin of 0.1, an accepted cost of 1.0
+times the baseline, and the judge, `regex`. It prints the four tasks. The two DR-19 tasks
+are the frozen set, and the two case-study tasks are the rolling set. No task has the
+stratum `failed`. Then it prints the digest of the plan. Each run records that digest,
+and the scorer refuses an outcome whose run names a different digest. Thus nobody can
+move the margin after the runs.
+
+**6.4 The runs.** This step needs the gateway. It did not run yet, and these notes hold
+no figures for it. Codex on qwen3.8-27b runs two of the tasks, one time for each seed,
+under each arm: 20 launches. Each run reads the record at one snapshot, taken five
+seconds before the first run. Thus no run reads what a different run wrote. The step
+prints one line for each run, with pass or fail, the seconds and the tokens, and then a
+table for each arm.
+
+**6.5 The scorecard.** This step needs the gateway too, and these notes hold no figures
+for it. You score the runs. The tape of each run gives its task, seed, arm, harness and
+model, so the scorer does not take them on trust from the script. For each arm, the step
+prints the passes, the mean cost in tokens, and the paired differences from the baseline
+in success and in cost, each with its interval. Then it prints the finding and the
+verdict. It prints the five replay traps, each held or open. Expect the survivorship
+trap to be open: the demo's tasks have no recorded failure. The two tasks of this act are
+both frozen, so the distribution-shift trap is open too. Thus each verdict reads
+`inconclusive`, and the finding from the numbers stays beside it. Say why: tasks that
+passed say nothing about tasks that failed. The scorecard is kept as a decision entry in
+the platform domain, and the last line lists the kept scorecards.
+
+The run of 12 October compared two conditions only, memory and an empty record, on four
+questions: 4 of 4 with memory and 0 of 4 without, in 71 seconds against 126. That
+comparison is still in `scripts/eval.py`, as the conditions `memory` and `empty`. The
+demo does not run it now.
 
 ## Act 7 · The platform
 
@@ -428,12 +548,15 @@ them. Nothing in this record has a price, so these are quantities, not money.
 `prices.toml` can set prices for CPU-hours and GiB-hours, as well as for tokens. The last
 line gives the total of every run in this record so far. It does not include act 6's
 empty-memory runs, because they used records of their own. The total is about 12 minutes
-of wall clock, 11 of them waiting on models, and less than a minute of CPU.
+of wall clock, 11 of them waiting on models, and less than a minute of CPU. Act 6 now
+runs its arms in this record. Thus the total of a new run includes them.
 
 ## Act 8 · Run it again
 
 On stage: Codex re-running a session from act 6, on qwen3.8-27b and then on gemma4-26b,
-with the tape answering its memory tool calls.
+with the tape answering its memory tool calls. The figures of this act are from 12
+October, when act 6 left one session for each question with memory. The act now takes a
+session of the `full` arm. It did not run through the gateway in this form yet.
 
 The claim: you can run a session again later, on another model, and score it on whether
 it would have done the same.
@@ -442,13 +565,21 @@ it would have done the same.
 memory tool call returned. A session that started with a prompt can run again. Act 6's
 four questions with memory used a session each, and left four. This one asked who the
 promotion gate is, and made 2 memory tool calls. It is the question as it was on 12
-October.
+October. The step now takes a session of the `full` arm, or a session that is no run of
+an evaluation. A session of the `no-memory` arm made no memory tool call, so it has
+nothing to run again. The step also prints the replay manifest of the tape in one line:
+the log offset of each domain, the policy version and the session settings that the
+session began with. Below it is the replay state now, `complete` or `incomplete`, with
+each part that moved since.
 
 **8.2 The same model again.** The control, on qwen3.8-27b: the same tools in the same
 order as the tape. Its second call asked differently, for example with a different
 search. So from there, the record answered it, not the tape. It gave the same answer as
 in act 6, where it passed. A model is not deterministic, so even the control can be
-different.
+different. The line of each run now also says where the run left the tape, and
+`complete` or `incomplete`. A run that left the tape read the record as it is now. When
+the record moved since the session, the run is incomplete, and the line names what
+moved. Expect that here: the demo wrote to the record after act 6.
 
 **8.3 Another model.** On gemma4-26b, its first call already asked differently. Its
 tools align with the tape's less well: alignment 67%. Alignment counts the tools that
@@ -461,7 +592,8 @@ calls again. Re-enactment runs the whole session.
 
 ## Act 9 · From outside
 
-On stage: the GitHub issues tap, GitHub's public API, and you.
+On stage: the GitHub issues tap, GitHub's public API, and you. In 9.5, also the scripted
+agents `agent:a` and `agent:reader`.
 
 **9.1 The grant.** The tap may reach api.github.com and nothing else. It files into
 `dom-demo`, and it holds no credential. It runs as a WebAssembly component with only that
@@ -477,20 +609,42 @@ there. The ledger knows each issue by its origin and last update.
 **9.4 A person admits.** What a tap brings is proposed. No worker claims it until a
 person admits it. You admit one.
 
+**9.5 Raw reach.** An issue is text from a stranger. `agent:a` holds the admitted task,
+reads it and writes a decision. The answer of the write says `reach: tap` and names the
+task, because the session read outside content. Then the step shows who reads the entry
+while it is raw:
+
+- A new session of `agent:a` on the same task finds it. That session is in the task
+  chain.
+- `agent:reader` holds no task. Its search finds nothing, and its `get` is refused as
+  not found.
+- You find it. A person reads all raw entries.
+
+You promote the entry to curated, and then `agent:reader` finds it. Last, `amem log
+outside` lists the sessions that read outside content. For the session of `agent:a`, it
+gives one write and no send. An auditor checks the sends of such a session first.
+
 ## Act 10 · The record moves
 
-On stage: the event log and its materializer, you, and a second record, another owner's.
+On stage: the event log, its feed and its materializer; you; a second record, another
+owner's; and `agent:reader`, played by the demo script.
 
 The claim: the record lasts longer than every component. You can rebuild it from its log
 and move it to another owner. When you do, it keeps its erasures.
 
-**10.1 The event log.** The log has 319 events: 318 writes and the erasure from 1.4, by
-id and digest, never a body. An erasure of a body adds an erasure to the log. It changes
-nothing already in the log.
+**10.1 The event log.** The step counts the events of each kind that the log holds, and
+shows the first event of each kind. The kinds are the writes as sessions offered them,
+the versions that the record took, and the writes that the policy refused. They are also
+the erasures, such as the one from 1.4, the reads, the sends, and the copies of the
+ledger's events. Each event has ids and digests, never a body. An erasure of a body adds
+an erasure to the log. It changes nothing already in the log.
 
-**10.2 The index, rebuilt.** The materializer rebuilds the index from the log and the
-record. 304 entries are live: all except the four superseded entries and the one erased
-entry. It replays 172 ledger events. Nothing is behind the log.
+**10.2 The index, fed and rebuilt.** Each writer fed the index from the log before its
+write returned. Thus the index has each version that the log holds, no version waits, and
+the domain is within the published bound of 60 seconds. Then the materializer builds the
+index again from the log and the record. 304 entries are live: all except the four
+superseded entries and the one erased entry. It replays the ledger's events. Nothing is
+behind the log.
 
 **10.3 Exported at a label.** You write one new note, marked public. A public export
 carries that one entry. An internal export carries all 309 entries of `dom-demo`: the 304
@@ -504,6 +658,18 @@ internal bundle: 309 entries. A search of it for DR-19 finds 10 hits.
 imports the same bundle again. The import skips 308 entries as already there, and it
 refuses 1. It refuses that entry because its erasure receipt holds a fingerprint of the
 removed text, and the bundle's copy matches it.
+
+**10.6 An erasure follows lineage.** You write a note in error. `agent:reader` reads it
+and writes a second note, which does not name the first note. Then you export the domain.
+You erase the first note. The receipt lists the second note as withheld. It also lists
+the export as a send: a copy that the erasure cannot reach. The stub in the record keeps
+the id, the type, the domain, the date, the session, the label and the erased status. Its
+author is now the word `erased`. It keeps no text. The session of `agent:reader` is still
+open, and the first note is in its context. It writes a third note. The answer to that
+write says that the note is withheld, and names the erased note. A search for the second
+note finds nothing. `amem withheld list` names the second note and the third note, each
+with the erased note as the cause. You read the second note, you decide that it is
+correct, and you release it. The search finds it again.
 
 ## Act 11 · What this is not, yet
 

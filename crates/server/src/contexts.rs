@@ -7,7 +7,12 @@
 //! the call was made, never indexed or searched, readable by the owner alone, and swept
 //! on the transcripts' clock. It holds every entry body the session had read, so erasing
 //! an entry erases the contexts that carry it.
+//!
+//! Each context carries a replay manifest ([`crate::replay_state`]): what the session
+//! could see when the call was made, by reference, and the entries it was served since
+//! the context before.
 
+use crate::replay_state::ReplayManifest;
 use crate::{Error, Memory};
 use dm_core::Label;
 use dm_store::Area;
@@ -40,6 +45,11 @@ pub struct Context {
     /// Who observed it: the egress, which every model call passes through.
     #[serde(default = "by_egress")]
     pub observed_by: String,
+    /// What the session could see at this call, and the entries it was served since
+    /// the context before; none on a context kept before manifests were, or when the
+    /// state could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<ReplayManifest>,
 }
 
 fn by_egress() -> String {
@@ -173,7 +183,15 @@ fn name_of(n: usize) -> String {
 impl Memory {
     /// Keep one model call's context, under this session in its domain: the domain of
     /// the task it holds, else the only granted one; a session with neither keeps none,
-    /// and nor does a re-run.
+    /// and nor does a re-run. The context carries the session's replay manifest, with
+    /// the entries served since the context before; a context is kept without one when
+    /// the state cannot be read, since the model's input is the evidence that has no
+    /// other copy.
+    ///
+    /// The call was answered, so its request left: first a `send` event goes into the
+    /// log of that domain and of each domain the session has read, whether a context is
+    /// kept or not. It names the destination and the digest of the request, read as
+    /// text. A send event that cannot be appended does not stop the context.
     ///
     /// # Errors
     ///
@@ -185,10 +203,13 @@ impl Memory {
         request: &[u8],
         response: &[u8],
     ) -> Result<(), Error> {
+        let home = self.recording_domain().await;
+        let digest = dm_core::digest(&String::from_utf8_lossy(request));
+        let _ = self.log_send(home.as_deref(), destination, digest).await;
         if !self.keeps_contexts() {
             return Ok(());
         }
-        let Some(domain) = self.recording_domain().await else {
+        let Some(domain) = home else {
             return Ok(());
         };
         let n = self.contexts_kept.fetch_add(1, Ordering::Relaxed) + 1;
@@ -211,6 +232,7 @@ impl Memory {
             tools: tools_in(&response),
             response,
             observed_by: by_egress(),
+            manifest: self.context_manifest().await,
         };
         let bytes = serde_json::to_vec(&c).map_err(|e| Error::Transcript(e.to_string()))?;
         self.store
@@ -222,6 +244,14 @@ impl Memory {
             )
             .await?;
         Ok(())
+    }
+
+    /// The manifest of the context kept now: the session's state, and the entries
+    /// served since the context before, which are taken from the read log.
+    async fn context_manifest(&self) -> Option<ReplayManifest> {
+        let mut manifest = self.replay_manifest().await.ok()?;
+        manifest.returned = self.reads.take_returned();
+        Some(manifest)
     }
 
     /// A session's decision contexts, in order. The owner's alone.
@@ -369,6 +399,88 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WriteRequest;
+
+    async fn wrote(m: &Memory, body: &str) -> String {
+        let req = WriteRequest {
+            body: body.into(),
+            ..WriteRequest::default()
+        };
+        m.write(req).await.unwrap().id
+    }
+
+    async fn keep(m: &Memory) {
+        m.keep_context("llmao", "v1/chat/completions", b"{}", b"{}")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_context_keeps_a_manifest_and_what_was_served_since_the_one_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let a = wrote(&owner, "The import has five steps.\n").await;
+        let b = wrote(&owner, "The export has two steps.\n").await;
+        let c = wrote(&owner, "The deploy runs on Friday.\n").await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        agent.get(&b).await.unwrap();
+        agent.get(&a).await.unwrap();
+        agent.get(&b).await.unwrap();
+        keep(&agent).await;
+        // a view of the session reads for it: the read log is the session's
+        agent.for_request().unwrap().get(&c).await.unwrap();
+        agent.get(&a).await.unwrap();
+        keep(&agent).await;
+        keep(&agent).await;
+        let kept = owner.contexts(agent.session_id()).await.unwrap();
+        let returned: Vec<Vec<String>> = kept
+            .iter()
+            .map(|k| k.manifest.clone().expect("a manifest").returned)
+            .collect();
+        assert_eq!(
+            returned,
+            [vec![b, a.clone()], vec![c, a], Vec::new()],
+            "each id once, in the order first served, and not again in the next context"
+        );
+        // the rest of each manifest is the session's state
+        let state = agent.replay_manifest().await.unwrap();
+        for k in &kept {
+            let m = k.manifest.clone().unwrap();
+            assert_eq!(
+                ReplayManifest {
+                    returned: Vec::new(),
+                    ..m
+                },
+                state
+            );
+        }
+        // the third version: each write is two events, and no read moves the offset
+        assert_eq!(state.log["dom-me"], 6);
+        // a session whose reads are not logged names none
+        let quiet = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:b")
+            .without_read_log();
+        quiet
+            .get(&kept[0].manifest.clone().unwrap().returned[0])
+            .await
+            .unwrap();
+        quiet.t0(None).await.unwrap();
+        keep(&quiet).await;
+        let kept = owner.contexts(quiet.session_id()).await.unwrap();
+        let m = kept[0].manifest.clone().unwrap();
+        assert!(m.returned.is_empty() && m.t0.is_none(), "{m:?}");
+    }
+
+    #[test]
+    fn a_context_kept_before_manifests_were_still_parses() {
+        let old = r#"{"n":1,"at":"2026-11-01T10:00:00Z","destination":"llmao","path":"v1/chat/completions","label":"internal","request":{"messages":[]},"response":"{}","tools":["search"],"observed_by":"egress"}"#;
+        let c: Context = serde_json::from_str(old).unwrap();
+        assert_eq!((c.n, c.tools.len()), (1, 1));
+        assert!(c.manifest.is_none());
+        // and one without a manifest is written as it was
+        assert_eq!(serde_json::to_string(&c).unwrap(), old);
+    }
 
     #[test]
     fn tools_are_read_from_each_providers_shape() {

@@ -242,6 +242,11 @@ pub struct Grants {
     /// suites and harness configurations, loaded by the launcher only once verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// The security role: the authors, beside the owner, that read a quarantined write.
+    /// Each is an author as an entry names one, `agent:<name>` or
+    /// `human:<system>:<user-id>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security: Vec<String>,
     /// The domain that holds the held-out suites: the scenarios that grade a task
     /// definition. Only the evaluator and the owner in person read it, so it is never
     /// the platform's domain, which every session reads.
@@ -329,6 +334,7 @@ impl Grants {
             owner: owner.to_string(),
             handling: Label::Restricted,
             platform: None,
+            security: Vec::new(),
             held_out: None,
             evaluator: None,
             domains,
@@ -485,6 +491,13 @@ impl Grants {
         self.taps.get(name).filter(|t| self.may_write(&t.domain))
     }
 
+    /// Whether `author` is in the security role, which reads a quarantined write: the
+    /// owner always, and each author that `security` lists.
+    #[must_use]
+    pub fn is_security(&self, author: &str) -> bool {
+        author == self.owner || self.security.iter().any(|a| a == author)
+    }
+
     /// Whether the owner may write into a domain.
     #[must_use]
     pub fn may_write(&self, domain: &str) -> bool {
@@ -521,6 +534,7 @@ impl Grants {
         Session {
             handling: self.handling,
             label: Label::Public,
+            outside: false,
         }
     }
 }
@@ -532,6 +546,10 @@ pub struct Session {
     pub handling: Label,
     /// The highest classification it has read. Rises, never falls.
     pub label: Label,
+    /// Whether it has read content from authors outside the fleet: an answer of a tool,
+    /// a raw entry with tap reach, or a task that came from outside. Once true, it
+    /// stays true.
+    pub outside: bool,
 }
 
 impl Session {
@@ -546,6 +564,12 @@ impl Session {
         }
         self.label = self.label.max(classification);
         true
+    }
+
+    /// Record that the session read content from authors outside the fleet. Nothing
+    /// sets the record back.
+    pub fn read_outside(&mut self) {
+        self.outside = true;
     }
 
     /// Whether this session may send to a destination with the given ceiling. `None`
@@ -607,6 +631,32 @@ ceiling = "public"
             !starter.render().unwrap().contains("[taps"),
             "no section until one is granted"
         );
+    }
+
+    #[test]
+    fn the_security_role_is_the_owner_and_each_author_the_grants_list() {
+        // a file from before the role was kept names nobody, and is written as it was
+        let plain = Grants::parse(FILE).unwrap();
+        assert!(plain.security.is_empty());
+        assert!(!plain.render().unwrap().contains("security"));
+        assert!(
+            plain.is_security("human:local:striker"),
+            "the owner, always"
+        );
+        assert!(!plain.is_security("agent:auditor"));
+        let listed = Grants::parse(&FILE.replacen(
+            "handling = \"internal\"\n",
+            "handling = \"internal\"\nsecurity = [\"agent:auditor\"]\n",
+            1,
+        ))
+        .unwrap();
+        assert!(listed.is_security("agent:auditor"), "a listed author");
+        assert!(
+            listed.is_security("human:local:striker"),
+            "the owner, always"
+        );
+        assert!(!listed.is_security("agent:worker"), "another author");
+        assert_eq!(Grants::parse(&listed.render().unwrap()).unwrap(), listed);
     }
 
     #[test]

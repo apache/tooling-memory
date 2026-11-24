@@ -50,6 +50,8 @@ term here in the same commit as the first document that needs it.
 | grant | One table in the grants: `[domains.<name>]`, `[destinations.<name>]` or `[taps.<name>]` | permission |
 | policy | The Rego rules that decide each action: write, read, erase, approve, declassify, promote, file a task, spend and fetch. The root's `policy/*.rego` replaces the built-in rules | rules engine |
 | perimeter | The policy, the grants and the parts that enforce them, as one part of the design | |
+| stopped (session) | A session whose grants changed after it started. Each read, decision, tool call and model call of the session is refused, and a new session starts under the grants as they are | revoked session, stale session |
+| policy stamp | `state/policy.stamp` and the digest of the root's `policy/*.rego`: what a session compares to know that the policy changed | |
 | rule | One policy entry in the record: an id, a layer, the rule, its intent, an owner and, where a machine can check it, a module | |
 | status (of a rule) | Where a rule is in its life: `proposed` (in no decision), `advisory` (reports, refuses nothing), `enforced` (refuses) or `retired` | state (of a rule) |
 | ceiling | `[gates] max_enforced_rules`: the largest number of enforced rules in one domain that need no sign-off | cap (for rules) |
@@ -82,15 +84,45 @@ term here in the same commit as the first document that needs it.
 | work outcome | `reverted` or `rejected`: what became of the work of a task that did not stand. A record of it lowers the autonomy level of the definition one step | outcome (alone, for a work outcome) |
 | held-out suite | The scenarios that grade one task definition, in a verified entry of the held-out domain. Each scenario gives the strings that a handoff must hold. The grants name the held-out domain (`held_out`), and only the evaluator and the owner in person read it | test suite (for a held-out suite), golden suite (for a held-out suite) |
 | held-out domain | The domain that the grants name with `held_out`. It holds the held-out suites. Only the evaluator and the owner in person read its entries and its tasks or write into it, and it is not the platform's domain | evaluation domain, hidden domain |
-| evaluator | The principal that the grants name (`evaluator`) to grade work on the held-out suites. It reads the held-out domain, and it claims no task | grader, judge |
+| evaluator | The principal that the grants name (`evaluator`) to grade work on the held-out suites. It reads the held-out domain, and it claims no task | grader, judge (for the evaluator) |
 | pass mark | The number of scenarios of a held-out suite that must pass for one autonomy level | threshold (for a pass mark) |
 | candidate | An entry of the platform's domain that is proposed for verified. A candidate version of a task definition is a candidate with a `platform task` block | proposal (for the entry), draft |
 | safety gate | The check that refuses a candidate version of a task definition when it declares a tool, a scope domain or an autonomy level that the version before it does not, and no person wrote it | privilege check, permission gate |
 | performance gate | The check that refuses a candidate version of a task definition while it has no passed run of the held-out suite in force for the level `person`. It applies only where such a suite gives that pass mark | quality gate |
 | probing | Five or more refusals of one agent in one clock hour, counted from the decision log | scanning, abuse (for probing) |
+| position | The record for one standing role: an entry of type `position` with a charter and an authority envelope, named `pos-<name>`. It is in force when a person verified its entry | seat, role (for a position), slot, post |
+| charter | The part of a position that gives its standing orders, the task definitions that it covers, and the agent definition that fills it | mandate, job description |
+| authority envelope | The part of a position that gives the most that a session in it may do: the tools and the handling. "The envelope" after the first use | scope (for the envelope), permissions |
+| agent definition | The name of one kind of agent: the name in the author of a session, `codex` for `agent:codex`. An `agent` artifact of the platform domain has the same name. A charter names one | agent type, persona |
+| pin | The field of a task that names a position. Only a session that fills the position claims a pinned task. To pin a task is to file it with a pin | assignment, binding |
+| pin reason | Why a task is pinned: `continuity`, `relationship` or `separation` | pin type |
+| commitment | A task that is pinned to a position, is admitted and is not closed | obligation, duty |
+| handoff cache | The newest handoffs that cite a position, which a session in the position gets first in T0 | handoff history, position memory |
+| seconded session | A session that fills a position under an agent definition that the charter does not name. It reads the position and does its tasks, and it does not write the position's history | substitute (for a seconded session), stand-in |
+| fill (a position) | What a session does when a launcher puts it in a position: it then claims the position's tasks under the authority envelope | occupy, take, assume |
+| wake (a position) | To start a session in a position that has a task that waits and no live session | spawn (for a wake), summon |
+| retire (a position) | What the owner does to end a position: its tasks lose their pin, and its history stays in the record | delete (for retire), close (for retire) |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |
 | owner | The person who holds the root and its grants | user (for the owner), admin |
+| event log | The log of a domain, `state/log/<domain>.jsonl`, to which `amem` only appends: each write, version, refusal, erasure, read and send, and a copy of each event of the ledger, in order. An event holds ids and digests, and no text. The paper names it the historian | historian, audit log, journal |
+| security role | The owner, and each author that `security` in `grants.toml` lists. Only this role reads the quarantine, the event log of a domain, lineage and the list of withheld entries | security team |
+| send event | An event in the event log of a domain for content that left the perimeter in a session: a handoff that a tap posted, an export, or a model call that the egress recorded as answered. It holds the place and a digest, and no text | |
+| lineage | The answer to one question about an entry, from the event log of each domain. Back: the entries that its session read before it wrote the entry, and the entries that it cites. Forward: the entries and the send events that came after a session read it | provenance |
+| informed-by edge | A step of lineage between two entries: a session read the first entry before it wrote the second. Each read of the session before the write counts | derived-from edge |
+| cited edge | A step of lineage between two entries: the second entry names the first in `cites` or in `supersedes` | reference (for a cited edge) |
+| read set | The entries that a session read before one of its events: the `read` events of that session that are before the event in the log | context (for a read set) |
+| outside content | Content from an author outside the fleet: the answer of a tool, a raw entry with tap reach, or a task that a tap filed. A task that a session filed after it read outside content is outside content too. The event log marks each event that a session appends after it read outside content | untrusted content, tainted content |
+| raw reach | Who reads an entry while it is raw. An entry has `reach`: `chain`, `fleet` (the default) or `tap`. A read filter has `raw_reach`: `chain` (only the raw entries of the task chain), `fleet` (those, and each raw entry whose reach is not `tap`) or `all` (each raw entry) | visibility (for raw reach), scope (for raw reach) |
+| held task | The task that a session works. The launcher sets it for the session, in `MEMORY_TASK` for a memory server on stdio | current task, active task |
+| task chain | The held task of a session, the task that it was filed from, the tasks that were filed from it, and the tasks that it depends on. A session reads each raw entry that names a task of its task chain | task tree (for a task chain), lineage (for a task chain) |
+| withheld entry | An entry with `status: withheld`. An erasure reached it by lineage, or its session read the erased entry and wrote it after the erasure. Its body stays in the record, and no search, list, T0, recall, get or bundle gives it. It stays withheld until a new entry replaces it, or the owner releases it or erases it | flagged entry, quarantined entry (for a withheld entry) |
+| feed | The step that brings the index up to the event log of a domain: it takes each version that the log names above a cursor from the record, and moves the cursor. A writer does it before its write returns | sync (for the feed) |
+| freshness bound | The longest time that a version in the event log of a domain can wait for the feed: 60 seconds. `freshness` measures a domain against it | index lag |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
+| session settings | The values that a launcher gives a session one time, before the session reads. They make what the session reads smaller, and the session cannot change them | session config, switches, flags (for session settings) |
+| arm | One fixed value of the session settings, for an evaluation: `no-memory`, `transcript-replay`, `t0-only`, `raw-only` or `full` | variant, condition, mode (for an arm) |
+| snapshot | The time that a session reads the record at, `--as-of`. The session does not read an entry that was created after it | cutoff, checkpoint (for a snapshot) |
+| disclosure depth | How far below T0 a session reads: `t0` (T0 and nothing below it) or `full` | depth (alone, for the session setting) |
 
 ## Calls and tools
 
@@ -108,6 +140,16 @@ term here in the same commit as the first document that needs it.
 | replay | Send a recorded decision context to a model again | |
 | tape | The memory tool calls of one session, with their results | |
 | re-enactment | Run a session again on its prompt, and answer its memory tools from its tape | |
+| replay manifest | The part of a decision context and of a tape header that names what the session could read at that time: for each domain the offset of its event log (the number of the last event that names a version of an entry) and the number of entries in the index, the policy version, the digest of the grants, the session settings, the ranker and the digest of T0. On a decision context, it also names the entries that the session got after the decision context before | starting state (for a replay manifest), checkpoint (for a replay manifest) |
+| replay state | What `amem reenact state` gives for a tape: its replay manifest, each part that is different now, the calls that an erasure removed, and `complete` or `incomplete` | |
+| drift window | A time span for one destination and one model. It starts at the time that detected drift gives, and it ends when the owner closes it. An entry that an agent wrote in the span is not promoted, also after the owner closed the drift window | freeze (as a noun), quarantine (for a drift window) |
+| freeze | The rule of a drift window: nothing that an agent wrote inside the window is promoted, also after the window closes | hold (for the freeze), lock (for the freeze) |
+| plan | For an evaluation: the evaluation set file with a `[plan]` table. It fixes the tasks, the arms, the baseline arm, the number of seeds, the margin and the judge before the first run. The plan has a digest, and the tape of each run names that digest | protocol, design (for a plan) |
+| seed | For an evaluation: the number of a repeated run of one task in one arm, from 0. Nothing gives the seed to the model | repetition, trial (for a seed) |
+| pair | For an evaluation: one task and one seed with a run in an arm and a run in the baseline arm. The scorer compares the two runs of a pair | match (for a pair) |
+| margin | The fraction that the success rate of an arm can be below the baseline, and the arm is still no worse. The plan fixes it | tolerance, threshold (for the margin) |
+| replay trap | One of five conditions that make the result of an evaluation unsafe: `survivorship`, `leakage`, `noise`, `judge-drift`, `distribution-shift`. An open replay trap makes each verdict `inconclusive` | pitfall, bias (for a replay trap) |
+| scorecard | The result of one evaluation: for each arm the paired differences from the baseline arm in success and in cost, the verdict, the five replay traps, and the drift window that the runs were in. The record keeps it as a decision entry in the platform's domain | report, result card |
 | recall | The memory tool that answers a question with a cited brief, or with a pack of entries when no model is behind it | |
 | deputy | The small model that the memory server calls through the egress for recall | |
 | tap | A component that connects an outside system to `amem`. A tap with `tool = true` is a tool. Any other tap runs on a schedule, such as `github-issues` | connector, plugin (for a tap) |

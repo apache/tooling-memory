@@ -40,3 +40,23 @@ first=$(a task list --domain dom-demo --status proposed | j "next((t['id'] for t
 if [ -n "$first" ]; then
   a task admit "$first" | j "f\"  {d['id']} is {d['status']}: {d['title'][:70]}\""
 fi
+
+say "Raw reach" "An issue is text from a stranger. agent:a works the admitted task and leaves a note. Until someone curates the note, it reaches the task chain and you, and no other agent."
+if [ -z "$first" ]; then
+  echo "  skipped: the tap brought no task"
+  exit 0
+fi
+marker="harbour$(date +%s)"
+hits() { j "f\"  $1: {len(d['hits'])} hit(s)\" + ''.join(f\", {h['id']} at {h['trust_tier']}, reach {h.get('reach', 'fleet')}\" for h in d['hits'])"; }
+note=$(agent agent:a batch "[{\"tool\": \"get_task\", \"arguments\": {\"id\": \"$first\"}}, {\"tool\": \"write\", \"arguments\": {\"entry_type\": \"decision\", \"title\": \"What the issue asks, $marker\", \"body\": \"The issue asks for one change. Marker: $marker.\"}}]" "$first" \
+  | j "d['id'] + ' ' + d.get('reach', 'fleet') + ' ' + d.get('task', '-')")
+echo "  agent:a wrote ${note%% *}: reach $(echo "$note" | cut -d' ' -f2), task $(echo "$note" | cut -d' ' -f3)"
+note=${note%% *}
+agent agent:a search "{\"query\": \"$marker\"}" "$first" | hits "a new session of agent:a on the same task"
+agent agent:reader search "{\"query\": \"$marker\"}" | hits "agent:reader, on no task"
+echo "  agent:reader asks for it by id: $(agent agent:reader get "{\"id\": \"$note\"}" 2>&1 | cut -c1-90 || true)"
+a search "$marker" | j "f\"  you: {len(d)} hit(s)\" + ''.join(f\", {h['id']} at {h['trust_tier']}, reach {h.get('reach', 'fleet')}\" for h in d)"
+a promote "$note" --to curated --why "read against the issue: it says what the issue asks, and no more" >/dev/null
+echo "  you promoted $note to curated"
+agent agent:reader search "{\"query\": \"$marker\"}" | hits "agent:reader, on no task"
+a log outside --domain dom-demo | j "f\"  the log names {len(d)} session(s) that read outside content\" + ''.join(f\"; {r['by']}, session {r['session']}: {len(r['writes'])} write(s), {len(r['sends'])} send(s) after the read\" for r in d if '$note' in r['writes'])"
