@@ -105,6 +105,11 @@ term here in the same commit as the first document that needs it.
 | usage | The tokens, calls and time that the egress counts for each model call it forwards | telemetry (for usage) |
 | spend limit | The most tokens, or the most money in US cents, that one destination's model calls may use in one session, and across the root in one day, from `[spend.<destination>]` | budget (for a spend limit) |
 | price vector | The file `prices.toml` under the root: the price of each model's tokens and of the host's resources, with a version | price list, rate card |
+| share of throughput | The most claims that one agent may make in one domain in 60 minutes, from `[limits.<domain>] claims_per_hour` | rate limit (for this share) |
+| outbound rate | The most handoffs of one family of origins that a tap gets to post in 24 hours, from `[limits.<domain>.outbound]`. The family is the origin of the task before its first colon | |
+| upkeep | Completed work that no person and no tap asked for and that only the fleet handled: curation, and a task that an agent filed and completed itself | |
+| share of upkeep | The highest percentage of the completed tasks of a window that may be upkeep, from `[limits.<domain>] upkeep_percent` | |
+| raise of a limit | An approval on the ledger that sets a limit above the value in the grants file, for one principal or one domain, until a time | |
 | decision context | The record of what a model call sent and got back, kept for replay | trace (for a decision context), transcript |
 | replay | Send a recorded decision context to a model again | |
 | tape | The memory tool calls of one session, with their results | |

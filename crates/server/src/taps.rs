@@ -9,7 +9,9 @@ use dm_ledger::Task;
 
 impl Memory {
     /// Completed tasks in a granted domain that came from upstream and whose handoff has
-    /// not been posted back, oldest first, each with its handoff. A task above `ceiling`
+    /// not been posted back, oldest first, each with its handoff. Of a family of origins
+    /// with an outbound rate, the tap is handed no more than the rate leaves in 24 hours
+    /// ([`crate::limits`]); the rest waits, and the decision log says so. A task above `ceiling`
     /// or the session's handling, or one whose handoff is, is left out rather than read;
     /// so is a task whose handoff is gone. Each task and handoff handed out is a read,
     /// and raises the label; each handoff is logged and counted like any other.
@@ -23,12 +25,20 @@ impl Memory {
         ceiling: Label,
     ) -> Result<Vec<(Task, Entry)>, Error> {
         let domain = self.resolve_domain(Some(domain))?;
-        let tasks = self.ledger.lock().await.unposted(&domain).await?;
+        let (tasks, mut rate) = {
+            let l = self.ledger.lock().await;
+            let tasks = l.unposted(&domain).await?;
+            (tasks, self.outbound(&l, &domain).await?)
+        };
         let mut filter = self.session_filter()?;
         filter.handling = self.handling()?.min(ceiling);
         let mut out = Vec::new();
         for task in tasks {
             if task.spec.classification > filter.handling {
+                continue;
+            }
+            // a family at its outbound rate is handed no more, and nothing of it is read
+            if !rate.has_room(&task) {
                 continue;
             }
             let Some(handoff) = task.handoff.as_deref() else {
@@ -49,7 +59,11 @@ impl Memory {
             if entry.front.classification > ceiling {
                 continue;
             }
+            rate.count(&task);
             out.push((task, entry));
+        }
+        for held in rate.held(&domain) {
+            let _logged = self.refusal("limit", &domain, held);
         }
         out.iter().for_each(|(task, _)| self.observe_task(task));
         Ok(out)

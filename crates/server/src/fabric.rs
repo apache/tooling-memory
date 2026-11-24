@@ -54,7 +54,7 @@ pub fn maintenance(t: &Task) -> bool {
 }
 
 /// A task's family for the statistics: the origin before its colon, or `filed`.
-fn family(t: &Task) -> String {
+pub(crate) fn family(t: &Task) -> String {
     t.spec
         .origin
         .as_deref()

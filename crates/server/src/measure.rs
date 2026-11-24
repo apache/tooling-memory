@@ -8,6 +8,7 @@
 //! up until the event `landing:<queue>` comes, with its handoff on it. A person in person
 //! lands the head of the queue, and that closes the task with the handoff.
 
+use crate::limits::Limit;
 use crate::{fabric, lock, Error, Memory};
 use dm_ledger::{Ledger, Moment, Status, Task};
 use dm_policy::decide::Class;
@@ -125,7 +126,7 @@ pub struct LandingView {
 }
 
 /// The moments of a domain, by task.
-struct Moments(BTreeMap<String, Vec<Moment>>);
+pub(crate) struct Moments(BTreeMap<String, Vec<Moment>>);
 
 impl Moments {
     async fn of(l: &Ledger, domain: &str) -> Result<Moments, Error> {
@@ -214,7 +215,7 @@ fn above(task: &Task) -> Option<&str> {
 
 /// The root of a task: the last task that the walk up finds. An ancestor that the ledger
 /// does not hold ends the walk.
-async fn root_of(l: &Ledger, task: &Task) -> Task {
+pub(crate) async fn root_of(l: &Ledger, task: &Task) -> Task {
     let mut root = task.clone();
     for _ in 0..ROOT_STEPS {
         let Some(id) = above(&root).map(str::to_string) else {
@@ -228,12 +229,12 @@ async fn root_of(l: &Ledger, task: &Task) -> Task {
     root
 }
 
-fn is_person(who: &str, owner: &str) -> bool {
+pub(crate) fn is_person(who: &str, owner: &str) -> bool {
     matches!(Class::of(who, owner), Class::Owner | Class::Human)
 }
 
 /// Whether an agent or the system filed the task: no person and no tap asked for it.
-fn fleet_filed(root: &Task, owner: &str) -> bool {
+pub(crate) fn fleet_filed(root: &Task, owner: &str) -> bool {
     let class = Class::of(&root.spec.created_by, owner);
     !matches!(class, Class::Owner | Class::Human | Class::Tap)
 }
@@ -309,6 +310,37 @@ impl Memory {
 
     /// [`Memory::flow`] for a caller that holds the ledger.
     pub(crate) async fn flow_in(&self, l: &Ledger, domain: &str, days: u32) -> Result<Flow, Error> {
+        self.flow_of(l, domain, days, true).await
+    }
+
+    /// The flow that a limit is held against: every task of the domain counts, whatever
+    /// the session's handling, and the session reads none of them. A limit is the
+    /// domain's, so it is the same number for every session.
+    pub(crate) async fn flow_all(
+        &self,
+        l: &Ledger,
+        domain: &str,
+        days: u32,
+    ) -> Result<Flow, Error> {
+        self.flow_of(l, domain, days, false).await
+    }
+
+    /// The tasks of `tasks` that a flow counts: those that the session reads, or all.
+    fn counted(&self, tasks: Vec<Task>, read: bool) -> Result<Vec<Task>, Error> {
+        if read {
+            self.read_tasks(tasks)
+        } else {
+            Ok(tasks)
+        }
+    }
+
+    async fn flow_of(
+        &self,
+        l: &Ledger,
+        domain: &str,
+        days: u32,
+        read: bool,
+    ) -> Result<Flow, Error> {
         let ms = Moments::of(l, domain).await?;
         let since = l.now() - Duration::days(i64::from(days));
         let owner = self.grants.owner.as_str();
@@ -325,7 +357,7 @@ impl Memory {
             median_claim_to_done_secs: None,
         };
         let mut secs = Vec::new();
-        for t in self.read_tasks(l.list(domain, Status::Done).await?)? {
+        for t in self.counted(l.list(domain, Status::Done).await?, read)? {
             let Some(done) = ms.completed(&t.id).filter(|at| *at >= since) else {
                 continue;
             };
@@ -340,7 +372,7 @@ impl Memory {
             Status::Blocked,
             Status::Claimed,
         ] {
-            for t in self.read_tasks(l.list(domain, status).await?)? {
+            for t in self.counted(l.list(domain, status).await?, read)? {
                 let root = root_of(l, &t).await;
                 let induced = fleet_filed(&root, owner) && !fabric::maintenance(&root);
                 flow.induced_open += usize::from(induced);
@@ -438,7 +470,7 @@ impl Memory {
         Ok(waiting)
     }
 
-    async fn landing_in(&self, l: &Ledger, queue: &str) -> Result<LandingView, Error> {
+    pub(crate) async fn landing_in(&self, l: &Ledger, queue: &str) -> Result<LandingView, Error> {
         let q = self.landing_queue(queue)?;
         let domain = self.resolve_domain(Some(&q.domain))?;
         let ms = Moments::of(l, &domain).await?;
@@ -492,9 +524,11 @@ impl Memory {
             )));
         };
         let landed = view.fleet_landed_last_day;
-        if let Some(share) = view
-            .per_day
-            .filter(|n| !head.person && landed >= *n as usize)
+        let limit = Limit::Landing(queue.to_string());
+        let cap = self.cap(&l, &view.domain, &limit, &view.domain).await?;
+        if let Some(share) = cap
+            .map(|c| c.cap)
+            .filter(|n| !head.person && landed as u64 >= *n)
         {
             return Err(self.refusal(
                 "limit",

@@ -182,9 +182,10 @@ two weeks. It is also the reason that none of it is the production shape.
   - The sign-off for the highest level is a field of the ledger record, not an approval
     event.
 - **Measurement, in part.** `amem` computes four read metrics, cost and usage. The paper
-  names 21 metrics. Upkeep share, induced work and the landing queue are not built. The
-  only limit is a spend limit, in tokens or in money. The limits on throughput, on the
-  outbound rate and on upkeep are not built.
+  names 21 metrics. Upkeep share, induced work and the landing queue have no command. The
+  grants file sets the five limits: spend, the share of throughput, the outbound rate,
+  the ceiling on enforced rules, and the share of upkeep. No command raises a limit or
+  lists the limits yet. A spend limit is raised only by a change to the grants file.
 - **The evaluation arms.** Act 6 compares memory with an empty record. The paper's five
   arms, the paired seeds and the margin are not built. No scorecard is kept in the
   platform domain.

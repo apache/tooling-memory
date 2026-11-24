@@ -277,6 +277,9 @@ pub struct Grants {
     /// Landing queues by name: `[landing.main]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub landing: BTreeMap<String, LandingQueue>,
+    /// The shares of a domain, by domain: `[limits.dom-a]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub limits: BTreeMap<String, DomainLimits>,
     /// Where the task ledger lives when not in the SQLite file under the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<LedgerSettings>,
@@ -312,6 +315,48 @@ impl LandingQueue {
     pub fn count_after(&self) -> time::Duration {
         let hours = self.count_after_hours.unwrap_or(Self::COUNT_AFTER_HOURS);
         time::Duration::hours(i64::from(hours))
+    }
+}
+
+/// The shares of one domain. A person raises one for a time with an approval; the file
+/// holds the value that stands without one:
+///
+/// ```toml
+/// [limits.dom-a]
+/// claims_per_hour = 6
+/// upkeep_percent = 30
+/// window_days = 7
+///
+/// [limits.dom-a.outbound]
+/// github = 20
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainLimits {
+    /// Share of throughput: the claims that one agent may make in this domain in 60
+    /// minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims_per_hour: Option<u32>,
+    /// Share of upkeep: the highest percentage of the completed tasks of the window
+    /// that may be upkeep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upkeep_percent: Option<u8>,
+    /// The window of the upkeep share, in days; 7 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_days: Option<u32>,
+    /// Outbound rate: the handoffs posted back in 24 hours, by the family of the
+    /// task's origin (`github`, `issues`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outbound: BTreeMap<String, u32>,
+}
+
+impl DomainLimits {
+    /// The days of the window of the upkeep share when the file names none.
+    pub const WINDOW_DAYS: u32 = 7;
+
+    /// The window of the upkeep share, in days.
+    #[must_use]
+    pub fn window(&self) -> u32 {
+        self.window_days.unwrap_or(Self::WINDOW_DAYS)
     }
 }
 
@@ -382,6 +427,7 @@ impl Grants {
             gates: Gates::default(),
             spend: BTreeMap::new(),
             landing: BTreeMap::new(),
+            limits: BTreeMap::new(),
         }
     }
 
@@ -941,5 +987,48 @@ ceiling = "public"
             ..g.landing["main"].clone()
         };
         assert_eq!(short.count_after(), time::Duration::hours(6));
+    }
+
+    #[test]
+    fn a_file_without_limits_reads_and_renders_as_before() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("limits"), "{text}");
+        assert!(Grants::parse(FILE).unwrap().limits.is_empty());
+    }
+
+    #[test]
+    fn the_shares_of_a_domain_round_trip_and_the_window_defaults_to_a_week() {
+        let mut g = Grants::starter("human:local:me", "dom-me");
+        let text = format!(
+            "{}\n[limits.dom-me]\nclaims_per_hour = 6\nupkeep_percent = 30\n\n[limits.dom-me.outbound]\ngithub = 20\n",
+            g.render().unwrap()
+        );
+        let back = Grants::parse(&text).unwrap();
+        let limits = DomainLimits {
+            claims_per_hour: Some(6),
+            upkeep_percent: Some(30),
+            window_days: None,
+            outbound: BTreeMap::from([("github".to_string(), 20)]),
+        };
+        assert_eq!(limits.window(), 7);
+        g.limits.insert("dom-me".into(), limits);
+        assert_eq!(back, g);
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        let short = DomainLimits {
+            window_days: Some(2),
+            ..DomainLimits::default()
+        };
+        assert_eq!(short.window(), 2);
+        let none = format!(
+            "{}\n[limits.dom-me]\n",
+            Grants::starter("human:local:me", "dom-me")
+                .render()
+                .unwrap()
+        );
+        assert_eq!(
+            Grants::parse(&none).unwrap().limits["dom-me"],
+            DomainLimits::default()
+        );
     }
 }

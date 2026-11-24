@@ -1439,6 +1439,65 @@ does not leave. The egress refuses it as a permission error with the reason, and
 does not retry that error. The refusal is a logged decision. A list of the models of a
 destination is not a model call, and no spend limit applies to it.
 
+## The other limits: `[limits]` in grants.toml
+
+The paper has five limits, and each one has its own unit. `[spend]` is the first, and
+`[gates] max_enforced_rules` is the fourth. `[limits.<domain>]` sets the other three for
+one domain:
+
+```toml
+[limits.dom-demo]
+claims_per_hour = 6
+upkeep_percent = 30
+window_days = 7
+
+[limits.dom-demo.outbound]
+github = 20
+```
+
+- `claims_per_hour` is the share of throughput. It is the number of claims that one
+  agent may make in the domain in 60 minutes. At that number, the memory server refuses
+  the next claim of that agent. The claims of people are not counted, and a person is
+  not refused.
+- `[limits.<domain>.outbound]` is the outbound rate. Each key is a family of origins,
+  which is the origin of a task before its first colon. The value is the number of
+  handoffs of that family that a tap gets to post in 24 hours. The memory server counts
+  the posts of the last 24 hours and gives the tap the oldest completed tasks up to the
+  rate. The other tasks wait. A family with no key has no outbound rate. The record of a
+  post is never refused, because the post is already made.
+- `upkeep_percent` is the share of upkeep. Upkeep is curation, and each task that an
+  agent filed and completed itself. The memory server counts the tasks that were
+  completed in the last `window_days` days, which is 7 without the key. When the upkeep
+  among them is at the percentage, the fleet's own work is not admitted. The root of a
+  task decides. The root is the task at the top of the chain of parents and origins. The
+  fleet's own work is a task whose root is curation, or whose root an agent or the
+  system filed. Such a task stays `proposed`. A task that a person or a tap filed is
+  admitted as before, and so is each part of it. A person in person admits a task that
+  stays `proposed`. An agent cannot admit it.
+
+Curation keeps its floor. A curation task is admitted at the share of upkeep while
+curation is below the `maintenance_floor` of the rubric among the completed tasks of the
+window. When no task was completed in the window, nothing stays `proposed` for this
+limit.
+
+The fleet's share of a landing queue, `[landing.<queue>] per_day`, counts in the same
+way.
+
+Each refusal for one of these limits is a line in the decision log with the action
+`limit`. The same applies when a task stays `proposed` and when handoffs wait.
+
+A person raises a limit with an approval on the ledger. The approval names the limit, the
+new value, and a time at which it expires. For the share of throughput, the approval
+applies to one agent. For the other limits, it applies to the domain. The approval
+applies to the value that the grants file has at that moment. Thus a change to that value
+in the grants file ends the raise. An approval with a lower value than the grants file
+changes nothing. The library function is `Memory::raise_limit`, and `Memory::limits`
+lists the five limits with their counts. No command and no memory tool calls these
+functions yet. A spend limit is not raised by an approval. The owner changes the grants
+file.
+
+All counts use the clock of the ledger.
+
 ## Cost: `prices.toml` and `amem cost`
 
 Each model call that the egress meters records its billing. The billing is metered when

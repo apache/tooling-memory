@@ -42,6 +42,7 @@ pub mod evaluation;
 pub mod fabric;
 pub mod gates;
 mod holds;
+pub mod limits;
 pub mod log;
 pub mod mcp;
 pub mod measure;
@@ -2438,6 +2439,11 @@ impl Memory {
                 return Err(Error::Denied(format!("{id} is not admitted: {gap}")));
             }
         }
+        if !self.is_in_person() {
+            if let Some(held) = self.upkeep_hold(&l, &task).await? {
+                return Err(self.refusal("limit", &task.spec.domain, held));
+            }
+        }
         let admitted = l.admit(id).await?;
         self.rank_edges(&mut l, &admitted).await?;
         self.observe_task(&admitted);
@@ -2507,13 +2513,18 @@ impl Memory {
             fetch: None,
             approval: None,
         })?;
-        if d.admit {
-            let admitted = l.admit(&task.id).await?;
-            self.rank_edges(l, &admitted).await?;
-            Ok(admitted)
-        } else {
-            Ok(task)
+        if !d.admit {
+            return Ok(task);
         }
+        // the policy admits it; the share of upkeep can still hold it back, and then
+        // the decision log says so. A person in person admits it later
+        if let Some(held) = self.upkeep_hold(l, &task).await? {
+            let _logged = self.refusal("limit", &task.spec.domain, held);
+            return Ok(task);
+        }
+        let admitted = l.admit(&task.id).await?;
+        self.rank_edges(l, &admitted).await?;
+        Ok(admitted)
     }
 
     /// The task a fan-out files for one subagent: its parent's work, under the parent's
@@ -2932,6 +2943,7 @@ impl Memory {
         let can = self.capabilities();
         let kept = attempt.map(|k| self.attempt_key(k)).transpose()?;
         let mut l = self.ledger.lock().await;
+        self.within_throughput(&l, &domain).await?;
         let claim = match &kept {
             Some(key) => Self::in_own_words(
                 l.claim_next_once(&domain, &self.author, lease, (&can, handling), key)
@@ -2961,7 +2973,9 @@ impl Memory {
     pub async fn claim(&self, id: &str, lease: Duration) -> Result<Claim, Error> {
         self.claims_work()?;
         let mut l = self.ledger.lock().await;
-        self.check_task(&l.get(id).await?)?;
+        let task = l.get(id).await?;
+        self.check_task(&task)?;
+        self.within_throughput(&l, &task.spec.domain).await?;
         let handling = self.handling()?;
         let c = l
             .claim(id, &self.author, lease, &self.capabilities(), handling)
