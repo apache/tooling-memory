@@ -67,7 +67,11 @@ term here in the same commit as the first document that needs it.
 | destination | A place that the grants name for model calls: a model provider or a gateway | target (for a destination), endpoint (for a destination) |
 | trust tier | `raw`, `curated` or `verified`: how far an entry has been checked | label (for a tier) |
 | task state | `proposed`, `open`, `blocked`, `claimed`, `done` or `invalidated`: where a task is on the ledger | admitted (for `open`), completed (for `done`), status (for a state in prose) |
-| generation | The number of a claim of a task. Each claim gets the next number. A heartbeat, a completion and a release carry it, and the ledger refuses an earlier one | attempt (for a generation), fencing token |
+| generation | The number of a claim of a task. Each claim gets the next number. A heartbeat, a completion and a release carry it, and the ledger refuses an earlier one. The claim epoch is the high part of the number | attempt (for a generation), fencing token |
+| claim epoch | A number that a restore gives to the ledger. It is higher than each claim epoch before it. When the ledger begins a claim epoch, each claimed task becomes open, and the ledger refuses each claim that was made before | restore epoch, fencing epoch |
+| recovery bundle | A copy of a root from which a restore makes a root again: the record, the event log of each domain, the events of the ledger, the quarantine and the configuration, with a manifest. It does not hold the index. It is not the bundle that an export makes | backup (for a recovery bundle) |
+| erasure journal | The receipts of the erasures of a root. The owner keeps a copy apart from each recovery bundle. A restore erases each entry that the erasure journal names | |
+| restore drill | A restore of a recovery bundle into a scratch root, and a report of each of the five cases of the paper as recovered, absent or failed. It does not write the record or the ledger of the root that runs it | restore test |
 | late handoff | A handoff that a holder leaves on a task after its claim is over | |
 | attempt key | A key that a caller makes for one claim or one completion. The same key asked again gives the same result, and the ledger does the operation one time | idempotency key, request id |
 | task definition | The record in the platform domain for one kind of work: its purpose, its tools, its acceptance checks and its outputs. A task names one as `<name>@<version>` | task type, task template |

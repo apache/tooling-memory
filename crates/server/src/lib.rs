@@ -51,6 +51,7 @@ pub mod projection;
 pub mod reach;
 pub mod reads;
 pub mod recall;
+pub mod recovery;
 pub mod registry;
 pub mod rules;
 pub mod sources;
@@ -483,8 +484,16 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// A missing or bad grants file, or a store, index, or ledger that will not open.
+    /// A missing or bad grants file, or a store, index, or ledger that will not open;
+    /// [`Error::Denied`] for a root that a restore did not finish.
     pub fn open(root: &Path) -> Result<Memory, Error> {
+        recovery::refuse_unfinished(root)?;
+        Memory::open_unchecked(root)
+    }
+
+    /// [`Memory::open`] without the check for a restore that did not finish: for the
+    /// restore itself, which opens the root to finish it.
+    pub(crate) fn open_unchecked(root: &Path) -> Result<Memory, Error> {
         let grants_text = std::fs::read_to_string(root.join(GRANTS_FILE)).map_err(io(root))?;
         let grants = Grants::parse(&grants_text)?;
         let (registry, registry_stamp) = registry::load(root)?;

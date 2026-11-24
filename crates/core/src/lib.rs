@@ -13,6 +13,7 @@ pub mod filter;
 pub mod id;
 pub mod identity;
 pub mod manifest;
+pub mod recovery;
 
 pub use filter::{RawReach, ReadFilter};
 

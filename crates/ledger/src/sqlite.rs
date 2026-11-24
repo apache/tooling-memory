@@ -4,9 +4,9 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
-    LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Checkpointed, Claimant, Error, Event, Held,
+    PromotionRecord, PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken,
+    Task, TaskSpec, EPOCH_KEY, LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -204,10 +204,11 @@ impl Db {
         Ok(())
     }
 
-    /// Who the ledger gave the claim of `generation` to: the holder of the task's
-    /// `generation`th claim event, counted from one.
+    /// Who the ledger gave the claim of `generation` to: the holder of the claim event
+    /// at the place that the generation's count of claims says, when that event is of
+    /// that generation.
     pub(crate) fn claimant(&self, id: &str, generation: u64) -> Result<Option<String>, Error> {
-        let Some(before) = generation.checked_sub(1) else {
+        let Some(before) = crate::claim_offset(generation) else {
             return Ok(None);
         };
         let payload: Option<String> = self
@@ -215,14 +216,14 @@ impl Db {
             .query_row(
                 "SELECT payload FROM events WHERE task_id = ?1 AND kind = 'claimed'
                  ORDER BY seq LIMIT 1 OFFSET ?2",
-                params![id, i64::try_from(before).unwrap_or(i64::MAX)],
+                params![id, before],
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(match payload.map(|p| Event::parse(id, &p)).transpose()? {
-            Some(Event::Claimed { holder, .. }) => Some(holder),
-            _ => None,
-        })
+        match payload {
+            Some(p) => crate::claimant_of(id, &p, generation),
+            None => Ok(None),
+        }
     }
 
     /// The handoff a task was completed with under an attempt key, if it was.
@@ -399,14 +400,17 @@ impl Db {
         // the claim this key made in this domain, looked for in the transaction that
         // would claim, so two callers with one key make one claim
         if let Some(key) = who.attempt {
+            // a claim of an earlier epoch is over for everyone, so the key did not make it
+            let floor = crate::epoch_floor(epoch_in(&tx)?);
             let before: Option<(String, String)> = tx
                 .query_row(
                     "SELECT e.task_id, e.payload FROM events e
                      JOIN tasks t ON t.id = e.task_id
                      WHERE t.domain = ?1 AND e.kind = 'claimed'
                        AND json_extract(e.payload, '$.attempt') = ?2
+                       AND COALESCE(json_extract(e.payload, '$.generation'), 0) >= ?3
                      ORDER BY e.seq LIMIT 1",
-                    params![domain, key],
+                    params![domain, key, floor],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -564,14 +568,15 @@ impl Db {
     /// rows that say who held the tasks those are of. The events table is one for all
     /// domains: a task's row names its domain, and a promotion names its own in its
     /// payload, so every promotion after `after` is given and the caller keeps its own.
+    /// Every epoch is given too: it ends the claims before it.
     pub(crate) fn events_after(&self, domain: &str, after: u64) -> Result<Vec<RawEvent>, Error> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT e.seq, e.task_id, e.at, e.payload, t.domain, t.label_rank
              FROM events e LEFT JOIN tasks t ON t.id = e.task_id
-             WHERE (e.seq > ?1 OR (e.kind IN ({LEASE_KINDS})
+             WHERE (e.seq > ?1 OR e.kind = 'epoch' OR (e.kind IN ({LEASE_KINDS})
                     AND e.task_id IN (SELECT task_id FROM events WHERE seq > ?1)))
-               AND (t.domain = ?2 OR e.kind = 'promoted')
+               AND (t.domain = ?2 OR e.kind IN ('promoted', 'epoch'))
              ORDER BY e.seq"
         ))?;
         let after = i64::try_from(after).unwrap_or(i64::MAX);
@@ -586,6 +591,87 @@ impl Db {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub(crate) fn epoch(&self) -> Result<u64, Error> {
+        epoch_in(&self.conn())
+    }
+
+    /// Append the epoch's event and project it, in one transaction taken for writing.
+    /// Returns the tasks that were claimed.
+    pub(crate) fn begin_epoch(
+        &mut self,
+        at: OffsetDateTime,
+        epoch: u64,
+    ) -> Result<Vec<String>, Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = epoch_in(&tx)?;
+        if epoch <= current {
+            return Err(Error::EpochNotLater {
+                given: epoch,
+                current,
+            });
+        }
+        let claimed: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT id FROM tasks WHERE status = 'claimed' ORDER BY id")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        apply(&tx, EPOCH_KEY, at, &Event::Epoch { epoch })?;
+        tx.commit()?;
+        Ok(claimed)
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<Vec<Checkpointed>, Error> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT seq, task_id, kind, at, payload FROM events ORDER BY seq")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Checkpointed {
+                seq: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
+                task: r.get(1)?,
+                kind: r.get(2)?,
+                at: r.get(3)?,
+                payload: r.get(4)?,
+                domain: None,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Insert the rows of a checkpoint, each with its sequence number, in one
+    /// transaction. The one table numbers all domains together, so two rows with one
+    /// number, as a checkpoint of a backend that numbers each domain apart can hold, are
+    /// refused.
+    pub(crate) fn restore(&mut self, events: &[Checkpointed]) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut seen = std::collections::HashSet::new();
+        for e in events {
+            if !seen.insert(e.seq) {
+                return Err(Error::BadRow {
+                    id: e.task.clone(),
+                    what: format!(
+                        "the sequence number {} is given twice: this ledger numbers all domains together",
+                        e.seq
+                    ),
+                });
+            }
+            tx.execute(
+                "INSERT INTO events (seq, task_id, kind, at, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    i64::try_from(e.seq).unwrap_or(i64::MAX),
+                    e.task,
+                    e.kind,
+                    e.at,
+                    e.payload
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn rebuild(&mut self) -> Result<u64, Error> {
@@ -784,6 +870,46 @@ fn checkpoint(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+/// The claim epoch in force: the highest that an epoch event names, 0 when there is none.
+fn epoch_in(conn: &Connection) -> Result<u64, Error> {
+    let highest: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(json_extract(payload, '$.epoch')), 0) FROM events
+         WHERE task_id = ?1 AND kind = 'epoch'",
+        params![EPOCH_KEY],
+        |r| r.get(0),
+    )?;
+    Ok(u64::try_from(highest).unwrap_or(0))
+}
+
+/// The projection of an epoch event: each task's generation gets the epoch above its
+/// count of claims, and each claimed task is open again with no holder.
+fn project_epoch(conn: &Connection, epoch: u64) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE tasks SET attempts = ?1 + (attempts % 4294967296)",
+        params![crate::epoch_floor(epoch)],
+    )?;
+    conn.execute(
+        "UPDATE tasks SET status = 'open', holder = NULL, lease_until = NULL
+         WHERE status = 'claimed'",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Give a task that was just filed the claim epoch as the high bits of its generation.
+/// The epoch is the highest among all the events: in a replay that is the last one, and
+/// each epoch event that the replay then reads sets the same bits again.
+fn start_in_epoch(conn: &Connection, id: &str) -> Result<(), Error> {
+    let epoch = epoch_in(conn)?;
+    if epoch > 0 {
+        conn.execute(
+            "UPDATE tasks SET attempts = ?2 WHERE id = ?1",
+            params![id, crate::epoch_floor(epoch)],
+        )?;
+    }
+    Ok(())
+}
+
 fn get_in(conn: &Connection, id: &str) -> Result<Task, Error> {
     conn.query_row(
         &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
@@ -916,7 +1042,11 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
 fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Result<(), Error> {
     match event {
         Event::Promoted { spec, why_erased } => insert_promotion(conn, at, spec, *why_erased)?,
-        Event::Created { id: new_id, spec } => insert_task(conn, new_id, at, spec)?,
+        Event::Created { id: new_id, spec } => {
+            insert_task(conn, new_id, at, spec)?;
+            start_in_epoch(conn, new_id)?;
+        }
+        Event::Epoch { epoch } => project_epoch(conn, *epoch)?,
         Event::Admitted => {
             conn.execute(
                 "UPDATE tasks SET status = 'open' WHERE id = ?1",

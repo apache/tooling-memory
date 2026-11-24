@@ -317,7 +317,7 @@ pub fn measure(
     }
 }
 
-fn valid_domain(domain: &str) -> Result<&str, Error> {
+pub(crate) fn valid_domain(domain: &str) -> Result<&str, Error> {
     if !domain.is_empty()
         && domain
             .chars()
@@ -431,6 +431,28 @@ impl Writer {
             .and_then(|f| f.sync_data())
             .map_err(crate::io(&self.log))
     }
+}
+
+/// Run `copy` while this process holds the append lock of `domain`'s log: no event is
+/// appended to the log meanwhile. `copy` gets the root-relative names of the log's files
+/// that a copy takes, and the sequence number of the last event.
+///
+/// # Errors
+///
+/// A domain that is not a name, the file system, or what `copy` returns.
+pub(crate) fn while_no_append<T>(
+    root: &Path,
+    domain: &str,
+    copy: impl FnOnce(&[String], u64) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let writer = Writer::open(root, domain)?;
+    let d = valid_domain(domain)?;
+    let files = [
+        format!("{d}.jsonl"),
+        format!("{d}.seq"),
+        format!("{d}.ledger"),
+    ];
+    copy(&files, writer.last)
 }
 
 fn now() -> String {

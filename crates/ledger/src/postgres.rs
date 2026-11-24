@@ -11,6 +11,11 @@
 //! lookup. A promotion is no task and has no route there: it names its domain, and is
 //! read by domain.
 //!
+//! A claim epoch is an event of no domain, and each domain replays alone. So the event is
+//! appended to the events of every domain, and a third table in `public`,
+//! `ledger_epochs`, keeps each epoch begun: a domain made later starts with the event of
+//! the epoch in force.
+//!
 //! Times are stored as the RFC 3339 text the SQLite backend stores, so a row reads back
 //! exactly as it was written and a replay produces the same projection on either side.
 //! A claim takes its candidates `FOR UPDATE SKIP LOCKED`, so two claimers on two
@@ -23,9 +28,9 @@
 //! reader has seen, and a reader that asks for the events after a number misses none.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
-    PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
-    LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Checkpointed, Claimant, Error, Event, Held,
+    PromotionRecord, PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken,
+    Task, TaskSpec, EPOCH_KEY, LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use dm_core::Label;
 use std::collections::HashMap;
@@ -44,6 +49,10 @@ CREATE TABLE IF NOT EXISTS public.ledger_domains (
 CREATE TABLE IF NOT EXISTS public.ledger_tasks (
     id     TEXT PRIMARY KEY,
     domain TEXT NOT NULL REFERENCES public.ledger_domains (domain)
+);
+CREATE TABLE IF NOT EXISTS public.ledger_epochs (
+    epoch BIGINT PRIMARY KEY,
+    at    TEXT NOT NULL
 );
 ";
 
@@ -405,14 +414,15 @@ impl Db {
         Ok(())
     }
 
-    /// Who the ledger gave the claim of `generation` to: the holder of the task's
-    /// `generation`th claim event, counted from one.
+    /// Who the ledger gave the claim of `generation` to: the holder of the claim event
+    /// at the place that the generation's count of claims says, when that event is of
+    /// that generation.
     pub(crate) async fn claimant(
         &self,
         id: &str,
         generation: u64,
     ) -> Result<Option<String>, Error> {
-        let Some(before) = generation.checked_sub(1) else {
+        let Some(before) = crate::claim_offset(generation) else {
             return Ok(None);
         };
         let s = self.schema_of_task(id).await?;
@@ -423,14 +433,14 @@ impl Db {
                     "SELECT payload FROM {s}.events WHERE task_id = $1 AND kind = 'claimed'
                      ORDER BY seq LIMIT 1 OFFSET $2"
                 ),
-                &[&id, &i64::try_from(before).unwrap_or(i64::MAX)],
+                &[&id, &before],
             )
             .await?;
         let payload: Option<String> = row.map(|r| r.try_get(0)).transpose()?;
-        Ok(match payload.map(|p| Event::parse(id, &p)).transpose()? {
-            Some(Event::Claimed { holder, .. }) => Some(holder),
-            _ => None,
-        })
+        match payload {
+            Some(p) => crate::claimant_of(id, &p, generation),
+            None => Ok(None),
+        }
     }
 
     /// The handoff a task was completed with under an attempt key, if it was.
@@ -644,14 +654,17 @@ impl Db {
         // so two connections with one key make one claim; and a claim appends an event
         lock_domain(&tx, domain).await?;
         if let Some(key) = who.attempt {
+            // a claim of an earlier epoch is over for everyone, so the key did not make it
+            let floor = crate::epoch_floor(epoch_of_schema(&tx, &s).await?);
             let before = tx
                 .query_opt(
                     &format!(
                         "SELECT task_id, payload FROM {s}.events
                          WHERE kind = 'claimed' AND payload::jsonb ->> 'attempt' = $1
+                           AND COALESCE((payload::jsonb ->> 'generation')::bigint, 0) >= $2
                          ORDER BY seq LIMIT 1"
                     ),
-                    &[&key],
+                    &[&key, &floor],
                 )
                 .await?;
             if let Some(row) = before {
@@ -837,16 +850,7 @@ impl Db {
 
     /// Every domain's schema.
     async fn schemas(&self) -> Result<Vec<(String, String)>, Error> {
-        let rows = self
-            .client
-            .query(
-                "SELECT domain, schema FROM public.ledger_domains ORDER BY domain",
-                &[],
-            )
-            .await?;
-        rows.iter()
-            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
-            .collect()
+        schemas_in(&self.client).await
     }
 
     pub(crate) async fn event_count(&self) -> Result<u64, Error> {
@@ -880,7 +884,7 @@ impl Db {
                 &format!(
                     "SELECT e.seq, e.task_id, e.at, e.payload, t.label_rank
                      FROM {s}.events e LEFT JOIN {s}.tasks t ON t.id = e.task_id
-                     WHERE e.seq > $1 OR (e.kind IN ({LEASE_KINDS})
+                     WHERE e.seq > $1 OR e.kind = 'epoch' OR (e.kind IN ({LEASE_KINDS})
                            AND e.task_id IN (SELECT task_id FROM {s}.events WHERE seq > $1))
                      ORDER BY e.seq"
                 ),
@@ -899,6 +903,135 @@ impl Db {
                 })
             })
             .collect()
+    }
+
+    pub(crate) async fn epoch(&self) -> Result<u64, Error> {
+        Ok(latest_epoch(&self.client).await?.map_or(0, |(e, _)| e))
+    }
+
+    /// Append the epoch's event to every domain and project it there, in one
+    /// transaction under the lock of each domain. Returns the tasks that were claimed.
+    pub(crate) async fn begin_epoch(
+        &mut self,
+        at: OffsetDateTime,
+        epoch: u64,
+    ) -> Result<Vec<String>, Error> {
+        let tx = self.client.transaction().await?;
+        // a domain that is made meanwhile waits for this lock, and then starts in the epoch
+        lock_epochs(&tx).await?;
+        let current = latest_epoch(&tx).await?.map_or(0, |(e, _)| e);
+        if epoch <= current {
+            return Err(Error::EpochNotLater {
+                given: epoch,
+                current,
+            });
+        }
+        tx.execute(
+            "INSERT INTO public.ledger_epochs (epoch, at) VALUES ($1, $2)",
+            &[
+                &i64::try_from(epoch).unwrap_or(i64::MAX),
+                &crate::fmt_time(at),
+            ],
+        )
+        .await?;
+        let mut claimed = Vec::new();
+        for (domain, s) in schemas_in(&tx).await? {
+            lock_domain(&tx, &domain).await?;
+            let rows = tx
+                .query(
+                    &format!("SELECT id FROM {s}.tasks WHERE status = 'claimed' ORDER BY id"),
+                    &[],
+                )
+                .await?;
+            for row in &rows {
+                claimed.push(row.try_get(0)?);
+            }
+            apply(&tx, &s, EPOCH_KEY, at, &Event::Epoch { epoch }).await?;
+        }
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    /// Every row of every domain's events, a domain at a time, each named with its domain.
+    pub(crate) async fn checkpoint(&self) -> Result<Vec<Checkpointed>, Error> {
+        let mut out = Vec::new();
+        for (domain, s) in self.schemas().await? {
+            let rows = self
+                .client
+                .query(
+                    &format!("SELECT seq, task_id, kind, at, payload FROM {s}.events ORDER BY seq"),
+                    &[],
+                )
+                .await?;
+            for r in &rows {
+                out.push(Checkpointed {
+                    seq: u64::try_from(r.try_get::<_, i64>(0)?).unwrap_or(0),
+                    task: r.try_get(1)?,
+                    kind: r.try_get(2)?,
+                    at: r.try_get(3)?,
+                    payload: r.try_get(4)?,
+                    domain: Some(domain.clone()),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Insert the rows of a checkpoint, each into the events of its domain with its
+    /// sequence number, in one transaction, and move each domain's sequence past its
+    /// highest number. A row that names no domain goes where its event says: a task's
+    /// events to the domain that the task was filed in, a promotion to the domain it
+    /// names, and an epoch to every domain of the checkpoint.
+    pub(crate) async fn restore(&mut self, events: &[Checkpointed]) -> Result<(), Error> {
+        let placed = place(events)?;
+        let tx = self.client.transaction().await?;
+        // every schema first: one made after an epoch is on record would start with an
+        // event of its own for that epoch
+        let mut schemas: HashMap<String, String> = HashMap::new();
+        for (domain, _) in &placed {
+            if !schemas.contains_key(domain) {
+                schemas.insert(domain.clone(), ensure_domain(&tx, domain).await?);
+            }
+        }
+        for (domain, e) in &placed {
+            let s = &schemas[domain];
+            tx.execute(
+                &format!(
+                    "INSERT INTO {s}.events (seq, task_id, kind, at, payload)
+                     VALUES ($1, $2, $3, $4, $5)"
+                ),
+                &[
+                    &i64::try_from(e.seq).unwrap_or(i64::MAX),
+                    &e.task,
+                    &e.kind,
+                    &e.at,
+                    &e.payload,
+                ],
+            )
+            .await?;
+            if let Event::Epoch { epoch } = Event::parse(&e.task, &e.payload)? {
+                tx.execute(
+                    "INSERT INTO public.ledger_epochs (epoch, at) VALUES ($1, $2)
+                     ON CONFLICT (epoch) DO NOTHING",
+                    &[&i64::try_from(epoch).unwrap_or(i64::MAX), &e.at],
+                )
+                .await?;
+            }
+        }
+        for s in schemas.values() {
+            tx.execute(
+                &format!(
+                    "SELECT setval(pg_get_serial_sequence($1, 'seq'), MAX(seq)) FROM {s}.events"
+                ),
+                &[&format!("{s}.events")],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        for (domain, s) in schemas {
+            self.remember(&domain, &s);
+        }
+        Ok(())
     }
 
     /// Replay every domain's events into a fresh projection, one transaction for all.
@@ -956,6 +1089,123 @@ impl Db {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// Each row of a checkpoint with the domain whose events it goes into. A row that names
+/// its domain goes there. Of the others, a `created` event and a promotion name their
+/// domain, any other event of a task goes with the task, and an epoch goes to every
+/// domain that the checkpoint has an event of.
+fn place(events: &[Checkpointed]) -> Result<Vec<(String, &Checkpointed)>, Error> {
+    let mut of_task: HashMap<&str, String> = HashMap::new();
+    let mut domains: Vec<String> = Vec::new();
+    let mut epochs = Vec::new();
+    let mut placed = Vec::new();
+    for e in events {
+        let domain = match (&e.domain, Event::parse(&e.task, &e.payload)?) {
+            (Some(domain), _) => domain.clone(),
+            // the event is appended under the id of its task
+            (None, Event::Created { spec, .. }) => {
+                of_task.insert(e.task.as_str(), spec.domain.clone());
+                spec.domain
+            }
+            (None, Event::Promoted { spec, .. }) => spec.domain,
+            (None, Event::Epoch { .. }) => {
+                epochs.push(e);
+                continue;
+            }
+            (None, _) => of_task
+                .get(e.task.as_str())
+                .cloned()
+                .ok_or_else(|| Error::BadRow {
+                    id: e.task.clone(),
+                    what: "an event of a task that the checkpoint does not file".into(),
+                })?,
+        };
+        if !domains.contains(&domain) {
+            domains.push(domain.clone());
+        }
+        placed.push((domain, e));
+    }
+    for e in epochs {
+        placed.extend(domains.iter().map(|d| (d.clone(), e)));
+    }
+    Ok(placed)
+}
+
+/// Take the lock of the claim epochs until the transaction ends. A transaction that
+/// begins an epoch takes it first, and one that makes a domain takes it after the lock of
+/// that domain, so each new domain either gets the epoch's event from the one or reads
+/// the epoch from the other.
+async fn lock_epochs<C: GenericClient>(conn: &C) -> Result<(), Error> {
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('ledger_epochs'))",
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The highest claim epoch begun and its time, or `None` when none was.
+async fn latest_epoch<C: GenericClient>(conn: &C) -> Result<Option<(u64, String)>, Error> {
+    let row = conn
+        .query_opt(
+            "SELECT epoch, at FROM public.ledger_epochs ORDER BY epoch DESC LIMIT 1",
+            &[],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let epoch: i64 = row.try_get(0)?;
+    Ok(Some((u64::try_from(epoch).unwrap_or(0), row.try_get(1)?)))
+}
+
+/// The highest claim epoch among the events of schema `s`: the epoch that a replay of
+/// this domain alone ends in.
+async fn epoch_of_schema<C: GenericClient>(conn: &C, s: &str) -> Result<u64, Error> {
+    let row = conn
+        .query_one(
+            &format!(
+                "SELECT COALESCE(MAX((payload::jsonb ->> 'epoch')::bigint), 0) FROM {s}.events
+                 WHERE task_id = $1 AND kind = 'epoch'"
+            ),
+            &[&EPOCH_KEY],
+        )
+        .await?;
+    let epoch: i64 = row.try_get(0)?;
+    Ok(u64::try_from(epoch).unwrap_or(0))
+}
+
+/// Every domain and its schema, in the order of the domains.
+async fn schemas_in<C: GenericClient>(conn: &C) -> Result<Vec<(String, String)>, Error> {
+    let rows = conn
+        .query(
+            "SELECT domain, schema FROM public.ledger_domains ORDER BY domain",
+            &[],
+        )
+        .await?;
+    rows.iter()
+        .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+        .collect()
+}
+
+/// The projection of an epoch event in schema `s`: each task's generation gets the epoch
+/// above its count of claims, and each claimed task is open again with no holder.
+async fn project_epoch<C: GenericClient>(conn: &C, s: &str, epoch: u64) -> Result<(), Error> {
+    conn.execute(
+        &format!("UPDATE {s}.tasks SET attempts = $1 + (attempts % 4294967296)"),
+        &[&crate::epoch_floor(epoch)],
+    )
+    .await?;
+    conn.execute(
+        &format!(
+            "UPDATE {s}.tasks SET status = 'open', holder = NULL, lease_until = NULL
+             WHERE status = 'claimed'"
+        ),
+        &[],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Lock one candidate's row and claim it for `who`, a holder and the end of its lease, if
@@ -1090,6 +1340,16 @@ async fn ensure_domain<C: GenericClient>(conn: &C, domain: &str) -> Result<Strin
         &[&domain, &s],
     )
     .await?;
+    // a domain made after an epoch began starts in it: its replay alone gives the epoch
+    lock_epochs(conn).await?;
+    if let Some((epoch, at)) = latest_epoch(conn).await? {
+        let began = Event::Epoch { epoch };
+        conn.execute(
+            &format!("INSERT INTO {s}.events (task_id, kind, at, payload) VALUES ($1, $2, $3, $4)"),
+            &[&EPOCH_KEY, &began.kind(), &at, &began.payload(EPOCH_KEY)?],
+        )
+        .await?;
+    }
     Ok(s)
 }
 
@@ -1363,6 +1623,17 @@ async fn insert_task<C: GenericClient>(
         &[&id, &spec.domain],
     )
     .await?;
+    // the claim epoch as the high bits of its generation. The epoch is the highest among
+    // the domain's events: in a replay that is the last one, and each epoch event that
+    // the replay then reads sets the same bits again
+    let epoch = epoch_of_schema(conn, s).await?;
+    if epoch > 0 {
+        conn.execute(
+            &format!("UPDATE {s}.tasks SET attempts = $2 WHERE id = $1"),
+            &[&id, &crate::epoch_floor(epoch)],
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1416,6 +1687,7 @@ async fn project<C: GenericClient>(
         Event::Promoted { spec, why_erased } => {
             return insert_promotion(conn, s, at, spec, *why_erased).await
         }
+        Event::Epoch { epoch } => return project_epoch(conn, s, *epoch).await,
         Event::Admitted => ("SET status = 'open' WHERE id = $1", vec![&id]),
         Event::Blocked { .. } => (
             "SET status = 'blocked' WHERE id = $1 AND status = 'open'",
