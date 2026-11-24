@@ -185,7 +185,10 @@ async fn claims_in_hour(l: &Ledger, domain: &str, who: &str) -> Result<u64, Erro
 
 /// The handoffs posted back in the 24 hours before the ledger's clock, by the family of
 /// the task's origin.
-async fn posted_in_day(l: &Ledger, domain: &str) -> Result<BTreeMap<String, u64>, Error> {
+pub(crate) async fn posted_in_day(
+    l: &Ledger,
+    domain: &str,
+) -> Result<BTreeMap<String, u64>, Error> {
     let since = l.now() - Duration::hours(24);
     let mut posted = BTreeMap::new();
     for m in l.moments(domain).await? {
@@ -534,9 +537,8 @@ impl Memory {
         Ok(rows)
     }
 
-    /// The row of the enforced rules: the rules of the domain that count against the
-    /// ceiling and are enforced now. The policy holds this limit.
-    fn rules_row(&self, domain: &str) -> LimitRow {
+    /// The rules of a domain that count against the ceiling and are enforced now.
+    pub(crate) fn enforced_rules(&self, domain: &str) -> usize {
         let p = self.policy();
         let owner = self.grants.owner.as_str();
         let signed = |by: &Option<String>| {
@@ -550,6 +552,12 @@ impl Memory {
                 && !signed(&e.meta.signed_off_by)
                 && p.state_of(e) == dm_policy::record::Status::Enforced
         });
+        enforced.count()
+    }
+
+    /// The row of the enforced rules: the rules of the domain that count against the
+    /// ceiling and are enforced now. The policy holds this limit.
+    fn rules_row(&self, domain: &str) -> LimitRow {
         let mut row = LimitRow::new("rules", "rules", domain);
         match self.grants.gates.max_enforced_rules {
             Some(ceiling) => {
@@ -558,7 +566,7 @@ impl Memory {
             }
             None => row = row.noted("not set"),
         }
-        row.counted(number(enforced.count() as u64))
+        row.counted(number(self.enforced_rules(domain) as u64))
     }
 
     async fn upkeep_row(&self, l: &Ledger, domain: &str) -> Result<LimitRow, Error> {

@@ -49,6 +49,7 @@ pub mod measure;
 pub mod platform;
 pub mod prefetch;
 pub mod projection;
+pub mod read_metrics;
 pub mod reads;
 pub mod recall;
 pub mod rules;
@@ -958,10 +959,12 @@ impl Memory {
         domain: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Hit>, Error> {
+        let asked = std::time::Instant::now();
         let f = self.filter_for(domain)?;
         let hits = self.index.lock().await.search(query, &f, limit)?;
         self.observe(&hits);
-        self.reads.hits("search", Some(query), &hits);
+        let ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.reads.searched(query, &hits, ms);
         Ok(hits)
     }
 

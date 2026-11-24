@@ -15,6 +15,46 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use time::OffsetDateTime;
 
+/// Where the tasks of a domain stand, and what holds them up.
+#[derive(Debug, Default)]
+pub(crate) struct Gaps {
+    /// By family, how many tasks are in each status.
+    pub(crate) by_family: BTreeMap<String, BTreeMap<String, usize>>,
+    /// Why tasks were invalidated: each reason, with its count.
+    pub(crate) reasons: BTreeMap<String, usize>,
+    /// The requirements of open and blocked tasks that no completed task carried.
+    pub(crate) unmatched: BTreeMap<String, usize>,
+}
+
+impl Gaps {
+    /// Count `tasks`.
+    pub(crate) fn of<'a>(tasks: impl Iterator<Item = &'a Task>) -> Gaps {
+        let mut gaps = Gaps::default();
+        let mut done_caps = BTreeSet::new();
+        let mut waiting = Vec::new();
+        for t in tasks {
+            let status = t.status.as_str().to_string();
+            let family = gaps.by_family.entry(family(t)).or_default();
+            *family.entry(status).or_default() += 1;
+            match t.status {
+                Status::Invalidated => {
+                    let reason = t.reason.clone().unwrap_or_default();
+                    *gaps.reasons.entry(reason).or_default() += 1;
+                }
+                Status::Done => done_caps.extend(t.spec.requirements.iter()),
+                Status::Open | Status::Blocked => waiting.push(t),
+                _ => {}
+            }
+        }
+        for r in waiting.iter().flat_map(|t| t.spec.requirements.iter()) {
+            if !done_caps.contains(r) {
+                *gaps.unmatched.entry(r.clone()).or_default() += 1;
+            }
+        }
+        gaps
+    }
+}
+
 /// One task moved in the queue.
 #[derive(Clone, Debug, Serialize)]
 pub struct Change {
@@ -381,6 +421,26 @@ impl Memory {
         })
     }
 
+    /// The tasks of a domain in every status that the session may see, each read.
+    pub(crate) async fn domain_tasks(
+        &self,
+        l: &dm_ledger::Ledger,
+        domain: &str,
+    ) -> Result<Vec<Task>, Error> {
+        let mut tasks = Vec::new();
+        for status in [
+            Status::Proposed,
+            Status::Open,
+            Status::Blocked,
+            Status::Claimed,
+            Status::Done,
+            Status::Invalidated,
+        ] {
+            tasks.extend(self.read_tasks(l.list(domain, status).await?)?);
+        }
+        Ok(tasks)
+    }
+
     /// How tasks flow in a domain, the paper's fabric telemetry: by family, how many
     /// are in each status; why tasks were invalidated; and the requirements of waiting
     /// tasks that no completed task ever carried, a fleet capability gap. Only tasks
@@ -392,44 +452,12 @@ impl Memory {
     pub async fn task_stats(&self, domain: Option<&str>) -> Result<serde_json::Value, Error> {
         let domain = self.resolve_domain(domain)?;
         let l = self.ledger.lock().await;
-        let mut by_family: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-        let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
-        let mut done_caps = BTreeSet::new();
-        let mut waiting = Vec::new();
-        for status in [
-            Status::Proposed,
-            Status::Open,
-            Status::Blocked,
-            Status::Claimed,
-            Status::Done,
-            Status::Invalidated,
-        ] {
-            for t in self.read_tasks(l.list(&domain, status).await?)? {
-                *by_family
-                    .entry(family(&t))
-                    .or_default()
-                    .entry(status.as_str().to_string())
-                    .or_default() += 1;
-                match status {
-                    Status::Invalidated => {
-                        *reasons
-                            .entry(t.reason.clone().unwrap_or_default())
-                            .or_default() += 1;
-                    }
-                    Status::Done => done_caps.extend(t.spec.requirements.clone()),
-                    Status::Open | Status::Blocked => waiting.push(t),
-                    _ => {}
-                }
-            }
-        }
-        let unmatched: BTreeMap<String, usize> = waiting
-            .iter()
-            .flat_map(|t| t.spec.requirements.iter())
-            .filter(|r| !done_caps.contains(*r))
-            .fold(BTreeMap::new(), |mut m, r| {
-                *m.entry(r.clone()).or_default() += 1;
-                m
-            });
+        let tasks = self.domain_tasks(&l, &domain).await?;
+        let Gaps {
+            by_family,
+            reasons,
+            unmatched,
+        } = Gaps::of(tasks.iter());
         Ok(serde_json::json!({
             "domain": domain, "by_family": by_family, "invalidated_because": reasons,
             "unmatched_requirements": unmatched,

@@ -7,6 +7,8 @@
 //! A landing queue reuses the ledger's wait. A holder that queues its work gives the task
 //! up until the event `landing:<queue>` comes, with its handoff on it. A person in person
 //! lands the head of the queue, and that closes the task with the handoff.
+//!
+//! The metric table of the paper is in [`table`], and its targets are in [`targets`].
 
 use crate::limits::Limit;
 use crate::{fabric, lock, Error, Memory};
@@ -549,6 +551,12 @@ impl Memory {
         Ok(done)
     }
 }
+
+mod table;
+mod targets;
+
+pub use table::{Metric, Metrics, PAPER_METRICS};
+pub use targets::{Target, TARGETS};
 
 #[cfg(test)]
 mod tests;
