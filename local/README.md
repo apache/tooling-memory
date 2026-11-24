@@ -364,7 +364,16 @@ only when all of these are true:
 
 A handoff and a policy entry are not demoted. Only a person restores an entry.
 
-The convention checks are `freshness`, `ownership`, `cross-link` and `superseded`. A
+A survey is not a use of an entry. Search, list and T0 give summaries, and their `read`
+events have `"survey": true`. The check that tests entries together reads bodies, and
+an export carries each entry of its scope. Their `read` events have the same field. Only a `read` event without this field keeps an
+entry out of the dead entries: `get` and `recall` write such events. Thus a curation
+cycle does not make each entry live again.
+
+The convention checks are `freshness`, `ownership`, `cross-link` and `superseded`. The
+check `cross-link` finds a linked entry through the read filter of the session. A linked
+entry that the session does not read fails as an entry that no granted domain holds,
+and the failure does not tell its status. A
 failure of the first three checks becomes a task that requires a person, with the origin
 `convention:<check>`. The text of the task names the owner of the entry. A failure of
 the check `superseded` becomes a task for a curator, with the origin `curator:rederive`
@@ -376,7 +385,15 @@ An outcome event has one of four kinds: `accepted`, `corrected`, `rejected` or
 `amem corrections --file` files a task for a curator with the origin
 `curator:correction`. The task asks whether the method was at fault or knowledge was
 missing. A disputed correction becomes a task for a person, with the origin
-`correction:disputed`.
+`correction:disputed`. If a curator task for that correction is not closed, the command
+invalidates it. The text of each of these tasks names the task, each outcome and each
+person. It does not hold a note or the title of the task: `outcomes` gives the notes.
+Thus an erasure that removes a note from a task leaves no copy of the note.
+
+`curation_case` gives the version that an entry replaced, and a cited entry that is
+demoted or replaced, only to a person and to a session that holds a task of the auditor.
+For each other session, the replaced version is absent and such a cited entry is in
+`missing`.
 
 `amem auditor qualify` puts each of the ten planted cases to the model of the curators,
 and to the candidate that `--model` names. A candidate qualifies when all of these are
@@ -402,7 +419,8 @@ A curation cycle (`amem curate`) does the duties too:
   curation that cites no entry becomes such a task without a model call.
 - It asks the model whether each of the newest handoffs holds an instruction for the
   next agent. A finding becomes a task for a person (`auditor:handoff`).
-- It files the human sample of the verdicts for a person (`auditor:review`).
+- It files the human sample of the verdicts for a person (`auditor:review`). A verdict
+  that has a task already takes no place in the sample.
 - It files the failures of the convention checks, the corrections, and the findings of
   the curation of the policy.
 
@@ -415,6 +433,14 @@ requires a person does not count.
 The telemetry of the curator (`amem curator --telemetry`) counts a demotion for the
 principal of the `demoted` event in the log of the domain. It does not count the
 demotion for the author of the entry.
+
+These items are open:
+
+- A task with the origin `auditor:review`, `auditor:curation` or `auditor:handoff` holds
+  the reason that the model gave. The reason can repeat text of the entry. An erasure of
+  the entry does not change these tasks.
+- An erasure does not close a correction task for a task that the erasure changed.
+- When the people who disputed a correction agree later, no new task goes to a curator.
 
 ## The perimeter: policy, admission and the gates
 

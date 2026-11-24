@@ -397,10 +397,12 @@ impl Memory {
         })
     }
 
-    /// File a task for a person for each verdict in the sample of this cycle. The sample
-    /// is the first verdicts in the order of the digest of the entry and the model, as
-    /// many as the mode of the auditor asks for. A verdict that already has a task gets
-    /// no second task. Returns the ids of the tasks filed now.
+    /// File a task for a person for each verdict in the sample of this cycle. A verdict
+    /// that already has a task is not in the sample, and gets no second task. The sample
+    /// is the first of the other verdicts in the order of the digest of the entry and
+    /// the model, as many as the mode of the auditor asks for. So a cycle that judges the
+    /// same entries again puts verdicts to a person that no person has reviewed. Returns
+    /// the ids of the tasks filed now.
     ///
     /// # Errors
     ///
@@ -414,7 +416,10 @@ impl Memory {
         let domain = self.resolve_domain(domain)?;
         let sample = self.auditor_mode()?.human_sample;
         let mut filed = Vec::new();
-        for j in sample_order(model, judged).into_iter().take(sample) {
+        for j in sample_order(model, judged) {
+            if filed.len() >= sample {
+                break;
+            }
             let created = self.file_own(review_task(&domain, model, j)).await?;
             if !created.deduplicated {
                 filed.push(created.task.id);
@@ -722,25 +727,47 @@ impl Memory {
         Ok(out)
     }
 
+    /// Whether this session reads the archive for an audit: the session of a person,
+    /// or a session that holds a task of the auditor. Retrieval never serves a demoted
+    /// or a replaced entry, so no other session gets one by the id that it names.
+    async fn audits(&self) -> bool {
+        if self.of_a_person() {
+            return true;
+        }
+        let Some(held) = self.held_task() else {
+            return false;
+        };
+        let task = self.ledger.lock().await.get(&held).await;
+        task.is_ok_and(|t| {
+            let origin = t.spec.origin.as_deref();
+            origin.is_some_and(|o| o.starts_with("auditor:"))
+        })
+    }
+
     /// One curated entry as a judge reads it: the entry, the version that it replaced,
-    /// and each entry that it cites. A cited entry that the active set no longer serves
-    /// is read from the archive. A cited handoff is never given: it holds the reasoning
-    /// of the curator. Each read is a read of this session.
+    /// and each entry that it cites. A cited handoff is never given: it holds the
+    /// reasoning of the curator. Each read is a read of this session.
+    ///
+    /// The version that the entry replaced, and a cited entry that the active set no
+    /// longer serves, come from the archive. Only the session of a person and a session
+    /// on a task of the auditor read the archive here. For each other session the
+    /// replaced version is absent, and such a cited entry is in `missing`.
     ///
     /// # Errors
     ///
     /// As [`Memory::get`] for the entry itself, or a store or index error.
     pub async fn curation_case(&self, id: &str) -> Result<CurationCase, Error> {
         let entry = self.get(id).await?;
+        let audits = self.audits().await;
         let replaced = match &entry.front.supersedes {
-            Some(old) => readable(self.archived(old).await)?,
-            None => None,
+            Some(old) if audits => readable(self.archived(old).await)?,
+            _ => None,
         };
         let mut cited = Vec::new();
         let mut missing = Vec::new();
         for c in entry.front.cites.iter().filter(|c| c.starts_with("mem-")) {
             let mut found = readable(self.get(c).await)?;
-            if found.is_none() {
+            if found.is_none() && audits {
                 found = readable(self.archived(c).await)?;
             }
             match found.filter(is_source) {
@@ -754,6 +781,23 @@ impl Memory {
             cited,
             missing,
         })
+    }
+
+    /// The entry of a hit, for a check that tests its body. The record serves the body,
+    /// and an entry that is not active, or that is withheld from this session, is not
+    /// given. The label of the session rises. The log takes a `read` event that is a
+    /// survey: this check reads each entry in each cycle, and that is no use of them.
+    async fn checked(&self, hit: &dm_index::Hit) -> Result<Option<Entry>, Error> {
+        let Some(entry) = self.store.get(&hit.domain, &hit.id).await? else {
+            return Ok(None);
+        };
+        if !entry.is_active() || self.withheld_from_author(&entry) {
+            return Ok(None);
+        }
+        let outside = crate::reach::outside_content(&entry);
+        let label = entry.front.classification;
+        let read = self.observe_checked(&hit.domain, &hit.id, label, outside)?;
+        Ok(read.then_some(entry))
     }
 
     /// Test entries together. For each of the newest `sample` active entries that are
@@ -779,7 +823,7 @@ impl Memory {
         for seed in seeds {
             let mut bodies = Vec::new();
             for hit in self.search(&seed.title, domain, TOGETHER_HITS).await? {
-                if let Some(e) = readable(self.get(&hit.id).await)? {
+                if let Some(e) = self.checked(&hit).await? {
                     bodies.push((hit.id, e.body));
                 }
             }
@@ -1045,7 +1089,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_fresh_mode_files_three_reviews_and_a_second_run_files_none() {
+    async fn the_fresh_mode_files_three_reviews_and_the_next_run_files_the_verdicts_not_yet_filed()
+    {
         let dir = tempfile::tempdir().unwrap();
         let o = owner(dir.path());
         let judged = five();
@@ -1066,10 +1111,21 @@ mod tests {
             assert_eq!(t.spec.priority, 1);
             assert!(t.spec.body.contains(&j.why), "{}", t.spec.body);
         }
+        // the next cycle judges the same entries again: a verdict that has a task takes
+        // no place in the sample, so the two other verdicts go to a person
         let mut reversed = judged.clone();
         reversed.reverse();
         let again = o.file_human_review(None, "m-a", &reversed).await.unwrap();
-        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(again.len(), 2, "{again:?}");
+        for (id, j) in again.iter().zip(&by_digest[3..]) {
+            let t = o.get_task(id).await.unwrap();
+            assert_eq!(
+                t.spec.title,
+                format!("Review the auditor's verdict on {}", j.entry)
+            );
+        }
+        let third = o.file_human_review(None, "m-a", &judged).await.unwrap();
+        assert!(third.is_empty(), "each verdict has a task: {third:?}");
     }
 
     #[tokio::test]
@@ -1133,13 +1189,13 @@ mod tests {
         m.write(r).await.unwrap().id
     }
 
-    /// An agent that holds a task of a curator.
-    async fn curator(dir: &Path, o: &Memory, name: &str) -> Memory {
+    /// An agent that holds a task with `origin`.
+    async fn on_task(dir: &Path, o: &Memory, name: &str, origin: &str) -> Memory {
         let spec = TaskSpec {
             domain: "dom-me".into(),
             title: name.into(),
             body: "b".into(),
-            origin: Some("curator:merge".into()),
+            origin: Some(origin.into()),
             upstream_event: Some(name.into()),
             ..TaskSpec::default()
         };
@@ -1147,6 +1203,11 @@ mod tests {
         let a = agent(dir, name);
         a.hold_task(&held).await.unwrap();
         a
+    }
+
+    /// An agent that holds a task of a curator.
+    async fn curator(dir: &Path, o: &Memory, name: &str) -> Memory {
+        on_task(dir, o, name, "curator:merge").await
     }
 
     /// A rewrite of `old` by a curator, with `cites`.
@@ -1215,6 +1276,57 @@ mod tests {
         assert!(text.contains("Uploads have some limit."), "{text}");
         assert!(!text.contains(HANDOFF_MARK), "{text}");
         assert!(!text.contains(WHY_MARK), "{text}");
+    }
+
+    const DEMOTED: &str = "The old mirror listens on port 7311.";
+    const REPLACED: &str = "The mirror has some port, see the wiki page of heronsbill.";
+
+    #[tokio::test]
+    async fn only_a_person_and_a_session_on_a_task_of_the_auditor_get_an_archived_body_in_a_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let demoted = put(&o, req(&format!("{DEMOTED}\n"))).await;
+        o.demote(&demoted, crate::duties::DemoteReason::Wrong)
+            .await
+            .unwrap();
+        let old = put(&o, req(&format!("{REPLACED}\n"))).await;
+        let c = curator(dir.path(), &o, "agent:curator").await;
+        let curated = rewrite(&c, &old, "The mirror listens on port 7312.\n", &[&demoted]).await;
+
+        // an agent names the two entries that retrieval does not serve, in its own entry
+        let w = agent(dir.path(), "agent:w");
+        assert!(matches!(w.get(&demoted).await, Err(Error::Gone(_))));
+        assert!(matches!(w.get(&old).await, Err(Error::Moved { .. })));
+        let cites = WriteRequest {
+            cites: vec![demoted.clone(), old.clone()],
+            ..req("A note about the mirror.\n")
+        };
+        let own = put(&w, cites).await;
+        // a task of a curator is not a task of the auditor
+        for reader in [w, curator(dir.path(), &o, "agent:other").await] {
+            for id in [&own, &curated] {
+                let case = reader.curation_case(id).await.unwrap();
+                assert!(case.replaced.is_none(), "{id}: {:?}", case.replaced);
+                assert!(case.cited.is_empty(), "{id}: {:?}", case.cited);
+                let text = case.to_json().to_string();
+                assert!(!text.contains("7311"), "{id}: {text}");
+                assert!(!text.contains("heronsbill"), "{id}: {text}");
+            }
+            let case = reader.curation_case(&own).await.unwrap();
+            assert_eq!(case.missing, vec![demoted.clone(), old.clone()]);
+            assert!(case.unsupported());
+        }
+
+        let auditor = on_task(dir.path(), &o, "agent:auditor", "auditor:sample").await;
+        let person = agent(dir.path(), "human:test:you");
+        for reader in [auditor, person] {
+            let case = reader.curation_case(&own).await.unwrap();
+            assert_eq!(ids(&case.cited), vec![demoted.as_str(), old.as_str()]);
+            assert!(case.text().contains(DEMOTED));
+            let case = reader.curation_case(&curated).await.unwrap();
+            assert_eq!(case.replaced.unwrap().body.trim(), REPLACED);
+            assert_eq!(ids(&case.cited), vec![demoted.as_str()]);
+        }
     }
 
     #[tokio::test]

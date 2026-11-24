@@ -7,8 +7,10 @@
 //! then a `demoted` event with the id and a reason code. A reason is a code and never a
 //! text, so an erasure has nothing to remove from the log.
 //!
-//! An entry is dead when nothing used it inside a window of time: no read of it is in
-//! the log, and no active entry names it. An agent demotes only a dead entry, and only
+//! An entry is dead when nothing used it inside a window of time: no read of its body
+//! is in the log, and no active entry names it. A survey is not a use: a search, a list
+//! and a brief serve summaries, the auditor reads bodies to test them together, and an
+//! export carries each entry of its scope. Each curation cycle runs such surveys. An agent demotes only a dead entry, and only
 //! on a task of a curator or of the auditor. A person demotes for either reason, and
 //! only a person restores.
 //!
@@ -92,7 +94,7 @@ pub struct Dead {
     pub title: String,
     /// When it was written.
     pub created: String,
-    /// The time of the last read that the log holds, when there is one.
+    /// The time of the last read of its body that the log holds, when there is one.
     pub last_read: Option<String>,
 }
 
@@ -126,20 +128,21 @@ impl Alive {
     }
 }
 
-/// The reads of a log: the last read of each entry whose time parses, and the entries
-/// with a read inside the window.
+/// The reads of bodies in a log: the last read of each entry whose time parses, and the
+/// entries with a read inside the window.
 #[derive(Default)]
 struct Reads<'a> {
     last: BTreeMap<&'a str, OffsetDateTime>,
     recent: BTreeSet<&'a str>,
 }
 
-/// The reads among `events`. A read at or after `since` is inside the window. A read
-/// whose time does not parse counts as inside the window.
+/// The reads among `events` that served a body to a reader. A read at or after `since`
+/// is inside the window. A read whose time does not parse counts as inside the window.
+/// A survey is not counted.
 fn reads_of(events: &[log::Event], since: OffsetDateTime) -> Reads<'_> {
     let mut out = Reads::default();
     for e in events {
-        let Change::Read { ids } = &e.change else {
+        let Change::Read { ids, survey: false } = &e.change else {
             continue;
         };
         let at = OffsetDateTime::parse(&e.at, &Rfc3339).ok();
@@ -203,8 +206,10 @@ fn alive(
 /// - It is not a handoff, not a policy entry and not a canary.
 /// - It is not verified.
 /// - It was written more than `window` before `now`.
-/// - No `read` event among `events` names it with a time inside the window. A time that
-///   does not parse counts as inside the window.
+/// - No `read` event among `events` that served its body to a reader names it with a
+///   time inside the window. A time that does not parse counts as inside the window. A
+///   `read` event of a survey (a search, a list, a brief, a check of the auditor) is
+///   not a use.
 /// - No other active entry names it: in a citation, as the entry that it replaces, or
 ///   in its body.
 #[must_use]
@@ -399,7 +404,7 @@ fn not_live(id: &str, status: Status) -> Error {
 
 impl Memory {
     /// Whether this session is the session of a person: the owner, or another person.
-    fn of_a_person(&self) -> bool {
+    pub(crate) fn of_a_person(&self) -> bool {
         matches!(
             Class::of(self.author(), &self.grants().owner),
             Class::Owner | Class::Human
@@ -591,14 +596,15 @@ impl Memory {
         Ok(())
     }
 
-    /// What the record says of a linked entry: `None` when no granted domain holds it,
-    /// else its status.
+    /// What this session may know of a linked entry: `None` when the read filter of the
+    /// session admits no entry with the id, active or not, else its status. An entry
+    /// that the handling or the reach of the session hides reads as an entry that no
+    /// granted domain holds, as [`Memory::get`] answers for it.
     async fn linked(&self, id: &str) -> Result<Option<Option<Status>>, Error> {
-        match self.find(id).await {
-            Ok((_, e)) => Ok(Some(e.front.status)),
-            Err(Error::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+        let mut wide = self.session_filter()?;
+        wide.include_inactive = true;
+        let meta = self.index.lock().await.meta(id, &wide)?;
+        Ok(meta.map(|m| m.status))
     }
 
     /// The failures of the link checks on one entry: a link that is broken, and a
@@ -643,7 +649,8 @@ impl Memory {
     /// - Ownership: a convention and a method name an owner.
     /// - Cross-link: the entry that an entry replaces, and each citation that is an
     ///   entry id, is an entry that a granted domain holds and that is not demoted,
-    ///   erased or withheld.
+    ///   erased or withheld. A linked entry that the read filter of this session does
+    ///   not admit fails as an entry that no granted domain holds, whatever its status.
     /// - Superseded: no citation is an entry that another entry replaced. The failure
     ///   names the current version, when the session reads one.
     ///
@@ -760,20 +767,28 @@ fn disputed(outcomes: &[Outcome]) -> bool {
     accepted.iter().any(|a| other.iter().any(|o| o.by != a.by))
 }
 
+/// The title of the task that puts the correction of `task` to a curator.
+fn correction_title(task: &str) -> String {
+    format!("Correction of {task}")
+}
+
 /// The task that [`Memory::file_corrections`] files for one correction. The upstream
 /// event is made from the task and the time of its newest outcome, so a later outcome
-/// is filed again.
+/// is filed again. The body names the task, each outcome and each person. It holds no
+/// note and no title: an erasure takes those from the task that was judged, and a copy
+/// here would keep them.
 fn correction_task(domain: &str, c: &Correction) -> TaskSpec {
     let newest = c.outcomes.iter().map(|o| o.at).max();
     let stamp = newest.map_or(0, OffsetDateTime::unix_timestamp_nanos);
     let said: String = c
         .outcomes
         .iter()
-        .map(|o| format!("- {}, by {}: {}\n", o.outcome.word(), o.by, o.note))
+        .map(|o| format!("- {}, by {}\n", o.outcome.word(), o.by))
         .collect();
     let about = format!(
-        "People judged the result of task {} ({}):\n\n{said}\n",
-        c.task, c.title
+        "People judged the result of task {}:\n\n{said}\nThe outcomes of the task hold \
+         what each person wrote. Read them with `outcomes`.\n\n",
+        c.task
     );
     let (origin, requirements, priority, title, ask) = if c.disputed {
         (
@@ -790,7 +805,7 @@ fn correction_task(domain: &str, c: &Correction) -> TaskSpec {
             CORRECTION_ORIGIN,
             Vec::new(),
             2,
-            format!("Correction of {}", c.task),
+            correction_title(&c.task),
             CORRECTION_QUESTION.to_string(),
         )
     };
@@ -907,7 +922,9 @@ impl Memory {
     /// A correction that is not disputed gets a task for a curator, with the origin
     /// [`CORRECTION_ORIGIN`] and priority 2. The body holds [`CORRECTION_QUESTION`]. A
     /// disputed correction gets a task for a person, with the origin [`DISPUTE_ORIGIN`]
-    /// and priority 4, and no task for a curator.
+    /// and priority 4, and no task for a curator. A task for a curator that an earlier
+    /// run filed for the same correction, and that is not closed, is invalidated: no
+    /// curator works a disputed correction.
     ///
     /// # Errors
     ///
@@ -922,6 +939,10 @@ impl Memory {
         let mut already = 0;
         for c in found {
             let created = self.file_own(correction_task(&domain, c)).await?;
+            if c.disputed {
+                self.withdraw_correction(&domain, &c.task, &created.task.id)
+                    .await?;
+            }
             if created.deduplicated {
                 already += 1;
             } else {
@@ -929,6 +950,28 @@ impl Memory {
             }
         }
         Ok((filed, already))
+    }
+
+    /// Invalidate each task that puts the correction of `task` to a curator and that is
+    /// not closed. `dispute` is the task that puts the disputed correction to a person.
+    async fn withdraw_correction(
+        &self,
+        domain: &str,
+        task: &str,
+        dispute: &str,
+    ) -> Result<(), Error> {
+        let title = correction_title(task);
+        let why = format!("the correction of {task} is disputed; a person decides it first");
+        {
+            let mut l = self.ledger.lock().await;
+            for t in l.with_origin(domain, CORRECTION_ORIGIN).await? {
+                if t.spec.title == title && !t.status.is_terminal() {
+                    l.invalidate(&t.id, &why, Some(dispute)).await?;
+                }
+            }
+        }
+        self.ledger_into_log(domain).await?;
+        Ok(())
     }
 }
 
@@ -1019,6 +1062,7 @@ mod tests {
             outside: false,
             change: Change::Read {
                 ids: vec![id.to_string()],
+                survey: false,
             },
         }
     }
@@ -1159,6 +1203,42 @@ mod tests {
         a.get("mem-me-dead001").await.unwrap();
         let after = ids(o.dead(None, DEAD_WINDOW_DAYS).await.unwrap());
         assert_eq!(after, ["mem-me-tap0001"]);
+    }
+
+    #[tokio::test]
+    async fn a_survey_is_no_use_of_an_entry_and_a_curator_demotes_the_entry_after_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let dead = "mem-me-dead001";
+        planted(&o, &[old(dead, "fact", "")]).await;
+        // a session lists and searches, and the auditor tests the entries together
+        let surveyor = agent(dir.path(), "agent:surveyor");
+        let listed = surveyor.list(None, None, 100).await.unwrap();
+        assert!(listed.iter().any(|h| h.id == dead), "{listed:?}");
+        let found = surveyor.search(dead, None, 10).await.unwrap();
+        assert!(found.iter().any(|h| h.id == dead), "{found:?}");
+        let auditor = agent(dir.path(), OWNER);
+        auditor.test_together(None, 8).await.unwrap();
+        // the log holds each of these reads, as a survey
+        let surveys: Vec<(String, Vec<String>)> = log::read(dir.path(), "dom-me", 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.change {
+                Change::Read { ids, survey: true } => Some((e.session.unwrap_or_default(), ids)),
+                Change::Read { ids, .. } => panic!("a read of a body: {ids:?}"),
+                _ => None,
+            })
+            .collect();
+        for session in [surveyor.session_id(), auditor.session_id()] {
+            let named = |(s, ids): &(String, Vec<String>)| s == session && ids == &[dead];
+            assert!(surveys.iter().any(named), "{session}: {surveys:?}");
+        }
+
+        let still = o.dead(None, DEAD_WINDOW_DAYS).await.unwrap();
+        let still: Vec<&str> = still.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(still, [dead]);
+        let curator = on_task(dir.path(), &o, "agent:curator", Some("curator:survey")).await;
+        curator.demote(dead, DemoteReason::Dead).await.unwrap();
     }
 
     #[tokio::test]
@@ -1610,6 +1690,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_link_to_an_entry_that_the_session_does_not_read_fails_the_same_in_each_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let hidden = WriteRequest {
+            classification: Some(Label::Restricted),
+            ..req("The key is in the vault.\n")
+        };
+        let hidden = o.write(hidden).await.unwrap().id;
+        let low = agent(dir.path(), "agent:low").with_handling_cap(Label::Internal);
+        assert!(matches!(low.get(&hidden).await, Err(Error::NotFound(_))));
+        let citing = WriteRequest {
+            cites: vec![hidden.clone(), "mem-me-zzzzzzzz".into()],
+            ..req("A note that names two entries.\n")
+        };
+        let citing = low.write(citing).await.unwrap().id;
+        let links = |found: Vec<Failure>| -> Vec<String> {
+            let of_entry = found.into_iter().filter(|f| f.entry == citing);
+            of_entry.map(|f| f.why).collect()
+        };
+        let nowhere = [
+            format!("{citing} names {hidden}, which no granted domain holds."),
+            format!("{citing} names mem-me-zzzzzzzz, which no granted domain holds."),
+        ];
+        assert_eq!(links(checked(&low).await), nowhere, "while it is active");
+        o.demote(&hidden, DemoteReason::Wrong).await.unwrap();
+        assert_eq!(links(checked(&low).await), nowhere, "after its demotion");
+        assert!(matches!(low.get(&hidden).await, Err(Error::NotFound(_))));
+        assert!(low.label() < Label::Restricted, "{:?}", low.label());
+        // a session that reads the entry learns its state
+        let seen = links(checked(&agent(dir.path(), OWNER)).await);
+        assert_eq!(
+            seen[0],
+            format!("{citing} names {hidden}, which is demoted.")
+        );
+    }
+
+    #[tokio::test]
     async fn each_failure_is_filed_once_and_a_task_to_derive_again_is_claimed_first() {
         let dir = tempfile::tempdir().unwrap();
         let o = owner(dir.path());
@@ -1949,13 +2066,13 @@ mod tests {
         assert_eq!(spec.title, format!("Correction of {t}"));
         assert_eq!((spec.priority, spec.requirements.len()), (2, 0));
         assert_eq!(spec.classification, Label::Restricted);
-        assert!(spec.body.contains(&format!("task {t} (Price the order)")));
-        assert!(
-            spec.body
-                .contains(&format!("- corrected, by {OTHER}: Wrong currency.\n")),
-            "{}",
-            spec.body
-        );
+        // the body names the task, the outcome and the person. It holds no note and no
+        // title: an erasure takes those from the task, and a copy here would keep them
+        let about = format!("task {t}:\n\n- corrected, by {OTHER}\n\n");
+        assert!(spec.body.contains(&about), "{}", spec.body);
+        assert!(spec.body.contains("Read them with `outcomes`."));
+        assert!(!spec.body.contains("Wrong currency"), "{}", spec.body);
+        assert!(!spec.body.contains("Price the order"), "{}", spec.body);
         assert!(spec.body.contains(
             "Could the agent have reached the right answer from what its read filter \
              admitted, whether or not it read that content? If it could, the method is at \
@@ -1994,17 +2111,69 @@ mod tests {
         assert_eq!(spec.title, format!("Disputed correction of {t}"));
         assert_eq!(spec.requirements, ["human"]);
         assert_eq!(spec.priority, 4);
-        assert!(spec
-            .body
-            .contains(&format!("- rejected, by {OTHER}: Too low.\n")));
-        assert!(spec
-            .body
-            .contains(&format!("- accepted, by {OWNER}: It is right.\n")));
+        let said = format!("- rejected, by {OTHER}\n- accepted, by {OWNER}\n");
+        assert!(spec.body.contains(&said), "{}", spec.body);
+        assert!(!spec.body.contains("Too low"), "{}", spec.body);
+        assert!(!spec.body.contains("It is right"), "{}", spec.body);
         assert!(spec.body.contains(
             "The people who judged this result disagree. The owner of the policy decides"
         ));
         assert!(!spec.body.contains("Could the agent"), "{}", spec.body);
         let again = o.corrections(None).await.unwrap();
         assert_eq!(o.file_corrections(None, &again).await.unwrap(), (vec![], 1));
+    }
+
+    #[tokio::test]
+    async fn a_correction_that_becomes_disputed_leaves_the_curator_and_goes_to_a_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let t = task(&o, "Price the order", None, 0).await;
+        let plain = task(&o, "Ship the order", None, 0).await;
+        for id in [&t, &plain] {
+            judged(dir.path(), id, OTHER, OutcomeKind::Rejected, "Too low.")
+                .await
+                .unwrap();
+        }
+        let found = o.corrections(None).await.unwrap();
+        let (filed, _) = o.file_corrections(None, &found).await.unwrap();
+        assert_eq!(filed.len(), 2);
+        let open = dm_ledger::Status::Open;
+        let states = |tasks: Vec<dm_ledger::Task>| -> Vec<(String, dm_ledger::Status)> {
+            tasks
+                .into_iter()
+                .map(|c| (c.spec.title, c.status))
+                .collect()
+        };
+        assert_eq!(
+            states(tasks_of(&o, CORRECTION_ORIGIN).await),
+            [
+                (format!("Correction of {t}"), open),
+                (format!("Correction of {plain}"), open)
+            ]
+        );
+        // another person accepts the result of one task: its correction is disputed now
+        judged(dir.path(), &t, OWNER, OutcomeKind::Accepted, "It is right.")
+            .await
+            .unwrap();
+        let found = o.corrections(None).await.unwrap();
+        let (filed, already) = o.file_corrections(None, &found).await.unwrap();
+        assert_eq!((filed.len(), already), (1, 1));
+        assert_eq!(
+            states(tasks_of(&o, CORRECTION_ORIGIN).await),
+            [
+                (format!("Correction of {t}"), dm_ledger::Status::Invalidated),
+                (format!("Correction of {plain}"), open)
+            ],
+            "no curator works the disputed correction, and the other correction stays"
+        );
+        let disputes = tasks_of(&o, DISPUTE_ORIGIN).await;
+        assert_eq!(
+            states(disputes.clone()),
+            [(format!("Disputed correction of {t}"), open)]
+        );
+        assert_eq!(filed, [disputes[0].id.clone()]);
+        // a run after that changes nothing
+        let again = o.corrections(None).await.unwrap();
+        assert_eq!(o.file_corrections(None, &again).await.unwrap(), (vec![], 2));
     }
 }

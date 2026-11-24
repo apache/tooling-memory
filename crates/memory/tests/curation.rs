@@ -562,9 +562,12 @@ fn a_cycle_does_the_duties_of_the_curator_and_the_auditor_and_files_each_finding
     the_ledger_holds_the_findings_of_the_duties(&tasks, &bare);
 
     let second = f.json(&args);
-    assert_eq!(second["human_review"], 0, "filed once: {second}");
+    // a verdict that has a task takes no place in the sample: the second cycle puts
+    // three verdicts to a person that no person has reviewed
+    assert_eq!(second["human_review"], 3, "the next sample: {second}");
     assert_eq!(second["curations_judged"], 3, "{second}");
     let again = filed_tasks(&f);
+    assert_eq!(bodies_of(&again, "auditor:review").len(), 6);
     for origin in ["auditor:curation", "auditor:handoff", "curator:correction"] {
         let (was, is) = (bodies_of(&tasks, origin), bodies_of(&again, origin));
         assert_eq!(was.len(), is.len(), "{origin}");

@@ -729,8 +729,9 @@ fn normalised(title: &str) -> String {
 }
 
 /// The repeated work among `done`: [`REPEATED_MIN`] tasks or more with one normalised
-/// title. A task that names a definition is not counted. A task that the system or a
-/// tap filed is not counted: its origin is absent or starts with `task:`.
+/// title. A task that names a definition is not counted. Only the work of a session
+/// is counted: a task whose origin is absent or starts with `task:`. A task with each
+/// other origin, which the system or a tap filed, is not counted.
 fn repeated_among(done: &[Task]) -> Vec<Repeated> {
     let mut by_title: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for t in done {

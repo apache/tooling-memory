@@ -424,7 +424,7 @@ mod tests {
 
     /// Whether an event is a read of `id` and of nothing else.
     fn reads_only(e: &Event, id: &str) -> bool {
-        matches!(&e.change, Change::Read { ids } if ids.len() == 1 && ids[0] == id)
+        matches!(&e.change, Change::Read { ids, .. } if ids.len() == 1 && ids[0] == id)
     }
 
     /// A tool that answers with one text.

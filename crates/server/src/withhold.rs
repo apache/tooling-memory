@@ -133,7 +133,7 @@ fn read_before_erasure<'a>(events: &'a [log::Event], session: &str) -> Option<&'
         .iter()
         .filter(|e| e.session.as_deref() == Some(session))
         .find_map(|e| match &e.change {
-            Change::Read { ids } => ids
+            Change::Read { ids, .. } => ids
                 .iter()
                 .map(String::as_str)
                 .find(|id| erased.get(id).is_some_and(|at| e.seq < *at)),
@@ -148,7 +148,7 @@ fn transcripts_read<'a>(events: &'a [log::Event], session: &str) -> BTreeSet<&'a
         .iter()
         .filter(|e| e.session.as_deref() == Some(session))
         .filter_map(|e| match &e.change {
-            Change::Read { ids } => Some(ids),
+            Change::Read { ids, .. } => Some(ids),
             _ => None,
         })
         .flatten()
