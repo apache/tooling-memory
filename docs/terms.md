@@ -97,6 +97,8 @@ term here in the same commit as the first document that needs it.
 | planted case | One of ten fixed pairs of an entry and a summary that the library holds for the qualification of the auditor. Six summaries say what the body does not say. A planted case is never in the record | planted fault (for a sound case), test entry |
 | qualification of the auditor | The decision on how the auditor runs, made from the scores of two models on the planted cases. The mode is `other-model` or `fresh-session`. `state/auditor.json` holds it | certification, calibration |
 | human sample | The verdicts of the auditor that a person reviews in each cycle: 1 in the mode `other-model` and 3 in the mode `fresh-session`. The digest of the entry and the model chooses them | spot check |
+| curation case | What the auditor reads to judge one curated entry: the entry, the version that it replaced, and the body of each entry that it cites. A handoff is never in it, because the reasoning of the curator is there | evidence pack |
+| entries tested together | The scan run over the joined bodies of two entries that one search returns. A finding counts when neither body has it alone | combined scan, pair check |
 | feed | The step that brings the index up to the event log of a domain: it takes each version that the log names above a cursor from the record, and moves the cursor. A writer does it before its write returns | sync (for the feed) |
 | freshness bound | The longest time that a version in the event log of a domain can wait for the feed: 60 seconds. `freshness` measures a domain against it | index lag |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
