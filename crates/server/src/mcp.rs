@@ -1171,7 +1171,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Give a held task up until an outside event comes: a check that runs, a reply, a change that has not landed. Do not wait in the session. The task is blocked, and nobody may claim it, until a tap or a person reports the event; then it is offered again. Pass the id of a handoff you wrote so the next claimant starts where you stopped."
+        description = "Give a held task up until an outside event comes: a check that runs, a reply, a change that has not landed. Do not wait in the session. The task is blocked, and nobody may claim it, until a tap or a person reports the event; then it is offered again. Pass the id of a handoff you wrote so the next claimant starts where you stopped. To queue a change for landing, call `queue_landing`: this tool refuses an event named `landing:<queue>`."
     )]
     async fn wait_for(&self, p: Parameters<WaitParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -1414,7 +1414,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "The metric table of the paper for a domain, over the last `days` days: 21 rows. A row has `measured`, a `value` and the log it comes `from`, or `why_not` says why no log answers it. Read `Share of throughput spent on upkeep` and `Induced work` before you file work of your own. The cost of a completed task is not measured here: `amem cost` gives it at the command line."
+        description = "The metric table of the paper for a domain, over the last `days` days: 21 rows. A row has `measured`, a `value` and the log it comes `from`, or `why_not` says why no log answers it. Read `Share of throughput spent on upkeep` and `Induced work` before you file work of your own. The cost of a completed task is not measured here: `amem cost` gives it at the command line. The four rows from the read log have no value here: only a person reads them, at the command line."
     )]
     async fn metrics(&self, p: Parameters<MetricsParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;

@@ -204,15 +204,20 @@ impl Moments {
     }
 }
 
+/// The task that an origin names as the one a task is filed from: the parent of a
+/// fan-out, the task that a continuation resumes, or the task that a retry repeats.
+pub(crate) fn filed_from(origin: &str) -> Option<&str> {
+    ["task:", "continues:", "retries:"]
+        .iter()
+        .find_map(|p| origin.strip_prefix(p))
+}
+
 /// The task that `task` was filed from: its parent, or the task that its origin names.
 fn above(task: &Task) -> Option<&str> {
     if let Some(parent) = task.spec.parent.as_deref() {
         return Some(parent);
     }
-    let origin = task.spec.origin.as_deref()?;
-    ["task:", "continues:", "retries:"]
-        .iter()
-        .find_map(|p| origin.strip_prefix(p))
+    filed_from(task.spec.origin.as_deref()?)
 }
 
 /// The root of a task: the last task that the walk up finds. An ancestor that the ledger
@@ -241,20 +246,35 @@ pub(crate) fn fleet_filed(root: &Task, owner: &str) -> bool {
     !matches!(class, Class::Owner | Class::Human | Class::Tap)
 }
 
-/// What kind of work `task` was. Its root decides: curation is upkeep, and what a person
-/// or a tap filed is requested. Of the rest, a task that its filer also completed is
-/// upkeep, and a task that another principal completed is induced.
+/// What kind of work `task` was. Curation is upkeep, by the root. A task that an agent
+/// or the system filed and that its filer also completed is upkeep, whatever its root:
+/// a part of a person's task that an agent filed and completed itself is upkeep too.
+/// Of the rest, the root decides: what a person or a tap filed is requested, and what
+/// the fleet filed is induced.
 #[must_use]
 pub fn work_of(task: &Task, root: &Task, completer: Option<&str>, owner: &str) -> Work {
-    if fabric::maintenance(root) {
+    let self_filed = fleet_filed(task, owner) && completer == Some(task.spec.created_by.as_str());
+    if fabric::maintenance(root) || self_filed {
         Work::Upkeep
-    } else if !fleet_filed(root, owner) {
-        Work::Requested
-    } else if completer == Some(task.spec.created_by.as_str()) {
-        Work::Upkeep
-    } else {
+    } else if fleet_filed(root, owner) {
         Work::Induced
+    } else {
+        Work::Requested
     }
+}
+
+/// The start of a window of `days` days that ends at `now`.
+///
+/// # Errors
+///
+/// [`Error::Denied`] for a window that starts before the first time that a clock holds.
+pub(crate) fn window_start(now: OffsetDateTime, days: u32) -> Result<OffsetDateTime, Error> {
+    now.checked_sub(Duration::days(i64::from(days)))
+        .ok_or_else(|| {
+            Error::Denied(format!(
+                "a window of {days} days starts before the first time that a clock holds: name fewer days"
+            ))
+        })
 }
 
 /// The median of the durations; the lower of the two middle ones for an even count.
@@ -303,7 +323,7 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// An ungranted domain, or a ledger error.
+    /// An ungranted domain, a window that is too long, or a ledger error.
     pub async fn flow(&self, domain: Option<&str>, days: u32) -> Result<Flow, Error> {
         let domain = self.resolve_domain(domain)?;
         let l = self.ledger.lock().await;
@@ -317,7 +337,8 @@ impl Memory {
 
     /// The flow that a limit is held against: every task of the domain counts, whatever
     /// the session's handling, and the session reads none of them. A limit is the
-    /// domain's, so it is the same number for every session.
+    /// domain's, so it is the same number for every session. No count of this flow goes
+    /// to a session: it would count tasks that the session may not see.
     pub(crate) async fn flow_all(
         &self,
         l: &Ledger,
@@ -344,7 +365,7 @@ impl Memory {
         read: bool,
     ) -> Result<Flow, Error> {
         let ms = Moments::of(l, domain).await?;
-        let since = l.now() - Duration::days(i64::from(days));
+        let since = window_start(l.now(), days)?;
         let owner = self.grants.owner.as_str();
         let mut flow = Flow {
             domain: domain.to_string(),

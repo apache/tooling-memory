@@ -2288,12 +2288,20 @@ impl Memory {
     /// one, since [`Memory::sign_off`] reads the requester, the action and the version
     /// from it.
     ///
+    /// An origin `task:<id>`, `continues:<id>` or `retries:<id>` names the task that
+    /// this one is filed from. That task is then the root that decides what kind of work
+    /// this one is, and a completion of a continuation closes it. The service sets such
+    /// an origin on a fan-out, a continuation and a retry. Only a person files a task
+    /// with one, and the task named is one that the session may read.
+    ///
     /// # Errors
     ///
     /// An ungranted domain, or a ledger or policy error; [`Error::Denied`] for a
     /// `promote:` origin, which only [`Memory::promote`] files, for a `signoff:` origin,
-    /// which only the service files, or when the origin and upstream event name a task
-    /// already filed that this session may not read.
+    /// which only the service files, for an origin that names a task when the session
+    /// is no person, or when the origin and upstream event name a task already filed
+    /// that this session may not read; the ledger's not-found for an origin that names
+    /// a task that the session may not read.
     pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
         // a task from this origin is an approval task: approve reads its event as the
         // version proposed and its filer as the proposer, so one filed here would be a
@@ -2312,6 +2320,7 @@ impl Memory {
             )));
         }
         let mut l = self.ledger.lock().await;
+        self.names_a_task_it_reads(&l, origin).await?;
         let held = match self.held_task() {
             Some(id) => l.get(&id).await.ok(),
             None => None,
@@ -2322,6 +2331,22 @@ impl Memory {
             Filing::Session
         };
         self.file_in(&mut l, spec, filing, held.as_ref()).await
+    }
+
+    /// Refuse an origin that names a task, unless a person files it and names a task
+    /// that the session may read. An agent that could name any task would choose the
+    /// root of its own filing, and the answer would say whether a hidden task is there.
+    async fn names_a_task_it_reads(&self, l: &Ledger, origin: &str) -> Result<(), Error> {
+        let Some(named) = measure::filed_from(origin) else {
+            return Ok(());
+        };
+        if !measure::is_person(&self.author, &self.grants.owner) {
+            return Err(Error::Denied(
+                "an origin task:<id>, continues:<id> or retries:<id> names the task that a task is filed from: the service sets it, or a person does"
+                    .into(),
+            ));
+        }
+        self.check_task(&l.get(named).await?)
     }
 
     /// File a task the system files on the owner's behalf, as the curator's survey,

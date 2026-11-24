@@ -34,6 +34,19 @@ fn not_a_verdict(event: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// The event that a task in a landing queue waits on is the landing of its change. A
+/// holder queues its change with [`Memory::queue_landing`], which checks the queue. Only
+/// [`Memory::land`] reports the landing, and it checks who lands and the fleet's share.
+fn not_a_landing(event: &str) -> Result<(), Error> {
+    if event.starts_with(crate::measure::LANDING_EVENT) {
+        return Err(Error::Denied(format!(
+            "an event named {}<queue> is the landing of a change: queue_landing waits on that name, and only land reports it",
+            crate::measure::LANDING_EVENT
+        )));
+    }
+    Ok(())
+}
+
 /// Why a task is not closed, folded or handed on: an effect of it that nobody has settled.
 pub(crate) fn unsettled(task: &Task) -> Option<String> {
     task.effects
@@ -64,7 +77,7 @@ impl Memory {
     /// # Errors
     ///
     /// [`Error::Denied`] for an event name that is not one token or that names a
-    /// verdict, or from a session whose label is above the task's classification; a
+    /// verdict or a landing, or from a session whose label is above the task's classification; a
     /// ledger error, including a lease already lost; a task outside the grants.
     pub async fn wait_for(
         &self,
@@ -75,6 +88,7 @@ impl Memory {
     ) -> Result<Task, Error> {
         token("an event name", on, 200)?;
         not_a_verdict(on)?;
+        not_a_landing(on)?;
         if let Some(h) = handoff {
             self.get(h).await?;
         }
@@ -97,7 +111,7 @@ impl Memory {
     /// # Errors
     ///
     /// [`Error::Denied`] for an agent, or an event name that is not one token or that
-    /// names a verdict; an ungranted domain; a ledger error.
+    /// names a verdict or a landing; an ungranted domain; a ledger error.
     pub async fn event_arrived(
         &self,
         domain: Option<&str>,
@@ -105,6 +119,7 @@ impl Memory {
     ) -> Result<Vec<Task>, Error> {
         token("an event name", event, 200)?;
         not_a_verdict(event)?;
+        not_a_landing(event)?;
         if Class::of(&self.author, &self.grants.owner) == Class::Agent {
             return Err(Error::Denied(
                 "an agent does not report the event a task waits on: a tap or a person does".into(),

@@ -199,6 +199,21 @@ two weeks. It is also the reason that none of it is the production shape.
     fraction of its spend limit.
   - The share of upkeep counts tasks. It does not count tokens or time.
   - The ceiling on upkeep holds at admission. It does not hold at the claim.
+  - A part of a person's task that an agent files and completes itself counts as
+    upkeep. The ceiling does not hold that part back at admission, because the root of
+    a task decides there.
+  - At the ceiling on upkeep, an agent is told that its task is not admitted. The
+    ceiling counts tasks that the agent possibly cannot read, so that answer tells the
+    agent one fact about them.
+  - Only a person at the command line gets the four rows of the metric table that come
+    from the read log. A line of the read log has no domain and no label, so no agent
+    session gets those rows.
+  - Two processes on one ledger can each count the claims of one agent and then claim.
+    The agent can then pass its share of throughput by one claim for each process.
+  - The count for the share of throughput reads every event of the domain at each claim
+    of an agent.
+  - Nothing sends a task to the landing queue of its domain. Its holder can complete
+    it, and then no person lands the change.
   - A person lands a change at the command line. No tap reports a landing, and the
     landing queue lands no change in a repository.
   - A task that is queued for landing does not wait for the verdict of its task

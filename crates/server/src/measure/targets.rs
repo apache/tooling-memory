@@ -6,7 +6,6 @@
 use super::table::when;
 use crate::{io, reads, Error, Memory};
 use serde::Serialize;
-use time::Duration;
 
 /// One published target, and what is measured against it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -94,9 +93,9 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// A read log that is there and cannot be read.
+    /// A read log that is there and cannot be read, or a window that is too long.
     pub async fn targets(&self, days: u32) -> Result<Vec<Target>, Error> {
-        let since = self.ledger.lock().await.now() - Duration::days(i64::from(days));
+        let since = super::window_start(self.ledger.lock().await.now(), days)?;
         let reads = reads::all(&self.root).map_err(io(&reads::path(&self.root)))?;
         let searches = reads.iter().filter(|r| r.tool == "search");
         let timed = searches.filter(|r| when(&r.at).is_some_and(|at| at >= since));

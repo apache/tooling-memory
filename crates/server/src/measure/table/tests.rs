@@ -632,6 +632,53 @@ async fn a_metric_counts_no_task_above_the_handling_of_the_session() {
     assert_eq!(moved, rows, "the same tasks move the rows of the owner");
 }
 
+/// A line of the read log has no domain and no label, so no filter of a session bounds
+/// it. The rows from the read log are for a person in person: an agent session and a
+/// served session get no number from the reads of other sessions.
+#[tokio::test]
+async fn the_rows_of_the_read_log_are_for_a_person_in_person_only() {
+    let site = busy().await;
+    let from_reads = [1, 2, 3, 4].map(|i| PAPER_METRICS[i]);
+    let rows = async |m: Memory| {
+        let table = m.metrics(Some(DOMAIN), 7, None).await.unwrap();
+        from_reads.map(|name| row(&table, name).clone())
+    };
+    let capped = async || {
+        let m = Memory::open(site.dir.path()).unwrap();
+        let m = m.with_author("agent:a").with_handling_cap(Label::Internal);
+        rows(site.timed(m).await).await
+    };
+    let before = capped().await;
+    site.log(
+        "reads.jsonl",
+        &[
+            read(3, "s-restricted", "search", 0),
+            read(4, "s-restricted", "search", 0),
+        ],
+    );
+    let served = site.owner().await;
+    served.mark_served();
+    for (who, got) in [
+        ("an agent", capped().await),
+        (
+            "an agent with no cap",
+            rows(site.session("agent:b").await).await,
+        ),
+        ("a served person", rows(served).await),
+    ] {
+        for r in &got {
+            assert!(!r.measured && r.value.is_null(), "{who}: {r:?}");
+            let why = r.why_not.as_deref().unwrap_or_default();
+            assert!(why.contains("only a person reads this row"), "{who}: {r:?}");
+        }
+        assert_eq!(got, before, "{who}");
+    }
+    let person = rows(site.owner().await).await;
+    let searches = &person[3];
+    assert!(searches.measured, "{searches:?}");
+    assert_eq!(searches.value["searches"], 4, "{searches:?}");
+}
+
 #[tokio::test]
 async fn the_targets_of_the_search_latency_are_measured_from_the_timed_searches() {
     let site = Site::new();

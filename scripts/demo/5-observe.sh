@@ -48,7 +48,11 @@ if has limits; then
   upkeep() { a metrics --domain dom-demo --json | j "(lambda v: $1)(next(r for r in d['rows'] if r['name'] == 'Share of throughput spent on upkeep')['value'])"; }
   share() { upkeep "f\"{v['upkeep']} of the {v['done']} completed tasks are upkeep ({v['share']:.0%}), {v['self_filed']} of them filed and completed by one agent\""; }
   rows() { a metrics --domain dom-demo | grep -E "^  ($1):" | sed 's/^/  /'; }
+  # This block changes grants.toml and puts it back. A run that stopped in the block
+  # left the copy: start from it, and put the grants back however this run ends.
+  [ ! -f "$root/grants.toml.before-limits" ] || mv "$root/grants.toml.before-limits" "$root/grants.toml"
   cp "$root/grants.toml" "$root/grants.toml.before-limits"
+  trap '[ ! -f "$root/grants.toml.before-limits" ] || mv "$root/grants.toml.before-limits" "$root/grants.toml"' EXIT
   printf '\n[landing.main]\ndomain = "dom-demo"\nper_day = 20\n' >> "$root/grants.toml"
   echo "  grants.toml: [landing.main] domain = \"dom-demo\", per_day = 20: the queue that changes land through"
   c=$(a task create "Correct the release checklist" --domain dom-demo --body "A change that a person asked for." | j "d['id']")
@@ -105,6 +109,7 @@ if has limits; then
   # the task that was admitted last is closed, so that no later act works it
   [ -z "$held" ] || a task invalidate "$held" --reason "a demo" >/dev/null 2>&1 || true
   mv "$root/grants.toml.before-limits" "$root/grants.toml"
+  trap - EXIT
 fi
 
 if has drift && gateway; then

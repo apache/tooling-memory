@@ -4,8 +4,12 @@
 //! a value from the ledger, the read log, the decision log or the grants, or it says why
 //! it is not measured. No row asks an agent, and no row calls a model. Every window ends
 //! at the ledger's clock. A row counts only the tasks that the session may read.
+//!
+//! A line of the read log holds no domain and no label, so no filter of a session bounds
+//! it. The rows from the read log are thus for a person in person only. Every other
+//! session gets them as not measured.
 
-use super::{landing_event, median, Flow, Moments, LANDING_EVENT};
+use super::{landing_event, median, window_start, Flow, Moments, LANDING_EVENT};
 use crate::approvals::SIGN_OFF_ORIGIN;
 use crate::autonomy::VERDICT_EVENT;
 use crate::limits::Limit;
@@ -69,6 +73,10 @@ const ROWS: [fn(&Logs) -> Metric; 21] = [
     upkeep,
     positions,
 ];
+
+/// Why a row from the read log has no value for a session that is no person in person.
+const ROOT_ONLY: &str =
+    "the read log holds the reads of every session of the root, with no domain and no label: only a person reads this row, with amem metrics";
 
 /// The tools that pull from the memory: a re-query is a search after a search among them.
 const PULLS: [&str; 4] = ["search", "list", "get", "recall"];
@@ -182,9 +190,10 @@ struct Logs {
     now: OffsetDateTime,
     /// What the caller says a completed task costs.
     cost: Option<Value>,
-    /// The retrieval metrics of the window.
-    retrieval: Counts,
-    /// The read log, oldest first.
+    /// The retrieval metrics of the window; `None` for a session that does not read the
+    /// rows of the read log.
+    retrieval: Option<Counts>,
+    /// The read log, oldest first; empty for such a session.
     reads: Vec<Read>,
     /// The decision log of the window, every domain.
     decisions: Vec<Decided>,
@@ -263,7 +272,9 @@ fn cost(x: &Logs) -> Metric {
 }
 
 fn fetch_through(x: &Logs) -> Metric {
-    let c = &x.retrieval;
+    let Some(c) = &x.retrieval else {
+        return Metric::not(ROOT_ONLY);
+    };
     match c.fetch_through_rate {
         Some(rate) => Metric::of(
             "read log",
@@ -274,7 +285,9 @@ fn fetch_through(x: &Logs) -> Metric {
 }
 
 fn wasted(x: &Logs) -> Metric {
-    let c = &x.retrieval;
+    let Some(c) = &x.retrieval else {
+        return Metric::not(ROOT_ONLY);
+    };
     match c.wasted_read_ratio {
         Some(ratio) => Metric::of(
             "read log",
@@ -286,7 +299,9 @@ fn wasted(x: &Logs) -> Metric {
 }
 
 fn depth(x: &Logs) -> Metric {
-    let c = &x.retrieval;
+    let Some(c) = &x.retrieval else {
+        return Metric::not(ROOT_ONLY);
+    };
     match c.retrieval_depth {
         Some(depth) => Metric::of(
             "read log",
@@ -297,6 +312,9 @@ fn depth(x: &Logs) -> Metric {
 }
 
 fn requery(x: &Logs) -> Metric {
+    if x.retrieval.is_none() {
+        return Metric::not(ROOT_ONLY);
+    }
     let mut last: BTreeMap<&str, &str> = BTreeMap::new();
     let (mut searches, mut empty, mut again) = (0, 0, 0);
     for r in &x.reads {
@@ -658,10 +676,14 @@ impl Memory {
         l: &Ledger,
         domain: &str,
         days: u32,
-        retrieval: Counts,
+        retrieval: Option<Counts>,
     ) -> Result<Logs, Error> {
         let now = l.now();
-        let since = now - Duration::days(i64::from(days));
+        let since = window_start(now, days)?;
+        let reads = match retrieval {
+            Some(_) => reads::all(&self.root).map_err(io(&reads::path(&self.root)))?,
+            None => Vec::new(),
+        };
         let granted = self.domains().into_iter();
         let tasks = self.domain_tasks(l, domain).await?;
         let ceiling = self.cap(l, domain, &Limit::Upkeep, domain).await?;
@@ -674,7 +696,7 @@ impl Memory {
             now,
             cost: None,
             retrieval,
-            reads: reads::all(&self.root).map_err(io(&reads::path(&self.root)))?,
+            reads,
             decisions: decisions(&self.root, since)?,
             tasks: tasks.into_iter().map(|t| (t.id.clone(), t)).collect(),
             moments: Moments::of(l, domain).await?,
@@ -688,13 +710,15 @@ impl Memory {
     /// The metric table of the paper for a domain, over the last `days` days: the 21
     /// rows of [`PAPER_METRICS`], in the paper's order. A row has a value from the logs,
     /// or it says why it is not measured. Only the tasks that the session may read are
-    /// counted, and each counted is read. The library cannot read the meter of the
+    /// counted, and each counted is read. The four rows from the read log are measured
+    /// for a person in person only: that log holds the reads of every session, and no
+    /// line of it has a domain or a label. The library cannot read the meter of the
     /// egress, so the caller passes the cost of a completed task.
     ///
     /// # Errors
     ///
-    /// An ungranted domain, a log or a price vector that cannot be read, or a ledger
-    /// error.
+    /// An ungranted domain, a window that is too long, a log or a price vector that
+    /// cannot be read, or a ledger error.
     pub async fn metrics(
         &self,
         domain: Option<&str>,
@@ -704,11 +728,15 @@ impl Memory {
         let domain = self.resolve_domain(domain)?;
         let prices = self.prices()?.version;
         let now = self.ledger.lock().await.now();
-        let since = now - Duration::days(i64::from(days));
+        let since = window_start(now, days)?;
         // before the ledger is held: the retrieval metrics list the completed tasks
-        let (retrieval, _) = self.read_metrics_since(Some(since)).await?;
+        let retrieval = if self.is_in_person() {
+            Some(self.read_metrics_since(Some(since)).await?.0.total)
+        } else {
+            None
+        };
         let l = self.ledger.lock().await;
-        let mut logs = self.logs(&l, &domain, days, retrieval.total).await?;
+        let mut logs = self.logs(&l, &domain, days, retrieval).await?;
         logs.cost = cost_per_task;
         let named = PAPER_METRICS.iter().zip(ROWS);
         let rows = named.map(|(name, row)| Metric {

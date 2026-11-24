@@ -65,6 +65,28 @@ impl Site {
         self.session(OWNER).await
     }
 
+    /// A new session of `author` that reads nothing above `internal`.
+    async fn capped(&self, author: &str) -> Memory {
+        let m = Memory::open(self.dir.path()).unwrap().with_author(author);
+        let m = m.with_handling_cap(Label::Internal);
+        let c = self.clock.clone();
+        m.ledger.lock().await.set_clock(move || *c.lock().unwrap());
+        m
+    }
+
+    /// A `restricted` task as the ledger takes it from `by`, admitted.
+    async fn restricted(&self, by: &str, spec: TaskSpec) -> Task {
+        let owner = self.owner().await;
+        let mut l = owner.ledger.lock().await;
+        let spec = TaskSpec {
+            classification: Label::Restricted,
+            created_by: by.into(),
+            ..spec
+        };
+        let t = l.create(spec).await.unwrap().task;
+        l.admit(&t.id).await.unwrap()
+    }
+
     async fn handoff(&self) -> String {
         let h = WriteRequest {
             body: "What was done.\n".into(),
@@ -451,7 +473,7 @@ async fn work_that_the_fleet_filed_stays_proposed_at_the_share_of_upkeep() {
     );
     let log = std::fs::read_to_string(site.dir.path().join("state/decisions.jsonl")).unwrap();
     let said = format!(
-        "{} is not admitted: 1 of the 2 tasks completed in dom-me in 7 days are upkeep, and the share of upkeep is 50 percent",
+        "{} is not admitted: the upkeep among the tasks completed in dom-me in 7 days is at the share, and the share of upkeep is 50 percent. A person admits it",
         held.id
     );
     assert!(log.contains(&said), "{log}");
@@ -484,6 +506,104 @@ async fn work_that_a_person_asked_for_is_admitted_at_the_share_of_upkeep() {
     assert_eq!(part.spec.created_by, "agent:a");
     assert_eq!(part.status, Status::Open, "its root is a person's task");
     assert!(!limited(site.dir.path(), "agent:a"));
+}
+
+/// The root of a task decides whether the share of upkeep holds it back. An agent that
+/// could name a task in the origin of its filing would choose that root: a task of a
+/// person passes the share, and a hidden task answers whether it is there.
+#[tokio::test]
+async fn an_agent_names_no_task_in_the_origin_of_its_filing() {
+    let site = Site::new(upkeep(50));
+    site.half_upkeep().await;
+    let asked = site.asked(spec("Asked by a person")).await;
+    let secret = site.restricted(OWNER, spec("Secret")).await;
+    let named = "names the task that a task is filed from";
+    for who in ["agent:a", "tap:github", "curator"] {
+        for prefix in ["task:", "continues:", "retries:"] {
+            for id in [asked.id.as_str(), secret.id.as_str(), "task-none"] {
+                let forged = from("Mine", &format!("{prefix}{id}"));
+                let r = site.session(who).await.create_task(forged).await;
+                assert!(denied(&r, named), "{who} {prefix}{id}: {r:?}");
+            }
+        }
+    }
+    let owner = site.owner().await;
+    let proposed = owner.tasks(Some(DOMAIN), Status::Proposed).await.unwrap();
+    assert!(proposed.is_empty(), "nothing was filed: {proposed:?}");
+    // without the name, the filing of the agent is its own and the share holds it back
+    let plain = site.session("agent:a").await;
+    let plain = plain.create_task(spec("Mine")).await.unwrap().task;
+    let admit = site.session("agent:a").await.admit(&plain.id).await;
+    assert!(
+        denied(&admit, "the share of upkeep is 50 percent"),
+        "{admit:?}"
+    );
+    // a person names a task that the session reads; a task above its handling and a
+    // task that is not there get the same answer
+    let person = site.capped("human:test:you").await;
+    for id in [secret.id.as_str(), "task-none"] {
+        let r = person
+            .create_task(from("Go on", &format!("task:{id}")))
+            .await;
+        let missing = matches!(&r, Err(Error::Ledger(dm_ledger::Error::NotFound(_))));
+        assert!(missing, "{id}: {r:?}");
+    }
+    let next = from("Go on", &format!("task:{}", asked.id));
+    let next = person.create_task(next).await.unwrap().task;
+    assert_eq!(next.spec.origin, Some(format!("task:{}", asked.id)));
+}
+
+/// The share of upkeep is the domain's: the tasks above the handling of the filer count
+/// too. A session that reads less would otherwise pass the share.
+#[tokio::test]
+async fn the_share_of_upkeep_counts_the_tasks_above_the_handling_of_the_filer() {
+    let site = Site::new(upkeep(50));
+    site.done(&site.asked(spec("Asked")).await, "agent:b").await;
+    let own = site.restricted("agent:b", spec("Own, restricted")).await;
+    site.done(&own, "agent:b").await;
+    let low = site.capped("agent:a").await;
+    let seen = low.flow(Some(DOMAIN), 7).await.unwrap();
+    assert_eq!((seen.done, seen.upkeep), (1, 0), "the session reads one");
+    let held = low.file_own(spec("More of the fleet's own")).await.unwrap();
+    assert_eq!(held.task.status, Status::Proposed, "1 of 2 is upkeep");
+    assert!(limited(site.dir.path(), "agent:a"));
+}
+
+/// A limit is held against every task of the domain. The report gives a session the
+/// counts of the tasks that it may read, so no row moves for a task above its handling.
+#[tokio::test]
+async fn the_report_counts_no_task_above_the_handling_of_the_session() {
+    let site = Site::new(DomainLimits {
+        upkeep_percent: Some(90),
+        outbound: BTreeMap::from([("github".to_string(), 4)]),
+        ..DomainLimits::default()
+    });
+    site.half_upkeep().await;
+    let counts = async |m: Memory| {
+        let rows = m.limits(None).await.unwrap();
+        let now = |limit: &str| rows.iter().find(|r| r.limit == limit).unwrap().now;
+        (now("upkeep"), now("outbound:github"))
+    };
+    let before = counts(site.capped("agent:a").await).await;
+    assert_eq!(before, (Some(50.0), Some(0.0)));
+    assert_eq!(counts(site.owner().await).await, before);
+    for i in 0..3 {
+        let own = site.restricted("agent:b", spec(&format!("Own {i}"))).await;
+        site.done(&own, "agent:b").await;
+    }
+    let posted = site.restricted(OWNER, from("G", "github:o/r#1")).await;
+    site.done(&posted, "agent:b").await;
+    let owner = site.owner().await;
+    let url = "https://example.test/1";
+    owner
+        .post(&posted.id, url, DOMAIN, Label::Restricted)
+        .await
+        .unwrap();
+    assert_eq!(counts(site.capped("agent:a").await).await, before);
+    // 4 of the 6 completed tasks are upkeep, and one handoff was posted
+    let all = counts(owner).await;
+    assert!((all.0.unwrap() - 400.0 / 6.0).abs() < 1e-9, "{all:?}");
+    assert_eq!(all.1, Some(1.0));
 }
 
 #[tokio::test]

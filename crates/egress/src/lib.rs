@@ -2087,6 +2087,33 @@ mod tests {
         );
     }
 
+    /// The limit of the root over one day in money is held at the egress too, with no
+    /// limit for one session beside it.
+    #[tokio::test]
+    async fn a_model_call_over_the_limit_of_a_day_in_money_does_not_leave() {
+        let (_dir, root, e) = metered("[spend.openai]\nday_usd_cents = 1\n").await;
+        // 80 input tokens at 125 dollars a million are one cent; the output is free
+        std::fs::write(
+            root.join("prices.toml"),
+            "version = \"t1\"\n[models.m]\ninput = 125.0\n",
+        )
+        .unwrap();
+        let ask = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        // half a cent after the first call: the second leaves
+        e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        e.call("openai", "v1/chat/completions", &ask).await.unwrap();
+        let refused = e
+            .call("openai", "v1/chat/completions", &ask)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains(
+                "the root has spent 1 US cents at openai in the last day, its limit is 1 US cents (price vector t1)"
+            ),
+            "{refused}"
+        );
+    }
+
     #[tokio::test]
     async fn every_model_call_leaves_its_decision_context() {
         let fake = Router::new().route(

@@ -107,7 +107,7 @@ term here in the same commit as the first document that needs it.
 | price vector | The file `prices.toml` under the root: the price of each model's tokens and of the host's resources, with a version | price list, rate card |
 | share of throughput | The most claims that one agent may make in one domain in 60 minutes, from `[limits.<domain>] claims_per_hour` | rate limit (for this share) |
 | outbound rate | The most handoffs of one family of origins that a tap gets to post in 24 hours, from `[limits.<domain>.outbound]`. The family is the origin of the task before its first colon | |
-| upkeep | Completed work that no person and no tap asked for and that only the fleet handled: curation, and a task that an agent filed and completed itself | |
+| upkeep | Completed work that the fleet made for itself: curation, and a task that an agent filed and completed itself, whatever task it is a part of | |
 | share of upkeep | The highest percentage of the completed tasks of a window that may be upkeep, from `[limits.<domain>] upkeep_percent` | |
 | limit | One of the five values that hold the fleet back, each in its own unit: a spend limit, the share of throughput, the outbound rate, the ceiling on enforced rules, and the share of upkeep. `amem limits` lists them | quota (for a limit), cap (for a limit) |
 | requested work | Completed work that a person or a tap asked for: a task that one of them filed, and each task that is a part of it | |

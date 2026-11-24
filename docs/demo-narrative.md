@@ -339,8 +339,9 @@ filing of a session that holds no task is born `proposed` in this domain, so `ag
 also asks to admit it. The server holds the ceiling at that admission. The first task is
 admitted, and `agent:a` claims it and completes it. Now 1 of the 2 completed tasks is
 upkeep, and `agent:a` filed and completed that one itself. The second task is refused at
-admission. The refusal gives the counts and the ceiling, and it says that a person
-admits the task or raises the share. The task stays `proposed`.
+admission. The refusal gives the ceiling, and it says that a person admits the task or
+raises the share. It gives no count, because the share counts tasks that a session
+possibly cannot read. The task stays `proposed`.
 
 `amem limits` then shows the five limits, each in its own unit: spend, the share of
 throughput, the outbound rate, the enforced rules and the share of upkeep, and also the

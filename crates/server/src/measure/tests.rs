@@ -160,8 +160,14 @@ fn the_root_and_the_completer_decide_the_kind_of_work() {
         let curation = task(OWNER, Some(origin));
         assert_eq!(kind(&curation, &curation, "agent:a"), Work::Upkeep);
     }
-    // the root decides: a part that an agent filed and completed, of a person's task
-    assert_eq!(kind(&own, &asked, "agent:a"), Work::Requested);
+    // a part of a person's task that an agent filed: upkeep when that agent completed
+    // it, and requested work when another principal did
+    assert_eq!(kind(&own, &asked, "agent:a"), Work::Upkeep);
+    assert_eq!(kind(&own, &asked, "agent:b"), Work::Requested);
+    assert_eq!(kind(&system, &asked, "launcher"), Work::Upkeep);
+    // a person who completes what that person filed did requested work
+    assert_eq!(kind(&asked, &asked, OWNER), Work::Requested);
+    assert_eq!(kind(&asked, &own, OWNER), Work::Induced);
     assert_eq!(
         kind(&own, &task(OWNER, Some("curator:x")), "agent:b"),
         Work::Upkeep
@@ -195,8 +201,10 @@ async fn completed_work_divides_into_requested_induced_and_upkeep() {
     assert_eq!(flow.induced_open, 1);
 }
 
+/// The paper, section 9: a task that an agent filed and completed itself counts as
+/// upkeep. The root of the task makes no exception.
 #[tokio::test]
-async fn a_part_of_a_person_s_task_is_requested_work_whoever_files_it() {
+async fn a_part_that_an_agent_files_and_completes_itself_is_upkeep_whatever_its_root() {
     let site = Site::new(None);
     let whole = site.filed(OWNER, spec("The whole")).await;
     let agent = site.session("agent:a").await;
@@ -205,22 +213,115 @@ async fn a_part_of_a_person_s_task_is_requested_work_whoever_files_it() {
     let part = agent.create_task(spec("A part")).await.unwrap().task;
     assert_eq!(part.spec.parent.as_deref(), Some(whole.id.as_str()));
     assert_eq!(part.spec.created_by, "agent:a");
+    let other = agent.create_task(spec("Another part")).await.unwrap().task;
     let open = site.flow().await;
     assert_eq!(open.induced_open, 0, "the root is a person's");
-    if part.status == Status::Proposed {
-        site.session(OWNER).await.admit(&part.id).await.unwrap();
+    for t in [&part, &other] {
+        if t.status == Status::Proposed {
+            site.session(OWNER).await.admit(&t.id).await.unwrap();
+        }
     }
     site.done(&part, "agent:a").await;
     let flow = site.flow().await;
-    assert_eq!((flow.done, flow.requested, flow.upkeep), (1, 1, 0));
-    // and what continues an agent's own task has that task as its root
+    assert_eq!(
+        (flow.done, flow.requested, flow.upkeep, flow.self_filed),
+        (1, 0, 1, 1),
+        "the agent filed the part and completed it"
+    );
+    site.done(&other, "agent:b").await;
+    let flow = site.flow().await;
+    assert_eq!(
+        (flow.done, flow.requested, flow.upkeep),
+        (2, 1, 1),
+        "another agent completed the other part"
+    );
+    // and what a person files from an agent's own task has that task as its root
     let own = site.filed("agent:a", spec("Own")).await;
     let next = site
-        .filed("agent:b", from("Go on", &format!("task:{}", own.id)))
+        .filed(OWNER, from("Go on", &format!("task:{}", own.id)))
         .await;
     site.done(&next, "agent:b").await;
     let flow = site.flow().await;
-    assert_eq!((flow.done, flow.requested, flow.upkeep), (2, 1, 1));
+    assert_eq!((flow.done, flow.requested, flow.induced), (3, 1, 1));
+}
+
+/// Only `land` reports the event of a landing queue, and only `queue_landing` waits on
+/// it. A report by name would open every queued change with no person to land it, past
+/// the order of the queue and the share of the fleet.
+#[tokio::test]
+async fn no_session_reports_a_landing_or_waits_on_one_by_name() {
+    let site = Site::new(Some(0));
+    let t = site.queued("A change", "agent:a").await;
+    for who in [OWNER, "human:test:you", "tap:github"] {
+        let said = site.session(who).await;
+        let said = said.event_arrived(Some("dom-me"), "landing:main").await;
+        assert!(
+            denied(&said, "is the landing of a change"),
+            "{who}: {said:?}"
+        );
+    }
+    let owner = site.session(OWNER).await;
+    let still = owner.get_task(&t.id).await.unwrap();
+    assert_eq!(still.status, Status::Blocked);
+    assert_eq!(still.waiting_on.as_deref(), Some("landing:main"));
+    // a holder that waits on the name would be in a queue that checked nothing
+    let held = site.filed(OWNER, spec("Another change")).await;
+    let holder = site.session("agent:b").await;
+    holder.claim(&held.id, Duration::minutes(30)).await.unwrap();
+    for event in ["landing:main", "landing:plat", "landing:"] {
+        let waits = holder.wait_for(&held.id, None, event, None).await;
+        assert!(
+            denied(&waits, "queue_landing waits on that name"),
+            "{event}: {waits:?}"
+        );
+    }
+    let view = owner.landing("main").await.unwrap();
+    assert_eq!(view.waiting.len(), 1, "{view:?}");
+    assert_eq!(view.fleet_landed_last_day, 0);
+}
+
+/// A landing is the completion that the arrival of the queue's event came with. A task
+/// that was queued, opened by another writer of the ledger and then completed by an
+/// agent did not land.
+#[tokio::test]
+async fn a_completion_at_another_time_than_the_arrival_is_no_landing() {
+    let site = Site::new(None);
+    site.at(1);
+    let t = site.queued("A change", "agent:a").await;
+    site.at(2);
+    let owner = site.session(OWNER).await;
+    let mut l = owner.ledger.lock().await;
+    let woken = l.arrived("dom-me", "landing:main").await.unwrap();
+    drop(l);
+    assert_eq!(woken.len(), 1);
+    site.at(5);
+    site.done(&t, "agent:b").await;
+    let view = owner.landing("main").await.unwrap();
+    assert_eq!(view.fleet_landed_last_day, 0, "{view:?}");
+    assert_eq!((view.landed_counted, view.landed_not_yet_counted), (0, 0));
+    assert_eq!(view.median_claim_to_landed_secs, None);
+}
+
+/// A window is a number of days before the clock of the ledger. A number that no time
+/// can hold is refused: it does not stop the memory server.
+#[tokio::test]
+async fn a_window_that_no_time_can_hold_is_refused() {
+    let site = Site::new(None);
+    let owner = site.session(OWNER).await;
+    let flow = owner.flow(Some("dom-me"), u32::MAX).await;
+    assert!(denied(&flow, "a window of 4294967295 days"), "{flow:?}");
+    let table = owner.metrics(Some("dom-me"), u32::MAX, None).await;
+    assert!(denied(&table, "a window of 4294967295 days"), "{table:?}");
+    let targets = owner.targets(u32::MAX).await;
+    assert!(
+        denied(&targets, "a window of 4294967295 days"),
+        "{targets:?}"
+    );
+    // the longest window that a time holds is answered
+    assert_eq!(
+        owner.flow(Some("dom-me"), 365 * 1000).await.unwrap().done,
+        0
+    );
 }
 
 #[tokio::test]

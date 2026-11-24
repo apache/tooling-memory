@@ -195,23 +195,27 @@ async fn claims_in_hour(l: &Ledger, domain: &str, who: &str) -> Result<u64, Erro
     Ok(made.count() as u64)
 }
 
-/// The handoffs posted back in the 24 hours before the ledger's clock, by the family of
-/// the task's origin.
-pub(crate) async fn posted_in_day(
-    l: &Ledger,
-    domain: &str,
-) -> Result<BTreeMap<String, u64>, Error> {
+/// The task of each handoff posted back in the 24 hours before the ledger's clock: one
+/// for each post.
+async fn posted_in_day(l: &Ledger, domain: &str) -> Result<Vec<Task>, Error> {
     let since = l.now() - Duration::hours(24);
-    let mut posted = BTreeMap::new();
+    let mut posted = Vec::new();
     for m in l.moments(domain).await? {
         if m.kind != "posted" || m.at <= since {
             continue;
         }
-        if let Ok(task) = l.get(&m.task).await {
-            *posted.entry(fabric::family(&task)).or_insert(0) += 1;
-        }
+        posted.extend(l.get(&m.task).await.ok());
     }
     Ok(posted)
+}
+
+/// The number of `posted` tasks, by the family of the task's origin.
+fn by_family(posted: &[Task]) -> BTreeMap<String, u64> {
+    let mut families = BTreeMap::new();
+    for task in posted {
+        *families.entry(fabric::family(task)).or_insert(0) += 1;
+    }
+    families
 }
 
 /// What the outbound rates of a domain leave for one answer to a tap.
@@ -408,7 +412,8 @@ impl Memory {
         if shares.outbound.is_empty() {
             return Ok(rate);
         }
-        let posted = posted_in_day(l, domain).await?;
+        // the rate is the domain's: every post counts, whatever the session reads
+        let posted = by_family(&posted_in_day(l, domain).await?);
         for family in shares.outbound.keys() {
             let limit = Limit::Outbound(family.clone());
             if let Some(cap) = self.cap(l, domain, &limit, domain).await? {
@@ -425,6 +430,10 @@ impl Memory {
     /// in the window is at the share. Curation keeps the floor of the rubric: a curation
     /// task is not held back while curation is under that floor. With nothing completed
     /// in the window there is no share, and nothing is held back.
+    ///
+    /// The share is the domain's: every task counts, whatever the session reads. The
+    /// reason thus gives no count, because a count would be of tasks that the session
+    /// may not see.
     pub(crate) async fn upkeep_hold(
         &self,
         l: &Ledger,
@@ -455,17 +464,19 @@ impl Memory {
             return Ok(None);
         }
         Ok(Some(format!(
-            "{} is not admitted: {} of the {} tasks completed in {domain} in {days} days are upkeep, and the share of upkeep is {} percent. A person admits it, or raises the share: amem limits raise upkeep",
-            task.id, flow.upkeep, flow.done, cap.cap
+            "{} is not admitted: the upkeep among the tasks completed in {domain} in {days} days is at the share, and the share of upkeep is {} percent. A person admits it, or raises the share: amem limits raise upkeep",
+            task.id, cap.cap
         )))
     }
 
     /// The five limits of a domain as they stand, in the paper's order: spend, the share
     /// of throughput, the outbound rate, the enforced rules, and the share of upkeep.
     /// Every limit has a row. A limit that the grants do not set has no cap and the note
-    /// `not set`. The counts are the ones that the limits are held against: they are of
-    /// the whole domain. The session reads no task for them, except for the row of a
-    /// landing queue, which reads as [`Memory::landing`] does.
+    /// `not set`. A limit is held against every task of the domain. The counts of the
+    /// rows of the outbound rate, of a landing queue and of the share of upkeep are of
+    /// the tasks that the session may read, and each counted is read. For a session that
+    /// reads every task of the domain, they are the counts that the limits are held
+    /// against.
     ///
     /// # Errors
     ///
@@ -547,7 +558,7 @@ impl Memory {
     /// landing queue of the domain.
     async fn outbound_rows(&self, l: &Ledger, domain: &str) -> Result<Vec<LimitRow>, Error> {
         let mut rows = Vec::new();
-        let posted = posted_in_day(l, domain).await?;
+        let posted = by_family(&self.read_tasks(posted_in_day(l, domain).await?)?);
         let families = self.grants.limits.get(domain).map(|s| &s.outbound);
         for family in families.into_iter().flat_map(BTreeMap::keys) {
             let limit = Limit::Outbound(family.clone());
@@ -610,7 +621,7 @@ impl Memory {
             .limits
             .get(domain)
             .map_or(DomainLimits::WINDOW_DAYS, DomainLimits::window);
-        let flow = self.flow_all(l, domain, days).await?;
+        let flow = self.flow_in(l, domain, days).await?;
         let row = LimitRow::new("upkeep", "percent of completed tasks", domain).capped(cap);
         Ok(match flow.upkeep_share {
             Some(share) => row.counted(share * 100.0),

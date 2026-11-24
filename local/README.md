@@ -189,6 +189,13 @@ decision in PLAN.md). The fan-out files two kinds of task:
 - A continuation, "Resume: <parent>", has `origin: continues:<parent>`. It depends on the
   children, and it gets the requirements and the priority of the parent.
 
+The memory server sets these origins, and the origin `retries:<task>` of a retry. An
+agent or a tap cannot file a task with an origin that names a task: `task:<id>`,
+`continues:<id>` or `retries:<id>`. The memory server refuses the filing. A person can
+file such a task when the session can read the task that the origin names. For a task
+that the session cannot read, the answer is "not found", as for a task that does not
+exist.
+
 The parent's session ends with its handoff, as each session does. The continuation becomes
 claimable when the last child completes. Its prompt contains the handoff of each child and
 the parent's own handoff. That is what resuming is. The starter grants set `admit_own =
@@ -1239,6 +1246,11 @@ The memory tool is `queue_landing`. The task is then `blocked` and waits on
 can claim the task. The task does not wait for the verdict of its task definition: the
 landing by a person closes it.
 
+An event with the name `landing:<queue>` is the landing of a change. No session waits
+on that name with `amem task wait`, and no session reports it with `amem task arrived`.
+The memory server refuses both. Only `queue-landing` puts a task in a landing queue, and
+only `amem landing land` reports a landing.
+
 `amem landing show <queue>` shows the landing queue as it is. The memory tool is
 `landing`. It shows:
 
@@ -1348,7 +1360,12 @@ latency are measured against their targets. Each of the other 8 targets says why
 is measured against it.
 
 The memory tool `metrics` gives the table with no cost in the first row. It does not
-give the targets.
+give the targets. It also gives no value in the four rows that come from the read log:
+fetch-through, wasted reads, retrieval depth, and the zero-result and re-query rate. The
+read log holds the reads of every session of the root, and a line has no domain and no
+label. Thus only a person at the command line gets those rows.
+
+A window of more days than a time can hold is refused.
 
 ## Transcripts are sources: `amem transcript`
 
@@ -1565,7 +1582,12 @@ github = 20
   fleet's own work is a task whose root is curation, or whose root an agent or the
   system filed. Such a task stays `proposed`. A task that a person or a tap filed is
   admitted as before, and so is each part of it. A person in person admits a task that
-  stays `proposed`. An agent cannot admit it.
+  stays `proposed`. An agent cannot admit it. The refusal gives the percentage and no
+  count.
+
+A part of a person's task is admitted at the share of upkeep. If the agent that filed
+the part also completes it, the part counts as upkeep among the completed tasks. If
+another principal completes it, the part counts as requested work.
 
 Curation keeps its floor. A curation task is admitted at the share of upkeep while
 curation is below the `maintenance_floor` of the rubric among the completed tasks of the
@@ -1608,6 +1630,11 @@ row of spend for one day has a count: `amem` reads the meter of the egress for t
 hours. The count is the tokens in and out, or their price in US cents. A row of spend for
 one session has no count, because the report is not of a session. The memory tool
 `limits` gives the same rows, and its rows of spend have no count.
+
+The memory server holds each limit against every task of the domain. The rows
+`outbound:<family>`, `landing:<queue>` and `upkeep` count only the tasks that the session
+can read. Thus the count of a session that reads less can be lower than the count that
+the limit is held against.
 
 `amem limits raise` raises a limit:
 
