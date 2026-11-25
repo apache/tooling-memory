@@ -28,6 +28,10 @@ pub enum Kind {
     Split,
     /// A question searched for more than once that found nothing: something to write.
     Author,
+    /// A convention or method whose author is not a `human:` principal.
+    MissingOwner,
+    /// An entry citing or mentioning an entry id that is missing, gone, or superseded.
+    BrokenLink,
 }
 
 impl Kind {
@@ -38,6 +42,8 @@ impl Kind {
             Kind::Verify => "Curator: verify",
             Kind::Split => "Curator: split",
             Kind::Author => "Curator: write what was asked for and not found",
+            Kind::MissingOwner => "Curator: assign an owner to",
+            Kind::BrokenLink => "Curator: repair broken link in",
         }
     }
 
@@ -48,6 +54,8 @@ impl Kind {
             Kind::Verify => "verify",
             Kind::Split => "split",
             Kind::Author => "author",
+            Kind::MissingOwner => "missing-owner",
+            Kind::BrokenLink => "broken-link",
         }
     }
 }
@@ -238,6 +246,7 @@ pub async fn survey(
     };
     let today = time::OffsetDateTime::now_utc().date();
     let mut by_title: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut entries: Vec<Entry> = Vec::with_capacity(hits.len());
     for h in &hits {
         let Ok(e) = memory.get(&h.id).await else {
             continue;
@@ -247,10 +256,12 @@ pub async fn survey(
             .or_default()
             .push(e.front.id.clone());
         survey_entry(&e, &h.summary, options, today, &mut survey.proposals);
+        entries.push(e);
     }
     merges(by_title, &mut survey.proposals);
     authoring(root, &mut survey.proposals);
     let live: std::collections::BTreeSet<String> = hits.iter().map(|h| h.id.clone()).collect();
+    check_links(memory, &entries, &live, &mut survey.proposals).await;
     signals(root, &live, &mut survey.proposals);
     Ok(survey)
 }
@@ -337,6 +348,7 @@ fn survey_entry(
     if e.front.cites.iter().any(|s| s == "canary") {
         return;
     }
+    check_owner(e, out);
     let changed = options
         .source_root
         .as_deref()
@@ -368,6 +380,121 @@ fn survey_entry(
             body: verify_body(id),
             // superseded-derived first: the source of the entry changed under it
             priority: if changed.is_some() { FIRST } else { LATER },
+        });
+    }
+}
+
+/// Flag a convention or method whose author is not a `human:` principal.
+fn check_owner(e: &Entry, out: &mut Vec<Proposal>) {
+    if !matches!(
+        e.front.entry_type,
+        EntryType::Convention | EntryType::Method
+    ) {
+        return;
+    }
+    if e.front.author.starts_with("human:") {
+        return;
+    }
+    let id = &e.front.id;
+    let kind = e.front.entry_type;
+    let author = &e.front.author;
+    out.push(Proposal {
+        kind: Kind::MissingOwner,
+        entries: vec![id.clone()],
+        why: format!("`{id}` is a {kind} authored by `{author}` with no human owner"),
+        body: format!(
+            "Read `{id}` with `get`. This {kind} has no human owner (`author` is `{author}`). Confirm who owns it and `write` a replacement with `supersedes: {id}` under a `human:` author, or leave a handoff naming the owner for a person to approve."
+        ),
+    });
+}
+
+/// Extract distinct `mem-...` entry ids cited in `front.cites` or mentioned in `body`,
+/// ignoring the entry's own id and path-like prefixes such as `file:mem-notes.md`.
+fn extract_entry_ids(e: &Entry) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push_unique = |cand: &str| {
+        if dm_core::id::is_entry_id(cand) && cand != e.front.id && !out.iter().any(|x| x == cand) {
+            out.push(cand.to_string());
+        }
+    };
+    for c in &e.front.cites {
+        push_unique(c.trim());
+    }
+    for (idx, _) in e.body.match_indices("mem-") {
+        let prev = e.body[..idx].chars().next_back();
+        if prev
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '_' | '-'))
+        {
+            continue;
+        }
+        let rest = &e.body[idx..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(rest.len());
+        let cand = rest[..end].trim_end_matches(['-', '_']);
+        push_unique(cand);
+    }
+    out
+}
+
+/// Return `Some(reason)` when `target` is missing, gone, or superseded.
+async fn link_status(
+    memory: &Memory,
+    target: &str,
+    live: &std::collections::BTreeSet<String>,
+    cache: &mut BTreeMap<String, Option<String>>,
+) -> Option<String> {
+    if live.contains(target) {
+        return None;
+    }
+    if let Some(cached) = cache.get(target) {
+        return cached.clone();
+    }
+    let status = match memory.get(target).await {
+        Ok(_) => None,
+        Err(dm_server::Error::Moved { to, .. }) => Some(format!("was superseded by `{to}`")),
+        Err(dm_server::Error::Gone(why)) => Some(why),
+        Err(dm_server::Error::NotFound(_)) => Some("does not exist".to_string()),
+        Err(err) => Some(err.to_string()),
+    };
+    cache.insert(target.to_string(), status.clone());
+    status
+}
+
+/// Flag entries whose `cites` or body reference missing, gone, or superseded entry ids.
+async fn check_links(
+    memory: &Memory,
+    entries: &[Entry],
+    live: &std::collections::BTreeSet<String>,
+    out: &mut Vec<Proposal>,
+) {
+    let mut cache: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for e in entries {
+        if e.front.cites.iter().any(|s| s == "canary") {
+            continue;
+        }
+        let mut broken = Vec::new();
+        for target in extract_entry_ids(e) {
+            if let Some(reason) = link_status(memory, &target, live, &mut cache).await {
+                broken.push((target, reason));
+            }
+        }
+        if broken.is_empty() {
+            continue;
+        }
+        let id = &e.front.id;
+        let detail = broken
+            .iter()
+            .map(|(t, r)| format!("`{t}` ({r})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(Proposal {
+            kind: Kind::BrokenLink,
+            entries: vec![id.clone()],
+            why: format!("`{id}` references broken or stale links: {detail}"),
+            body: format!(
+                "Read `{id}` with `get`. It references {detail}. Check whether the entry still holds, update its `cites` and body to point at the current entries or remove dead references, and `write` a replacement with `supersedes: {id}`. Leave a handoff."
+            ),
         });
     }
 }
@@ -503,6 +630,155 @@ pub(crate) mod tests {
             "dr19 does the wiki stay on moinmoin"
         );
         assert_eq!(Kind::Resummarise.name(), "resummarise");
+    }
+
+    #[tokio::test]
+    async fn survey_flags_conventions_and_methods_without_a_human_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Memory::init(dir.path(), "human:local:owner", "dom-t")
+            .unwrap()
+            .without_read_log()
+            .with_author("agent:claude (model: test)");
+        let agent_conv = agent
+            .write(dm_server::WriteRequest {
+                domain: Some("dom-t".into()),
+                entry_type: EntryType::Convention,
+                title: Some("Agent convention".into()),
+                body: "Always run tests before committing.".into(),
+                summary: Some("Always run tests before committing any change.".into()),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let agent_method = agent
+            .write(dm_server::WriteRequest {
+                domain: Some("dom-t".into()),
+                entry_type: EntryType::Method,
+                title: Some("Agent method".into()),
+                body: "Split large functions into small helpers.".into(),
+                summary: Some("Split large functions into small focused helpers.".into()),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let agent_fact = agent
+            .write(dm_server::WriteRequest {
+                domain: Some("dom-t".into()),
+                entry_type: EntryType::Fact,
+                title: Some("Agent fact".into()),
+                body: "The workspace uses Rust 2021 edition.".into(),
+                summary: Some("The workspace targets the Rust 2021 edition.".into()),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let human = Memory::open(dir.path())
+            .unwrap()
+            .without_read_log()
+            .with_author("human:local:owner");
+        let human_conv = human
+            .write(dm_server::WriteRequest {
+                domain: Some("dom-t".into()),
+                entry_type: EntryType::Convention,
+                title: Some("Human convention".into()),
+                body: "Keep docs in sync with code.".into(),
+                summary: Some("Keep documentation in sync with every code change.".into()),
+                ..dm_server::WriteRequest::default()
+            })
+            .await
+            .unwrap();
+
+        let s = survey(&human, dir.path(), Some("dom-t"), &Options::default())
+            .await
+            .unwrap();
+        let missing: Vec<&str> = s
+            .proposals
+            .iter()
+            .filter(|p| p.kind == Kind::MissingOwner)
+            .flat_map(|p| p.entries.iter().map(String::as_str))
+            .collect();
+        assert!(missing.contains(&agent_conv.id.as_str()), "{missing:?}");
+        assert!(missing.contains(&agent_method.id.as_str()), "{missing:?}");
+        assert!(!missing.contains(&human_conv.id.as_str()), "{missing:?}");
+        assert!(!missing.contains(&agent_fact.id.as_str()), "{missing:?}");
+    }
+
+    async fn write_fact(
+        m: &Memory,
+        title: &str,
+        body: String,
+        cites: Vec<String>,
+        supersedes: Option<String>,
+    ) -> String {
+        m.write(dm_server::WriteRequest {
+            domain: Some("dom-t".into()),
+            entry_type: EntryType::Fact,
+            title: Some(title.into()),
+            body,
+            cites,
+            supersedes,
+            summary: Some(format!("{title}: concise summary for index retrieval.")),
+            ..dm_server::WriteRequest::default()
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    #[tokio::test]
+    async fn survey_flags_broken_and_superseded_cross_links_in_cites_and_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:local:owner", "dom-t")
+            .unwrap()
+            .without_read_log();
+        let alive = write_fact(&m, "Alive target", "Still active.".into(), vec![], None).await;
+        let old = write_fact(&m, "Old target", "Old version.".into(), vec![], None).await;
+        write_fact(
+            &m,
+            "New target",
+            "New version.".into(),
+            vec![],
+            Some(old.clone()),
+        )
+        .await;
+
+        let bad_cite = write_fact(
+            &m,
+            "Bad cite",
+            format!("Depends on `{alive}` and `file:mem-notes.md`."),
+            vec!["mem-domt-missing1".into()],
+            None,
+        )
+        .await;
+        let stale_body_link = write_fact(
+            &m,
+            "Superseded body link",
+            format!("See {old} for earlier context."),
+            vec![],
+            None,
+        )
+        .await;
+        let clean = write_fact(
+            &m,
+            "Clean entry",
+            format!("Points to `{alive}` which is active."),
+            vec![alive.clone()],
+            None,
+        )
+        .await;
+
+        let s = survey(&m, dir.path(), Some("dom-t"), &Options::default())
+            .await
+            .unwrap();
+        let broken: Vec<&str> = s
+            .proposals
+            .iter()
+            .filter(|p| p.kind == Kind::BrokenLink)
+            .flat_map(|p| p.entries.iter().map(String::as_str))
+            .collect();
+        assert!(broken.contains(&bad_cite.as_str()), "{broken:?}");
+        assert!(broken.contains(&stale_body_link.as_str()), "{broken:?}");
+        assert!(!broken.contains(&clean.as_str()), "{broken:?}");
     }
 
     #[test]
