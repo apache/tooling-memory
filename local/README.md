@@ -320,7 +320,8 @@ steps:
    `--budget-tasks` open curation tasks.
 2. It runs the auditor on `--sample` entries, and with `--contradictions`, the
    contradiction hunt. The egress counts each model call against `--budget-tokens`. At
-   that number, the auditor stops.
+   that number, the auditor asks no more questions. It still makes the checks that
+   need no model.
 3. It checks the canaries.
 4. It computes the telemetry and files its alarms.
 5. It adds a line to `state/curation.jsonl` with what it found, filed and spent.

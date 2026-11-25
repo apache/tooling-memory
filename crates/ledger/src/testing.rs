@@ -74,7 +74,7 @@ impl PgServer {
         if let Err(e) = installed {
             return unavailable(format!("embedded PostgreSQL cannot be installed here: {e}"));
         }
-        let pg = match started(0).await {
+        let pg = match started(0, None).await {
             Ok(pg) => pg,
             Err(why) => return unavailable(why),
         };
@@ -114,12 +114,19 @@ impl PgServer {
 }
 
 /// An embedded server of the installed release, started on `port`, or on a free port
-/// for `0`; else the reason that it cannot be had.
-async fn started(port: u16) -> Result<PostgreSQL, String> {
-    let mut pg = PostgreSQL::new(Settings {
+/// for `0`; else the reason that it cannot be had. `listen` names the one address the
+/// server listens on; without it the server listens where its default says.
+async fn started(port: u16, listen: Option<&str>) -> Result<PostgreSQL, String> {
+    let mut wanted = Settings {
         port,
         ..settings()?
-    });
+    };
+    if let Some(address) = listen {
+        wanted
+            .configuration
+            .insert("listen_addresses".to_string(), address.to_string());
+    }
+    let mut pg = PostgreSQL::new(wanted);
     if let Err(e) = pg.setup().await {
         return Err(format!("embedded PostgreSQL cannot be set up here: {e}"));
     }
@@ -141,9 +148,10 @@ async fn started(port: u16) -> Result<PostgreSQL, String> {
 /// there is `Command error: stdout=; stderr=` whatever the cause.
 fn start_evidence(pg: &PostgreSQL, took: std::time::Duration) -> String {
     let data = &pg.settings().data_dir;
-    let log = match std::fs::read_to_string(data.join("start.log")) {
-        Ok(text) if text.trim().is_empty() => "start.log is empty".to_string(),
-        Ok(text) => format!("start.log:\n{}", text.trim_end()),
+    // read as bytes: a server can write the system's error text in a local code page
+    let log = match std::fs::read(data.join("start.log")) {
+        Ok(bytes) if bytes.trim_ascii().is_empty() => "start.log is empty".to_string(),
+        Ok(bytes) => format!("start.log:\n{}", String::from_utf8_lossy(&bytes).trim_end()),
         Err(e) => format!("start.log cannot be read: {e}"),
     };
     let pid_file = if data.join("postmaster.pid").exists() {
@@ -225,19 +233,21 @@ mod tests {
     use super::{started, unavailable, with_db, PgServer};
     use std::net::TcpListener;
 
-    /// The error of a start that fails says why, in the server's own words. The port is
-    /// held here on each loopback address, so the server finds no address to listen on.
+    /// The error of a start that fails says why, in the server's own words. The server
+    /// is told to listen on one address, and the port is held here on that address.
     #[tokio::test]
     async fn a_start_that_fails_gives_the_log_of_the_server() {
+        // a named server is used as it is: nothing embedded is installed or started
+        if std::env::var_os("MEMORY_PG_URL").is_some() {
+            return;
+        }
         // the release is installed by the first start, and where it cannot be, this skips
         let Some(_installed) = PgServer::start().await.unwrap() else {
             return;
         };
-        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = v4.local_addr().unwrap().port();
-        // a host with no IPv6 loopback has no second address for the server either
-        let _v6 = TcpListener::bind(("::1", port));
-        let why = match started(port).await {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let why = match started(port, Some("127.0.0.1")).await {
             Ok(_) => panic!("a server started on port {port}, which this test holds"),
             Err(why) if why.contains("did not start") => why,
             // the setup failed before the start: as each test here takes it
