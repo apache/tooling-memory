@@ -59,6 +59,11 @@ term here in the same commit as the first document that needs it.
 | amendment | A task for the owner of a rule, with evidence, that asks for a change to the rule | |
 | gates | The `[gates]` rules on a write: how many entries one session may supersede, and whether a verified entry needs an approver | |
 | version (of an entry) | The text of an entry at one time. Each write and each promotion makes a new version. The digest of the text names the version: `<id>@<digest>` cites one version, and an approval names one | revision |
+| address | What `get` takes to name what it serves: an entry id, an id with `#<anchor>` for one section, or an id with `@<version>` for one version | locator, reference (for an address) |
+| anchor | The name of one section of an entry: the text of the heading of the section in lower case, with `-` in place of each group of other characters | fragment, slug |
+| snippet | The words of the body of a hit around the words of the query. The index cuts it for each hit of a search | excerpt (for a snippet), highlight |
+| related entry | An entry that searches return together with another entry. A fetch of that other entry carries the summary of the related entry | companion entry, neighbour |
+| weight (of a related entry) | `p`: of the searches that returned an entry in their first five hits, the share that returned the related entry there too | score (for a weight), confidence (for a weight) |
 | approval | An event on the ledger: a person approved one action on one version of one entry, for one principal, until a time. The policy checks it when the action runs | permission (for an approval) |
 | guard | The person who approves a copy of an entry at a lower label: `guard` in the grant of the domain, or the owner | |
 | declassification | A copy of one version of an entry at a lower label, written under an approval of the guard. The copy cites that version, and its origin names the guard. The source does not change | downgrade, lowering (of an entry) |
@@ -165,6 +170,8 @@ term here in the same commit as the first document that needs it.
 | replay trap | One of five conditions that make the result of an evaluation unsafe: `survivorship`, `leakage`, `noise`, `judge-drift`, `distribution-shift`. An open replay trap makes each verdict `inconclusive` | pitfall, bias (for a replay trap) |
 | scorecard | The result of one evaluation: for each arm the paired differences from the baseline arm in success and in cost, the verdict, the five replay traps, and the drift window that the runs were in. The record keeps it as a decision entry in the platform's domain | report, result card |
 | recall | The memory tool that answers a question with a cited brief, or with a pack of entries when no model is behind it | |
+| answer kind | `fact`, `list` or `overview`: the kind of answer that the caller of a recall needs. It sets the length of the brief and of the pack | answer type |
+| session of a person | A session of the memory server that a person starts with `amem serve --person`, with no harness behind it. Only such a session approves through the memory tool `approve`. Nobody authenticates in it | personal session, human session |
 | deputy | The small model that the memory server calls through the egress for recall | |
 | tap | A component that connects an outside system to `amem`. A tap with `tool = true` is a tool. Any other tap runs on a schedule, such as `github-issues` | connector, plugin (for a tap) |
 | tool | A tap that an agent calls in a turn: `fetch`, `search` and the others. A tool server can also run `fetch` as native code | |

@@ -488,11 +488,25 @@ fn as_named(
     tool: &str,
     arguments: &serde_json::Value,
 ) -> Result<String, String> {
+    as_served(root, &["--author", author], tool, arguments)
+}
+
+/// One tool call through `amem serve` with `flags`, on standard input and output: the
+/// text of the tool's answer, or the message of its refusal.
+fn as_served(
+    root: &Path,
+    flags: &[&str],
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> Result<String, String> {
     use std::io::{BufRead, BufReader, Write};
     let mut child = Command::new(env!("CARGO_BIN_EXE_amem"))
         .arg("--root")
         .arg(root)
-        .args(["serve", "--author", author])
+        .arg("serve")
+        .args(flags)
+        .env_remove("MEMORY_POSITION")
+        .env_remove("MEMORY_ARM")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2074,4 +2088,168 @@ fn reenact_state_gives_the_replay_state_of_a_tape() {
         serde_json::json!(["The log dom-me moved: it was 4 and it is 7 now."])
     );
     assert!(fails(&d.root, &["reenact", "state", "sess-none"]).contains("no tape"));
+}
+
+const SECTIONS: &str = "The import runs on the staging host.\n\n## Context\n\nThe import job needs a host with the loader installed.\n\n## Decision\n\nThe import job runs on the staging host every night.\n";
+
+/// A decision of the owner with two sections, and a fact about the same thing.
+fn decision_and_fact(root: &Path) -> (String, String) {
+    let title = "Where the import runs";
+    let decision = ["write", "--kind", "decision", "--title", title];
+    let decision = id_of(&ok(root, &decision, Some(SECTIONS)));
+    let note = "The import took four hours on the staging host last night.\n";
+    let fact = ["write", "--kind", "fact", "--title", "Import duration"];
+    (decision, id_of(&ok(root, &fact, Some(note))))
+}
+
+/// `amem get` takes an address. An anchor prints the section alone. A version prints the
+/// text of that version, and `--json` says when it is no longer the current one.
+#[test]
+fn get_prints_a_section_and_an_earlier_version_by_address() {
+    let d = step_init();
+    let (id, _) = decision_and_fact(&d.root);
+    let section = ok(&d.root, &["get", &format!("{id}#decision")], None);
+    assert_eq!(
+        section,
+        "## Decision\n\nThe import job runs on the staging host every night.\n"
+    );
+    let err = fails(&d.root, &["get", &format!("{id}#options")]);
+    assert!(err.contains("context, decision"), "{err}");
+    let whole = json(&ok(&d.root, &["get", &id, "--json"], None));
+    assert_eq!(whole["body"], SECTIONS);
+    assert!(whole.get("current").is_none(), "{whole}");
+    let first = whole["version"].as_str().unwrap().to_string();
+    session(&d.root, "agent:curator", &[promote_call(&id)]);
+    let at = format!("{id}@{first}");
+    let old = json(&ok(&d.root, &["get", &at, "--json"], None));
+    assert_eq!(old["current"], false, "{old}");
+    assert_eq!(old["trust_tier"], "raw");
+    assert_eq!(old["version"], first.as_str());
+    let now = json(&ok(&d.root, &["get", &id, "--json"], None));
+    assert_eq!(now["trust_tier"], "curated");
+    assert_ne!(now["version"], first.as_str());
+    let text = memory(&d.root, &["get", &at], None);
+    let (out, err) = (
+        String::from_utf8_lossy(&text.stdout),
+        String::from_utf8_lossy(&text.stderr),
+    );
+    assert!(out.starts_with("---\nid: "), "{out}");
+    assert!(out.contains("trust_tier: raw"), "{out}");
+    assert!(err.contains("an earlier version"), "{err}");
+}
+
+/// The keys of a JSON object, sorted.
+fn keys(v: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// `amem search` with a filter prints what the tool answers: the same hits, with the
+/// same keys. Each flag narrows the search.
+#[test]
+fn search_takes_the_filters_of_the_tool_and_prints_its_hits() {
+    let d = step_init();
+    let (decision, _) = decision_and_fact(&d.root);
+    let both = json(&ok(&d.root, &["search", "import staging"], None));
+    assert_eq!(both.as_array().unwrap().len(), 2, "{both}");
+    let line = ["search", "import staging", "--type", "decision"];
+    let line = json(&ok(&d.root, &line, None));
+    let args = serde_json::json!({"query": "import staging", "filters": {"type": "decision"}});
+    let tool = json(&as_agent(&d.root, "search", &args).unwrap());
+    assert_eq!(line.as_array().unwrap().len(), 1, "{line}");
+    assert_eq!(line[0]["id"], decision.as_str());
+    assert_eq!(line, tool["hits"]);
+    assert!(keys(&line[0]).contains(&"snippet"), "{line}");
+    let err = fails(&d.root, &["search", "import", "--min-tier", "gold"]);
+    assert!(err.contains("--min-tier"), "{err}");
+    for none in [
+        ["--since", "2999-01-01T00:00:00Z"],
+        ["--author", "agent:nobody"],
+        ["--min-tier", "curated"],
+    ] {
+        let found = ok(&d.root, &["search", "import", none[0], none[1]], None);
+        assert_eq!(json(&found), serde_json::json!([]), "{none:?}");
+    }
+}
+
+/// `amem recall` with an answer kind or the tokens of a context prints what the tool
+/// answers: the same keys and the same plan. A recall with neither has no plan.
+#[test]
+fn recall_takes_the_answer_kind_and_the_context_and_prints_the_plan_of_the_tool() {
+    let d = step_init();
+    decision_and_fact(&d.root);
+    let question = "where does the import run";
+    let line = ["recall", question, "--answer-kind", "fact"];
+    let line = json(&ok(&d.root, &line, None));
+    let args = serde_json::json!({"question": question, "answer_kind": "fact"});
+    let tool = json(&as_agent(&d.root, "recall", &args).unwrap());
+    assert_eq!(keys(&line), keys(&tool));
+    assert_eq!(line["plan"], tool["plan"]);
+    assert_eq!(line["plan"]["answer_kind"], "fact");
+    let full = ["recall", question, "--context-tokens", "120000"];
+    let full = json(&ok(&d.root, &full, None));
+    assert_eq!(full["plan"]["context_tokens"], 120_000);
+    let plain = json(&ok(&d.root, &["recall", question], None));
+    assert!(plain.get("plan").is_none(), "{plain}");
+    let err = fails(&d.root, &["recall", question, "--answer-kind", "essay"]);
+    assert!(err.contains("is not fact, list or overview"), "{err}");
+}
+
+/// `amem export` without a destination keeps the bundle under the root and prints
+/// where.
+#[test]
+fn export_without_a_destination_keeps_the_bundle_under_the_root() {
+    let d = step_init();
+    decision_and_fact(&d.root);
+    let out = ok(&d.root, &["export", "--max-label", "internal"], None);
+    let (said, at) = out.trim_end().split_once(", kept at ").expect(&out);
+    assert_eq!(
+        said,
+        "exported 2 entries from dom-me, highest label internal"
+    );
+    let kept = Path::new(at);
+    let under = kept.strip_prefix(d.root.join("state/exports")).expect(at);
+    assert_eq!(under.components().count(), 2, "{at}");
+    assert!(at.ends_with("/dom-me-internal"), "{at}");
+    assert!(kept.join("manifest.yaml").is_file(), "{at}");
+}
+
+/// `amem serve --person` is the session of the owner in person: the command line
+/// refuses it another author, a position or an arm. Its `approve` records the approval
+/// that a session with `--author` is refused, the owner's author included.
+#[test]
+fn serve_person_takes_no_author_and_approves_what_a_served_session_does_not() {
+    let d = step_init();
+    for flags in [
+        ["--author", "agent:x"],
+        ["--position", "pos-release"],
+        ["--arm", "full"],
+    ] {
+        let err = fails(&d.root, &["serve", "--person", flags[0], flags[1]]);
+        assert!(err.contains("cannot be used with"), "{flags:?}: {err}");
+        assert!(err.contains("--person"), "{flags:?}: {err}");
+    }
+    let (_, id) = decision_and_fact(&d.root);
+    let erase = serde_json::json!({"id": id, "reason": "mistaken"});
+    let refused = as_agent(&d.root, "erase", &erase).unwrap_err();
+    let named = refused
+        .split_once("Task ")
+        .and_then(|(_, r)| r.split_once(' '));
+    let task = named.expect(&refused).0;
+    let approve = serde_json::json!({ "task": task });
+    for flags in [["--author", AGENT], ["--author", "human:test:me"]] {
+        let why = as_served(&d.root, &flags, "approve", &approve).unwrap_err();
+        assert!(why.contains("approves nothing"), "{flags:?}: {why}");
+    }
+    let listed = serde_json::json!({ "id": id });
+    let none = json(&as_served(&d.root, &["--person"], "approvals", &listed).unwrap());
+    assert_eq!(none["approvals"], serde_json::json!([]));
+    let signed = json(&as_served(&d.root, &["--person"], "approve", &approve).unwrap());
+    assert_eq!(signed["outcome"], "approved", "{signed}");
+    assert_eq!(signed["approval"]["principal"], "human:test:me");
+    let one = json(&as_served(&d.root, &["--person"], "approvals", &listed).unwrap());
+    assert_eq!(one["approvals"][0]["in_force"], true, "{one}");
+    let receipt = json(&as_agent(&d.root, "erase", &erase).unwrap());
+    assert_eq!(receipt["erased_by"], AGENT);
 }

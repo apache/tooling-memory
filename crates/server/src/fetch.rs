@@ -11,6 +11,8 @@ use crate::address::{self, Address, Part};
 use crate::prefetch::Related;
 use crate::{reach, withhold, Error, Memory};
 use dm_core::{Entry, Status};
+use serde_json::{json, Value};
+use time::format_description::well_known::Rfc3339;
 
 /// The most related entries that a fetch of a current version carries.
 pub const RELATED_ON_FETCH: usize = 2;
@@ -157,6 +159,75 @@ impl Memory {
             related: Vec::new(),
         })
     }
+}
+
+impl Fetched {
+    /// The text that the fetch served, as a command prints it: the section alone when
+    /// the address named an anchor, else the entry with its frontmatter.
+    #[must_use]
+    pub fn text(&self) -> String {
+        if self.anchor.is_some() {
+            self.entry.body.clone()
+        } else {
+            self.entry.render()
+        }
+    }
+}
+
+/// The JSON that a binding returns for a fetch. One shape for the command line and the
+/// memory tool. `version` is the address part that a later fetch by version takes.
+/// `anchor` is there when the address named one, `current` only when it is false, and
+/// `related` only when the fetch carries related entries.
+#[must_use]
+pub fn to_json(f: &Fetched) -> Value {
+    let front = &f.entry.front;
+    let mut v = json!({
+        "id": front.id,
+        "domain": front.domain,
+        "type": front.entry_type.to_string(),
+        "author": front.author,
+        "created": front.created.format(&Rfc3339).unwrap_or_default(),
+        "trust_tier": front.trust_tier.to_string(),
+        "classification": front.classification.to_string(),
+        "cites": front.cites,
+        "supersedes": front.supersedes,
+        "review_by": front.review_by.map(|d| d.to_string()),
+        "title": f.entry.title(),
+        "version": f.version,
+        "body": f.entry.body,
+    });
+    // an entry with fleet reach and no task has neither key
+    if !front.reach.is_fleet() {
+        v["reach"] = json!(front.reach.to_string());
+    }
+    if let Some(task) = &front.task {
+        v["task"] = json!(task);
+    }
+    if let Some(anchor) = &f.anchor {
+        v["anchor"] = json!(anchor);
+    }
+    if !f.current {
+        v["current"] = json!(false);
+    }
+    if !f.redirected_from.is_empty() {
+        // as a client shows the URL it was redirected to: cite this id, not the one asked
+        v["redirected_from"] = json!(f.redirected_from);
+    }
+    if !f.related.is_empty() {
+        v["related"] = f.related.iter().map(related_json).collect();
+    }
+    v
+}
+
+/// One related entry in the answer of a fetch: its summary, and its weight to two
+/// decimal places.
+fn related_json(r: &Related) -> Value {
+    json!({
+        "id": r.hit.id,
+        "title": r.hit.title,
+        "summary": r.hit.summary,
+        "p": (r.p * 100.0).round() / 100.0,
+    })
 }
 
 /// The refusal of an anchor that `entry` does not have, with the anchors that it has.

@@ -174,8 +174,35 @@ two weeks. It is also the reason that none of it is the production shape.
     higher spend limit.
   - A guard that is not the owner cannot approve, because the command line acts only as
     the owner.
-  - The memory server has no memory tool that approves.
+  - The memory tool `approve` approves only in a session of a person, which the owner
+    starts with `amem serve --person`. Nobody authenticates there. Thus the tool is as
+    strong as the command line, and it stops an agent only when the harness is
+    confined.
   - The erasure of a transcript makes no approval.
+- **The surface of Appendix A, in part.** `get` takes an address: an entry id, an id
+  with `#<anchor>` for one section, or an id with `@<version>` for one version. A fetch
+  carries the related entries, each with a weight. `search` takes filters by type,
+  lowest trust tier, author and time, and each hit has a snippet from the index. `recall`
+  takes the answer kind and the tokens in the context of the caller, and it plans the
+  size of the answer from them. `approve`, `approvals` and `export` are memory tools.
+  These parts are not built:
+  - No cheap model expands the query or ranks the hits again inside `search`.
+  - The size of a recall comes from the answer kind and the context of the caller only.
+    The model of the caller and the results of a recall suite do not change it.
+  - Nothing checks that the deputy kept its brief under the planned length. No replay
+    checks the choice that the read log holds.
+  - The weight of a related entry is the share of the searches that returned both
+    entries. It is not the share of the sessions that opened the second entry after the
+    first. A fetch never carries the body of a related entry.
+  - `approve` takes the sign-off task and an expiry. It does not take an action, a
+    version and a scope, because the task names them.
+  - A bundle that the `export` tool writes stays under the root. Nothing sends it to a
+    destination under the ceiling of that destination.
+  - `get` by version checks the creation time of the entry against the snapshot of a
+    session, and not the time that the version was written.
+  - `get` by version reads each earlier version of the entry to find one digest.
+  - No audit counts the citations that name no version.
+  - `write` has no fast lane for a handoff.
 - **The rule lifecycle, in part.** `check_policy` gives all the rules in force for a
   domain. It does not select rules by the action. The lint reports a rule after its
   review date and an unused rule, from the full decision log and not from one review
@@ -597,8 +624,9 @@ network and credentials. Nothing meters its model calls. No model's ceiling appl
 what it may read. `amem launch --unconfined` is the middle case. At this time it is only
 for Claude Code and Codex. It gives no sandbox, but the model calls still go through the
 egress. A harness with no sandbox has a shell on the host. From that shell, an agent can
-run `amem approve` as the owner, because nobody authenticates at the command line. Thus
-an approval stops an agent only when the harness is confined.
+run `amem approve` as the owner, because nobody authenticates at the command line. It can
+also start `amem serve --person` and call `approve` there. Thus an approval stops an
+agent only when the harness is confined.
 
 ## The parts, and their commands
 
@@ -608,11 +636,11 @@ describes re-enactment, the platform domain and the Gofannon bridge.
 
 | Part | What it does | Commands |
 |---|---|---|
-| The read path | T0, BM25 search with summaries first, one body on `get`, recall as a cited brief or a pack, prefetch on claim and at fetch | `t0`, `search`, `get`, `list`, `recall`, `write` |
+| The read path | T0, BM25 search with summaries first, filters and a snippet for each hit. One body on `get`, or one section or one version of it by address, with the related entries and their weights. Recall as a cited brief or a pack, sized from the answer kind and the context of the caller. Prefetch on claim and at fetch | `t0`, `search` (with `--type`, `--min-tier`, `--author`, `--since`), `get` (`<id>`, `<id>#<anchor>`, `<id>@<version>`, `--json`), `list`, `recall` (with `--answer-kind`, `--context-tokens`), `write` |
 | The task fabric | Tasks with leases and handoffs. A rubric from the L1 strategy ranks along the ledger's edges, at admission and in the triage cycle. Workers only claim. Subagents go on the board as children, with a continuation | `task create` (with `--position` and `--pin-reason` for a pinned task), `task admit, claim-next, complete, release, tree, retry, rescore, stats`, `work` (with `--position` or `--wake` for a session in a position) |
 | Positions | A standing role as a verified entry: a charter and an authority envelope. A task pinned to a position goes only to a session that fills it. That session gets the position's commitments and handoff cache first in T0. A session under another agent definition is seconded. The owner retires a position | `position list, show, retire`, `write --kind position`, `serve --position`; MCP `position`, `positions`, `retire_position` |
 | Trust tiers | Raw, curated, verified. Only a person who did not propose an entry can make it verified. Review clocks and decay. Raw reach: a raw entry from a session that read outside content is served only to its task chain, to triage and to curators | `promote`, `approve`; `reach` and `task` in the answers of `write`, `search` and `get` |
-| Approvals | An erasure and a declassification run only under an approval: a person approves one action on one version of one entry, for one principal, until an expiry. An action without an approval is refused, and a sign-off task asks the owner or the guard | `approve`, `approvals`, `declassify`, `erase`; MCP `erase`, `declassify` |
+| Approvals | An erasure and a declassification run only under an approval: a person approves one action on one version of one entry, for one principal, until an expiry. An action without an approval is refused, and a sign-off task asks the owner or the guard | `approve`, `approvals`, `declassify`, `erase`, `serve --person`; MCP `erase`, `declassify`, `approvals`, and `approve` in a session of a person |
 | The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced after they are verified, with scoped exceptions). Admission, the read filter, the write scan and quarantine, and blast-radius gates. A log of every decision | `policy show, eval, list, lint`, `quarantine` |
 | The curator | A survey of what needs curation, an independent auditor, a search for contradictions, canaries, its own telemetry and alarms, and a cycle on a budget | `curator`, `curate`, `audit`, `canary` |
 | The egress | It forwards, meters and times model calls, holds spend limits per destination, and records decision contexts. It keeps the wall clock, CPU and peak memory of each session beside the session's tokens | `launch`, `usage`, `cost` |
@@ -624,7 +652,7 @@ describes re-enactment, the platform domain and the Gofannon bridge.
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory. The metric table of the paper with its targets, and the times of a task | `savings`, `golden`, `scripts/eval.py`, `metrics`, `task times`; MCP `metrics`, `task_times` |
 | Limits and landing | The five limits, each in its own unit, and the raise of a limit by an approval. A landing queue, in which the change of a task waits until a person lands it | `limits`, `limits raise`, `task queue-landing`, `landing show, land`; MCP `limits`, `landing`, `queue_landing` |
 | Evaluation | The five arms as session settings that the launcher gives. A plan with a margin and seeds, runs paired with a baseline arm, the replay traps, and a scorecard kept in the platform domain | `eval arms, plan, score, scorecards`, `launch --arm --as-of --eval-plan --eval-task --eval-seed`, `serve --arm --as-of`, `scripts/eval.py`; MCP `settings`, `scorecards`, `score_evaluation` |
-| Interchange | Bundles at or below a label, erasure with a stub and a receipt, and taps as WASI components | `export`, `import`, `erase`, `tap` |
+| Interchange | Bundles at or below a label, erasure with a stub and a receipt, and taps as WASI components. An export without a destination stays under the root, and its answer names no entry | `export`, `import`, `erase`, `tap`; MCP `export` |
 | Tools | Fetch and search as taps that an agent calls in a turn. The policy decides every request at the session label. The answers are scanned and kept as sources. Or hosted: a tool server serves the same components, and another launcher calls it through its egress. This path reaches only the hosts that the calling session may reach, and says where it went. The source keeps that | `tool`, `source`, `tool-server`; MCP `fetch`, `web_search` |
 | Gofannon | Its deployed agents as a tool tap on the same terms: listed, run and read back. Also a worker that runs one of them on the ledger's tasks and files its result as the handoff | `gofannon agents`, `gofannon work`; MCP `gofannon` |
 | Traces | OpenTelemetry spans for model calls, reads, policy decisions and task transitions, to any OTLP collector | `OTEL_EXPORTER_OTLP_ENDPOINT` |
@@ -634,11 +662,15 @@ From the command line:
 ```sh
 echo "Stopped at step 3. Next: digests." | amem write --kind handoff --title "Import, step 3"
 amem search digests
+amem search digests --type handoff --since 2026-11-01T00:00:00Z
 amem get mem-me-xxxxxxxx
+amem get mem-me-xxxxxxxx#decision          # one section, by its anchor
+amem get mem-me-xxxxxxxx --json            # with its version and the related entries
 amem task create "Finish the import" --priority 5
 amem task admit task-me-xxxxxxxx
 amem work --harness claude                 # claim the top task, run the harness on it
 amem recall "how does the import retry?" --provider anthropic
+amem recall "how does the import retry?" --answer-kind fact --context-tokens 120000
 amem curate --auth gateway --contradictions  # one curation cycle
 amem quarantine list
 amem lineage mem-me-xxxxxxxx               # what was written and sent after a read of a bad entry

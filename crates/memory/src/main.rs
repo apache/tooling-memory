@@ -323,6 +323,11 @@ enum Command {
         /// later is not read.
         #[arg(long, env = "MEMORY_AS_OF")]
         as_of: Option<String>,
+        /// Serve the session of a person: the owner starts it and types its calls, and
+        /// no harness is behind it. Only such a session approves through the `approve`
+        /// tool. Nobody authenticates here: it is as strong as the command line.
+        #[arg(long, conflicts_with_all = ["author", "position", "arm"])]
+        person: bool,
     },
     /// Run a harness confined: no network except the egress, the memory server attached,
     /// model calls forwarded and metered. Credentials come from this process's
@@ -998,6 +1003,8 @@ enum Command {
         /// Summaries, or the best hits with their bodies within a budget.
         #[arg(long, value_enum, default_value = "summaries")]
         depth: DepthArg,
+        #[command(flatten)]
+        narrow: NarrowArgs,
     },
     /// Delegated recall: a cited brief when a model is behind it, else the pack the
     /// brief would be written from, with the synthesis owed to the caller.
@@ -1018,9 +1025,18 @@ enum Command {
         /// The deputy's model; a small default per destination otherwise.
         #[arg(long, requires = "provider")]
         model: Option<String>,
+        #[command(flatten)]
+        ask: AskArgs,
     },
-    /// One entry, in full.
-    Get { id: String },
+    /// One entry, by address: `<id>` for the current version in full, `<id>#<anchor>`
+    /// for one section, `<id>@<version>` for one version.
+    Get {
+        address: String,
+        /// Print the answer of the `get` tool: the fields of the entry, its `version`,
+        /// and the related entries with their weights.
+        #[arg(long)]
+        json: bool,
+    },
     /// Entries of one kind, newest first.
     List {
         #[arg(long, value_enum)]
@@ -1113,9 +1129,11 @@ enum Command {
         #[command(subcommand)]
         op: sources::SourceOp,
     },
-    /// Export a domain to a bundle directory, at or below a label.
+    /// Export a domain to a bundle directory, at or below a label. Without a
+    /// destination, the bundle is kept under the root, in `state/exports/`, as the
+    /// `export` tool keeps it.
     Export {
-        dest: PathBuf,
+        dest: Option<PathBuf>,
         #[arg(long)]
         domain: Option<String>,
         #[arg(long, value_enum, default_value = "public")]
@@ -1486,6 +1504,54 @@ enum TaskOp {
     },
 }
 
+/// The filters of `amem search`: each one narrows the search.
+#[derive(clap::Args)]
+struct NarrowArgs {
+    /// Only entries of this kind.
+    #[arg(long = "type", value_enum)]
+    entry_type: Option<Kind>,
+    /// Only entries at this trust tier or above: raw, curated or verified.
+    #[arg(long)]
+    min_tier: Option<dm_core::TrustTier>,
+    /// Only entries of this author, as the principal: `agent:a`.
+    #[arg(long)]
+    author: Option<String>,
+    /// Only entries created at this time or after it, RFC 3339.
+    #[arg(long, value_parser = rfc3339_time)]
+    since: Option<time::OffsetDateTime>,
+}
+
+impl From<NarrowArgs> for dm_server::Narrow {
+    fn from(n: NarrowArgs) -> Self {
+        Self {
+            entry_type: n.entry_type.map(Into::into),
+            min_tier: n.min_tier,
+            author: n.author,
+            since: n.since,
+        }
+    }
+}
+
+/// What the caller of `amem recall` says about itself.
+#[derive(clap::Args)]
+struct AskArgs {
+    /// The tokens that the context of the caller holds now, approximately.
+    #[arg(long)]
+    context_tokens: Option<usize>,
+    /// The kind of answer that the caller needs: fact, list or overview.
+    #[arg(long)]
+    answer_kind: Option<dm_server::brief::AnswerKind>,
+}
+
+impl From<AskArgs> for dm_server::brief::Ask {
+    fn from(a: AskArgs) -> Self {
+        Self {
+            context_tokens: a.context_tokens,
+            answer_kind: a.answer_kind,
+        }
+    }
+}
+
 type Fallible = Result<(), Box<dyn std::error::Error>>;
 
 fn json<T: serde::Serialize>(v: &T) -> Fallible {
@@ -1494,21 +1560,7 @@ fn json<T: serde::Serialize>(v: &T) -> Fallible {
 }
 
 fn hits_json(hits: &[dm_index::Hit]) -> Vec<serde_json::Value> {
-    hits.iter()
-        .map(|h| {
-            let mut v = serde_json::json!({
-                "id": h.id, "domain": h.domain, "type": h.entry_type.to_string(),
-                "trust_tier": h.trust_tier.to_string(),
-                "classification": h.classification.to_string(),
-                "title": h.title, "summary": h.summary,
-            });
-            // an entry with fleet reach has no key
-            if !h.reach.is_fleet() {
-                v["reach"] = serde_json::json!(h.reach.to_string());
-            }
-            v
-        })
-        .collect()
+    hits.iter().map(mcp::hit_json).collect()
 }
 
 fn default_owner() -> String {
@@ -1693,10 +1745,14 @@ async fn serve_stdio_cmd(root: &Path, command: Command) -> Fallible {
         position,
         arm,
         as_of,
+        person,
     } = command
     else {
         unreachable!("routed by run_cli")
     };
+    if person {
+        return serve_person(root, manifest, as_of.as_deref()).await;
+    }
     let settings = eval::settings(arm.as_deref(), as_of.as_deref())?;
     // serve gives no prompt, so it has nothing to put transcripts in front of
     eval::needs_prompt(settings.as_ref(), false)?;
@@ -1717,6 +1773,19 @@ async fn serve_stdio_cmd(root: &Path, command: Command) -> Fallible {
     }
     m.set_tools(taps::TapTools::for_root(root));
     mcp::serve_stdio(Arc::new(m)).await?;
+    Ok(())
+}
+
+/// `amem serve --person`: the root over MCP on standard input and output, as the
+/// session of the owner in person. No harness is behind it, so it holds no task and
+/// fills no position, and the session is not marked as one that the memory server
+/// serves to a harness.
+async fn serve_person(root: &Path, manifest: Vec<String>, as_of: Option<&str>) -> Fallible {
+    let settings = eval::settings(None, as_of)?;
+    let m = Memory::open(root)?.with_manifest(manifest);
+    eval::give(&m, settings.as_ref())?;
+    m.set_tools(taps::TapTools::for_root(root));
+    mcp::serve_stdio_for_person(Arc::new(m)).await?;
     Ok(())
 }
 
@@ -2913,6 +2982,7 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
             provider: Some(provider),
             auth,
             model,
+            ask,
         } => {
             let p = prepare_launch(
                 root,
@@ -2923,13 +2993,15 @@ async fn tools_cmd(root: &Path, command: Command) -> Fallible {
                 Projected::No,
             )
             .await?;
+            let depth = depth.map(Into::into);
             let r = p
                 .memory
-                .recall(
+                .recall_for(
                     &question,
                     domain.as_deref(),
-                    depth.map(Into::into),
+                    depth,
                     Budget::default(),
+                    ask.into(),
                 )
                 .await?;
             json(&recall::to_json(&r))
@@ -4512,14 +4584,7 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
             json(&w)
         }
         cmd @ (Command::Search { .. } | Command::Recall { .. }) => retrieve(m, cmd).await,
-        Command::Get { id } => {
-            let (e, from) = m.get_following(&id).await?;
-            for old in &from {
-                eprintln!("amem: {old} was replaced; reading its successor");
-            }
-            print!("{}", e.render());
-            Ok(())
-        }
+        Command::Get { address, json } => get_cmd(m, &address, json).await,
         Command::List {
             kind,
             domain,
@@ -4536,6 +4601,23 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
     }
 }
 
+/// `amem get`: what the address names, as text, or with `--json` as the `get` tool
+/// answers.
+async fn get_cmd(m: &Memory, address: &str, as_json: bool) -> Fallible {
+    let fetched = m.fetch(address).await?;
+    for old in &fetched.redirected_from {
+        eprintln!("amem: {old} was replaced; reading its successor");
+    }
+    if as_json {
+        return json(&dm_server::fetch::to_json(&fetched));
+    }
+    if !fetched.current {
+        eprintln!("amem: this is an earlier version; the entry has changed since");
+    }
+    print!("{}", fetched.text());
+    Ok(())
+}
+
 /// `search` and `recall`: the retrieval operations, one shape of JSON each.
 async fn retrieve(m: &Memory, command: Command) -> Fallible {
     match command {
@@ -4544,8 +4626,11 @@ async fn retrieve(m: &Memory, command: Command) -> Fallible {
             domain,
             limit,
             depth: DepthArg::Sections,
+            narrow,
         } => {
-            let pack = m.search_sections(&query, domain.as_deref(), limit).await?;
+            let pack = m
+                .search_sections_with(&query, domain.as_deref(), &narrow.into(), limit)
+                .await?;
             json(&serde_json::json!({
                 "hits": pack.pieces,
                 "truncated": pack.truncated,
@@ -4557,21 +4642,26 @@ async fn retrieve(m: &Memory, command: Command) -> Fallible {
             domain,
             limit,
             depth: DepthArg::Summaries,
+            narrow,
         } => json(&hits_json(
-            &m.search(&query, domain.as_deref(), limit).await?,
+            &m.search_with(&query, domain.as_deref(), &narrow.into(), limit)
+                .await?,
         )),
         Command::Recall {
             question,
             domain,
             depth,
+            ask,
             ..
         } => {
+            let depth = depth.map(Into::into);
             let r = m
-                .recall(
+                .recall_for(
                     &question,
                     domain.as_deref(),
-                    depth.map(Into::into),
+                    depth,
                     Budget::default(),
+                    ask.into(),
                 )
                 .await?;
             json(&recall::to_json(&r))
@@ -5124,7 +5214,22 @@ async fn curator_cmd(
 async fn bundle_cmd(m: &Memory, command: Command) -> Fallible {
     match command {
         Command::Export {
-            dest,
+            dest: None,
+            domain,
+            max_label,
+        } => {
+            let kept = m.export_kept(domain.as_deref(), max_label.into()).await?;
+            println!(
+                "exported {} entries from {}, highest label {}, kept at {}",
+                kept.entries,
+                kept.domain,
+                kept.highest_label,
+                m.root().join(&kept.kept_at).display()
+            );
+            Ok(())
+        }
+        Command::Export {
+            dest: Some(dest),
             domain,
             max_label,
         } => {
