@@ -60,6 +60,7 @@ pub mod sources;
 pub mod t0;
 pub mod tape;
 mod taps;
+pub mod timescales;
 pub mod transcripts;
 pub mod withhold;
 

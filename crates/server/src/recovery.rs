@@ -87,7 +87,7 @@ fn refuse(why: impl std::fmt::Display) -> Error {
 }
 
 /// A name that can be one part of a path and nothing else.
-fn valid_name(name: &str) -> Result<&str, Error> {
+pub(crate) fn valid_name(name: &str) -> Result<&str, Error> {
     let ok = !name.is_empty()
         && name.len() <= 128
         && name

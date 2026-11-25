@@ -43,6 +43,7 @@ mod sources;
 mod status;
 mod stops;
 mod taps;
+mod timescales;
 mod tool_server;
 mod transcripts;
 mod work;
@@ -291,7 +292,8 @@ impl From<AuthArg> for AuthMode {
 enum Command {
     /// Create a root for one owner and one domain.
     Init {
-        /// The owner, system-qualified. Defaults to human:local:<user>.
+        /// The owner: `human:<authority>,<YYYY-MM-DD>:<user-id>`, or the form without
+        /// a date. Defaults to `human:local,<today>:<user>`.
         #[arg(long)]
         owner: Option<String>,
         /// The first domain, such as dom-me.
@@ -999,6 +1001,37 @@ enum Command {
         #[command(subcommand)]
         op: eventlog::LogOp,
     },
+    /// The ownership registry, `registry.toml` beside the grants: check it against the
+    /// grants, or read the identifier of a person through its assertions.
+    Registry {
+        #[command(subcommand)]
+        op: timescales::RegistryOp,
+    },
+    /// The proposals to a personal domain: a write there by anyone but its person is
+    /// held, and the owner admits it, refuses it, or lets it expire.
+    Proposal {
+        #[command(subcommand)]
+        op: timescales::ProposalOp,
+    },
+    /// Recovery: a bundle of the record and the ledger at checkpoints that fit
+    /// together, a copy of the erasure journal, the restore of a bundle into a new
+    /// root, and the restore drill.
+    Recover {
+        #[command(subcommand)]
+        op: timescales::RecoverOp,
+    },
+    /// An outage that the owner declares: reads and changes wait, a session works from
+    /// the T0 it loaded, and handoffs and heartbeats are queued until the end.
+    Outage {
+        #[command(subcommand)]
+        op: timescales::OutageOp,
+    },
+    /// The horizon scanner of each unit: the evidence task and the review task of the
+    /// period.
+    Horizon {
+        #[command(subcommand)]
+        op: timescales::HorizonOp,
+    },
     /// Re-enactment: a session run again on its prompt and commit against its tape,
     /// the memory calls answered from the tape until the run diverges; the tapes, and
     /// a report of the runs by harness and model.
@@ -1360,7 +1393,8 @@ fn default_owner() -> String {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "me".into());
-    format!("human:local:{user}")
+    let today = time::OffsetDateTime::now_utc().date();
+    format!("human:local,{today}:{user}")
 }
 
 fn body_or_stdin(body: Option<String>) -> std::io::Result<String> {
@@ -1517,7 +1551,16 @@ fn refuse_invocation(cli: &Cli, root: &Path) -> Fallible {
                 .into(),
         );
     }
-    if !root.exists() && !matches!(command, Command::Init { .. } | Command::Doctor { .. }) {
+    // these make the root, or say what is wrong with it
+    let needs_no_root = matches!(
+        command,
+        Command::Init { .. }
+            | Command::Doctor { .. }
+            | Command::Recover {
+                op: timescales::RecoverOp::Restore { .. }
+            }
+    );
+    if !root.exists() && !needs_no_root {
         return Err(format!(
             "no record at {}: run `amem init` to make one there, or give --root (or MEMORY_ROOT)",
             root.display()
@@ -1655,7 +1698,20 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Tap { op } => tap_cmd(&root, op).await,
         Command::Drift { op } => drift::run(&root, op).await,
         Command::Auditor { op } => duties::auditor_cmd(&root, op).await,
-        other => entries(&Memory::open(&root)?, other).await,
+        other => record_cmd(&root, other).await,
+    }
+}
+
+/// The commands for the long timescales, and each command on the entries and the tasks
+/// of an opened root.
+async fn record_cmd(root: &Path, command: Command) -> Fallible {
+    match command {
+        Command::Registry { op } => timescales::registry(&Memory::open(root)?, op).await,
+        Command::Proposal { op } => timescales::proposal(&Memory::open(root)?, op).await,
+        Command::Recover { op } => timescales::recover(root, op).await,
+        Command::Outage { op } => timescales::outage(&Memory::open(root)?, op).await,
+        Command::Horizon { op } => timescales::horizon(&Memory::open(root)?, op).await,
+        other => entries(&Memory::open(root)?, other).await,
     }
 }
 
@@ -4597,6 +4653,7 @@ async fn owner_pass(
     cycle.alarms = t.alarms.len();
     curation::file_alarms(m, &t).await?;
     duties::file_surveys(m, domain, cycle).await?;
+    timescales::file_cycle(root, cycle).await?;
     transcripts::sweep(m).await?;
     Ok(())
 }
@@ -5041,6 +5098,11 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Log { .. }
         | Command::Lineage { .. }
         | Command::Withheld { .. }
+        | Command::Registry { .. }
+        | Command::Proposal { .. }
+        | Command::Recover { .. }
+        | Command::Outage { .. }
+        | Command::Horizon { .. }
         | Command::Gofannon { .. }
         | Command::Platform { .. }
         | Command::Tool { .. }

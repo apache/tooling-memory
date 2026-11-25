@@ -80,7 +80,9 @@ two weeks. It is also the reason that none of it is the production shape.
   - the authoring of agent definitions
   - the loop that proposes changes to them from cost and telemetry
 - **Identity.** There is one principal: the owner of a root. Other people appear only as
-  a class of claimant (`human`), and as approvers by convention. Nobody authenticates.
+  a class of claimant (`human`), and as approvers by convention. An identifier of a
+  person can carry the authority that issued it and a date:
+  `human:<authority>,<YYYY-MM-DD>:<user-id>`. Nobody authenticates.
 - **Federation.** There are no cross-domain request tasks, no interface summaries between
   domains, and no portfolio orchestration. A cross-domain dependency is visible, and that
   is all.
@@ -243,8 +245,41 @@ two weeks. It is also the reason that none of it is the production shape.
 - **The evaluation arms.** Act 6 compares memory with an empty record. The paper's five
   arms, the paired seeds and the margin are not built. No scorecard is kept in the
   platform domain.
-- **Long timescales.** There is no ownership registry, no personal domain, no recovery
-  bundle and no restore drill.
+- **Long timescales, in part.** The registry (`registry.toml`) names the unit and the
+  owners of each domain, and `amem registry check` flags a domain with no owner. A write
+  to a personal domain by another author is a proposal, which the owner admits, refuses
+  or lets expire. `amem recover` makes a recovery bundle, restores it with the erasure
+  journal and the next claim epoch, and runs a restore drill (demo act 10). In a declared
+  outage, a session works from the T0 that it loaded, and its handoff waits on a queue
+  (demo act 4). Each curation cycle files an evidence task for the horizon scanner of a
+  unit. These parts are not built:
+  - The restore drill reports two of the five cases as absent: the cross-domain
+    dependency and the uncertain external action.
+  - Only the ledger refuses a claim of an earlier claim epoch. No tap and no outside
+    tracker reads a generation.
+  - The record is not encrypted. Thus there is no key for erased content to keep apart
+    from a recovery bundle.
+  - The erasure journal is a copy of the receipts that a person makes with a command. A
+    restore keeps the reason of an erasure, and gives the new receipt the time of the
+    restore.
+  - Nothing detects an outage. The owner declares one, and it is one state for the
+    ledger and for retrieval. In an outage, a tap and a spawn are refused, and nothing
+    buffers them.
+  - The owner of a root is compared as text. A person under an earlier identifier is not
+    the owner, although the registry check and the gate of a personal domain follow an
+    assertion.
+  - A change to the registry stops each open session, as a change to the grants does.
+  - No clock runs the registry check, the restore drill or the schedule of the horizon
+    scanner. A curation cycle or a command runs them.
+  - A team split with tombstone redirects, a lazy merge, and an import of an acquisition
+    into a quarantined low tier are not built.
+  - A personal domain is a domain of the same root. It does not live on the machine of
+    the person, and no view of it is shared under a grant. A proposer does not read the
+    policy of the owner first.
+  - The strategy review, the protected exploration budget and proposals that change the
+    L1 strategy are not built.
+  - A drill restores into a file ledger. A restore onto PostgreSQL needs an empty
+    database.
 - **Smaller pieces.** The search tool ran only against a fake of Brave's API. It never
   ran against the live provider.
 - **Platforms.** Confinement on macOS ran only on a CI runner. CI runs the Seatbelt
@@ -326,6 +361,11 @@ These parts do what the paper says, on one laptop. Each item names what replaces
   - the bare harness with its own tools off
 
   It runs on any number of harnesses, but on one model per run.
+- **The registry and the outage** are files that the owner edits or makes:
+  `registry.toml` beside the grants, and `state/outage.json`. The claim epoch is a
+  number in a file beside the root. Production: the registry in the identity system of
+  the institution, an outage that the ledger and the log report themselves, and the
+  claim epoch in a store that no restore rolls back.
 - **The web launcher** listens on loopback for the one owner.
 
 The code hides none of this:
@@ -496,6 +536,7 @@ describes re-enactment, the platform domain and the Gofannon bridge.
 | Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned | `transcript`, `replay`, `reenact run, report, tapes, show, pin, unpin` |
 | The event log | Each write, read and send goes into the append-only log of its domain, with a label, and with ids and digests only. The log feeds the index, against a bound of 60 seconds. A materializer builds the index again from the log and replays the ledger's events. Lineage reads the log back and forward. An erasure withholds the entries that are one step forward. The log marks each event of a session that read outside content | `log show, feed, freshness, materialize, outside`, `lineage`, `withheld list, release`; MCP `log`, `lineage`, `outside_readers` |
 | The platform | Agent definitions, templates, eval suites and harness defaults as artifacts in a platform domain. They load only after a person verifies them | `platform list, show`, `golden --platform` |
+| Long timescales | Dated identifiers and the registry of units, owners and personal domains, with its check. Proposals to a personal domain. A recovery bundle, its restore with the erasure journal and a claim epoch, and the restore drill. A declared outage, in which a session works from its loaded T0 and its handoff waits on a queue. Evidence tasks for the horizon scanner | `registry check, resolve`, `proposal list, admit, refuse, expire`, `recover bundle, journal, drill, restore`, `outage status, declare, end`, `horizon schedule` |
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory | `savings`, `golden`, `scripts/eval.py` |
 | Interchange | Bundles at or below a label, erasure with a stub and a receipt, and taps as WASI components | `export`, `import`, `erase`, `tap` |

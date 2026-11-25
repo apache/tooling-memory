@@ -2,10 +2,11 @@
 # Act 10: the record moves. The record outlives every component because it is plain
 # entries and an ordered log of them: the log feeds and rebuilds the index, a bundle
 # carries the entries at or below a label to another record, an erasure travels as a
-# receipt that refuses the text if it comes back, and an erasure follows the log to the
-# entries written and the sends made after a read of what it erased.
+# receipt that refuses the text if it comes back, an erasure follows the log to the
+# entries written and the sends made after a read of what it erased, and a restore
+# drill shows that a recovery bundle brings back a task in flight and keeps an erasure.
 . "$(dirname "$0")/lib.sh"
-act 10 "The record moves" "The event log every write, read and send goes through, by id and digest and never a body; the index fed and rebuilt from it; the record exported at a label and imported into another, under another owner; an erasure that holds when the same bundle is imported again; and an erasure that follows lineage to what was written and sent after." "the event log, its feed and its materializer; you, exporting the record; a second record, another owner's, importing it; and agent:reader, played by the demo script."
+act 10 "The record moves" "The event log every write, read and send goes through, by id and digest and never a body; the index fed and rebuilt from it; the record exported at a label and imported into another, under another owner; an erasure that holds when the same bundle is imported again; an erasure that follows lineage to what was written and sent after; and a restore drill on a recovery bundle, with the ownership registry checked first." "the event log, its feed and its materializer; you, exporting the record; a second record, another owner's, importing it; agent:reader, played by the demo script; and a scratch root that the restore drill makes."
 work=$(mktemp -d)
 
 say "The event log" "Every write as it was offered, every version the record took, every write the screen refused, every erasure, every read, every send and every event of the ledger, in order, one writer per domain. It holds ids and digests, never bodies, so erasing a body leaves the log as it was. Each event has a label, and the log is for the owner and the security role."
@@ -52,4 +53,46 @@ echo "  a search for the second note: $(a search 'visitors walkthrough' | j 'len
 a withheld list --domain dom-demo | j "'\n'.join(f\"  withheld: {w['id']}, because {w.get('because', 'an erasure')} was erased\" for w in d) or '  nothing is withheld'"
 a withheld release "$derived" | j "f\"  you looked at it and it stands: released {d['released']}\""
 echo "  the search again: $(a search 'visitors walkthrough' | j 'len(d)') hits"
+
+say "A restore drill" "A backup of the record alone loses the tasks in flight. A recovery bundle holds the record and the ledger at checkpoints that fit together. First the ownership registry says who answers for each domain, and flags a domain that nobody answers for. Then agent:reader claims a task, you make a recovery bundle, and you erase a note. The restore drill restores the bundle into a scratch root, with the erasure journal and the next claim epoch, and reports five cases. The record and the ledger of this root are not written."
+owner=$(sed -n 's/^owner = "\(.*\)"$/\1/p' "$root/grants.toml")
+domains=$(sed -n 's/^\[domains\.\(.*\)\]$/"\1"/p' "$root/grants.toml" | paste -sd, -)
+# the registry names a person by a dated identifier; an assertion says that the
+# identifier in the grants names the same person
+dated=$(a registry resolve "$owner" | j "d['id'] if d['dated'] else f\"human:{d['authority']},2026-11-01:{d['user_id']}\"")
+registry() {
+  {
+    printf '[units.unit-7f3a]\nname = "The demo unit"\ndomains = [%s]\nhorizon_scanner = "%s"\n' "$domains" "$dated"
+    [ "$1" = owned ] && printf '\n[[units.unit-7f3a.owners]]\nid = "%s"\n' "$dated"
+    [ "$dated" != "$owner" ] && printf '\n[[assertions]]\nwas = "%s"\nis = "%s"\nsince = 2026-11-01\n' "$owner" "$dated"
+    :
+  } > "$root/registry.toml"
+}
+flags="f\"  registry check: {len(d['flags'])} flags\" + ''.join(f\"\\n    {x['flag']}: {x.get('domain') or x.get('unit')}\" for x in d['flags'])"
+registry owned
+echo "  registry.toml: the unit unit-7f3a answers for $(echo "$domains" | tr -d '"' | sed 's/,/, /g'), and $dated owns it"
+a registry resolve "$owner" | j "f\"  {d['id']} is {d['is']} now\" if d['id'] != d['is'] else f\"  {d['id']} is a dated identifier\""
+a registry check | j "$flags"
+registry ownerless
+echo "  the owner is removed from the unit:"
+a registry check | j "$flags"
+registry owned
+echo "  the owner is back: $(a registry check | j "len(d['flags'])") flags"
+drilled=$(a task create "Check the restore" --domain dom-demo --body "Held under a claim while the recovery bundle is made." | j "d['id']")
+a task admit "$drilled" >/dev/null 2>&1 || true
+generation=$(agent agent:reader claim "{\"id\": \"$drilled\"}" | j "d['generation']")
+echo "  agent:reader claimed $drilled at generation $generation"
+lost=$(a write --domain dom-demo --kind fact --title "The restore runs on Fridays" --body "Written in error: the restore runs on Fridays in room 4.12." | j "d['id']")
+a recover bundle "$work/recovery" | j "f\"  recovery bundle: {len(d['domains'])} domains, {len(d['files'])} files, {d['ledger']['events']} events of the ledger, claim epoch {d['ledger']['epoch']}; the index is not in it\""
+a erase "$lost" --reason mistaken >/dev/null 2>&1
+echo "  after the bundle, you erased $lost: the bundle still holds its text"
+a recover drill "$work/recovery" --scratch "$work/drill" > "$work/drill.json"
+j "'\n'.join(f\"  {c['name']:<32} {c['outcome']:<10} {c['detail']}\" for c in d['cases'])" < "$work/drill.json"
+j "f\"  the restore began claim epoch {d['epoch']}; no case failed: {'yes' if d['passed'] else 'no'}\"" < "$work/drill.json"
+j "next(('  on the restored root, the heartbeat of agent:reader under generation $generation is refused: that claim is from an earlier claim epoch' for c in d['cases'] if c['name'] == 'unfinished-task' and c['outcome'] == 'recovered' and 'is refused' in c['detail']), '  the drill did not show a refused heartbeat')" < "$work/drill.json"
+echo "  on this root the claim is still in force: $(a task get "$drilled" | j "f\"{d['status']} by {d['holder']} at generation {d['generation']}\"")"
+agent agent:reader release "{\"id\": \"$drilled\", \"generation\": $generation}" >/dev/null
+a task invalidate "$drilled" --reason "obsolete: shown" >/dev/null
+rm -f "$root/registry.toml"
+echo "  the task is released and closed, and registry.toml is removed: the root has no registry, as before"
 rm -rf "$work"

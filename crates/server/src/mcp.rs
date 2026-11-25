@@ -29,6 +29,8 @@ use std::sync::Arc;
 use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::Duration;
 
+mod timescales;
+
 const DEFAULT_LEASE_SECONDS: i64 = 30 * 60;
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 100;
@@ -708,13 +710,19 @@ const READS: &[&str] = &[
     "outcomes",
     "auditor_mode",
     "curation_case",
+    "resolve_identity",
+    "proposals",
+    "outage_status",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
 const OUTSIDE: &[&str] = &["fetch", "web_search", "gofannon"];
 
-fn kind_of(tool: &str) -> tape::Kind {
-    if READS.contains(&tool) {
+/// What a call does: a read, a reach outside, or a change. `registry_check` reads, and
+/// with `file` it files tasks, so its arguments decide.
+fn kind_of(tool: &str, arguments: &Value) -> tape::Kind {
+    let files = arguments.get("file").and_then(Value::as_bool) == Some(true);
+    if READS.contains(&tool) || (tool == "registry_check" && !files) {
         tape::Kind::Read
     } else if OUTSIDE.contains(&tool) {
         tape::Kind::Outside
@@ -762,9 +770,15 @@ impl McpServer {
     pub fn new(memory: Arc<Memory>) -> Self {
         Self {
             memory,
-            tool_router: Self::tool_router(),
+            tool_router: Self::routes(),
             taped: true,
         }
+    }
+
+    /// Each tool of the server: the tools of this file, and the tools for the long
+    /// timescales.
+    fn routes() -> ToolRouter<Self> {
+        Self::tool_router() + Self::timescales_router()
     }
 
     /// A server for the launcher's own calls in the same process, which are not the
@@ -1502,7 +1516,7 @@ impl McpServer {
         if let Some(play) = self.memory.playback() {
             // a tool this server does not have is the router's to refuse, as it was
             let kind = if self.tool_router.get(&tool).is_some() {
-                kind_of(&tool)
+                kind_of(&tool, &arguments)
             } else {
                 tape::Kind::Read
             };
@@ -1662,7 +1676,7 @@ mod tests {
 
     #[test]
     fn every_tool_has_a_description_and_a_schema() {
-        let router = McpServer::tool_router();
+        let router = McpServer::routes();
         let tools = router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for expected in [
@@ -1689,6 +1703,14 @@ mod tests {
             "lineage",
             "log",
             "outside_readers",
+            "registry_check",
+            "resolve_identity",
+            "proposals",
+            "answer_proposal",
+            "outage_status",
+            "horizon_schedule",
+            "recovery_bundle",
+            "recovery_drill",
         ] {
             assert!(
                 names.contains(&expected),
@@ -1711,7 +1733,7 @@ mod tests {
 
     #[test]
     fn write_schema_names_every_field_and_requires_only_the_body() {
-        let router = McpServer::tool_router();
+        let router = McpServer::routes();
         let write = router
             .list_all()
             .into_iter()
@@ -2886,19 +2908,30 @@ mod tests {
 
     #[test]
     fn the_surveys_of_the_duties_only_read_and_the_duties_change() {
-        for tool in ["dead", "outcomes", "auditor_mode", "curation_case"] {
-            assert_eq!(kind_of(tool), tape::Kind::Read, "{tool}");
+        let none = json!({});
+        for tool in [
+            "dead",
+            "outcomes",
+            "auditor_mode",
+            "curation_case",
+            "registry_check",
+            "resolve_identity",
+            "proposals",
+            "outage_status",
+        ] {
+            assert_eq!(kind_of(tool, &none), tape::Kind::Read, "{tool}");
         }
         for tool in ["demote", "restore", "record_outcome", "check_conventions"] {
-            assert_eq!(kind_of(tool), tape::Kind::Mutation, "{tool}");
+            assert_eq!(kind_of(tool, &none), tape::Kind::Mutation, "{tool}");
         }
     }
 
     #[test]
     fn lineage_and_log_only_read() {
-        assert_eq!(kind_of("lineage"), tape::Kind::Read);
-        assert_eq!(kind_of("log"), tape::Kind::Read);
-        assert_eq!(kind_of("outside_readers"), tape::Kind::Read);
-        assert_eq!(kind_of("write"), tape::Kind::Mutation);
+        let none = json!({});
+        assert_eq!(kind_of("lineage", &none), tape::Kind::Read);
+        assert_eq!(kind_of("log", &none), tape::Kind::Read);
+        assert_eq!(kind_of("outside_readers", &none), tape::Kind::Read);
+        assert_eq!(kind_of("write", &none), tape::Kind::Mutation);
     }
 }

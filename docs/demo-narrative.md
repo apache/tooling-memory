@@ -101,6 +101,13 @@ offline.
   entry replaces it or you release it (10.6).
 - **Bundle**: entries exported at or below a label, as Markdown and a manifest, for
   another record to import (act 10).
+- **Recovery bundle**: a copy of a root from which a restore makes a root again: the
+  record, the event logs, the events of the ledger and the configuration. A *restore
+  drill* restores one into a scratch root and reports what came back (10.7).
+- **Claim epoch**: a number that each restore gives to the ledger. The ledger refuses
+  each claim that was made before it (10.7).
+- **Outage**: the time in which reads and changes wait, because nothing can check them.
+  You declare it and end it (4.9).
 
 ## Act 1 · The read path
 
@@ -267,9 +274,11 @@ finds no hit. Your own search reaches the cap of 50 results.
 ## Act 4 · The task fabric
 
 On stage: you filing tasks, the ledger ranking them, Claude Code delegating and later
-taking the results, and Codex doing each delegated task.
+taking the results, and Codex doing each delegated task. In the last step: `agent:worker`,
+played by the demo script, on a scratch record.
 
-The work is on the ledger. The ledger continues after any one session ends.
+The work is on the ledger. The ledger continues after any one session ends. When nothing
+can check a read or a change, a session works from the T0 that it loaded.
 
 **4.1 A strategy.** A policy entry says what is important in this period. After you
 verify it, it becomes the scoring rule that puts the ledger in order.
@@ -310,6 +319,18 @@ follow-up task was the rest of its work. The last line shows it done.
 
 **4.8 Telemetry.** Tasks by kind and status. "gate" means the held writes that wait for
 you. "promote" means the approvals to verified.
+
+**4.9 An outage.** This step runs on a scratch record of its own. Thus the queue and the
+counts of the demo record stay as they are. `agent:worker` loads T0. Then you declare an
+outage, while that session is open. The `outage_status` tool tells the session that an
+outage is declared, and for which domain it loaded T0. The session holds no task, so it
+has no lease. It asks for T0 again, and gets the copy that it loaded, with a line that
+says so. Its search waits: the answer says that an outage is declared. It writes a
+handoff, and the answer says that the handoff is queued. You end the outage. The queue is
+replayed through the ordinary write, and the handoff lands in the record with
+`agent:worker` as its author. The same session searches again and gets hits. The step
+shows no claimed task: the tests of the library hold the rule for a session with a
+lease.
 
 ## Act 5 · Watching it
 
@@ -477,10 +498,12 @@ gives one write and no send. An auditor checks the sends of such a session first
 ## Act 10 · The record moves
 
 On stage: the event log, its feed and its materializer; you; a second record, another
-owner's; and `agent:reader`, played by the demo script.
+owner's; `agent:reader`, played by the demo script; and a scratch root that the restore
+drill makes.
 
 The claim: the record lasts longer than every component. You can rebuild it from its log
-and move it to another owner. When you do, it keeps its erasures.
+and move it to another owner. When you do, it keeps its erasures. A recovery bundle
+brings back the tasks that were not finished, and a restore keeps a later erasure.
 
 **10.1 The event log.** The step counts the events of each kind that the log holds, and
 shows the first event of each kind. The kinds are the writes as sessions offered them,
@@ -520,6 +543,31 @@ write says that the note is withheld, and names the erased note. A search for th
 note finds nothing. `amem withheld list` names the second note and the third note, each
 with the erased note as the cause. You read the second note, you decide that it is
 correct, and you release it. The search finds it again.
+
+**10.7 A restore drill.** First the registry. The step writes `registry.toml`: one unit
+answers for each granted domain, and you own the unit. The registry names you by a dated
+identifier, and an assertion says that the identifier in the grants is that person.
+`amem registry check` gives no flag. The step removes the owner from the unit, and the
+check gives the flag `ownerless` for each domain. The step puts the owner back.
+Then the drill. `agent:reader` claims a task, and the step keeps the generation of the
+claim. You write a note. You make a recovery bundle: the record, the logs, the events of
+the ledger and the configuration, and not the index. You erase the note. The bundle still
+holds its text. `amem recover drill` restores the bundle into a scratch root, with the
+erasure journal of this root and the next claim epoch. It reports five cases:
+
+- `unfinished-task` is recovered. The task is in the restored ledger, and it is open.
+  The restored ledger refuses the heartbeat of `agent:reader` under its claim from
+  before the restore.
+- `erasure-after-backup` is recovered. The note is a stub in the scratch root, and a
+  search does not find it.
+- `write-awaiting-materialisation` is absent. The index held each version when the
+  bundle was made.
+- `cross-domain-dependency` and `uncertain-external-action` are absent. These
+  mechanisms are not built.
+
+The drill wrote nothing in the record or the ledger of this root: the claim of
+`agent:reader` is still in force here. Only the claim epoch file moved. At the end,
+`agent:reader` releases the task, you close it, and the step removes `registry.toml`.
 
 ## Act 11 · What this is not, yet
 

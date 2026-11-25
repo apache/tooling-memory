@@ -523,6 +523,9 @@ fn the_cycle_counted_the_duties(first: &serde_json::Value) {
     assert_eq!(first["handoffs_sampled"], 1, "{first}");
     assert_eq!(first["human_review"], 3, "the fresh mode: {first}");
     assert!(first["conventions"].as_u64().unwrap() >= 2, "{first}");
+    // a root with no registry has no flag and no horizon scanner
+    assert_eq!(first["registry_flags"], 0, "{first}");
+    assert_eq!(first["horizon_filed"], 0, "{first}");
 }
 
 /// What the duties of a first cycle filed. `bare` is the curation that cites nothing.
@@ -571,6 +574,42 @@ fn a_cycle_does_the_duties_of_the_curator_and_the_auditor_and_files_each_finding
     for origin in ["auditor:curation", "auditor:handoff", "curator:correction"] {
         let (was, is) = (bodies_of(&tasks, origin), bodies_of(&again, origin));
         assert_eq!(was.len(), is.len(), "{origin}");
+    }
+}
+
+/// A registry whose one unit lists the domain of the fixture, names a horizon scanner
+/// and has no owner.
+const REGISTRY: &str = "[units.u1]\ndomains = [\"dom-me\"]\n\
+    horizon_scanner = \"human:test,2026-11-01:scout\"\n";
+
+#[test]
+fn a_cycle_files_the_flags_of_the_registry_and_the_tasks_of_the_horizon_scanner_once() {
+    let f = fixture();
+    std::fs::write(f.root.join("registry.toml"), REGISTRY).unwrap();
+    let mut args = vec!["curate"];
+    args.extend(GATEWAY);
+    args.extend(["--domain", "dom-me", "--budget-tokens", "1"]);
+    let first = f.json(&args);
+    assert_eq!(first["registry_flags"], 1, "the unit has no owner: {first}");
+    assert_eq!(first["horizon_filed"], 1, "{first}");
+    // the review task waits for the evidence task, so it is not in these two states
+    let origins = ["registry:ownerless", "horizon:evidence"];
+    let tasks = filed_tasks(&f);
+    for origin in origins {
+        assert_eq!(bodies_of(&tasks, origin).len(), 1, "{origin}");
+    }
+    let blocked = ["task", "list", "--domain", "dom-me", "--status", "blocked"];
+    let waits = f.json(&blocked);
+    assert_eq!(
+        bodies_of(waits.as_array().unwrap(), "horizon:review").len(),
+        1
+    );
+    let second = f.json(&args);
+    assert_eq!(second["registry_flags"], 1, "the flag stands: {second}");
+    assert_eq!(second["horizon_filed"], 0, "the same period: {second}");
+    let again = filed_tasks(&f);
+    for origin in origins {
+        assert_eq!(bodies_of(&again, origin).len(), 1, "{origin}");
     }
 }
 

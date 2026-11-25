@@ -66,6 +66,18 @@ pub struct Replayed {
     pub failed: Vec<String>,
 }
 
+/// The outage as one session sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OutageStatus {
+    /// The outage that is declared now. None when there is no outage.
+    pub outage: Option<Outage>,
+    /// The domains whose T0 this session loaded: what it works from in an outage.
+    pub t0_loaded: Vec<String>,
+    /// The end of the last lease that the ledger confirmed to this session.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub confirmed_lease: Option<OffsetDateTime>,
+}
+
 /// What a session keeps for an outage. The views of one session share it.
 #[derive(Debug, Default)]
 pub(crate) struct Offline {
@@ -166,6 +178,19 @@ impl Memory {
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => unreadable(e.to_string()),
+        }
+    }
+
+    /// The outage as this session sees it: the declared outage, the domains whose T0
+    /// the session loaded, and the last lease that the ledger confirmed to it. Any
+    /// session may ask, in an outage too: nothing of the record is read.
+    #[must_use]
+    pub fn outage_status(&self) -> OutageStatus {
+        let offline = lock(&self.offline);
+        OutageStatus {
+            outage: self.outage(),
+            t0_loaded: offline.loaded.keys().cloned().collect(),
+            confirmed_lease: offline.lease,
         }
     }
 
@@ -579,6 +604,31 @@ mod tests {
             Err(other) => panic!("the action did not wait: {other}"),
             Ok(_) => panic!("the action did not wait: it was done"),
         }
+    }
+
+    #[tokio::test]
+    async fn the_status_names_the_outage_the_loaded_t0_and_the_confirmed_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = init(dir.path());
+        let id = task(&owner, "Relay").await;
+        let worker = agent(dir.path());
+        let before = worker.outage_status();
+        assert_eq!(before.outage, None);
+        assert!(before.t0_loaded.is_empty());
+        assert_eq!(before.confirmed_lease, None);
+        worker.t0(None).await.unwrap();
+        let claim = worker.claim(&id, Duration::minutes(30)).await.unwrap();
+        owner.declare_outage("the ledger is moved").unwrap();
+        let status = worker.outage_status();
+        assert_eq!(status.outage, owner.outage());
+        assert_eq!(status.t0_loaded, vec![DOMAIN.to_string()]);
+        assert_eq!(status.confirmed_lease, Some(claim.lease_until));
+        // a session that loaded nothing says so, and the status itself does not wait
+        let late = agent(dir.path()).outage_status();
+        assert!(late.outage.is_some() && late.t0_loaded.is_empty());
+        let text = serde_json::to_value(&status).unwrap();
+        assert_eq!(text["outage"]["reason"], "the ledger is moved");
+        assert!(text["confirmed_lease"].is_string(), "{text}");
     }
 
     /// How many events the ledger holds for the domain.

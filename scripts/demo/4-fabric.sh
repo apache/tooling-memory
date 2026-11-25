@@ -1,9 +1,10 @@
 #!/bin/sh
 # Act 4: the task fabric. A strategy compiles into the rubric; a rescore ranks the
 # queue along its edges and keeps curation's floor; a harness that would spawn
-# subagents has them filed on the board instead; and the flow is counted.
+# subagents has them filed on the board instead; the flow is counted; and in an outage
+# a session works from the T0 it loaded and its handoff waits on a queue.
 . "$(dirname "$0")/lib.sh"
-act 4 "The task fabric" "Work is a shared ledger of tasks with leases and handoffs. A strategy compiles into the rubric that ranks it, the ranking moves along dependencies, and a harness that would spawn subagents files them on the board instead, where any worker can take them." "you, who file the tasks and verify the strategy; the ledger, which ranks and moves them, not a worker; ${HARNESS:-a harness} on your login (agent:${HARNESS:-...}), the session asked to delegate and later the continuation; and $WORKER_HARNESS on $WORKER_MODEL, the board's worker for each subagent task."
+act 4 "The task fabric" "Work is a shared ledger of tasks with leases and handoffs. A strategy compiles into the rubric that ranks it, the ranking moves along dependencies, and a harness that would spawn subagents files them on the board instead, where any worker can take them. In an outage, a session works from the T0 that it loaded, and its handoff waits on a queue." "you, who file the tasks and verify the strategy; the ledger, which ranks and moves them, not a worker; ${HARNESS:-a harness} on your login (agent:${HARNESS:-...}), the session asked to delegate and later the continuation; $WORKER_HARNESS on $WORKER_MODEL, the board's worker for each subagent task; and in the last step agent:worker, played by the demo script, on a scratch record."
 
 say "A strategy that compiles into the rubric" "An L1 policy entry says what matters this period: work a running task filed comes first, curation keeps a floor. A person verifies it, and the rubric the queue is ranked by is compiled from it."
 strategy=$(a write --kind policy --title "pol-L1-007 This period: subagent work first" <<'POL' | j "d['id']"
@@ -89,3 +90,23 @@ fi
 
 say "The fabric's telemetry" "Tasks by family and status, why work was dropped, and which requirements no worker could meet."
 a task stats | j "'\n'.join(f\"  {fam:<12} \" + ', '.join(f'{k} {v}' for k, v in s.items()) for fam, s in d['by_family'].items()) + f\"\n  unmatched requirements: {d['unmatched_requirements'] or 'none'}\""
+
+say "An outage" "You declare an outage when nothing can check a read or a change: each one waits. A session is not stopped. It works from the T0 that it loaded before the outage, and it writes its handoff, which goes on a queue. When you end the outage, the queue is replayed through the ordinary write, so the gates still decide. This step runs on a scratch record of its own, so the queue and the counts of the demo record stay as they are."
+outage=$(mktemp -d)
+o() { "$memory" --root "$outage/root" "$@"; }
+o init --owner human:demo:outage --domain dom-outage >/dev/null
+o write --domain dom-outage --kind fact --title "The mirror list has three mirrors" --body "Two mirrors answer. The third mirror times out." >/dev/null
+# what you do while the session of the agent is open: declare the outage, and end it
+echo "\"$memory\" --root \"$outage/root\" outage declare --reason \"the host of the ledger moves\" > \"$outage/declared.json\"" > "$outage/declare.sh"
+echo "\"$memory\" --root \"$outage/root\" outage end > \"$outage/ended.json\"" > "$outage/end.sh"
+python3 "$here/scripts/demo/mcp.py" "$memory" "$outage/root" agent:worker steps "[{\"tool\": \"t0\", \"arguments\": {}}, {\"run\": \"sh $outage/declare.sh\"}, {\"tool\": \"outage_status\", \"arguments\": {}}, {\"tool\": \"t0\", \"arguments\": {}}, {\"tool\": \"search\", \"arguments\": {\"query\": \"mirror\"}}, {\"tool\": \"write\", \"arguments\": {\"entry_type\": \"handoff\", \"title\": \"Handoff: the mirror list\", \"body\": \"Two mirrors answered. Start with the third mirror.\"}}, {\"run\": \"sh $outage/end.sh\"}, {\"tool\": \"search\", \"arguments\": {\"query\": \"mirror\"}}]" > "$outage/steps.jsonl"
+step() { sed -n "$1p" "$outage/steps.jsonl"; }
+step 1 | j "f\"  agent:worker loaded T0: {len(d['result'].splitlines())} lines\" if d['ok'] else '  T0 was refused: ' + d['refused']"
+j "f\"  you declared an outage: {d['reason']}\"" < "$outage/declared.json"
+step 2 | j "f\"  outage_status, in the same session: an outage since {d['result']['outage']['since']}; T0 loaded for {', '.join(d['result']['t0_loaded']) or 'no domain'}; \" + ('no claim, so no lease to watch' if d['result']['confirmed_lease'] is None else f\"work stops at {d['result']['confirmed_lease']}\")"
+step 3 | j "'  t0 again, the loaded copy: ' + next((l for l in d['result'].splitlines() if l.startswith('> Outage')), 'no outage line') if d['ok'] else '  t0 was refused: ' + d['refused']"
+step 4 | j "'  search: ' + (d.get('refused') or 'answered, and it must wait')"
+step 5 | j "'  a handoff: ' + (d.get('refused') or 'written, and it must wait')"
+j "f\"  you ended the outage: {len(d['handoffs'])} handoff landed in the record ({', '.join(d['handoffs'])}); heartbeats applied {d['heartbeats_applied']}, refused {d['heartbeats_refused']}; failed {len(d['failed'])}\"" < "$outage/ended.json"
+step 6 | j "'  the same session searches again: ' + (f\"{len(d['result'] if isinstance(d['result'], list) else d['result'].get('hits', []))} hits\" if d['ok'] else 'refused: ' + d['refused'])"
+rm -rf "$outage"
